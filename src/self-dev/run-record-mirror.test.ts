@@ -15,6 +15,8 @@ describe('run record machine-ledger mirror', () => {
     runId: 'run-mirror-test', createdAt: 1, updatedAt,
     results: [{ taskId: 'task-1', feature: 'fixture', status: 'done' }],
   });
+  // CTX-DIGEST1: a saved record carries its one-line summary.
+  const saved = (updatedAt: number): SelfDevRunState => ({ ...state(updatedAt), summaryLine: 'run-mirror-test · done' });
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'run-record-mirror-'));
@@ -56,7 +58,7 @@ describe('run record machine-ledger mirror', () => {
     try {
       saveSelfDevRun(state(100), primary);
       unlinkSync(join(primary, 'run-mirror-test.json'));
-      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(state(100));
+      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(saved(100));
       expect(log).toHaveBeenCalledWith('self-dev.run-store', 'read-from-mirror', { runId: 'run-mirror-test' });
     } finally { log.mockRestore(); }
   });
@@ -67,7 +69,7 @@ describe('run record machine-ledger mirror', () => {
       mkdirSync(join(root, 'machine-ledger'));
       writeFileSync(mirror, 'not a directory');
       saveSelfDevRun(state(100), primary);
-      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(state(100));
+      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(saved(100));
       expect(log).toHaveBeenCalledWith('self-dev.run-store', 'mirror-failed', {
         runId: 'run-mirror-test', reason: expect.any(String),
       });
@@ -77,7 +79,7 @@ describe('run record machine-ledger mirror', () => {
   test('repeated saves replace the one mirror file with the latest checkpoint', () => {
     saveSelfDevRun(state(100), primary);
     saveSelfDevRun(state(200), primary);
-    expect(loadMirroredRunRecord('run-mirror-test')).toEqual(state(200));
+    expect(loadMirroredRunRecord('run-mirror-test')).toEqual(saved(200));
     expect(readdirSync(mirror)).toEqual(['run-mirror-test.json']);
   });
 
@@ -101,7 +103,7 @@ describe('run record machine-ledger mirror', () => {
     writeFileSync(join(mirror, 'run-mirror-test.json'), JSON.stringify(state(999)));
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
-      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(state(100));
+      expect(loadSelfDevRun('run-mirror-test', primary)).toEqual(saved(100));
       expect(log).not.toHaveBeenCalledWith('self-dev.run-store', 'read-from-mirror', expect.anything());
     } finally { log.mockRestore(); }
   });

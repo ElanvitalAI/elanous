@@ -52,6 +52,49 @@ describe('TD1 proposals and shadow cards', () => {
     expect(propose(judge(base, 0), td1Dispositions('file\tdisposition\nx.test.ts\tkeep\n'))).toMatchObject({ proposal: null });
   });
 
+  test('effectiveness proposes a rewrite or investigation while TD1 retains precedence', () => {
+    const stable = { ...base, effectiveness: { flake: 'stable' as const, mutation: 'survived' as const } };
+    expect(propose(judge(stable, 0), new Map())).toMatchObject({ proposal: 'rewrite-cheap', basis: '돌연변이를 못 잡음' });
+    expect(propose(judge(stable, 1), new Map()).proposal).toBeNull();
+    const root = mkdtempSync(join(tmpdir(), 'td-effect-card-'));
+    try {
+      const result = propose(judge(stable, 0), new Map());
+      const card = writeCardDraft(root, { at: new Date().toISOString(), range: '#0~#0', start: 0, end: 0, next: 1, total: 1, commit: 'abc', budgetSecs: 1, results: [result] });
+      expect(readFileSync(card!, 'utf8')).toContain('rewrite-cheap | 돌연변이를 못 잡음');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+    expect(propose(judge({ ...base, rc: 1, effectiveness: { flake: 'flaky', mutation: 'caught' } }, 0), new Map()))
+      .toMatchObject({ verdict: 'review', proposal: 'investigate', basis: '3회 중 갈림' });
+    expect(judge({ ...base, rc: 1, effectiveness: { flake: 'stable', mutation: 'caught' } }, 0).verdict).toBe('keep');
+    expect(propose(judge(stable, 0), td1Dispositions('file\tdisposition\nx.test.ts\tkeep\n')).proposal).toBeNull();
+  });
+
+  test('sweep cursor records progress and resets after a full pass', () => {
+    const root = mkdtempSync(join(tmpdir(), 'td-sweep-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const td1 = new Map();
+      const measure = { commit: 'abc', measurements: [{ ...base }, { ...base, file: 'y.test.ts' }] };
+      const pick = (start: number, end: number, next: number) => ({ start, end, next, total: 4, budgetSecs: 2160, estimatedSecs: 1000, sweep: true, totalCostSecs: 50400 });
+      expect(record({ input: {}, outputs: { pick: pick(0, 1, 2), measure } }, { td1 })).toBe(0);
+      expect(lastLedgerLine(root)?.sweepVisited).toBe(2);
+      expect(lastLedgerLine(root)?.sweepCostSecs).toBe(1000);
+      expect(lastLedgerLine(root)?.sweepSlices).toBe(1);
+      expect(record({ input: {}, outputs: { pick: pick(2, 3, 0), measure } }, { td1 })).toBe(0);
+      expect(lastLedgerLine(root)?.sweepVisited).toBe(4);
+      expect(lastLedgerLine(root)?.sweepCostSecs).toBe(2000);
+      expect(lastLedgerLine(root)?.sweepSlices).toBe(2);
+      expect(record({ input: {}, outputs: { pick: pick(0, 1, 2), measure } }, { td1 })).toBe(0);
+      expect(lastLedgerLine(root)?.sweepVisited).toBe(2);
+      expect(lastLedgerLine(root)?.sweepCostSecs).toBe(1000);
+      expect(lastLedgerLine(root)?.sweepSlices).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('identical record is idempotent; same-commit remeasurement appends updated card section; card failure preserves ledger', () => {
     const root = mkdtempSync(join(tmpdir(), 'td-proposals-'));
     const previous = process.env.ELANOUS_STATE_DIR;
@@ -259,6 +302,71 @@ describe('ledger and card draft', () => {
       expect(script).toContain(`done <<'TEST_DIET_FILES'\n${GATE_NIGHTLY_AUDITS.join('\n')}\nTEST_DIET_FILES`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  test('sweep pick derives its budget from measured total cost only when enabled', () => {
+    const repo = join(import.meta.dir, '../..');
+    const root = mkdtempSync(join(tmpdir(), 'td-pick-state-'));
+    try {
+      const run = (...args: string[]) => spawnSync(process.execPath, [join(import.meta.dir, 'node.ts'), 'pick', ...args], {
+        cwd: repo, encoding: 'utf8', env: { ...process.env, ELANOUS_STATE_DIR: root,
+          ELANOUS_GRAPH_CONTEXT: JSON.stringify({ input: { budgetSecs: 123 }, outputs: {} }) },
+      });
+      const ordinary = run();
+      const sweep = run('--sweep');
+      expect(ordinary.status).toBe(0);
+      expect(sweep.status).toBe(0);
+      const oldPick = JSON.parse(ordinary.stdout.trim()) as { budgetSecs: number; sweep?: boolean };
+      const newPick = JSON.parse(sweep.stdout.trim()) as { budgetSecs: number; totalCostSecs: number; sweep: boolean };
+      expect(oldPick.budgetSecs).toBe(123);
+      expect(oldPick.sweep).toBeUndefined();
+      expect(newPick.sweep).toBe(true);
+      expect(newPick.budgetSecs).toBeCloseTo(newPick.totalCostSecs / 28 * 1.2);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('effectiveness is opt-in: three baseline runs and one isolated mutation per file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'td-effectiveness-'));
+    try {
+      const bin = join(root, 'bin');
+      mkdirSync(bin);
+      const executions = join(root, 'executions');
+      writeFileSync(join(bin, 'ssh'), '#!/bin/sh\ncat > "$TEST_SCRIPT"\nsed -e "s|/usr/bin/time -l|$TEST_TIME|g" -e "s|$HOME/.bun/bin:||g" -e "s|export PATH=|export PATH=$TEST_BIN:|g" "$TEST_SCRIPT" | bash\n');
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\ncase "$1" in clone) for target do :; done; mkdir -p "$target/apps/pwa" ;; rev-parse) echo abc ;; *) exit 2 ;; esac\n');
+      writeFileSync(join(bin, 'bun'), '#!/bin/sh\ncase "$1" in install) exit 0 ;; run) echo baseline >> "$TEST_EXECUTIONS"; if [ "$TEST_BASELINE_FAIL" = 1 ] || { [ "$TEST_BASELINE_FLAKY" = 1 ] && [ "$(wc -l < "$TEST_EXECUTIONS")" -eq 2 ]; }; then echo "1 fail" >&2; exit 1; fi; echo "1 pass" >&2 ;; scripts/test-diet/effectiveness.ts) echo mutation >> "$TEST_EXECUTIONS"; echo survived ;; *) exit 2 ;; esac\n');
+      const timed = join(root, 'time');
+      writeFileSync(timed, '#!/bin/sh\nif [ "$1" = timeout ]; then shift 3; fi\n"$@"\nrc=$?\necho "104857600 maximum resident set size" >&2\nexit "$rc"\n');
+      for (const path of [join(bin, 'ssh'), join(bin, 'git'), join(bin, 'bun'), timed]) chmodSync(path, 0o700);
+      const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: root,
+        ELANOUS_GRAPH_CONTEXT: JSON.stringify({ input: {}, outputs: { pick: { files: ['test/sample.test.ts'] } } }), TEST_TIME: timed, TEST_EXECUTIONS: executions, TEST_SCRIPT: join(root, 'script'), TEST_BIN: bin };
+      const run = (...args: string[]) => spawnSync(process.execPath, [join(import.meta.dir, 'node.ts'), 'measure', ...args], {
+        cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env,
+      });
+      const ordinary = run();
+      expect({ status: ordinary.status, stdout: ordinary.stdout, stderr: ordinary.stderr }).toMatchObject({ status: 0 });
+      expect((JSON.parse(ordinary.stdout.trim()) as { measurements: Array<{ effectiveness?: unknown }> }).measurements[0]?.effectiveness).toBeUndefined();
+      expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(['baseline']);
+      writeFileSync(executions, '');
+      const effective = run('--effectiveness');
+      expect(effective.status).toBe(0);
+      expect((JSON.parse(effective.stdout.trim()) as { measurements: Array<{ effectiveness: { flake: string; mutation: string } }> }).measurements[0]?.effectiveness)
+        .toEqual({ flake: 'stable', mutation: 'survived' });
+      expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(['baseline', 'baseline', 'baseline', 'mutation']);
+      writeFileSync(executions, '');
+      Object.assign(env, { TEST_BASELINE_FAIL: '1' });
+      const failing = run('--effectiveness');
+      expect(failing.status).toBe(0);
+      expect((JSON.parse(failing.stdout.trim()) as { measurements: Array<{ effectiveness: { flake: string; mutation: string } }> }).measurements[0]?.effectiveness)
+        .toEqual({ flake: 'failing', mutation: 'n/a' });
+      expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(['baseline', 'baseline', 'baseline']);
+      writeFileSync(executions, '');
+      Object.assign(env, { TEST_BASELINE_FAIL: '0', TEST_BASELINE_FLAKY: '1' });
+      const flaky = run('--effectiveness');
+      expect(flaky.status).toBe(0);
+      expect((JSON.parse(flaky.stdout.trim()) as { measurements: Array<{ effectiveness: { flake: string; mutation: string } }> }).measurements[0]?.effectiveness)
+        .toEqual({ flake: 'flaky', mutation: 'n/a' });
+      expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(['baseline', 'baseline', 'baseline']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('nightly record keeps partial measurements, identifies unmeasured files and drafts one failure card', () => {
     const root = mkdtempSync(join(tmpdir(), 'nightly-audit-'));
     try {

@@ -6,6 +6,7 @@ import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
+import { NowSpeakButton } from './NowSpeakButton';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { ChatHistory } from './ChatHistory';
@@ -1158,6 +1159,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
             />
           </div>
+          <NowSpeakButton />
           <div ref={moreRef} className="relative shrink-0">
             <button type="button" aria-label="채팅 더보기" aria-expanded={moreOpen} aria-controls="chat-header-more" onClick={() => setMoreOpen((open) => !open)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-muted">
               <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
@@ -1182,7 +1184,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
             <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
           </div>
-          <div className="flex items-center gap-2">{voiceButton}</div>
+          <div className="flex items-center gap-2"><NowSpeakButton />{voiceButton}</div>
         </div>
       )}
       <SeatsNowStrip />

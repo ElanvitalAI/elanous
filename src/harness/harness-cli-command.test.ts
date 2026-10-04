@@ -7,9 +7,11 @@ import { join } from 'node:path';
 import { describe, expect, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
+import { RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
@@ -28,6 +30,7 @@ import {
   installHarnessCliCommand,
   killHarnessProcess,
   githubDraftSweepAdapters,
+  supersedeMergedGoalDrafts,
   draftSweepRunStatus,
   observeHarnessLaunchdPids,
   parseHarnessProcessPsOutput,
@@ -171,6 +174,39 @@ describe('harness CLI command', () => {
     return captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'processes']));
   }
 
+  test('harness say and ask --seat stamp launch env and pass resolved cwd seat to handlers', async () => {
+    const previous = process.env.ELANOUS_HARNESS_SEAT;
+    const previousLaunch = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+    delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+    const received: Array<{ kind: string; seat: string | undefined; env: string | undefined }> = [];
+    const { program } = install(async (_file, opts) => { received.push({ kind: 'ask', seat: opts.seat, env: process.env.ELANOUS_HARNESS_SEAT }); },
+      async (_words, opts) => { received.push({ kind: 'say', seat: opts.seat, env: process.env.ELANOUS_HARNESS_SEAT }); });
+    try {
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'objective', '--seat', 'UX']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', 'goal.md', '--seat', 'TC']);
+      expect(received).toEqual([{ kind: 'say', seat: 'UX', env: 'UX' }, { kind: 'ask', seat: 'TC', env: 'TC' }]);
+      expect(process.env.ELANOUS_HARNESS_SEAT).toBe(previous);
+      setUserConfigOverlay((config) => ({ ...config, loops: { ...config.loops,
+        orchestrator: { ...config.loops?.orchestrator!, seatTrees: { OP: [process.cwd()] } } } }));
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'inferred']);
+      expect(received.at(-1)).toEqual({ kind: 'say', seat: 'OP', env: 'OP' });
+      setUserConfigOverlay(null);
+      process.env.ELANOUS_HARNESS_SEAT = 'MK';
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'unassigned']);
+      expect(received.at(-1)).toEqual({ kind: 'say', seat: undefined, env: undefined });
+      process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = 'hq-fixture';
+      process.env.ELANOUS_HARNESS_SEAT = 'MK';
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'queued']);
+      expect(received.at(-1)).toEqual({ kind: 'say', seat: 'MK', env: 'MK' });
+    } finally {
+      if (previousLaunch === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+      else process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = previousLaunch;
+      setUserConfigOverlay(null);
+      if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+      else process.env.ELANOUS_HARNESS_SEAT = previous;
+    }
+  });
+
   test('processes --kill checks repository, owning run and terminal status before sending one SIGTERM', async () => {
     const root = '/tmp/owned-elanous-repo';
     const signals: Array<[number, string]> = [];
@@ -261,6 +297,79 @@ describe('harness CLI command', () => {
       })).toMatchObject({ outcome: 'sent', owned: true });
       expect(await exit).toEqual({ signal: 'SIGTERM' });
     } finally { child.kill(); log.mockRestore(); }
+  });
+
+  test('goal PR and runId show the authored goal, recorded outcome and matching universe', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'harness-goal-'));
+    const goalsDir = join(root, 'goals');
+    const runsDir = join(root, 'runs');
+    mkdirSync(goalsDir);
+    mkdirSync(runsDir);
+    const runId = 'run-cli-child';
+    writeFileSync(join(goalsDir, 'GOAL-cli.txt'), 'Build the CLI\n- KanId: TC-7\n## 실행 기록\n- runId: run-cli-child\n  stage: merged\n  outcome: completed\n  prNumber: 42\n');
+    writeFileSync(join(runsDir, 'parent.json'), JSON.stringify({ runId: 'parent', createdAt: 1, updatedAt: 2,
+      supervisorStopReason: 'converged', results: [{ runId, status: 'done', stage: 'merged', prNumber: 42 }] }));
+    const program = new Command().exitOverride();
+    const harness = installHarnessCliCommand(program, {
+      registerSink: async () => {}, resolveSurface: async () => 'harness', goalLookup: { goalsDir, runsDir },
+    });
+    const previousExit = process.exitCode;
+    try {
+      expect(harness.commands.map((command) => command.name())).toContain('goal');
+      expect(harness.commands.find((command) => command.name() === 'goal')?.helpInformation()).toContain('<reference>');
+      for (const reference of ['42', runId]) {
+        process.exitCode = 0;
+        const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'goal', reference]));
+        expect(lines).toEqual([[
+          '골: Build the CLI', `runId: ${runId}`, '칸 id: TC-7', 'PR: #42',
+          'stage/결과: merged / completed', '종결 사유: converged', '찾은 우주: 시험',
+          '원장: 찾음', '골 문서: 찾음',
+        ].join('\n')]);
+        expect(process.exitCode).toBe(0);
+      }
+      const json = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'goal', '#42', '--json']));
+      expect(json).toHaveLength(1);
+      expect(JSON.parse(json[0]!)).toEqual({
+        goalBody: 'Build the CLI\n- KanId: TC-7', goalFile: join(goalsDir, 'GOAL-cli.txt'), kanId: 'TC-7', runId,
+        record: { runId, stage: 'merged', outcome: 'completed', prNumber: 42 },
+        runState: { runId: 'parent', createdAt: 1, updatedAt: 2, supervisorStopReason: 'converged',
+          results: [{ runId, status: 'done', stage: 'merged', prNumber: 42 }] },
+      });
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = previousExit; rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('goal missing run ledger or goal document is explicit and exits 1 in human and JSON modes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'harness-goal-missing-'));
+    const goalsDir = join(root, 'goals');
+    const runsDir = join(root, 'runs');
+    mkdirSync(goalsDir);
+    mkdirSync(runsDir);
+    writeFileSync(join(goalsDir, 'GOAL-only.md'), 'Only authored\n## 실행 기록\n- runId: run-no-ledger\n  stage: merged\n  outcome: completed\n  prNumber: 17\n');
+    writeFileSync(join(runsDir, 'run-no-document.json'), JSON.stringify({ runId: 'run-no-document',
+      createdAt: 1, updatedAt: 2, results: [] }));
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+      goalLookup: { goalsDir, runsDir } });
+    const previousExit = process.exitCode;
+    try {
+      for (const [reference, missing] of [['17', '원장에 없음'], ['run-no-document', '골 문서에 없음'],
+        ['999', '원장에 없음']] as const) {
+        process.exitCode = 0;
+        const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'goal', reference]));
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain(missing);
+        expect(lines[0]).toContain('찾은 우주: 시험');
+        expect(process.exitCode).toBe(1);
+        process.exitCode = 0;
+        const json = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'goal', reference, '--json']));
+        expect(json).toHaveLength(1);
+        const parsed = JSON.parse(json[0]!);
+        expect(Object.keys(parsed).sort()).toEqual(['goalBody', 'goalFile', 'kanId', 'record', 'runId', 'runState']);
+        expect(parsed[missing === '원장에 없음' ? 'runState' : 'goalFile']).toBeNull();
+        expect(process.exitCode).toBe(1);
+      }
+    } finally { process.exitCode = previousExit; rmSync(root, { recursive: true, force: true }); }
   });
 
   test('draft sweep is installed by default; dry-run and apply pass repository and actions through the CLI', async () => {
@@ -453,6 +562,81 @@ describe('harness CLI command', () => {
       }
       expect(requests).toEqual(Array.from({ length: 4 }, () => ['api', 'repos/my/repo/pulls/123']));
     } finally { process.exitCode = previousExit; }
+  });
+
+  test('merge-time GitHub adapter reuses open-draft inventory and liveness without listing closed PRs', async () => {
+    const requests: string[][] = [];
+    const merged = { number: 90, state: 'closed', draft: false, title: 'same goal', head: { ref: 'self-impl/merged-goalid-abcd-new' },
+      labels: [], created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z' };
+    const gh = (args: string[]) => {
+      requests.push(args);
+      if (args[0] === 'api' && args[1] === 'repos/my/repo/pulls/90') return JSON.stringify(merged);
+      if (args[0] === 'api' && args[1]?.includes('state=closed')) throw new Error('must not list closed PRs');
+      if (args[0] === 'api' && args[1]?.includes('/files?')) return '[]';
+      if (args[0] === 'api' && args[1]?.includes('state=open')) return JSON.stringify([
+        { number: 1, draft: true, title: 'same goal', head: { ref: 'self-impl/old' }, labels: [{ name: 'elanous:stalled' }],
+          created_at: '2026-09-01T00:00:00Z', merged_at: null },
+        { number: 2, draft: true, title: 'same goal', head: { ref: 'self-impl/release' }, labels: [{ name: 'elanous:stalled' }, { name: RELEASE_PATH_LABEL }],
+          created_at: '2026-09-01T00:00:00Z', merged_at: null },
+        { number: 3, draft: true, title: 'another goal', head: { ref: 'self-impl/other' }, labels: [{ name: 'elanous:stalled' }],
+          created_at: '2026-09-01T00:00:00Z', merged_at: null },
+        { number: 4, draft: true, title: 'same goal', head: { ref: 'self-impl/live' }, labels: [{ name: 'elanous:stalled' }],
+          created_at: '2026-09-01T00:00:00Z', merged_at: null },
+      ]);
+      return '';
+    };
+    const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '', stdout: args[0] === 'config'
+      ? 'https://github.com/my/repo.git' : 'worktree /tmp/live\nbranch refs/heads/self-impl/live\n' });
+    await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
+    expect(requests[0]).toEqual(['api', 'repos/my/repo/pulls/90']);
+    expect(requests.filter((args) => args[0] === 'api' && args[1]?.includes('/files?'))).toHaveLength(5);
+    expect(requests.filter((args) => args[0] === 'pr')).toEqual([
+      ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
+      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90. Branch preserved.'],
+    ]);
+    requests.length = 0;
+    await expect(supersedeMergedGoalDrafts(90, '/tmp/launch-tree', () => { throw new Error('GitHub unavailable'); }, git))
+      .rejects.toThrow('GitHub unavailable');
+    expect(requests).toEqual([]);
+    await expect(supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh,
+      (_cwd, args) => ({ status: 1, stdout: '', stderr: `unavailable: ${args[0]}` })))
+      .rejects.toThrow('Merge repository unavailable');
+    expect(requests).toEqual([]);
+  });
+
+  test('merge-time lookup uses edited GitHub goal metadata and refuses unmerged or incomplete PRs', async () => {
+    const writes: string[][] = [];
+    const merged = { number: 90, state: 'closed', draft: false, title: 'edited goal',
+      head: { ref: 'self-impl/edited' }, labels: [], body: '칸: UX 10-04',
+      created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z' };
+    let observed: Record<string, unknown> = merged;
+    const gh = (args: string[]) => {
+      if (args[0] === 'pr') { writes.push(args); return ''; }
+      if (args[1] === 'repos/my/repo/pulls/90') return JSON.stringify(observed);
+      if (args[1]?.includes('state=open')) return JSON.stringify([
+        { number: 1, draft: true, title: 'edited goal', head: { ref: 'self-impl/old' },
+          labels: [{ name: 'elanous:stalled' }], created_at: '2026-09-01T00:00:00Z', merged_at: null,
+          body: '칸: UX 10-04' },
+      ]);
+      if (args[1]?.includes('/files?')) return '[]';
+      throw new Error(`unexpected lookup ${args.join(' ')}`);
+    };
+    const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '', stdout: args[0] === 'config'
+      ? 'https://github.com/my/repo.git' : 'worktree /tmp/main\nbranch refs/heads/main\n' });
+    await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
+    expect(writes).toEqual([
+      ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
+      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90. Branch preserved.'],
+    ]);
+    for (const invalid of [{ ...merged, merged_at: null }, { ...merged, number: 91 },
+      { ...merged, head: null }, { ...merged, created_at: 'invalid' },
+      { ...merged, merged_at: '2026-09-01T00:00:00Z' }]) {
+      observed = invalid;
+      writes.length = 0;
+      await expect(supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git))
+        .rejects.toThrow('Merged PR metadata unavailable');
+      expect(writes).toEqual([]);
+    }
   });
 
   test('GitHub adapters page the full draft and merged inventory and pass label/close arguments without deleting branches', async () => {
@@ -1281,6 +1465,22 @@ describe('harness CLI command', () => {
       expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
         { runId, reason: 'no-launch', status: 1, signal: null });
     } finally { log.mockRestore(); }
+  });
+
+  test('unknown Pod exits use recognizable output tail causes without misattributing bare exits', () => {
+    const deps = { loadLedger: () => null, hasJobApplied: () => undefined,
+      supervisorDecision: () => undefined, loadCheckpoint: () => null };
+    for (const [output, reason] of [
+      ['pod-error: Pod pool unavailable', 'pod-error'],
+      ['❌ launch gate: blocked-duplicate — active run', 'launch-gate-blocked'],
+      ['Error: ENOBUFS, buffer full', 'ENOBUFS'],
+      ['Job si-x failed (OOMKilled/137)', 'OOMKilled'],
+    ] as const) {
+      const result = classifyHarnessPodExit({ status: 1 }, output, deps);
+      expect(result.reason).toBe(reason);
+      expect(result.lines[0]).toContain(reason);
+    }
+    expect(classifyHarnessPodExit({ status: 1 }, 'unrelated output', deps).reason).toBe('unknown');
   });
 
   test('an unreadable or missing ledger never proves a Pod launch was absent', () => {

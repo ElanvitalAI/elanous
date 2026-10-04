@@ -10,6 +10,7 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
 import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
 import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, type LedgerLine, type Measurement, type Td1Disposition } from './lib.js';
+import { fixedCountAssertions, flakeVerdict, sweepSlice, type Mutation, type TestRun } from './effectiveness.js';
 
 type Context = { graphId?: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown> | null> };
 function context(): Context {
@@ -24,20 +25,29 @@ function emit(result: Record<string, unknown> & { outcome: 'ok' | 'fail' | 'erro
 }
 const git = (args: string[]) => spawnSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).stdout ?? '';
 
-function pick(ctx: Context): number {
-  const budgetSecs = typeof ctx.input.budgetSecs === 'number' && ctx.input.budgetSecs > 0 ? ctx.input.budgetSecs : 1800;
+function pick(ctx: Context, sweep = false): number {
   const files = git(['ls-files', '*.test.ts']).split('\n').filter(Boolean).sort();
   const costs = costTable(readFileSync(join(process.cwd(), 'docs/measurements/td1-whole-gate-mechanical-2026-10-01.tsv'), 'utf8'));
   const last = lastLedgerLine(effectiveInstanceRoot());
   for (const r of last?.results ?? []) costs.set(r.file, r.secs);
+  const totalCostSecs = sweep ? files.reduce((sum, file) => sum + (costs.get(file) ?? 10), 0) : 0;
   // `start` re-looks a slice on purpose; otherwise continue from the ledger cursor.
   const startAt = typeof ctx.input.start === 'number' && ctx.input.start >= 0 ? ctx.input.start : last?.next ?? 0;
+  const continuing = ctx.input.start === undefined && last?.sweepVisited && last.sweepVisited < files.length && last.next === startAt && last.total === files.length;
+  const remaining = continuing ? files.length - last.sweepVisited! : files.length;
+  const elapsed = continuing ? last.sweepSlices ?? 0 : 0;
+  const slotsLeft = Math.max(1, 28 - elapsed);
+  const sweepPlan = sweep && files.length > 0 ? sweepSlice({ totalCostSecs, files, costs, start: startAt, remaining,
+    slotsLeft, minBudgetSecs: continuing ? last.budgetSecs : 0 }) : undefined;
+  const budgetSecs = sweepPlan?.budgetSecs
+    ?? (typeof ctx.input.budgetSecs === 'number' && ctx.input.budgetSecs > 0 ? ctx.input.budgetSecs : 1800);
   const range = pickRange(files, startAt, costs, budgetSecs);
-  return emit({ outcome: 'ok', summary: `test-diet pick #${range.start}~#${range.end} of ${files.length} (≈${Math.round(range.estimatedSecs)}s)`, ...range, total: files.length, budgetSecs });
+  return emit({ outcome: 'ok', summary: `test-diet pick #${range.start}~#${range.end} of ${files.length} (≈${Math.round(range.estimatedSecs)}s)`, ...range, total: files.length, budgetSecs,
+    ...(sweep ? { sweep: true, totalCostSecs, slicesNeeded: sweepPlan?.slicesNeeded, sweepElapsed: elapsed } : {}) });
 }
 
 /** One remote run: shallow clone of the mirror, one install, each file alone with its peak memory. */
-function measure(ctx: Context, audit = false): number {
+function measure(ctx: Context, audit = false, effectiveness = false): number {
   const picked = audit ? [...GATE_NIGHTLY_AUDITS] : ctx.outputs.pick?.files;
   if (!Array.isArray(picked) || picked.length === 0) return emit({ outcome: 'fail', summary: 'nothing picked' });
   const host = typeof ctx.input.remote === 'string' ? ctx.input.remote : 'node-b';
@@ -62,6 +72,25 @@ function measure(ctx: Context, audit = false): number {
     // A failing file names its first error, so an environment gap (e.g. no Java on the host) is not read as a test defect.
     '  why=""; [ "$rc" -ne 0 ] && why=$(grep -v -E "^\\s*$|^bun test|^ *[0-9]+ \\||^error: *$" "$T/err" | grep -m1 -E "Unable to|Cannot find|not found|ENOENT|EACCES|rror" | tr "\\t" " " | cut -c1-160)',
     '  printf "M\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$f" "$e" "${rss:-}" "$rc" "${pass:-}" "${fail:-}" "$why"',
+    ...(effectiveness && !audit ? [
+      '  runs="$rc,${pass:-},${fail:-}"',
+      '  for n in 2 3; do',
+      '    if [ -n "$TO" ]; then "$TO" -k 10 300 bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; else bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; fi',
+      '    rc2=$?',
+      '    pass2=$(cat "$T/out" "$T/err" | grep -E -o "^ *[0-9]+ pass" | grep -E -o "[0-9]+" | tail -1); fail2=$(cat "$T/out" "$T/err" | grep -E -o "^ *[0-9]+ fail" | grep -E -o "[0-9]+" | tail -1)',
+      '    runs="$runs;$rc2,${pass2:-},${fail2:-}"',
+      '  done',
+      '  stable=1; oldIFS=$IFS; IFS=";"',
+      '  for entry in $runs; do',
+      '    status=${entry%%,*}; counts=${entry#*,}; passing=${counts%%,*}; failing=${counts#*,}',
+      '    [ "$status" = 0 ] && [ "${passing:-0}" -gt 0 ] && [ "${failing:-0}" -eq 0 ] || stable=0',
+      '  done',
+      '  IFS=$oldIFS',
+      '  mutation="n/a"',
+      '  if [ "$stable" -eq 1 ]; then mutation=$(bun scripts/test-diet/effectiveness.ts "$f" stable 2> "$T/mutation-err") || { cat "$T/mutation-err" >&2; exit 5; }; fi',
+      '  e=$(( $(date +%s) - s ))',
+      '  printf "E\\t%s\\t%s\\t%s\\t%s\\n" "$f" "$runs" "$mutation" "$e"',
+    ] : []),
     "done <<'TEST_DIET_FILES'", ...picked, 'TEST_DIET_FILES',
   ].join('\n');
   const run = spawnSync('ssh', ['-o', 'BatchMode=yes', host, 'bash', '-s'], { input: `${script}\n`, encoding: 'utf8', timeout: 4 * 3600_000, maxBuffer: 16 * 1024 * 1024 });
@@ -73,9 +102,35 @@ function measure(ctx: Context, audit = false): number {
     const num = (v: string | undefined) => (v === undefined || v === '' ? null : Number(v));
     return { file: file!, secs: Number(secs), rssMb: num(rss), rc: num(rc), pass: num(pass), fail: num(fail), ...(why ? { reason: why } : {}) };
   });
+  if (effectiveness && !audit) {
+    const effects = new Map(String(run.stdout).split('\n').filter((l) => l.startsWith('E\t')).map((l) => {
+      const [, file, raw, mutation, secs] = l.split('\t');
+      const runs: TestRun[] = (raw ?? '').split(';').map((entry) => {
+        const [rc, pass, fail] = entry.split(',');
+        const num = (value: string | undefined) => value === undefined || value === '' ? null : Number(value);
+        return { rc: num(rc), pass: num(pass), fail: num(fail) };
+      });
+      return [file!, { flake: flakeVerdict(runs), mutation: (['caught', 'survived', 'n/a'].includes(mutation ?? '') ? mutation : 'n/a') as Mutation, secs: Number(secs) }] as const;
+    }));
+    for (const measurement of measurements) {
+      const effect = effects.get(measurement.file);
+      if (!effect) continue;
+      measurement.effectiveness = { flake: effect.flake, mutation: effect.flake === 'stable' ? effect.mutation : 'n/a' };
+      try {
+        measurement.effectiveness.fixedCounts = fixedCountAssertions(measurement.file, process.cwd()).length;
+      } catch (error) {
+        debug.log('test-diet.effectiveness', 'fixed-count-unreadable', {
+          file: measurement.file, reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+      debug.log('test-diet.effectiveness', 'judged', { file: measurement.file, ...measurement.effectiveness, secs: effect.secs });
+    }
+  }
   const complete = measurements.length === picked.length && picked.every((file) => measurements.some((m) => m.file === file));
-  const summary = remoteError ?? `measured ${measurements.length}/${picked.length} on ${host} at ${commit.slice(0, 9)}`;
-  return emit({ outcome: audit ? complete && !remoteError ? 'ok' : 'error' : measurements.length ? 'ok' : 'error',
+  const summary = remoteError ?? (effectiveness && measurements.some((m) => !m.effectiveness)
+    ? `effectiveness missing for ${measurements.filter((m) => !m.effectiveness).length} file(s)`
+    : `measured ${measurements.length}/${picked.length} on ${host} at ${commit.slice(0, 9)}`);
+  return emit({ outcome: audit ? complete && !remoteError ? 'ok' : 'error' : effectiveness && (remoteError || measurements.some((m) => !m.effectiveness)) ? 'error' : measurements.length ? 'ok' : 'error',
     summary, host, commit, measurements, ...(remoteError ? { remoteError } : {}) });
 }
 
@@ -123,9 +178,15 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
   if (!p || measurements.length === 0) return emit({ outcome: 'fail', summary: 'nothing measured' });
   const td1 = deps.td1 ?? td1Dispositions(readFileSync(join(process.cwd(), 'docs/measurements/td1-top200-content-review-2026-10-01.tsv'), 'utf8'));
   const results = measurements.map((x) => propose(judge(x, git(['log', '--since=90.days', '--format=%s', '--', x.file]).split('\n').filter((s) => /^fix\b/i.test(s)).length), td1));
+  const previous = p.sweep === true ? lastLedgerLine(effectiveInstanceRoot()) : null;
+  const continuing = previous?.sweepVisited && previous.sweepVisited < Number(p.total)
+    && previous.next === Number(p.start) && previous.total === Number(p.total);
+  const visited = p.sweep === true ? Math.min(Number(p.total), (continuing ? previous.sweepVisited! : 0) + results.length) : undefined;
+  const sweepCostSecs = p.sweep === true ? (continuing ? previous.sweepCostSecs ?? 0 : 0) + Number(p.estimatedSecs) : undefined;
+  const sweepSlices = p.sweep === true ? Number(p.sweepElapsed ?? (continuing ? previous.sweepSlices ?? 0 : 0)) + 1 : undefined;
   const line = {
     at: new Date().toISOString(), range: `#${p.start}~#${p.end}`, start: Number(p.start), end: Number(p.end), next: Number(p.next), total: Number(p.total),
-    commit: String(m?.commit ?? '?'), budgetSecs: Number(p.budgetSecs), results,
+    commit: String(m?.commit ?? '?'), budgetSecs: Number(p.budgetSecs), results, ...(visited === undefined ? {} : { sweepVisited: visited, sweepCostSecs, sweepSlices }),
   };
   const root = effectiveInstanceRoot();
   appendLedger(root, line);
@@ -139,7 +200,7 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
       store = deps.createStore?.(root) ?? new CardStore(root);
       const task = store.createCard({ goalId: `test-diet:${result.file}:${result.proposal}`, title: `시험 다이어트 제안 — ${result.file} · ${result.proposal}` });
       const observation = { proposal: result.proposal, basis: result.basis, guards: td1.get(result.file)?.guards ?? '',
-        secs: result.secs, rssMb: result.rssMb, caught90: result.caught90, range: line.range };
+        secs: result.secs, rssMb: result.rssMb, caught90: result.caught90, range: line.range, ...(result.effectiveness ? { effectiveness: result.effectiveness } : {}) };
       const fingerprint = createHash('sha256').update(JSON.stringify(observation)).digest('hex');
       const key = `test-diet:${line.commit}:${fingerprint}`;
       if (!task.sections.some((section) => section.key === key)) store.appendSection(task.id, {
@@ -154,6 +215,12 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
         debug.log('test-diet', 'card-failed', { file: result.file });
       }
     }
+  }
+  if (p.sweep === true) {
+    const etaDays = visited === Number(p.total) ? 0 : p.slicesNeeded !== undefined
+      ? Math.ceil((Number(p.slicesNeeded) - 1) / 4)
+      : Math.ceil(Math.max(0, Number(p.totalCostSecs) - (sweepCostSecs ?? 0)) / Number(p.budgetSecs) / 4);
+    debug.log('test-diet.sweep', 'slice', { start: line.start, end: line.end, total: line.total, etaDays });
   }
   debug.log('test-diet', 'proposed', { range: line.range, proposals });
   const counts = { keep: results.filter((r) => r.verdict === 'keep').length, review: results.filter((r) => r.verdict === 'review').length, failing: results.filter((r) => r.verdict === 'failing').length };
@@ -210,7 +277,8 @@ if (import.meta.main) {
       process.exitCode = status(effectiveInstanceRoot(), { json: args.includes('--json'), days });
     } else {
       const ctx = context();
-      process.exitCode = step === 'pick' ? pick(ctx) : step === 'measure' ? measure(ctx) : step === 'audit' ? measure(ctx, true)
+      const flags = process.argv.slice(3);
+      process.exitCode = step === 'pick' ? pick(ctx, flags.includes('--sweep')) : step === 'measure' ? measure(ctx, false, flags.includes('--effectiveness')) : step === 'audit' ? measure(ctx, true)
         : step === 'record' ? (ctx.graphId === 'nightly-audit' || Object.hasOwn(ctx.outputs, 'audit') ? recordNightlyAudit(ctx) : record(ctx)) : emit({ outcome: 'error', summary: `unknown step: ${step}` });
     }
   } catch (error) {

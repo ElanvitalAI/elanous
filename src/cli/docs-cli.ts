@@ -6,6 +6,7 @@
 // 양쪽에서 잡는다. 임베딩 다운 시 키워드 단독으로 강등(fail-soft).
 
 import type { Command } from 'commander';
+import { registerRfcStatusCommand } from './rfc-status.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { knowledgeDbPath, openKnowledgeDb, hybridQueryKnowledge } from '../domains/knowledge.js';
@@ -280,6 +281,7 @@ export async function runDocsStale(
 export function registerDocsCommands(program: Command): void {
   const docsCmd = program.command('docs')
     .description('문서 지식 검색/관리 — knowledge.db 벡터+BM25 하이브리드 (DocOps)');
+  registerRfcStatusCommand(docsCmd);
   docsCmd.command('search <query>')
     .description('하이브리드 검색(RRF) — 의미(임베딩)+키워드(FTS5) 융합. 임베딩 다운 시 키워드 단독')
     .option('--limit <n>', '최대 결과 (기본 8·최대 20)')

@@ -53,7 +53,7 @@ export function startApprovalGate(input: ApprovalGateInput, deps: ApprovalGateDe
     void Promise.resolve().then(() => (deps.runHostRegate ?? runHostRegate)({
       prNumber: input.prNumber, headCommit: input.headSha, repoRoot: input.repoRoot, verifyOnly: true,
     })).then(async (result) => {
-      let status = result.status ?? (result.passed ? 'passed' : 'failed');
+      let status: ApprovalGateStatus = result.status === 'frozen' ? 'unmeasured' : result.status ?? (result.passed ? 'passed' : 'failed');
       let failures = result.failures.map(({ step, detail }) => `${step} — ${detail.replace(/\s+/g, ' ')}`.slice(0, 800));
       if (status === 'passed') {
         const current = await (deps.readPr ?? readPr)(input);

@@ -593,6 +593,8 @@ import { resolveDashboardChatMainSubmitIntent } from './input/chat-main-submit-r
 import { maybeEmitDashboardSubmitQuickPass } from './input/chat-main-submit-control.js';
 import { attachDashboardQuickPassConsumers } from './input/control-signal-consumers.js';
 import { resolveDashboardChatMainSlashCommand } from './input/chat-main-slash-command.js';
+import { TuiChatPersonaSelection, tuiChatPersonaMessages } from './slash-runtime/chat-persona.js';
+import { awaitGlobalPersonaLoad } from '../persona/global-registry.js';
 import { resolveDashboardChatMainCacheCommand } from './input/chat-main-cache-command.js';
 import {
   dashboardDeltaHelpLines,
@@ -956,6 +958,8 @@ import {
   resetDashboardAcpTurnRef,
 } from './turn-lifecycle-runtime.js';
 import { runDashboardTurnPrelude } from './turn-prelude-runtime.js';
+import { askSeat, deliverSeatAnswers, getTuiSeatAskClientId, parseSeatAsk } from '../seat-dispatch/seat-ask.js';
+import { ceoTaskDeps } from '../seat-dispatch/ceo-intent.js';
 import {
   commitDashboardAssistantRenderState,
   runDashboardTurnTailAutoCopy,
@@ -2136,6 +2140,7 @@ export function renderDashboardFirstScreenBand(input: {
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
+  await awaitGlobalPersonaLoad().catch(() => {});
   const dashboardQuitConfirmationState = createQuitConfirmationState();
   const signalQuitConfirmationState = createQuitConfirmationState();
   let disposeDashboardEventLoopMonitor = (): void => {};
@@ -2639,6 +2644,19 @@ When a user's request matches an installed skill (they will see a "hint: /run-sk
 Mode- and sync-specific instructions are injected per-turn when relevant — do not assume sync/diff context unless the current turn's Context: block explicitly mentions them.`,
   );
   let chatLines: string[] = []; // chat log — increasingly reserved for transcript / LLM speech
+  const tuiSeatAskClientId = getTuiSeatAskClientId();
+  const tuiSeatAskDeps = {
+    channel: 'tui' as const, clientId: tuiSeatAskClientId,
+    send: async (_origin: import('../seat-dispatch/seat-ask.js').AskOrigin, answer: string) => {
+      chatLines.push(C.info(answer));
+      chatScrollOffset = -1;
+      draw();
+    },
+  };
+  const pollTuiSeatAnswers = (): void => {
+    void deliverSeatAnswers(tuiSeatAskDeps).catch((error) => debug.log('seat.ask', 'delivery-failed', { via: 'tui', error: String(error) }, { level: 'warn' }));
+  };
+  let tuiSeatAskTimer: ReturnType<typeof setInterval> | undefined;
   let debugLines: string[] = [
     C.muted('Dashboard ready. Press / for slash, Ctrl+L for plain input.'),
     C.muted('Debug window ready. Use /debug window open.'),
@@ -3121,6 +3139,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // the laptop left off. `/telegram attach` creates this, `/telegram
   // detach` clears it. Lives for the dashboard lifetime.
   let attachedSessionId: string | null = null;
+  const chatPersonaSelection = new TuiChatPersonaSelection();
+  let chatPersonaConversationId = crypto.randomUUID();
+  const currentChatPersonaSessionId = () => attachedSessionId ?? chatPersonaConversationId;
   let attachedChatId: number | null = null;
   const forkableSessionHistory = (source: ChatMessage[] = chat.history): ForkableSessionTurn[] =>
     flattenForkableSessionHistory(source);
@@ -3134,7 +3155,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       messages: forkableSessionHistory(),
     });
     const prev = attachedSessionId;
+    const selectedPersona = chatPersonaSelection.get(currentChatPersonaSessionId());
     attachedSessionId = forked.meta.id;
+    if (selectedPersona) chatPersonaSelection.set(forked.meta.id, selectedPersona);
     try { _setActive(forked.meta.id); } catch { /* best-effort */ }
     chatLines.push('');
     chatLines.push(prev
@@ -3174,7 +3197,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       messages: forkableSessionHistory(truncatedChat),
     });
     const prev = attachedSessionId;
+    const selectedPersona = chatPersonaSelection.get(currentChatPersonaSessionId());
     attachedSessionId = forked.meta.id;
+    if (selectedPersona) chatPersonaSelection.set(forked.meta.id, selectedPersona);
     try { setActiveForTimetravel(forked.meta.id); } catch { /* best-effort */ }
     // in-memory 히스토리도 동일 경계로 절단 — 스토어와 문맥 일치 보장.
     chat.history.length = 0;
@@ -15522,20 +15547,23 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 rich: false,
               })
             : [];
-          return buildDashboardTurnPreamble({
-            userText,
-            sessionId,
-            cwd: getSessionCwd(),
-            turnProfile: acpTurnRef.turnProfile,
-            userConfig: getUserConfig(),
-            // Resolved per-turn so a mid-session model switch (codex →
-            // claude or vice-versa) takes effect immediately. Drives the
-            // codex-only behavioral addendum (fix L-1) inside the
-            // universal preamble.
-            modelFamily: getModelFamily(inspectActiveProvider().model),
-            rich: false,
-            enabledTools: tools.map(t => t.name),
-          });
+          return [
+            ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
+            ...buildDashboardTurnPreamble({
+              userText,
+              sessionId,
+              cwd: getSessionCwd(),
+              turnProfile: acpTurnRef.turnProfile,
+              userConfig: getUserConfig(),
+              // Resolved per-turn so a mid-session model switch (codex →
+              // claude or vice-versa) takes effect immediately. Drives the
+              // codex-only behavioral addendum (fix L-1) inside the
+              // universal preamble.
+              modelFamily: getModelFamily(inspectActiveProvider().model),
+              rich: false,
+              enabledTools: tools.map(t => t.name),
+            }),
+          ];
         },
         getTools: ({ userText }) => {
           const runtime = acpToolRuntime;
@@ -15819,6 +15847,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       observe: (data) => { try { debug.log('dashboard.first-screen-band', 'resolved', data); } catch { /* observation is best-effort */ } },
     });
 
+    tuiSeatAskTimer = setInterval(pollTuiSeatAnswers, 10_000);
+    tuiSeatAskTimer.unref();
+    pollTuiSeatAnswers();
     while (true) {
       draw();
       let wdInputExited = false;   // set true when the input-mode loop exits this iter
@@ -17571,6 +17602,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const cmdText = submitIntent.kind === 'control-turn'
             ? (submitIntent.commandText ?? '')
             : submitIntent.text;
+          if (submitIntent.kind === 'submit-turn' && parseSeatAsk(submitIntent.text)) {
+            try {
+              const receipt = await askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId },
+                ceoTaskDeps(getUserConfig(), null), tuiSeatAskDeps);
+              chatLines.push(C.info(receipt));
+            } catch (error) {
+              chatLines.push(C.error(`CTO 질문 전송 실패: ${String(error)}`));
+            }
+            chatScrollOffset = -1;
+            draw();
+            continue;
+          }
           if (submitIntent.kind === 'submit-turn' && submitIntent.route === 'sticky-acp') {
             await runDashboardChatMainSubmitIntent({
               submit: createDashboardChatMainTurnSubmit(submitIntent),
@@ -18198,6 +18241,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               getAttachedSessionId: () => attachedSessionId,
               setAttachedSessionId: (id) => { attachedSessionId = id; },
+              chatPersona: {
+                sessionId: currentChatPersonaSessionId,
+                selection: chatPersonaSelection,
+                newConversation: () => { chatPersonaConversationId = crypto.randomUUID(); },
+              },
               getAttachedChatId: () => attachedChatId,
               setAttachedChatId: (id) => { attachedChatId = id; },
               sessionSlash: {
@@ -19010,14 +19058,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     rich: false,
                   })
                 : [];
-              return buildDashboardTurnPreamble({
-                userText: args.userText,
-                cwd: args.cwd,
-                turnProfile: args.turnProfile as SessionTurnProfile,
-                userConfig: args.userConfig,
-                rich: false,
-                enabledTools: tools.map(t => t.name),
-              });
+              return [
+                ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
+                ...buildDashboardTurnPreamble({
+                  userText: args.userText,
+                  cwd: args.cwd,
+                  turnProfile: args.turnProfile as SessionTurnProfile,
+                  userConfig: args.userConfig,
+                  rich: false,
+                  enabledTools: tools.map(t => t.name),
+                }),
+              ];
             },
             runAutoCompact: async ({ preamble, chatHistory, userMsg }) => {
               const compactMod = await import('../compact/index.js');
@@ -19427,5 +19478,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   } catch (err) {
     closeDashboardTui();
     throw err;
+  } finally {
+    if (tuiSeatAskTimer) clearInterval(tuiSeatAskTimer);
   }
 }

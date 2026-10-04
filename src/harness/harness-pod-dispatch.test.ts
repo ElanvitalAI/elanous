@@ -7,6 +7,14 @@ import { debug } from '../debug/log.js';
 import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
 
 describe('harness say/ask --substrate pod', () => {
+  test('the explicit seat is present in the spawned orchestrator environment', () => {
+    let stamped: string | undefined;
+    dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', seat: 'TC' }, {
+      run: (_command, _args, env) => { stamped = env.ELANOUS_HARNESS_SEAT; return 0; },
+    });
+    expect(stamped).toBe('TC');
+  });
+
   test('routes to the one pod path (orchestrate --substrate pod), keeping the harness completion default', () => {
     const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x', podPool: 'pool-node-b@node-b:4' }, 'x');
     expect(args.slice(1, 5)).toEqual(['self', 'orchestrate', '--goal-file', 'x']);

@@ -28,6 +28,7 @@ describe('PWA route maturity', () => {
     const built = builtPages(app);
     expect(new Set(built).size).toBe(built.length);
     expect(routeMaturity('/exec')).toBe('beta');
+    expect(routeMaturity('/loops')).toBe('beta');
     expect(routeMaturity('/field')).toBe('beta');
     expect(Object.keys(ROUTE_MATURITY).sort()).toEqual([...built].sort());
     expect(ROUTE_MATURITY).toEqual(Object.fromEntries(

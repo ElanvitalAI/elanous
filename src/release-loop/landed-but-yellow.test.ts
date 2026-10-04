@@ -18,7 +18,7 @@ const pr = (number: number, title: string, body = '', mergedAt = '2026-10-03T01:
 const sample = [item('W3', 'yellow', { evidence: '#12' }), item('R1', 'red', { owner: 'TC', updatedAt: '2026-10-04T00:00:00Z' }), item('G1', 'green')];
 const merges = [pr(11, 'W3d only'), pr(12, 'W3 fixed'), pr(13, 'misc', '칸: R1'), pr(14, 'G1 fixed')];
 
-async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: { status?: number | null; stderr?: string; items?: ChecklistItem[]; evidenceAdd?: LandedButYellowDeps['evidenceAdd'] } = {}) {
+async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: { status?: number | null; stderr?: string; items?: ChecklistItem[]; evidenceAdd?: LandedButYellowDeps['evidenceAdd']; pages?: (args: readonly string[]) => MergedChecklistPr[] } = {}) {
   const stdout: string[] = [], stderr: string[] = [], calls: Array<{ command: string; args: readonly string[] }> = [];
   const evidenceCalls: Array<{ id: string; version: string; ref: string; by: string; released: string | undefined; dev: string | undefined }> = [];
   const events: Array<{ category: string; event: string; data: unknown }> = [];
@@ -41,7 +41,7 @@ async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: {
   process.exitCode = 0;
   const run: Runner = (command, argv) => {
     calls.push({ command, args: argv });
-    return { status: options.status ?? 0, stdout: JSON.stringify(prs), stderr: options.stderr ?? '' };
+    return { status: options.status ?? 0, stdout: JSON.stringify(options.pages?.(argv) ?? prs), stderr: options.stderr ?? '' };
   };
   let reads = 0;
   try {
@@ -196,9 +196,9 @@ describe('release checklist landed-but-yellow CLI', () => {
     expect(items.map(({ status, evidence }) => ({ status, evidence }))).toEqual(initial);
   });
 
-  test('human lines, counts, seven-day search and read-only injected ledger', async () => {
+  test('human lines, counts, earliest relevant updatedAt search and read-only injected ledger', async () => {
     const result = await cli([]);
-    expect(result.calls).toEqual([{ command: 'gh', args: ['pr', 'list', '--state', 'merged', '--search', 'merged:>=2026-09-27', '--limit', '400', '--json', 'number,title,body,mergedAt'] }]);
+    expect(result.calls).toEqual([{ command: 'gh', args: ['pr', 'list', '--state', 'merged', '--search', 'merged:>=2026-10-03', '--limit', '400', '--json', 'number,title,body,mergedAt'] }]);
     expect(result.reads).toBe(1);
     expect(result.stdout).toEqual([
       'W3 UX 🟡 ← #12 «W3 fixed» (10-03 10:00 · 근거에 있음 · 칸보다 새것)',
@@ -228,19 +228,65 @@ describe('release checklist landed-but-yellow CLI', () => {
     ]);
   });
 
-  test('--owner filters, --json returns only an array, and 400 limit warns', async () => {
+  test('--owner filters and --json returns only an array', async () => {
     const filtered = await cli(['--owner', 'UX', '--json']);
     expect(JSON.parse(filtered.stdout.join(''))).toEqual(landedButYellow(sample, merges, { owner: 'UX' }));
     expect(filtered.stdout).toHaveLength(1);
     expect(filtered.stderr).toEqual([]);
-    const capped = await cli([], Array.from({ length: 400 }, (_, i) => pr(i + 1, 'W3')));
-    expect(capped.stderr).toEqual(['⚠ 병합 PR 400개 상한: 목록이 잘렸을 수 있다']);
   });
 
-  test('gh failure is exit 1 with reason, never reads or writes ledger', async () => {
+  test('offset updatedAt uses its UTC day, retaining a PR merged on the preceding local date', async () => {
+    const merged = pr(99, 'W3 fixed', '', '2026-10-02T12:00:00Z');
+    const result = await cli(['--json'], [merged], {
+      items: [item('W3', 'yellow', { updatedAt: '2026-10-03T00:30:00+14:00' }), item('OTHER', 'red', { updatedAt: '2026-10-03T01:00:00Z' })],
+      pages: (args) => [merged].filter((row) => row.mergedAt >= args[args.indexOf('--search') + 1]!.match(/merged:>=(\S+)/)![1]!),
+    });
+    expect(result.calls[0]!.args).toContain('merged:>=2026-10-02');
+    expect(JSON.parse(result.stdout.join(''))[0].prs[0].number).toBe(99);
+    expect(result.stderr).toEqual([]);
+  });
+
+  test('400 cap subdivides dated windows, merges pages and removes duplicate PR numbers without changing JSON rows', async () => {
+    const all = [pr(900, 'W3 fixed', '', '2026-10-03T02:00:00Z'),
+      ...Array.from({ length: 399 }, (_, i) => pr(i + 1, 'other', '', '2026-10-03T03:00:00Z')),
+      pr(901, 'W3 fixed', '', '2026-10-04T02:00:00Z')];
+    const result = await cli(['--json'], all, { items: [item('W3', 'yellow', { updatedAt: '2026-10-03T00:00:00Z' })],
+      pages: (args) => {
+        const search = args[args.indexOf('--search') + 1]!;
+        const limit = Number(args[args.indexOf('--limit') + 1]);
+        const from = search.match(/merged:>=(\S+)/)![1]!;
+        const until = search.match(/merged:<(\S+)/)?.[1];
+        const matches = all.filter((row) => row.mergedAt >= from && (!until || row.mergedAt < until));
+        return (until && matches.length < 400 && matches.length ? [matches[0]!, ...matches] : matches).slice(0, limit);
+      } });
+    expect(result.calls.length).toBeGreaterThan(2);
+    expect(result.calls[0]!.args).toContain('merged:>=2026-10-03');
+    expect(result.calls.slice(1).every(({ args }) => args[args.indexOf('--search') + 1]!.includes('merged:<'))).toBe(true);
+    const rows = JSON.parse(result.stdout.join(''));
+    expect(rows).toEqual(landedButYellow([item('W3', 'yellow', { updatedAt: '2026-10-03T00:00:00Z' })], all));
+    expect(rows[0].prs.map((entry: { number: number }) => entry.number)).toEqual([901, 900]);
+    expect(result.stderr).toEqual([]);
+  });
+
+  test('exactly 400 within one second is not a truncation, but 401 warns', async () => {
+    const all = Array.from({ length: 401 }, (_, i) => pr(i + 1, 'W3', '', '2026-10-03T02:00:00Z'));
+    const pages = (rows: MergedChecklistPr[]) => (args: readonly string[]) => {
+      const search = args[args.indexOf('--search') + 1]!;
+      const from = search.match(/merged:>=(\S+)/)![1]!;
+      const until = search.match(/merged:<(\S+)/)?.[1];
+      return rows.filter((row) => row.mergedAt >= from && (!until || row.mergedAt < until)).slice(0, Number(args[args.indexOf('--limit') + 1]));
+    };
+    const exact = await cli([], all.slice(0, 400), { pages: pages(all.slice(0, 400)) });
+    expect(exact.stderr).toEqual([]);
+    const overflow = await cli([], all, { pages: pages(all) });
+    expect(overflow.stderr).toEqual(['⚠ 병합 PR 400개 상한: 목록이 잘렸을 수 있다']);
+    expect(overflow.calls.some(({ args }) => args.includes('401'))).toBe(true);
+  });
+
+  test('gh failure is exit 1 with reason, never writes ledger', async () => {
     const result = await cli([], merges, { status: 1, stderr: 'authentication required' });
     expect(result.exitCode).toBe(1);
-    expect(result.reads).toBe(0);
+    expect(result.reads).toBe(1);
     expect(result.stderr).toEqual(['⛔ 병합 PR 조회(gh) 실패 rc=1: authentication required']);
   });
 });

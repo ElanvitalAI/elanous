@@ -35,10 +35,12 @@ export function listSchedules(root?: string): ReleaseSchedule[] {
   return schedules;
 }
 
-export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string }, by: string, root?: string): ReleaseSchedule {
+export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string }, by: string, root?: string): ReleaseSchedule {
   const schedule = writeSchedule(version, {
     ...(patch.cutAt !== undefined ? { cutAt: utcIso(patch.cutAt) } : {}),
     ...(patch.landBy !== undefined ? { landBy: utcIso(patch.landBy) } : {}),
+    ...(patch.freezeFrom !== undefined ? { freezeFrom: utcIso(patch.freezeFrom) } : {}),
+    ...(patch.freezeUntil !== undefined ? { freezeUntil: utcIso(patch.freezeUntil) } : {}),
   }, by, root);
   debug.log('release.schedule', 'set', { version, cutAt: schedule.cutAt, landBy: schedule.landBy });
   return schedule;

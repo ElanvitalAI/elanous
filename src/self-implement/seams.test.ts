@@ -2436,7 +2436,7 @@ describe('defaultSeams — platform gates', () => {
 describe('defaultSeams — docs-only gate scope', () => {
   let repo: string;
   let captured: { steps?: GateStepName[]; testArgs?: string[] } | undefined;
-  let result: { passed?: boolean; testStepExecuted?: boolean; scopeReason?: string; unverified?: readonly string[]; documentPaths?: readonly string[]; documentsWithoutDerivedTests?: readonly string[]; missingTestFiles?: number; comparisonBaseStatus?: string } | undefined;
+  let result: { passed?: boolean; log?: string; testStepExecuted?: boolean; scopeReason?: string; unverified?: readonly string[]; documentPaths?: readonly string[]; documentsWithoutDerivedTests?: readonly string[]; missingTestFiles?: number; comparisonBaseStatus?: string } | undefined;
 
   beforeEach(() => {
     repo = mkdtempSync(join(tmpdir(), 'seam-gate-scope-'));
@@ -2449,7 +2449,7 @@ describe('defaultSeams — docs-only gate scope', () => {
   });
   afterEach(() => { rmSync(repo, { recursive: true, force: true }); });
 
-  async function gate(changed: Record<string, string>, gateSteps?: GateStepName[], runId?: string) {
+  async function gate(changed: Record<string, string>, gateSteps?: GateStepName[], runId?: string, round?: number) {
     for (const [file, content] of Object.entries(changed)) {
       const path = join(repo, file);
       mkdirSync(join(path, '..'), { recursive: true });
@@ -2468,7 +2468,7 @@ describe('defaultSeams — docs-only gate scope', () => {
         } satisfies GateResult;
       },
     });
-    result = await seams.gate(repo, runId ? { runId } : undefined);
+    result = await seams.gate(repo, runId || round !== undefined ? { ...(runId ? { runId } : {}), ...(round !== undefined ? { round } : {}) } : undefined);
     return captured!;
   }
 
@@ -2596,6 +2596,61 @@ describe('defaultSeams — docs-only gate scope', () => {
     });
   });
 
+  test('앞 라운드에 커밋된 소스의 기존 짝 시험을 마지막 라운드의 무짝 소스 게이트에서 실행한다', async () => {
+    mkdirSync(join(repo, 'test'), { recursive: true });
+    writeFileSync(join(repo, 'test/earlier.test.ts'), "import { test } from 'bun:test';\ntest('earlier', () => {});\n");
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'base test');
+    git(repo, 'checkout', '-b', 'feature/earlier');
+    mkdirSync(join(repo, 'src/cli'), { recursive: true });
+    writeFileSync(join(repo, 'src/earlier.ts'), 'export const earlier = true;\n');
+    git(repo, 'add', 'src/earlier.ts');
+    git(repo, 'commit', '-m', 'earlier source');
+
+    const opts = await gate({ 'src/cli/private-ledger-commands.ts': 'export const ledger = true;\n' });
+    expect(opts.testArgs).toContain('test/earlier.test.ts');
+    expect(result).toMatchObject({ scopeReason: 'derived', testStepExecuted: true,
+      unverified: ['src/cli/private-ledger-commands.ts'] });
+  });
+
+  test('앞 라운드에서 삭제한 서버 경로의 비교-base 소비자 시험을 마지막 라운드 무짝 소스 게이트에서 실행한다', async () => {
+    const server = 'src/nexus/api/old-route.ts';
+    const consumer = 'apps/pwa/chrome/old-route.test.ts';
+    mkdirSync(join(repo, 'src/nexus/api'), { recursive: true });
+    mkdirSync(join(repo, 'apps/pwa/chrome'), { recursive: true });
+    writeFileSync(join(repo, server), "server.get('/v1/old-route', handler);\n");
+    writeFileSync(join(repo, consumer), "fetch('/v1/old-route');\n");
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'base route and consumer');
+    git(repo, 'checkout', '-b', 'feature/remove-route');
+    git(repo, 'rm', server);
+    git(repo, 'commit', '-m', 'remove route');
+
+    const opts = await gate({ 'src/cli/private-ledger-commands.ts': 'export const ledger = true;\n' });
+    expect(opts.testArgs).toEqual([consumer]);
+    expect(result).toMatchObject({ scopeReason: 'derived', testStepExecuted: true,
+      unverified: ['src/cli/private-ledger-commands.ts'] });
+  });
+
+  test('런 전체에도 짝이 없으면 동작 검증 0 경고와 라운드를 관측한다', async () => {
+    git(repo, 'checkout', '-b', 'feature/unpaired');
+    mkdirSync(join(repo, 'src/cli'), { recursive: true });
+    writeFileSync(join(repo, 'src/earlier.ts'), 'export const earlier = true;\n');
+    git(repo, 'add', 'src/earlier.ts');
+    git(repo, 'commit', '-m', 'earlier source');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const opts = await gate({ 'src/cli/private-ledger-commands.ts': 'export const ledger = true;\n' }, undefined, undefined, 3);
+      expect(opts.steps).not.toContain('test');
+      expect(result).toMatchObject({ scopeReason: 'no-related-tests', testStepExecuted: false });
+      expect(result?.log).toContain('⚠️ 동작 검증 0: src/cli/private-ledger-commands.ts, src/earlier.ts — 사람 확인 필요');
+      expect(log).toHaveBeenCalledWith('self-implement.gate-scope', 'no-related-tests',
+        { files: ['src/cli/private-ledger-commands.ts', 'src/earlier.ts'], round: 3 }, { level: 'warn' });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   test('실제 gate는 비교 기준 뒤 커밋된 변경을 tracked-changes로 반환한다', async () => {
     git(repo, 'checkout', '-b', 'feature/tracked-change');
     writeFileSync(join(repo, 'src.ts'), 'export const x = 1;\n');
@@ -2603,6 +2658,31 @@ describe('defaultSeams — docs-only gate scope', () => {
     git(repo, 'commit', '-m', 'tracked change');
     await gate({});
     expect(result).toMatchObject({ comparisonBaseStatus: 'tracked-changes' });
+  });
+
+  test('커밋된 시험 + 미커밋 release notes를 실제 게이트가 함께 재고 test 스텝을 실행한다', async () => {
+    const testFile = 'scripts/release-loop/publish-node.test.ts';
+    git(repo, 'checkout', '-b', 'feature/publish');
+    mkdirSync(join(repo, 'scripts/release-loop'), { recursive: true });
+    writeFileSync(join(repo, testFile), "import { test, expect } from 'bun:test';\ntest('publish', () => expect(2 + 2).toBe(4));\n");
+    git(repo, 'add', testFile);
+    git(repo, 'commit', '-m', 'test publish');
+    mkdirSync(join(repo, 'release'), { recursive: true });
+    writeFileSync(join(repo, 'release/next.md'), 'fix — publish\n');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const gateResult = await defaultSeams({
+        gateSteps: ['test'],
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+        runVerifyByBreaking: () => ({ files: [], baseStatuses: { pass: 0, 'test-fail': 0, unknown: 0 } }),
+      }).gate(repo);
+      expect(log).toHaveBeenCalledWith('self-implement', 'gate.scope', expect.objectContaining({
+        'evaluated-changes': ['release/next.md', testFile],
+        evaluatedChangeCount: 2, scopeReason: 'changed-tests', testStepSkipped: false,
+      }), expect.anything());
+      expect(gateResult).toMatchObject({ passed: true, scopeReason: 'changed-tests', testStepExecuted: true, measuredFileCount: 2 });
+      expect(gateResult.log).toContain('[test] PASS');
+    } finally { log.mockRestore(); }
   });
 
   test('테스트 변경은 기존처럼 testArgs를 전달하고 test를 유지한다', async () => {
@@ -3006,7 +3086,7 @@ describe('defaultSeams — changed test declaration observation', () => {
     await expect(gate()).resolves.toMatchObject({ passed: true, testDeclarationDecline: 0 });
   });
 
-  test('self-commit 뒤 clean worktree에서도 기본 브랜치 fork 대비 선언 감소를 남기되 testArgs는 넓히지 않는다', async () => {
+  test('self-commit 뒤 clean worktree에서도 선언 감소를 남기고 커밋된 시험을 실행한다', async () => {
     git(repo, 'checkout', '-b', 'self-commit');
     writeFileSync(join(repo, 'src', 'changed.test.js'), "test('one', () => {});\n");
     git(repo, 'add', '-A');
@@ -3014,7 +3094,7 @@ describe('defaultSeams — changed test declaration observation', () => {
     expect(git(repo, 'status', '--porcelain').stdout).toBe('');
     let captured: { steps?: GateStepName[]; testArgs?: string[] } | undefined;
     await expect(gate((opts) => { captured = opts; })).resolves.toMatchObject({ passed: true, testDeclarationDecline: 3 });
-    expect(captured?.testArgs).toBeUndefined();
+    expect(captured?.testArgs).toEqual(['src/changed.test.js']);
   });
 
   test('base에 없는 변경 테스트 파일은 0을 꾸며내지 않고 null을 남긴다', async () => {

@@ -1,0 +1,17 @@
+graph_id: youtube-summary
+version: 1
+loop:
+  title: Built-in YouTube summary
+  description: Turn video captions (or STT) into a local summary or study note; no publishing or external skill.
+  exec_request: true
+  inputs: [url, format]
+  trigger:
+    events: [manual]
+entry_node: summary
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: summary, kind: agent, recipe: 'cmd:summary', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: summary, on: outcome, map: { ok: done, no-transcript: done, invalid-video-id: failed, fail: failed } }

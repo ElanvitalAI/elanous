@@ -53,6 +53,8 @@ import {
 } from './pr-granularity.js';
 import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
+import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
+import { admitLandingMerge } from '../self-implement/frozen-merges.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -1574,7 +1576,32 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 0;
   }
 
-  let merged = manager.mergePrOutcome(upsert.url);
+  const prNumber = Number(/\/(\d+)$/.exec(upsert.url)?.[1]);
+  const landedHead = run('git', ['rev-parse', 'HEAD'], { cwd });
+  const headCommit = landedHead.ok && /^[a-f0-9]{40}$/i.test(landedHead.out.trim()) ? landedHead.out.trim() : undefined;
+  const validPr = Number.isSafeInteger(prNumber) && prNumber > 0;
+  const heldEntry = validPr && headCommit ? { prNumber, headCommit, repoRoot: cwd } : null;
+  const admission = admitLandingMerge(heldEntry, undefined, {}, validPr ? { prNumber, repoRoot: cwd, ...(headCommit ? { headCommit } : {}) } : undefined);
+  if (admission.kind === 'held' && !heldEntry) {
+    out.error(`✗ freeze: ready PR의 검증 HEAD/번호를 보존하지 못했습니다: ${upsert.url}`);
+    return 1;
+  }
+  if (admission.kind === 'held') {
+    const frozen = admission.freeze;
+    debug.log('harness.merge', 'frozen', { prUrl: upsert.url, reason: frozen.reason, until: frozen.until });
+    record('freeze', true, { url: upsert.url, reason: frozen.reason, until: frozen.until });
+    out.log(`✓ ready: ${upsert.url} — ${landingFreezeMessage(frozen)} · 병합 연기`);
+    return 0;
+  }
+  if (admission.kind === 'taken') {
+    record('freeze', true, { url: upsert.url, resumedElsewhere: true });
+    out.log(`✓ ready: ${upsert.url} — 동결이 막 풀려 보류 병합 재개가 이 PR 을 맡았습니다`);
+    return 0;
+  }
+  const landing = admission;
+  let merged: ReturnType<typeof manager.mergePrOutcome>;
+  try {
+  merged = manager.mergePrOutcome(upsert.url);
   // `GIT-S14` — 병합이 «미완료(OPEN)»로 끝났고 GitHub 가 아직 `mergeable=UNKNOWN`(병합 가능 여부 계산 중)이면
   //   짧게 기다렸다 다시 병합한다. 표본 셋(08-25 · 09-24 🅢 #20233 등)이 모두 «같은 명령 재시도에 병합»이었다.
   //   ⛔ UNKNOWN 일 때만 재시도한다 — CONFLICTING 등 다른 값은 기다려도 안 풀린다(그대로 실패를 낸다).
@@ -1588,6 +1615,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     await sleep(PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS);
     merged = manager.mergePrOutcome(upsert.url);
   }
+  } finally { landing.end(merged!?.ok === true); }
   if (!merged.ok) {
     // `GIT-S76` — 「미완료(OPEN)」만으로는 «충돌»과 «아직 계산 중»이 안 갈린다. GitHub 의 병합 가능 상태를 같이 싣는다.
     //   되읽기에 실패하면 종전 문면 그대로다(못 읽은 것을 「충돌 아님」으로 적지 않는다).

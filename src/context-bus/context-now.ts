@@ -5,6 +5,7 @@ import { listChecklist, devVersion, type Checklist } from '../release-loop/check
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
+import { filterPublicDemoContext } from './context-now-public.js';
 
 export type ContextFact =
   | { kind: 'version'; version: string; source: string }
@@ -12,7 +13,7 @@ export type ContextFact =
   | { kind: 'decision'; id: string; title: string; status: string; dueAt: string | null; source: string }
   | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string };
 export type ContextEvent = { at: string; kind: string; summary: string; source: string };
-export type ContextNowAnswer = { at: string; topic: string | null; facts: ContextFact[]; events: ContextEvent[]; guide: string[] };
+export type ContextNowAnswer = { at: string; topic: string | null; facts: ContextFact[]; events: ContextEvent[]; guide: string[]; hiddenCount?: number };
 
 export interface ContextNowDeps {
   now?: () => Date;
@@ -37,7 +38,7 @@ function todaySeatEntries(now: Date): Array<{ entry: SeatEntry; source: string }
 }
 
 /** Read a bounded, source-labelled view of current ledgers, never a transcript or decision body. */
-export function contextNow(options: { topic?: string; limit?: number } = {}, deps: ContextNowDeps = {}): ContextNowAnswer {
+export function contextNow(options: { topic?: string; limit?: number; audience?: 'operator' | 'user' | 'public-demo' } = {}, deps: ContextNowDeps = {}): ContextNowAnswer {
   const now = (deps.now ?? (() => new Date()))();
   const at = `${now.toISOString().slice(0, 16)}:00.000Z`;
   const topic = options.topic?.trim() || null;
@@ -100,5 +101,5 @@ export function contextNow(options: { topic?: string; limit?: number } = {}, dep
     .map(event => `📌 ${event.summary} — ${event.source}`);
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };
   debug.log('context.now', 'answer', { topic, facts: answer.facts, events: answer.events });
-  return answer;
+  return options.audience === 'public-demo' ? filterPublicDemoContext(answer) : answer;
 }

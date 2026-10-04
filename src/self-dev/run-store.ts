@@ -16,8 +16,9 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21 §5 (S3).
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dlopen, FFIType } from 'bun:ffi';
 import { randomUUID } from 'node:crypto';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { loadRunLedger, queryInterruptedRunLedgers, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { join, resolve, sep } from 'node:path';
@@ -68,6 +69,8 @@ export interface SelfDevRunState {
   createdAt: number;
   updatedAt: number;
   results: SelfDevJobResult[];
+  /** Redacted, bounded one-line projection for loop readers; legacy checkpoints omit it. */
+  summaryLine?: string;
   /** Undefined means a legacy checkpoint has no dependency information; each key is a shard ID and its array lists predecessor shard IDs. */
   dependencies?: Record<string, string[]>;
   /**
@@ -93,6 +96,10 @@ export interface SelfDevRunState {
    *  non-terminal goal 은 **실행중(running)** 이지 막힌(interrupted) 게 아니다. 죽었으면(오케스트레이터
    *  killed) 진짜 interrupted. isPidAlive 로 구분해 라이브 잡을 parked/repair-signals 에서 제외. */
   pid?: number;
+  /** OS process birth identity, paired with pid to reject a recycled pid. */
+  pidStart?: string;
+  /** Seat fixed at launch; survives removal of the launch worktree. */
+  seat?: 'OP' | 'TC' | 'MK' | 'UX';
 }
 
 /** `<ELANOUS_STATE_DIR or ~/.elanous>/self-dev-runs`. */
@@ -102,6 +109,34 @@ export function selfDevRunsDir(stateDir?: string): string {
 }
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/** Kernel process birth identity: Linux boot ID + start ticks or Darwin microseconds since epoch. */
+export function processBirthId(pid: number, platform: NodeJS.Platform = process.platform): string | undefined {
+  if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
+  try {
+    if (platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const tail = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+      const ticks = tail[19]; // field 22 (starttime), after pid and parenthesized comm
+      const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      return ticks && /^\d+$/.test(ticks) && /^[0-9a-f-]{36}$/i.test(bootId)
+        ? `linux:${bootId}:${ticks}` : undefined;
+    }
+    if (platform === 'darwin') {
+      const libproc = dlopen('/usr/lib/libproc.dylib', {
+        proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+      });
+      try {
+        const buf = new Uint8Array(136);
+        if (libproc.symbols.proc_pidinfo(pid, 3, 0n, buf, buf.length) !== buf.length) return undefined;
+        const view = new DataView(buf.buffer);
+        if (view.getUint32(12, true) !== pid) return undefined;
+        return `darwin:${view.getBigUint64(120, true) * 1_000_000n + view.getBigUint64(128, true)}`;
+      } finally { libproc.close(); }
+    }
+  } catch { /* Unreadable birth identity is not evidence of a match. */ }
+  return undefined;
+}
 
 function runPath(runId: string, dir: string): string {
   if (!RUN_ID.test(runId)) throw new Error(`invalid self-dev run ID: ${runId}`);
@@ -154,6 +189,40 @@ function mergeParticipants(
   return [...byId.values()];
 }
 
+const SUMMARY_LINE_LIMIT = 120;
+const FINISHED_RESULT_STATUSES = new Set(['done', 'failed', 'cancelled', 'superseded']);
+
+function boundedSummaryLine(text: string): string {
+  const redacted = redactSecretText(text.replace(/\s+/g, ' ').trim());
+  if (redacted.length <= SUMMARY_LINE_LIMIT) return redacted;
+  const head = redacted.slice(0, SUMMARY_LINE_LIMIT - 1).replace(/[\uD800-\uDBFF]$/, '');
+  return `${head}…`;
+}
+
+/** Read-only projection for loop readers; missing legacy fields are derived in memory. */
+export function runSummaryLine(state: SelfDevRunState): string {
+  if (state.summaryLine !== undefined) return boundedSummaryLine(state.summaryLine);
+  const feature = state.goals?.[0]?.feature ?? state.results[0]?.feature ?? '';
+  const head = feature.split(/\r?\n/, 1)[0]?.trim() ?? '';
+  const header = /^「하니스로 구현」\s+(\S+?)\s+—\s*(.*)$/.exec(head);
+  const id = state.goals?.[0]?.goalId ?? header?.[1] ?? state.goals?.[0]?.id ?? state.runId;
+  const phrase = (header?.[2] ?? head).split(/[.!?。；;]/, 1)[0]?.trim() ?? '';
+  const finished = state.results.length > 0
+    && state.results.every((result) => FINISHED_RESULT_STATUSES.has(result.status));
+  if (finished) {
+    // A completed shard cannot hide a failed one merely by settling later.
+    const result = state.results.find(({ status }) => status === 'failed')
+      ?? state.results.find(({ status }) => status === 'cancelled')
+      ?? state.results.find(({ status }) => status === 'superseded')
+      ?? state.results.at(-1)!;
+    const stage = result.stage ?? result.status;
+    const prNumber = result.prNumber ?? Number(/\/pull\/(\d+)(?:[/?#]|$)/.exec(result.prUrl ?? '')?.[1]);
+    const pr = Number.isSafeInteger(prNumber) && prNumber > 0 ? ` · PR #${prNumber}` : '';
+    return boundedSummaryLine(`${id} · ${stage}${pr}`);
+  }
+  return boundedSummaryLine(`「하니스로 구현」 ${id}${phrase ? ` — ${phrase}` : ''}`);
+}
+
 /** Persist a run checkpoint (fail-soft — never throws into the caller). */
 export function saveSelfDevRun(state: SelfDevRunState, dir = selfDevRunsDir()): void {
   try {
@@ -163,7 +232,10 @@ export function saveSelfDevRun(state: SelfDevRunState, dir = selfDevRunsDir()): 
       const participants = mergeParticipants(current?.participants, state.participants);
       const saved = {
         ...state,
+        summaryLine: runSummaryLine({ ...state, goals: state.goals ?? current?.goals, summaryLine: undefined }),
         ...(participants === undefined ? {} : { participants }),
+        ...(current?.seat && !state.seat ? { seat: current.seat } : {}),
+        ...(current?.pidStart && current.pid === state.pid && !state.pidStart ? { pidStart: current.pidStart } : {}),
         ...(current?.parkedResolution && !state.parkedResolution ? { parkedResolution: current.parkedResolution } : {}),
       };
       writeSelfDevRun(saved, dir);

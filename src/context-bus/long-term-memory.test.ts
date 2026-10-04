@@ -42,19 +42,87 @@ test('five sources keep two memories and count each unusable source; an all-unus
     const result = await condenseContextWindowWithReport(since, until, [], deps, now);
     expect(result.cards.map(card => card.topic)).toEqual(['first', 'second']);
     expect(result.skipped).toEqual({ 'no-seat': 1, 'bad-link': 1, 'summarize-failed': 1 });
+    expect(result.funnel.read.total - result.funnel.sources.total).toBe(result.funnel.sources.noSeat.total);
+    expect(result.funnel.sources.noSeat).toEqual({ total: 1, bySeat: { '(unknown)': 1 } });
+    expect(result.funnel.sources.total - result.funnel.summarized.total).toBe(1);
+    expect(result.funnel.summarized.summarizeFailed).toEqual({ total: 1, bySeat: { TC: 1 } });
     expect(logs.filter(entry => entry.event === 'source-skipped')).toHaveLength(3);
     expect(logs.filter(entry => entry.event === 'source-skipped').map(entry => entry.data)).toEqual([
       { reason: 'no-seat', kind: 'event', at: event(2).at },
       { reason: 'bad-link', kind: 'event', at: event(3).at },
       { reason: 'summarize-failed', kind: 'event', at: event(4).at },
     ]);
-    expect(logs.at(-1)).toEqual({ event: 'window', data: { sources: 5, kept: 2, skipped: result.skipped } });
+    expect(logs.at(-1)).toEqual({ event: 'funnel', data: result.funnel });
+    expect(logs.at(-2)).toEqual({ event: 'window', data: { sources: 5, kept: 2, skipped: result.skipped } });
     expect(JSON.stringify(logs)).not.toContain('raw source text');
     logs.length = 0;
     const empty = await condenseContextWindowWithReport(since, until, [], { ...deps, events: () => [events[2]!] }, now);
-    expect(empty).toEqual({ cards: [], skipped: { 'no-seat': 1 }, folded: 0 });
-    expect(logs.at(-1)).toEqual({ event: 'window', data: { sources: 1, kept: 0, skipped: { 'no-seat': 1 } } });
+    expect(empty).toEqual({ cards: [], skipped: { 'no-seat': 1 }, folded: 0, droppedHarnessChild: 0,
+      funnel: { read: { total: 1, bySeat: { '(unknown)': 1 }, bySurface: { '(unknown)': 1 } },
+        sources: { total: 0, bySeat: {}, folded: { total: 0, bySeat: {} },
+          droppedHarnessChild: { total: 0, bySeat: {} }, noSeat: { total: 1, bySeat: { '(unknown)': 1 } } },
+        summarized: { total: 0, bySeat: {}, accepted: { total: 0, bySeat: {} },
+          summarizeFailed: { total: 0, bySeat: {} }, skipped: { 'no-seat': { total: 1, bySeat: { '(unknown)': 1 } } } },
+        collapsed: { total: 0, bySeat: {} }, cards: { total: 0, bySeat: {}, carried: { total: 0, bySeat: {} }, supersededByPrevious: { total: 0, bySeat: {} } } } });
+    expect(logs.at(-2)).toEqual({ event: 'window', data: { sources: 1, kept: 0, skipped: { 'no-seat': 1 } } });
   } finally { log.mockRestore(); }
+});
+
+test('per-seat funnel reconciles read, child drop, no-claim, key collapses and cards', async () => {
+  const events = [
+    ...[0, 1, 2].map(n => ({ ...event(n, 'OP'), summary: `alpha/release/${n}`,
+      surface: 'coord:channel' })),
+    { ...event(3, 'TC'), summary: 'alpha/mention/on', surface: 'coord:channel' },
+    ...[4, 5].map(n => ({ ...event(n, 'MK'), summary: `alpha/mk-${n}/on`,
+      surface: 'coord:channel' })),
+    { ...event(6, 'harness-child', 'finished'), surface: 'context:external' },
+  ];
+  const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
+    '2026-10-03T00:00:00.000Z', [], { events: () => events, decisions: () => [],
+      summarize: async source => {
+        const [project, topic, value] = source.text.split('/');
+        return { project: project!, topic: topic!, summary: source.text,
+          ...(source.seat === 'TC' ? {} : { claim: { key: topic!, value: value! } }) };
+      } }, now);
+  const { read, sources, summarized, collapsed, cards } = report.funnel;
+  expect(read).toEqual({ total: 7, bySeat: { OP: 3, TC: 1, MK: 2, 'harness-child': 1 },
+    bySurface: { 'coord:channel': 6, 'context:external': 1 } });
+  expect(sources).toEqual({ total: 6, bySeat: { OP: 3, TC: 1, MK: 2 },
+    folded: { total: 0, bySeat: {} }, droppedHarnessChild: { total: 1, bySeat: { 'harness-child': 1 } },
+    noSeat: { total: 0, bySeat: {} } });
+  expect(summarized).toEqual({ total: 6, bySeat: { OP: 3, TC: 1, MK: 2 },
+    accepted: { total: 5, bySeat: { OP: 3, MK: 2 } },
+    summarizeFailed: { total: 0, bySeat: {} }, skipped: { 'no-claim': { total: 1, bySeat: { TC: 1 } } } });
+  expect(collapsed).toEqual({ total: 2, bySeat: { OP: 2 } });
+  expect(cards).toEqual({ total: 3, bySeat: { OP: 1, MK: 2 }, carried: { total: 0, bySeat: {} },
+    supersededByPrevious: { total: 0, bySeat: {} } });
+  expect(report.skipped).toEqual({ 'no-claim': 1 });
+  expect(report.droppedHarnessChild).toBe(1);
+  expect(read.total - sources.total).toBe(sources.folded.total + sources.droppedHarnessChild.total + sources.noSeat.total);
+  expect(sources.total - summarized.total).toBe(summarized.summarizeFailed.total);
+  expect(summarized.total - summarized.accepted.total).toBe(summarized.skipped['no-claim']!.total);
+  expect(summarized.accepted.total - cards.total).toBe(collapsed.total);
+});
+
+test('previous snapshot cards remain visible without being counted as new candidates', async () => {
+  const previous = [
+    { project: 'alpha', seat: 'TC', topic: 'release', summary: 'newer', source: 'https://example.test/newer',
+      updatedAt: `${day}T01:00:00.000Z`, status: 'active' as const },
+    { project: 'alpha', seat: 'UX', topic: 'carry', summary: 'kept', source: 'https://example.test/carry',
+      updatedAt: `${day}T01:00:00.000Z`, status: 'active' as const },
+  ];
+  const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
+    '2026-10-03T00:00:00.000Z', previous, { events: () => [{ ...event(0), summary: 'alpha/release/old' }],
+      decisions: () => [], summarize }, now);
+  expect(report.cards).toHaveLength(2);
+  expect(report.cards.find(card => card.seat === 'TC')?.summary).toBe('newer');
+  const { read, sources, summarized, collapsed, cards } = report.funnel;
+  expect(cards).toEqual({ total: 2, bySeat: { TC: 1, UX: 1 },
+    carried: { total: 1, bySeat: { UX: 1 } }, supersededByPrevious: { total: 1, bySeat: { TC: 1 } } });
+  expect(read.total - sources.total).toBe(sources.folded.total + sources.droppedHarnessChild.total + sources.noSeat.total);
+  expect(sources.total - summarized.total).toBe(summarized.summarizeFailed.total);
+  expect(summarized.accepted.total - collapsed.total + cards.carried.total).toBe(cards.total);
+  expect(cards.supersededByPrevious.total).toBe(1);
 });
 
 test('six lifecycle, report and decision events fold to five summarizer calls before skips', async () => {
@@ -62,8 +130,8 @@ test('six lifecycle, report and decision events fold to five summarizer calls be
   const runB = 'elanous://harness/run-B/pty-B';
   const at = (n: number) => `${day}T00:${String(n).padStart(2, '0')}:00.000Z`;
   const lifecycle = (n: number, run: string, kind: string, summary: string): CoordEvent => ({
-    ...event(n, 'harness-child', kind), at: at(n), summary,
-    refs: { ...event(n).refs, seat: 'harness-child', source: run, url: null },
+    ...event(n, 'TC', kind), at: at(n), summary,
+    refs: { ...event(n).refs, seat: 'TC', source: run, url: null },
   });
   const events = [lifecycle(1, runA, 'started', 'Harness child started'),
     lifecycle(4, runA, 'finished', 'Harness child finished: success'),
@@ -84,7 +152,7 @@ test('six lifecycle, report and decision events fold to five summarizer calls be
         events: () => events, decisions: () => [decision], summarize: async source => {
           calls.push(source);
           return { project: source.text === 'unassigned' ? '' : 'alpha', topic: source.source,
-            summary: source.text };
+            summary: source.text, claim: { key: source.source, value: source.text } };
         },
       }, now);
     expect(calls).toHaveLength(5);
@@ -93,16 +161,22 @@ test('six lifecycle, report and decision events fold to five summarizer calls be
     expect(calls.find(source => source.source === runA)?.text).toBe(`${runA} success · 3m 0s`);
     expect(calls.find(source => source.source === runB)?.text).toBe(`${runB} 진행 중 · 알 수 없음`);
     expect(report.cards.find(card => card.source === runA)).toMatchObject({
-      seat: 'harness-child', updatedAt: at(4), summary: `${runA} success · 3m 0s`,
+      seat: 'TC', updatedAt: at(4), summary: `${runA} success · 3m 0s`,
     });
     expect(report.cards.filter(card => card.source === runA)).toHaveLength(1);
     expect(report.folded).toBe(1);
+    expect(report.funnel).toMatchObject({ read: { total: 6, bySeat: { TC: 4, MK: 1, OP: 1 } },
+      sources: { total: 5, folded: { total: 1, bySeat: { TC: 1 } } },
+      summarized: { total: 5, accepted: { total: 4 },
+        skipped: { 'no-project': { total: 1, bySeat: { TC: 1 } } } },
+      collapsed: { total: 0 }, cards: { total: 4 } });
     expect(report.skipped).toEqual({ 'no-project': 1 });
     expect(logs.find(entry => entry.event === 'folded')).toEqual({ event: 'folded',
-      data: { harnessEvents: 3, kept: 2 } });
+      data: { harnessEvents: 3, kept: 2, droppedHarnessChild: 0 } });
     const cliReport = await runContextCondense({ hours: 24, now, apply: false }, {
       events: () => events, decisions: () => [decision], summarize: async source => ({
         project: source.text === 'unassigned' ? '' : 'alpha', topic: source.source, summary: source.text,
+        claim: { key: source.source, value: source.text },
       }),
     });
     expect(cliReport).toMatchObject({ skipped: { 'no-project': 1 }, folded: 1 });
@@ -123,7 +197,7 @@ test('lifecycle kind folds across source and URL while unrelated events and wind
     '2026-10-03T00:00:00.000Z', [], {
       events: () => [finished, outside, unrelated, started], decisions: () => [],
       summarize: async source => { calls.push(source); return { project: 'alpha', topic: source.text,
-        summary: source.text }; },
+        summary: source.text, claim: { key: source.text, value: source.text } }; },
     }, now);
   expect(calls).toHaveLength(2);
   expect(calls.map(source => source.text)).toEqual(['report', `${run} done · 3m 0s`]);
@@ -137,9 +211,9 @@ test('lifecycle kind folds across source and URL while unrelated events and wind
 
 test('a finish without seat inherits the matching start seat and produces a memory', async () => {
   const run = 'elanous://harness/missing-finish-seat';
-  const started = { ...event(1, 'harness-child', 'started'),
-    refs: { ...event(1).refs, seat: 'harness-child', source: run, url: null } };
-  const finished = { ...event(4, 'harness-child', 'finished'), summary: 'Harness child finished: success',
+  const started = { ...event(1, 'TC', 'started'),
+    refs: { ...event(1).refs, seat: 'TC', source: run, url: null } };
+  const finished = { ...event(4, 'TC', 'finished'), summary: 'Harness child finished: success',
     refs: { ...event(4).refs, seat: undefined, source: run, url: null } } as unknown as CoordEvent;
   const calls: MemorySource[] = [];
   const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
@@ -147,12 +221,13 @@ test('a finish without seat inherits the matching start seat and produces a memo
       events: () => [finished, started], decisions: () => [],
       summarize: async source => {
         calls.push(source);
-        return { project: 'alpha', topic: 'run outcome', summary: source.text };
+        return { project: 'alpha', topic: 'run outcome', summary: source.text,
+          claim: { key: 'run outcome', value: source.text } };
       },
     }, now);
-  expect(calls).toEqual([{ kind: 'event', at: finished.at, seat: 'harness-child', source: run,
+  expect(calls).toEqual([{ kind: 'event', at: finished.at, seat: 'TC', source: run,
     text: `${run} success · 3m 0s` }]);
-  expect(report.cards).toMatchObject([{ seat: 'harness-child', source: run, updatedAt: finished.at,
+  expect(report.cards).toMatchObject([{ seat: 'TC', source: run, updatedAt: finished.at,
     summary: `${run} success · 3m 0s` }]);
   expect(report).toMatchObject({ folded: 1, skipped: {} });
 });
@@ -160,32 +235,33 @@ test('a finish without seat inherits the matching start seat and produces a memo
 test('a start just before the window supplies elapsed time without becoming a source or a fold', async () => {
   const run = 'elanous://harness/cross-window';
   const since = `${day}T00:02:00.000Z`;
-  const before = { ...event(1, 'harness-child', 'started'), summary: 'Harness child started',
-    at: `${day}T00:01:00.000Z`, refs: { ...event(1).refs, seat: 'harness-child', source: run, url: null } };
-  const finish = { ...event(4, 'harness-child', 'finished'), summary: 'Harness child finished: success',
-    at: `${day}T00:04:00.000Z`, refs: { ...event(4).refs, seat: 'harness-child', source: run, url: null } };
+  const before = { ...event(1, 'TC', 'started'), summary: 'Harness child started',
+    at: `${day}T00:01:00.000Z`, refs: { ...event(1).refs, seat: 'TC', source: run, url: null } };
+  const finish = { ...event(4, 'TC', 'finished'), summary: 'Harness child finished: success',
+    at: `${day}T00:04:00.000Z`, refs: { ...event(4).refs, seat: 'TC', source: run, url: null } };
   const otherStart = { ...event(0, 'harness-child', 'started'), at: `${day}T00:00:00.000Z`,
     refs: { ...event(0).refs, seat: 'harness-child', source: 'elanous://harness/other', url: null } };
   const calls: MemorySource[] = [];
   let requestedSince = '';
   const report = await condenseContextWindowWithReport(since, '2026-10-03T00:00:00.000Z', [], {
     events: from => { requestedSince = from; return [finish, otherStart, before]; }, decisions: () => [],
-    summarize: async source => { calls.push(source); return { project: 'alpha', topic: 'outcome', summary: source.text }; },
+    summarize: async source => { calls.push(source); return { project: 'alpha', topic: 'outcome', summary: source.text,
+      claim: { key: 'outcome', value: source.text } }; },
   }, now);
   expect(requestedSince).toBe('2026-10-01T00:02:00.000Z');
-  expect(calls).toEqual([{ kind: 'event', at: finish.at, seat: 'harness-child', source: run,
+  expect(calls).toEqual([{ kind: 'event', at: finish.at, seat: 'TC', source: run,
     text: `${run} success · 3m 0s` }]);
   expect(report.cards).toMatchObject([{ source: run, updatedAt: finish.at, summary: `${run} success · 3m 0s` }]);
   expect(report.folded).toBe(0);
   expect(report.skipped).toEqual({});
 });
 
-test('a shared URL folds different source links while harness-child reports retain their original text', async () => {
+test('a shared URL folds different outer-run source links while harness-child reports retain their original text', async () => {
   const url = 'https://example.test/run-shared';
-  const started = { ...event(1, 'harness-child', 'started'), summary: 'Harness child started',
-    refs: { ...event(1).refs, seat: 'harness-child', source: 'elanous://harness/start', url } };
-  const finished = { ...event(4, 'harness-child', 'finished'), summary: 'Harness child finished: success',
-    refs: { ...event(4).refs, seat: 'harness-child', source: 'elanous://harness/finish', url } };
+  const started = { ...event(1, 'TC', 'started'), summary: 'Harness child started',
+    refs: { ...event(1).refs, seat: 'TC', source: 'elanous://harness/start', url } };
+  const finished = { ...event(4, 'TC', 'finished'), summary: 'Harness child finished: success',
+    refs: { ...event(4).refs, seat: 'TC', source: 'elanous://harness/finish', url } };
   const reportEvent = { ...event(2, 'harness-child'), summary: 'MK/report/on',
     refs: { ...event(2).refs, seat: 'harness-child', url } };
   const calls: MemorySource[] = [];
@@ -193,14 +269,14 @@ test('a shared URL folds different source links while harness-child reports reta
     '2026-10-03T00:00:00.000Z', [], {
       events: () => [finished, reportEvent, started], decisions: () => [],
       summarize: async source => { calls.push(source); return { project: 'alpha', topic: source.text,
-        summary: source.text }; },
+        summary: source.text, claim: { key: source.text, value: source.text } }; },
     }, now);
   expect(calls).toHaveLength(2);
   expect(calls.find(source => source.text === 'MK/report/on')).toEqual({
     kind: 'event', at: reportEvent.at, seat: 'harness-child', text: 'MK/report/on', source: url,
   });
   expect(calls.find(source => source.text !== 'MK/report/on')).toEqual({
-    kind: 'event', at: finished.at, seat: 'harness-child',
+    kind: 'event', at: finished.at, seat: 'TC',
     text: `${url} success · 3m 0s`, source: url,
   });
   expect(report.folded).toBe(1);
@@ -210,7 +286,7 @@ test('a shared URL folds different source links while harness-child reports reta
   });
 });
 
-test('harness-child report with no lifecycle is summarized without a fabricated progress state', async () => {
+test('harness-child report with no lifecycle is summarized without a fabricated progress state but claimless result is skipped', async () => {
   const source = event(1, 'harness-child');
   const calls: MemorySource[] = [];
   const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
@@ -222,7 +298,7 @@ test('harness-child report with no lifecycle is summarized without a fabricated 
     }, now);
   expect(calls).toEqual([{ kind: 'event', at: source.at, seat: 'harness-child',
     text: source.summary, source: source.refs.url! }]);
-  expect(report).toMatchObject({ folded: 0, skipped: {}, cards: [{ summary: source.summary }] });
+  expect(report).toMatchObject({ folded: 0, skipped: { 'no-claim': 1 }, cards: [] });
 });
 
 test('dry-run report exposes skip counts in JSON and Markdown without writing', async () => {
@@ -251,11 +327,54 @@ test('each malformed summary field and claim is counted without blocking later s
       if (n === 2) return { project: 'alpha', topic: 'x', summary: '' };
       if (n === 3) return { project: 'alpha', topic: 'x', summary: 'x', claim: { key: '', value: 'on' } };
       if (n === 4) return { project: 'alpha', topic: 'x', summary: 'x', claim: { key: 'x', value: '' } };
-      return { project: 'alpha', topic: 'valid', summary: 'kept' };
+      return { project: 'alpha', topic: 'valid', summary: 'kept', claim: { key: 'valid', value: 'kept' } };
     },
   }, now);
   expect(result.cards).toMatchObject([{ topic: 'valid', summary: 'kept' }]);
   expect(result.skipped).toEqual({ 'no-project': 1, 'no-topic': 1, 'no-summary': 1, 'bad-claim': 2 });
+});
+
+test('claimless channel mentions are skipped while concrete channel values and a claimless decision become cards', async () => {
+  const summaries = [
+    'MK가 OP · TC · 보고 · K10을 언급함',
+    'LOOP-CHECK1 #23657을 언급했다',
+    'K10e 착지: #23507',
+    '결정론 env 확인 건수: 6건',
+  ];
+  const events = summaries.map((summary, n) => ({ ...event(n, 'MK'), summary }));
+  const decision = { id: 'D-no-claim', title: '착지 경로', status: 'decided',
+    decidedAt: `${day}T00:04:00.000Z`, raisedBy: { agent: 'OP', track: 'OP' },
+    choice: 'a', options: [{ key: 'a', label: '유지', consequence: '유지' }],
+    scqa: { s: '착지', c: '경로 선택' } } as DecisionEntry;
+  const logs: Array<{ event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, name, data) => {
+    if (category === 'context.condense') logs.push({ event: name, data });
+  });
+  try {
+    const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
+      '2026-10-03T00:00:00.000Z', [], {
+        events: () => events, decisions: () => [decision],
+        summarize: async source => ({ project: 'alpha', topic: source.text, summary: source.text,
+          ...(source.text === summaries[2] ? { claim: { key: 'K10e 착지', value: '#23507' } } : {}),
+          ...(source.text === summaries[3] ? { claim: { key: '결정론 env 확인 건수', value: '6건' } } : {}),
+        }),
+      }, now);
+    expect(report.cards.map(card => card.source)).toEqual([
+      'https://example.test/2', 'https://example.test/3', 'elanous://decisions/D-no-claim',
+    ]);
+    expect(report.cards.map(card => card.claim)).toEqual([
+      { key: 'K10e 착지', value: '#23507' }, { key: '결정론 env 확인 건수', value: '6건' }, undefined,
+    ]);
+    expect(report.skipped['no-claim']).toBe(2);
+    expect(logs.filter(entry => entry.event === 'skipped').map(entry => entry.data)).toEqual([
+      { reason: 'no-claim', source: 'https://example.test/0' },
+      { reason: 'no-claim', source: 'https://example.test/1' },
+    ]);
+    expect(logs.filter(entry => entry.event === 'source-skipped').map(entry => entry.data)).toEqual([
+      { reason: 'no-claim', kind: 'event', at: events[0]!.at },
+      { reason: 'no-claim', kind: 'event', at: events[1]!.at },
+    ]);
+  } finally { log.mockRestore(); }
 });
 
 test('twenty fake journal rows become project/seat items; newer corrections win, opposite claims flag OP, and >30 days retires', async () => {
@@ -290,7 +409,8 @@ test('decided ledger entries join the same day without touching the ledger, and 
     events: () => [event(0, 'MK')], decisions: () => [decision],
     summarize: async source => source.kind === 'decision'
       ? { project: 'project-alpha', topic: 'release route', summary: source.text }
-      : { project: 'project-alpha', topic: 'MK update', summary: source.text },
+      : { project: 'project-alpha', topic: 'MK update', summary: source.text,
+        claim: { key: 'MK update', value: source.text } },
   }, now);
   expect(items).toHaveLength(2);
   expect(items.find(i => i.topic === 'release route')).toMatchObject({ summary: 'use production', source: 'elanous://decisions/later' });
@@ -389,14 +509,15 @@ test('day window excludes adjacent days and summaries never include a second lin
     { ...event(3), at: '2026-10-03T00:00:00.000Z' },
   ], decisions: () => [], summarize: async source => {
     called++;
-    return { project: 'alpha', topic: 'topic', summary: `${source.text}\nprivate text` };
+    return { project: 'alpha', topic: 'topic', summary: `${source.text}\nprivate text`,
+      claim: { key: 'topic', value: 'on' } };
   } }, now);
   expect(called).toBe(1);
   expect(items).toHaveLength(1);
   expect(JSON.stringify(items)).not.toContain('private text');
 });
 
-test('harness-child lifecycle events of other kinds fold too, while a harness-child report stays its own source (review round 3)', async () => {
+test('harness-child lifecycle events of other kinds are dropped, while a harness-child report stays its own source', async () => {
   const run = 'elanous://harness/run-C/pty-C';
   const at = (n: number) => `${day}T01:${String(n).padStart(2, '0')}:00.000Z`;
   const child = (n: number, kind: string, summary: string): CoordEvent => ({
@@ -408,11 +529,66 @@ test('harness-child lifecycle events of other kinds fold too, while a harness-ch
   const calls: MemorySource[] = [];
   const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`, '2026-10-03T00:00:00.000Z', [], {
     events: () => events, decisions: () => [],
-    summarize: async source => { calls.push(source); return { project: 'alpha', topic: source.text, summary: source.text }; },
+    summarize: async source => { calls.push(source); return { project: 'alpha', topic: source.text, summary: source.text,
+      claim: { key: source.text, value: source.text } }; },
   }, now);
-  // started · unknown · finished fold into one run source; the report is summarized on its own
-  expect(calls).toHaveLength(2);
-  expect(calls.filter(source => source.source === run && source.text.startsWith(run))).toHaveLength(1);
-  expect(calls.some(source => source.text === 'child report')).toBe(true);
-  expect(report.folded).toBe(2);
+  expect(calls).toEqual([{ kind: 'event', at: events[3]!.at, seat: 'harness-child',
+    text: 'child report', source: run }]);
+  expect(report.cards).toMatchObject([{ summary: 'child report' }]);
+  expect(report.folded).toBe(0);
+  expect(report.droppedHarnessChild).toBe(3);
+});
+
+test('real harness-child endings are dropped before sources while reports and an outer run remain', async () => {
+  const outerRun = 'elanous://harness/outer-run';
+  const endings = [
+    'Harness child loop exhausted without completion (0m 0s).',
+    'Harness child reported a soft timeout at 2026-10-03T22:42:34.596Z (0m 0s).',
+    'Child run self_752ca9fd exited successfully in 0m 0s.',
+  ];
+  const childEvents = endings.map((summary, n) => ({
+    ...event(n + 1, 'harness-child', 'finished'), summary,
+    refs: { ...event(n + 1).refs, seat: 'harness-child', source: `elanous://harness/child-${n}`, url: null },
+  }));
+  const childReport = { ...event(4, 'harness-child'), summary: 'Child report: shipped change',
+    refs: { ...event(4).refs, seat: 'harness-child', source: 'elanous://harness/child-report', url: null } };
+  const started = { ...event(5, 'TC', 'started'), summary: 'Outer run started',
+    refs: { ...event(5).refs, seat: 'TC', source: outerRun, url: null } };
+  const finished = { ...event(8, 'TC', 'finished'), summary: 'Outer run finished: landed',
+    refs: { ...event(8).refs, seat: 'TC', source: outerRun, url: null } };
+  const channelReport = { ...event(7, 'MK'), summary: 'Channel report: landed',
+    refs: { ...event(7).refs, seat: 'MK', source: 'https://example.test/channel-report' } };
+  const calls: MemorySource[] = [];
+  const logs: Array<{ event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, name, data) => {
+    if (category === 'context.condense') logs.push({ event: name, data });
+  });
+  try {
+    const report = await condenseContextWindowWithReport(`${day}T00:00:00.000Z`,
+      '2026-10-03T00:00:00.000Z', [], {
+        events: () => [...childEvents, childReport, finished, channelReport, started], decisions: () => [],
+        summarize: async source => {
+          calls.push(source);
+          return { project: 'alpha', topic: source.source, summary: source.text,
+            claim: { key: source.source, value: source.text } };
+        },
+      }, now);
+    expect(calls).toEqual([
+      { kind: 'event', at: childReport.at, seat: 'harness-child', text: childReport.summary,
+        source: childReport.refs.source },
+      { kind: 'event', at: channelReport.at, seat: 'MK', text: channelReport.summary,
+        source: channelReport.refs.source },
+      { kind: 'event', at: finished.at, seat: 'TC', source: outerRun,
+        text: `${outerRun} Outer run finished: landed · 3m 0s` },
+    ]);
+    expect(report.cards.map(card => card.source).sort()).toEqual([
+      childReport.refs.source, channelReport.refs.source, outerRun,
+    ].sort());
+    expect(report.cards.map(card => card.summary)).not.toContain(endings[0]);
+    expect(report.cards.map(card => card.summary)).not.toContain(endings[1]);
+    expect(report.cards.map(card => card.summary)).not.toContain(endings[2]);
+    expect(report).toMatchObject({ droppedHarnessChild: 3, folded: 1, skipped: {} });
+    expect(logs.find(entry => entry.event === 'folded')).toEqual({ event: 'folded',
+      data: { harnessEvents: 2, kept: 1, droppedHarnessChild: 3 } });
+  } finally { log.mockRestore(); }
 });

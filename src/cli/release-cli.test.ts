@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
@@ -63,7 +64,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -121,6 +122,8 @@ describe('release checklist CLI', () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-move-reason-cli-'));
     setElanousConfigDir(dir);
     const output = spyOn(console, 'log').mockImplementation(() => {});
+    const oldTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'OP';
     const run = async (...args: string[]) => {
       const cmd = new Command();
       registerReleaseCommands(cmd);
@@ -129,6 +132,7 @@ describe('release checklist CLI', () => {
     try {
       await run('add', 'K1', 'carry', '--version', '0.2.9');
       await run('add', 'OTHER', 'unrelated', '--version', '0.2.9');
+      await expect(run('move', 'K1', '--from', '0.2.9', '--to', '0.2.10')).rejects.toThrow('이동 이유가 필요하다');
       await run('move', 'K1', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'next cut');
       await run('move', 'K1', '--from', '0.2.10', '--to', '0.2.11', '--reason', 'needs more work');
       const entries = checklistHistory('K1');
@@ -143,12 +147,17 @@ describe('release checklist CLI', () => {
       expect(entries.every((entry, index) => index === 0 || entry.at >= entries[index - 1]!.at)).toBe(true);
       expect(checklistHistory('OTHER').map(({ field }) => field)).toEqual(['add']);
       expect(listChecklist('0.2.11').history.at(-1)).toMatchObject({ field: 'move', reason: 'needs more work' });
-    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+      if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
+    }
   });
 
   test('move · retitle · evidence add · history · export CLI 가 SQLite 기록과 JSON 스냅샷을 만든다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-features-cli-'));
     setElanousConfigDir(dir);
+    const oldTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'OP';
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
     const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
@@ -157,7 +166,7 @@ describe('release checklist CLI', () => {
       await run('set', 'L13e', '--version', '0.2.9', '--status', 'green');
       await run('retitle', 'L13e', '새 제목', '--version', '0.2.9');
       await run('evidence', 'add', 'L13e', '#123', '--version', '0.2.9');
-      await run('move', 'L13e', '--from', '0.2.9', '--to', '0.2.10');
+      await run('move', 'L13e', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'next release');
       await run('history', 'L13e', '--json');
       const rows = JSON.parse(lines.at(-1)!);
       expect(rows.map((row: { field: string }) => row.field)).toEqual(['add', 'status', 'title', 'evidence.add', 'move']);
@@ -171,7 +180,10 @@ describe('release checklist CLI', () => {
       expect(listChecklist('0.2.10').items[0]).toMatchObject({ title: '새 제목', status: 'green', evidence: '#123' });
       await run('export', '--version', '0.2.10');
       expect(JSON.parse(readFileSync(join(dir, 'release/0.2.10/checklist.json'), 'utf8'))).toEqual(listChecklist('0.2.10'));
-    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+      if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
+    }
   }, 15_000);
 
   test('판 번호가 다른 판의 별칭과 충돌해도 실제 판 번호를 우선한다', async () => {
@@ -213,86 +225,45 @@ describe('release checklist CLI', () => {
   });
 });
 
-test('checklist CLI fences every ledger mutation before write; override is observed, bootstrap and reads remain available', async () => {
+test('isolated checklist ledger skips HQ adjudication and records the bypass', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'release-hq-cli-'));
   setElanousConfigDir(dir);
-  const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
-  const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
-  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100,
-    log: ((_category: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); }) as HqDeps['log'] };
-  const lines: string[] = [];
-  const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
-  const error = spyOn(console, 'error').mockImplementation((line: string) => { lines.push(line); });
-  const before = process.exitCode;
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+  const output = spyOn(console, 'log').mockImplementation(() => {});
+  const error = spyOn(console, 'error').mockImplementation(() => {});
+  const previous = process.exitCode;
+  const hq: HqDeps = { store: { read: () => { throw new Error('HQ adjudicator contacted'); }, cas: () => { throw new Error('HQ adjudicator contacted'); } } };
   const run = async (...args: string[]) => { const cli = new Command(); registerReleaseCommands(cli, {}, {}, hq); await cli.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
   try {
     process.exitCode = 0;
-    await run('add', 'K1', 'Bootstrap');
-    expect(listChecklist('9.9.9').items).toHaveLength(1);
-    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    const writes = [
-      ['set', 'K1', '--status', 'red'], ['add', 'K2', 'Blocked'], ['move', 'K1', '--from', '9.9.9', '--to', '9.9.8'],
-      ['rm', 'K1'], ['evidence', 'add', 'K1', '#blocked'], ['claim', 'K1', '--by', 'TC'], ['retitle', 'K1', 'Blocked'],
-      ['seed', '--from', join(dir, 'roadmap.md')], ['export'],
-    ];
-    writeFileSync(join(dir, 'roadmap.md'), '# Roadmap\n');
-    const original = listChecklist('9.9.9');
-    for (const args of writes) {
-      process.exitCode = 0;
-      await run(...args);
-      expect(process.exitCode).toBe(4);
-      expect(lines.at(-1)).toContain('본부는 node-b gen 2 — 거기서 쓰거나 --hq-override(관측)');
-      expect(listChecklist('9.9.9')).toEqual(original);
-      expect(listChecklist('9.9.8').items).toHaveLength(0);
-    }
-    process.exitCode = 0;
-    await run('status');
-    expect(process.exitCode).toBe(0);
-    expect(lines.some(line => line.includes('🟢'))).toBe(true);
-    process.exitCode = 0;
+    await run('add', 'K1', 'Isolated');
     await run('set', 'K1', '--status', 'red', '--hq-override');
+    await run('evidence', 'add', 'K1', '#proof');
+    expect(listChecklist('9.9.9').items[0]).toMatchObject({ status: 'red', evidence: '#proof' });
     expect(process.exitCode).toBe(0);
-    expect(listChecklist('9.9.9').items[0]?.status).toBe('red');
-    expect(logs).toContainEqual({ event: 'cli-override', data: expect.objectContaining({ command: 'release checklist set', holder: 'node-b', generation: 2 }) });
-    expect(lines.some(line => line.includes('hq override: release checklist set'))).toBe(true);
-    process.exitCode = 0;
-    await run('evidence', 'add', 'K1', '#override', '--hq-override');
-    expect(listChecklist('9.9.9').items[0]?.evidence).toContain('#override');
-    expect(logs).toContainEqual({ event: 'cli-override', data: expect.objectContaining({ command: 'release checklist add', holder: 'node-b', generation: 2 }) });
-    expect(store.cas(store.read().raw, serializeLease({ holder: 'mbp', generation: 3, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    process.exitCode = 0;
-    await run('set', 'K1', '--status', 'green');
-    expect(process.exitCode).toBe(0);
-    expect(listChecklist('9.9.9').items[0]?.status).toBe('green');
-    expect(store.cas(store.read().raw, '')).toBe(true);
-    process.exitCode = 0;
-    await run('set', 'K1', '--status', 'done');
-    expect(process.exitCode).toBe(4);
-    expect(listChecklist('9.9.9').items[0]?.status).toBe('green');
-  } finally { process.exitCode = before ?? 0; error.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    expect(events).toContainEqual({ category: 'hq.fence', event: 'skipped-isolated', data: { root: dir, command: 'release checklist set' } });
+    expect(events.filter(({ category, event }) => category === 'hq.fence' && event !== 'skipped-isolated')).toEqual([]);
+  } finally { process.exitCode = previous ?? 0; observation.mockRestore(); error.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('actual CLI exits 4 for non-holder checklist writes, while reads and the observed override remain usable', () => {
+test('actual isolated checklist CLI ignores a foreign HQ lease without an override', () => {
   const dir = mkdtempSync(join(tmpdir(), 'release-hq-child-'));
   const store = fileLeaseStore(join(dir, 'hq', 'lease.json'), () => 100);
   const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
     { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
   try {
     expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    const blocked = run('set', 'K1', '--status', 'red');
-    expect(blocked.status).toBe(4);
-    expect(blocked.stderr).toContain('본부는 other-host gen 2 — 거기서 쓰거나 --hq-override(관측)');
-    const read = run('status', '--json');
-    expect(read.status).toBe(0);
-    expect(JSON.parse(read.stdout).items).toHaveLength(0);
-    const override = run('add', 'K1', 'Fixture', '--hq-override');
-    expect(override.status, override.stderr).toBe(0);
-    expect(override.stderr).toContain('hq override: release checklist add');
-    expect(JSON.parse(run('list', '--json').stdout).items).toMatchObject([{ id: 'K1' }]);
+    const added = run('add', 'K1', 'Fixture');
+    expect(added.status, added.stderr).toBe(0);
+    expect(added.stderr).not.toContain('hq override:');
+    const updated = run('set', 'K1', '--status', 'red');
+    expect(updated.status, updated.stderr).toBe(0);
+    expect(JSON.parse(run('list', '--json').stdout).items).toMatchObject([{ id: 'K1', status: 'red' }]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 180_000);
 
-test('other ledger-writing release CLI routes obey the same HQ fence; read-only previews stay available', async () => {
+test('isolated schedule and evidence writes bypass the lease; a schedule targeting another ledger remains fenced', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'release-hq-other-'));
   setElanousConfigDir(dir);
   const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
@@ -308,19 +279,61 @@ test('other ledger-writing release CLI routes obey the same HQ fence; read-only 
     expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
     process.exitCode = 0;
     await run('schedule', 'set', '--version', '9.9.9', '--cut-at', '2026-10-04T12:00+09:00');
-    expect(process.exitCode).toBe(4);
-    expect(getSchedule('9.9.9')).toBeNull();
-    process.exitCode = 0;
-    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--apply-evidence');
-    expect(process.exitCode).toBe(4);
-    process.exitCode = 0;
-    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--dry-run');
-    expect(process.exitCode).toBe(0);
-    await run('schedule', 'set', '--version', '9.9.9', '--cut-at', '2026-10-04T12:00+09:00', '--hq-override');
     expect(process.exitCode).toBe(0);
     expect(getSchedule('9.9.9')?.cutAt).toBe('2026-10-04T03:00:00.000Z');
-    expect(lines.some(line => line.includes('hq override: release schedule set'))).toBe(true);
+    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--apply-evidence');
+    expect(process.exitCode).toBe(0);
+    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--dry-run');
+    expect(process.exitCode).toBe(0);
+    const outside = join(dir, '..', 'release-hq-outside-' + process.pid);
+    const fenced = new Command();
+    registerReleaseCommands(fenced, { ledgerRoot: outside }, {}, hq);
+    await fenced.parseAsync(['release', 'schedule', 'set', '--version', '9.9.9', '--cut-at', '2026-10-04T12:00+09:00'], { from: 'user' });
+    expect(process.exitCode).toBe(4);
+    expect(lines.at(-1)).toContain('본부는 node-b gen 2');
+    expect(existsSync(join(outside, 'release', 'features.sqlite'))).toBe(false);
   } finally { process.exitCode = before ?? 0; error.mockRestore(); log.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('place and rebalance refuse a foreign HQ before writing the schedule ledger; dry-run does not ask the fence', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-placement-fence-'));
+  const ledger = join(dir, 'external-ledger');
+  const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
+  const errors: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+  const output = spyOn(console, 'log').mockImplementation(() => {});
+  const before = process.exitCode;
+  const track = process.env.ELANOUS_TRACK;
+  try {
+    setElanousConfigDir(join(dir, 'instance'));
+    process.env.ELANOUS_TRACK = 'OP';
+    const cli = new Command();
+    registerReleaseCommands(cli, { ledgerRoot: ledger }, {}, hq);
+    const run = (...args: string[]) => cli.parseAsync(['release', ...args], { from: 'user' });
+    await run('checklist', 'add', 'K1', 'Fixture', '--version', '9.9.9', '--owner', 'OP', '--priority', 'P1');
+    setSchedule('9.9.9', { cutAt: '2099-10-04T12:00+09:00', landBy: '2099-10-04T11:00+09:00' }, 'fixture', ledger);
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    process.exitCode = 0;
+    await run('place', 'K1');
+    expect(process.exitCode).toBe(4);
+    expect(errors.at(-1)).toBe('본부는 node-b gen 2 — 원장 쓰기는 지금 본부로 보내라 (수동 우회: --hq-override, 관측)');
+    expect(listChecklist('9.9.9').items).toMatchObject([{ id: 'K1', priority: 'P1' }]);
+    process.exitCode = 0;
+    await run('rebalance', '--version', '9.9.9');
+    expect(process.exitCode).toBe(4);
+    expect(errors.at(-1)).toContain('지금 본부로 보내라');
+    expect(listChecklist('9.9.9').items).toHaveLength(1);
+    process.exitCode = 0;
+    const count = errors.length;
+    await run('rebalance', '--version', '9.9.9', '--dry-run');
+    expect(errors).toHaveLength(count);
+    expect(process.exitCode).toBe(0);
+  } finally {
+    process.exitCode = before ?? 0;
+    if (track === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = track;
+    error.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe('release schedule CLI', () => {
@@ -352,6 +365,164 @@ describe('release schedule CLI', () => {
 });
 
 describe('release run CLI', () => {
+  test('a direct release run while frozen fails in a real CLI process (exit 1 · JSON failure); --if-ready defers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-proc-'));
+    try {
+      enableLandingFreeze({ reason: 'drill', by: 'MK' }, dir);
+      const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.meta.dir, '../../bin/elanous.mjs'), 'release', 'run', '--version', '0.2.4', '--json', ...args], { env: { ...process.env, ELANOUS_STATE_DIR: dir } });
+      const direct = cli();
+      expect(direct.exitCode).toBe(1);
+      expect(JSON.parse(direct.stdout.toString().trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+      const scheduled = cli('--if-ready');
+      expect(scheduled.exitCode).toBe(0);
+      expect(JSON.parse(scheduled.stdout.toString().trim().split('\n').at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+  test('a real graph run: the gate node refuses a freeze switched on after the run started, records it, and release run reports frozen', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-realgraph-'));
+    const root = join(dir, 'state');
+    const ledger = join(dir, 'ledger');
+    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    // A graph of the release loop's own gate recipe → done | failed, run by the real graph runner.
+    const graphDir = join(dir, 'graph');
+    mkdirSync(graphDir, { recursive: true });
+    writeFileSync(join(graphDir, 'release-loop.yaml'), [
+      'graph_id: release-loop-freeze-probe', 'version: 1', 'entry_node: gate', 'terminal_nodes: [done, failed]', 'nodes:',
+      "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }",
+      '  - { node_id: done, kind: gate, max_visits: 1 }', '  - { node_id: failed, kind: gate, max_visits: 1 }',
+      'edges:', '  - { from: gate, on: outcome, map: { ok: done, fail: failed, error: failed } }', '',
+    ].join('\n'));
+    writeFileSync(join(graphDir, 'recipes.yaml'), `gate:\n  command: 'bun ${join(import.meta.dir, '../../scripts/release-loop/gate-node.ts')} --json'\n  timeout_ms: 60000\n`);
+    const lines: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      const { runGraph } = await import('../graph-runner/runner.js');
+      let state: Awaited<ReturnType<typeof runGraph>> | undefined;
+      const cli = new Command();
+      registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async (_path, options) => {
+          enableLandingFreeze({ reason: 'mid-run', by: 'OP' }, root); // after every entry check, before the gate node
+          state = await runGraph(join(graphDir, 'release-loop.yaml'), { ...options, input: { ...options.input, commit: 'a'.repeat(40) }, deps: { root } });
+          return state;
+        } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(state?.status).toBe('failed');
+      const gate = state!.nodes.find((node) => node.nodeId === 'gate')!;
+      expect(gate.ok).toBe(false);
+      expect(JSON.stringify(gate.output)).toContain('동결 중 · mid-run');
+      const saved = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop-freeze-probe', `${state!.runId}.json`), 'utf8'));
+      expect(JSON.stringify(saved.nodes.find((node: { nodeId: string }) => node.nodeId === 'gate').output)).toContain('동결 중 · mid-run');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+      expect(process.exitCode).toBe(1);
+    } finally {
+      write.mockRestore(); process.exitCode = 0;
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+  test('a freeze met by the gate node inside the release graph is reported as frozen; an unrelated failure keeps its reason', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-graph-'));
+    const root = join(dir, 'state');
+    const ledger = join(dir, 'ledger');
+    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const lines: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    try {
+      const { disableLandingFreeze } = await import('../release-loop/landing-freeze.js');
+      // The real gate node, run as the graph runs it, meets a freeze switched on mid-run and records its refusal.
+      const realGateOutput = () => {
+        enableLandingFreeze({ reason: 'mid-run', by: 'OP' }, root);
+        const node = Bun.spawnSync([process.execPath, join(import.meta.dir, '../../scripts/release-loop/gate-node.ts')], {
+          env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ input: { commit: 'a'.repeat(40), version: '0.2.4', previousVersion: '0.2.3' }, outputs: {} }) },
+        });
+        return node.stdout.toString();
+      };
+      let failure: 'freeze' | 'other' = 'freeze';
+      const cli = new Command();
+      registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async () => {
+          const output = failure === 'freeze' ? realGateOutput() : (enableLandingFreeze({ reason: 'unrelated', by: 'OP' }, root), JSON.stringify({ outcome: 'regression', introduced: ['a > b'] }));
+          return { status: 'failed', nodes: [{ nodeId: 'gate', ok: false, exit: 1, executed: true, output }] } as never;
+        } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+      expect(process.exitCode).toBe(1);
+      disableLandingFreeze(root);
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
+      expect(process.exitCode).toBe(0);
+      // A gate regression while a freeze happens to be on is still a regression, not a freeze.
+      disableLandingFreeze(root);
+      failure = 'other';
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      const last = JSON.parse(lines.at(-1)!);
+      expect(last.ok).toBe(false);
+      expect(last.reason).toBeUndefined();
+      expect(process.exitCode).toBe(1);
+    } finally { write.mockRestore(); process.exitCode = 0; rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('--if-ready defers (not fails) when the freeze is switched on after its entry check, at the run boundary', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-late-'));
+    const root = join(dir, 'state');
+    const ledger = join(dir, 'ledger');
+    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    let graphCalls = 0;
+    const lines: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+        checklist: () => { enableLandingFreeze({ reason: 'late', by: 'OP' }, root); return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+        graph: async () => { graphCalls++; return { status: 'done' } as never; } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
+      expect(graphCalls).toBe(0);
+      expect(process.exitCode).toBe(0);
+      // A direct run hit by the same late freeze fails with the frozen reason.
+      const { disableLandingFreeze } = await import('../release-loop/landing-freeze.js');
+      disableLandingFreeze(root);
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+      expect(graphCalls).toBe(0);
+      expect(process.exitCode).toBe(1);
+    } finally { write.mockRestore(); process.exitCode = 0; rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('freeze skips --if-ready before readiness and --force-freeze executes it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-'));
+    const root = join(dir, 'state');
+    const ledger = join(dir, 'ledger');
+    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
+    let checklistCalls = 0;
+    let graphCalls = 0;
+    const lines: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
+        checklist: () => { checklistCalls++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+        graph: async () => { graphCalls++; return { status: 'done' } as never; } });
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
+      expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--force-freeze', '--json'], { from: 'user' });
+      expect([checklistCalls, graphCalls]).toEqual([1, 1]);
+    } finally { write.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
   test('--dry-run --json prints the complete ledger/config input on stdout without invoking the checklist or graph', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-run-cli-'));
     const ledger = join(dir, 'ledger');

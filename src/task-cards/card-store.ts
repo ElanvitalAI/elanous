@@ -42,7 +42,7 @@ export const SECTION_OWNERS: Readonly<Record<string, string | null>> = {
   gates: 'execution-loop', relations: 'execution-loop', memory: 'execution-loop',
   workspace: 'executor', run: 'executor',
   landing: 'landing-loop', release: 'release-loop', 'test-diet': 'test-diet',
-  incidents: null,
+  incidents: null, orch: 'orchestrator', flow: 'flow',
 };
 
 export function sectionOf(key: string): string {
@@ -80,10 +80,11 @@ export class CardStore {
   private readonly db: Database;
   readonly root: string;
 
-  constructor(root: string = elanousStateRoot()) {
+  constructor(root: string = elanousStateRoot(), private readonly readOnly = false) {
     this.root = root;
-    mkdirSync(taskCardsDir(root), { recursive: true });
-    this.db = new Database(cardIndexPath(root));
+    if (!readOnly) mkdirSync(taskCardsDir(root), { recursive: true });
+    this.db = readOnly ? new Database(cardIndexPath(root), { readonly: true }) : new Database(cardIndexPath(root));
+    if (readOnly) return;
     try {
       this.db.exec('PRAGMA busy_timeout = 5000');
       this.db.exec('PRAGMA journal_mode = WAL');
@@ -127,6 +128,7 @@ export class CardStore {
   }
 
   private reconcile(): void {
+    if (this.readOnly) return;
     for (const file of readdirSync(taskCardsDir(this.root))) {
       if (!/^[a-zA-Z0-9_-]+\.jsonl$/.test(file)) continue;
       const id = file.slice(0, -'.jsonl'.length);
@@ -220,6 +222,7 @@ export class CardStore {
   }
 
   getCard(id: string): TaskCard | null {
+    if (this.readOnly) return this.readCard(id);
     return this.db.transaction(() => {
       this.reconcile();
       return this.readCard(id);
@@ -227,12 +230,13 @@ export class CardStore {
   }
 
   listCards(options: { open?: boolean } = {}): TaskCard[] {
-    return this.db.transaction(() => {
+    const list = () => {
       this.reconcile();
       const rows = this.db.query(`SELECT id FROM cards ${options.open ? "WHERE status = 'open'" : ''} ORDER BY created_at DESC, id DESC`)
         .all() as Array<{ id: string }>;
       return rows.map(({ id }) => this.readCard(id)!);
-    }).immediate();
+    };
+    return this.readOnly ? list() : this.db.transaction(list).immediate();
   }
 
   close(): void {

@@ -45,7 +45,8 @@ describe('dashboard turn-preamble implementation-discipline wiring', () => {
     expect(callbackStart).toBeGreaterThanOrEqual(0);
     expect(callbackEnd).toBeGreaterThan(callbackStart);
     const callback = source.slice(callbackStart, callbackEnd);
-    expect(callback).toContain('return buildDashboardTurnPreamble({');
+    // B7 (TUI /persona): persona messages are prepended, so the builder is spread into the returned array.
+    expect(callback).toContain('...buildDashboardTurnPreamble({');
     expect(callback).toContain('userConfig: args.userConfig,');
     expect(callback).toContain('enabledTools: tools.map(t => t.name),');
   });

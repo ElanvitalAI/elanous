@@ -13,6 +13,9 @@ export interface ChecklistItem {
   title: string;
   status: ChecklistStatus;
   owner?: string;
+  priority?: 'P0' | 'P1' | 'P2';
+  predecessors?: string[];
+  deadlineVersion?: string;
   evidence?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
@@ -93,11 +96,14 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
   debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
 }
 
-export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind }, options: { allowDuplicateId?: boolean } = {}): Checklist {
+export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
   if (input.owner !== undefined) parseOwner(input.owner);
+  if (input.priority !== undefined && !['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
+  if (input.predecessors !== undefined && (!Array.isArray(input.predecessors) || input.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === input.id))) throw new CliUserError('잘못된 선행 칸');
+  if (input.deadlineVersion !== undefined) store.validateVersion(input.deadlineVersion);
   return mutate(v, (data, otherItems) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const collisions = otherItems(input.id);
@@ -108,27 +114,30 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
     }
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), updatedAt: at, updatedBy: by };
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), updatedAt: at, updatedBy: by };
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
     if (patch.kind !== undefined && patch.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen');
+    if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
+    if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
+    if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
     if (patch.owner !== undefined) {
       parseOwner(patch.owner);
       if (item.owner && patch.owner !== item.owner) {
         throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
       }
     }
-    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
+    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field]));
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {

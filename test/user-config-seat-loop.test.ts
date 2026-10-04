@@ -6,9 +6,10 @@ import { buildUserConfig, saveUserConfig } from '../src/user-config.js';
 
 const root = mkdtempSync(join(tmpdir(), 'user-config-seat-loop-'));
 const path = join(root, 'config.json');
-const base = { mode: 'off' as const, seats: ['MK'], podPool: 'pool-node-b@node-b:8', questions: 'shadow' as const };
-// ORCH2 (#23660) parses the orchestrator loop block with defaults even when it is absent.
-const orchestrator = { seatCaps: { MK: 6, OP: 4, TC: 8, UX: 6 }, seatTrees: {}, trafficMode: 'shadow' as const };
+const base = { mode: 'shadow' as const, seats: ['MK'], podPool: 'pool-node-b@node-b:8', questions: 'shadow' as const };
+// ORCH2 (#23660) parses the orchestrator loop block with defaults even when it is absent · ORCH1 adds mode (default shadow).
+const orchestrator = { mode: 'shadow' as const, seatCaps: { MK: 6, OP: 4, TC: 8, UX: 6 }, seatTrees: {}, trafficMode: 'shadow' as const };
+const ownership = { owners: {}, defaultOwner: 'OP' as const };
 function parse(loops: unknown) {
   writeFileSync(path, JSON.stringify({ loops }));
   return buildUserConfig(path).loops;
@@ -16,19 +17,19 @@ function parse(loops: unknown) {
 afterEach(() => rmSync(path, { force: true }));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-test('absent file and absent seat default to off while steward defaults to shadow', () => {
-  expect(buildUserConfig(path).loops).toEqual({ orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
-  expect(parse(undefined)).toEqual({ orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
-  expect(parse({})).toEqual({ orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
+test('absent file and absent seat default to shadow alongside steward', () => {
+  expect(buildUserConfig(path).loops).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
+  expect(parse(undefined)).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
+  expect(parse({})).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: base });
 });
 
-test('seat accepts the three explicit modes', () => {
-  for (const mode of ['off', 'shadow', 'on'] as const) {
+test('seat accepts the four explicit modes', () => {
+  for (const mode of ['off', 'shadow', 'on', 'live-safe'] as const) {
     expect(parse({ seat: { mode } })?.seat).toEqual({ ...base, mode });
   }
 });
 
-test('invalid seat mode or shape cannot arm the loop', () => {
+test('invalid seat mode or shape cannot arm live-safe execution', () => {
   for (const seat of [{ mode: 'act' }, { mode: 'ON' }, { mode: true }, { mode: null }, {}, null, [], 'on']) {
     expect(parse({ seat })?.seat).toEqual(base);
   }
@@ -39,9 +40,9 @@ test('seat parsing preserves steward normalization independently', () => {
   const steward = { mode: 'live', linearTeam: ' team ', roles: { OP: { maxConcurrent: 2 } }, budget: 3, tracks: { OP: ' Operations ' }, alertAfterFailures: 4 };
   const expected = { mode: 'live', linearTeam: 'team', roles: { OP: { maxConcurrent: 2 } }, budget: 3, tracks: { OP: 'Operations' }, alertAfterFailures: 4 } as const;
   expect(parse({ steward })?.steward).toEqual(expected);
-  expect(parse({ steward, seat: { mode: 'shadow' } })).toEqual({ orchestrator, steward: expected, persona: { enabled: false }, seat: { ...base, mode: 'shadow' } });
-  expect(parse({ steward, seat: { mode: 'invalid' } })).toEqual({ orchestrator, steward: expected, persona: { enabled: false }, seat: base });
-  expect(parse({ seat: { mode: 'on' }, steward: null })).toEqual({ orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: { ...base, mode: 'on' } });
+  expect(parse({ steward, seat: { mode: 'shadow' } })).toEqual({ ...ownership, orchestrator, steward: expected, persona: { enabled: false }, seat: { ...base, mode: 'shadow' } });
+  expect(parse({ steward, seat: { mode: 'invalid' } })).toEqual({ ...ownership, orchestrator, steward: expected, persona: { enabled: false }, seat: base });
+  expect(parse({ seat: { mode: 'on' }, steward: null })).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow' }, persona: { enabled: false }, seat: { ...base, mode: 'on' } });
 });
 
 test('steward mode accepts only off, shadow, live and defaults invalid values to shadow', () => {
@@ -65,8 +66,8 @@ test('seat fields persist through save while steward and unknown loop keys survi
   cfg.loops!.seat = { mode: 'on', seats: ['TC'], podPool: 'pool-x', reportPr: 12 };
   saveUserConfig(cfg, path);
   const saved = JSON.parse(readFileSync(path, 'utf8')).loops;
-  expect(saved).toEqual({ orchestrator, steward: { mode: 'shadow', linearTeam: ' team ', futureSteward: 'keep' }, futureLoop: { enabled: true }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
-  expect(buildUserConfig(path).loops).toEqual({ orchestrator, steward: { mode: 'shadow', linearTeam: 'team' }, persona: { enabled: false }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
+  expect(saved).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow', linearTeam: ' team ', futureSteward: 'keep' }, futureLoop: { enabled: true }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
+  expect(buildUserConfig(path).loops).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow', linearTeam: 'team' }, persona: { enabled: false }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
   const typed = buildUserConfig(path);
   typed.loops!.steward!.mode = 'off';
   saveUserConfig(typed, path);
@@ -80,7 +81,7 @@ test('partial config save without cfg.loops preserves raw steward and unknown lo
   cfg.loops = undefined;
   saveUserConfig(cfg, path);
   expect(JSON.parse(readFileSync(path, 'utf8')).loops).toEqual(loops);
-  expect(buildUserConfig(path).loops).toEqual({ orchestrator, steward: { mode: 'shadow', linearTeam: 'team' }, persona: { enabled: false }, seat: { ...base, mode: 'shadow' } });
+  expect(buildUserConfig(path).loops).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow', linearTeam: 'team' }, persona: { enabled: false }, seat: { ...base, mode: 'shadow' } });
 });
 
 test('saving typed steward mode preserves unrelated steward and loop keys', () => {
@@ -92,7 +93,7 @@ test('saving typed steward mode preserves unrelated steward and loop keys', () =
   cfg.loops!.steward!.mode = 'live';
   saveUserConfig(cfg, path);
   expect(JSON.parse(readFileSync(path, 'utf8')).loops).toEqual({
-    orchestrator,
+    ...ownership, orchestrator,
     steward: { mode: 'live', linearTeam: 'ELA', launch: 'shadow', futureSteward: 'keep' },
     futureLoop: { enabled: true },
     seat: base,

@@ -1,7 +1,7 @@
 'use client';
 
 // `/intake` 첫 입구. 규칙 미리보기와 사용자 요청 시 분류기 ⊕ 세 실행 버튼.
-// 흡수 · 작업 분할 · 그래프는 이미 있는 입구만 부른다.
+// 흡수 · 소원 카드 · 그래프는 데몬의 기존 입구만 부른다.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -15,6 +15,7 @@ import {
   routeIntake,
   submitAbsorb,
   submitGraph,
+  submitWishCard,
   type AbsorbStatus,
   type GraphStatus,
   type RunEvent,
@@ -23,7 +24,6 @@ import {
 } from '@/lib/intake-front-door-api';
 import { summarizeAbsorbStatus } from '@/lib/intake-absorb-status';
 import { summarizeRunEvents, type RunTimeline } from '@/lib/intake-run-timeline';
-import { MemoIntakePreview } from './MemoIntakePreview';
 
 const RECENT_KEY = 'elanous.intake.recent';
 const RECENT_LIMIT = 20;
@@ -90,6 +90,7 @@ interface RecentSend {
   ids?: string[];
   acceptanceId?: string;
   runId?: string;
+  cardId?: string;
 }
 
 export interface IntakeFrontDoorState {
@@ -100,8 +101,7 @@ export interface IntakeFrontDoorState {
   acceptanceId: string | null;
   graph: GraphStatus | null;
   runEvents?: Record<string, RunEvent[]>;
-  splitOpen: boolean;
-  splitMemo: string;
+  wishCardId: string | null;
   recent: RecentSend[];
   /** 판정 칩. 없거나 실패면 칩을 그리지 않는다. */
   route?: IntakeRouteDecision | null;
@@ -170,7 +170,7 @@ export function IntakeFrontDoor({
   state?: IntakeFrontDoorState;
   deps?: IntakeFrontDoorDeps;
 } = {}) {
-  const { client } = useDaemon();
+  const { client, sessionId } = useDaemon();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -178,8 +178,8 @@ export function IntakeFrontDoor({
   const [acceptanceId, setAcceptanceId] = useState<string | null>(null);
   const [graph, setGraph] = useState<GraphStatus | null>(null);
   const [runEvents, setRunEvents] = useState<Record<string, RunEvent[]>>({});
-  const [splitOpen, setSplitOpen] = useState(false);
-  const [splitMemo, setSplitMemo] = useState('');
+  const [wishCardId, setWishCardId] = useState<string | null>(null);
+  const pendingWishRef = useRef<string | null>(null);
   const [recent, setRecent] = useState<RecentSend[]>([]);
   const [absorbStatuses, setAbsorbStatuses] = useState<Record<string, AbsorbStatus | null>>({});
   const absorbStatusesRef = useRef(absorbStatuses);
@@ -270,13 +270,25 @@ export function IntakeFrontDoor({
     }
   }, [busy, client, record, text]);
 
-  const onSplit = useCallback(() => {
+  const onSplit = useCallback(async () => {
     const value = text.trim();
-    if (!value || busy) return;
-    setSplitMemo(value);
-    setSplitOpen(true);
-    record({ track: 'split', preview: intakeTextPreview(value) });
-  }, [busy, record, text]);
+    if (!value || busy || !sessionId) return;
+    const ref = pendingWishRef.current ?? crypto.randomUUID();
+    pendingWishRef.current = ref;
+    setBusy(true);
+    setError(null);
+    setWishCardId(null);
+    try {
+      const card = await submitWishCard(client, value, sessionId, ref);
+      pendingWishRef.current = null;
+      setWishCardId(card.cardId);
+      record({ track: 'split', preview: intakeTextPreview(value), cardId: card.cardId });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, client, record, sessionId, text]);
 
   const onGraph = useCallback(async () => {
     const value = text.trim();
@@ -408,7 +420,7 @@ export function IntakeFrontDoor({
   }, [client, runIds]);
 
   const view: IntakeFrontDoorState = stateOverride ?? {
-    text, busy, error, absorbIds, acceptanceId, graph, runEvents, splitOpen, splitMemo, recent, route,
+    text, busy, error, absorbIds, acceptanceId, graph, runEvents, wishCardId, recent, route,
   };
   const graphLine = useMemo(() => {
     if (!view.acceptanceId) return null;
@@ -433,7 +445,7 @@ export function IntakeFrontDoor({
 
       <textarea
         value={view.text}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => { pendingWishRef.current = null; setText(e.target.value); }}
         rows={6}
         disabled={view.busy}
         data-testid="intake-front-door-field"
@@ -461,7 +473,7 @@ export function IntakeFrontDoor({
         <Button type="button" size="sm" className={buttonClass('absorb')} aria-pressed={emphasis === 'absorb'} disabled={fieldEmpty || view.busy} onClick={() => void onAbsorb()} data-testid="intake-absorb" data-emphasized={emphasis === 'absorb' ? 'true' : 'false'}>
           흡수
         </Button>
-        <Button type="button" size="sm" variant="outline" className={buttonClass('split')} aria-pressed={emphasis === 'split'} disabled={fieldEmpty || view.busy} onClick={onSplit} data-testid="intake-split" data-emphasized={emphasis === 'split' ? 'true' : 'false'}>
+        <Button type="button" size="sm" variant="outline" className={buttonClass('split')} aria-pressed={emphasis === 'split'} disabled={fieldEmpty || view.busy || !sessionId} onClick={() => void onSplit()} data-testid="intake-split" data-emphasized={emphasis === 'split' ? 'true' : 'false'}>
           작업으로 나누기
         </Button>
         <Button type="button" size="sm" variant="secondary" className={buttonClass('graph')} aria-pressed={emphasis === 'graph'} disabled={fieldEmpty || view.busy} onClick={() => void onGraph()} data-testid="intake-graph" data-emphasized={emphasis === 'graph' ? 'true' : 'false'}>
@@ -490,11 +502,7 @@ export function IntakeFrontDoor({
 
       {view.error && <p className="text-sm text-destructive" data-testid="intake-front-door-error">{view.error}</p>}
 
-      {view.splitOpen && (
-        <div data-testid="intake-split-host">
-          <MemoIntakePreview initialMemo={view.splitMemo} onClose={() => setSplitOpen(false)} />
-        </div>
-      )}
+      {view.wishCardId && <p className="text-sm" data-testid="intake-wish-card-id">소원 카드 {view.wishCardId}</p>}
 
       {view.recent.length > 0 && (
         <ul data-testid="intake-recent" className="space-y-1 text-xs text-muted-foreground">
@@ -510,6 +518,7 @@ export function IntakeFrontDoor({
                     : null;
                   return <span key={id} data-testid="intake-absorb-status"> · 흡수: {summary?.label ?? '조회 중'}{summary?.noteRef ? ` · ${summary.noteRef}` : ''}</span>;
                 })}
+                {row.cardId ? ` · 카드 ${row.cardId}` : ''}
                 {row.acceptanceId ? ` · ${row.acceptanceId}` : ''}
                 {timeline?.stage && <span data-testid="intake-run-stage"> · 단계: {timeline.stage}</span>}
                 {timeline?.lastEventAt && <time data-testid="intake-run-last-event" dateTime={timeline.lastEventAt}> · 마지막 사건: {timeline.lastEventAt}</time>}

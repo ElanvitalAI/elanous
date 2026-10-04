@@ -27,7 +27,7 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.status).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -40,7 +40,7 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -96,7 +96,7 @@ test('mac-smoke fail and error are warning-only: the graph continues to export-c
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -137,7 +137,7 @@ test('npm publish follows GitHub publication and failure continues to docs land'
       stdout: JSON.stringify(body.includes('npm-publish-node.ts') ? { outcome: 'fail', verdict: 'fail', summary: 'E401' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('done');
-    expect(state.path.slice(-6)).toEqual(['npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path.slice(-7)).toEqual(['npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'npm-publish')?.output))).toMatchObject({ outcome: 'fail', summary: 'E401' });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -147,7 +147,7 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
   const graph = yaml(readFileSync(graphPath, 'utf8')) as { nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>; edges: Array<{ from: string; map: Record<string, string> }> };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'ops-upgrade')).toMatchObject({ kind: 'agent', recipe: 'cmd:ops-upgrade', max_visits: 1 });
-  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'ops-upgrade', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'failed', error: 'failed' });
   expect(graph.edges.find((edge) => edge.from === 'ops-upgrade')?.map).toEqual({ ok: 'version-dev-bump', fail: 'version-dev-bump', error: 'version-dev-bump' });
   expect(recipes['ops-upgrade']).toEqual({ command: 'bun scripts/release-loop/ops-upgrade-node.ts', timeout_ms: 1_200_000 });
   const root = mkdtempSync(join(tmpdir(), 'release-ops-failed-'));
@@ -159,7 +159,7 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
         : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('done');
-    expect(state.path.slice(-7)).toEqual(['publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path.slice(-8)).toEqual(['publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'ops-upgrade')?.output))).toMatchObject({ outcome: 'fail', hosts: [{ host: 'node-b', ok: false }] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -359,10 +359,10 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
-    expect(resumed.path.slice(-8)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
-    expect(commands).toHaveLength(20);
-    expect(commands.at(-6)).toContain('publish-node.ts');
-    expect(commands.at(-5)).toContain('npm-publish-node.ts');
+    expect(resumed.path.slice(-9)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(commands).toHaveLength(21); // + vault-note (RELNOTE-VAULT)
+    expect(commands.at(-7)).toContain('publish-node.ts');
+    expect(commands.at(-6)).toContain('npm-publish-node.ts');
     expect(commands.at(-1)).toContain('version-node.ts dev-bump');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

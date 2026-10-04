@@ -1,8 +1,8 @@
 # Drive elanous from your coding agent
 
-A coding agent that speaks MCP can drive elanous — the steps below use Claude Code and Codex as examples. Once connected, the agent can check what elanous is running, read its logs, and hand it a change to build. Decisions that need you are answered from the elanous CLI.
+A coding agent that speaks MCP can drive elanous — the steps below use Claude Code and Codex as examples. Once connected, the agent can check what elanous is running, read its logs, and hand it a change to build.
 
-This page walks through the whole loop: connect, observe, launch a goal, answer a decision. Every command below was run end to end, first with Claude Code and then with Codex, against a throwaway elanous setup.
+This page walks through the loop: connect, observe, and launch a goal. Every command below was run end to end, first with Claude Code and then with Codex, against a throwaway elanous setup.
 
 ## What you get
 
@@ -103,27 +103,6 @@ Ask the agent again, in plain words:
 - "Is anything failing?" → `ops_status` with `action: health`
 - "What happened in the last 30 minutes?" → `logs_query` with `sinceMinutes`, `level` or `category`
 
-## 5. Answer a decision
-
-When elanous needs you (something irreversible, public, or costly), it raises a decision with a short situation, the options and a recommendation. Decisions are handled from the CLI:
-
-```bash
-elanous decisions list                       # open decisions
-elanous decisions show <id>                  # situation, options, recommendation
-elanous decisions decide <id> <option>       # record your answer
-```
-
-You can also raise one yourself, for example from a script your agent runs:
-
-```bash
-elanous decisions raise --title "Ship now or next release?" --category scope \
-  --s "The flag is drafted." --c "Shipping now skips one review round." \
-  --option "a=Ship now:Faster, less review" --option "b=Next release:One more review" \
-  --recommend b --why "Review first" --json
-```
-
-Option keys are single letters (`a`, `b`, …). In our run the decision was raised as open, then `decisions decide <id> b` closed it as decided by a human.
-
 ## The other direction: elanous drives the agent
 
 MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude Code, Codex or Grok as a child agent and drives it. `elanous acp list` shows the backends this build knows; `elanous acp test --backend <id>` sends one prompt as a smoke test.
@@ -135,4 +114,3 @@ MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude 
 | Codex says the elanous call "required approval" | Set `default_tools_approval_mode = "approve"` and `enabled_tools` for the elanous server |
 | `logs_query` returns nothing | The daemon has not written logs to this state directory yet; start it once (`elanous start`) |
 | `SelfImplement` returns `observed: true` but nothing happens | Observe-only is on: `elanous config set tools.selfImplement.observeOnly false` |
-| `decisions raise` rejects `--option` | Use single-letter keys: `a=Label:Consequence` |

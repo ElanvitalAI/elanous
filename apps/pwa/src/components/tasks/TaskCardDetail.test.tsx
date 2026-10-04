@@ -49,6 +49,18 @@ describe('TaskCardDetail', () => {
     expect((html.match(/<details class=/g) ?? []).length).toBe(3);
   });
 
+  test('shows assigned cell, release version and live progress on one line, or an unplaced state', () => {
+    const card = foldCard([entry('triage', 'wish', 1700000000000, 'steward', { title: '소원' })]);
+    if (!card) throw new Error('expected a card');
+    const assigned = renderToStaticMarkup(<TaskCardDetail card={card} placements={[
+      { cellId: 'C1', cellTitle: '첫 칸', version: '0.2.14', status: 'yellow' },
+      { cellId: 'C2', cellTitle: '둘째 칸', version: '0.2.15', status: 'done' },
+    ]} />);
+    expect(assigned).toMatch(/<p[^>]*aria-label="Wish placement and progress"[^>]*>배치 · C1 첫 칸 · 0.2.14판 · 진행 중 \/ C2 둘째 칸 · 0.2.15판 · 완료<\/p>/);
+    expect(renderToStaticMarkup(<TaskCardDetail card={card} placements={[]} />)).toContain('배치 · 아직 배치되지 않음');
+    expect(renderToStaticMarkup(<TaskCardDetail card={card} />)).not.toContain('Wish placement and progress');
+  });
+
   test('does not invent a gate decision or incident when neither exists', () => {
     const html = render([entry('triage', 'triage-1', 1700000000000, 'steward', { title: 'Ready' })]);
     expect(html).not.toContain('Gate decisions');

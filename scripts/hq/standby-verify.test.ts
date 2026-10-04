@@ -50,6 +50,20 @@ test('intact generation reports generation, host, age and checksum count in one 
   expect(readlinkSync(join(standby, 'core', 'latest'))).toBe(generation);
 });
 
+test('verified manifest digest identifies the exact bytes read by the checksum verifier', async () => {
+  const { standby, generation } = fixture();
+  const path = join(standby, 'core', generation, 'MANIFEST.json');
+  const before = await verifyStandby({ root: standby, tiers: ['core'] });
+  expect(before.ok).toBe(true);
+  expect(before.tiers[0].manifestSha256).toBe(createHash('sha256').update(readFileSync(path)).digest('hex'));
+  const manifest = JSON.parse(readFileSync(path, 'utf8'));
+  manifest.host = 'changed-host';
+  writeFileSync(path, JSON.stringify(manifest));
+  const after = await verifyStandby({ root: standby, tiers: ['core'] });
+  expect(after.ok).toBe(true);
+  expect(after.tiers[0].manifestSha256).not.toBe(before.tiers[0].manifestSha256);
+});
+
 test('changed bytes and listed missing file are distinct FAIL counts', () => {
   const { standby, generation } = fixture();
   const file = join(standby, 'core', generation, 'config.json');

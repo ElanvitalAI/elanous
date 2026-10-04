@@ -4,11 +4,13 @@ import * as ceoCommands from '../src/seat-dispatch/ceo-commands.js';
 import * as intakeWork from '../src/intake-plane/submit-intake-work.js';
 import type { UserConfig } from '../src/user-config.js';
 import { probeDiscordSeatWork, runbookTexts, runProbeCli } from './discord-seat-probe.js';
+import { assertTuiSeatAskRestartContract } from '../test/seat-ask-tui-restart-contract.js';
 
 const config = { raw: { decisions: { discordOwnerId: '11111' } }, discord: { allowedUsers: ['11111'] } } as unknown as UserConfig;
 
 // The production registry maps COO/CTO/CMO/CXO to OP/TC/MK/UX; config supplies the real owner decision.
 describe('Discord seat probe', () => {
+  test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
   test('dry CLI runs three messages without reaching real dispatch, submit or Discord transport', async () => {
     const effects: string[] = [];
     const dispatch = spyOn(ceoCommands, 'dispatchCeoTask').mockImplementation((async () => {

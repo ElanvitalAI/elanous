@@ -23,7 +23,7 @@ export function decodeDrag(value: string): GraphKindEntry | null {
     if (candidate.graph !== 'workflow' || typeof candidate.kind !== 'string'
       || typeof candidate.core !== 'boolean' || typeof candidate.description !== 'string'
       || (candidate.plugin !== undefined && candidate.plugin !== null && typeof candidate.plugin !== 'string')) return null;
-    if (candidate.core ? !CORE_VARIANTS.has(candidate.kind as NodeVariant)
+    if (candidate.core ? !/^[a-z][a-zA-Z0-9]*$/.test(candidate.kind)
       : !/^[a-z0-9-]+:[a-z0-9-]+$/.test(candidate.kind)) return null;
     return entry as GraphKindEntry;
   } catch {
@@ -31,19 +31,26 @@ export function decodeDrag(value: string): GraphKindEntry | null {
   }
 }
 
+export function addPaletteNode(def: WorkflowDefinitionLike, entry: GraphKindEntry): WorkflowDefinitionLike {
+  const knownCore = entry.core && CORE_VARIANTS.has(entry.kind as NodeVariant);
+  const added = addNode(def, knownCore ? entry.kind as NodeVariant : 'unknown');
+  if (knownCore) return added;
+  const id = added.nodes.at(-1)!.id;
+  return {
+    ...added,
+    nodes: [
+      ...added.nodes.slice(0, -1),
+      entry.core ? { id, [entry.kind]: {} } : { id, kind: entry.kind, inputs: {} },
+    ],
+  };
+}
+
 export function addNodeAt(
   def: WorkflowDefinitionLike,
   variant: GraphKindEntry,
   position: { x: number; y: number },
 ): { def: WorkflowDefinitionLike; id: string } {
-  const added = addNode(def, variant.core ? variant.kind as NodeVariant : 'unknown');
+  const added = addPaletteNode(def, variant);
   const id = added.nodes.at(-1)!.id;
-  const withKind = variant.core ? added : {
-    ...added,
-    nodes: [
-      ...added.nodes.slice(0, -1),
-      { id, kind: variant.kind, inputs: {} },
-    ],
-  };
-  return { def: setNodePosition(withKind, id, position), id };
+  return { def: setNodePosition(added, id, position), id };
 }

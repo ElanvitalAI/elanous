@@ -21,6 +21,7 @@ const beforeMove = [
       { name: 'level', flags: ['--json', '--render <on|off>'] },
       { name: 'timeline', flags: ['--session <id>', '--since <t>', '--until <t>', '--out <path>', '--test', '--instance <name>'] },
       { name: 'durations', flags: ['--json', '--limit <n>', '--test', '--instance <name>', '--all', '--include-test'] },
+      { name: 'model-input', flags: ['--since <t>', '--json', '--test', '--instance <name>', '--all', '--include-test'] },
       { name: 'degenerate', flags: ['--category <prefix>', '--event <event>', '--since <t>', '--min-samples <n>', '--test', '--instance <name>', '--all', '--include-test'] },
       { name: 'fields', flags: ['--category <prefix>', '--exact-category <category>', '--event <event>', '--since <t>', '--limit <n>', '--values [n]', '--test', '--instance <name>', '--all', '--include-test'] },
       { name: 'unclosed', flags: ['--since <t>', '--older-than <t>', '--json', '--test', '--instance <name>'] },
@@ -29,6 +30,7 @@ const beforeMove = [
   },
   {
     name: 'docs', flags: [], children: [
+      { name: 'rfc-status', flags: ['--json', '--missing-cards'] },
       { name: 'search', flags: ['--limit <n>', '--domain <d>', '--kind <k>', '--json'] },
       { name: 'revision', flags: ['--json'] },
       { name: 'stale', flags: ['--json', '--axis <axis>', '--history'] },

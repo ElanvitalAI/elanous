@@ -1,5 +1,9 @@
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { nextMdWarning, runPrLand, type PrLandDeps } from './pr-cli';
 
 const warning = '⚠ next-md: 사용자에게 보이는 변경인데 release/next.md 에 줄이 없습니다 — 공개 노트에서 빠집니다. 「- <kind> — <영어 한 문장>. Documentation: … Target: next.」 한 줄을 더하십시오.';
@@ -61,7 +65,7 @@ test('pr land emits the next-md warning but still merges with exit code 0', asyn
     resolveBase: () => 'origin/main',
     run: (command, args) => {
       if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
-      if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: '/tmp/notes-test' };
+      if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? 'a'.repeat(40) : '/tmp/notes-test' };
       if (command === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: 'src/cli/x.ts\n' };
       return { ok: true, out: '' };
     },
@@ -86,7 +90,75 @@ test('pr land emits the next-md warning but still merges with exit code 0', asyn
       mergePrOutcome: () => { merges++; return { ok: true, kind: 'merged' }; },
     } as unknown as PrLandDeps['manager'],
   };
-  expect(await runPrLand({ body: note('feat') }, deps)).toBe(0);
-  expect(lines.filter((line) => line.startsWith('⚠ next-md:'))).toEqual([warning]);
-  expect(merges).toBe(1);
+  const root = mkdtempSync(join(tmpdir(), 'pr-land-freeze-'));
+  const before = process.env.ELANOUS_STATE_DIR;
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
+    expect(await runPrLand({ body: note('feat') }, deps)).toBe(0);
+    expect(lines.at(-1)).toContain('동결 중 · drill · 끝 시각 미지정');
+    expect(merges).toBe(0);
+    disableLandingFreeze(root);
+    expect(await runPrLand({ body: note('feat') }, deps)).toBe(0);
+    expect(lines.filter((line) => line.startsWith('⚠ next-md:'))).toEqual([warning, warning]);
+    expect(merges).toBe(1);
+  } finally {
+    if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = before;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
+
+test('`freeze on` run during an in-flight pr land merge returns only after that merge finishes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pr-land-freeze-race-'));
+  const before = process.env.ELANOUS_STATE_DIR;
+  const lines: string[] = [];
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  let exitedDuringMerge: number | null | undefined;
+  const deps: PrLandDeps = {
+    currentBranch: () => 'feat/notes',
+    resolveBase: () => 'origin/main',
+    run: (command, args) => {
+      if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
+      if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? 'a'.repeat(40) : '/tmp/notes-test' };
+      if (command === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: 'src/cli/x.ts\n' };
+      return { ok: true, out: '' };
+    },
+    listUnfinishedRuns: () => [],
+    queryRunningRuns: () => { throw new Error('observation unavailable'); },
+    runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true,
+    runDaemonPortGate: () => true, runPublicLeakGate: () => 0, runExportLeakCheck: () => ({ measured: true, hits: [] }),
+    runTestInterferenceGate: async () => 0, runAndroidGate: () => true, runPwaGate: () => true, runIosGate: () => true,
+    listOpenPrs: () => [],
+    out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
+    manager: {
+      findPrForBranchOutcome: () => ({ status: 'NOT_FOUND' }),
+      upsertPr: () => ({ ok: true, url: 'https://github.com/example/repo/pull/1', reused: false }),
+      mergePrOutcome: () => {
+        // The real CLI, in another process, turns the freeze on while this merge is still running.
+        child = Bun.spawn([process.execPath, resolve(import.meta.dir, '../../bin/elanous.mjs'), 'freeze', 'on', '--reason', 'race', '--wait-seconds', '60'], {
+          env: { ...process.env, ELANOUS_STATE_DIR: root }, stdout: 'pipe', stderr: 'pipe',
+        });
+        const deadline = Date.now() + 60_000;
+        while (!existsSync(join(root, 'landing-freeze.json')) && Date.now() < deadline) Bun.sleepSync(50);
+        Bun.sleepSync(2_000);
+        // The event loop is blocked here, so read the child's state from ps: gone or zombie (Z) means it returned.
+        const stat = Bun.spawnSync(['ps', '-o', 'stat=', '-p', String(child.pid)]).stdout.toString().trim();
+        exitedDuringMerge = stat === '' || stat.startsWith('Z') ? 0 : null;
+        return { ok: true, kind: 'merged' };
+      },
+    } as unknown as PrLandDeps['manager'],
+  };
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    expect(await runPrLand({ body: note('feat') }, deps)).toBe(0);
+    expect(existsSync(join(root, 'landing-freeze.json'))).toBe(true);
+    expect(exitedDuringMerge).toBeNull();
+    expect(await child!.exited).toBe(0);
+  } finally {
+    if (child && child.exitCode === null) child.kill();
+    if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = before;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);

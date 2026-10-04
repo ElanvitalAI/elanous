@@ -2,10 +2,10 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { Frames, launch, PUBLIC_LEAK_CHECK, sleep } from './lib/cdp.js';
-import { failedApiResponse, judgeRun, judgeScene, worstSceneState, type SceneObservation, type SceneState } from './lib/rehearsal-verdict.js';
+import { EMPTY_STATE_PHRASES, failedApiResponse, judgeRun, judgeScene, worstSceneState, type SceneObservation, type SceneState } from './lib/rehearsal-verdict.js';
+export { EMPTY_STATE_PHRASES } from './lib/rehearsal-verdict.js';
 
 const TITLES = ['문서 아키텍처', '라이브 트레이스', '루프 에이전트', '그래프 편집기', '마법사 → 마켓', 'PTY 인텔리전스'];
-export const EMPTY_STATE_PHRASES = ['지금 도는 런이 없습니다', '마법사가 아직 돌지 않았습니다', '터미널을 기다리는 중', '판단을 기다리는 중', '못 읽음'] as const;
 
 export function sceneSnapshotScript(): string {
   return `(()=>{const sections=[...document.querySelectorAll('[data-inside-scene]')]; const visible=sections.filter(s=>!s.hidden && s.getClientRects().length>0); const text=visible.length===1?visible[0].innerText:''; return {sectionsInDom:sections.length,visibleScene:visible.length===1?Number(visible[0].getAttribute('data-inside-scene')):null,textLength:text.length,emptyStates:${JSON.stringify(EMPTY_STATE_PHRASES)}.filter(phrase=>text.includes(phrase))}})()`;

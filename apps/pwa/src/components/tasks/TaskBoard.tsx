@@ -1,11 +1,12 @@
 'use client';
 
 import { maskCardsForPublic } from './card-public';
+import { maskValueForPublic } from '@/lib/live-public';
 import { cardMetaParts } from './card-meta';
 import { useEffect, useMemo, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { boardColumn, cardTitle, foldCard, type BoardColumn, type TaskCard, type TaskCardEntry, type TaskCardSection } from '@/lib/task-card-model';
-import { createNexusClient, NexusApiError, type TaskCardWire } from '@/nexus/client';
+import { createNexusClient, NexusApiError, type TaskCardWire, type WishPlacementWire } from '@/nexus/client';
 import { TaskCardDetail } from './TaskCardDetail';
 
 const COLUMNS: BoardColumn[] = ['steward', 'execution', 'landing', 'release', 'done'];
@@ -79,12 +80,13 @@ export function isSameSelection(current: string | null, next: string | null): bo
   return next !== null && current === next;
 }
 
-export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detailError }: {
+export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detailError, placements }: {
   cards: readonly TaskCard[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   selectedCard?: TaskCard | null;
   detailError?: string | null;
+  placements?: readonly WishPlacementWire[];
 }) {
   const selected = selectedCard?.taskId === selectedId ? selectedCard : null;
   return (
@@ -110,7 +112,7 @@ export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detai
       {selectedId && (
         <aside className="max-w-3xl space-y-2" aria-label="Selected card">
           <button type="button" onClick={() => onSelect(null)} aria-label="Close card detail" className="text-sm text-muted-foreground">Close</button>
-          {selected ? <TaskCardDetail card={selected} /> :
+          {selected ? <TaskCardDetail card={selected} placements={placements} /> :
             <p role="status">{detailError ?? 'Loading card detail…'}</p>}
         </aside>
       )}
@@ -126,12 +128,14 @@ export function TaskBoard() {
   const [cards, setCards] = useState<TaskCard[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<TaskCard | null>(null);
+  const [placements, setPlacements] = useState<WishPlacementWire[] | undefined>(undefined);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const selectCard = (id: string | null) => {
     // 같은 카드를 다시 누르면 무시한다 — selectedId 가 안 바뀌면 상세 조회 effect 가 다시 돌지 않아 상세가 «로딩»에 갇힌다(리뷰 R3).
     if (isSameSelection(selectedId, id)) return;
     setSelectedCard(null);
+    setPlacements(undefined);
     setDetailError(null);
     setSelectedId(id);
   };
@@ -140,12 +144,15 @@ export function TaskBoard() {
   const [publicCapture, setPublicCapture] = useState(false);
   useEffect(() => { if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('capture') === 'public') setPublicCapture(true); }, []);
   const shownCards = useMemo(() => (publicCapture ? maskCardsForPublic(cards) : cards), [cards, publicCapture]);
+  const shownSelectedCard = publicCapture && selectedCard ? maskCardsForPublic([selectedCard])[0] : selectedCard;
+  const shownPlacements = publicCapture && placements ? maskValueForPublic(placements, []) : placements;
 
   useEffect(() => {
     let cancelled = false;
     setCards([]);
     setSelectedId(null);
     setSelectedCard(null);
+    setPlacements(undefined);
     setDetailError(null);
     if (!client) {
       setMessage('Connect to NEXUS to load task cards.');
@@ -169,9 +176,10 @@ export function TaskBoard() {
     if (!client || !selectedId) return;
     let cancelled = false;
     setSelectedCard(null);
+    setPlacements(undefined);
     setDetailError(null);
-    void client.getTaskCard(selectedId).then(({ card }) => {
-      if (!cancelled) setSelectedCard(cardFromWire(card));
+    void client.getTaskCard(selectedId).then(({ card, placements: assigned }) => {
+      if (!cancelled) { setPlacements(assigned); setSelectedCard(cardFromWire(card)); }
     }).catch((error: unknown) => {
       if (!cancelled) setDetailError(error instanceof Error ? error.message : String(error));
     });
@@ -179,6 +187,6 @@ export function TaskBoard() {
   }, [client, selectedId]);
 
   return <>{message && <p role="status" className="p-4 text-sm text-muted-foreground">{message}</p>}
-    <TaskBoardView cards={shownCards} selectedId={selectedId} selectedCard={selectedCard} detailError={detailError} onSelect={selectCard} />
+    <TaskBoardView cards={shownCards} selectedId={selectedId} selectedCard={shownSelectedCard} detailError={detailError} placements={shownPlacements} onSelect={selectCard} />
   </>;
 }

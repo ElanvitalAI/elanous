@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { slashEnterAction } from './ChatInput';
+import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 
 const COMMANDS = [{ name: 'help' }, { name: 'history' }, { name: 'clear' }];
+
+test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 describe('slashEnterAction — Enter while the slash menu is open', () => {
   test('an exact command name runs it at once as a meta line', () => {

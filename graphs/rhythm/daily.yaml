@@ -1,0 +1,38 @@
+graph_id: rhythm-daily
+loop:
+  title: 데일리 리뷰
+  description: 어제 착지·판·루프·그리드·결정·위험·외부 동향을 한 장으로 읽는다
+  trigger:
+    cron: '30 8 * * *'
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: collect
+    kind: agent
+    recipe: cmd:collect
+    max_visits: 1
+  - node_id: compose
+    kind: agent
+    recipe: cmd:compose
+    max_visits: 1
+  - node_id: deliver
+    kind: agent
+    recipe: cmd:deliver
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: collect
+    on: outcome
+    map: { ok: compose, fail: compose }
+  - from: compose
+    on: outcome
+    map: { ok: deliver, fail: failed }
+  - from: deliver
+    on: outcome
+    map: { ok: done, fail: failed }

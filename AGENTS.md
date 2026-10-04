@@ -8,6 +8,26 @@ elanous is a self-hosting agent runtime: a CLI, a local daemon, and a harness th
 turns a one-line request into a goal document, runs an implementer in an isolated
 git worktree, gates it with tests, reviews it, and opens a pull request.
 
+## Philosophy
+
+- elanous should converge on a goal itself rather than make a person judge every step.
+- It observes its own actions, understands the context, then heals what it can; when it cannot, it brings the evidence to a person.
+- Checklists, decisions and run ledgers are the source of truth; documents describe what those records show. See [What is Elanous](내부 문서 `intro`).
+- Say only what you have measured, with the command that measures it: `bun bin/elanous.mjs self run-ledger <runId>` inspects run evidence. See [The harness](내부 문서 `harness`).
+- A person supplies requirements and makes decisions; elanous does the work and escalates when necessary.
+- Raise decisions in SCQA form: Situation, Complication, Question, Answer. See [Drive elanous from your coding agent](내부 문서 `drive-from-a-coding-agent`).
+
+## Driving elanous from a coding agent
+
+Hand a change to elanous rather than editing it directly when it needs an isolated build, gates and review:
+
+- `bun bin/elanous.mjs harness say "<one line>"` — Hand over a one-sentence change request; see [The harness](내부 문서 `harness`).
+- `bun bin/elanous.mjs harness ask <goal.md>` — Hand over an already written goal document; see [The harness](내부 문서 `harness`).
+- `bun bin/elanous.mjs loop status --all` — Inspect the loops and their runs; see [Loop agents](내부 문서 `loop-agents`).
+- `bun bin/elanous.mjs wf` — Explore workflows, the bodies of graph nodes; see [Graph engineering](내부 문서 `graph-engineering`).
+- `bun bin/elanous.mjs agent-mission mission --backend codex "<request>"` — Let elanous drive another coding agent in a PTY; see [PTY intelligence](내부 문서 `pty-intelligence`).
+- `bun bin/elanous.mjs decisions raise` — Raise a decision card when a choice needs a person; see [Drive elanous from your coding agent](내부 문서 `drive-from-a-coding-agent`) for the required fields.
+
 ## Toolchain
 
 - Runtime and package manager: **bun** (see `package.json` `engines`).

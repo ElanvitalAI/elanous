@@ -40,7 +40,7 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
  *  예약만 실사용에 맞춘다. */
 export const POD_CHILD_REQUESTS = { cpu: '1', memory: '4Gi' } as const;
 import type { PodPoolMember, PodPoolScheduler } from './pod-pool.js';
-import { measurePoolLease, recommendConcurrency, POD_HOST_LEASE_ANNOTATION } from './pod-lease.js';
+import { measurePoolLease, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, LEASE_KUBECTL_MAX_BUFFER } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -58,7 +58,7 @@ import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
 import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
-import { goalTypeOf } from '../../../scripts/measure-pod-memory-by-goal.js';
+import { goalTypeOf, type GoalType } from '../../../scripts/measure-pod-memory-by-goal.js';
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
 import { getUserConfig } from '../../user-config.js';
 
@@ -145,8 +145,11 @@ export function defaultKubectl(args: readonly string[], input?: string): { statu
   // 셸 프록시가 kubectl 의 로컬 API 요청을 가로챈다(2026-09-25 실측) — 자식 env 에서 뺀다.
   const env = { ...process.env };
   for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[k];
-  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: 120_000 });
-  return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
+  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
+  const error = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS'
+    ? `kubectl 출력 너무 큼 (ENOBUFS; maxBuffer=${LEASE_KUBECTL_MAX_BUFFER} bytes)`
+    : r.error ? String(r.error) : '';
+  return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + error };
 }
 
 /** Job·Secret 이름 — 런마다 다르게(병렬) · k8s 이름 규칙(소문자·숫자·하이픈 · 63자 이하). */
@@ -218,6 +221,46 @@ export function hostGrokCredentials(opts: {
     return { grokApiKey: credential.token, ghToken: (opts.ghToken ?? defaultGhToken)() };
   }
   throw new Error('grok: 구독 자격 없음 · API 키 opt-in 꺼짐 또는 키 없음');
+}
+
+export type PodGrokSkipReason = 'missing' | 'expiring' | 'refresh-failed';
+
+/** GROK-OPTIONAL (10-05) — may this launch plan put grok in the Pod's chain at all?
+ *  The Pod copy must outlive the Job (POD_GROK_MIN_VALIDITY_MS), so an expiring subscription that the host cannot
+ *  refresh is «not available» here: the plan drops grok and goes on with codex instead of failing every launch. */
+export function podGrokSubscriptionUsable(opts: {
+  home?: string; env?: NodeJS.ProcessEnv;
+  refresh?: () => void; isExpiring?: () => boolean; expiresAt?: () => string | null;
+  log?: (category: string, event: string, data: Record<string, unknown>) => void;
+} = {}): { usable: true } | { usable: false; reason: PodGrokSkipReason; expiresAt: string | null } {
+  const log = opts.log ?? ((category, event, data) => debug.log(category, event, data));
+  const expiresAt = () => {
+    if (opts.expiresAt) return opts.expiresAt();
+    try {
+      const scopes = JSON.parse(readFileSync(grokAuthFilePath(opts.home), 'utf8')) as Record<string, { expires_at?: unknown }>;
+      const all = Object.values(scopes).flatMap((s) => (s && typeof s.expires_at === 'string' ? [s.expires_at] : []));
+      return all.sort().at(-1) ?? null;
+    } catch { return null; }
+  };
+  const skip = (reason: PodGrokSkipReason) => {
+    const at = expiresAt();
+    try { log('pod.grok-credentials', 'skipped', { reason, expiresAt: at }); } catch { /* observation is fail-soft */ }
+    return { usable: false as const, reason, expiresAt: at };
+  };
+  const credential = resolveGrokCredential({ home: opts.home, env: opts.env });
+  if (credential?.kind !== 'subscription') return skip('missing');
+  const expiring = opts.isExpiring ?? (() => isGrokSubscriptionExpiring({ home: opts.home, bufferMs: POD_GROK_MIN_VALIDITY_MS }));
+  if (!expiring()) return { usable: true };
+  let refreshed = true;
+  try { (opts.refresh ?? (() => { refreshGrokSubscriptionToken({ home: opts.home }); }))(); } catch { refreshed = false; }
+  if (!expiring()) return { usable: true };
+  return skip(refreshed ? 'expiring' : 'refresh-failed');
+}
+
+/** The one launch line for a skipped grok copy — the reader sees why grok left this run's chain. */
+export function podGrokSkippedLine(skip: { reason: PodGrokSkipReason; expiresAt: string | null }): string {
+  const why = skip.reason === 'missing' ? '구독 자격 없음' : skip.reason === 'expiring' ? '만료 임박' : '만료 임박 · 호스트 갱신 실패';
+  return `⚠️ grok 자격 없음(${why}${skip.expiresAt ? ` · 만료 ${skip.expiresAt}` : ''}) — 이 런의 폴백 체인에서 grok 을 뺐다`;
 }
 
 /** 키 캐시 관례: `~/.cache/<env 이름 소문자>`(예: OPENROUTER_API_KEY → ~/.cache/openrouter_api_key · src/config.ts 와 같다). */
@@ -416,6 +459,20 @@ export const POD_MEMORY_DEFAULT = '16Gi';
 export const POD_MEMORY_HIGH_DEFAULT = '32Gi';
 /** POD7 — `lite`(`ELANOUS_POD_MEMORY_LITE` 또는 2Gi): 명시할 때만(인자·문면 줄) · 자동 판정은 없다(성공 런 피크 기록 0 — 설계 §②). OOM 이면 POD9 가 high 로 한 번 다시 띄운다. */
 export const POD_MEMORY_LITE_DEFAULT = '2Gi';
+
+/** Reserve from measured per-run peaks, never from the advisory limit tier. Sparse or missing measurements keep the old reservation. */
+export function podMemoryRequestFor(kind: GoalType | null, advice?: PodMemoryAdvice): string {
+  const evidence = advice?.byGoalType.find((entry) => entry.goalType === kind)?.evidence;
+  const peak = evidence?.peakMiB.p95;
+  const reason = !kind ? 'unknown-kind' : !evidence ? 'no-advice'
+    : evidence.measured < 3 || evidence.runs < 3 || evidence.measured * 2 < evidence.runs ? 'insufficient-sample'
+      : peak === null || peak === undefined || !Number.isFinite(peak) || peak < 0 ? 'no-peak' : null;
+  if (reason) {
+    debug.log('pod.memory', 'request-default', { kind, reason });
+    return POD_CHILD_REQUESTS.memory;
+  }
+  return `${Math.max(1, Math.ceil(peak! * 1.25 / 1024))}Gi`;
+}
 export const POD_MEMORY_TIERS = ['lite', 'standard', 'high'] as const;
 export type PodMemoryTier = (typeof POD_MEMORY_TIERS)[number];
 export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto' | 'advise';
@@ -485,7 +542,7 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
   return { limit: a !== null && b !== null && a > b ? base : high, tier, source };
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean }): Record<string, unknown> {
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const goalPath = o.goalDoc ? `'${(o.goalDoc.startsWith('-') ? `./${o.goalDoc}` : o.goalDoc).replace(/'/g, `'\\''`)}'` : undefined;
   const askBaseIndex = o.goalDoc ? o.args.indexOf('--base') : -1;
@@ -598,8 +655,8 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
             // 📏 09-25: 6Gi 는 빠듯했다 — 자식이 6,127Mi 에 붙어 OOMKilled(137) → 12Gi.
             // 📏 09-27: 12Gi 에서도 OOMKilled 셋(구현 노드 도중) — 같은 골을 16Gi 로 다시 쏘니 끝까지 갔다(#20930) → 기본 16Gi.
-            //   요청(4Gi · POD_CHILD_REQUESTS)과 따로라 자리 계산은 안 바뀐다. ELANOUS_POD_MEMORY 로 조정.
-            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: o.memoryLimit ?? POD_MEMORY_DEFAULT, cpu: '4' } },
+            //   요청은 실측 피크별로 고르고 상한은 독립적으로 유지한다. ELANOUS_POD_MEMORY 로 상한 조정.
+            resources: { requests: { ...POD_CHILD_REQUESTS, memory: o.memoryRequest ?? POD_CHILD_REQUESTS.memory }, limits: { memory: o.memoryLimit ?? POD_MEMORY_DEFAULT, cpu: '4' } },
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
@@ -674,11 +731,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     let advice: PodMemoryAdvice | undefined;
     const explicitMemory = Boolean(parsePodMemoryTier(env.ELANOUS_POD_MEMORY_TIER) || GOAL_LINE.test(input.feature) || GOAL_LINE.test(parentGoal ?? ''));
     const useAdvice = options.adviseDefaults ?? getUserConfig().pod?.memory?.adviseDefaults === true;
-    if (useAdvice && !explicitMemory) {
-      try { advice = (options.memoryAdvice ?? readPodMemoryAdvice)(); }
-      catch (error) { debug.log('self-implement.pod', 'memory-advice-unavailable', { spaceId: input.spaceId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
-    }
-    const { limit: selectedMemoryLimit, tier: memoryTier, source: memorySource } = podMemoryLimitFor(input.feature, env, parentGoal, advice);
+    try { advice = (options.memoryAdvice ?? readPodMemoryAdvice)(); }
+    catch (error) { debug.log('self-implement.pod', 'memory-advice-unavailable', { spaceId: input.spaceId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+    const { limit: selectedMemoryLimit, tier: memoryTier, source: memorySource } = podMemoryLimitFor(input.feature, env, parentGoal, useAdvice && !explicitMemory ? advice : undefined);
+    const requestKind = broadPodTestWarning(input.feature) ? 'test' : goalTypeOf(input.feature)
+      ?? (parentGoal ? (broadPodTestWarning(parentGoal) ? 'test' : goalTypeOf(parentGoal)) : null);
     for (const [where, text] of [['feature', input.feature], ['parent-goal', parentGoal]] as const) {
       if (text && text.split(/\r?\n/u).some((line) => /Pod 메모리/u.test(line) && !GOAL_LINE.test(line))) {
         const reason = '한 줄 단독 `Pod 메모리: high|standard` 형식이 아님';
@@ -694,7 +751,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     let oomRetried = false;
     let retryFromChildRunId: string | undefined;
     let retryFromMemoryLimit: string | undefined;
-    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, memoryLimit, tier: memoryTier, source: memorySource,
+    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, goalType: requestKind, memoryLimit, tier: memoryTier, source: memorySource,
       ...(memorySource.startsWith('parent-') ? { inheritedFrom } : {}), ...(parentGoalUnreadable ? { parentGoal: 'unreadable' } : {}) });
     const childRunId = mintRunId();
     const executionKey = createHash('sha256').update(JSON.stringify({ spaceId: input.spaceId, feature: input.feature, base: input.base, autoMerge: input.autoMerge, autoReview: input.autoReview, openPr: input.openPr, draft: input.draft })).digest('hex');
@@ -1074,17 +1131,23 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const detailUntil = detail && (detail.scope === 'all' || detail.scope === parentRunId || detail.scope === launchRunId) && detail.until > Date.now()
           ? String(detail.until) : undefined;
         const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
-        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil
+        const seat = env.ELANOUS_HARNESS_SEAT;
+        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil || seat
           ? {
               ...armEnv,
               ...(detailUntil ? { ELANOUS_LIVE_DETAIL_UNTIL: detailUntil } : {}),
               ...(env.ELANOUS_DISPATCH_RECORDED === '1' ? { ELANOUS_DISPATCH_RECORDED: '1' } : {}),
+              ...(seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX' ? { ELANOUS_HARNESS_SEAT: seat } : {}),
               ...(grounding ? { [GROUNDING_URL_ENV]: groundingUrl! } : {}),
               ...(credentialRelay ? { [POD_CREDENTIAL_URL_ENV]: `${new URL(groundingUrl!).origin}${POD_CREDENTIAL_GROK_PATH}` } : {}),
               ...(githubRelay ? { [POD_GITHUB_CREDENTIAL_URL_ENV]: `${new URL(groundingUrl!).origin}${POD_CREDENTIAL_GITHUB_PATH}` } : {}),
             }
           : undefined;
-        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        const measuredRequest = podMemoryRequestFor(requestKind, advice);
+        const requestGi = memoryGi(measuredRequest);
+        const limitGi = memoryGi(memoryLimit);
+        const memoryRequest = requestGi !== null && limitGi !== null && requestGi > limitGi ? memoryLimit : measuredRequest;
+        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
         releaseAdmission?.applied?.(name, context, namespace);
@@ -1267,7 +1330,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             catch (error) { debug.log('harness.host-regate', 'unmeasured', { pr: prNumber, files: [], os: process.platform, failedStep: 'comment', detail: error instanceof Error ? error.message : String(error) }); }
           }
           const releaseHold = regate.failures[0]?.step === 'release-path-hold';
-          disposition = { ...disposition, stage: regate.passed ? 'merged' : releaseHold ? 'pr-opened' : 'host-regate-failed', merged: regate.passed, hostRegate: regate, ok: regate.passed || releaseHold };
+          const frozen = regate.status === 'frozen';
+          disposition = { ...disposition, stage: frozen || releaseHold ? 'pr-opened' : regate.passed ? 'merged' : 'host-regate-failed', merged: regate.passed && !frozen, hostRegate: regate, ok: regate.passed || releaseHold || frozen };
         }
         const childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
           ? lastPodChildFailure(logs) : null;

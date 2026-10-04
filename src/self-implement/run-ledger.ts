@@ -276,7 +276,7 @@ interface RunLedgerLookupTarget {
   targetName: string | null;
 }
 
-function resolveFederatedRunLedgerTargets(options: Pick<FederatedRunLedgerLookupOptions, 'includeTest' | 'targets'>): RunLedgerLookupTarget[] {
+export function resolveFederatedRunLedgerTargets(options: Pick<FederatedRunLedgerLookupOptions, 'includeTest' | 'targets'>): RunLedgerLookupTarget[] {
   const resolved = options.targets ? { targets: [...options.targets] } : resolveLogTargets({ all: true, includeTest: options.includeTest });
   if (resolved.error) throw new Error(resolved.error);
   const targets = new Map<string, string>();

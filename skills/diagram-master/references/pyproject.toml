@@ -3,7 +3,10 @@ name = "diagram-master"
 version = "2.0.0"
 description = "Diagram Master - unified renderer for all diagram engines"
 requires-python = ">=3.11"
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+python-engines = [
     "matplotlib>=3.9",
     "numpy>=1.26",
     "pillow>=10.0",

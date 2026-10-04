@@ -56,6 +56,9 @@ docs-land:
 verify:
   command: 'bun scripts/release-loop/verify-node.ts'
   timeout_ms: 1800000
+vault-note:
+  command: 'bun scripts/release-loop/vault-note-node.ts'
+  timeout_ms: 60000
 ops-upgrade:
   command: 'bun scripts/release-loop/ops-upgrade-node.ts'
   timeout_ms: 1200000

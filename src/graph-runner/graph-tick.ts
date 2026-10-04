@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
+import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { latestGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
@@ -30,6 +32,7 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
   const lock = join(root, 'graph-runs', graphId, '.tick.lock');
   mkdirSync(join(root, 'graph-runs', graphId), { recursive: true });
   const releaseRecovery = await acquireRecoveryGuard(`${lock}.recovery.guard`, graphId);
+  const tickId = `graph-${randomUUID()}`;
   let acquired = false;
   try {
     acquireTickLock(lock, graphId, options.deps?.isAlive ?? processAlive);
@@ -60,6 +63,7 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
   } finally {
     try {
       if (acquired) {
+        observeModelInputTokens({ scope: 'loop-tick', nodeKind: 'graph-tick', graphId, tickId });
         unlinkSync(join(lock, 'owner'));
         rmdirSync(lock);
       }

@@ -2,7 +2,7 @@ id: orchestrator
 version: 1.0.0
 kind: orchestrator
 role: docs/roles/OP.md
-graph: graphs/operate-loop.yaml
+graph: graphs/orchestrator/orchestrator.yaml
 orchestration:
   windows:
     - {at: '08:00', delegateTo: [op-seat, cmo-seat, tc-seat, ux-seat], fromLedger: release/checklist-and-seat-requests}

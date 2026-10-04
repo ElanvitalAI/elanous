@@ -31,8 +31,32 @@
 import { importerTestsNotInRunSet, type ImporterTestIndex } from './importer-test-index.js';
 import type { RouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { rankGateCallerCandidates } from './gate-candidate-ranking.js';
+import { debug } from '../debug/log.js';
 
 export const GATE_CALLER_TEST_LIMIT = 30;
+
+/** Command registries and their non-import-linked gate companions. Kept outside the caller cap. */
+const PAIRED_REGISTRY_TESTS = {
+  registries: [
+    'src/chat/index.ts',
+    'src/telegram-commands.ts',
+    'src/discord-slash-wire.ts',
+    'src/index.ts',
+  ],
+  tests: [
+    'src/maturity/feature-maturity.test.ts',
+    'src/maturity/tui-slash-maturity.test.ts',
+    'src/maturity/bot-command-maturity.test.ts',
+    'src/maturity/cli-maturity.test.ts',
+    'test/slash-filter.test.ts',
+    'test/bot-slash-parity.test.ts',
+  ],
+} as const;
+
+/** 게이트 로그와 PR Gate 절에서 공통으로 쓰는 미검증 경고(파일 목록은 자르지 않는다). */
+export function formatNoRelatedTestsWarning(files: readonly string[]): string {
+  return `⚠️ 동작 검증 0: ${files.join(', ')} — 사람 확인 필요`;
+}
 export type GateCallerReason = 'import' | 'route';
 
 /** 테스트 파일 판정(기존 `seams.ts` 정규식과 동일 — 어휘 분기 금지). */
@@ -225,7 +249,7 @@ export function deriveRelatedTests(
 /** 왜 이 범위로 돌았나 — 로그만으로 답할 수 있게 하는 관측 필드(제1원칙).
  *  ⚠️ 비-export 유지(리뷰 must-fix) — 소비처가 이 모듈 안뿐이다. 구조적 사용(호출부의 `scope.reason`)은
  *  export 없이도 성립하므로 불필요한 공개 surface 를 만들지 않는다. */
-type GateScopeReason = 'changed-tests' | 'derived' | 'no-changes' | 'docs-only' | 'no-related-tests' | 'unmeasured';
+type GateScopeReason = 'changed-tests' | 'derived' | 'paired-registry' | 'no-changes' | 'docs-only' | 'no-related-tests' | 'unmeasured';
 
 export type GateScopeMode = 'worktree' | 'postsync';
 
@@ -279,7 +303,7 @@ export function resolveGateScope(
   changed: readonly string[],
   exists: (path: string) => boolean,
   importerTestIndex?: ImporterTestIndex,
-  opts?: { mode?: GateScopeMode; isDeleted?: (path: string) => boolean; routeConsumerTestIndex?: RouteConsumerTestIndex },
+  opts?: { mode?: GateScopeMode; isDeleted?: (path: string) => boolean; routeConsumerTestIndex?: RouteConsumerTestIndex; runChanged?: readonly string[]; round?: number },
 ): GateScopeDecision {
   // ⚠️ **실존 검증(리뷰 must-fix 4R)** — `gitChangedFiles` 는 `git diff --name-only HEAD` 라
   //   **삭제·rename 前 경로도 포함**한다. 그걸 그대로 `testArgs` 로 넘기면 필터가 아무것도 매치하지
@@ -292,9 +316,9 @@ export function resolveGateScope(
   const missingTestFiles = changedTests.length - testFiles.length;
   const sourceFiles = userChanged.filter((f) => SOURCE_RE.test(f));
   const ignoredOutsideSrc = sourceFiles.filter((f) => !isTestFile(f) && !f.startsWith('src/')).length;
-  /** ⭐ **문서가 아닌 사용자 변경** — 이게 비어야 docs-only 다(소스 부재가 아니라 **문서 전부**여야 한다). */
-  const documentPaths = userChanged.filter(isDocPath);
-  const nonDoc = userChanged.filter((f) => !isDocPath(f));
+  /** ⭐ **문서가 아닌 사용자 변경** — 시험 파일도 명시적으로 docs-only 대상에서 제외한다. */
+  const documentPaths = userChanged.filter((f) => isDocPath(f) && !isTestFile(f));
+  const nonDoc = userChanged.filter((f) => isTestFile(f) || !isDocPath(f));
   /**
    * ⭐ **이 변경 중 무엇이 검증되지 않나** — 분기와 **무관하게** 계산한다(리뷰 must-fix 2026-07-27).
    *
@@ -323,6 +347,8 @@ export function resolveGateScope(
     if (runSet.includes(f)) return true;
     if (opts?.isDeleted?.(f)) return true;
     if (importerTestIndex && (importerTestIndex.testsBySource.get(f) ?? []).some((t) => runSet.includes(t))) return true;
+    if (PAIRED_REGISTRY_TESTS.registries.some((registry) => registry === f)
+      && PAIRED_REGISTRY_TESTS.tests.some((test) => runSet.includes(test))) return true;
     const related = relatedFor(f);
     return related.length > 0 && related.every((t) => runSet.includes(t));
   };
@@ -354,7 +380,9 @@ export function resolveGateScope(
     importerTestIndex?.testsBySource ?? new Map());
   const callerTests = candidates.slice(0, GATE_CALLER_TEST_LIMIT);
   const callerTestsOverflow = candidates.slice(GATE_CALLER_TEST_LIMIT);
-  const runWithCallers = (tests: readonly string[]) => [...new Set([...tests, ...callerTests.map(({ file }) => file)])];
+  const pairedRegistryTests = userChanged.some((file) => PAIRED_REGISTRY_TESTS.registries.some((registry) => registry === file))
+    ? PAIRED_REGISTRY_TESTS.tests.filter(exists) : [];
+  const runWithCallers = (tests: readonly string[]) => [...new Set([...tests, ...callerTests.map(({ file }) => file), ...pairedRegistryTests])];
   const base = { sourceFiles, documentPaths, ignoredOutsideSrc, missingTestFiles, elanousRuntimeArtifacts, callerTests, callerTestsOverflow,
     unverified: [] as readonly string[], derived: [] as readonly string[], pulledInRelatedTests: [] as readonly string[] };
   const withDocumentNonContribution = (runSet: readonly string[]) => ({
@@ -381,8 +409,17 @@ export function resolveGateScope(
   const derived = conventional;
   const runSet = runWithCallers(derived);
   if (runSet.length > 0) {
-    return { ...base, ...withDocumentNonContribution(runSet), derived, testArgs: runSet, unverified: unverifiedFor(runSet), importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: 'derived' };
+    return { ...base, ...withDocumentNonContribution(runSet), derived, testArgs: runSet, unverified: unverifiedFor(runSet), importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: derived.length === 0 && callerTests.length === 0 ? 'paired-registry' : 'derived' };
   }
-  // 실행 집합이 비었으므로 비문서 전부가 미검증이다.
-  return { ...base, ...withDocumentNonContribution([]), unverified: unverifiedFor([]), importerTestsNotRun: observationFor([]), skipTestStep: true, reason: 'no-related-tests' };
+  // 마지막 라운드에 짝이 없어도 원 PR의 앞 라운드에서 편집한 소스·시험을 같은 규칙으로 한 번 더 잰다.
+  if (opts?.runChanged?.some((file) => !changed.includes(file))) {
+    const wholeRun = resolveGateScope([...new Set([...changed, ...opts.runChanged])], exists, importerTestIndex,
+      { ...opts, runChanged: undefined });
+    return wholeRun;
+  }
+  const unverified = unverifiedFor([]);
+  try {
+    debug.log('self-implement.gate-scope', 'no-related-tests', { files: unverified, round: opts?.round ?? null }, { level: 'warn' });
+  } catch { /* 관측 장애는 게이트 판정을 바꾸지 않는다. */ }
+  return { ...base, ...withDocumentNonContribution([]), unverified, importerTestsNotRun: observationFor([]), skipTestStep: true, reason: 'no-related-tests' };
 }

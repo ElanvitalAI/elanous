@@ -2,14 +2,16 @@ import { execFileSync } from 'node:child_process';
 import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { constants as osConstants } from 'node:os';
-import { resolve, sep } from 'node:path';
+import { constants as osConstants, hostname } from 'node:os';
+import { basename, dirname, resolve, sep } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
 import { normalizeRunId } from './harness-space.js';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { detectBursts, formatIncidentBurstWarning, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { lookupGoal, type GoalLookupOptions, type GoalLookupResult } from '../self-implement/goal-lookup.js';
+import { archiveGoals, type GoalArchiveOptions } from '../self-implement/goal-archive.js';
+import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
 import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, type GoalType } from '../self-implement/goal-author.js';
@@ -29,7 +31,7 @@ import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
-import { addHarnessQueue, listHarnessQueue, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
+import { addHarnessQueue, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps, type QueueSeat } from './harness-queue.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
@@ -92,6 +94,7 @@ export class HarnessCliInputError extends Error {
 }
 
 export interface HarnessAskSayOptions {
+  seat?: QueueSeat;
   json?: boolean;
   base?: string;
   target?: string;
@@ -253,6 +256,7 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--target <path>', 'self: harness가 작업할 레포 또는 디렉터리(self-mission 전용)')
     .option('--yes', 'git 아닌 프로젝트에 git init 및 첫 커밋을 만들도록 동의')
     .option('--correlation <id>', '요청과 런을 잇는 불투명 correlation 값')
+    .addOption(new Option('--seat <seat>', '런 귀속 자리 (OP|TC|MK|UX)').choices(['OP', 'TC', 'MK', 'UX']))
     .addOption(new Option('--goal-type <type>', `골 종류 (${GOAL_TYPES.join('|')})`).choices([...GOAL_TYPES]))
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
     .option('--force-gate', '같은 골 실행 중 막힘을 명시 요청으로 우회(관측에 남음; 예산 막힘은 우회 불가)')
@@ -284,6 +288,7 @@ function registerHarnessMissionOptions(command: Command): Command {
 function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSayOptions {
   return {
     ...(opts.json ? { json: true } : {}),
+    ...(opts.seat !== undefined ? { seat: opts.seat } : {}),
     ...(opts.base !== undefined ? { base: opts.base } : {}),
     ...(opts.target !== undefined ? { target: opts.target } : {}),
     ...(opts.yes === true ? { yes: true } : {}),
@@ -328,7 +333,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; seat?: QueueSeat };
 function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
   const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
   debug.log('harness.substrate', 'resolved', resolved);
@@ -338,7 +343,17 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
   return resolved;
 }
 type PodExit = { status: number | null; signal?: string | null };
-type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown';
+type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown'
+  | 'pod-error' | 'launch-gate-blocked' | 'ENOBUFS' | 'OOMKilled';
+
+function unknownPodExitTailReason(output: string): PodExitReason | undefined {
+  const tail = output.slice(-16_000);
+  if (/\bOOMKilled\b/i.test(tail)) return 'OOMKilled';
+  if (/\bENOBUFS\b/i.test(tail)) return 'ENOBUFS';
+  if (/launch gate[^\r\n]*blocked|blocked[^\r\n]*launch gate/i.test(tail)) return 'launch-gate-blocked';
+  if (/\bpod-error\b/i.test(tail)) return 'pod-error';
+  return undefined;
+}
 /** GitHub lists at most this many files for one pull request; a list that reaches it is not provably complete. */
 export const GITHUB_PR_FILES_LIST_CAP = 3000;
 const STOPPING_SUPERVISOR_VERDICTS = new Set(['UNCONVERGEABLE', 'CONTRACT-CONFLICT']);
@@ -441,34 +456,47 @@ export function classifyHarnessPodExit(
     try { applied = (deps.hasJobApplied ?? hasHarnessPodJobApplied)(runId, output); } catch { /* unknown */ }
     const noLaunch = ledgerReadable && !ledger?.some((entry) => LAUNCH_EVIDENCE_EVENTS.has(entry.event))
       && applied === false && !pr;
-    reason = noLaunch ? 'no-launch' : 'unknown';
+    reason = noLaunch ? 'no-launch' : unknownPodExitTailReason(output) ?? 'unknown';
     line = noLaunch
       ? 'Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'
-      : 'Pod 실행 여부 또는 종료 이유를 확인하지 못했다';
+      : reason === 'unknown' ? 'Pod 실행 여부 또는 종료 이유를 확인하지 못했다'
+        : `Pod 종료 출력에서 확인한 원인: ${reason}`;
   }
   try { debug.log('harness.pod', 'exit-classified', { runId, reason, status: exit.status, signal: signal ?? null }); } catch { /* observation is fail-soft */ }
   return { reason, lines: [line, ...(pr ? [`PR 이 남아 있다: ${pr}`] : [])] };
 }
 
 /** The classified status is the same exit handed to the launcher; ledger failure is never an exit failure. */
-export function recordClassifiedHarnessPodExit(runId: string | undefined, reason: string, status: number): void {
+export function recordClassifiedHarnessPodExit(runId: string | undefined, reason: string, status: number,
+  context: { entrance?: string; seat?: string; output?: string } = {}): void {
   if (!runId) return;
   try {
     const signal = status > 128
       ? Object.entries(osConstants.signals).find(([, number]) => number === status - 128)?.[0] ?? null : null;
-    recordRunExit({ runId, reason, status, signal, at: new Date().toISOString() }, effectiveInstanceRoot());
+    const cwd = process.cwd();
+    const seat = context.seat ?? process.env.ELANOUS_HARNESS_SEAT;
+    recordRunExit({ runId, reason, status, signal, at: new Date().toISOString(),
+      ...(context.entrance ? { entrance: context.entrance } : {}),
+      ...(['OP', 'TC', 'MK', 'UX'].includes(seat ?? '') ? { seat } : {}),
+      cwd: `${basename(dirname(cwd))}/${basename(cwd)}`, hostname: hostname().split('.')[0]!, pid: process.pid,
+      ...(context.output ? { lastLines: incidentLastLines(context.output) } : {}),
+    }, effectiveInstanceRoot());
   } catch { /* incident writes cannot change Pod output or exit */ }
 }
 
 /** Every Pod launch entrance (harness ask/say · dev ask --substrate pod) warns once after a recent burst; it never blocks the launch. */
 export function warnRecentIncidentBurst(
   root: string = effectiveInstanceRoot(), now: Date = new Date(), write: (line: string) => void = (line) => console.error(line),
+  context: { seat?: string; entrance?: string } = {},
 ): boolean {
   try {
-    const burst = recentBurst(root, now);
+    const seat = context.seat ?? process.env.ELANOUS_HARNESS_SEAT;
+    const burst = recentBurst(root, now, { entrance: context.entrance,
+      ...(['OP', 'TC', 'MK', 'UX'].includes(seat ?? '') ? { seat } : {}) });
     if (!burst) return false;
     write(formatIncidentBurstWarning(burst));
-    try { debug.log('harness.incident', 'burst', { reason: burst.reason, count: burst.count }); } catch { /* observation is fail-soft */ }
+    try { debug.log('harness.incident', 'burst', { reason: burst.reason, count: burst.count,
+      ...(burst.seat ? { seat: burst.seat } : {}), ...(burst.entrance ? { entrance: burst.entrance } : {}) }); } catch { /* observation is fail-soft */ }
     return true;
   } catch { return false; /* incident reads cannot block a launch */ }
 }
@@ -540,7 +568,8 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     process.exitCode = 2;
     return;
   }
-  warnRecentIncidentBurst();
+  warnRecentIncidentBurst(effectiveInstanceRoot(), new Date(), (line) => console.error(line),
+    { entrance, seat: o.seat });
   let dispatchRecorded = false;
   try {
     const goalText = entrance === 'cli-harness-ask' ? readFileSync(input, 'utf8') : input;
@@ -559,14 +588,15 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
   let output = '';
   let runId: string | undefined;
-  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) },
+  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
     } });
   if (status !== 0) {
     const classified = classifyHarnessPodExit({ status }, output, { ...(runId ? { runId } : {}) });
-    recordClassifiedHarnessPodExit(runId ?? harnessPodRunId(output), classified.reason, status);
+    recordClassifiedHarnessPodExit(runId ?? harnessPodRunId(output), classified.reason, status,
+      { entrance, seat: o.seat, output });
     for (const line of classified.lines) console.error(line);
     process.exitCode = status;
   }
@@ -634,7 +664,7 @@ async function dispatchHarnessAskSay(
     readonly wouldStart: string;
     readonly goalPath?: string;
   },
-  dispatch: (resolved: ResolvedHarnessSubstrate) => Promise<void>,
+  dispatch: (resolved: ResolvedHarnessSubstrate, stampedOpts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => Promise<void>,
   gate: PreLaunchGateDeps & { readBudget?: () => Promise<BudgetDecision | 'unknown'> } = {},
 ): Promise<void> {
   await runInjectedHarnessHandler(async () => {
@@ -644,6 +674,25 @@ async function dispatchHarnessAskSay(
       printHarnessLaunchDryRun(dryRunPreview);
       return;
     }
+    // Resolve the launch directory once; descendants and the checkpoint retain the same identity.
+    const queued = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH && process.env.ELANOUS_HARNESS_SEAT;
+    const queueSeat = queued === 'OP' || queued === 'TC' || queued === 'MK' || queued === 'UX' ? queued : undefined;
+    const assigned = opts.seat ?? queueSeat ?? queueSeatForCwd(process.cwd(), getUserConfig().loops?.orchestrator?.seatTrees);
+    const inheritedSeat = process.env.ELANOUS_HARNESS_SEAT;
+    const podSeat = resolved.substrate === 'pod' && ['OP', 'TC', 'MK', 'UX'].includes(inheritedSeat ?? '')
+      ? inheritedSeat as QueueSeat : undefined;
+    const stampedSeat = resolved.substrate === 'pod' ? opts.seat ?? queueSeat ?? podSeat ?? assigned : assigned;
+    const stampedOpts = stampedSeat ? { ...opts, seat: stampedSeat } : opts;
+    const launch = async () => {
+      const previous = process.env.ELANOUS_HARNESS_SEAT;
+      if (stampedSeat) process.env.ELANOUS_HARNESS_SEAT = stampedSeat;
+      else delete process.env.ELANOUS_HARNESS_SEAT;
+      try { await dispatch(resolved, stampedOpts); }
+      finally {
+        if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+        else process.env.ELANOUS_HARNESS_SEAT = previous;
+      }
+    };
     // Without a GoalId, match the request to a live run's exact verbatim original ask; still check budget.
     let identity = dryRunPreview.input;
     let goalId: string | null = null;
@@ -658,7 +707,7 @@ async function dispatchHarnessAskSay(
     // CLI wiring tests time out on them. Gate tests inject deps or opt in with ELANOUS_LAUNCH_GATE_LIVE=1.
     if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0 && process.env.ELANOUS_LAUNCH_GATE_LIVE !== '1') {
       try { debug.log('execution-loop.launch-gate', 'skipped-test-env', { goalId }); } catch { /* observation is fail-soft */ }
-      await dispatch(resolved);
+      await launch();
       return;
     }
     const budget = await (gate.readBudget ?? (() => readHarnessLaunchBudget(opts)))();
@@ -673,7 +722,7 @@ async function dispatchHarnessAskSay(
       ...(decision.budget === 'unknown' ? ['budget unknown'] : decision.budget.action === 'next-provider' ? [decision.budget.reasons.join(' · ') || 'next-provider'] : []),
     ];
     if (warnings.length > 0) console.error(`⚠️ launch gate: ${warnings.join(' · ').split(/\r?\n/, 1)[0]}`);
-    await dispatch(resolved);
+    await launch();
   });
 }
 
@@ -1606,6 +1655,30 @@ const executeGh: GhExecute = (args) => execFileSync('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
 });
 
+/** Merge-time adapter: reuse the sweep's GitHub inventory and worktree liveness without a second triage implementation. */
+export async function supersedeMergedGoalDrafts(
+  number: number, cwd: string,
+  execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand,
+): Promise<void> {
+  const remote = git(cwd, ['config', '--get', 'remote.origin.url']);
+  const repository = remote.status === 0 ? githubRemoteRepository(remote.stdout) : undefined;
+  if (!repository) throw new Error('Merge repository unavailable');
+  // The PR can change between open and merge; never authorize a close using locally reconstructed metadata.
+  const pr = ghJson<GithubPull>(['api', `repos/${repository}/pulls/${number}`], execute);
+  if (!pr || pr.number !== number || pr.state !== 'closed' || !pr.merged_at || !pr.title?.trim()
+    || !pr.head?.ref?.trim() || !pr.created_at || !Array.isArray(pr.labels)
+    || !Number.isFinite(Date.parse(pr.created_at)) || !Number.isFinite(Date.parse(pr.merged_at))
+    || Date.parse(pr.merged_at) < Date.parse(pr.created_at)) {
+    throw new Error('Merged PR metadata unavailable');
+  }
+  const merged: SweepMergedPr & { createdAt: string; mergedAt: string } = {
+    number: pr.number, title: pr.title, body: pr.body ?? undefined, branch: pr.head.ref,
+    createdAt: pr.created_at, mergedAt: pr.merged_at,
+  };
+  const { supersedeDraftsOnMerge } = await import('../self-dev/draft-sweep.js');
+  await supersedeDraftsOnMerge({ repository, merged, adapters: githubDraftSweepAdapters(execute, git, cwd) });
+}
+
 function ghJson<T>(args: string[], execute: GhExecute): T {
   return JSON.parse(execute(args)) as T;
 }
@@ -1670,7 +1743,7 @@ function githubRemoteRepository(url: string): string | undefined {
   return match?.[1];
 }
 
-export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand): DraftSweepAdapters {
+export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand, cwd = process.cwd()): DraftSweepAdapters {
   const inventory = async (repository: string, state: 'open' | 'closed'): Promise<GithubPull[]> => {
     // ⛔ A large repository has tens of thousands of closed PRs (2026-09-28: 21k → «exceeded pagination limit», no sweep at all).
     //    Merged twins only matter after the oldest open draft was opened, so the closed listing stops at that time.
@@ -1763,6 +1836,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     return draftSweepRunStatus(ledgerMatches, running, repository, draft.number);
   };
   return {
+    getPrFiles: async (repository, number) => filesFor(repository, number),
     listDrafts: async (page, perPage, repository): Promise<SweepDraft[]> =>
       (await listed(open, repository, 'open')).filter((pr) => pr.draft)
         .slice((page - 1) * perPage, page * perPage)
@@ -1811,7 +1885,6 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       } finally { store.close(); }
     },
     listLiveBranches: async (repository) => {
-      const cwd = process.cwd();
       const remote = git(cwd, ['config', '--get', 'remote.origin.url']);
       if (remote.status !== 0 || githubRemoteRepository(remote.stdout)?.toLowerCase() !== repository.toLowerCase()) {
         return undefined;
@@ -1918,6 +1991,55 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
         process.exitCode = 1;
       }
     });
+}
+
+function renderHarnessGoal(result: GoalLookupResult, universe: '운영' | '시험'): string {
+  const matchedRun = result.runState?.results.find((entry) => entry.runId === result.runId);
+  return [
+    `골: ${result.goalBody?.split(/\r?\n/, 1)[0] || '골 문서에 없음'}`,
+    `runId: ${result.runId ?? '원장에 없음'}`,
+    `칸 id: ${result.kanId ?? '기록 없음'}`,
+    `PR: ${result.record?.prNumber != null ? `#${result.record.prNumber}` : '기록 없음'}`,
+    `stage/결과: ${result.record?.stage ?? '기록 없음'} / ${result.record?.outcome ?? '기록 없음'}`,
+    `종결 사유: ${result.runState?.supervisorStopReason ?? matchedRun?.error?.message ?? '기록 없음'}`,
+    `찾은 우주: ${universe}`,
+    `원장: ${result.runState ? '찾음' : '원장에 없음'}`,
+    `골 문서: ${result.goalFile ? '찾음' : '골 문서에 없음'}`,
+  ].join('\n');
+}
+
+function installHarnessGoalCommand(harnessCmd: Command, options?: GoalLookupOptions, archiveOptions?: GoalArchiveOptions): Command {
+  const goal = harnessCmd.command('goal').usage('<reference> | archive [--before <date>] [--apply]')
+    .description('골 문서와 실행 결과를 조회하거나 보관한다');
+  goal.command('archive')
+    .description('종료된 골 문서를 미리 보거나 상태 루트에 보관한다 — 저장소는 건드리지 않고 지울 목록(filesForPr)만 낸다')
+    .option('--before <date>', '완료 시각이 이 YYYY-MM-DD 이전인 골만')
+    .option('--apply', '상태 루트에 보관 복사·색인 (저장소 삭제·스테이지·커밋 없음 · 지우기는 filesForPr 로 사람이 PR)')
+    .option('--trust-doc-record', '런 원장이 없을 때 문서에 적힌 종료 실행 기록을 신뢰')
+    .action((opts: { before?: string; apply?: boolean; trustDocRecord?: boolean }) => {
+      try {
+        const result = archiveGoals({ ...archiveOptions, before: opts.before, apply: opts.apply, trustDocRecord: opts.trustDocRecord });
+        console.log(JSON.stringify(result));
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+  goal.command('show <reference>', { isDefault: true })
+    .description('PR 번호 또는 runId 로 골 문서와 실행 결과를 조회한다 (읽기 전용)')
+    .option('--json', 'GoalLookupResult 그대로 출력')
+    .action((reference: string, opts: { json?: boolean }) => {
+      try {
+        const result = lookupGoal(reference, options);
+        const universe = effectiveInstanceRoot() === prodInstanceRoot() ? '운영' : '시험';
+        console.log(opts.json ? JSON.stringify(result) : renderHarnessGoal(result, universe));
+        if (!result.goalFile || !result.runState) process.exitCode = 1;
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+  return goal;
 }
 
 function installHarnessBudgetCommand(harnessCmd: Command): Command {
@@ -2106,6 +2228,8 @@ export interface HarnessCliCommandDeps {
   processObservation?: HarnessProcessObservationDeps;
   draftSweep?: HarnessDraftSweepDeps;
   queue?: HarnessQueueDeps;
+  goalLookup?: GoalLookupOptions;
+  goalArchive?: GoalArchiveOptions;
   ask?: HarnessAskHandler;
   say?: HarnessSayHandler;
   /** Observe-only Pod host dispatch seam. */
@@ -2146,8 +2270,8 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
         const bursts = detectBursts(rows).filter((burst) => Date.parse(burst.lastAt) >= now - since * 60_000 && Date.parse(burst.lastAt) <= now);
         if (opts.json) console.log(JSON.stringify({ rows: selected, bursts }));
         else {
-          for (const row of selected) console.log(`${row.at} run ${row.runId} · ${row.reason} · status=${row.status} signal=${row.signal ?? '-'}`);
-          for (const burst of bursts) console.log(`${burst.firstAt}–${burst.lastAt} 묶음 ${burst.reason} ×${burst.count} · ${burst.runIds.join(', ')}`);
+          for (const row of selected) console.log(`${row.at} run ${row.runId} · seat=${row.seat ?? '-'} entrance=${row.entrance ?? '-'} reason=${row.reason} · status=${row.status} signal=${row.signal ?? '-'}`);
+          for (const burst of bursts) console.log(`${burst.firstAt}–${burst.lastAt} 묶음 ${burst.reason} ×${burst.count} · seat=${burst.seat ?? '-'} entrance=${burst.entrance ?? '-'} · ${burst.runIds.join(', ')}`);
         }
       } catch (error) {
         console.error(humanErrorLine(error));
@@ -2157,6 +2281,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installDeliverableVerifyCliCommand(harnessCmd, deps.deliverableVerify);
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
   installHarnessBudgetCommand(harnessCmd);
+  installHarnessGoalCommand(harnessCmd, deps.goalLookup, deps.goalArchive);
   installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
   const queue = harnessCmd.command('queue').description('자리별 영속 발사 대기열');
   const queueDeps = deps.queue ?? {};
@@ -2197,13 +2322,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          (resolved) => {
+          (resolved, stampedOpts) => {
             if (resolved.substrate !== 'pod' && (opts as { source?: string }).source !== undefined) {
               console.error('`--source` 는 `--substrate pod` 와 함께');
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts));
           },
           deps.launchGate,
         );
@@ -2222,13 +2347,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             wouldStart: '골 문서 · 워크트리 · 브랜치 · 자식 · 파이프라인',
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          (resolved) => {
+          (resolved, stampedOpts) => {
             if (resolved.substrate !== 'pod' && (opts as { source?: string }).source !== undefined) {
               console.error('`--source` 는 `--substrate pod` 와 함께');
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask) : say(sentence, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask) : say(sentence, normalizeHarnessAskSayOptions(stampedOpts));
           },
           deps.launchGate,
         );

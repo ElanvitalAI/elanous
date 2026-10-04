@@ -5,6 +5,7 @@ import type { DeployVerifyFinding } from '../harness/browser-verify.js';
 import type { SelfDevJobResult } from './orchestrate.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
+import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 
 export interface SupervisorRound {
   round: number;
@@ -410,6 +411,7 @@ export interface SuperviseRunOptions {
   onRound?: (results: readonly SupervisorJobResult[]) => void;
   runStore?: { runId?: string; operatorDir?: string; dir?: string; isolatedDir?: string };
   observe?: (event: string, data: Record<string, unknown>) => void;
+  sweepPendingMerges?: typeof sweepFrozenMerges;
   observeDeliverables?: () => Promise<{
     readonly deployFindings: ReadonlyMap<string, { target: string; findings?: readonly DeployVerifyFinding[] | readonly unknown[] }>;
     readonly unmeasured: readonly unknown[];
@@ -432,6 +434,12 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
   let history: SupervisorRound[] = [];
 
   for (;;) {
+    try {
+      const resumed = await (opts.sweepPendingMerges ?? sweepFrozenMerges)();
+      if (resumed.pending || resumed.merged) opts.observe?.('frozen-merges', resumed);
+    } catch (error) {
+      try { debug.log('harness.merge', 'resume-failed', { error: String(error) }); } catch { /* observation must not interrupt supervision */ }
+    }
     if (opts.enrich) results = [...opts.enrich(results)];
 
     let observed: {

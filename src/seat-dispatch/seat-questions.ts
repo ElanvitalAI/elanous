@@ -73,6 +73,64 @@ export function seatQuestions(root: string, seat: SeatId): Message[] {
   } finally { store.close(); }
 }
 
+export type CrossCheckJudgment = { agree: boolean; note: string; resolves: boolean };
+
+export function askCrossCheck(root: string, from: SeatId, to: SeatId, draft: string, key: string): Message {
+  if (from === to || !draft.trim() || !key.trim()) throw new Error('cross-check requires another seat, a draft and a key');
+  return deliverOnce(root, key, { from, to, body: draft.trim(), kind: 'seat-xcheck' });
+}
+
+export function seatCrossChecks(root: string, seat: SeatId): Message[] {
+  const store = storeAt(root);
+  try {
+    const found: Message[] = [];
+    let cursor = 0;
+    while (true) {
+      const batch = store.listByRecipient(seat, cursor, 1000);
+      found.push(...batch.filter((message) => message.kind === 'seat-xcheck' && isSeatId(message.from) && message.from !== seat));
+      if (batch.length < 1000) return found;
+      cursor = batch[batch.length - 1]!.id;
+    }
+  } finally { store.close(); }
+}
+
+export function answerCrossCheck(root: string, question: Message, judgment: CrossCheckJudgment): Message {
+  if (question.kind !== 'seat-xcheck' || !isSeatId(question.to) || !isSeatId(question.from)
+    || typeof judgment.agree !== 'boolean' || typeof judgment.resolves !== 'boolean'
+    || typeof judgment.note !== 'string' || !judgment.note.trim()) throw new Error('invalid cross-check answer');
+  return deliverOnce(root, `xcheck-answer:${question.id}`, {
+    from: question.to, to: question.from,
+    body: JSON.stringify({ questionId: question.id, agree: judgment.agree, note: judgment.note.trim(), resolves: judgment.resolves }),
+    kind: 'seat-xcheck-answer',
+  });
+}
+
+export function crossCheckAnswer(root: string, question: Message): CrossCheckJudgment | null {
+  if (question.kind !== 'seat-xcheck' || !isSeatId(question.to) || !isSeatId(question.from)) return null;
+  const store = storeAt(root);
+  try {
+    let cursor = 0;
+    while (true) {
+      const batch = store.listByRecipient(question.from, cursor, 1000);
+      for (const message of batch) {
+        if (message.kind !== 'seat-xcheck-answer' || message.from !== question.to) continue;
+        try {
+          const value: unknown = JSON.parse(message.body);
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            const answer = value as Record<string, unknown>;
+            if (answer.questionId === question.id && typeof answer.agree === 'boolean'
+              && typeof answer.resolves === 'boolean' && typeof answer.note === 'string' && answer.note.trim()) {
+              return { agree: answer.agree, note: answer.note, resolves: answer.resolves };
+            }
+          }
+        } catch { /* Ignore unrelated malformed messages. */ }
+      }
+      if (batch.length < 1000) return null;
+      cursor = batch[batch.length - 1]!.id;
+    }
+  } finally { store.close(); }
+}
+
 export function answerSeat(root: string, question: Message, answer: string): Message {
   if (question.kind !== 'seat-question' || !isSeatId(question.to) || !isSeatId(question.from) || !answer.trim()) {
     throw new Error('invalid seat answer');

@@ -5,6 +5,7 @@ import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { SeatRequestError } from '@/lib/daemon-client';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
 import { ChatInput } from './ChatInput';
+import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -45,6 +46,8 @@ async function setup(initial: AttachmentMeta[], outcome: (request: { seat?: stri
   const error = () => tree.root.findAllByProps({ role: 'alert' }).map((node) => node.children.join('')).join('');
   return { tree, requests, chats, type, send, chip, chips, error };
 }
+
+test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 test('selected seat sends queued attachment id; receipt count appears and success clears chips', async () => {
   const ui = await setup([attachment('file-1')], async (request) => ({

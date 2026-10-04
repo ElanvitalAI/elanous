@@ -1090,7 +1090,7 @@ describe('PWA :wish', () => {
     expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/task-cards/wish');
     expect(calls[0]!.init?.method).toBe('POST');
     expect(calls[0]!.init?.headers).toEqual({ 'content-type': 'application/json', authorization: 'Bearer tok' });
-    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ text: '새 소원', ref: expect.stringMatching(/^session-1:\d+:[0-9a-f-]{36}$/) });
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ text: '새 소원', sessionId: 'session-1', ref: expect.stringMatching(/^session-1:\d+:[0-9a-f-]{36}$/) });
     expect((await dispatchMeta(':help', ctx))?.text).toContain(':wish');
     expect((await dispatchMeta(':help', ctx))?.text).toContain(':wish --retry <작업 ID>');
   });

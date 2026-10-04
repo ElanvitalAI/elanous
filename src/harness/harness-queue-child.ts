@@ -3,9 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { renameSync, writeFileSync } from 'node:fs';
 
 /** Only a confirmed terminal observation allows reconciliation to release an uncertain launch. */
-export function writeHarnessQueueReceipt(receiptPath: string, state: 'started' | 'finished' | 'not-started'): void {
+export function writeHarnessQueueReceipt(receiptPath: string, state: 'started' | 'finished' | 'not-started', exitCode?: number): void {
   const temp = `${receiptPath}.${randomUUID()}.tmp`;
-  writeFileSync(temp, JSON.stringify({ state, at: new Date().toISOString() }), { flag: 'wx', mode: 0o600 });
+  writeFileSync(temp, JSON.stringify({ state, at: new Date().toISOString(), ...(exitCode === undefined ? {} : { exitCode }) }), { flag: 'wx', mode: 0o600 });
   renameSync(temp, receiptPath);
 }
 
@@ -22,7 +22,7 @@ export async function runHarnessQueueChild(
     child.once('spawn', () => {
       started = true;
       record('started');
-      child.once('exit', (code) => { record('finished'); done(code ?? 1); });
+      child.once('exit', (code) => { writeHarnessQueueReceipt(receiptPath, 'finished', code ?? 1); done(code ?? 1); });
     });
     child.once('error', () => {
       if (!started) { record('not-started'); done(1); }

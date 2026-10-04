@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import { join, resolve } from 'node:path';
 import { scanWishFolder } from '../intake-plane/wish-folder.js';
-import { LINEAR_WISH_KEY_MISSING, scanLinearWishes } from '../intake-plane/linear-wish.js';
+import { LINEAR_WISH_KEY_MISSING, scanLinearWishes, suggestLinearWishes } from '../intake-plane/linear-wish.js';
 import type { fetchLinearIssues } from '../connectors/linear.js';
 import { CardStore, type TaskCard } from './card-store.js';
 
@@ -145,10 +145,18 @@ export function registerCardCommand(program: Command, deps: CardCliDeps = {}): C
     .description('Create wish cards from open Linear issues')
     .requiredOption('--team <key>', 'Linear team key')
     .option('--label <name>', 'Wish label or title prefix', 'wish')
+    .option('--suggest', 'Suggest wish labels without writing to Linear or creating cards')
     .option('--json', 'Output JSON')
-    .action(async (options: { team: string; label: string; json?: boolean }) => {
+    .action(async (options: { team: string; label: string; suggest?: boolean; json?: boolean }) => {
       let store: CardStore | undefined;
       try {
+        if (options.suggest) {
+          const suggestions = await suggestLinearWishes({ teamKey: options.team,
+            deps: { getApiKey: deps.getApiKey, fetchIssues: deps.fetchIssues } });
+          write(options.json ? `${JSON.stringify(suggestions)}\n` :
+            suggestions.map(item => `${item.identifier}\t${item.title}\t${item.reason}\n`).join(''));
+          return;
+        }
         store = createStore();
         const result = await scanLinearWishes({ teamKey: options.team, label: options.label, store,
           deps: { getApiKey: deps.getApiKey, fetchIssues: deps.fetchIssues } });

@@ -63,6 +63,8 @@ import { registerUsageCommand } from './cli/usage-cli.js';
 import { registerLiveCommands } from './cli/live-cli.js';
 import { registerResearchCommand } from './cli/research-cli.js';
 import { registerReleaseCommands } from './cli/release-cli.js';
+import { registerFreezeCommands } from './cli/freeze-cli.js';
+import { registerFlowCommands } from './cli/flow-cli.js';
 import { registerModelWatchCommand } from './cli/model-watch-cli.js';
 import { registerIntakeCommands } from './cli/intake-cli.js';
 import { registerTasksCommands } from './cli/tasks-cli.js';
@@ -869,6 +871,8 @@ registerUsageCommand(program);
 registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
+registerFreezeCommands(program);
+registerFlowCommands(program);
 // HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
 const hqCmd = program.command('hq').description('본부 임대 — 하트비트·중재·단일 작성자 래퍼');
 async function hqSink(): Promise<void> {
@@ -896,6 +900,19 @@ hqCmd.command('lease').argument('<action>', 'acquire|renew|status|release')
       else console.log(result.ok ? `hq lease ${action}: ok${'record' in result && result.record ? ` · holder ${result.record.holder} · generation ${result.record.generation}` : ''}` : `hq lease ${action}: refused — ${'reason' in result ? result.reason : ''}`);
       if (!result.ok) process.exitCode = 2;
     } catch (error) { if (error instanceof CliUserError) throw error; console.error(`hq lease: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('promote').description('HQ 승격 런북 (기본 dry-run · --apply 일 때만 변경)')
+  .requiredOption('--to <host>', '승격 대상 호스트')
+  .option('--apply', '대기 사본을 승격 우주에 반영하고 넥서스·rescue 실행')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { to: string; apply?: boolean; json?: boolean }) => {
+    try {
+      const { promoteHq, formatPromote } = await import('./hq/promote.js');
+      const result = promoteHq(opts.to, opts.apply === true);
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else console.log(formatPromote(result));
+      if (!result.ok) process.exitCode = 1;
+    } catch (error) { console.error(`hq promote: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 hqCmd.command('heartbeat').description('보유자는 갱신 · 아니면 대기(보유자에 닿는지 중재자에 보고)').option('--json', 'JSON 출력')
   .action(async (opts: { json?: boolean }) => {
@@ -3034,6 +3051,8 @@ export async function runHarnessOrchestrateExecution(
     prior,
     goals,
     pid,
+    ...(['OP', 'TC', 'MK', 'UX'].includes(process.env.ELANOUS_HARNESS_SEAT ?? '')
+      ? { seat: process.env.ELANOUS_HARNESS_SEAT as SelfDevRunState['seat'] } : {}),
     runIdSource,
     now,
     onPersistenceFailure: reportPersistenceFailure,
@@ -3151,7 +3170,7 @@ contextCmd.command('condense')
       if (!/^[1-9]\d*h$/.test(opts.since)) throw new Error('--since requires positive hours, e.g. 24h');
       const { runContextCondense } = await import('./context-bus/condense.js');
       const report = await runContextCondense({ hours: Number(opts.since.slice(0, -1)), apply: opts.apply === true });
-      await writeStdoutJson(JSON.stringify({ since: report.since, until: report.until, cards: report.cards, conflicts: report.conflicts, skipped: report.skipped, folded: report.folded, ...(report.applied ? { applied: report.applied } : {}) }) + '\n');
+      await writeStdoutJson(JSON.stringify({ since: report.since, until: report.until, cards: report.cards, conflicts: report.conflicts, skipped: report.skipped, folded: report.folded, droppedHarnessChild: report.droppedHarnessChild, funnel: report.funnel, ...(report.applied ? { applied: report.applied } : {}) }) + '\n');
       if (!opts.json) await writeStdoutFully(report.markdown);
     } catch (error) {
       console.error(`context condense: ${error instanceof Error ? error.message : String(error)}`);
@@ -4300,6 +4319,35 @@ selfCmd
     } catch (e) { console.error(`⛔ ${(e as Error).message}`); process.exitCode = 1; }
   });
 
+export async function announceLaunchQuotaPolicy(input: {
+  runId: string;
+  current: import('./oauth/codex-quota-policy.js').ResolvedCodexQuotaPolicy;
+  universe: { kind: 'prod' | 'test'; root: string };
+  production?: import('./oauth/codex-quota-policy.js').ResolvedCodexQuotaPolicy;
+}): Promise<{ line: string; warning?: string; quotaPolicy: {
+  policy: import('./oauth/codex-quota-policy.js').CodexQuotaPolicy;
+  source: import('./oauth/codex-quota-policy.js').ResolvedCodexQuotaPolicy['source'];
+  universeKind: 'prod' | 'test';
+} }> {
+  const { describeLaunchQuotaPolicy } = await import('./oauth/codex-quota-policy.js');
+  const { appendRunLedgerEntry } = await import('./self-implement/run-ledger.js');
+  const described = describeLaunchQuotaPolicy(input);
+  const data = { policy: input.current.policy, source: input.current.source, universe: input.universe,
+    ...(described.warning ? { warning: described.warning } : {}) };
+  try {
+    appendRunLedgerEntry({ runId: input.runId, timestamp: new Date().toISOString(), event: 'launch-quota-policy', data });
+  } catch (error) {
+    debug.log('pod.quota-policy', 'ledger-unavailable', { runId: input.runId, error: String(error) }, { level: 'warn' });
+    throw new Error(`pod launch quota policy ledger write failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  debug.log('pod.quota-policy', 'announced', data);
+  return { ...described, quotaPolicy: { policy: input.current.policy, source: input.current.source, universeKind: input.universe.kind } };
+}
+
+export function withLaunchQuotaPolicy<T extends object>(results: readonly T[], quotaPolicy: Awaited<ReturnType<typeof announceLaunchQuotaPolicy>>['quotaPolicy'] | undefined): (T & { quotaPolicy?: Awaited<ReturnType<typeof announceLaunchQuotaPolicy>>['quotaPolicy'] })[] {
+  return quotaPolicy ? results.map((result) => ({ ...result, quotaPolicy })) : [...results];
+}
+
 // self orchestrate — 병렬 self-dev(S1·2026-07-21) — N개 독립 goal 을 각자 `elanous self implement` 서브프로세스로
 //   TOX 디스패처 위에서 동시성캡 병렬 실행. 각 잡=자기 프로세스=자기 harness-space(병렬안전). 엔진(그래프/
 //   디스패처)은 기존 재사용·새 조각=self-implement surface 어댑터. [[PLAN-parallel-self-dev-orchestrator-2026-07-21]].
@@ -4458,6 +4506,8 @@ const selfOrchestrateCmd = selfCmd
         prior,
         goals,
         pid: process.pid,
+        ...(['OP', 'TC', 'MK', 'UX'].includes(process.env.ELANOUS_HARNESS_SEAT ?? '')
+          ? { seat: process.env.ELANOUS_HARNESS_SEAT as SelfDevRunState['seat'] } : {}),
         runIdSource,
         now: () => Date.now(),
       });
@@ -4492,6 +4542,7 @@ const selfOrchestrateCmd = selfCmd
       //   coordinator 해석(decompose·run-identity·checkpoint·board)은 액션에 유지·감독 콜백은 runtime 으로 주입.
       // ☸️ 실행 칸 — pod 면 self-implement 자식을 k8s Job 으로(계약 동일 · 슈퍼바이저 무수정).
       const substrate = (opts as { substrate?: string }).substrate ?? 'local';
+      let launchQuotaPolicy: Awaited<ReturnType<typeof announceLaunchQuotaPolicy>>['quotaPolicy'] | undefined;
       let podSpawn: import('./task-orchestrator/surfaces/self-implement.js').SelfImplementJobSpawn | undefined;
       let podTargets: { context: string; namespace: string }[] | undefined;
       if (substrate === 'pod') {
@@ -4574,30 +4625,39 @@ const selfOrchestrateCmd = selfCmd
           const resolvedQuota = resolveCodexQuotaPolicy(getUserConfig().llm);
           const quotaPolicy = resolvedQuota.policy;
           // POL1 — say which policy this launch uses and where it came from; warn when a test universe disagrees with production.
-          try {
-            const { effectiveInstanceRoot, prodInstanceRoot } = await import('./instance/resolve.js');
-            const { describeLaunchQuotaPolicy } = await import('./oauth/codex-quota-policy.js');
-            const root = effectiveInstanceRoot();
-            const kind = root === prodInstanceRoot() ? 'prod' as const : 'test' as const;
-            let production: ReturnType<typeof resolveCodexQuotaPolicy> | undefined;
-            if (kind === 'test') {
-              try {
-                const { readFileSync } = await import('node:fs');
-                const prodLlm = (JSON.parse(readFileSync(`${prodInstanceRoot()}/config.json`, 'utf8')) as { llm?: Record<string, unknown> }).llm;
-                production = resolveCodexQuotaPolicy(prodLlm);
-              } catch { /* no production config on this machine */ }
+          const { effectiveInstanceRoot, prodInstanceRoot } = await import('./instance/resolve.js');
+          const root = effectiveInstanceRoot();
+          const kind = root === prodInstanceRoot() ? 'prod' as const : 'test' as const;
+          let production: ReturnType<typeof resolveCodexQuotaPolicy> | undefined;
+          if (kind === 'test') {
+            try {
+              const { readFileSync } = await import('node:fs');
+              const prodLlm = (JSON.parse(readFileSync(`${prodInstanceRoot()}/config.json`, 'utf8')) as { llm?: Record<string, unknown> }).llm;
+              production = resolveCodexQuotaPolicy(prodLlm);
+            } catch { /* no production config on this machine */ }
+          }
+          const described = await announceLaunchQuotaPolicy({ runId, current: resolvedQuota, universe: { kind, root }, ...(production ? { production } : {}) });
+          launchQuotaPolicy = described.quotaPolicy;
+          debug.log('self-implement.pod', 'quota-policy', { policy: resolvedQuota.policy, source: resolvedQuota.source, universe: kind, productionPolicy: production?.policy ?? null });
+          if (!opts.json) { ui.info(described.line); if (described.warning) ui.warn(described.warning); }
+          // GROK-OPTIONAL (10-05): an expiring grok subscription the host cannot refresh is dropped from the chain here,
+          // so the launch goes on with codex instead of dying later in hostGrokCredentials.
+          let grokSubscriptionUsable = credential?.kind === 'subscription';
+          if (grokSubscriptionUsable && codexPolicyAllowsFallback(quotaPolicy)) {
+            const { podGrokSubscriptionUsable, podGrokSkippedLine } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
+            const grokCheck = podGrokSubscriptionUsable();
+            if (!grokCheck.usable) {
+              grokSubscriptionUsable = false;
+              if (!opts.json) ui.warn(podGrokSkippedLine(grokCheck));
             }
-            const described = describeLaunchQuotaPolicy({ current: resolvedQuota, universe: { kind, root }, ...(production ? { production } : {}) });
-            debug.log('self-implement.pod', 'quota-policy', { policy: resolvedQuota.policy, source: resolvedQuota.source, universe: kind, productionPolicy: production?.policy ?? null });
-            if (!opts.json) { ui.info(described.line); if (described.warning) ui.warn(described.warning); }
-          } catch { /* the line is advice; the launch goes on */ }
+          }
           const plan = planPodProvider({
             codexCandidates: inspectCodexRotation().candidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
             thresholdPercentByAccount: getUserConfig().llm?.codexAccountRotationThresholdPercentByAccount,
             // 대표 한도 정책 한 값(`llm.codexQuotaPolicy`) — 크레딧·폴백을 같이 정한다.
             creditsAllowed: codexPolicyAllowsCredits(quotaPolicy),
-            grokSubscription: codexPolicyAllowsFallback(quotaPolicy) && credential?.kind === 'subscription',
+            grokSubscription: codexPolicyAllowsFallback(quotaPolicy) && grokSubscriptionUsable,
             grokApiKey: codexPolicyAllowsFallback(quotaPolicy) && credential?.kind === 'api_key',
             grokApiKeyOptIn,
           });
@@ -4714,7 +4774,7 @@ const selfOrchestrateCmd = selfCmd
           debug.log('self-dev.reduce', 'orchestrate-reduce', { runId, shards: shards.length, kind: r.kind });
         }
       }
-      if (opts.json) { await writeStdoutJson(JSON.stringify(results) + '\n'); await reportRun(results); return; }
+      if (opts.json) { await writeStdoutJson(JSON.stringify(withLaunchQuotaPolicy(results, launchQuotaPolicy)) + '\n'); await reportRun(results); return; }
       const done = results.filter((r) => r.status === 'done').length;
       const promoted = results.filter((r) => r.prUrl).length;
       const incomplete = results.length - done;
@@ -6811,7 +6871,8 @@ const selfDevCmd = program
         const { dispatchHarnessOnPod } = await import('./harness/harness-pod-dispatch.js');
         const { devAskPodDispatchInput } = await import('./harness/harness-substrate-default.js');
         const { classifyHarnessPodExit, harnessPodRunId, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } = await import('./harness/harness-cli-command.js');
-        warnRecentIncidentBurst();
+        warnRecentIncidentBurst(undefined, undefined, undefined,
+          { entrance: 'cli-dev-ask', seat: opts.seat });
         let podOutput = '';
         let podRunId: string | undefined;
         const previousLeaseId = process.env.ELANOUS_POD_RESERVED_LEASE;
@@ -6831,7 +6892,8 @@ const selfDevCmd = program
         }
         if (status !== 0) {
           const classified = classifyHarnessPodExit({ status }, podOutput, { ...(podRunId ? { runId: podRunId } : {}) });
-          recordClassifiedHarnessPodExit(podRunId ?? harnessPodRunId(podOutput), classified.reason, status);
+          recordClassifiedHarnessPodExit(podRunId ?? harnessPodRunId(podOutput), classified.reason, status,
+            { entrance: 'cli-dev-ask', seat: opts.seat, output: podOutput });
           for (const line of classified.lines) console.error(line);
         }
         completionGuard.conclude();

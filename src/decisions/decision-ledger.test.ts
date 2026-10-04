@@ -542,6 +542,52 @@ test('legacy raised events without resume still list and decide; unsafe question
   expect(store.list({ status: 'all' })).toHaveLength(1);
 });
 
+test('delegated seat decisions are durable posthoc ledger rows, never owner decision cards', () => {
+  const stateDir = root();
+  const store = ledger(stateDir);
+  const card = store.raise(base);
+  const first = store.recordSeatDecision({ seat: 'OP', title: '예산 막힘', decision: '크레딧으로 풀기', delegation: '운영 예산 위임',
+    decidedAt: '2026-09-30T23:00:00Z', refs: ['coord#123'] });
+  const second = store.recordSeatDecision({ seat: 'TC', title: '발사 경로', decision: '임시 발사 경로 변경', delegation: '기술 운영 위임' });
+  expect(first).toMatchObject({ id: 'SD-20261001-01', seat: 'OP', decision: '크레딧으로 풀기', reporting: 'posthoc',
+    recordedAt: '2026-10-01T01:00:00.000Z', decidedAt: '2026-09-30T23:00:00.000Z', versionAtDecision: versions('2026-09-30'), refs: ['coord#123'] });
+  expect(second.id).toBe('SD-20261001-02');
+  expect(second.recordedAt).toBe('2026-10-01T01:00:00.000Z');
+  expect(second.decidedAt).toBeUndefined();
+  expect(second.versionAtDecision).toBeUndefined();
+  expect(new DecisionLedger({ stateDir }).seatReport()).toEqual([first, second]);
+  expect(store.seatReport({ since: '2026-10-01T00:00:00Z' })).toEqual([first, second]);
+  expect(store.seatReport({ seat: 'OP' })).toEqual([first]);
+  expect(store.seatReport({ since: '2026-10-01T02:00:00Z' })).toEqual([]);
+  const persisted = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(persisted[1].entry).toEqual(first);
+  expect(persisted[2].entry).toEqual(second);
+  expect(persisted[2].entry).not.toHaveProperty('decidedAt');
+  expect(persisted[2].entry).not.toHaveProperty('versionAtDecision');
+  expect(store.list()).toEqual([card]);
+  expect(store.list({ status: 'all' })).toEqual([card]);
+  expect(() => store.show(first.id)).toThrow('decision not found');
+  expect(() => store.decide(first.id, 'a', { kind: 'human' })).toThrow('decision not found');
+  expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line).type)).toEqual(['raised', 'seat-recorded', 'seat-recorded']);
+  expect(store.raise(base).id).toBe('D-20261001-02');
+});
+
+test('seat reporting rejects ungrounded identity and empty delegation without appending; source is idempotency guard', () => {
+  const store = ledger();
+  const input = { seat: 'MK' as const, title: '루프 담당표', decision: '담당표 적용', delegation: '자리 위임', refs: ['coord#456'] };
+  const first = store.recordSeatDecision(input);
+  for (const invalid of [
+    { ...input, seat: 'S' as never }, { ...input, delegation: ' ' }, { ...input, decision: '\n' },
+    { ...input, decidedAt: '2026-02-29T00:00:00Z' },
+  ]) expect(() => store.recordSeatDecision(invalid)).toThrow();
+  expect(() => store.recordSeatDecision(input)).toThrow('source already recorded');
+  expect(() => store.seatReport({ seat: 'S' as never })).toThrow('invalid seat');
+  expect(store.seatReport()).toEqual([first]);
+  expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(1);
+  expect(store.recordSeatDecision({ ...input, refs: ['coord#457'] }).id).toBe('SD-20261001-02');
+  expect(store.recordSeatDecision({ ...input, title: '발사 경로', decision: '임시 경로 전환' }).id).toBe('SD-20261001-03');
+});
+
 test('raise and auto-decide accept seat names (OP·MK·TC·UX) as track while old letters keep working', () => {
   const store = ledger();
   const bySeat = store.raise({ ...base, raisedBy: { agent: 'claude', track: 'OP' } });

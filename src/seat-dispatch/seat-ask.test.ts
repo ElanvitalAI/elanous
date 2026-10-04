@@ -1,5 +1,5 @@
 import { expect, test, spyOn } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { MsgStore } from '../msg/msg-store.js';
@@ -9,13 +9,20 @@ import { TelegramBot } from '../telegram.js';
 import { DiscordBot } from '../discord.js';
 import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from '../intake-plane/discord-seat-work.js';
 import { handleSeatRequests } from '../nexus/api/seat-requests.js';
+import { resolveDashboardChatMainSubmitIntent } from '../dashboard/input/chat-main-submit-route.js';
 import type { UserConfig } from '../user-config.js';
-import { answerSeatAsk, askSeat, deliverSeatAnswers, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
+import { answerSeatAsk, askSeat, deliverSeatAnswers, getTuiSeatAskClientId, parseSeatAsk, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
 
 const config = { raw: { decisions: { telegramOwnerId: 111 } } } as unknown as UserConfig;
 const command = (store: MsgStore, lines: string[]) => ({ ownerId: '111', replyTarget: 'acme/repo#42',
   runGh: async (_args: string[], stdin: string) => { lines.push(stdin); return 0; },
   append: (message: Parameters<MsgStore['append']>[0]) => store.append(message),
+});
+
+test('CTO ask accepts the spoken form without requiring punctuation, but not an empty question', () => {
+  expect(parseSeatAsk('CTO에게 물어봐 배포 상태?')).toBe('배포 상태?');
+  expect(parseSeatAsk('CTO에게 물어봐: 배포 상태?')).toBe('배포 상태?');
+  expect(parseSeatAsk('CTO에게 물어봐')).toBeNull();
 });
 
 test('fake Telegram ask reaches the /cto channel and seat inbox; seat mailbox reply returns to the same chat', async () => {
@@ -29,7 +36,7 @@ test('fake Telegram ask reaches the /cto channel and seat inbox; seat mailbox re
   }) as typeof debug.log);
   try {
     const askDeps = { open: () => store, now: () => 0, send: async (origin: AskOrigin, text: string) => { sent.push({ origin, text }); } };
-    const receipt = await handleTelegramSeatWork('CTO 에게 물어봐: 배포 상태?', { chatId: 111, userId: 111, messageId: 456, threadId: 7 },
+    const receipt = await handleTelegramSeatWork('CTO에게 물어봐 배포 상태?', { chatId: 111, userId: 111, messageId: 456, threadId: 7 },
       { config, commandDeps: command(store, lines), askDeps });
     expect(receipt).toContain('답을 기다립니다');
     expect(receipt).toContain('최대 120분');
@@ -325,6 +332,30 @@ test('PWA seat ask polling returns only to its own browser client', async () => 
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test('PWA poll shows overdue unanswered CTO request only to the requesting browser', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-ask-expiry-'));
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  let time = 0;
+  const clientId = 'a0000000-0000-4000-8000-000000000001';
+  const other = 'a0000000-0000-4000-8000-000000000002';
+  const deps = { root: () => root, ceoDeps: () => command(store, []), askDeps: {
+    open: () => store, now: () => time, send: async () => {},
+  } };
+  const query = (client: string) => new Request('http://localhost/v1/seat-requests?answers=1', { headers: { 'x-seat-ask-client': client } });
+  try {
+    const post = await handleSeatRequests(new Request('http://localhost/v1/seat-requests', { method: 'POST',
+      headers: { 'x-seat-ask-client': clientId, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'CTO에게 물어봐 배포 상태?' }) }), deps);
+    expect(post.status).toBe(202);
+    const id = /요청: ask:([\w-]+)/.exec(store.list('TC')[0]!.body)![1]!;
+    time = 2 * 60 * 60 * 1000;
+    expect((await (await handleSeatRequests(query(other), deps)).json() as { items: unknown[] }).items).toEqual([]);
+    expect((await (await handleSeatRequests(query(clientId), deps)).json() as { items: unknown[] }).items)
+      .toEqual([{ id, text: `CTO 미답 (${id}): 아직 답 없음 (120분 경과).`, status: 'expired' }]);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a failed outbox insert rolls back the answer decision and retries the same answer', async () => {
   const store = new MsgStore(':memory:');
   store.close = () => {};
@@ -361,6 +392,89 @@ test('the originating Telegram bot alone claims its answer, including a retry fr
     expect(wrong).toEqual([]);
     expect(right).toEqual([`CTO 답변 (${id}): 완료`]);
   } finally { store.close(); }
+});
+
+test('TUI chat submit resolves CTO ask as a turn before sticky ACP or ordinary chat', () => {
+  for (const stickyBackend of [null, 'codex']) {
+    const intent = resolveDashboardChatMainSubmitIntent('CTO에게 물어봐 배포 상태?', { stickyBackend });
+    expect(intent.kind).toBe('submit-turn');
+    if (intent.kind === 'submit-turn') expect(parseSeatAsk(intent.text)).toBe('배포 상태?');
+  }
+});
+
+test('TUI ask reaches TC and its reply or expired notice returns only to the originating TUI', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  const sent: string[] = [];
+  let time = 0;
+  const worker = { open: () => store, now: () => time, channel: 'tui' as const, clientId: 'terminal-a',
+    send: async (_origin: AskOrigin, text: string) => { sent.push(text); } };
+  try {
+    const receipt = await askSeat('CTO에게 물어봐 배포 상태?', { channel: 'tui', clientId: 'terminal-a' }, command(store, []), worker);
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    expect(store.list('TC')[0]!.body).toContain(`답장 요청: ${id}`);
+    answerSeatAsk(id, '완료', worker);
+    await deliverSeatAnswers({ ...worker, clientId: 'terminal-b' });
+    expect(sent).toEqual([]);
+    expect((store.db.query('SELECT status FROM seat_asks WHERE id = ?').get(id) as { status: string }).status).toBe('pending');
+    await deliverSeatAnswers(worker);
+    await deliverSeatAnswers(worker);
+    expect(sent).toEqual([`CTO 답변 (${id}): 완료`]);
+    const second = await askSeat('CTO에게 물어봐 다음 배포?', { channel: 'tui', clientId: 'terminal-a' }, command(store, []), worker);
+    time = 2 * 60 * 60 * 1000;
+    await deliverSeatAnswers(worker);
+    expect(sent[1]).toBe(`CTO 미답 (${/요청: ([\w-]+)/.exec(second)![1]}): 아직 답 없음 (120분 경과).`);
+  } finally { store.close(); }
+});
+
+test('dashboard uses the durable TUI address for both submission and reconnect polling', () => {
+  const source = readFileSync(join(import.meta.dir, '../dashboard/index.ts'), 'utf8');
+  expect(source.includes('const tuiSeatAskClientId = getTuiSeatAskClientId();')).toBe(true);
+  expect(source.includes("askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId }")).toBe(true);
+  expect(source.includes("channel: 'tui' as const, clientId: tuiSeatAskClientId,")).toBe(true);
+  expect(source.includes('pollTuiSeatAnswers();')).toBe(true);
+});
+
+test('a restarted TUI recovers its own pending question, missed answer and overdue notice', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-ask-tui-restart-'));
+  const otherRoot = mkdtempSync(join(tmpdir(), 'seat-ask-tui-other-'));
+  const open = () => new MsgStore(join(root, 'msg', 'messages.db'));
+  const openOther = () => new MsgStore(join(otherRoot, 'msg', 'messages.db'));
+  let time = 0;
+  const received: string[] = [];
+  const worker = (clientId: string) => ({ open, now: () => time, channel: 'tui' as const, clientId,
+    send: async (_origin: AskOrigin, text: string) => { received.push(text); } });
+  try {
+    const beforeRestart = getTuiSeatAskClientId(open);
+    expect(getTuiSeatAskClientId(openOther)).not.toBe(beforeRestart);
+    const store = open();
+    let answerId: string;
+    let expiredId: string;
+    try {
+      const receipt = await askSeat('CTO에게 물어봐 답변할 질문?', { channel: 'tui', clientId: beforeRestart },
+        command(store, []), worker(beforeRestart));
+      answerId = /요청: ([\w-]+)/.exec(receipt)![1]!;
+      expiredId = /요청: ([\w-]+)/.exec(await askSeat('CTO에게 물어봐 미답 질문?',
+        { channel: 'tui', clientId: beforeRestart }, command(store, []), worker(beforeRestart)))![1]!;
+    } finally { store.close(); }
+
+    // No old worker polls after restart. A new DB connection must recover the address
+    // before the answer arrives, then drain replies and overdue questions on startup.
+    const afterRestart = getTuiSeatAskClientId(open);
+    expect(afterRestart).toBe(beforeRestart);
+    answerSeatAsk(answerId!, '재시작 후 완료', { open, now: () => time });
+    time = 2 * 60 * 60 * 1000;
+    await deliverSeatAnswers(worker(getTuiSeatAskClientId(openOther)));
+    expect(received).toEqual([]);
+    await deliverSeatAnswers(worker(afterRestart));
+    expect(received).toEqual([
+      `CTO 답변 (${answerId!}): 재시작 후 완료`,
+      `CTO 미답 (${expiredId!}): 아직 답 없음 (120분 경과).`,
+    ]);
+    await deliverSeatAnswers(worker(getTuiSeatAskClientId(openOther)));
+    await deliverSeatAnswers(worker(afterRestart));
+    expect(received).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(otherRoot, { recursive: true, force: true }); }
 });
 
 test('concurrent delivery workers cannot both send the same mailbox answer', async () => {

@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { ChatMessageView } from './ChatMessage';
 import { HarnessAskCard } from './HarnessAskCard';
+import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 import { ChatLayout } from './ChatLayout';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
@@ -41,6 +42,8 @@ function text(): string {
   return tree!.root.findByProps({ 'aria-label': '하니스 진행' }).children.map((node) =>
     typeof node === 'string' ? node : node.children.join('')).join(' ');
 }
+
+test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 test('meta block renders an updating card and polls at five seconds; settled status stops', async () => {
   const timers = new Map<number, () => void>();

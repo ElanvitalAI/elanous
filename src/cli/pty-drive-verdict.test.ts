@@ -17,6 +17,40 @@ describe('verdictForFinalPtyScreen', () => {
     expect(verdict).toEqual({ kind: 'done-but-failed', reason: failure, evidence: null });
   });
 
+  test.each(['rg --files -g AGENTS.md', 'grep -q target missing.txt', 'diff a.txt b.txt'])(
+    '%s exit 1 is a no-match/difference rather than mission failure', (command) => {
+      expect(verdictForFinalPtyScreen({ screen: `• Failed (exit 1) ${command}\nThe artifact is ready.`, inputHistory: [], exitCode: null, artifactEvidence: true }))
+        .toEqual({ kind: 'success-unverified', reason: 'final PTY screen has no success evidence', evidence: null });
+    },
+  );
+
+  test.each(['rg --files -g AGENTS.md', 'grep -q target missing.txt', 'diff a.txt b.txt'])(
+    '%s exit 1 alone does not provide success evidence', (command) => {
+      expect(verdictForFinalPtyScreen({ screen: `• Failed (exit 1) ${command}`, inputHistory: [], exitCode: null }))
+        .toEqual({ kind: 'success-unverified', reason: 'final PTY screen has no success evidence', evidence: null });
+    },
+  );
+
+  test('a failed non-search tool in scrollback cannot override a verified artifact without a failure in the final answer', () => {
+    expect(verdictForFinalPtyScreen({ screen: '• Failed (exit 2) bun test broken.test.ts\n└ Error: test failed\nThe artifact is ready.', inputHistory: [], exitCode: null, artifactEvidence: true }))
+      .toEqual({ kind: 'success-unverified', reason: 'final PTY screen has no success evidence', evidence: null });
+  });
+
+  test('an actual final-answer error mentioning rg exit 1 still blocks artifact-backed success', () => {
+    expect(verdictForFinalPtyScreen({ screen: 'Error: rg exit 1 caused the build to fail', inputHistory: [], exitCode: null, artifactEvidence: true }))
+      .toEqual({ kind: 'done-but-failed', reason: 'Error: rg exit 1 caused the build to fail', evidence: null });
+  });
+
+  test('a non-search tool failure still blocks success without verified artifacts', () => {
+    expect(verdictForFinalPtyScreen({ screen: '• Failed (exit 2) bun test broken.test.ts', inputHistory: [], exitCode: null }))
+      .toEqual({ kind: 'done-but-failed', reason: '• Failed (exit 2) bun test broken.test.ts', evidence: null });
+  });
+
+  test('an error in the last answer still rejects verified artifacts', () => {
+    expect(verdictForFinalPtyScreen({ screen: '• Failed (exit 1) rg --files -g AGENTS.md\nThe task failed: Error: build failed', inputHistory: [], exitCode: null, artifactEvidence: true }))
+      .toEqual({ kind: 'done-but-failed', reason: 'The task failed: Error: build failed', evidence: null });
+  });
+
   test('recognizes a positive output line with no failure', () => {
     expect(verdictForFinalPtyScreen({ screen: '\x1b[32m7 pass\x1b[0m\n0 fail', inputHistory: ['bun test file.test.ts\r'], exitCode: 0 }))
       .toEqual({ kind: 'success', reason: 'final PTY screen has success evidence', evidence: '7 pass' });

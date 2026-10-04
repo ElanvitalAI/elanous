@@ -20,6 +20,7 @@ export interface HarnessPodDispatchInput {
   /** say 의 문장, 또는 ask 의 골 문서 경로. */
   readonly input: string;
   readonly podPool?: string;
+  readonly seat?: 'OP' | 'TC' | 'MK' | 'UX';
   /** Host already recorded the observe-only dispatch; suppress a second decision in the Pod. */
   readonly dispatchRecorded?: boolean;
   /** Pod 메모리 등급(standard|high) — 오케스트레이터 환경 `ELANOUS_POD_MEMORY_TIER` 로 Job 까지 간다. */
@@ -80,6 +81,7 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
   const args = podOrchestrateArgs(input, goalFile);
   debug.log('harness.substrate', 'goal-file', { entrance: input.entrance, mode: tempDir ? 'temp' : 'path' });
   const env = { ...process.env };
+  if (input.seat) env.ELANOUS_HARNESS_SEAT = input.seat;
   delete env.ELANOUS_POD_GOAL_DOC;
   delete env.ELANOUS_DISPATCH_RECORDED;
   if (input.dispatchRecorded) env.ELANOUS_DISPATCH_RECORDED = '1';

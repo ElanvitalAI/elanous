@@ -3,10 +3,12 @@ import { useLayoutEffect, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { ChatLayout } from './ChatLayout';
+import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 import { ChatPanel } from './ChatPanel';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
+import { NowSpeakButton } from './NowSpeakButton';
 import { ChatDropOverlay } from './ChatDropOverlay';
 import { BudgetPill } from './BudgetPill';
 import { VoiceCostPill } from './VoiceCostPill';
@@ -116,6 +118,8 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
   const input = tree!.root.findByType(ChatInput);
   return { requests, streams, turns, uploads, input, sessionStorage, receiveAsk: (payload: unknown) => inbound!(payload) };
 }
+
+test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 test('pending composer queues FIFO, holds one turn at a time, and chips remove or clear queued turns', async () => {
   const { streams, turns, input } = await mount({ acp: false, deferred: true });
@@ -263,6 +267,8 @@ test('compact header fits one 44px row with navigation, session, and expandable 
   expect(header.props.className).toContain('whitespace-nowrap');
   expect(header.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
   expect(header.findAllByType(SessionPill)).toHaveLength(1);
+  expect(header.findAllByType(NowSpeakButton)).toHaveLength(1);
+  expect(header.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
   expect(header.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(1);
   expect(header.findAllByType(BudgetPill)).toHaveLength(0);
   const pillSlot = header.findByType(SessionPill).parent!;
@@ -303,6 +309,8 @@ test('wide header preserves the existing session, money pills, and voice button 
   expect(root.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
   expect(root.findAllByType(SessionPill)).toHaveLength(1);
+  expect(root.findAllByType(NowSpeakButton)).toHaveLength(1);
+  expect(root.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
   expect(root.findAllByType(BudgetPill)).toHaveLength(1);
   expect(root.findAllByType(VoiceCostPill)).toHaveLength(1);
   expect(root.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(1);

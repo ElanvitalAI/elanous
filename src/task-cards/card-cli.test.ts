@@ -50,6 +50,51 @@ test('linear-scan creates cards and returns text and JSON counts; --label reache
   } finally { store.close(); }
 });
 
+test('linear-scan --suggest shows label proposals in text and JSON without opening a card store', async () => {
+  const calls: unknown[] = [];
+  const root = mkdtempSync(join(tmpdir(), 'card-suggest-'));
+  roots.push(root);
+  const output: string[] = [];
+  const program = new Command();
+  registerCardCommand(program, {
+    createStore: () => { throw new Error('suggest must not open a card store'); },
+    write: text => { output.push(text); },
+    getApiKey: async () => 'secret',
+    fetchIssues: async args => { calls.push(args); return [{
+      provider: 'linear', eventId: '1', kind: 'updated', ref: 'id', identifier: 'UX-7',
+      title: '만들어 줘', body: 'private body', url: 'https://linear.app/UX-7', priority: null,
+      occurredAt: '2026-10-04T00:00:00Z',
+    }]; },
+  });
+  await program.parseAsync(['node', 'elanous', 'card', 'linear-scan', '--team', 'UX', '--suggest']);
+  await program.parseAsync(['node', 'elanous', 'card', 'linear-scan', '--team', 'UX', '--suggest', '--label', 'idea', '--json']);
+  expect(calls).toEqual([
+    { apiKey: 'secret', teamKey: 'UX', excludeLabel: 'wish' },
+    { apiKey: 'secret', teamKey: 'UX', excludeLabel: 'wish' },
+  ]);
+  expect(output).toEqual(['UX-7\t만들어 줘\t제작\n', '[{"identifier":"UX-7","title":"만들어 줘","reason":"제작"}]\n']);
+});
+
+test('linear-scan --suggest without a key uses existing guidance and exit 2 without reading Linear or cards', async () => {
+  let fetched = false;
+  const program = new Command();
+  registerCardCommand(program, {
+    createStore: () => { throw new Error('card store opened'); },
+    getApiKey: async () => undefined,
+    fetchIssues: async () => { fetched = true; return []; },
+  });
+  const lines: string[] = [];
+  const original = process.stderr.write;
+  const exitCode = process.exitCode;
+  process.stderr.write = ((text: string) => { lines.push(text); return true; }) as typeof process.stderr.write;
+  try {
+    await program.parseAsync(['node', 'elanous', 'card', 'linear-scan', '--team', 'UX', '--suggest', '--json']);
+    expect(lines).toEqual(['Linear 키가 없습니다 — elanous connector linear 로 먼저 등록하세요\n']);
+    expect(process.exitCode).toBe(2);
+    expect(fetched).toBe(false);
+  } finally { process.stderr.write = original; process.exitCode = exitCode ?? 0; }
+});
+
 test('linear-scan requires --team before reading the key', async () => {
   let readKey = false;
   const { store, runAsync } = fixture({ getApiKey: async () => { readKey = true; return 'secret'; } });

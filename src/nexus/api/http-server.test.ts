@@ -11,10 +11,11 @@ import {
   startNexusHttpServer,
 } from './http-server.js';
 import { NexusEventBus } from './event-bus.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
+import type { ContextNowDeps } from '../../context-bus/context-now.js';
 import { resetUserConfig } from '../../user-config.js';
 import { useBackend } from '../config/secrets/index.js';
 
@@ -140,6 +141,101 @@ function capturePortSkipLogs(): { records: Array<{ port: number; reason: string 
     },
   };
 }
+
+describe('GET /v1/context/now audience boundary', () => {
+  const at = '2026-10-04T04:00:00.000Z';
+  const deps: ContextNowDeps = {
+    now: () => new Date(at), version: () => '0.2.0',
+    checklist: version => ({ version, released: '', dev: version, history: [], items: version === '0.2.0'
+      ? [{ id: 'K6', title: '공개 기능', status: 'red', owner: 'TC', updatedAt: at, updatedBy: 'TC' },
+        { id: 'K7', title: 'fully autonomous', status: 'yellow', owner: 'OP', updatedAt: at, updatedBy: 'OP' }] : [] }),
+    decisions: () => [],
+    seatEntries: () => [{ entry: { seat: 'MK', at, status: 'shadow', item: { id: 'K6', title: '공개 기능', text: '', source: 'checklist' } }, source: 'elanous://seat-loop/MK/2026-10-04#1' }],
+    events: () => [{ id: 'event-1', at, text: '', kind: 'report', summary: 'PR #1234 on run-abcdef12 at /home/alice/plan',
+      refs: { seat: 'UX', recipients: [], all: false, kind: 'report', slot: null, deadline: null, url: 'https://github.com/org/repo/pull/1234' } }],
+  };
+
+  test('accepts all three query audiences, defaults to operator, and rejects unknown values', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'context-now-http-'));
+    setElanousConfigDir(dir);
+    resetUserConfig();
+    const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+      metaApi: { bearerToken: 'auth', noAuth: false }, contextNowDeps: deps });
+    const headers = { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' };
+    try {
+      expect((await fetch(`${server.url}/v1/context/now?audience=public-demo`, {
+        headers: { 'sec-fetch-site': 'cross-site' },
+      })).status).toBe(401);
+      for (const [query, audience] of [['', 'operator'], ['?audience=operator', 'operator'],
+        ['?audience=user', 'user'], ['?audience=public-demo', 'public-demo']] as const) {
+        const res = await fetch(`${server.url}/v1/context/now${query}`, { headers });
+        expect(res.status).toBe(200);
+        const body = await res.json() as Record<string, unknown>;
+        expect(body.audience).toBe(audience);
+        expect(body.hiddenCount).toBe(audience === 'public-demo' ? 1 : 0);
+        expect(JSON.stringify(body)).toContain('공개 기능');
+        if (audience === 'public-demo') {
+          const text = JSON.stringify(body);
+          for (const sensitive of [/\b(?:OP|TC|MK|UX)\b/, /\bPR\s*#?\d+\b|#\d+\b/i,
+            /\brun[-_][a-z0-9-]{8,}\b/i, /\/(?:home|Users|root)\//]) {
+            expect(text).not.toMatch(sensitive);
+          }
+        } else {
+          expect(JSON.stringify(body)).toContain('PR #1234');
+        }
+      }
+      const bad = await fetch(`${server.url}/v1/context/now?audience=other`, { headers });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toEqual({ error: 'invalid_audience' });
+      const repeated = await fetch(`${server.url}/v1/context/now?audience=public-demo&audience=operator`, { headers });
+      expect(repeated.status).toBe(400);
+    } finally {
+      server.stop();
+      resetUserConfig();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('nexus.demoMode forces public-demo for absent and operator/user queries, including voice', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'context-now-demo-http-'));
+    setElanousConfigDir(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ nexus: { demoMode: true } }));
+    resetUserConfig();
+    const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+      metaApi: { bearerToken: 'auth', noAuth: false }, contextNowDeps: deps });
+    const headers = { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' };
+    const originalLog = debug.log.bind(debug) as typeof debug.log;
+    const served: unknown[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+      if (category === 'context.now' && event === 'served') served.push(data);
+      originalLog(category, event, data as never);
+    }) as typeof debug.log;
+    try {
+      for (const query of ['', '?audience=operator', '?audience=user', '?audience=operator&format=voice']) {
+        const res = await fetch(`${server.url}/v1/context/now${query}`, { headers });
+        expect(res.status).toBe(200);
+        const body = await res.json() as Record<string, unknown>;
+        expect(body.audience).toBe('public-demo');
+        expect(body.hiddenCount).toBe(1);
+        const text = JSON.stringify(body);
+        for (const sensitive of [/\b(?:OP|TC|MK|UX)\b/, /\bPR\s*#?\d+\b|#\d+\b/i,
+          /\brun[-_][a-z0-9-]{8,}\b/i, /\/(?:home|Users|root)\//]) {
+          expect(text).not.toMatch(sensitive);
+        }
+      }
+      expect(served).toEqual(Array.from({ length: 4 }, () => ({ audience: 'public-demo', hidden: 1, forced: true })));
+      const bad = await fetch(`${server.url}/v1/context/now?audience=unknown`, { headers });
+      expect(bad.status).toBe(400);
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      server.stop();
+      resetUserConfig();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('createFeedbackEmitter', () => {
   test('publishes the original envelope to the media SSE bus without ACP', () => {

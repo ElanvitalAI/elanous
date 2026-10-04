@@ -1,4 +1,4 @@
-import { test, expect } from 'bun:test';
+import { test, expect, spyOn } from 'bun:test';
 import { Command } from 'commander';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -6,6 +6,8 @@ import { resetUserConfig } from '../user-config.js';
 import { renderCardText } from '../decisions/decision-cards.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
+import { debug } from '../debug/log.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { HqDeps } from '../hq/hq.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +16,39 @@ import { createPendingQuestion, writePendingQuestion } from '../ask-user-questio
 import { registerDecisionsCommands } from './decisions-cli.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
+
+test('CLI records delegated decisions and the owner reads overnight seat report without cards', () => {
+  const stateDir = root();
+  const lines: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, { stateDir, now: () => new Date('2026-10-04T23:00:00Z'), resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  try {
+    const first = JSON.parse(run('record-seat', '--seat', 'OP', '--title', '예산 막힘', '--decision', '크레딧으로 풀기',
+      '--delegation', '운영 위임', '--ref', 'coord#1', '--json'));
+    const second = JSON.parse(run('record-seat', '--seat', 'UX', '--title', '담당표', '--decision', '담당표 적용',
+      '--delegation', 'UX 위임', '--at', '2026-10-04T22:00:00Z', '--json'));
+    expect(first.reporting).toBe('posthoc');
+    expect(first.recordedAt).toBe('2026-10-04T23:00:00.000Z');
+    expect(first).not.toHaveProperty('decidedAt');
+    expect(first).not.toHaveProperty('versionAtDecision');
+    expect(second.seat).toBe('UX');
+    expect(second.recordedAt).toBe('2026-10-04T23:00:00.000Z');
+    expect(second.decidedAt).toBe('2026-10-04T22:00:00.000Z');
+    expect(run('seat-report', '--since', '2026-10-04T21:00:00Z')).toContain('결정: 시각 미상 · 기록:');
+    expect(run('seat-report', '--since', '2026-10-04T21:00:00Z')).toContain('OP 결정 · 사후 보고');
+    expect(run('seat-report', '--since', '2026-10-04T21:00:00Z')).toContain('결정: 2026-10-05 07:00:00 KST · 기록: 2026-10-05 08:00:00 KST · UX 결정 · 사후 보고');
+    expect(JSON.parse(run('seat-report', '--since', '2026-10-04T21:00:00Z', '--seat', 'OP', '--json'))).toEqual([first]);
+    expect(JSON.parse(run('seat-report', '--since', '2026-10-04T21:00:00Z', '--seat', 'UX', '--json'))).toEqual([second]);
+    expect(run('seat-report', '--since', '2026-10-04T22:30:00Z')).toContain('UX 결정 · 사후 보고');
+    expect(run('seat-report', '--since', '2026-10-05T00:00:00Z')).toBe('자리 결정 0건');
+    expect(JSON.parse(run('list', '--status', 'all', '--json'))).toEqual([]);
+    expect(() => run('show', first.id)).toThrow('decision not found');
+    expect(() => run('record-seat', '--seat', 'XX', '--title', 'bad', '--decision', 'bad', '--delegation', 'bad')).toThrow('invalid seat');
+    expect(() => run('record-seat', '--seat', 'OP', '--title', '예산 막힘', '--decision', '크레딧으로 풀기', '--delegation', '운영 위임', '--ref', 'coord#1')).toThrow('source already recorded');
+    expect(new DecisionLedger({ stateDir }).seatReport()).toHaveLength(2);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
 
 test('CLI cross-check, shadow warning, strict config and alternative validation', () => {
   const stateDir = root();
@@ -95,6 +130,59 @@ test('actual CLI parses checked, explicitly skipped, absent and conflicting cros
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 }, 180_000);
 
+test('isolated decisions CLI skips adjudication and records the write target', () => {
+  const stateDir = root();
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+  const lines: string[] = [];
+  const hq: HqDeps = { store: { read: () => { throw new Error('HQ adjudicator contacted'); }, cas: () => { throw new Error('HQ adjudicator contacted'); } } };
+  const cli = new Command();
+  const raise = ['raise', '--agent', 'codex', '--title', 'Isolated?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
+  try {
+    setElanousConfigDir(stateDir);
+    registerDecisionsCommands(cli, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
+    cli.parse(['decisions', ...raise, '--hq-override'], { from: 'user' });
+    const entry = JSON.parse(lines.at(-1)!);
+    cli.parse(['decisions', 'decide', entry.id, 'a', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).choice).toBe('a');
+    expect(events).toContainEqual({ category: 'hq.fence', event: 'skipped-isolated', data: { root: stateDir, command: 'decisions raise' } });
+    expect(events).toContainEqual({ category: 'hq.fence', event: 'skipped-isolated', data: { root: stateDir, command: 'decisions decide' } });
+    expect(events.filter(({ category, event }) => category === 'hq.fence' && event !== 'skipped-isolated')).toEqual([]);
+  } finally { observation.mockRestore(); resetElanousConfigDir(); rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('decision ledger outside the instance universe retains the HQ fence and observed override', () => {
+  const instanceRoot = root();
+  const outsideRoot = root();
+  const store = fileLeaseStore(join(instanceRoot, 'hq', 'lease.json'), () => 100);
+  const events: string[] = [];
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(instanceRoot, 'local.json'), seenPath: join(instanceRoot, 'seen-generation'), now: () => 100,
+    log: ((_category: string, event: string) => { events.push(event); }) as HqDeps['log'] };
+  const lines: string[] = [];
+  const errors: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+  const before = process.exitCode;
+  const cli = new Command();
+  const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
+  try {
+    setElanousConfigDir(instanceRoot);
+    registerDecisionsCommands(cli, { stateDir: outsideRoot, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    process.exitCode = 0;
+    cli.parse(['decisions', ...raise], { from: 'user' });
+    expect(process.exitCode).toBe(4);
+    expect(lines).toEqual([]);
+    expect(errors.at(-1)).toContain('본부는 node-b gen 2');
+    expect(() => readFileSync(join(outsideRoot, 'decisions', 'decisions.jsonl'))).toThrow();
+    cli.parse(['decisions', ...raise, '--hq-override'], { from: 'user' });
+    expect(process.exitCode).toBe(4);
+    expect(JSON.parse(lines.at(-1)!).status).toBe('open');
+    expect(events).toContain('cli-override');
+    expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
+    expect(effectiveInstanceRoot()).toBe(instanceRoot);
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); resetElanousConfigDir(); rmSync(instanceRoot, { recursive: true, force: true }); rmSync(outsideRoot, { recursive: true, force: true }); }
+});
+
 test('decisions CLI fences raise/decide at generation, permits observed override and pre-lease bootstrap without altering reads', () => {
   const stateDir = root();
   const store = fileLeaseStore(join(stateDir, 'lease.json'), () => 100);
@@ -118,7 +206,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
     expect(run(...raise)).toBeUndefined();
     expect(process.exitCode).toBe(4);
-    expect(errors.at(-1)).toContain('본부는 node-b gen 2 — 거기서 쓰거나 --hq-override(관측)');
+    expect(errors.at(-1)).toBe('본부는 node-b gen 2 — 원장 쓰기는 지금 본부로 보내라 (수동 우회: --hq-override, 관측)');
     expect(readFileSync(path, 'utf8')).toBe(before);
     expect(JSON.parse(run('show', entry.id, '--json')!).status).toBe('open');
     process.exitCode = 0;
@@ -136,7 +224,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
   } finally { process.exitCode = prior ?? 0; console.error = oldError; rmSync(stateDir, { recursive: true, force: true }); }
 });
-test('actual decisions CLI refuses a non-holder with exit 4 and allows the observed override', () => {
+test('actual isolated decisions CLI writes despite a foreign lease without override', () => {
   const stateDir = root();
   const store = fileLeaseStore(join(stateDir, 'hq', 'lease.json'), () => 100);
   const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...args],
@@ -145,16 +233,13 @@ test('actual decisions CLI refuses a non-holder with exit 4 and allows the obser
     '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
     expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    const blocked = run(...raise);
-    expect(blocked.status).toBe(4);
-    expect(blocked.stderr).toContain('본부는 other-host gen 2 — 거기서 쓰거나 --hq-override(관측)');
-    const read = run('list', '--json');
-    expect(read.status).toBe(0);
-    expect(JSON.parse(read.stdout)).toEqual([]);
-    const override = run(...raise, '--hq-override');
-    expect(override.status, override.stderr).toBe(0);
-    expect(override.stderr).toContain('hq override: decisions raise');
-    expect(JSON.parse(run('show', JSON.parse(override.stdout).id, '--json').stdout).status).toBe('open');
+    const added = run(...raise);
+    expect(added.status, added.stderr).toBe(0);
+    expect(added.stderr).not.toContain('hq override:');
+    const entry = JSON.parse(added.stdout);
+    const decided = run('decide', entry.id, 'a', '--json');
+    expect(decided.status, decided.stderr).toBe(0);
+    expect(JSON.parse(decided.stdout).status).toBe('decided');
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 }, 180_000);
 

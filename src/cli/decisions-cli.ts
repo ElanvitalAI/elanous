@@ -1,12 +1,15 @@
 import { Option, type Command } from 'commander';
 import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
 import { fileLeaseStore } from '../hq/lease.js';
+import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
+import { debug } from '../debug/log.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { join } from 'node:path';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
-import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry } from '../decisions/decision-ledger.js';
+import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
 function date(raw?: string): string | undefined {
@@ -52,13 +55,24 @@ export function formatDecisionDetail(e: DecisionEntry): string {
     ...(e.refs?.length ? [`참조: ${e.refs.join(' · ')}`] : [])].join('\n');
 }
 
+export function formatSeatDecisionRow(e: SeatDecisionRecord): string {
+  return `${e.id} · 결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · 기록: ${e.recordedAt ? kst(e.recordedAt) : '시각 미상'} · ${e.seat} 결정 · 사후 보고 · ${e.title} → ${e.decision} · 위임: ${e.delegation}${e.refs?.length ? ` · 참조: ${e.refs.join(' · ')}` : ''}`;
+}
+
 export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
   const noXcheck = new Option('--no-xcheck <이유>', '교차 확인 생략 이유');
   // This flag takes a reason, not Commander's negated boolean default.
   noXcheck.negate = false;
   const root = program.command('decisions').description('대표 결정 원장 · 로컬 전용').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
-  const mayWrite = (command: string, override?: boolean) => hqCliWriteAllowed(`decisions ${command}`, Boolean(override || root.opts().hqOverride),
-    (getElanousConfigDirOverride() || config.stateDir) && !hqDeps.store && !getUserConfig().hq?.arbiter ? { ...hqDeps, store: fileLeaseStore(join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'lease.json')), seenPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'seen-generation'), localPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'local.json') } : hqDeps);
+  const mayWrite = (command: string, override?: boolean) => {
+    const ledgerRoot = config.stateDir ?? elanousStateRoot();
+    if (command !== 'linear-sync' && isIsolatedLedgerWriteRoot(ledgerRoot)) {
+      try { debug.log('hq.fence', 'skipped-isolated', { root: ledgerRoot, command: `decisions ${command}` }); } catch { /* observation is fail-soft */ }
+      return true;
+    }
+    return hqCliWriteAllowed(`decisions ${command}`, Boolean(override || root.opts().hqOverride),
+      (getElanousConfigDirOverride() || config.stateDir) && !hqDeps.store && !getUserConfig().hq?.arbiter ? { ...hqDeps, store: fileLeaseStore(join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'lease.json')), seenPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'seen-generation'), localPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'local.json') } : hqDeps);
+  };
   const emit = (value: unknown, json?: boolean, text?: string) => out.log(json ? JSON.stringify(value) : text ?? JSON.stringify(value));
   const fail = (action: () => void) => { try { action(); } catch (e) { throw new Error(`decisions: ${e instanceof Error ? e.message : String(e)}`); } };
   root.command('linear-sync').description('열린 결정을 COO Linear 프로젝트에 투영하고 닫힌 결정을 동기화한다')
@@ -104,6 +118,24 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
         ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
       if (entry.crossCheckSkipped === 'missing') console.error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
       emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
+    }));
+  root.command('record-seat').description('위임 범위에서 이미 내린 자리 결정을 사후 보고로 원장에 기록 (대표 카드 아님)')
+    .requiredOption('--seat <OP|MK|TC|UX>').requiredOption('--title <text>')
+    .requiredOption('--decision <text>').requiredOption('--delegation <scope>')
+    .option('--at <UTC>', '알고 있는 결정 시각 (UTC ISO; 생략 시 결정 시각 미상)')
+    .option('--ref <source>', '조율 글 등의 출처 (반복)', repeat, [] as string[])
+    .option('--json').option('--hq-override')
+    .action((o: { seat: Seat; title: string; decision: string; delegation: string; at?: string; ref: string[]; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('record-seat', o.hqOverride)) return;
+      const entry = new DecisionLedger(config).recordSeatDecision({ seat: o.seat, title: o.title, decision: o.decision,
+        delegation: o.delegation, ...(o.at ? { decidedAt: o.at } : {}), ...(o.ref.length ? { refs: o.ref } : {}) });
+      emit(entry, o.json, formatSeatDecisionRow(entry));
+    }));
+  root.command('seat-report').description('밤사이 자리들의 사후 결정을 한 번에 조회 (기본 최근 24시간)')
+    .option('--since <date>', '조회 시작 UTC ISO 또는 Nd', '1d').option('--seat <OP|MK|TC|UX>').option('--json')
+    .action((o: { since: string; seat?: Seat; json?: boolean }) => fail(() => {
+      const rows = new DecisionLedger(config).seatReport({ since: date(o.since), seat: o.seat });
+      emit(rows, o.json, rows.length ? rows.map(formatSeatDecisionRow).join('\n') : '자리 결정 0건');
     }));
   root.command('list').description('결정 목록 (기본 열린 것)')
     .option('--status <open|decided|all>', '기본 open', 'open').option('--since <date>').option('--version <version>')

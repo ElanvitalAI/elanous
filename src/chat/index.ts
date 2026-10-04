@@ -452,6 +452,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'reasoning', aliases: ['r', 'think'],  description: 'Reasoning level (codex effort + summary, anthropic extended-thinking budget) — /reasoning [off|low|medium|high|xhigh] (cycle when no arg · xhigh 는 모델 상한이 xhigh 이상일 때만 wire 에 실린다, 아니면 high 로 깎인다)', subcommands: ['off', 'low', 'medium', 'high', 'xhigh'] },
   { name: 'local',     aliases: ['ll'],         description: 'Local OpenAI-compatible LLM — ping / models / test / use', subcommands: ['ping', 'models', 'test', 'use', 'status'] },
   { name: 'session',   aliases: ['sess'],       description: 'Session resume — list / load / sync / new (handoff from mobile)', subcommands: ['list', 'load', 'sync', 'new'] },
+  { name: 'persona', aliases: [], description: '이 대화의 페르소나 보기·고르기·빼기 — /persona [이름|-]', subcommands: ['-'] },
   { name: 'fork',      aliases: [],             description: 'Copy this session into a new one' },
   { name: 'rewind',    aliases: [],             description: 'Rewind — 과거 user 턴 픽커로 되감기 (원본 보존 · 새 세션 분기 · /rewind <n> 숏컷)' },
   // TUI 부활 C-a (2026-07-12): autopilot 미션 TUI 표면 — CLI 동등 단일 창구 소비.
@@ -463,6 +464,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'plugin', aliases: ['plugins'], description: 'Manage plugins', subcommands: ['list', 'activate', 'deactivate', 'reload'] },
   { name: 'widget', aliases: ['widgets'], description: 'Manage widgets', subcommands: ['list', 'reload', 'instances'] },
   { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'help'] },
+  { name: 'loops', aliases: [], description: '루프와 크론 상태 표 — /loops [owner]' },
   { name: 'memory', aliases: ['mem'], description: 'Memory ops — list / show / search / add / delete (see `elanous memory --help`)', subcommands: ['list', 'show', 'search', 'add', 'delete', 'index'] },
   { name: 'export', aliases: [], description: 'Export this conversation transcript to a markdown file — /export [path] (default ~/temp/elanous-transcript-<stamp>.md)' },
   { name: 'delta', aliases: ['diffs'], description: 'Source delta browser — open the latest turn-scoped file diff popup', subcommands: ['open', 'help'] },

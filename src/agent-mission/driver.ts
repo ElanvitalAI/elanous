@@ -2202,8 +2202,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     rounds: round, evidencePath: null, committed: false, usedOmniCrawl: usedOmni, detail: 'aborted' };
   const finalEv = verifyEvidence(wt.path, spec.evidence);
   const finalScreen = await h.renderScreen();
-  const driveVerdict = verdictForFinalPtyScreen({ screen: finalScreen, inputHistory: submittedInputs, exitCode: h.exitCode ?? null });
-  debug.log('agent-mission', 'drive-verdict', { kind: driveVerdict.kind, reason: driveVerdict.reason.slice(0, 200) });
+  const driveVerdict = verdictForFinalPtyScreen({ screen: finalScreen, inputHistory: submittedInputs, exitCode: h.exitCode ?? null, artifactEvidence: finalEv.ok });
+  debug.log('agent-mission', 'drive-ok', { verdict: driveVerdict.kind, reason: driveVerdict.reason.slice(0, 200), evidence: finalEv.ok });
   const recoverExhausted = control.termination.kind === 'stuck' && control.termination.reason.startsWith('사람 필요');
   const accepted = finalEv.ok && !recoverExhausted && driveVerdict.kind !== 'done-but-failed';
   const evidencePath = accepted ? finalEv.path : null;
@@ -2223,7 +2223,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     ok: accepted, worktree: wt.path, branch: wt.branch, rounds: round,
     evidencePath, evidenceSatisfied: finalEv.ok, committed, usedOmniCrawl: usedOmni,
     ptyId: h.id, webUrl: webAddress.webUrl, driveVerdict: driveVerdict.kind,
-    detail: recoverExhausted ? control.termination.reason : driveVerdict.kind === 'done-but-failed' ? `미완(DRIVE-OK: ${driveVerdict.reason})` : done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
+    detail: recoverExhausted ? control.termination.reason : driveVerdict.kind === 'done-but-failed' ? `미완(DRIVE-OK: ${driveVerdict.reason})` : driveVerdict.kind === 'success-unverified' && finalEv.ok ? '완료(증거)' : done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
   } finally { stopLive(); finishContext(false); }
 }

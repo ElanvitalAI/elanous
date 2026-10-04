@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { addedCandidates, auditTestStateWrites, august8Inventory, classifyCandidates, classifyStaticIsolation, renderAudit } from './audit-test-state-writes';
+import { readFileSync } from 'node:fs';
+import { addedCandidates, auditTestStateWrites, august8Inventory, classifyCandidates, classifyStaticIsolation, renderAudit, unclassifiedCandidates } from './audit-test-state-writes';
 
 describe('audit-test-state-writes static safety classification', () => {
   test('recognizes only the three approval-safe isolation signals', () => {
@@ -13,17 +14,16 @@ describe('audit-test-state-writes static safety classification', () => {
     });
   });
 
-  test('classifies exactly the 62 candidates added since the fixed August 8 inventory without approving a mixed-file HOME writer', () => {
+  test('classifies new candidates against the reviewed baseline without pinning the growing August 8 window', () => {
     const report = auditTestStateWrites();
+    const reviewed = new Set(readFileSync('test/test-home-state-write-audit-baseline.txt', 'utf8').split('\n').filter((line) => line && !line.startsWith('#')));
     const window = addedCandidates(report, august8Inventory());
     const classification = classifyCandidates(report, window);
-    expect(window.size).toBe(62);
-    expect(classification.findings).toHaveLength(62);
-    expect(classification.manualReview.length).toBeGreaterThan(0);
-    expect(classification.findings.some((finding) => finding.staticSafety === 'manual-review')).toBe(true);
+    expect(classification.findings.map(({ file }) => file).sort()).toEqual([...window].sort());
+    expect(unclassifiedCandidates(report, reviewed)).toEqual([]);
     const rendered = renderAudit(report);
-    expect(rendered).toContain('August 8 candidate window: **62 files**');
-    expect(rendered).toContain('Candidate classification (files):');
+    expect(rendered).toContain(`August 8 candidate window: **${window.size} files**`);
+    expect(rendered).toContain('## 분류기 통과(자동)');
     expect(rendered).toContain('a file is ㉡ whenever any writer call lacks a direct approved signal.');
   });
 });

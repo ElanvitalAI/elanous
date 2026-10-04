@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { landingFreezeMessage, readLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { diffFailures, junitFailures, parseFailures } from './gate-diff';
@@ -32,6 +33,7 @@ export interface GateRunner {
 }
 export interface GateOptions {
   commit: string;
+  forceFreeze?: boolean;
   version: string;
   baselineVersion?: string;
   baselineCommit?: string;
@@ -537,6 +539,12 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   const start = Date.now();
   const explicitConfig = getElanousConfigDirOverride();
   const root = explicitConfig ? effectiveInstanceRoot() : (opts.instanceRoot ?? effectiveInstanceRoot());
+  // The freeze is read from the same root the gate runs in (a config-dir override must not move it elsewhere).
+  const frozen = readLandingFreeze(root);
+  if (frozen) {
+    debug.log('release.run', opts.forceFreeze ? 'freeze-forced' : 'frozen', { version: opts.version, reason: frozen.reason, until: frozen.until, node: 'gate' });
+    if (!opts.forceFreeze) throw new Error(landingFreezeMessage(frozen));
+  }
   const ledger = explicitConfig ? root : (opts.ledgerRoot ?? releaseLedgerRoot());
   const roots = [...new Set([ledger, root])];
   const cachedBaseline = (version: string, commit: string) => {
@@ -766,6 +774,7 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     commit: typeof fromGraph.commit === 'string' ? fromGraph.commit : '',
     version: typeof fromGraph.version === 'string' ? fromGraph.version : '',
     baselineVersion: typeof fromGraph.previousVersion === 'string' ? fromGraph.previousVersion : undefined,
+    forceFreeze: fromGraph.forceFreeze === true,
     baselineCommit: typeof fromGraph.previousCommit === 'string' ? fromGraph.previousCommit : undefined,
     remote: typeof fromGraph.gateRemote === 'string' ? fromGraph.gateRemote : undefined,
     remoteMirror: typeof fromGraph.gateRemoteMirror === 'string' ? fromGraph.gateRemoteMirror : undefined,

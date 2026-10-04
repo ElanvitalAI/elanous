@@ -38,7 +38,7 @@ import { lookupEntrance, type EntranceId } from './entrance-registry.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
 import type { ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { resolveRunIdentity, type RunIdSource } from '../harness/harness-space.js';
-import { addSelfDevRunParticipant, saveSelfDevRun } from './run-store.js';
+import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-store.js';
 import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
@@ -1718,7 +1718,11 @@ export async function runDevPipeline(spec: DevPipelineSpec, deps: DevPipelineDep
   if (spec.runId) {
     const runIdSource = spec.runIdSource ?? resolveRunIdentity({ explicit: spec.runId }).source;
     const now = Date.now();
-    saveSelfDevRun({ runId: spec.runId, createdAt: now, updatedAt: now, results: [], pid: process.pid });
+    const seat = process.env.ELANOUS_HARNESS_SEAT;
+    const pidStart = processBirthId(process.pid);
+    saveSelfDevRun({ runId: spec.runId, createdAt: now, updatedAt: now, results: [], pid: process.pid,
+      ...(pidStart ? { pidStart } : {}),
+      ...(seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX' ? { seat } : {}) });
     addSelfDevRunParticipant(spec.runId, {
       id: `process:${process.pid}`,
       kind: 'process',

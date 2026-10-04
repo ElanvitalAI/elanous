@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../../src/graph-runner/runner.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../../src/self-implement/run-ledger.js';
+import { recordFailureEvent } from '../../src/self-implement/heal-intake.js';
 import { roleResult } from './run-role.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -69,6 +70,53 @@ test('역할 recipe 는 러너가 카탈로그+recipes.yaml command 로 실행�
     });
     expect(state.path).toContain('acknowledge');
     expect(state.status).toBe('done');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('heal board observe-ledger reads the selected inbox event and passes its failure into triage', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'heal-board-inbox-'));
+  try {
+    const event = { source: 'release-run' as const, kind: 'graph-run', ref: 'release-loop/run-fail',
+      summary: 'release node failed', at: '2026-10-04T13:00:00.000Z' };
+    recordFailureEvent(event, root);
+    const input = { failureEvent: { source: event.source, ref: event.ref } };
+    const collect = roleResult('observe-ledger', { input }, { stateRoot: root });
+    expect(collect).toMatchObject({ outcome: 'ok', entries: [{ errorText: event.summary }], event });
+    const actualCollect = runRole('observe-ledger', { input, outputs: {} }, root);
+    expect(actualCollect).toMatchObject({ outcome: 'ok', event, entries: [{ errorText: event.summary }] });
+    const triage = runRole('triage', { input, outputs: { collect: actualCollect } }, root);
+    expect(triage.outcome).toBe('needs-deeper-observation');
+    expect(triage.evidence).toContain('errorText ← collect');
+    expect(roleResult('observe-ledger', { input: { ...input, since: '2026-10-04T13:00:01.000Z' } }, { stateRoot: root }))
+      .toMatchObject({ outcome: 'empty', reason: 'inbox-event-not-found' });
+    expect(roleResult('observe-ledger', { input: { failureEvent: { source: event.source, ref: 'unrelated' } } }, { stateRoot: root }))
+      .toMatchObject({ outcome: 'empty', reason: 'inbox-event-not-found' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('observe-ledger selects the newest repeated source+ref failure for heal triage', () => {
+  const root = mkdtempSync(join(tmpdir(), 'heal-board-repeat-'));
+  try {
+    const older = { source: 'release-run' as const, kind: 'graph-run', ref: 'release-loop/retry',
+      summary: 'old failure', at: '2026-10-04T13:00:00.000Z' };
+    const newer = { ...older, summary: 'new failure', at: '2026-10-04T14:01:00.000Z' };
+    recordFailureEvent(older, root);
+    recordFailureEvent(newer, root);
+    expect(readFileSync(join(root, 'heal/inbox.jsonl'), 'utf8').trimEnd().split('\n')).toHaveLength(2);
+    const input = { failureEvent: { source: older.source, ref: older.ref } };
+    const collect = runRole('observe-ledger', { input }, root);
+    expect(collect).toMatchObject({ outcome: 'ok', event: newer, entries: [{ errorText: newer.summary }] });
+    const triage = runRole('triage', { input, outputs: { collect } }, root);
+    expect(triage.evidence).toContain('errorText ← collect');
+    let query = '';
+    roleResult('ground-external', { input, outputs: { collect } }, { search: (text) => { query = text; return []; } });
+    expect(query).toBe(newer.summary);
+    expect(roleResult('observe-ledger', { input: { ...input, since: newer.at } }, { stateRoot: root }))
+      .toMatchObject({ event: newer, entries: [{ errorText: newer.summary }] });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

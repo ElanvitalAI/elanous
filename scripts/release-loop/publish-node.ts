@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WARNING_ONLY } from './auto-approve-node.js';
+import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
+import { debug } from '../../src/debug/log.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
 
 export function publicNotes(markdown: string, pages: { pages: Array<{ id: string; slug?: string; source?: string }> }): string {
@@ -64,7 +66,18 @@ export function runPublish(run: CommandRunner = runCommand) {
   try {
     const file = join(dir, 'notes.md');
     writeFileSync(file, body);
-    const published = run('bun', ['bin/elanous.mjs', 'release', 'publish', '--dir', out, '--notes-file', file, '--yes', '--json']);
+    // Same in-flight marker as merges: `freeze on` waits for a publication that already passed this check.
+    // Unlike a merge, a frozen publication is not queued: it fails, and the release run is run again after `freeze off`.
+    const landing = beginLandingMerge();
+    const frozen = landing.frozen;
+    if (frozen) {
+      landing.end(); // already released by beginLandingMerge when frozen; kept explicit so no path leaves a marker
+      debug.log('release.run', context.input.forceFreeze === true ? 'freeze-forced' : 'frozen', { version, reason: frozen.reason, until: frozen.until, node: 'publish' });
+      if (context.input.forceFreeze !== true) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${landingFreezeMessage(frozen)}` };
+    }
+    let published: ReturnType<typeof run>;
+    try { published = run('bun', ['bin/elanous.mjs', 'release', 'publish', '--dir', out, '--notes-file', file, '--yes', '--json']); }
+    finally { landing.end(); }
     if (published.stderr) process.stderr.write(published.stderr);
     const result = lastResult(published);
     if (published.status === 1) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `release publish failed: ${result?.error ?? published.stderr.trim()}` };

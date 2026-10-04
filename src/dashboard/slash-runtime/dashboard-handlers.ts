@@ -273,6 +273,7 @@
 // of circular dependency on dashboard/index.ts.
 
 import { tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
+import { handleTuiChatPersona, type TuiChatPersonaSelection } from './chat-persona.js';
 import { createWishCard } from '../../intake-plane/wish-card.js';
 import { CardStore } from '../../task-cards/card-store.js';
 import type { ContextNowDeps } from '../../context-bus/context-now.js';
@@ -390,6 +391,8 @@ import { resolveTerminalMoveDestination } from '../../terminal-matrix/mobility.j
 import { loadPersistedSessions } from '../../terminal/session-persistence.js';
 import { dispatchTerminalModalObserve } from '../../skills/tools/terminal-modal.js';
 import { SlashCommandRegistry } from './registry.js';
+import { cronSecondDueAt, filterLoopRows, formatLoopsTable, localLoopRows, type LoopsTableRow } from './loops-table.js';
+import { loopCronVerdict } from '../../loops/verdict.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import {
   buildContextSlashCommand,
@@ -1029,6 +1032,7 @@ export interface DashboardSlashContext {
   /** Currently-attached session id (TUI's pointer to a JSONL on disk). */
   getAttachedSessionId(): string | null;
   setAttachedSessionId(id: string | null): void;
+  chatPersona?: { sessionId(): string; selection: TuiChatPersonaSelection; newConversation?(): void };
   /** Telegram chat id paired with the attached session, when handed off. */
   getAttachedChatId(): number | null;
   setAttachedChatId(id: number | null): void;
@@ -1037,6 +1041,9 @@ export interface DashboardSlashContext {
     getConfig(): ReturnType<typeof getUserConfig>;
     send: (cfg: ReturnType<typeof getUserConfig>, text: string) => Promise<boolean>;
   };
+
+  /** Test seam for the local read-only loop and cron registry. */
+  loopsLocalRows?: (now: Date) => LoopsTableRow[];
 
   sessionSlash: {
     /** opts.remote — when the dashboard is attached to a remote daemon. */
@@ -1364,11 +1371,88 @@ function emitReplyToChat(ctx: Pick<DashboardSlashContext, 'pushChatLine'>, line:
   ctx.pushChatLine(line);
 }
 
+async function fetchLoopsDaemonJson<T>(url: string, headers: Record<string, string>): Promise<T> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      (async () => {
+        const response = await fetch(url, { headers, signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json() as T;
+      })(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error('request timed out'));
+        }, 1_000);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
   const registry = new SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn>();
 
   registry.register(['now'], (args, ctx) => {
     for (const line of tuiNowSlash(args, nowDeps)) ctx.pushChatLine(line);
+  });
+
+  registry.register('loops', async (args, ctx) => {
+    if (args.length > 1) {
+      ctx.pushChatLine(ctx.warning('  usage: /loops [owner]'));
+      return;
+    }
+    const now = new Date(Date.now());
+    let rows: LoopsTableRow[] = [];
+    const remote = ctx.sessionSlash.remoteDaemon();
+    if (remote) {
+      const base = deriveDaemonHttpBase(remote.url);
+      if (base) {
+        try {
+          const headers: Record<string, string> = remote.token ? { authorization: `Bearer ${remote.token}` } : {};
+          const body = await fetchLoopsDaemonJson<{ schedules?: Array<{ name: string; domain?: string | null; runVia?: string | null;
+            source: string; cron?: string | null; state: string; lastRun?: { at: string; status: string | null; exit: number | null } | null;
+            intervalMs?: number | null }> }>(`${base}/v1/schedules?includeOff=1`, headers);
+          rows = (body.schedules ?? []).map(schedule => ({
+            layer: 'daemon cron', name: schedule.name, owner: schedule.domain ?? '—', mode: schedule.runVia ?? schedule.source,
+            lastRun: schedule.lastRun?.at ?? null,
+            verdict: loopCronVerdict({ enabled: schedule.state !== 'off', lastRunAt: schedule.lastRun?.at ?? null,
+              lastStatus: schedule.lastRun?.exit != null && schedule.lastRun.exit !== 0 ? 'failed' : schedule.lastRun?.status ?? null,
+              intervalMs: schedule.intervalMs ?? null,
+              secondDueAt: cronSecondDueAt(schedule.cron ?? null, schedule.lastRun?.at ?? null) }, now.getTime()),
+          }));
+        } catch (err) {
+          ctx.pushChatLine(ctx.warning(`  daemon cron unavailable: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        try {
+          const headers: Record<string, string> = remote.token ? { authorization: `Bearer ${remote.token}` } : {};
+          const body = await fetchLoopsDaemonJson<{ loops?: { loops?: Array<{
+            name: string; label: string; armed: boolean | null; category?: string;
+            last: { at: string; status: string } | null;
+          }> } | null }>(`${base}/v1/dashboard/loops`, headers);
+          // dashboardLoops returns LoopStatus (no owner field). Its category is
+          // exec/reflect, not an owner; keep ownership unknown rather than
+          // attributing every daemon loop to a guessed domain.
+          rows.push(...(body.loops?.loops ?? []).map(loop => ({
+            layer: 'daemon loop', name: loop.label || loop.name, owner: '—', mode: loop.category ?? 'loop',
+            lastRun: loop.last?.at ?? null,
+            verdict: loopCronVerdict({ enabled: loop.armed !== false, lastRunAt: loop.last?.at ?? null,
+              lastStatus: loop.last?.status ?? null, intervalMs: null }, now.getTime()),
+          })));
+        } catch (err) {
+          ctx.pushChatLine(ctx.warning(`  daemon loops unavailable: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      }
+    }
+    try { rows.push(...(ctx.loopsLocalRows ?? localLoopRows)(now)); }
+    catch (err) { ctx.pushChatLine(ctx.warning(`  local loops unavailable: ${err instanceof Error ? err.message : String(err)}`)); }
+    const filtered = filterLoopRows(rows, args[0]);
+    for (const line of formatLoopsTable(filtered, text => ctx.error(text))) ctx.pushChatLine(`  ${line}`);
+    if (!filtered.length) ctx.pushChatLine(ctx.muted('  No loops or cron jobs found.'));
+    ctx.setChatScrollOffset(-1);
   });
 
   registry.register('wish', (args, ctx) => {
@@ -1425,6 +1509,16 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
       ctx.chatLines.push(...lines);
       ctx.setChatScrollOffset(-1);
     }
+  });
+
+  registry.register('persona', async (args, ctx) => {
+    if (!ctx.chatPersona) {
+      ctx.pushChatLine(ctx.warning('  페르소나를 사용할 수 없습니다'));
+    } else {
+      const text = await handleTuiChatPersona(args, ctx.chatPersona.sessionId(), ctx.chatPersona.selection);
+      for (const line of text.split('\n')) ctx.pushChatLine(ctx.muted(`  ${line}`));
+    }
+    ctx.setChatScrollOffset(-1);
   });
 
   registry.register('directive', async (args, ctx) => {
@@ -4042,6 +4136,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
       const prev = attached;
       ctx.setAttachedSessionId(null);
       ctx.setAttachedChatId(null);
+      ctx.chatPersona?.newConversation?.();
       const chatHistory = ctx.compactSlash.chatHistory;
       const sysFromDash = chatHistory.find(m => m.role === 'system');
       chatHistory.length = 0;
@@ -4151,6 +4246,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
           sessionAppendMessage(meta.id, { role: m.role, content, ts: nowTs });
         }
         sessionAttachTelegram(meta.id, chatTarget);
+        if (ctx.chatPersona) {
+          const selected = ctx.chatPersona.selection.get(ctx.chatPersona.sessionId());
+          if (selected) ctx.chatPersona.selection.set(meta.id, selected);
+        }
         ctx.setAttachedSessionId(meta.id);
         ctx.setAttachedChatId(chatTarget);
         ctx.chatLines.push(ctx.success(`  ✓ attached session ${meta.id.slice(0, 8)} → chat ${chatTarget}  (${chatHistory.length} turns mirrored)`));

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { exportFileName, nameFromFileName, checkImportFile } from './workflow-file';
+import { exportFileName, nameFromFileName, checkImportFile, readonlyExportFileName, readonlyExportYaml } from './workflow-file';
+import { parse } from 'yaml';
 
 test('export filenames sanitize unsafe names and fall back on empty names', () => {
   expect(exportFileName('my flow')).toBe('my-flow.yaml');
@@ -8,6 +9,24 @@ test('export filenames sanitize unsafe names and fall back on empty names', () =
   expect(exportFileName('')).toBe('workflow.yaml');
   expect(exportFileName('../unsafe:flow')).toBe('unsafe-flow.yaml');
   expect(exportFileName('???')).toBe('workflow.yaml');
+});
+
+test('readonly export locks a copy of the YAML, preserving content without mutating the draft', () => {
+  const draft = 'name: demo\nreadonly: false\ndescription: "read only: false"\nnodes:\n  - id: first\n    bash: echo hello\n';
+  const exported = readonlyExportYaml(draft);
+  expect(parse(exported)).toEqual({
+    name: 'demo', readonly: true, description: 'read only: false',
+    nodes: [{ id: 'first', bash: 'echo hello' }],
+  });
+  expect(draft).toContain('readonly: false');
+  expect(parse(readonlyExportYaml(exported)).readonly).toBe(true);
+  expect(readonlyExportFileName('my flow')).toBe('my-flow-readonly.yaml');
+  expect(exportFileName('my flow')).toBe('my-flow.yaml');
+});
+
+test('readonly export rejects invalid YAML instead of downloading a misleading file', () => {
+  expect(() => readonlyExportYaml('name: [unclosed\n')).toThrow('워크플로 YAML을 읽을 수 없어');
+  expect(() => readonlyExportYaml('just text\n')).toThrow('워크플로 YAML을 읽을 수 없어');
 });
 
 test('imported filename loses YAML extension and becomes lowercase kebab-case', () => {
@@ -42,4 +61,10 @@ test('editor wires the gallery and offers export of the draft next to Save', () 
   expect(source).toMatch(/link\.remove\(\)/);
   expect(source).toMatch(/URL\.revokeObjectURL\(url\)/);
   expect(source.indexOf('내보내기')).toBeLessThan(source.indexOf('Save\n'));
+  expect(source).toMatch(/onClick=\{handleReadonlyExport\}\s+disabled=\{!draftYaml\.trim\(\)\}/);
+  expect(source).toContain('읽기 전용 사본 내보내기');
+  expect(source).toMatch(/const yaml = readonlyExportYaml\(draftYaml\)/);
+  expect(source).toMatch(/new Blob\(\[yaml\], \{ type: 'application\/x-yaml' \}\)/);
+  expect(source).toMatch(/link\.download = readonlyExportFileName\(creatingNew \? newName : selectedName \?\? ''\)/);
+  expect(source).toMatch(/setSaveError\(err instanceof Error \? err\.message : String\(err\)\)/);
 });

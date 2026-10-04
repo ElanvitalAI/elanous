@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync, type Dirent } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { CardStore } from '../task-cards/card-store.js';
+import { recordWishBenchmarkSampleSafely } from './wish-benchmark-ledger.js';
 
 export interface WishScanResult {
   added: number;
@@ -52,9 +53,11 @@ export function scanWishFolder({ dir, store }: { dir: string; store: CardStore }
       result.skipped++;
       continue;
     }
-    const title = /^# (.+)$/m.exec(readFileSync(path, 'utf8'))?.[1]?.trim() || basename(path, '.md');
+    const text = readFileSync(path, 'utf8');
+    const title = /^# (.+)$/m.exec(text)?.[1]?.trim() || basename(path, '.md');
     const card = old ?? store.createCard({ goalId, title });
-    const intake = { source: 'wish', path: relPath, mtime, title };
+    if (intakeSections.length === 0) recordWishBenchmarkSampleSafely({ cardId: card.id, at: card.createdAt, surface: 'wish', text });
+    const intake = { source: 'wish', path: relPath, mtime, title, text };
     store.appendSection(card.id, {
       key: `intake:wish:${intakeSections.length}`,
       owner: 'steward',

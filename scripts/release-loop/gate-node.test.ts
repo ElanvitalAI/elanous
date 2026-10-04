@@ -7,11 +7,22 @@ import { createGateRunner, graphGateResult, judgeGate, parseOptions, POD_HEAVY_F
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
+import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+test('freeze prevents starting the release gate before runner side effects', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'freeze-release-gate-'));
+  scratch.push(root);
+  enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
+  let calls = 0;
+  const runner = new Proxy({}, { get: () => { calls++; throw new Error('runner must not run'); } }) as GateRunner;
+  await expect(judgeGate({ commit: 'a'.repeat(40), version: '0.2.4', instanceRoot: root }, runner)).rejects.toThrow('동결 중 · drill');
+  expect(calls).toBe(0);
+});
 
 const CUT = 'a'.repeat(40), BASE = 'b'.repeat(40);
 const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';

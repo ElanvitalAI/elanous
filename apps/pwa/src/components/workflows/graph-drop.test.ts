@@ -9,6 +9,7 @@ import { MINIMAP_MIN_NODES, WorkflowGraph, droppedEntry, showMiniMap } from './W
 
 const core: GraphKindEntry = { graph: 'workflow', kind: 'bash', core: true, plugin: null, description: 'Shell' };
 const plugin: GraphKindEntry = { graph: 'workflow', kind: 'demo:step', core: false, plugin: 'demo', description: 'Step' };
+const knowledge: GraphKindEntry = { graph: 'workflow', kind: 'knowledge', core: true, plugin: null, description: 'Look up knowledge' };
 
 const globals = globalThis as { window?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean };
 const previousWindow = globals.window;
@@ -26,9 +27,10 @@ test('drag payload round-trips known entries and rejects malformed or unknown va
   expect(DRAG_MIME).toBe('application/x-elanous-node');
   expect(decodeDrag(encodeDrag(core))).toEqual(core);
   expect(decodeDrag(encodeDrag(plugin))).toEqual(plugin);
+  expect(decodeDrag(encodeDrag(knowledge))).toEqual(knowledge);
   for (const invalid of ['', '{broken', 'null', '[]', '{}',
     '{"graph":"harness","kind":"bash","core":true,"description":"x"}',
-    '{"graph":"workflow","kind":"surprise","core":true,"description":"x"}',
+    '{"graph":"workflow","kind":"surprise!","core":true,"description":"x"}',
     '{"graph":"workflow","kind":"not-a-plugin","core":false,"description":"x"}',
   ]) expect(decodeDrag(invalid)).toBeNull();
 });
@@ -52,6 +54,8 @@ test('addNodeAt inserts one fresh node at the dropped coordinates without changi
   const inserted = addNodeAt(def, plugin, { x: 32, y: 60 });
   expect(inserted.def.nodes.at(-1)).toEqual({ id: inserted.id, kind: 'demo:step', inputs: {} });
   expect((inserted.def._meta as { layout: Record<string, unknown> }).layout[inserted.id]).toEqual({ x: 32, y: 60 });
+  const addedKnowledge = addNodeAt(inserted.def, knowledge, { x: 0, y: 0 });
+  expect(addedKnowledge.def.nodes.at(-1)).toEqual({ id: addedKnowledge.id, knowledge: {} });
 });
 
 function definition(count: number): WorkflowDefinitionLike {
@@ -75,6 +79,53 @@ test('palette chips are draggable and carry the palette MIME; click-to-add still
   await act(async () => renderer.unmount());
 });
 
+test('daemon vocabulary drives the floating list and the N picker, including knowledge and plugin kinds', async () => {
+  const entries = [core, knowledge, plugin];
+  const initialYaml = 'name: example\nnodes: []\n';
+  let yaml = '';
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(createElement(WorkflowGraph, {
+    yaml: initialYaml, definition: definition(0), editable: true, palette: entries,
+    onChangeYaml: (value: string) => { yaml = value; },
+  })); });
+  const buttons = () => renderer.root.findAllByType('button');
+  const chip = (kind: string) => buttons().find((b) => b.children.includes(`+ ${kind}`))!;
+  expect(entries.map((entry) => chip(entry.kind).children[0])).toEqual(entries.map((entry) => `+ ${entry.kind}`));
+  chip('knowledge').props.onClick(); // don't commit ReactFlow with nodes under the test renderer
+  expect(yaml).toContain('knowledge: {}');
+  expect(yaml).not.toContain('bash: echo placeholder');
+  expect(yaml).not.toContain('_meta:');
+  await act(async () => renderer.unmount());
+  // The N shortcut opens the same vocabulary as the floating chips.
+  const listeners = new Set<(event: KeyboardEvent) => void>();
+  // The global window stub is shared with the other graph tests; trigger the binding via its listener.
+  const currentWindow = globals.window as { addEventListener: (type: string, cb: (e: KeyboardEvent) => void) => void; removeEventListener: (type: string, cb: (e: KeyboardEvent) => void) => void };
+  const originalAdd = currentWindow.addEventListener;
+  const originalRemove = currentWindow.removeEventListener;
+  currentWindow.addEventListener = (type, cb) => { if (type === 'keydown') listeners.add(cb); };
+  currentWindow.removeEventListener = (type, cb) => { if (type === 'keydown') listeners.delete(cb); };
+  try {
+    await act(async () => { renderer = create(createElement(WorkflowGraph, {
+      yaml: initialYaml, definition: definition(0), editable: true, palette: entries,
+      onChangeYaml: (value: string) => { yaml = value; },
+    })); });
+    await act(async () => {
+      for (const listener of listeners) listener({ key: 'n', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, target: { tagName: 'DIV' }, preventDefault: () => {} } as unknown as KeyboardEvent);
+    });
+    const picker = renderer.root.findAllByType('span').filter((span) => entries.some((entry) => span.children.includes(entry.kind)));
+    expect(picker.map((span) => span.children[0])).toEqual(entries.map((entry) => entry.kind));
+    const pickPlugin = renderer.root.findAllByType('li').find((item) =>
+      item.findAllByType('span').some((span) => span.children.includes('demo:step')),
+    )!.findByType('button');
+    pickPlugin.props.onClick(); // outside act: do not mount the resulting one-node ReactFlow
+    expect(yaml).toContain('kind: demo:step');
+  } finally {
+    await act(async () => renderer.unmount());
+    currentWindow.addEventListener = originalAdd;
+    currentWindow.removeEventListener = originalRemove;
+  }
+});
+
 test('droppedEntry accepts only our MIME and entries this palette offers', () => {
   const ours = (value: string, types = [DRAG_MIME]) => ({ dataTransfer: { types, getData: () => value } });
   expect(droppedEntry(ours(encodeDrag(core)), [core])).toEqual(core);
@@ -84,6 +135,7 @@ test('droppedEntry accepts only our MIME and entries this palette offers', () =>
   expect(droppedEntry(ours(encodeDrag(plugin)), [core, plugin])).toEqual(plugin);
   expect(droppedEntry(ours(encodeDrag(core)), undefined)).toEqual(core);
   expect(droppedEntry(ours(encodeDrag(plugin)), undefined)).toBeNull();
+  expect(droppedEntry(ours(encodeDrag(knowledge)), undefined)).toBeNull();
 });
 
 test('empty editable canvas takes a palette drop and places the first node at the origin', async () => {

@@ -37,7 +37,8 @@ import { iosFilesIn, runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.
 import { detectGateCommand } from './detect-gate.js';
 import { writeScopedTypecheckConfig } from './scoped-typecheck-config.js';
 // ⭐ 게이트 스코프 근본 수리(2026-07-26) — 풀 `bun test` 폴백 제거 + 연관 테스트 유도(순수).
-import { resolveGateScope } from './gate-scope.js';
+import { formatNoRelatedTestsWarning, resolveGateScope } from './gate-scope.js';
+import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
 import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { countTestDeclarations } from './test-declarations.js';
@@ -976,6 +977,7 @@ export interface DefaultSeamsOptions {
   runIosUnitTestGate?: (io: { args: readonly string[]; cwd: string }) => number;
   /** Source-policy gate adapter for focused seam tests. */
   runHarnessPolicyGates?: typeof runHarnessPolicyGates;
+  runExposeGate?: typeof runExposeGate;
   /** Dependency-wide validation adapter for focused seam tests. */
   runDependencyChangeGate?: typeof runDependencyChangeGate;
   /** 워크트리 시험 묶음(없으면 실패 파일)을 base에서 재실행하는 seam. 실패 경로에서만 호출된다. */
@@ -1409,6 +1411,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       },
       removeMatchingGoalCopy,
     },
+    supersedeDraftsOnMerge: async (number, cwd) => {
+      const { supersedeMergedGoalDrafts } = await import('../harness/harness-cli-command.js');
+      await supersedeMergedGoalDrafts(number, cwd);
+    },
     lineageSupersede: {
       listOpenDrafts: () => listOpenDraftsForLineage(),
       readRunLedger: (runId) => {
@@ -1810,8 +1816,13 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const observationChanges = gateChangedFiles(cwd, comparisonBase);
       const observationChangedFiles = observationChanges.files;
       const postsync = ctx?.mode === 'postsync';
-      // 정합 전 일반 게이트는 worktree-only. 정합 후 재게이트만 이미 계산된 merge-base 목록을 실행 범위로 쓴다.
-      const changedAll = postsync ? observationChangedFiles : gitChangedFiles(cwd);
+      // 일반 게이트는 기존 worktree 범위를 유지하되 fork 이후 커밋된 시험을 더한다.
+      // HEAD 대비 미커밋 목록만 쓰면 릴리스 노트만 남은 재작업 라운드에서
+      // 커밋된 시험을 놓쳐 docs-only 로 건너뛴다. postsync는 종전처럼 전 변경을 잰다.
+      const changedAll = postsync ? observationChangedFiles : [...new Set([
+        ...gitChangedFiles(cwd),
+        ...observationChangedFiles.filter((file) => isTestPath(file)),
+      ])];
       // ⚠️ **regular-file 판정**(리뷰 should-fix 5R) — `existsSync` 는 **디렉터리도 true** 다.
       //   계약은 "실존 테스트 **파일**"이므로 파일 여부까지 확인한다(디렉터리를 testArgs 로 넘기면
       //   필터 무매치 → "0 files ran" 부당 실패).
@@ -1824,11 +1835,19 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         trackedFiles.filter(isTestPath),
         [...new Set([...trackedFiles, ...changedAll, ...observationChangedFiles])].filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file)),
       );
-      const routeConsumerTestIndex = buildRouteConsumerTestIndex(cwd, trackedFiles.filter(isTestPath), changedAll, comparisonBase ?? 'HEAD');
+      // 런 전체 재탐색 시 앞 라운드의 변경·삭제 서버 경로도 비교-base 소비자 색인에 있어야 한다.
+      const routeConsumerTestIndex = buildRouteConsumerTestIndex(cwd, trackedFiles.filter(isTestPath),
+        [...new Set([...changedAll, ...observationChangedFiles])], comparisonBase ?? 'HEAD');
       // 워크트리에 없는 변경 경로 = 지운 파일 — 미검증으로 세지 않는다(gate-scope `isDeleted` · 2026-09-26 run-7dd4cce6).
       const isDeleted = (path: string): boolean => !isFile(path);
-      const scopeOpts = { isDeleted, routeConsumerTestIndex: routeConsumerTestIndex ?? undefined };
+      const scopeOpts = { isDeleted, routeConsumerTestIndex: routeConsumerTestIndex ?? undefined,
+        runChanged: observationChangedFiles, round: ctx?.round };
       const scope = resolveGateScope(changedAll, isFile, importerTestIndex ?? undefined, postsync ? { ...scopeOpts, mode: 'postsync' } : scopeOpts);
+      // The landing scope is the PR diff, not only this round's uncommitted test files.
+      const expose = publicExposureFiles(observationChangedFiles).length > 0
+        ? (o.runExposeGate ?? runExposeGate)(cwd, observationChangedFiles,
+          getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn')
+        : { passed: true, log: '' };
       const comparisonFailureReason = observationChanges.comparisonBaseStatus === 'unavailable'
         ? 'comparison-base-unavailable'
         : observationChanges.comparisonBaseStatus === 'comparison-failed'
@@ -1865,6 +1884,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       debug.log('self-implement', 'gate.scope', {
         ...(ctx?.runId ? { runId: ctx.runId } : {}),
         targeted: gateOpts.testArgs?.length ?? 0, files: (gateOpts.testArgs ?? []).slice(0, 8),
+        'evaluated-changes': changedAll.slice(0, 8), evaluatedChangeCount: changedAll.length,
         changedTests: observedChangedTestFiles.slice(0, 8), changedTestCount: observedChangedTestFiles.length,
         srcChanged: scope.sourceFiles.length, testStepSkipped,
         scopeReason, derived: scope.derived.length, ignoredOutsideSrc: scope.ignoredOutsideSrc,
@@ -2053,7 +2073,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       //   `tc`(변경파일 tsc) **전에** 실행해서, tsc 가 깨져 **최종 게이트가 실패한 런에도**
       //   base 를 다시 돌리고 `gate.log` 를 바꿨다 ⇒ *"게이트 실패 경로 무변경"* 경계 위반.
       //   ⇒ 조건을 최종 판정과 같은 식으로 묶는다.
-      const gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed && policy.passed && (dependencyGate?.passed ?? true);
+      const gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed && policy.passed && expose.passed && (dependencyGate?.passed ?? true);
       const verifyIdentity = gateVerifyIdentity(ctx?.runId);
       if (gatePassed && scope.skipTestStep) {
         verifyByBreaking = { ran: false, distinguishes: 0, 'does-not-distinguish': 0, unknown: 0, skippedReason: scope.reason };
@@ -2204,7 +2224,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           + (scope.reason === 'no-related-tests'
             // ⭐ **미검증 파일 목록**(2026-07-27 사후 리뷰 수리) — 종전엔 `sourceFiles` 를 실어
             //   `package.json`·설정·스크립트 변경 시 **빈 목록**이 나갔다(그 파일들은 소스 확장자가 아니다).
-            ? `동작 검증을 못 한 변경: ${scope.unverified.slice(0, 8).join(', ')}`
+            ? `\n\n${formatNoRelatedTestsWarning(scope.unverified)}\n\n동작 검증을 못 한 변경: ${scope.unverified.slice(0, 8).join(', ')}`
               + `\n⚠️ 이 라운드는 **동작 검증이 되지 않았다**(변경파일 tsc 만 통과) — "게이트 통과=검증됨"으로 결론내지 말 것.`
               // ⚠️ 안내를 일반화(리뷰 should-fix) — `package.json`·lockfile·설정·스크립트에는
               //   "해당 소스의 테스트"라는 표현이 부정확하다(그 변경엔 대응 테스트 관례가 없다).
@@ -2229,7 +2249,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         : '';
       return {
         passed: gatePassed,
-        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}`,
+        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}${expose.log ? `\n\n${expose.log}` : ''}`,
         testStepExecuted: !testStepSkipped && testStep !== undefined && !testStep.skipped,
         scopeReason,
         comparisonBaseStatus: observationChanges.comparisonBaseStatus,

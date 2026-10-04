@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { basename, isAbsolute, resolve } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { defaultListHarnessProcesses, type HarnessProcessListObservation } from '../../harness/harness-cli-command.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
@@ -10,7 +10,8 @@ export type WorkItem = { kind: 'pr' | 'goal'; ref: string; seat: OrchestratorSea
 export type WorkRef = Pick<WorkItem, 'kind' | 'ref' | 'seat'>;
 export type Overlap = ({ type: 'file'; path: string } | { type: 'cell'; cell: string }) & { refs: WorkRef[]; crossSeat: boolean };
 
-type OpenPr = { number: number; title: string; body?: string | null; headRefName: string; files: Array<{ path: string }>; isDraft: boolean };
+type OpenPr = { number: number; title: string; body?: string | null; headRefName: string; files: Array<{ path: string }>; isDraft: boolean; labels: Array<{ name: string }> };
+export type CollectWorkResult = { work: WorkItem[]; excluded: { stalled: number; superseded: number; draft: number }; unreadableTrees: number; unreadableGoals: number };
 export interface CollectWorkDeps {
   runGh?: (args: string[]) => string;
   listProcesses?: () => HarnessProcessListObservation;
@@ -59,14 +60,51 @@ function goalFiles(text: string): string[] {
   return [...new Set(match[1]!.split(/\s*[·,]\s*/).map(file => file.trim().replace(/^`|`$/g, '')).filter(Boolean))];
 }
 
-export function collectWork(deps: CollectWorkDeps = {}): WorkItem[] {
-  const prs = JSON.parse((deps.runGh ?? defaultRunGh)(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,body,headRefName,files,isDraft'])) as OpenPr[];
+export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
+  const prs = JSON.parse((deps.runGh ?? defaultRunGh)(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,body,headRefName,files,isDraft,labels'])) as OpenPr[];
   if (!Array.isArray(prs)) throw new Error('PR observation is not a list');
   const observation = (deps.listProcesses ?? defaultListHarnessProcesses)();
   if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
   const cfg = deps.config ?? getUserConfig().loops?.orchestrator ?? ORCHESTRATOR_DEFAULTS;
-  const work: WorkItem[] = prs.map(pr => ({ kind: 'pr', ref: `#${pr.number}`, seat: seatOfPr(pr.title),
-    files: pr.files.map(file => file.path), cells: cellsOf(`${pr.title}\n${pr.body ?? ''}`) }));
+  const excluded = { stalled: 0, superseded: 0, draft: 0 };
+  const ready = prs.filter(pr => {
+    const labels = pr.labels ?? [];
+    if (labels.some(label => label.name === 'elanous:stalled')) { excluded.stalled++; return false; }
+    if (labels.some(label => label.name === 'elanous:superseded')) { excluded.superseded++; return false; }
+    if (pr.isDraft) { excluded.draft++; return false; }
+    return true;
+  });
+  const seatsByPr = new Map<number, Set<OrchestratorSeat>>();
+  let unreadableTrees = 0;
+  let unreadableGoals = 0;
+  for (const seat of TRAFFIC_SEATS) {
+    for (const tree of cfg.seatTrees[seat] ?? []) {
+      try {
+        const goals = join(tree, 'docs', 'goals');
+        const numbers = new Set<number>();
+        for (const entry of readdirSync(goals, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+          // One unreadable goal file must not drop the whole tree's PR→seat mapping; count it instead.
+          let text: string;
+          try { text = (deps.readGoal ?? ((file: string) => readFileSync(file, 'utf8')))(join(goals, entry.name)); }
+          catch { unreadableGoals++; continue; }
+          for (const match of text.matchAll(/^[ \t]*prNumber:[ \t]*(\d+)[ \t]*\r?$/gm)) numbers.add(Number(match[1]));
+        }
+        for (const number of numbers) {
+          const seats = seatsByPr.get(number) ?? new Set<OrchestratorSeat>();
+          seats.add(seat);
+          seatsByPr.set(number, seats);
+        }
+      } catch {
+        unreadableTrees++;
+      }
+    }
+  }
+  const work: WorkItem[] = ready.map(pr => {
+    const matched = seatsByPr.get(pr.number);
+    return { kind: 'pr', ref: `#${pr.number}`, seat: seatOfPr(pr.title) ?? (matched?.size === 1 ? [...matched][0]! : null),
+      files: pr.files.map(file => file.path), cells: cellsOf(`${pr.title}\n${pr.body ?? ''}`) };
+  });
   for (const process of observation.records) {
     const path = goalPath(process.command);
     if (path === null) continue;
@@ -86,7 +124,7 @@ export function collectWork(deps: CollectWorkDeps = {}): WorkItem[] {
     }
     work.push({ kind: 'goal', ref, seat, files: goalFiles(text), cells: cellsOf(text) });
   }
-  return work;
+  return { work, excluded, unreadableTrees, unreadableGoals };
 }
 
 export function findOverlaps(work: readonly WorkItem[], excludedFiles: readonly string[] = ['release/next.md']): Overlap[] {
@@ -119,16 +157,17 @@ export function renderOverlaps(overlaps: readonly Overlap[]): string[] {
 if (import.meta.main) {
   try {
     if (process.argv.slice(2).some(arg => arg !== '--json')) throw new Error('usage: overlap.ts [--json]');
-    const work = collectWork();
+    const { work, excluded, unreadableTrees, unreadableGoals } = collectWork();
     const overlaps = findOverlaps(work);
     const files = overlaps.filter(overlap => overlap.type === 'file').length;
     const cells = overlaps.filter(overlap => overlap.type === 'cell').length;
     const crossSeat = overlaps.filter(overlap => overlap.crossSeat).length;
     const unreadable = work.filter(item => item.unreadable).length;
-    debug.log('loop.orchestrator', 'exchange', { node: 'overlap', files, cells, crossSeat });
-    const summary = `overlap work=${work.length} files=${files} cells=${cells} crossSeat=${crossSeat} unreadable=${unreadable}`;
+    const seatNull = work.filter(item => item.kind === 'pr' && item.seat === null).length;
+    debug.log('loop.orchestrator', 'exchange', { node: 'overlap', files, cells, crossSeat, excluded, seatNull, unreadableTrees, unreadableGoals });
+    const summary = `overlap work=${work.length} files=${files} cells=${cells} crossSeat=${crossSeat} unreadable=${unreadable} excluded=stalled:${excluded.stalled},superseded:${excluded.superseded},draft:${excluded.draft} seatNull=${seatNull} unreadableTrees=${unreadableTrees} unreadableGoals=${unreadableGoals}`;
     if (process.argv.includes('--json')) {
-      console.log(JSON.stringify({ work, overlaps }));
+      console.log(JSON.stringify({ work, overlaps, excluded, seatNull, unreadableTrees, unreadableGoals }));
       console.error(summary);
     } else {
       for (const line of renderOverlaps(overlaps)) console.log(line);

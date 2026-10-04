@@ -92,6 +92,13 @@ export interface ModelTierPutWire {
   smartDefaults?: SmartDefaultsUserConfigWire | null;
 }
 
+export interface WishPlacementWire {
+  cellId: string;
+  cellTitle: string;
+  version: string;
+  status: 'green' | 'yellow' | 'red' | 'done';
+}
+
 export interface TaskCardWire {
   id: string;
   goalId: string;
@@ -119,7 +126,7 @@ export interface NexusClient {
   getTabs(opts?: { kind?: NexusTabKind }): Promise<{ tabs: NexusTabState[] }>;
   getTab(id: string): Promise<{ tab: NexusTabState; recentEvents: NexusEvent[] }>;
   getTaskCards(): Promise<{ cards: TaskCardWire[] }>;
-  getTaskCard(id: string): Promise<{ card: TaskCardWire }>;
+  getTaskCard(id: string): Promise<{ card: TaskCardWire; placements?: WishPlacementWire[] }>;
   /** PWA mirror PR 1 — chat-backend Quick Setup snapshot. PR 2's
    *  QuickSetupCard component consumes this to mirror the TUI Settings
    *  card on mobile / iOS / remote PWA users. Cache-free; the PWA's

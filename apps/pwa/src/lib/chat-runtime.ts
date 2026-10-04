@@ -534,9 +534,9 @@ const TUI_SLASH_NAMES = new Set([
   'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now', 'wish',
   'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
   'ad', 'design', 'design-check',
-  'local', 'll', 'session', 'sess', 'fork', 'rewind', 'mission',
+  'local', 'll', 'session', 'sess', 'persona', 'fork', 'rewind', 'mission',
   'resume-turn', 'context', 'ctx', 'paste', 'sync', 's', 'plugin',
-  'plugins', 'widget', 'widgets', 'log', 'memory', 'mem', 'export',
+  'plugins', 'widget', 'widgets', 'log', 'loops', 'memory', 'mem', 'export',
   'delta', 'diffs', 'theme', 'debug', 'rebind', 'api-allow', 'api',
   'prompt', 'prompts', 'history', 'hist', 'inputs', 'research', 'rsh',
   'harness', 'plan', 'chat', 'dashboard', 'dash', 'telegram', 'tg',
@@ -689,7 +689,7 @@ export const META_HANDLERS: Record<
       const res = await fetch(`${baseUrl}/v1/task-cards/wish`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(cfg.token ? { authorization: `Bearer ${cfg.token}` } : {}) },
-        body: JSON.stringify({ text: wish.text, ref: wish.ref }),
+        body: JSON.stringify({ text: wish.text, ref: wish.ref, sessionId: wish.sessionId }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const card: unknown = await res.json();

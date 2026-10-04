@@ -3,14 +3,16 @@ import { execFile } from 'node:child_process';
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
+import { recordFailureEvent } from '../self-implement/heal-intake.js';
 import { growthApprovalRef, proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect, type GrowthDecisionDeps, type GrowthCommand } from './graph-grow.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { createLLMGrowthProposer } from './graph-grow-llm.js';
@@ -210,6 +212,18 @@ function persistGraphRun(state: GraphRunState): void {
   const temporary = `${state.statePath}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n');
   renameSync(temporary, state.statePath);
+}
+
+/** Inbox I/O cannot change a persisted graph verdict. The saved run is the replay source if intake fails. */
+function recordReleaseRunFailure(state: GraphRunState, root: string, summary: string): void {
+  const event = { source: 'release-run' as const, kind: 'graph-run', ref: `${state.graphId}/${state.runId}`,
+    summary, at: state.finishedAt! };
+  try { recordFailureEvent(event, root); }
+  catch (error) {
+    debug.log('heal.intake', 'record-failed', {
+      ...event, statePath: state.statePath, error: String(error),
+    }, { level: 'error' });
+  }
 }
 
 /** A synchronous, per-ledger critical section shared by runner writes and stop/destroy. */
@@ -690,12 +704,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const env = { ...process.env };
       for (const key of declaredEnv) delete env[key];
       Object.assign(env, credentials);
-      // 러너가 명시로 받은 우주(`--config-dir`)를 `cmd:` 자식에 못 박는다 — 자식이 코드 위치(소스 트리)로 시험 우주를 새로 고르던 구멍
-      //   (09-30 🅢 스튜어드: 작업 트리 `graph run … --config-dir ~/.elanous` 의 자식 triage 가 «apiKey missing» · 0.2.5 컷 릴리스 루프도 같은 발사 줄).
+      // An explicit --config-dir is process-local. Pin its effective root via the
+      // state stamp so a cmd: child resolves its default config in the same universe.
+      // The ignored config-dir environment variable must not appear to propagate the flag.
+      delete env.ELANOUS_CONFIG_DIR;
       if (getElanousConfigDirOverride()) {
-        env.ELANOUS_CONFIG_DIR = getElanousConfigDir();
         env.ELANOUS_STATE_DIR = effectiveInstanceRoot();
-        debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: env.ELANOUS_CONFIG_DIR, stateDir: env.ELANOUS_STATE_DIR });
+        debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: getElanousConfigDirOverride(), stateDir: env.ELANOUS_STATE_DIR });
       }
       env.ELANOUS_GRAPH_CONTEXT = contextPath;
       env.ELANOUS_GRAPH_DRY_RUN = state.dryRun ? '1' : '0';
@@ -733,10 +748,17 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
     publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
     log('node-end', { graphId, runId, nodeId: current, ok, exit, ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
+    if (!resumingCompleted) {
+      // Recipe commands expose stdout/exit but no provider usage; never infer zero from success.
+      observeModelInputTokens({ scope: 'harness-node', nodeKind: node.kind, runId, nodeId: current });
+    }
     persist();
     if (graph.terminalNodes.includes(current)) {
       state.status = current === 'failed' || !ok ? 'failed' : 'done';
       persist();
+      if (state.status === 'failed' && !state.dryRun && graphId === 'release-loop') {
+        recordReleaseRunFailure(state, root, `Graph ${graphId}/${runId} failed at ${current}`);
+      }
       break;
     }
     const fromNodeId = current;
@@ -782,6 +804,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (current === undefined) {
       state.status = 'failed';
       persist();
+      if (!state.dryRun && graphId === 'release-loop') {
+        recordReleaseRunFailure(state, root, `Graph ${graphId}/${runId} failed after ${fromNodeId} (no outgoing edge)`);
+      }
     }
   }
   return state;

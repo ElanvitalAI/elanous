@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_SWEEP_CLOSE_CAP, runDraftSweep, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr } from './draft-sweep.js';
+import { DRAFT_SWEEP_CLOSE_CAP, runDraftSweep, supersedeDraftsOnMerge, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr } from './draft-sweep.js';
+import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
 
 const state = (name: string) => PR_LABELS.find((entry) => entry.axis === 'state' && entry.name.endsWith(name))!.name;
@@ -29,6 +30,171 @@ const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
   return { calls, statuses, adapters, setLive: (value: ReadonlySet<string> | undefined) => { live = value; } };
 };
 const sweep = (adapters: DraftSweepAdapters, apply = false) => runDraftSweep({ repository: 'owner/repo', adapters, apply, now });
+
+describe('supersedeDraftsOnMerge', () => {
+  const merged = { number: 90, title: '「하니스로 구현」 DRAFT-TRIAGE', branch: 'self-impl/draft-triage-goalid-abcd-new',
+    createdAt: '2026-09-30T00:00:00Z', mergedAt: '2026-10-01T00:00:00Z' };
+
+  it('closes only an older same-goal draft, protecting release, keep, approval, live and other goals', async () => {
+    const rows = [
+      draft(1, { title: merged.title, labels: [stalled] }),
+      draft(2, { title: merged.title, labels: [stalled, RELEASE_PATH_LABEL] }),
+      draft(3, { title: 'another goal', labels: [stalled] }),
+      draft(4, { title: merged.title, labels: [keep] }),
+      draft(5, { title: merged.title, labels: [approval] }),
+      draft(6, { title: merged.title, labels: [stalled] }),
+      draft(9, { title: merged.title, labels: [stalled], createdAt: '2026-10-02T00:00:00Z' }),
+    ];
+    const fixture = make(rows);
+    fixture.setLive(new Set([rows[5]!.branch]));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters });
+      expect(result).toEqual({ closed: [1], kept: [2, 3, 4, 5, 6, 9] });
+      expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
+        `label:1:${stalled}=>${superseded}`, 'close:1:Draft sweep: superseded-by #90. Branch preserved.',
+      ]);
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'superseded-on-merge', { merged: 90, closed: [1], kept: [2, 3, 4, 5, 6, 9] });
+    } finally { log.mockRestore(); }
+  });
+
+  it('records a failed close as kept without hiding later successful closes', async () => {
+    const fixture = make([draft(1, { title: merged.title, labels: [stalled] }), draft(2, { title: merged.title, labels: [stalled] })]);
+    fixture.adapters.closeDraft = async (_repo, number) => {
+      if (number === 1) throw new Error('close unavailable');
+      fixture.calls.push(`close:${number}`);
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+        .toEqual({ closed: [2], kept: [1] });
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'superseded-on-merge', {
+        merged: 90, closed: [2], kept: [1], failed: [1], error: 'Error: close unavailable',
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps a draft open when the superseded label write fails, so an open-draft sweep can retry', async () => {
+    const row = draft(1, { title: merged.title, labels: [stalled] });
+    const fixture = make([row]);
+    const github: { open: boolean; labels: string[] } = { open: true, labels: [stalled] };
+    let failLabels = true;
+    fixture.adapters.listDrafts = async () => github.open ? [{ ...row, labels: [...github.labels] }] : [];
+    fixture.adapters.setLabels = async (_repo, number, change) => {
+      if (failLabels) throw new Error('label unavailable');
+      github.labels = [...github.labels.filter((label) => !change.remove.includes(label)), change.add];
+      fixture.calls.push(`label:${number}`);
+    };
+    fixture.adapters.closeDraft = async (_repo, number) => {
+      github.open = false;
+      fixture.calls.push(`close:${number}`);
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+        .toEqual({ closed: [], kept: [1] });
+      expect(github).toEqual({ open: true, labels: [stalled] });
+      expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual([]);
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'superseded-on-merge', {
+        merged: 90, closed: [], kept: [1], failed: [1], error: 'Error: label unavailable',
+      });
+      failLabels = false;
+      expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+        .toEqual({ closed: [1], kept: [] });
+      expect(github).toEqual({ open: false, labels: [superseded] });
+    } finally { log.mockRestore(); }
+  });
+
+  it('leaves an open draft labelled superseded for the next sweep when closing fails', async () => {
+    const fixture = make([draft(1, { title: merged.title, labels: [stalled] })]);
+    const github = new Map<number, { open: boolean; labels: string[] }>([[1, { open: true, labels: [stalled] }]]);
+    fixture.adapters.setLabels = async (_repo, number, change) => {
+      const pr = github.get(number)!;
+      pr.labels = [...pr.labels.filter((label) => !change.remove.includes(label)), change.add];
+      fixture.calls.push(`label:${number}`);
+    };
+    fixture.adapters.closeDraft = async () => { throw new Error('close unavailable'); };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [1] });
+    expect(github.get(1)).toEqual({ open: true, labels: [superseded] });
+    expect(fixture.calls.filter((call) => call.startsWith('label:'))).toEqual(['label:1']);
+
+    // Review must-fix (GOODHART): the claimed retry is the periodic sweep itself — clear the fault and run the real
+    // runDraftSweep against the same GitHub state; the draft must end closed and still labelled superseded.
+    const row = draft(1, { title: merged.title, labels: [stalled] });
+    fixture.adapters.listDrafts = async (page, size) => {
+      const pr = github.get(1)!;
+      return (pr.open ? [{ ...row, labels: [...pr.labels] }] : []).slice((page - 1) * size, page * size);
+    };
+    fixture.adapters.listMerged = async (page, size) => [merged].slice((page - 1) * size, page * size);
+    fixture.adapters.closeDraft = async (_repo, number) => {
+      github.get(number)!.open = false;
+      fixture.calls.push(`close:${number}`);
+    };
+    const swept = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true,
+      now: new Date('2026-10-02T00:00:00Z') });
+    expect(swept.complete).toBe(true);
+    expect(swept.entries.find((entry) => entry.number === 1)?.action).toBe('close');
+    expect(github.get(1)).toEqual({ open: false, labels: [superseded] });
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toEqual(['close:1']);
+  });
+
+  it('reuses the merged-twin branch lineage when titles differ', async () => {
+    const fixture = make([draft(7, { title: 'old title', labels: [stalled], branch: 'self-impl/another-goalid-abcd-old' })]);
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+      .toEqual({ closed: [7], kept: [] });
+  });
+
+  it('closes a same-goal draft opened after the merged PR but before its landing', async () => {
+    const fixture = make([draft(8, { title: merged.title, labels: [stalled], createdAt: '2026-09-30T12:00:00Z' })]);
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+      .toEqual({ closed: [8], kept: [] });
+  });
+
+  it('reuses the all-files-landed same-slot path only with verified latest changes', async () => {
+    const old = draft(11, { title: 'old slot', branch: 'self-impl/old', labels: [stalled],
+      body: '칸: UX 10-04', changedFiles: ['docs/goal.md'] });
+    const landed = { ...merged, title: 'new slot', branch: 'self-impl/new', body: '칸: UX 10-04' };
+    const fixture = make([old]);
+    fixture.adapters.getPrFiles = async () => ['docs/goal.md'];
+    fixture.adapters.getLatestFileChanges = async () => ({ 'docs/goal.md': '2026-09-29T00:00:00Z' });
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: landed, adapters: fixture.adapters }))
+      .toEqual({ closed: [11], kept: [] });
+    fixture.calls.length = 0;
+    fixture.adapters.getLatestFileChanges = async () => undefined;
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged: landed, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: [11] });
+    expect(fixture.calls.some((call) => call.startsWith('close:'))).toBe(false);
+  });
+
+  it('fails closed on a failed draft listing or missing liveness and respects the close cap', async () => {
+    const rows = Array.from({ length: DRAFT_SWEEP_CLOSE_CAP + 2 }, (_, i) => draft(i + 10, { title: merged.title, labels: [stalled] }));
+    const fixture = make(rows);
+    fixture.adapters.listDrafts = async () => { throw new Error('GitHub unavailable'); };
+    expect((await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters })).closed).toEqual([]);
+    fixture.adapters.listDrafts = async (page, size) => rows.slice((page - 1) * size, page * size);
+    fixture.setLive(undefined);
+    expect((await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters })).closed).toEqual([]);
+    fixture.setLive(new Set());
+    fixture.adapters.getPrFiles = async () => { throw new Error('file inventory failed'); };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: rows.map((row) => row.number) });
+    fixture.adapters.getPrFiles = undefined;
+    fixture.adapters.getRunStatus = async () => { throw new Error('run lookup failed'); };
+    expect(await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters }))
+      .toEqual({ closed: [], kept: rows.map((row) => row.number) });
+    fixture.adapters.getRunStatus = async () => undefined;
+    const result = await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: fixture.adapters });
+    expect(result.closed).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
+    expect(result.kept).toHaveLength(2);
+    const failures = make(rows);
+    failures.adapters.closeDraft = async () => { throw new Error('close unavailable'); };
+    const failedResult = await supersedeDraftsOnMerge({ repository: 'owner/repo', merged, adapters: failures.adapters });
+    expect(failedResult.closed).toEqual([]);
+    expect(failures.calls.filter((call) => call.startsWith('label:'))).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
+    expect(failedResult.kept).toHaveLength(rows.length);
+  });
+});
 
 describe('runDraftSweep', () => {
   it('reuses paged open drafts to supersede an older matching attempt and logs the existing reason', async () => {

@@ -43,11 +43,9 @@ import {
 } from './workflow-graph-layout';
 import {
   addEdge as defAddEdge,
-  addNode as defAddNode,
   clearLayout as defClearLayout,
   definitionToYaml,
   deleteNode as defDeleteNode,
-  nextFreeNodeId,
   duplicateNode as defDuplicateNode,
   removeEdge as defRemoveEdge,
   safeParseWorkflowYaml,
@@ -62,10 +60,15 @@ import {
   type NodeStatusEntry,
 } from './run-status-helpers';
 import { nodeStatusClass } from './node-status-class';
-import { DRAG_MIME, addNodeAt, decodeDrag, encodeDrag } from './graph-drop';
+import { DRAG_MIME, addNodeAt, addPaletteNode, decodeDrag, encodeDrag } from './graph-drop';
 import { addNote, loadNotes, removeNote, saveNotes, updateNote, type GraphNote } from './graph-notes';
 import type { ValidationIssue } from './validation-helpers';
 import type { GraphKindEntry } from '@/nexus/client';
+import { CORE_WORKFLOW_KINDS } from '@/lib/run-graph-yaml-edit';
+
+const fallbackPalette: GraphKindEntry[] = CORE_WORKFLOW_KINDS.map((kind) => ({
+  graph: 'workflow', kind, core: true, description: '', plugin: null,
+}));
 
 // Lazy parse: yaml has its own bundle cost so we only import on first
 // use. Returns the parsed definition or null on failure.
@@ -173,9 +176,8 @@ export function droppedEntry(
   if (!Array.from(event.dataTransfer.types as Iterable<string>).includes(DRAG_MIME)) return null;
   const entry = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
   if (!entry) return null;
-  const offered = palette
-    ? palette.some((item) => item.kind === entry.kind && item.core === entry.core)
-    : entry.core;
+  const offered = (palette ?? fallbackPalette)
+    .some((item) => item.kind === entry.kind && item.core === entry.core);
   return offered ? entry : null;
 }
 
@@ -470,18 +472,13 @@ export function WorkflowGraph({
   // 위에 두라」고 이미 적어 두었는데도 새 훅 하나가 그 아래로 들어갔고, 파싱 실패·미파싱·노드 0 인
   // 렌더에서 훅 수가 줄어 React 가 이 트리를 죽인다. 2026-05-08 에 같은 파일에서 났던 그 결함이다.
   // ⇒ 이제 그 재발을 «세는» 자가 있다: `bun run scripts/hook-order-sweep.ts --list`.
-  const onCreateNode = useCallback(
-    (variant: NodeVariant) => {
-      mutate((def) => defAddNode(def, variant));
-      setNodeCreatorOpen(false);
-    },
-    [mutate],
-  );
   const onAddPaletteNode = useCallback((entry: GraphKindEntry) => {
-    mutate((def) => entry.core
-      ? defAddNode(def, entry.kind as NodeVariant)
-      : { ...def, nodes: [...def.nodes, { id: nextFreeNodeId(def, 'unknown'), kind: entry.kind, inputs: {} }] });
+    mutate((def) => addPaletteNode(def, entry));
   }, [mutate]);
+  const onCreateNode = useCallback((entry: GraphKindEntry) => {
+    onAddPaletteNode(entry);
+    setNodeCreatorOpen(false);
+  }, [onAddPaletteNode]);
 
   // Tier E3.2 (2026-05-11) — keyboard shortcuts. Skipped entirely
   // when not editable so a read-only viewer doesn't accidentally
@@ -585,6 +582,9 @@ export function WorkflowGraph({
         {editable && <NodePalette palette={palette} editable={editable === true} onAdd={onAddPaletteNode} />}
         {editable && <GraphHistoryControls canUndo={canUndo} canRedo={canRedo} onUndo={onUndo} onRedo={onRedo} />}
         {editable && <AddNoteButton onAdd={onAddNote} />}
+        {editable && nodeCreatorOpen && (
+          <NodeCreatorPanel palette={palette} onPick={onCreateNode} onClose={() => setNodeCreatorOpen(false)} />
+        )}
         {editable
           ? 'No nodes yet — pick a variant from the palette.'
           : 'No nodes yet — switch to YAML view to add one.'}
@@ -603,6 +603,7 @@ export function WorkflowGraph({
       )}
       {editable && nodeCreatorOpen && (
         <NodeCreatorPanel
+          palette={palette}
           onPick={onCreateNode}
           onClose={() => setNodeCreatorOpen(false)}
         />
@@ -715,30 +716,11 @@ function GraphHistoryControls({
 /** Floating palette of variant buttons. Click → add a new node of
  *  that variant via the consumer's mutate callback. */
 function NodePalette({ palette, editable, onAdd }: { palette?: GraphKindEntry[]; editable: boolean; onAdd: (entry: GraphKindEntry) => void }) {
-  const variants: { v: NodeVariant; label: string }[] = [
-    { v: 'prompt', label: '+ prompt' },
-    { v: 'bash', label: '+ bash' },
-    { v: 'skill', label: '+ skill' },
-    { v: 'cft', label: '+ cft' },
-    { v: 'approval', label: '+ approval' },
-    { v: 'if', label: '+ if' },
-    { v: 'switch', label: '+ switch' },
-    { v: 'iteration', label: '+ loop' },
-    { v: 'classify', label: '+ classify' },
-    { v: 'extract', label: '+ extract' },
-    { v: 'set', label: '+ set' },
-    { v: 'filter', label: '+ filter' },
-    { v: 'template', label: '+ template' },
-    { v: 'http', label: '+ http' },
-    { v: 'scheduleTrigger', label: '+ schedule' },
-    { v: 'webhookTrigger', label: '+ webhook' },
-  ];
   return (
     <div
-      className="absolute left-3 top-3 z-10 flex flex-col gap-1 rounded-md border border-border bg-surface-elevated p-1 shadow-md"
+      className="absolute left-3 top-3 z-10 flex max-h-[calc(100%-1.5rem)] flex-col gap-1 overflow-y-auto rounded-md border border-border bg-surface-elevated p-1 shadow-md"
     >
-      {(palette ?? variants.map(({ v }) => ({ graph: 'workflow' as const, kind: v, core: true, plugin: null, description: '' })))
-        .map((entry) => (
+      {(palette ?? fallbackPalette).map((entry) => (
         <button
           key={entry.kind}
           type="button"
@@ -752,7 +734,7 @@ function NodePalette({ palette, editable, onAdd }: { palette?: GraphKindEntry[];
           className="rounded px-2 py-0.5 text-left text-[10px] text-text-tertiary transition-colors hover:bg-surface hover:text-text-primary"
           style={{ minWidth: 80 }}
         >
-          {variants.find(({ v }) => v === entry.kind)?.label ?? `+ ${entry.kind}`}
+          {`+ ${entry.kind}`}
           {entry.plugin && <span className="ml-1 rounded bg-accent/15 px-1 text-accent">{entry.plugin}</span>}
         </button>
       ))}
@@ -857,42 +839,20 @@ function TidyUpButton({ onTidy }: { onTidy: () => void }) {
   );
 }
 
-/** Tier E4.3 (2026-05-11) — NodeCreator side panel. Slide-in from the
- *  right with a search bar + variant chips. Click a chip to insert a
- *  node of that variant; ESC or click-outside dismisses. Triggered by
- *  `N` shortcut from the parent.
- *
- *  Search is a substring filter (no fuzzy / Fuse.js dep — the variant
- *  catalog is 5 entries long). When skill / cft selectors land in a
- *  later iteration the same surface accepts a list prop. */
+/** Searchable node picker using the same daemon vocabulary as the header and floating palette. */
 function NodeCreatorPanel({
+  palette,
   onPick,
   onClose,
 }: {
-  onPick: (variant: NodeVariant) => void;
+  palette?: GraphKindEntry[];
+  onPick: (entry: GraphKindEntry) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState('');
-  const items: { v: NodeVariant; label: string; help: string }[] = [
-    { v: 'prompt', label: 'prompt', help: 'Run an LLM prompt with the run context.' },
-    { v: 'bash', label: 'bash', help: 'Run a shell snippet.' },
-    { v: 'skill', label: 'skill', help: 'Invoke a registered skill (e.g. omni-digest).' },
-    { v: 'cft', label: 'cft', help: 'Run a CFT (e.g. pdca, swot).' },
-    { v: 'approval', label: 'approval', help: 'Pause for human approval.' },
-    { v: 'if', label: 'if', help: 'Branch on a boolean condition (then / else).' },
-    { v: 'switch', label: 'switch', help: 'N-way branch on an expression value.' },
-    { v: 'iteration', label: 'iteration', help: 'Run a bash body for each element of an array.' },
-    { v: 'classify', label: 'classify', help: 'LLM picks one class label from a list.' },
-    { v: 'extract', label: 'extract', help: 'LLM fills a JSON schema from free text.' },
-    { v: 'set', label: 'set', help: 'Build a record of derived values.' },
-    { v: 'filter', label: 'filter', help: 'Keep array elements where a condition holds.' },
-    { v: 'template', label: 'template', help: '{{var}} substitution into a string template.' },
-    { v: 'http', label: 'http', help: 'HTTP request (GET/POST/...). Parsed JSON output.' },
-    { v: 'scheduleTrigger', label: 'schedule', help: 'Cron / interval trigger (daemon-side dispatch v2).' },
-    { v: 'webhookTrigger', label: 'webhook', help: 'HTTP entry point (daemon-side dispatch v2).' },
-  ];
-  const filtered = items.filter((it) =>
-    it.label.includes(query.toLowerCase()) || it.help.toLowerCase().includes(query.toLowerCase()),
+  const filtered = (palette ?? fallbackPalette).filter((entry) =>
+    entry.kind.toLowerCase().includes(query.toLowerCase())
+    || entry.description.toLowerCase().includes(query.toLowerCase()),
   );
   return (
     <div className="absolute right-0 top-0 z-20 flex h-full w-72 flex-col border-l border-border bg-surface-elevated shadow-xl">
@@ -921,20 +881,21 @@ function NodeCreatorPanel({
         {filtered.length === 0 && (
           <li className="px-2 py-1 text-[11px] text-text-tertiary">No matches.</li>
         )}
-        {filtered.map((it) => (
-          <li key={it.v}>
+        {filtered.map((entry) => (
+          <li key={entry.kind}>
             <button
               type="button"
-              onClick={() => onPick(it.v)}
+              onClick={() => onPick(entry)}
               className="flex w-full flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left text-[11px] hover:bg-surface"
             >
               <span
                 className="inline-block rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white"
-                style={{ background: VARIANT_COLOR[it.v] }}
+                style={{ background: VARIANT_COLOR[entry.kind as NodeVariant] ?? VARIANT_COLOR.unknown }}
               >
-                {it.label}
+                {entry.kind}
               </span>
-              <span className="text-text-tertiary">{it.help}</span>
+              {entry.plugin && <span className="text-accent">{entry.plugin}</span>}
+              <span className="text-text-tertiary">{entry.description}</span>
             </button>
           </li>
         ))}

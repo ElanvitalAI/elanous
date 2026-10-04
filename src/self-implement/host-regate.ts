@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
+import { publicExposureFiles, runExposeGate } from './expose-gate.js';
+import { admitLandingMerge } from './frozen-merges.js';
 import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
@@ -17,8 +20,8 @@ export function needsPwaBuild(files: readonly string[]): boolean {
   return files.some((file) => file.startsWith('apps/pwa/') || (file.startsWith('src/') && !/\.test\.tsx?$/.test(file)));
 }
 
-export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; verifyOnly?: boolean }
-export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
+export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; verifyOnly?: boolean; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
+export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
   interference?: (files: readonly string[], cwd: string) => Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }>;
@@ -26,6 +29,8 @@ export type HostRegateDeps = {
   removeTemp?: (path: string) => void;
   acquire?: (repoRoot: string) => Promise<() => void>;
   log?: (event: 'passed' | 'failed' | 'unmeasured' | 'base-raced', data: Record<string, unknown>) => void;
+  freezeRoot?: string;
+  runExposeGate?: typeof runExposeGate;
 };
 
 const SPAWN_MAX_BUFFER = 256 * 1024 * 1024;
@@ -122,6 +127,8 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let worktree: string | undefined;
   let attached = false;
   let release: (() => void) | undefined;
+  let endLanding: ((merged?: boolean) => void) | undefined;
+  let landed = false;
   let verifiedBase: string | undefined;
   const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string): HostRegateResult => {
     if (step) failures.push({ step, detail: detail ?? 'unknown' });
@@ -203,6 +210,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, { neighbors: !input.verifyOnly })))(files, worktree);
       if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
     } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
+    // Landing can also be initiated by the host after the child gate; judge the checked PR here too.
+    if (publicExposureFiles(files).length > 0) {
+      const exposure = (deps.runExposeGate ?? runExposeGate)(worktree, files,
+        getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn',
+        (bin, args, dir) => command(bin, args, dir));
+      if (!exposure.passed) return result('failed', 'expose', exposure.log);
+    }
     // verifyOnly: 통합 후보는 «지금 main 끝»(baseCommit)에 얹은 것이다 — 옛 merge-base 로 비교하면 그사이 main 착지분
     //   수백 파일이 «이 PR 의 변경»으로 잡혀 저장소 전체 검사로 승격된다(2026-09-28 #21239 실측: 456파일 · PWA 636건).
     try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: input.verifyOnly ? baseCommit : base }); }
@@ -226,6 +240,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just
     // above; the seconds between that read and the merge are checked after the fact below.
     if (input.verifyOnly) return result('passed');
+    const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit });
+    if (landing.kind !== 'merge') {
+      debug.log('harness.merge', 'frozen', { pr: input.prNumber, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
+      return { passed: true, failures: [], os: process.platform, status: 'frozen' };
+    }
+    // The marker and claim are held through the merge «and» its confirmation; released in the outer finally.
+    endLanding = landing.end;
     try { run('gh', ['pr', 'merge', String(input.prNumber), '--squash', '--match-head-commit', input.headCommit], input.repoRoot); }
     catch (e) { return result('failed', 'merge', String(e)); }
     type MergedView = { state?: string; mergeCommit?: { oid?: string } | null };
@@ -233,6 +254,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     try { merged = JSON.parse(run('gh', ['pr', 'view', String(input.prNumber), '--json', 'state,mergeCommit'], input.repoRoot)); }
     catch (e) { return result('unmeasured', 'merge-confirm', String(e)); }
     if (merged.state !== 'MERGED') return result('unmeasured', 'merge-confirm', `PR state after merge is ${merged.state ?? 'unknown'}`);
+    landed = true;
     const mergeCommit = merged.mergeCommit?.oid ?? '';
     let mergedOnto = '';
     try {
@@ -249,6 +271,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   } catch (e) {
     return result('unmeasured', 'host-regate', String(e));
   } finally {
+    try { endLanding?.(landed); } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'landing-release', detail: String(e) }); }
     try { if (attached && worktree) run('git', ['worktree', 'remove', '--force', worktree], input.repoRoot); }
     catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
     try { if (worktree) (deps.removeTemp ?? ((path) => rmSync(path, { recursive: true, force: true })))(worktree); }

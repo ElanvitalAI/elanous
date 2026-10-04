@@ -16,12 +16,15 @@
 // 우회해 도착하므로 여기서 allowlist를 직접 강제한다.
 
 import type { UserConfig } from './user-config.js';
+import { SLASH_COMMANDS } from './chat/index.js';
 import type { DiscordBot, DcIncoming, DcMessageStreamer } from './discord.js';
 import { makeCommandRest } from './discord/slash-registry.js';
 import { normalizeInteractionPayload } from './discord/slash-router.js';
 import type { SlashCommandSchema } from './discord/slash-types.js';
 import { debug } from './debug/log.js';
 import { gateDiscordSchemas, readBotAudience } from './maturity/bot-command-maturity.js';
+import { buildBotSlashCatalog } from './maturity/bot-slash-catalog.js';
+import { FEATURE_MATURITY } from './maturity/feature-maturity.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 
 const REST_BASE = 'https://discord.com/api/v10';
@@ -42,6 +45,9 @@ export const ELANOUS_SLASH_COMMANDS: readonly SlashCommandSchema[] = [
     { name: 'file', description: '첨부 (이미지/문서 — 백엔드가 봄)', type: 11, required: false },
   ] },
   { name: 'brain', description: '브레인 모드로 복귀 (위임 해제)' },
+  { name: 'now', description: '지금 판·칸·결정·자리·최근 맥락 보기', options: [
+    { name: 'topic', description: '좁혀 볼 주제 (선택)', type: 3, required: false },
+  ] },
   { name: 'sessions', description: '바인딩된 세션 목록' },
   { name: 'new', description: '새 세션으로 시작 (이전 대화 보존)' },
   { name: 'attach', description: '이 채널을 다른 세션에 연결', options: [
@@ -57,6 +63,15 @@ export const ELANOUS_SLASH_COMMANDS: readonly SlashCommandSchema[] = [
   { name: 'voice-leave', description: '보이스 채널 퇴장' },
   { name: 'voice-status', description: '보이스 연결 상태' },
 ] as const;
+
+/** The native wire keeps its original schemas (including options); only new catalog
+ * entries use the core registry's description and the unsupported response. */
+export function discordWireCatalog() {
+  return buildBotSlashCatalog({
+    surface: 'discord', coreCommands: SLASH_COMMANDS, maturity: FEATURE_MATURITY,
+    handledCommands: ELANOUS_SLASH_COMMANDS,
+  });
+}
 
 /** SlashInteraction → 기존 텍스트 명령 문장 합성. */
 export function synthesizeCommandText(
@@ -79,6 +94,10 @@ export function synthesizeCommandText(
     case 'voice-leave': return '!voice-leave';
     case 'voice-status': return '!voice-status';
     case 'sessions': return '!sessions';
+    case 'now': {
+      const topic = options.get('topic');
+      return typeof topic === 'string' && topic.trim() ? `!now ${topic.trim()}` : '!now';
+    }
     case 'new': return '!new';
     case 'attach': return `!attach ${String(options.get('prefix') ?? '').trim()}`;
     case 'brain': return '!brain';
@@ -123,8 +142,16 @@ export function buildDiscordSlashWire(deps: DiscordSlashWireDeps): DiscordSlashW
     const guilds = await (await fetchImpl(`${REST_BASE}/users/@me/guilds`, auth)).json() as Array<{ id: string }>;
     const rest = makeCommandRest({ token, ...(deps.__fetchImpl ? { fetchImpl: deps.__fetchImpl } : {}) });
     const audience = readBotAudience((deps.userConfig.raw?.discord as { commandAudience?: unknown } | undefined)?.commandAudience);
-    const { schemas, hidden } = gateDiscordSchemas(ELANOUS_SLASH_COMMANDS, audience);
-    debug.log('discord.command', 'menu-filtered', { total: ELANOUS_SLASH_COMMANDS.length, shown: schemas.length - hidden, ...audience });
+    const catalog = discordWireCatalog();
+    const handled = new Map(ELANOUS_SLASH_COMMANDS.map((schema) => [schema.name, schema]));
+    const allSchemas: SlashCommandSchema[] = catalog.commands.map((entry) => {
+      const original = handled.get(entry.name);
+      if (original) return original;
+      const { name, description } = entry;
+      return { name, description };
+    });
+    const { schemas, hidden } = gateDiscordSchemas(allSchemas, audience);
+    debug.log('discord.command', 'menu-filtered', { total: allSchemas.length, shown: schemas.length - hidden, ...audience });
     for (const g of Array.isArray(guilds) ? guilds : []) {
       const registered = await rest.bulkOverwriteGuild(app.id, g.id, schemas);
       log(`[slash] registered ${registered.length} commands in guild ${g.id}`);
@@ -180,6 +207,8 @@ export function buildDiscordSlashWire(deps: DiscordSlashWireDeps): DiscordSlashW
       await ack(it.id, it.token, `이 봇은 <#${deps.channelScope}> 채널 전용입니다.`);
       return;
     }
+    const unsupported = discordWireCatalog().unsupportedReply(it.commandName);
+    if (unsupported) { await ack(it.id, it.token, unsupported); return; }
     const text = synthesizeCommandText(it.commandName, it.options);
     const attachments = resolvedAttachments(raw);
     await ack(it.id, it.token, `▶ \`${text}\`${attachments.length ? ` (+첨부 ${attachments.length})` : ''}`);

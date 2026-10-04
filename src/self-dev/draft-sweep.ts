@@ -31,6 +31,8 @@ export interface DraftSweepAdapters {
   hasFinalRunResult?(draft: SweepDraft, repository: string): Promise<boolean | undefined>;
   /** Per-file last change on the draft branch; undefined means file coverage is unverified. */
   getLatestFileChanges?(draft: SweepDraft, repository: string): Promise<Readonly<Record<string, string>> | undefined>;
+  /** Optional merge-time file inventory for the existing all-files-landed decision. */
+  getPrFiles?(repository: string, number: number): Promise<readonly string[] | undefined>;
 }
 
 export interface DraftSweepOptions {
@@ -83,6 +85,80 @@ const releaseHoldLabel = PR_LABELS.find((entry) => entry.axis === 'addon' && ent
 const PAGE_SIZE = 100;
 /** At most this many closes per tick, so a wrong rule cannot close everything at once. */
 export const DRAFT_SWEEP_CLOSE_CAP = 10;
+
+/** Post-merge shortcut: only the existing superseded-by decision can authorize a close. */
+export async function supersedeDraftsOnMerge(input: {
+  repository: string;
+  merged: SweepMergedPr & { createdAt: string; mergedAt: string };
+  adapters: Pick<DraftSweepAdapters, 'listDrafts' | 'listLiveBranches' | 'getRunStatus' | 'setLabels' | 'closeDraft'>
+    & Pick<Partial<DraftSweepAdapters>, 'getLatestFileChanges' | 'getPrFiles'>;
+}): Promise<{ closed: number[]; kept: number[] }> {
+  const { repository, merged, adapters } = input;
+  const closed: number[] = [];
+  const kept: number[] = [];
+  let drafts: SweepDraft[] = [];
+  let error: string | undefined;
+  const failed: number[] = [];
+  let closeAttempts = 0;
+  try {
+    const [listedDrafts, liveBranches] = await Promise.all([
+      collectPages((page, size) => adapters.listDrafts(page, size, repository)),
+      adapters.listLiveBranches(repository),
+    ]);
+    drafts = listedDrafts;
+    if (!liveBranches || !Number.isInteger(merged.number) || !merged.branch || !merged.title
+      || !Number.isFinite(Date.parse(merged.createdAt)) || !Number.isFinite(Date.parse(merged.mergedAt))
+      || drafts.some((pr) => !Number.isInteger(pr.number) || !pr.branch || !Array.isArray(pr.labels)
+        || !Number.isFinite(Date.parse(pr.createdAt)))) throw new Error('Incomplete merge draft inventory');
+    const statuses = new Map<number, string | undefined>();
+    const latestChanges = new Map<number, Readonly<Record<string, string>> | undefined>();
+    const mergedFiles = await adapters.getPrFiles?.(repository, merged.number);
+    const landed = { ...merged, changedFiles: mergedFiles };
+    for (const draft of drafts) {
+      if (draft.number !== merged.number && !liveBranches.has(draft.branch)
+        && Date.parse(draft.createdAt) < Date.parse(merged.mergedAt)) {
+        statuses.set(draft.number, await adapters.getRunStatus(draft, repository));
+        if (draft.changedFiles?.length && adapters.getLatestFileChanges) {
+          latestChanges.set(draft.number, await adapters.getLatestFileChanges(draft, repository));
+        }
+      }
+    }
+    for (const listedDraft of drafts) {
+      const draft = { ...listedDraft, latestFileChanges: latestChanges.get(listedDraft.number) };
+      if (draft.number === merged.number || liveBranches.has(draft.branch)
+        || Date.parse(draft.createdAt) >= Date.parse(merged.mergedAt)) {
+        kept.push(draft.number);
+        continue;
+      }
+      const decision = decideDraft({ draft, runStatus: statuses.get(draft.number),
+        mergedTwins: [landed], liveBranches, ageHours: NaN });
+      if (decision.action !== 'close' || !decision.reason.startsWith(`superseded-by #${merged.number}`)
+        || PR_LABELS.filter((entry) => entry.axis === 'state' && draft.labels.includes(entry.name)).length > 1
+        || (draft.labels.length === 0 && !draft.branch.startsWith('self-impl/'))
+        || closeAttempts >= DRAFT_SWEEP_CLOSE_CAP) {
+        kept.push(draft.number);
+        continue;
+      }
+      closeAttempts += 1;
+      const remove = stateLabels.filter((entry) => draft.labels.includes(entry.name) && entry.name !== supersededLabel).map((entry) => entry.name);
+      try {
+        // Label first: a failed label write must never strand a closed, unlabelled PR outside open-draft sweeps.
+        if (!draft.labels.includes(supersededLabel)) await adapters.setLabels(repository, draft.number, { add: supersededLabel, remove });
+        await adapters.closeDraft(repository, draft.number, `Draft sweep: superseded-by #${merged.number}. Branch preserved.`);
+        closed.push(draft.number);
+      } catch (failure) {
+        kept.push(draft.number);
+        failed.push(draft.number);
+        error = String(failure);
+      }
+    }
+  } catch (failure) {
+    error = String(failure);
+    kept.push(...drafts.map((draft) => draft.number).filter((number) => !closed.includes(number) && !kept.includes(number)));
+  }
+  debug.log('drafts.cleanup', 'superseded-on-merge', { merged: merged.number, closed, kept, ...(failed.length ? { failed } : {}), ...(error ? { error } : {}) });
+  return { closed, kept };
+}
 
 async function collectPages<T>(fetch: (page: number, perPage: number) => Promise<readonly T[]>): Promise<T[]> {
   const rows: T[] = [];

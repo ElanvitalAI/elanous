@@ -11,7 +11,7 @@ import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import type { CoordEvent } from './coord-events.js';
 import { applyCondensedCards, runContextCondense } from './condense.js';
 import type { MemoryItem } from './long-term-memory.js';
-import { condenseContextDay, type MemorySource } from './long-term-memory.js';
+import { condenseContextDay, condenseContextWindowWithReport, type MemorySource } from './long-term-memory.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { force: true, recursive: true }); });
@@ -49,6 +49,10 @@ test('24h dry-run folds a newer topic version, joins ledger decisions and flags 
   expect(report.conflicts).toBe(1);
   expect(report.folded).toBe(0);
   expect(report.skipped).toEqual({});
+  expect(report.droppedHarnessChild).toBe(0);
+  expect(report.markdown).toContain('Funnel: read 4 (OP 0 · TC 3 · MK 0 · UX 1) → sources 4 (OP 0 · TC 3 · MK 0 · UX 1) → summarized 4 (OP 0 · TC 3 · MK 0 · UX 1) → cards 2 (OP 0 · TC 1 · MK 0 · UX 1)');
+  expect(JSON.parse(JSON.stringify(report)).funnel).toEqual(report.funnel);
+  expect(report.markdown).toContain('Skipped: {} · Dropped harness-child: 0');
   const withoutDecision = await runContextCondense({ hours: 24, now, root }, { ...fakeDeps(), decisions: () => [] });
   expect(withoutDecision.cards.find(card => card.seat === 'TC')).toMatchObject({
     source: 'https://example.test/2', summary: 'release is on', updatedAt: '2026-10-03T01:30:00.000Z',
@@ -64,6 +68,35 @@ test('24h dry-run folds a newer topic version, joins ledger decisions and flags 
   });
   expect(report.markdown).toContain('충돌 (OP): elanous://decisions/D-20261003-01 ↔ https://example.test/3');
   expect(readdirSync(root)).toEqual([]);
+});
+
+test('dry-run Markdown and JSON expose no-claim skips without dropping a claimless decision', async () => {
+  const decision = { id: 'D-channel', title: '착지 경로', status: 'decided',
+    decidedAt: '2026-10-03T03:00:00.000Z', raisedBy: { agent: 'OP', track: 'OP' },
+    choice: 'a', options: [{ key: 'a', label: '유지', consequence: '유지' }],
+    scqa: { s: '착지', c: '경로 선택' } } as DecisionEntry;
+  const report = await runContextCondense({ hours: 24, now, apply: false }, {
+    events: () => [event(8, '2026-10-03T02:00:00.000Z', 'MK', 'MK가 OP · TC · 보고 · K10을 언급함')],
+    decisions: () => [decision],
+    summarize: async source => ({ project: 'alpha', topic: source.text, summary: source.text }),
+  });
+  expect(report.cards).toHaveLength(1);
+  expect(report.cards[0]?.source).toBe('elanous://decisions/D-channel');
+  expect(report.skipped).toEqual({ 'no-claim': 1 });
+  expect(JSON.parse(JSON.stringify(report)).skipped).toEqual({ 'no-claim': 1 });
+  expect(report.markdown).toContain('Skipped: {"no-claim":1} · Dropped harness-child: 0');
+});
+
+test('dry-run Markdown reports dropped harness-child count separately from folded and skipped', async () => {
+  const child = { ...event(6, '2026-10-03T04:00:00.000Z', 'harness-child', 'Harness child loop exhausted without completion (0m 0s).'),
+    kind: 'finished' };
+  const report = await runContextCondense({ hours: 24, now }, {
+    events: () => [child], decisions: () => [], summarize: async () => {
+      throw new Error('dropped source must not be summarized');
+    },
+  });
+  expect(report).toMatchObject({ cards: [], skipped: {}, folded: 0, droppedHarnessChild: 1 });
+  expect(report.markdown).toContain('Skipped: {} · Dropped harness-child: 1');
 });
 
 test('UTC daily condensation still uses midnight boundaries after rolling-window extraction', async () => {
@@ -179,7 +212,8 @@ test('two independent --apply processes serialize writes to the same topic', asy
     const root = process.argv[1], at = process.argv[2];
     const events = () => [{ id: at, at, kind: '보고', text: 'alpha/release/on', summary: 'alpha/release/on',
       refs: { seat: 'TC', recipients: [], all: false, kind: '보고', slot: null, deadline: null, url: 'https://example.test/' + at } }];
-    const summarize = async () => ({ project: 'alpha', topic: 'release', summary: 'new' });
+    const summarize = async () => ({ project: 'alpha', topic: 'release', summary: 'new',
+      claim: { key: 'release', value: 'on' } });
     const result = await runContextCondense({ hours: 24, now: new Date('2026-10-04T00:30:00.000Z'), root, apply: true },
       { summarize, events, decisions: () => [] });
     console.log(JSON.stringify(result.applied));`;
@@ -261,6 +295,10 @@ test('reads a populated context-bus journal without mutating its bytes', async (
     const report = await runContextCondense({ hours: 24, now, root: state }, { summarize, decisions: () => [] });
     expect(report.cards).toMatchObject([{ source: 'https://example.test/journal', seat: 'TC',
       summary: 'release is on', updatedAt: '2026-10-03T01:30:00.000Z' }]);
+    expect(report.funnel.read).toEqual({ total: 1, bySeat: { TC: 1 }, bySurface: { 'coord:channel': 1 } });
+    const direct = await condenseContextWindowWithReport(report.since, report.until, [],
+      { summarize, decisions: () => [] }, now);
+    expect(direct.funnel.read).toEqual(report.funnel.read);
     expect(readFileSync(journal)).toEqual(before);
     expect(readdirSync(state)).toEqual(['surface_events.db']);
   } finally {
@@ -269,7 +307,7 @@ test('reads a populated context-bus journal without mutating its bytes', async (
   }
 });
 
-test('real isolated CLI emits skipped and folded counts for a harness run without writing', () => {
+test('real isolated CLI drops harness-child lifecycle counts without writing', () => {
   const root = resolve(import.meta.dir, '../..');
   const state = mkdtempSync(join(root, 'context-condense-cli-')); dirs.push(state);
   const journal = join(state, 'surface_events.db');
@@ -292,8 +330,11 @@ test('real isolated CLI emits skipped and folded counts for a harness run withou
       env: { ...process.env, ELANOUS_STATE_DIR: state, NODE_ENV: 'test' } });
   expect(output.status).toBe(0);
   const json = JSON.parse(output.stdout.split('\n')[0]!);
-  expect(json).toMatchObject({ conflicts: 0, skipped: { 'no-seat': 1 }, folded: 1 });
-  expect(json.cards).toBeArray();
+  expect(json).toMatchObject({ conflicts: 0, skipped: { 'no-seat': 1 }, folded: 0, droppedHarnessChild: 2 });
+  expect(json.cards).toEqual([]);
+  expect(json.funnel.read).toEqual({ total: 3, bySeat: { 'harness-child': 2, '(unknown)': 1 },
+    bySurface: { 'context:external': 2, 'coord:channel': 1 } });
+  expect(json.funnel.sources.droppedHarnessChild).toEqual({ total: 2, bySeat: { 'harness-child': 2 } });
   expect(output.stdout.trim().split('\n')).toHaveLength(1);
   expect(json).toHaveProperty('since');
   expect(json).toHaveProperty('until');
@@ -319,6 +360,7 @@ test('real isolated CLI previews an empty window without mutating an existing jo
   const [json, ...markdown] = output.stdout.split('\n');
   expect(JSON.parse(json!)).toMatchObject({ cards: [], conflicts: 0, skipped: {}, folded: 0 });
   expect(markdown.join('\n')).toContain('# Long-term context memory candidates');
+  expect(markdown.join('\n')).toContain('Funnel: read 0 (OP 0 · TC 0 · MK 0 · UX 0) → sources 0');
   expect(readdirSync(state)).toEqual(['surface_events.db']);
   expect(readFileSync(journal)).toEqual(before);
   const bad = spawnSync(process.execPath, [...args, '--apply'], { cwd: root, encoding: 'utf8', timeout: 90_000,

@@ -302,7 +302,7 @@ export function hqCliWriteAllowed(command: string, override = false, deps: HqDep
   }
   if (allowed) return true;
   observe(r, 'hq.fence', 'cli-refused', { command, reason: decision.reason, holder: decision.holder, generation: decision.generation });
-  console.error(`본부는 ${decision.holder ?? 'unknown'} gen ${decision.generation ?? 'unknown'} — 거기서 쓰거나 --hq-override(관측)`);
+  console.error(`본부는 ${decision.holder ?? 'unknown'} gen ${decision.generation ?? 'unknown'} — 원장 쓰기는 지금 본부로 보내라 (수동 우회: --hq-override, 관측)`);
   process.exitCode = 4;
   return false;
 }

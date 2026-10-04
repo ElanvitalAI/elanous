@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyTraffic, seatOfTree, trafficLine, trafficTick, type TrafficProcess } from './traffic.js';
+import { applyTraffic, seatOfTree, trafficLine, trafficTick, withFinishAdvice, type TrafficProcess } from './traffic.js';
 import { ORCHESTRATOR_DEFAULTS, buildUserConfig, saveUserConfig } from '../../user-config.js';
 
 const roots: string[] = [];
@@ -101,9 +101,35 @@ test('config defaults and explicit seat trees, caps, mode survive parsing and sa
   expect(buildUserConfig(path).loops?.orchestrator).toEqual(ORCHESTRATOR_DEFAULTS);
   writeFileSync(path, JSON.stringify({ loops: { orchestrator: { seatTrees: { MK: ['/tmp/mk', 42], UX: ['relative'] }, seatCaps: { TC: 4, MK: 3, UX: -1 }, trafficMode: 'live' } } }));
   const cfg = buildUserConfig(path);
-  expect(cfg.loops?.orchestrator).toEqual({ seatTrees: { MK: ['/tmp/mk'], UX: [] }, seatCaps: { TC: 4, MK: 3, UX: 6, OP: 4 }, trafficMode: 'live' });
+  expect(cfg.loops?.orchestrator).toEqual({ mode: 'shadow', seatTrees: { MK: ['/tmp/mk'], UX: [] }, seatCaps: { TC: 4, MK: 3, UX: 6, OP: 4 }, trafficMode: 'live' });
   saveUserConfig(cfg, path);
   expect(buildUserConfig(path).loops?.orchestrator).toEqual(cfg.loops?.orchestrator);
+});
+
+test('fake collectors append finish advice without changing seat decisions, and both modes only log rebalance', () => {
+  const now = new Date('2026-10-04T16:00:00Z');
+  const original = trafficTick({ processes: [{ seat: 'MK', command: 'bun bin/elanous.mjs harness ask goal.md', elapsedSeconds: 2400 }],
+    now, caps: { ...ORCHESTRATOR_DEFAULTS.seatCaps, TC: 4 }, openCells: [{ id: 'MK-1', title: 'one', status: 'yellow', owner: 'MK' }] });
+  const result = withFinishAdvice(original, {
+    listStarts: () => ({ starts: Array.from({ length: 40 }, (_, i) => ({ runId: `run-${i}`, startedAt: now.toISOString() })), unreadable: [] }),
+    runGh: args => JSON.stringify(args.includes('merged')
+      ? Array.from({ length: 12 }, (_, i) => ({ number: i, headRefName: `self-impl/${i}`, mergedAt: now.toISOString() }))
+      : args.includes('--draft')
+        ? Array.from({ length: 30 }, (_, i) => ({ number: i, headRefName: `self-impl/${i}`, createdAt: '2026-10-03T15:00:00Z', labels: i < 5 ? [{ name: 'elanous:superseded' }] : [] }))
+        : Array.from({ length: 50 }, (_, i) => ({ number: i, headRefName: `self-impl/${i}`, mergeable: i < 30 ? 'CONFLICTING' : i < 40 ? 'MERGEABLE' : 'UNKNOWN' }))),
+  });
+  expect(result.seats).toEqual(original.seats);
+  expect(result.unassigned).toBe(original.unassigned);
+  expect(trafficLine(result, 'shadow')).toBe('traffic OP 0/4 · TC 0/4 · MK 1/6 · UX 0/6 · idle=MK · mode=shadow · finish rate=0.30 stale=25 conflict=0.75 → finish=6/20');
+  expect(JSON.parse(JSON.stringify(result)).finish).toMatchObject({ metrics: { unknownMergeable: 10 }, advice: { state: 'backlogged', finishSlots: 6, launchSlots: 14 } });
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  for (const mode of ['shadow', 'live'] as const) {
+    applyTraffic(result, { mode, root: temp(), log: (_category, event, data) => { events.push({ event, data }); } });
+  }
+  expect(events.filter(row => row.event === 'would-rebalance').map(row => row.data)).toEqual(Array(2).fill({ finishSlots: 6, launchSlots: 14, state: 'backlogged', reasons: ['landingRate below threshold', 'staleDrafts above threshold', 'conflictRatio above threshold'] }));
+  const unavailable = withFinishAdvice(original, { listStarts: () => ({ starts: [], unreadable: [] }), runGh: () => { throw new Error('gh offline'); } });
+  expect(trafficLine(unavailable, 'shadow')).toEndWith('finish rate=? stale=? conflict=? → finish=6/20');
+  expect(unavailable.finish?.advice.state).toBe('unknown');
 });
 
 test('seat trees match by real path — a /private/var cwd matches a configured /var/folders tree (macOS)', () => {

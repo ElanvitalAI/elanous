@@ -43,6 +43,7 @@ export type SceneResult = SceneObservation & { verdict: 'ok' | 'broken' | 'unver
 /** A scene the demo hides is not a pass — it was not seen. OP 10-03: ⑤ (wizard → market) is the 10-08 highlight. */
 export const UNVERIFIED_REASON = '시연 모드에서 숨긴 장면 — WIZ1 착지 뒤 실물 필요';
 const CIRCLED = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
+export const EMPTY_STATE_PHRASES = ['지금 도는 런이 없습니다', '마법사가 아직 돌지 않았습니다', '터미널을 기다리는 중', '판단을 기다리는 중', '못 읽음', '지금 PTY 판단이 없습니다'] as const;
 
 export function judgeScene(obs: SceneObservation): SceneResult {
   if (obs.hiddenByDemo) return { ...obs, verdict: 'unverified', reasons: [UNVERIFIED_REASON] };

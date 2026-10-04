@@ -6,12 +6,13 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { devVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { withFileLockSync } from '../../storage/file-lock.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
+import { finishAdvice, measureFinish, type FinishAdvice, type FinishMetrics, type MeasureFinishDeps } from './finish-rate.js';
 
 export const TRAFFIC_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TrafficCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status'>;
 export type TrafficProcess = Pick<HarnessProcessRecord, 'command' | 'elapsedSeconds' | 'cwd'> & { seat: OrchestratorSeat | null };
 export type TrafficSeatRow = { seat: OrchestratorSeat; running: number; cap: number; idleFor: number | null; idle: boolean; nextCell: TrafficCell | null };
-export type TrafficResult = { seats: TrafficSeatRow[]; unassigned: number; now: Date; idleMinutes: number };
+export type TrafficResult = { seats: TrafficSeatRow[]; unassigned: number; now: Date; idleMinutes: number; finish?: { metrics: FinishMetrics; advice: FinishAdvice } };
 
 /** Same bounded walk as the CTX1 hook: a marker at the git root is checked before stopping. */
 export function seatOfTree(cwd: string | undefined, cfg: Pick<OrchestratorLoopConfig, 'seatTrees'>): OrchestratorSeat | null {
@@ -74,6 +75,12 @@ export function trafficTick({ processes, now, caps, lastLaunchAt, openCells, idl
   return { seats, unassigned: launches.filter(process => process.seat === null).length, now, idleMinutes };
 }
 
+export function withFinishAdvice(result: TrafficResult, deps: MeasureFinishDeps = {}): TrafficResult {
+  const metrics = measureFinish(deps, result.now);
+  const totalSlots = result.seats.reduce((total, row) => total + row.cap, 0);
+  return { ...result, finish: { metrics, advice: finishAdvice(metrics, totalSlots) } };
+}
+
 export type TrafficRequest = { key: string; receiptId: string; seat: OrchestratorSeat; text: string; status: 'queued'; queuedAt: string; source: 'orchestrator-traffic' };
 export interface TrafficApplyDeps {
   mode?: 'shadow' | 'live';
@@ -86,6 +93,10 @@ export function applyTraffic(result: TrafficResult, deps: TrafficApplyDeps = {})
   const log = deps.log ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data));
   const mode = deps.mode ?? 'shadow';
   log('loop.orchestrator', 'tick', { mode, seats: result.seats.map(({ seat, running, cap, idleFor, idle }) => ({ seat, running, cap, idleFor, idle })), unassigned: result.unassigned });
+  if (result.finish) {
+    const { finishSlots, launchSlots, state, reasons } = result.finish.advice;
+    log('loop.orchestrator', 'would-rebalance', { finishSlots, launchSlots, state, reasons });
+  }
   let queued = 0;
   for (const row of result.seats) {
     if (!row.idle) continue;
@@ -122,7 +133,11 @@ export function applyTraffic(result: TrafficResult, deps: TrafficApplyDeps = {})
 export function trafficLine(result: TrafficResult, mode: 'shadow' | 'live'): string {
   const parts = result.seats.map(row => `${row.seat} ${row.running}/${row.cap}`);
   const idle = result.seats.filter(row => row.idle).map(row => row.seat);
-  return `traffic ${parts.join(' · ')} · idle=${idle.length ? idle.join(',') : '없음'} · mode=${mode}`;
+  const prefix = `traffic ${parts.join(' · ')} · idle=${idle.length ? idle.join(',') : '없음'} · mode=${mode}`;
+  if (!result.finish) return prefix;
+  const { metrics, advice } = result.finish;
+  const rate = (value: number | null) => value === null ? '?' : value.toFixed(2);
+  return `${prefix} · finish rate=${rate(metrics.landingRate)} stale=${metrics.staleDrafts ?? '?'} conflict=${rate(metrics.conflictRatio)} → finish=${advice.finishSlots}/${advice.finishSlots + advice.launchSlots}`;
 }
 
 if (import.meta.main) {
@@ -139,7 +154,7 @@ if (import.meta.main) {
     if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
     const now = new Date();
     const processes = observation.records.map(process => ({ ...process, seat: seatOfTree(process.cwdStatus === 'unknown' ? undefined : process.cwd, cfg) }));
-    const result = trafficTick({ processes, now, caps: cfg.seatCaps, openCells: listChecklist(version).items });
+    const result = withFinishAdvice(trafficTick({ processes, now, caps: cfg.seatCaps, openCells: listChecklist(version).items }));
     const queued = applyTraffic(result, { mode: cfg.trafficMode });
     if (args.includes('--json')) console.log(JSON.stringify({ ...result, mode: cfg.trafficMode, queued, version }));
     else console.log(trafficLine(result, cfg.trafficMode));

@@ -10,6 +10,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { runGitCommand } from '../../git-fs/runner.js';
 import { countTestDeclarations } from '../../self-implement/test-declarations.js';
 import { NEXT_MD_PATH, resolveNextMdConflict } from '../../release-loop/next-md-merge.js';
+import { getUserConfig } from '../../user-config.js';
+import { debug } from '../../debug/log.js';
+import { collectMergeIntent, defaultIntentGit, type IntentGit } from './merge-intent.js';
 
 function deterministicNextMd(git: MergeGitSeam, worktreePath: string, file: string): string | null {
   try {
@@ -328,27 +331,61 @@ export function defaultGitMergeSeam(): MergeGitSeam {
 }
 
 /** 실 LLM 충돌 해결 어댑터(streamLLM·sol). 코드펜스/설명 제거해 완결 파일만. */
-export async function defaultLlmResolve(filePath: string, conflicted: string, mergeTarget: string): Promise<string> {
-  const { streamLLM } = await import('../../llm.js');
-  const out = await streamLLM([{ role: 'user', content: conflictResolvePrompt(filePath, conflicted, mergeTarget) }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
-  // ⛔ 라우터는 공급자가 전부 막히면 던지지 않고 오류 문구를 돌려준다 — 그것은 파일 내용이 아니다. 던져서 «LLM 예외 → base 유지» 로 보낸다.
-  if (PROVIDER_FAILURE_TEXT.test(out)) throw new Error(`conflict resolve: LLM provider failure for ${filePath}`);
-  return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;
+export async function defaultLlmResolve(
+  filePath: string, conflicted: string, mergeTarget: string,
+  options: { worktreePath?: string; mode?: 'off' | 'shadow' | 'on'; git?: IntentGit; stream?: typeof import('../../llm.js')['streamLLM'] } = {},
+): Promise<string> {
+  let rawMode: unknown = options.mode;
+  if (rawMode === undefined) {
+    try { rawMode = (getUserConfig().raw.selfImplement as { mergeIntent?: unknown } | undefined)?.mergeIntent; }
+    catch { /* unreadable config keeps the old resolver */ }
+  }
+  const mode = rawMode === 'shadow' || rawMode === 'on' ? rawMode : 'off';
+  const streamLLM = options.stream ?? (await import('../../llm.js')).streamLLM;
+  const resolve = async (intent?: { ours: string | null; theirs: string[] }): Promise<string> => {
+    const out = await streamLLM([{ role: 'user', content: conflictResolvePrompt(filePath, conflicted, mergeTarget, intent) }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
+    // ⛔ 라우터는 공급자가 전부 막히면 던지지 않고 오류 문구를 돌려준다 — 그것은 파일 내용이 아니다.
+    if (PROVIDER_FAILURE_TEXT.test(out)) throw new Error(`conflict resolve: LLM provider failure for ${filePath}`);
+    return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;
+  };
+  if (mode === 'off') return resolve();
+  const collect = () => collectMergeIntent({ worktreePath: options.worktreePath ?? process.cwd(), filePath, mergeTarget, git: options.git ?? defaultIntentGit });
+  if (mode === 'on') return resolve(collect());
+  const plain = await resolve();
+  try {
+    const intent = collect();
+    const withIntent = await resolve(intent);
+    debug.log('self-dev.merge', 'intent-shadow', {
+      file: filePath, same: plain === withIntent,
+      plainMarkers: hasConflictMarkers(plain), intentMarkers: hasConflictMarkers(withIntent),
+      plainLines: lineCount(plain), intentLines: lineCount(withIntent),
+      oursIntent: intent.ours !== null, theirsCount: intent.theirs.length,
+    });
+  } catch (error) {
+    try { debug.log('self-dev.merge', 'intent-shadow-failed', { file: filePath, error: String(error) }); }
+    catch { /* shadow observation must not affect the adopted result */ }
+  }
+  return plain;
 }
 
 /** 편의 — 실 git+LLM 으로 호출부가 해석한 ref를 worktree 에 지능 정합한다. */
 export async function mergeMainIntoWorktreeWithLlm(worktreePath: string, mergeTarget: string): Promise<LlmMergeOutcome> {
-  return mergeMainWithLlmResolve(worktreePath, mergeTarget, (filePath, conflicted) => defaultLlmResolve(filePath, conflicted, mergeTarget), defaultGitMergeSeam());
+  return mergeMainWithLlmResolve(worktreePath, mergeTarget, (filePath, conflicted) => defaultLlmResolve(filePath, conflicted, mergeTarget, { worktreePath }), defaultGitMergeSeam());
 }
 
 /** LLM 충돌 해결 프롬프트(순수·테스트) — ours(walker)·theirs(호출자가 전달한 정합 대상) 종합 지시. */
-export function conflictResolvePrompt(filePath: string, conflictedContent: string, mergeTarget: string): string {
+export function conflictResolvePrompt(filePath: string, conflictedContent: string, mergeTarget: string, intent?: { ours: string | null; theirs: string[] }): string {
   return [
     '너는 git merge 충돌을 지능적으로 해결하는 엔지니어다. 아래 파일은 3-way merge 충돌 마커를 포함한다:',
     '  <<<<<<< ours   = 현재 브랜치(walker 가 이 미션에서 만든 산출물)',
     '  ======= 사이   = 양쪽 버전',
     `  >>>>>>> theirs = ${mergeTarget}(호출자가 해석해 전달한 정합 대상)`,
     '',
+    ...(intent ? [
+      `ours 의 의도: ${intent.ours ?? '(확인 불가)'}`,
+      `theirs 에 먼저 착지한 변경: ${intent.theirs.length ? intent.theirs.join(' · ') : '(확인 불가)'}`,
+      '',
+    ] : []),
     '해결 원칙:',
     '- 양쪽의 의도를 **모두 보존**하며 종합한다(한쪽을 통째로 버리지 않는다).',
     `- 같은 목적의 중복(예: 같은 테스트·같은 함수)은 **theirs(${mergeTarget}) 버전을 채택**하고 ours 의 중복은 제거.`,

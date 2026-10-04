@@ -30,6 +30,7 @@ nodes:
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
   - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
   - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1 }
+  - { node_id: vault-note, kind: gate, recipe: 'cmd:vault-note', max_visits: 1 }
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }
   - { node_id: version-dev-bump, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
@@ -54,6 +55,8 @@ edges:
   - { from: publish, on: outcome, map: { ok: npm-publish, fail: failed, error: failed } }
   - { from: npm-publish, on: outcome, map: { ok: docs-land, fail: docs-land, error: docs-land } }
   - { from: docs-land, on: outcome, map: { ok: verify, fail: failed, error: failed } }
-  - { from: verify, on: outcome, map: { ok: ops-upgrade, fail: failed, error: failed } }
+  - { from: verify, on: outcome, map: { ok: vault-note, fail: failed, error: failed } }
+  # Warning-only: vault note failures after publication never block operational upgrades.
+  - { from: vault-note, on: outcome, map: { ok: ops-upgrade, fail: ops-upgrade, error: ops-upgrade } }
   - { from: ops-upgrade, on: outcome, map: { ok: version-dev-bump, fail: version-dev-bump, error: version-dev-bump } }
   - { from: version-dev-bump, on: outcome, map: { ok: done, fail: failed, error: failed } }

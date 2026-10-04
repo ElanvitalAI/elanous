@@ -14,6 +14,9 @@
 import type { TgIncoming, TgMessageStreamer } from './telegram.js';
 import type { UserConfig } from './user-config.js';
 import { botCommandsToTelegram } from './bots/command-surface.js';
+import { SLASH_COMMANDS, type SlashCommand } from './chat/index.js';
+import { FEATURE_MATURITY, type Maturity } from './maturity/feature-maturity.js';
+import { buildBotSlashCatalog } from './maturity/bot-slash-catalog.js';
 import {
   appendMessage,
   attachTelegramBinding,
@@ -46,6 +49,7 @@ import { classifyIntake } from './ad-pipeline/intake.js';
 import { createAdPipelineDeps, runAdPipeline } from './ad-pipeline/run.js';
 import { projectCommand } from './telegram-project-command.js';
 import { telegramNowSlash } from './context-bus/context-now-surfaces.js';
+import { telegramLoopsStatus } from './telegram-loops-command.js';
 import { createWishCard } from './intake-plane/wish-card.js';
 import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
 import { CardStore } from './task-cards/card-store.js';
@@ -298,8 +302,12 @@ function dropChatSessionReply(ctx: TgIncoming): string {
 /** Build the default command set for a Telegram bot wired via
  *  botFromConfig. Returns the array rather than mutating globals so
  *  tests can construct a variant set with stubbed handlers. */
-export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashCommand[] {
-  return [
+export function defaultTelegramCommands(
+  nowDeps?: ContextNowDeps,
+  coreCommands: readonly SlashCommand[] = SLASH_COMMANDS,
+  maturity: { tuiSlash: Readonly<Record<string, Maturity>>; telegramCommand: Readonly<Record<string, Maturity>>; discordCommand: Readonly<Record<string, Maturity>> } = FEATURE_MATURITY,
+): TgSlashCommand[] {
+  const handled: TgSlashCommand[] = [
     {
       name: 'help',
       description: 'List available commands',
@@ -315,6 +323,11 @@ export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashComman
       name: 'now',
       description: 'Show current release, decisions, seats and context: /now [topic]',
       handler: async (args) => telegramNowSlash(args, nowDeps),
+    },
+    {
+      name: 'loops',
+      description: '루프·크론 현황 — 늦음·실패를 먼저 보여줍니다',
+      handler: async (args) => telegramLoopsStatus(args),
     },
     {
       name: 'status',
@@ -604,7 +617,8 @@ export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashComman
         if (args.length === 0) return '/wish <소원 한 줄>';
         const store = new CardStore();
         try {
-          const card = createWishCard({ text: args.join(' '), source: 'telegram', ref: `${ctx.chatId}:${ctx.messageId}` }, store);
+          const card = createWishCard({ text: args.join(' '), source: 'telegram', ref: `${ctx.chatId}:${ctx.messageId}`,
+            replyTo: { surface: 'telegram', chatId: String(ctx.chatId), ...(ctx.threadId != null ? { threadId: String(ctx.threadId) } : {}), ...(ctx.botId ? { botId: ctx.botId } : {}) } }, store);
           return `소원 카드로 남겼습니다 — ${card.title} (카드 ${card.cardId.slice(0, 8)})`;
         } finally {
           store.close();
@@ -951,6 +965,16 @@ export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashComman
     },
     ...botCommandsToTelegram(),
   ];
+  const catalog = buildBotSlashCatalog({
+    surface: 'telegram', coreCommands, maturity,
+    handledCommands: handled,
+  });
+  const handlers = new Map(handled.map((command) => [command.name, command]));
+  return catalog.commands.map((entry) => handlers.get(entry.name) ?? {
+    name: entry.name,
+    description: entry.description,
+    handler: async () => catalog.unsupportedReply(entry.name)!,
+  });
 }
 
 /** Telegram-side adapter over the messenger-agnostic ACP turn runner.

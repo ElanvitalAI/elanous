@@ -12,6 +12,8 @@ import { podJobName, podMemoryLimitFor, podSelfImplementSpawn, type Kubectl } fr
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { PodPoolScheduler, parsePodPool } from './pod-pool.js';
 import { POD_HOST_LEASE_ANNOTATION } from './pod-lease.js';
+import { advisePodMemory } from '../../cli/pod-memory-advice.js';
+import { measurePodMemoryByGoal } from '../../../scripts/measure-pod-memory-by-goal.js';
 
 const creds = () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' });
 
@@ -55,6 +57,27 @@ function simulation(reasons: string[], tier?: 'high' | 'standard') {
 }
 
 describe('Pod OOM retry', () => {
+  test('lite OOM recalculates the measured request for the high retry Job without changing either limit', async () => {
+    const s = simulation(['OOMKilled', 'Complete']);
+    const now = Date.now();
+    const rows = [1, 2, 3].flatMap((n) => [
+      { ts_ms: now - n * 1000, category: 'self-implement.pod', event: 'memory-limit', data: JSON.stringify({ spaceId: `code-${n}`, goalType: 'code', memoryLimit: '16Gi' }) },
+      { ts_ms: now - n * 1000 + 1, category: 'self-implement.pod', event: 'job-applied', data: JSON.stringify({ spaceId: `code-${n}`, job: `job-code-${n}` }) },
+      { ts_ms: now - n * 1000 + 2, category: 'self-implement.pod', event: 'memory-last', data: JSON.stringify({ job: `job-code-${n}`, sample: { cgroupBytes: (4 + n) * 1024 ** 3 } }) },
+    ]);
+    const advice = advisePodMemory(measurePodMemoryByGoal(rows, now, 'fixture.db'));
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: s.kubectl, pool: s.pool as never, env: s.env, credentials: creds, memoryAdvice: () => advice })({ feature: '코드 구현\nPod 메모리: lite', spaceId: 'oom-lite-request' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(s.jobs).toHaveLength(2);
+      expect(s.jobs.map((job) => job.metadata.annotations['elanous.dev/attempt'])).toEqual(['1', '2']);
+      expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources)).toEqual([
+        { requests: { cpu: '1', memory: '2Gi' }, limits: { memory: '2Gi', cpu: '4' } },
+        { requests: { cpu: '1', memory: '9Gi' }, limits: { memory: '32Gi', cpu: '4' } },
+      ]);
+    } finally { rmSync(s.root, { recursive: true, force: true }); }
+  });
+
   test('only a standalone memory line selects high, never an inline phrase', () => {
     expect(podMemoryLimitFor('Pod 메모리: high\ngoal', {}).tier).toBe('high');
     expect(podMemoryLimitFor('이번 Pod 메모리: high 로 실행', {}).tier).toBe('standard');

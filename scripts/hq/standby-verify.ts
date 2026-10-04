@@ -10,6 +10,7 @@ import type { Manifest, Tier } from './standby-snapshot.js';
 export interface TierVerification {
   tier: Tier;
   generation: string | null;
+  manifestSha256: string | null;
   ageMin: number | null;
   host: string | null;
   entries: number | null;
@@ -27,7 +28,7 @@ export interface StandbyVerification {
   reasons: string[];
 }
 
-export interface VerifyOptions { root: string; tiers: Tier[]; marker?: string; maxAgeMin?: number | Partial<Record<Tier, number>>; now?: Date }
+export interface VerifyOptions { root: string; tiers: Tier[]; generations?: Partial<Record<Tier, string>>; marker?: string; maxAgeMin?: number | Partial<Record<Tier, number>>; now?: Date }
 
 function errorCode(error: unknown): unknown {
   return typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
@@ -46,8 +47,8 @@ async function hashFile(path: string): Promise<string> {
   return hash.digest('hex');
 }
 
-async function verifyTier(root: string, tier: Tier, maxAgeMin: number | undefined, now: Date): Promise<TierVerification> {
-  const result: TierVerification = { tier, generation: null, ageMin: null, host: null, entries: null, checked: 0, mismatches: 0, missing: 0, unreadable: false, reasons: [] };
+async function verifyTier(root: string, tier: Tier, maxAgeMin: number | undefined, now: Date, pinnedGeneration?: string): Promise<TierVerification> {
+  const result: TierVerification = { tier, generation: null, manifestSha256: null, ageMin: null, host: null, entries: null, checked: 0, mismatches: 0, missing: 0, unreadable: false, reasons: [] };
   const base = join(root, tier);
   try {
     await stat(base);
@@ -58,7 +59,7 @@ async function verifyTier(root: string, tier: Tier, maxAgeMin: number | undefine
   }
   let target: string;
   try {
-    target = await readlink(join(base, 'latest'));
+    target = pinnedGeneration ?? await readlink(join(base, 'latest'));
   } catch (error) {
     if (errorCode(error) === 'ENOENT' || errorCode(error) === 'EINVAL') result.reasons.push(`${tier}:latest missing`);
     else {
@@ -76,10 +77,13 @@ async function verifyTier(root: string, tier: Tier, maxAgeMin: number | undefine
   let manifest: Manifest;
   let sums: string;
   try {
-    [manifest, sums] = await Promise.all([
-      readFile(join(dir, 'MANIFEST.json'), 'utf8').then(text => JSON.parse(text) as Manifest),
+    const [manifestBytes, sumsText] = await Promise.all([
+      readFile(join(dir, 'MANIFEST.json')),
       readFile(join(dir, 'SHA256SUMS'), 'utf8'),
     ]);
+    manifest = JSON.parse(manifestBytes.toString('utf8')) as Manifest;
+    sums = sumsText;
+    result.manifestSha256 = createHash('sha256').update(manifestBytes).digest('hex');
   } catch (error) {
     if (error instanceof SyntaxError) result.reasons.push(`${tier}:invalid manifest`);
     else {
@@ -128,7 +132,7 @@ async function verifyTier(root: string, tier: Tier, maxAgeMin: number | undefine
 
 export async function verifyStandby(opts: VerifyOptions): Promise<StandbyVerification> {
   const tiers = await Promise.all(opts.tiers.map(tier => verifyTier(opts.root, tier,
-    typeof opts.maxAgeMin === 'number' ? opts.maxAgeMin : opts.maxAgeMin?.[tier], opts.now ?? new Date())));
+    typeof opts.maxAgeMin === 'number' ? opts.maxAgeMin : opts.maxAgeMin?.[tier], opts.now ?? new Date(), opts.generations?.[tier])));
   const reasons = tiers.flatMap(tier => tier.reasons);
   let marker: StandbyVerification['marker'];
   if (opts.marker !== undefined) {

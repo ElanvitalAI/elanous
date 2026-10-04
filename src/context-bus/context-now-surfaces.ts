@@ -1,4 +1,11 @@
 import { contextNow, type ContextFact, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
+import { filterPublicDemoContext } from './context-now-public.js';
+
+export type ContextNowAudience = 'operator' | 'user' | 'public-demo';
+const publicSeatNames: Record<string, string> = { OP: '운영', MK: '마케팅', TC: '기술', UX: '사용자 경험' };
+const seatOrder = ['OP', 'MK', 'TC', 'UX'] as const;
+const forAudience = (answer: ContextNowAnswer, audience: ContextNowAudience): ContextNowAnswer =>
+  audience === 'public-demo' ? filterPublicDemoContext(answer) : answer;
 
 export function readSlashContextNow(args: string[], deps?: ContextNowDeps): ContextNowAnswer {
   return contextNow({ topic: args.join(' ').trim() }, deps);
@@ -30,7 +37,8 @@ function factText(fact: ContextFact): string {
   }
 }
 
-export function renderTelegramNow(answer: ContextNowAnswer): string {
+export function renderTelegramNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
+  const answer = forAudience(input, audience);
   const rows = [
     ['판', answer.facts.filter(f => f.kind === 'version')],
     ['칸', answer.facts.filter(f => f.kind === 'cell')],
@@ -42,7 +50,8 @@ export function renderTelegramNow(answer: ContextNowAnswer): string {
   return lines.map(line => line.replace(/\s+/g, ' ').trim()).join('\n');
 }
 
-export function renderTuiNow(answer: ContextNowAnswer): string[] {
+export function renderTuiNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string[] {
+  const answer = forAudience(input, audience);
   const shortText = (text: string) => {
     const characters = Array.from(text);
     return characters.length > 100 ? `${characters.slice(0, 100).join('')}…` : text;
@@ -67,6 +76,50 @@ export function renderTuiNow(answer: ContextNowAnswer): string[] {
     '| --- | --- | --- |',
     ...rows.map(row => `| ${row.map(cell => cell.replaceAll('|', '\\|').replaceAll(/\r?\n/g, ' ')).join(' | ')} |`),
   ];
+}
+
+/** Voice keeps the source-labelled ledger view out of the spoken transcript. */
+export function renderVoiceNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
+  const answer = forAudience(input, audience);
+  const spoken = (text: string) => text.replace(/\s+/g, ' ').replace(/[.!?。！？]+/g, ' ').trim();
+  const sentence = (text: string) => `${Array.from(spoken(text)).slice(0, 119).join('').trimEnd()}。`;
+  const seats = seatOrder.flatMap(seat => {
+    const label = audience === 'public-demo' ? publicSeatNames[seat]! : seat;
+    const latest = answer.facts.filter((fact): fact is Extract<ContextFact, { kind: 'seat' }> => fact.kind === 'seat' && (fact.seat === label || (audience === 'public-demo' && fact.seat === seat)))
+      .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+    if (!latest) return [];
+    return [`${label} ${Array.from(spoken(latest.title ?? latest.status)).slice(0, 18).join('')}`];
+  });
+  const first = sentence(seats.length ? `지금 ${seats.join(', ')} 중입니다` : '지금 자리 현황은 확인되지 않았습니다');
+  const decision = answer.facts.find(fact => fact.kind === 'decision' && fact.status === 'open');
+  const cell = answer.facts.find(fact => fact.kind === 'cell' && fact.status !== 'done');
+  const shortTitle = (text: string) => Array.from(spoken(text)).slice(0, 75).join('').trimEnd();
+  const next = decision?.kind === 'decision' ? `다음은 ${shortTitle(decision.title)} 결정이 필요합니다`
+    : cell?.kind === 'cell' ? `다음은 ${shortTitle(cell.title)} 칸을 확인해야 합니다`
+      : '다음에 필요한 결정이나 미완료 칸은 확인되지 않았습니다';
+  return `${first} ${sentence(next)}`;
+}
+
+/** A compact card retains the same source-labelled public facts as the other /now surfaces. */
+export function renderCardNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): {
+  title: string;
+  sections: Array<{ label: string; items: Array<{ text: string; source: string }> }>;
+} {
+  const answer = forAudience(input, audience);
+  const kinds = [
+    ['판', 'version'], ['칸', 'cell'], ['결정', 'decision'], ['자리', 'seat'],
+  ] as const;
+  return {
+    title: `지금${answer.topic ? ` · ${answer.topic}` : ''} (${answer.at})`,
+    sections: [
+      ...kinds.map(([label, kind]) => ({
+        label,
+        items: answer.facts.filter(fact => fact.kind === kind).map(fact => ({ text: factText(fact), source: fact.source })),
+      })),
+      { label: '최근', items: answer.events.map(event => ({ text: event.summary, source: event.source })) },
+      { label: '안내', items: answer.guide.map(text => ({ text, source: '' })) },
+    ],
+  };
 }
 
 export function telegramNowSlash(args: string[], deps?: ContextNowDeps): string {

@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireSlot, runHostRegate, type HostRegateDeps } from './host-regate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
+import { enableLandingFreeze, disableLandingFreeze } from '../release-loop/landing-freeze.js';
+import { sweepFrozenMerges } from './frozen-merges.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'c'.repeat(40);
@@ -43,6 +45,91 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
 }
 
 describe('host regate: never merge without a measured host pass', () => {
+  test('public doc changed: host calls exposure gate before merging; blocking verdict fails landing', async () => {
+    const original = mock();
+    const calls: string[] = [];
+    const deps: HostRegateDeps = {
+      ...original.deps,
+      command: (bin, args, cwd, env) => {
+        if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'release/public/docs/intro.md\n', stderr: '' };
+        calls.push(`${bin} ${args.join(' ')}`);
+        return original.deps.command!(bin, args, cwd, env);
+      },
+      runExposeGate: (_cwd, files, mode) => {
+        expect(files).toEqual(['release/public/docs/intro.md']);
+        expect(mode).toBe('warn');
+        calls.push('expose');
+        return { passed: false, log: '[expose] 1개 · 미판정 1 · fail 0' };
+      },
+    };
+    const result = await runHostRegate(input, deps);
+    expect(calls).toContain('expose');
+    expect(result.failures).toEqual([{ step: 'expose', detail: '[expose] 1개 · 미판정 1 · fail 0' }]);
+    expect(result.passed).toBe(false);
+    expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
+  });
+
+  test('non-public PR: host never invokes exposure gate', async () => {
+    const { deps } = mock({ runExposeGate: () => { throw new Error('unexpected exposure check'); } });
+    expect((await runHostRegate(input, deps)).passed).toBe(true);
+  });
+  test('freeze keeps the PR ready and defers merge; next pass after off resumes merge', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'landing-freeze-regate-'));
+    const path = process.env.PATH;
+    try {
+      // The sweep's own GitHub check (no injection): a fake gh on PATH answers from a state file —
+      // OPEN until the head-pinned merge runs, then MERGED at the held head.
+      const bin = join(root, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(root, 'gh-state'), 'OPEN');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '{"state":"%s","headRefOid":"${HEAD}"}\\n' "$(cat '${join(root, 'gh-state')}')"\n`);
+      execFileSync('chmod', ['+x', join(bin, 'gh')]);
+      process.env.PATH = `${bin}:${path ?? ''}`;
+      const held = { ...input, repoRoot: root };
+      enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
+      const { deps, calls } = mock({ freezeRoot: root });
+      const command = deps.command!;
+      deps.command = (bin, args, cwd, env) => {
+        if (bin === 'gh' && args[0] === 'pr' && args[1] === 'merge') writeFileSync(join(root, 'gh-state'), 'MERGED');
+        return command(bin, args, cwd, env);
+      };
+      const frozen = await runHostRegate(held, deps);
+      expect(frozen).toMatchObject({ passed: true, status: 'frozen', failures: [] });
+      expect(calls.filter((call) => call.startsWith('gh pr merge'))).toHaveLength(0);
+      expect(calls.filter((call) => call.startsWith('gh pr view 42 --json headRefOid'))).toHaveLength(2);
+      const pending = () => JSON.parse(readFileSync(join(root, 'landing-freeze-pending.json'), 'utf8')) as unknown[];
+      expect(pending()).toHaveLength(1);
+      disableLandingFreeze(root);
+      // A merge that reports success but GitHub still shows OPEN stays queued.
+      const notYet = await sweepFrozenMerges(async () => ({ passed: true }), root);
+      expect(notYet).toEqual({ pending: 1, merged: 0 });
+      expect(pending()).toHaveLength(1);
+      const sweep = await sweepFrozenMerges((item) => runHostRegate(item, deps), root);
+      expect(sweep).toEqual({ pending: 0, merged: 1 });
+      expect(pending()).toEqual([]);
+      expect(calls.filter((call) => call.startsWith('gh pr merge'))).toEqual([`gh pr merge 42 --squash --match-head-commit ${HEAD}`]);
+    } finally {
+      if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the in-flight marker is held until the merge has been confirmed, not just sent', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'landing-regate-marker-'));
+    try {
+      const { inFlightLandingMerges } = await import('../release-loop/landing-freeze.js');
+      const { deps } = mock({ freezeRoot: root });
+      const command = deps.command!;
+      let markersAtConfirm = -1;
+      deps.command = (bin, args, cwd, env) => {
+        if (bin === 'gh' && args.join(' ') === 'pr view 42 --json state,mergeCommit') markersAtConfirm = inFlightLandingMerges(root);
+        return command(bin, args, cwd, env);
+      };
+      expect((await runHostRegate(input, deps)).passed).toBe(true);
+      expect(markersAtConfirm).toBe(1);
+      expect(inFlightLandingMerges(root)).toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('all gates pass: one head-pinned squash merge after the base re-read, confirmed MERGED, cleanup', async () => {
     const { deps, calls, events } = mock();
     const result = await runHostRegate(input, deps);

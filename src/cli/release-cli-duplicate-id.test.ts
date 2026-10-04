@@ -102,7 +102,7 @@ describe('release checklist id collision at the real CLI entrance', () => {
     try {
       addItem('0.2.9', { id: 'W8', title: '온보딩', owner: 'UX' });
       legacy(root, '0.2.10', 'W8', '편집기 화면', 'TC');
-      const refused = cli(root, 'move', 'W8', '--from', '0.2.9', '--to', '0.2.10');
+      const refused = cli(root, 'move', 'W8', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'carry');
       expect(refused.exitCode).not.toBe(0);
       expect(refused.stderr).toContain('이미 있는 칸: W8 — 0.2.10 · 담당 TC · 편집기 화면');
       expect(listChecklist('0.2.9').items[0]).toMatchObject({ id: 'W8', title: '온보딩', owner: 'UX' });
@@ -119,7 +119,7 @@ describe('release checklist id collision at the real CLI entrance', () => {
       const id = 'W8\nlegacy';
       legacy(root, '0.2.9', id, '온보딩', 'UX');
       legacy(root, '0.2.10', id, '편집기 화면', 'TC\nlegacy');
-      const refused = cli(root, 'move', id, '--from', '0.2.9', '--to', '0.2.10');
+      const refused = cli(root, 'move', id, '--from', '0.2.9', '--to', '0.2.10', '--reason', 'carry');
       expect(refused.exitCode).not.toBe(0);
       expect(refused.stderr.split('\n').filter((line) => line.includes('이미 있는 칸:'))).toEqual([
         '❌ 이미 있는 칸: W8\\nlegacy — 0.2.10 · 담당 TC\\nlegacy · 편집기 화면',

@@ -4,7 +4,7 @@
  */
 import { setDefaultTimeout, describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import {
   aggregateListEvents, buildQuery, collectObservedEventNames, effectiveLogLimit, eventCategoryWarning, eventNameDistance, eventNameHint, eventNameVerdict, EVENT_NAME_HINT_SHOWN, EVENT_NAME_HINT_WINDOW_MS, formatLogInstance, formatLogLine, formatRemoteLogLine, grepPhraseWarning, isNameLikeEvent, limitReachedHint, limitReachedJsonMeta, limitReachedStderrSignal, matchesReworkRecurrenceDisagreement, multiSurfaceDuplicateJsonMeta, otherInstanceHint, rankNearbyEventNames, renderLogJsonLine, renderRemoteLogJsonLine,
   probeOtherInstanceMatches, quoteShellArg, resolveLogTargets, resolveLogsRemoteFlag, renderAxisExplanation, renderLogAxisDiscovery, runCoverageHint, UNCLASSIFIED_PREVIEW, renderGatedHint, runLogsCli, nonCurrentScopeNames, zeroResultFilterRelaxationWarning, type LogTarget,
-  liveFetchRemoteLogs,
+  liveFetchRemoteLogs, podObservationGapNotice,
   runLogsLevel,
 } from './logs-cli.js';
 import { LogStore, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
@@ -652,6 +652,206 @@ describe('런 커버리지 안내', () => {
       .toBe('안내: 반환된 4행에는 식별 가능한 런 식별자가 없습니다.');
     expect(runCoverageHint([])).toBeNull();
   });
+});
+
+describe('Pod child observation gap', () => {
+  it('warns only for a child category or event-only query with Pod runs', () => {
+    const notice = podObservationGapNotice({ events: ['pre-pr-sync'] }, 2);
+    expect(notice).toContain('Pod 에서 돈 런 2개');
+    expect(notice).toContain('elanous self run-ledger <runId>');
+    for (const category of ['self-implement', 'self-dev.worker', 'harness.clean']) {
+      expect(podObservationGapNotice({ categories: [category] }, 1)).not.toBeNull();
+      expect(podObservationGapNotice({ exactCategories: [category] }, 1)).not.toBeNull();
+    }
+    expect(podObservationGapNotice({ categories: ['nexus'], events: ['pre-pr-sync'] }, 2)).toBeNull();
+    expect(podObservationGapNotice({ categories: ['harness'], events: ['pre-pr-sync'] }, 0)).toBeNull();
+  });
+
+  it('counts in-window Pod ledgers for text and JSON, not local or stale ledgers; scopes federation and surfaces unreadable ledgers', async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-gap-')));
+    const stateDir = join(home, '.elanous');
+    const testState = join(home, 'test-state');
+    const directory = join(stateDir, 'run-ledger');
+    const testDirectory = join(testState, 'run-ledger');
+    mkdirSync(directory, { recursive: true });
+    mkdirSync(testDirectory, { recursive: true });
+    new LogStore(join(stateDir, 'logs', 'logs.db')).close();
+    new LogStore(join(testState, 'logs', 'logs.db')).close();
+    const now = Date.now();
+    const start = now - 60_000;
+    const stamp = new Date(now - 30_000).toISOString();
+    const put = (dir: string, suffix: string, hostname: string, timestamp = stamp) => {
+      const runId = `run-00000000-0000-0000-0000-${suffix.padStart(12, '0')}`;
+      const path = join(dir, `${runId}.jsonl`);
+      writeFileSync(path, `${JSON.stringify({ runId, timestamp, event: 'run-origin', data: { hostname, platform: 'linux' } })}\n`);
+      return path;
+    };
+    const pod = 'si-task-03814f9f935e-e40e5e5f-trmp5';
+    put(directory, '1', pod);
+    const overlapping = put(directory, '2', pod, new Date(now - 120_000).toISOString());
+    writeFileSync(overlapping, `${readFileSync(overlapping, 'utf8')}${JSON.stringify({
+      runId: 'run-00000000-0000-0000-0000-000000000002', timestamp: stamp, event: 'pre-pr-sync', data: {},
+    })}\n`);
+    put(directory, '3', 'Joosungui-MacBookPro');
+    const stale = put(directory, '4', pod);
+    utimesSync(stale, new Date(now - 120_000), new Date(now - 120_000));
+    put(directory, '7', pod, new Date(now - 120_000).toISOString());
+    put(testDirectory, '5', pod);
+    writeFileSync(join(directory, 'run-00000000-0000-0000-0000-000000000006.jsonl'), 'broken json\n');
+    writeFileSync(join(stateDir, 'logs', 'instances.json'), JSON.stringify({ instances: [{
+      name: 'test:fixture', stateDir: testState, kind: 'test', configDir: testState, pid: 0, startedAt: '',
+    }] }));
+    const run = (args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--instance', 'prod', '--since', String(start), '--until', String(now), ...args], {
+      cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    try {
+      const event = run(['--event', 'pre-pr-sync']);
+      expect(event.status).toBe(0);
+      expect(event.stderr).toContain('Pod 에서 돈 런 2개');
+      expect(event.stderr).toContain('elanous self run-ledger <runId>');
+      expect(event.stderr).toContain('(못 읽은 원장 1)');
+      const nexus = run(['--category', 'nexus']);
+      expect(nexus.status).toBe(0);
+      expect(nexus.stderr).not.toContain('POD-OBS');
+      const json = run(['--event', 'pre-pr-sync', '--json']);
+      expect(json.status).toBe(0);
+      const meta = json.stdout.trim().split('\n').map((line) => JSON.parse(line)._meta);
+      expect(meta[0]).toMatchObject({ type: 'log-query-opened-stores' });
+      expect(meta.find((item) => item?.type === 'log-query-pod-observation-gap'))
+        .toEqual({ type: 'log-query-pod-observation-gap', podRuns: 2, unreadableLedgers: 1 });
+      expect(meta).toContainEqual({ type: 'log-query-multi-surface-duplicates', duplicateGroupCount: 0, surfaceKindCount: 0, surfaces: [], groups: [] });
+      const all = spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--all', '--include-test', '--since', String(start), '--until', String(now), '--event', 'pre-pr-sync', '--json'], {
+        cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(all.status).toBe(0);
+      expect(all.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)._meta)
+        .find((item) => item?.type === 'log-query-pod-observation-gap')?.podRuns).toBe(3);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('--follow --event pre-pr-sync warns after the seed; --json emits the same Pod gap meta', async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-follow-')));
+    const stateDir = join(home, '.elanous');
+    const ledgerDir = join(stateDir, 'run-ledger');
+    mkdirSync(ledgerDir, { recursive: true });
+    new LogStore(join(stateDir, 'logs', 'logs.db')).close();
+    const now = Date.now();
+    for (const suffix of ['1', '2']) {
+      const runId = `run-00000000-0000-0000-0000-${suffix.padStart(12, '0')}`;
+      writeFileSync(join(ledgerDir, `${runId}.jsonl`), `${JSON.stringify({
+        runId, timestamp: new Date(now - 10_000).toISOString(), event: 'run-origin',
+        data: { hostname: 'si-task-03814f9f935e-e40e5e5f-trmp5', platform: 'linux' },
+      })}\n`);
+    }
+    const follow = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+      const child = spawn(process.execPath, [
+        'bin/elanous.mjs', 'logs', '--instance', 'prod', '--follow', '--since', String(now - 60_000),
+        '--event', 'pre-pr-sync', ...args,
+      ], {
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error(`follow banner timeout: ${stderr}`)), 10_000);
+          child.stderr.on('data', () => {
+            if (stderr.includes('--- following 열린 로그 스토어 1개 (Ctrl-C 종료) ---')) {
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+          child.once('error', (error) => { clearTimeout(timeout); reject(error); });
+          child.once('exit', (code) => { clearTimeout(timeout); reject(new Error(`follow exited early: ${code} ${stderr}`)); });
+        });
+        return { stdout, stderr };
+      } finally {
+        child.kill('SIGTERM');
+        if (child.exitCode === null) await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      }
+    };
+    try {
+      const text = await follow([]);
+      expect(text.stderr).toContain('Pod 에서 돈 런 2개');
+      expect(text.stderr).toContain('elanous self run-ledger <runId>');
+      expect(text.stderr.match(/Pod 에서 돈 런 2개/g)).toHaveLength(1);
+      const json = await follow(['--json']);
+      expect(json.stdout.trim().split('\n').map((line) => JSON.parse(line)._meta)).toContainEqual({
+        type: 'log-query-pod-observation-gap', podRuns: 2, unreadableLedgers: 0,
+      });
+      expect(json.stderr).not.toContain('Pod 에서 돈 런 2개');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('uses the first run-origin even when another event precedes it', () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-late-origin-')));
+    const stateDir = join(home, '.elanous');
+    const ledgerDir = join(stateDir, 'run-ledger');
+    mkdirSync(ledgerDir, { recursive: true });
+    new LogStore(join(stateDir, 'logs', 'logs.db')).close();
+    const now = Date.now();
+    const runId = 'run-00000000-0000-0000-0000-000000000008';
+    const timestamp = new Date(now - 10_000).toISOString();
+    writeFileSync(join(ledgerDir, `${runId}.jsonl`), [
+      { runId, timestamp, event: 'pre-pr-sync', data: {} },
+      { runId, timestamp, event: 'run-origin', data: { hostname: 'si-task-03814f9f935e-e40e5e5f-trmp5', platform: 'linux' } },
+      { runId, timestamp, event: 'run-origin', data: { hostname: 'Joosungui-MacBookPro', platform: 'darwin' } },
+    ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+    try {
+      const result = spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--instance', 'prod', '--since', String(now - 60_000), '--until', String(now), '--event', 'pre-pr-sync'], {
+        cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('Pod 에서 돈 런 1개');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('counts selected registered instance ledgers without a logs.db, including when no store opens', () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-no-db-')));
+    const prodState = join(home, '.elanous');
+    const siblingState = join(home, 'ledger-only');
+    const ledgerDir = join(siblingState, 'run-ledger');
+    mkdirSync(ledgerDir, { recursive: true });
+    const now = Date.now();
+    const runId = 'run-00000000-0000-0000-0000-000000000009';
+    writeFileSync(join(ledgerDir, `${runId}.jsonl`), `${JSON.stringify({
+      runId, timestamp: new Date(now - 10_000).toISOString(), event: 'run-origin',
+      data: { hostname: 'si-task-03814f9f935e-e40e5e5f-trmp5', platform: 'linux' },
+    })}\n`);
+    mkdirSync(join(prodState, 'logs'), { recursive: true });
+    writeFileSync(join(prodState, 'logs', 'instances.json'), JSON.stringify({ instances: [{
+      name: 'ledger-only', stateDir: siblingState, kind: 'prod', configDir: siblingState, pid: 0, startedAt: '',
+    }] }));
+    const run = (args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--since', String(now - 60_000), '--until', String(now), '--event', 'pre-pr-sync', ...args], {
+      cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: prodState, ELANOUS_CONFIG_DIR: prodState },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    try {
+      const missing = run(['--instance', 'ledger-only']);
+      expect(missing.status).toBe(1);
+      expect(missing.stderr).toContain('열 수 있는 로그 스토어 없음');
+      expect(missing.stderr).toContain('Pod 에서 돈 런 1개');
+      const missingJson = run(['--instance', 'ledger-only', '--json']);
+      expect(missingJson.status).toBe(1);
+      expect(missingJson.stdout.trim().split('\n').map((line) => JSON.parse(line)))
+        .toEqual([{ _meta: { type: 'log-query-pod-observation-gap', podRuns: 1, unreadableLedgers: 0 } }]);
+      new LogStore(join(prodState, 'logs', 'logs.db')).close();
+      const federated = run(['--all', '--json']);
+      expect(federated.status).toBe(0);
+      expect(federated.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)._meta)
+        .find((item) => item?.type === 'log-query-pod-observation-gap'))
+        .toEqual({ type: 'log-query-pod-observation-gap', podRuns: 1, unreadableLedgers: 0 });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, 30_000);
 });
 
 describe('runLogsCli — 사람용 출력 wiring', () => {

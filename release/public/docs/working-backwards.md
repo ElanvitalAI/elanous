@@ -7,10 +7,12 @@ Start from the result you want, then let the harness build toward it. Writing th
 Write three or four sentences, as if you were announcing the change:
 
 ```markdown
-Status now answers in JSON. Anyone scripting against elanous can run
-`elanous status --json` and read the same fields they see on screen,
-without parsing text. The plain output does not change.
+Status now answers in JSON. To automate status checks, run
+`elanous status` (with the proposed JSON output) and read the same fields
+you see on screen, without parsing text. The plain output does not change.
 ```
+
+Today, `elanous status` prints text only. For a structured operational snapshot now, use `elanous ops status --json`; it reports operational state, not the same fields as `elanous status`.
 
 If a sentence is hard to write, that is the part you have not decided yet. Decide it now, not during review.
 

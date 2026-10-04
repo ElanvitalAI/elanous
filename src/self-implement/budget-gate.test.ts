@@ -252,3 +252,77 @@ describe('live grok usage and empty chain (2026-09-27 실물)', () => {
   });
 });
 
+
+// BUDGET-GATE(10-05 00:0x) — 발사 관문이 «codex 구독 % ≥ 95» 만 보고 전 자리 발사를 막았다.
+// 정책 credits ⊕ 잔액이 확인된 계정이 있으면 Pod 배분(planPodAccounts)과 같은 결론(codex 로 계속)이어야 한다.
+describe('codex credits policy (BUDGET-GATE)', () => {
+  const full = [
+    { name: 'default', usedPercent: 97, creditBalance: 150_826, hasCredits: true },
+    { name: 'team', usedPercent: 100 },
+    { name: 'third', usedPercent: 100 },
+  ];
+  const credits = (codex: DecideBudgetInput['codexCandidates'], allowed: boolean): DecideBudgetInput => ({
+    ...input({ codex: [], grok: 60, onShortfall: 'wait-reset' }),
+    codexCandidates: codex,
+    ...(allowed ? { codexCreditsAllowed: true } : {}),
+  });
+
+  test('정책 credits ⊕ 잔액>0 ⊕ 구독 97/100/100 → codex 로 proceed · 이유에 잔액', () => {
+    const { decision } = decideLaunchBudget(credits(full, true));
+    expect(decision.action).toBe('proceed');
+    expect(decision.provider).toBe('openai-codex');
+    expect(decision.reasons[0]).toContain('credits allowed (balance 150826)');
+    expect(decideBudget(credits(full, true)).action).toBe('proceed');
+  });
+
+  test('정책 fallback(크레딧 불허) → 지금처럼 막힌다', () => {
+    expect(decideLaunchBudget(credits(full, false)).decision.action).toBe('wait-reset');
+  });
+
+  test('잔액 0 · 잔액 모름 · hasCredits=false → 막힌다(크레딧은 돈 — fail-closed)', () => {
+    for (const codex of [
+      [{ name: 'default', usedPercent: 97, creditBalance: 0 }],
+      [{ name: 'default', usedPercent: 97 }],
+      [{ name: 'default', usedPercent: 97, creditBalance: 500, hasCredits: false }],
+    ]) {
+      expect(decideLaunchBudget(credits(codex, true)).decision.action).toBe('wait-reset');
+    }
+  });
+
+  test('구독 잔량이 남은 계정이 있으면 크레딧 줄을 붙이지 않는다(회전이 먼저)', () => {
+    const { decision } = decideLaunchBudget(credits([{ name: 'team', usedPercent: 40 }, ...full.slice(0, 1)], true));
+    expect(decision.action).toBe('proceed');
+    expect(decision.reasons[0]).not.toContain('credits allowed');
+  });
+
+  test('readBudgetInputs 가 회전 점검의 creditsAllowed·잔액을 운반한다', () => {
+    const inputs = readBudgetInputs({
+      config: { tools: { selfImplement: {} }, llm: { provider: 'auto', fallbackChain: ['codex-rotate'] } } as never,
+      inspectCodex: () => ({
+        policy: { policy: 'credits', source: 'config' },
+        candidates: [{ name: 'default', storeKey: 'k', home: '/h', usedPercent: 97, creditBalance: 150_826, hasCredits: true }],
+      }) as never,
+      grokSnapshot: () => undefined,
+    });
+    expect(inputs.codexCreditsAllowed).toBe(true);
+    expect(inputs.codexCandidates).toEqual([{ name: 'default', usedPercent: 97, creditBalance: 150_826, hasCredits: true }]);
+    expect(decideLaunchBudget(inputs).decision.provider).toBe('openai-codex');
+    const fallbackPolicy = readBudgetInputs({
+      config: { tools: { selfImplement: {} }, llm: { provider: 'auto', fallbackChain: ['codex-rotate'] } } as never,
+      inspectCodex: () => ({ policy: { policy: 'fallback', source: 'default' }, candidates: [] }) as never,
+      grokSnapshot: () => undefined,
+    });
+    expect(fallbackPolicy.codexCreditsAllowed).toBeUndefined();
+  });
+
+  test('Pod 배분과 같은 결론 — 둘 다 «찬 계정을 크레딧으로»', async () => {
+    const { planPodAccounts } = await import('../task-orchestrator/surfaces/pod-account-broker.js');
+    const rotation = full.map((c) => ({ ...c, storeKey: c.name, home: `/h/${c.name}` }));
+    const pod = planPodAccounts(rotation as never, { excludeAt: 95, creditsAllowed: true });
+    expect(pod.creditAccounts?.[0]).toBe('default');
+    expect(decideLaunchBudget(credits(full, true)).decision.provider).toBe('openai-codex');
+    const podOff = planPodAccounts(rotation as never, { excludeAt: 95, creditsAllowed: false });
+    expect(podOff.usable).toEqual([]);
+    expect(decideLaunchBudget(credits(full, false)).decision.action).not.toBe('proceed');
+  });
+});

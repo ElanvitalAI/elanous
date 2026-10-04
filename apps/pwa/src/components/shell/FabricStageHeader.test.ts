@@ -3,7 +3,11 @@
 // 연결됨을 잠근다. SIDEBAR_NAV_ITEMS 와 href 정합도 확인(사이드바 ↔ 단계 헤더 일치).
 
 import { describe, it, expect } from 'bun:test';
-import { FABRIC_STAGES } from './FabricStageHeader';
+import { FABRIC_STAGES, FabricStageHeader } from './FabricStageHeader';
+import LoopsPage from '@/app/loops/page';
+import { LoopStatusPanel } from '@/components/loops/LoopStatusPanel';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { createElement } from 'react';
 import { SIDEBAR_NAV_ITEMS } from './sidebar-nav-items';
 
 describe('FABRIC_STAGES', () => {
@@ -22,6 +26,12 @@ describe('FABRIC_STAGES', () => {
     expect(byKey.autopilot).toBe('/autopilot');
     expect(byKey.tasks).toBe('/tasks');
     expect(byKey.scheduler).toBe('/scheduler');
+  });
+
+  it('루프 현황은 스케줄 단계를 공유하되 별도 파이프라인 단계를 만들지 않는다', () => {
+    expect(LoopsPage().type).toBe(LoopStatusPanel);
+    expect(renderToStaticMarkup(createElement(FabricStageHeader, { active: 'scheduler' }))).toMatch(/<a aria-current="page"[^>]*href="\/scheduler"/);
+    expect(FABRIC_STAGES.map((stage) => stage.href)).not.toContain('/loops');
   });
 
   it('모든 단계 href 가 사이드바 nav 에도 존재(표면 정합)', () => {

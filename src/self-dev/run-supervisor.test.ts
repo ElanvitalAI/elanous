@@ -36,6 +36,14 @@ const falseFailure = (id: string) => ({
 }) as never;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('each supervision sweep resumes deferred merges without rerunning an implemented job', async () => {
+    let sweeps = 0;
+    let reruns = 0;
+    await superviseRun({ initial: [merged('a')], rerun: async (prior) => { reruns++; return prior; },
+      sweepPendingMerges: async () => { sweeps++; return { pending: 0, merged: 1 }; } });
+    expect(sweeps).toBe(1);
+    expect(reruns).toBe(0);
+  });
   test('⭐ 북극성 실물 — 다시 건다고 답한다(사람이 볼 것은 0이었다)', () => {
     const d = decideNextRun({
       results: [merged('2'), merged('4'), lockRace('3'), depFailed('5'), depFailed('6'), unconverged('0'), unconverged('1')],

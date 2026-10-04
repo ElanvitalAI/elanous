@@ -1,0 +1,59 @@
+graph_id: orchestrator
+loop:
+  title: 오케스트레이터
+  trigger:
+    cron: '0 8,12,18 * * *'
+    events: [manual]
+version: 1
+entry_node: intake
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: intake
+    kind: agent
+    recipe: cmd:orchestrator-intake
+    max_visits: 1
+  - node_id: split
+    kind: agent
+    recipe: cmd:orchestrator-split
+    max_visits: 1
+  - node_id: place
+    kind: agent
+    recipe: cmd:orchestrator-place
+    max_visits: 1
+  - node_id: delegate
+    kind: agent
+    recipe: cmd:orchestrator-delegate
+    max_visits: 1
+  - node_id: reconcile
+    kind: agent
+    recipe: cmd:orchestrator-reconcile
+    max_visits: 1
+  - node_id: report
+    kind: agent
+    recipe: cmd:orchestrator-report
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: intake
+    on: outcome
+    map: { ok: split, fail: failed }
+  - from: split
+    on: outcome
+    map: { ok: place, fail: failed }
+  - from: place
+    on: outcome
+    map: { ok: delegate, fail: failed }
+  - from: delegate
+    on: outcome
+    map: { ok: reconcile, fail: failed }
+  - from: reconcile
+    on: outcome
+    map: { ok: report, fail: failed }
+  - from: report
+    on: outcome
+    map: { ok: done, fail: failed }

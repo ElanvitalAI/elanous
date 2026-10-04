@@ -1,0 +1,3 @@
+summary:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/video/youtube-summary.ts"'
+  timeout_ms: 120000

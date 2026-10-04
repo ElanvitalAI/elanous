@@ -7,12 +7,13 @@ export const DEFAULT_COST_SECS = 10;
 export const SLOW_SECS = 60;
 export const HEAVY_MB = 2048;
 
-export interface Measurement { file: string; secs: number; rssMb: number | null; rc: number | null; pass: number | null; fail: number | null; reason?: string }
+export interface Effectiveness { flake: 'stable' | 'flaky' | 'failing'; mutation: 'caught' | 'survived' | 'n/a'; fixedCounts?: number }
+export interface Measurement { file: string; secs: number; rssMb: number | null; rc: number | null; pass: number | null; fail: number | null; reason?: string; effectiveness?: Effectiveness }
 export type Verdict = 'keep' | 'failing' | 'review';
 export type Proposal = 'delete' | 'shrink' | 'rewrite-cheap' | 'move-out-of-gate' | 'investigate';
 export interface Td1Disposition { disposition: string; alternative: string; guards: string; why_slow: string }
-export interface Judged extends Measurement { caught90: number; flags: string[]; verdict: Verdict; proposal?: Proposal | null; basis?: string | null }
-export interface LedgerLine { at: string; range: string; start: number; end: number; next: number; total: number; commit: string; budgetSecs: number; results: Judged[] }
+export interface Judged extends Measurement { caught90: number; flags: string[]; verdict: Verdict; effectiveness?: Effectiveness; proposal?: Proposal | null; basis?: string | null }
+export interface LedgerLine { at: string; range: string; start: number; end: number; next: number; total: number; commit: string; budgetSecs: number; results: Judged[]; sweepVisited?: number; sweepCostSecs?: number; sweepSlices?: number }
 
 /** `file\tsecs\t…` (TD1 whole-gate TSV) → seconds per file. */
 export function costTable(tsv: string): Map<string, number> {
@@ -47,8 +48,13 @@ export function propose(judged: Judged, td1: ReadonlyMap<string, Td1Disposition>
     const proposal = reviewed.disposition === 'keep' ? null : reviewed.disposition as Proposal;
     return { ...judged, proposal, basis: proposal ? [reviewed.alternative, reviewed.why_slow, reviewed.guards && `guards: ${reviewed.guards}`].filter(Boolean).join(' · ') : null };
   }
+  if (judged.effectiveness?.flake === 'flaky') return { ...judged, proposal: 'investigate', basis: '3회 중 갈림' };
+  if (judged.effectiveness?.flake === 'stable' && judged.effectiveness.mutation === 'survived' && judged.caught90 === 0)
+    return { ...judged, proposal: 'rewrite-cheap', basis: '돌연변이를 못 잡음' };
   if (judged.verdict === 'failing') return { ...judged, proposal: 'investigate', basis: `failing (rc=${judged.rc}) · caught90=${judged.caught90}` };
   if (judged.verdict === 'review') return { ...judged, proposal: 'shrink', basis: `${judged.flags.join(', ')} · caught90=${judged.caught90}` };
+  if (judged.effectiveness?.fixedCounts && judged.effectiveness.fixedCounts > 0)
+    return { ...judged, proposal: 'investigate', basis: `저장소 전수 개수 고정 단언 ${judged.effectiveness.fixedCounts}줄 — 관련 시험 묶음 후보` };
   return { ...judged, proposal: null, basis: null };
 }
 
@@ -75,7 +81,9 @@ export function judge(m: Measurement, caught90: number): Judged {
   const flags: string[] = [];
   if (m.secs >= SLOW_SECS) flags.push('slow');
   if (m.rssMb !== null && m.rssMb >= HEAVY_MB) flags.push('heavy');
-  const verdict: Verdict = m.rc !== 0 ? 'failing' : flags.length > 0 && caught90 === 0 ? 'review' : 'keep';
+  const verdict: Verdict = m.effectiveness?.flake === 'flaky' ? 'review'
+    : (m.effectiveness?.flake === 'failing' || (m.effectiveness === undefined && m.rc !== 0)) ? 'failing'
+      : flags.length > 0 && caught90 === 0 ? 'review' : 'keep';
   return { ...m, caught90, flags, verdict };
 }
 
@@ -96,19 +104,19 @@ export function appendLedger(root: string, line: LedgerLine): void {
 
 /** Draft approval card — written as a file for a person to read; nothing is acted on. */
 export function writeCardDraft(root: string, line: LedgerLine): string | null {
-  const items = line.results.filter((r) => r.verdict !== 'keep');
+  const items = line.results.filter((r) => r.verdict !== 'keep' || r.proposal != null);
   if (items.length === 0) return null;
   const dir = join(root, 'test-diet', 'cards');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${line.at.slice(0, 10)}-${line.range.replace(/[^0-9a-z~#-]/gi, '')}.md`);
-  const rows = items.map((r) => `| \`${r.file}\` | ${r.verdict} | ${r.secs}s | ${r.rssMb ?? '?'} MB | ${r.caught90} | ${r.flags.join(', ') || '—'} | ${(r.reason ?? '').replace(/\|/g, '/')} |`);
+  const rows = items.map((r) => `| \`${r.file}\` | ${r.verdict} | ${r.secs}s | ${r.rssMb ?? '?'} MB | ${r.caught90} | ${r.flags.join(', ') || '—'} | ${(r.reason ?? '').replace(/\|/g, '/')} | ${r.proposal ?? '—'} | ${(r.basis ?? '—').replace(/\|/g, '/')} |`);
   writeFileSync(path, [
     `# 시험 리뷰 초안 — ${line.range} (${line.at.slice(0, 10)})`,
     '',
     '> 초안이다. 아무것도 지우거나 옮기지 않았다. 사람이 읽고 정한다.',
     '',
-    '| 파일 | 판정 | 단독 시간 | 피크 메모리 | 90일 fix 커밋 | 표지 | 실패 사유(첫 줄) |',
-    '|---|---|---|---|---|---|---|',
+    '| 파일 | 판정 | 단독 시간 | 피크 메모리 | 90일 fix 커밋 | 표지 | 실패 사유(첫 줄) | 제안 | 근거 |',
+    '|---|---|---|---|---|---|---|---|---|',
     ...rows,
     '',
     `원장: ${line.results.length}개 중 ${items.length}개 · 측정 판 ${line.commit}`,

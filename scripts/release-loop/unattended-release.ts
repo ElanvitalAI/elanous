@@ -4,6 +4,8 @@ import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { userConfigPath } from '../../src/user-config.js';
 import { checklistGate } from '../../src/release-loop/checklist.js';
+import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '../../src/release-loop/landing-freeze.js';
+import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
@@ -26,6 +28,7 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   previousVersion: string;
   cutCommit?: string;
   gatePodPool: string;
+  forceFreeze?: boolean;
 }
 
 export interface UnattendedReleaseDeps {
@@ -34,6 +37,7 @@ export interface UnattendedReleaseDeps {
   configPath?: string;
   graph?: (path: string, options: { input: ReleaseRunInput }) => Promise<GraphRunState>;
   checklist?: typeof checklistGate;
+  freezeRoot?: string;
 }
 
 function compareVersions(a: string, b: string): number {
@@ -83,13 +87,31 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
+  if (!opts.dryRun) {
+    const frozen = readLandingFreeze(deps.freezeRoot);
+    if (frozen) {
+      debug.log('release.run', opts.forceFreeze ? 'freeze-forced' : 'frozen', { version: opts.version, reason: frozen.reason, until: frozen.until });
+      if (!opts.forceFreeze) throw new LandingFrozenError(frozen);
+    }
+  }
   const input = buildReleaseRunInput(opts.version, deps, opts.cutCommit);
+  if (opts.forceFreeze) input.forceFreeze = true;
   if (opts.dryRun) return { input, dryRun: true };
   const gate = (deps.checklist ?? checklistGate)(opts.version);
   if (!gate.ok) throw new Error(`release checklist blocked: ${[...gate.red, ...gate.undecided, ...gate.blocked].join(', ')}`);
+  const beforeGraph = readLandingFreeze(deps.freezeRoot);
+  if (beforeGraph && !opts.forceFreeze) throw new LandingFrozenError(beforeGraph);
   const state = await (deps.graph ?? runGraph)(GRAPH, { input });
+  // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
+  // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.
+  if (state.status === 'failed' && !opts.forceFreeze) {
+    const refused = (state.nodes ?? []).find((node) => (node.nodeId === 'gate' || node.nodeId === 'publish') && !node.ok
+      && isLandingFreezeRefusal(`${typeof node.output === 'string' ? node.output : JSON.stringify(node.output ?? '')} ${node.error ?? ''}`));
+    const during = refused ? readLandingFreeze(deps.freezeRoot) : null;
+    if (refused) throw new LandingFrozenError(during ?? { reason: 'frozen during the run', startedAt: new Date().toISOString(), until: null, by: 'release-run' });
+  }
   return { input, dryRun: false, state };
 }

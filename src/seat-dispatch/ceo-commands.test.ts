@@ -40,6 +40,14 @@ test('Discord seat dispatch uses the existing inbox and coordination channel pat
   expect(gh).toEqual([{ args: ['pr', 'comment', '20798', '--repo', 'acme/repo', '--body-file', '-'], stdin: '**[대표]** 2026-10-02 12:30 KST → TC · 결제 화면 오타 고쳐 줘' }]);
 });
 
+test('TUI dispatch reaches the existing inbox and labels its coordination channel line', async () => {
+  const { deps, gh, stored } = harness();
+  const result = await dispatchCeoTask('TC', '질문: 배포 상태?', deps, { via: 'tui', ref: 'ask:r-1' });
+  expect(result.channel).toBe('posted');
+  expect(stored).toEqual([{ from: 'CEO', to: 'TC', body: '질문: 배포 상태?\n요청: ask:r-1', kind: 'ceo-task' }]);
+  expect(gh[0]!.stdin).toBe('**[대표]** 2026-10-02 12:30 KST → TC · 질문: 배포 상태? (TUI)');
+});
+
 test('dispatchCeoTask rejects whitespace-only requests before writing', async () => {
   const { deps, gh, stored } = harness();
   const result = await dispatchCeoTask('OP', '  \t  ', deps);

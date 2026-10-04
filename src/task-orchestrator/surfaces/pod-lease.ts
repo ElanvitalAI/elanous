@@ -12,12 +12,15 @@ export const POD_HOST_LEASE_ANNOTATION = 'elanous.dev/host-lease-admitted';
 
 // `get pods --all-namespaces -o json` on a busy cluster is several MB — the default spawnSync
 // buffer fails with ENOBUFS (10-03 node-b measured). Same proxy stripping as the Pod launch kubectl.
-const LEASE_KUBECTL_MAX_BUFFER = 256 * 1024 * 1024;
+export const LEASE_KUBECTL_MAX_BUFFER = 256 * 1024 * 1024;
 export function leaseKubectl(args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string } {
   const env = { ...process.env };
   for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[k];
   const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
-  return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
+  const error = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS'
+    ? `kubectl 출력 너무 큼 (ENOBUFS; maxBuffer=${LEASE_KUBECTL_MAX_BUFFER} bytes)`
+    : r.error ? String(r.error) : '';
+  return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + error };
 }
 
 export interface PodLeaseMember {

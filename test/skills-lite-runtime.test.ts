@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const ROOT = join(import.meta.dir, '..');
-const SKILLS = ['omni-crawl', 'omni-digest'] as const;
+const SKILLS = ['omni-crawl', 'omni-digest', 'youtube-master'] as const;
 
 function withStandaloneSkills(check: (root: string) => void): void {
   const root = mkdtempSync(join(tmpdir(), 'skills-lite-'));
@@ -42,8 +42,49 @@ test('standalone skill TS, SKILL.md and package.json contain no tsx launcher or 
   }
 });
 
-test('both skill entrypoint shebangs launch bun', () => {
-  for (const [skill, script] of [['omni-crawl', 'scripts/main.ts'], ['omni-crawl', 'scripts/monitor.ts'], ['omni-digest', 'scripts/main.ts']]) {
+test('youtube-master standalone self-test and optional engine probes work without tsx or media engines', () => {
+  withStandaloneSkills(root => {
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const bun = realpathSync(process.execPath);
+    const main = join(root, 'skills/youtube-master/scripts/main.ts');
+    const env = { ...process.env, PATH: bin };
+    const result = spawnSync(bun, [main, '--self-test'], {
+      cwd: root, env, encoding: 'utf8', timeout: 15_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('결과: 18 passed, 0 failed');
+    expect(result.stderr).not.toMatch(/(?:Error:|\bat\s+\S+\s*\()/);
+
+    const util = join(root, 'skills/youtube-master/src/util.ts');
+    const audio = join(root, 'skills/youtube-master/src/audio.ts');
+    const probe = spawnSync(bun, ['-e', `
+      import { findAddon } from ${JSON.stringify(util)};
+      import { downloadAudio, splitAudio } from ${JSON.stringify(audio)};
+      console.log(JSON.stringify(['ffmpeg', 'yt-dlp', 'whisper'].map(findAddon)));
+      for (const stage of [() => downloadAudio('https://youtu.be/test', '.'), () => splitAudio('audio.mp3', '.', 30)]) {
+        try { await stage(); } catch (error) { console.log('STAGE_ERROR', error.code, error.message); }
+      }
+    `], { cwd: root, env, encoding: 'utf8', timeout: 15_000 });
+    expect(probe.status, probe.stderr).toBe(0);
+    const addons = JSON.parse(probe.stdout.split('\n')[0]);
+    expect(addons.map(({ found, name, hint }: { found: boolean; name: string; hint: string }) => ({ found, name, hint }))).toEqual([
+      { found: false, name: 'ffmpeg', hint: 'brew install ffmpeg' },
+      { found: false, name: 'yt-dlp', hint: 'brew install yt-dlp' },
+      { found: false, name: 'whisper', hint: 'pip install openai-whisper' },
+    ]);
+    expect(probe.stderr.trim().split('\n')).toEqual([
+      '없음: yt-dlp — 선택 애드온 · brew install yt-dlp',
+      '없음: ffmpeg — 선택 애드온 · brew install ffmpeg',
+    ]);
+    expect(probe.stdout).toContain('STAGE_ERROR ADDON_MISSING 없음: yt-dlp');
+    expect(probe.stdout).toContain('STAGE_ERROR ADDON_MISSING 없음: ffmpeg');
+    expect(probe.stderr).not.toMatch(/\bat\s+\S+\s*\(/);
+  });
+});
+
+test('all skill entrypoint shebangs launch bun', () => {
+  for (const [skill, script] of [['omni-crawl', 'scripts/main.ts'], ['omni-crawl', 'scripts/monitor.ts'], ['omni-digest', 'scripts/main.ts'], ['youtube-master', 'scripts/main.ts']]) {
     expect(readFileSync(join(ROOT, 'skills', skill, script), 'utf8').split('\n')[0]).toBe('#!/usr/bin/env bun');
   }
 });

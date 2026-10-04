@@ -15,18 +15,41 @@
 // Resolution order:
 //   1. Programmatic override set via `setElanousConfigDir(dir)` (incl.
 //      from the `--config-dir` CLI flag).
-//   2. `~/.elanous` — default daily-driver root.
+//   2. State-dir via `effectiveInstanceRoot()` (including isolated source trees).
+//   3. `~/.elanous` for the installed daily-driver root.
 
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 
 let override: string | undefined;
+let checkedIgnoredEnv = false;
+
+function normalizedDir(dir: string): string {
+  const trimmed = dir.trim();
+  const expanded = trimmed === '~' ? homedir() : trimmed.startsWith('~/') ? `${homedir()}${trimmed.slice(1)}` : trimmed;
+  return resolve(expanded);
+}
+
+function warnIfIgnoredEnv(resolved: string, source: 'flag' | 'state-dir' | 'default'): void {
+  if (checkedIgnoredEnv) return;
+  checkedIgnoredEnv = true;
+  const env = process.env.ELANOUS_CONFIG_DIR;
+  if (env === undefined || normalizedDir(env) === normalizedDir(resolved)) return;
+  console.error(`ELANOUS_CONFIG_DIR 는 읽지 않습니다 — 설정 폴더 = ${resolved} · 그 폴더를 쓰려면 --config-dir ${normalizedDir(env)}`);
+  try {
+    const { debug } = require('./debug/log.js') as typeof import('./debug/log.js');
+    debug.log('config.dir', 'env-ignored', { env, resolved, source });
+  } catch { /* logging must not change config resolution */ }
+}
 
 /** Resolve the current elanous config / daemon root directory. Caller
  *  decides what subpath to append (`workflows/`, `config.json`,
  *  `acp-token`, ...). */
 export function getElanousConfigDir(): string {
-  if (override !== undefined) return override;
+  if (override !== undefined) {
+    warnIfIgnoredEnv(override, 'flag');
+    return override;
+  }
   // ★ §4d (P3 · 2026-07-26) — **config-dir 은 state-dir 을 따라간다.**
   //
   //   `ELANOUS_STATE_DIR` 은 env 라 전 자손에 자동 전파되는데 config-dir 은 argv 재부착 **7곳**
@@ -41,7 +64,9 @@ export function getElanousConfigDir(): string {
   //     (`configDirFollowingStateDir` 은 §4d 계약을 문서화·테스트하는 순수 함수로 남는다 —
   //      실제 해석 경로는 이 리졸버 하나다.)
   const { effectiveInstanceRoot } = require('./instance/resolve.js') as typeof import('./instance/resolve.js');
-  return effectiveInstanceRoot();
+  const resolved = effectiveInstanceRoot();
+  warnIfIgnoredEnv(resolved, process.env.ELANOUS_STATE_DIR?.trim() ? 'state-dir' : 'default');
+  return resolved;
 }
 
 /** Programmatic override. Trims, rejects empty/blank. Child processes

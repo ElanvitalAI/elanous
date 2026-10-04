@@ -58,14 +58,20 @@ function open(root = releaseLedgerRoot()): Database {
     if (!columns.some((column) => column.name === 'imported_at')) db.exec('ALTER TABLE imported_versions ADD COLUMN imported_at TEXT');
     if (!(db.query('PRAGMA table_info(events)').all() as Array<{ name: string }>).some((column) => column.name === 'reason')) db.exec('ALTER TABLE events ADD COLUMN reason TEXT');
     db.exec('CREATE TABLE IF NOT EXISTS release_schedules (version TEXT PRIMARY KEY, cut_at TEXT NOT NULL, land_by TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)');
+    const assignmentColumns = db.query('PRAGMA table_info(assignments)').all() as Array<{ name: string }>;
+    for (const [name, sql] of [['priority', 'TEXT'], ['predecessors', 'TEXT'], ['deadline_version', 'TEXT']] as const) {
+      if (!assignmentColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE assignments ADD COLUMN ${name} ${sql}`);
+    }
+    const scheduleColumns = db.query('PRAGMA table_info(release_schedules)').all() as Array<{ name: string }>;
+    for (const name of ['freeze_from', 'freeze_until']) if (!scheduleColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE release_schedules ADD COLUMN ${name} TEXT`);
     return db;
   } catch (error) { db.close(); throw error; }
 }
 
-export interface ScheduleRow { version: string; cutAt: string; landBy: string | null; updatedAt: string; updatedBy: string }
-type StoredSchedule = { version: string; cut_at: string; land_by: string | null; updated_at: string; updated_by: string };
+export interface ScheduleRow { version: string; cutAt: string; landBy: string | null; freezeFrom?: string | null; freezeUntil?: string | null; updatedAt: string; updatedBy: string }
+type StoredSchedule = { version: string; cut_at: string; land_by: string | null; freeze_from: string | null; freeze_until: string | null; updated_at: string; updated_by: string };
 function scheduleRow(row: StoredSchedule): ScheduleRow {
-  return { version: row.version, cutAt: row.cut_at, landBy: row.land_by, updatedAt: row.updated_at, updatedBy: row.updated_by };
+  return { version: row.version, cutAt: row.cut_at, landBy: row.land_by, ...(row.freeze_from ? { freezeFrom: row.freeze_from } : {}), ...(row.freeze_until ? { freezeUntil: row.freeze_until } : {}), updatedAt: row.updated_at, updatedBy: row.updated_by };
 }
 
 export function readSchedule(version: string, root?: string): ScheduleRow | null {
@@ -84,7 +90,7 @@ export function readSchedules(root?: string): ScheduleRow[] {
   finally { db.close(); }
 }
 
-export function writeSchedule(version: string, patch: { cutAt?: string; landBy?: string }, by: string, root?: string): ScheduleRow {
+export function writeSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string }, by: string, root?: string): ScheduleRow {
   validateVersion(version);
   const db = open(root);
   try {
@@ -93,13 +99,17 @@ export function writeSchedule(version: string, patch: { cutAt?: string; landBy?:
       const cutAt = patch.cutAt ?? previous?.cut_at;
       if (!cutAt) throw new CliUserError('새 판에는 --cut-at 이 필요하다');
       const landBy = patch.landBy ?? previous?.land_by ?? null;
-      if (previous && previous.cut_at === cutAt && previous.land_by === landBy) return scheduleRow(previous);
+      const freezeFrom = patch.freezeFrom ?? previous?.freeze_from ?? null;
+      const freezeUntil = patch.freezeUntil ?? previous?.freeze_until ?? null;
+      if (Boolean(freezeFrom) !== Boolean(freezeUntil) || (freezeFrom && freezeUntil && Date.parse(freezeFrom) >= Date.parse(freezeUntil))) throw new CliUserError('동결 시작·끝은 함께 주고 시작이 끝보다 앞서야 한다');
+      if (previous && previous.cut_at === cutAt && previous.land_by === landBy && previous.freeze_from === freezeFrom && previous.freeze_until === freezeUntil) return scheduleRow(previous);
       const at = new Date().toISOString();
-      db.query(`INSERT INTO release_schedules (version, cut_at, land_by, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(version) DO UPDATE SET cut_at=excluded.cut_at, land_by=excluded.land_by, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
-        .run(version, cutAt, landBy, at, by);
+      db.query(`INSERT INTO release_schedules (version, cut_at, land_by, freeze_from, freeze_until, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(version) DO UPDATE SET cut_at=excluded.cut_at, land_by=excluded.land_by, freeze_from=excluded.freeze_from, freeze_until=excluded.freeze_until, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
+        .run(version, cutAt, landBy, freezeFrom, freezeUntil, at, by);
       for (const [field, from, to] of [
         ['cut_at', previous?.cut_at ?? null, cutAt], ['land_by', previous?.land_by ?? null, landBy],
+        ['freeze_from', previous?.freeze_from ?? null, freezeFrom], ['freeze_until', previous?.freeze_until ?? null, freezeUntil],
       ] as const) {
         if (from !== to) record(db, version, { at, by, id: '@version', field, from, to, released: releasedVersion(root), dev: devVersion() });
       }
@@ -134,12 +144,14 @@ function evidenceRefs(db: Database, version: string, id: string): string[] {
   return (db.query('SELECT ref FROM evidence WHERE feature_id = ? AND version = ? ORDER BY rowid').all(id, version) as Array<{ ref: string }>).map((row) => row.ref);
 }
 function items(db: Database, version: string): ChecklistItem[] {
-  const rows = db.query(`SELECT f.id, COALESCE(a.title_override, f.title) AS title, a.owner, a.kind, a.status, a.disposition, a.evidence, a.updated_at, a.updated_by
+  const rows = db.query(`SELECT f.id, COALESCE(a.title_override, f.title) AS title, a.owner, a.kind, a.priority, a.predecessors, a.deadline_version, a.status, a.disposition, a.evidence, a.updated_at, a.updated_by
     FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.version = ? ORDER BY a.rowid`).all(version) as Array<Record<string, string | null>>;
   return rows.map((r) => {
     const evidence = [r.evidence, ...evidenceRefs(db, version, r.id!)].filter((value) => value !== null).join('\n');
     return { id: r.id!, title: r.title!, status: r.status as ChecklistItem['status'],
       ...(r.owner !== null ? { owner: r.owner! } : {}), ...(r.kind !== null ? { kind: r.kind as ChecklistItem['kind'] } : {}),
+      ...(r.priority !== null ? { priority: r.priority as ChecklistItem['priority'] } : {}), ...(r.predecessors !== null ? { predecessors: JSON.parse(r.predecessors!) as string[] } : {}),
+      ...(r.deadline_version !== null ? { deadlineVersion: r.deadline_version! } : {}),
       ...(r.evidence !== null || evidence ? { evidence } : {}), ...(r.disposition !== null ? { disposition: r.disposition as ChecklistItem['disposition'] } : {}),
       updatedAt: r.updated_at!, updatedBy: r.updated_by! };
   });
@@ -153,9 +165,9 @@ function putItem(db: Database, version: string, item: ChecklistItem): void {
   if (!feature) db.query('INSERT INTO features (id, title, owner, kind, created_at) VALUES (?, ?, ?, ?, ?)').run(item.id, item.title, item.owner ?? null, item.kind ?? null, item.updatedAt);
   // features.owner/kind follow the latest assignment so details() and the checklist never disagree after a set.
   else if (item.owner !== undefined || item.kind !== undefined) db.query('UPDATE features SET owner = COALESCE(?, owner), kind = COALESCE(?, kind) WHERE id = ?').run(item.owner ?? null, item.kind ?? null, item.id);
-  db.query(`INSERT INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(feature_id, version) DO UPDATE SET status=excluded.status, disposition=excluded.disposition, evidence=excluded.evidence, owner=excluded.owner, kind=excluded.kind, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
-    .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, feature && feature.title !== item.title ? item.title : null, item.owner ?? null, item.kind ?? null, item.updatedAt, item.updatedBy);
+  db.query(`INSERT INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(feature_id, version) DO UPDATE SET status=excluded.status, disposition=excluded.disposition, evidence=excluded.evidence, owner=excluded.owner, kind=excluded.kind, priority=excluded.priority, predecessors=excluded.predecessors, deadline_version=excluded.deadline_version, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
+    .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, feature && feature.title !== item.title ? item.title : null, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.updatedAt, item.updatedBy);
 }
 function jsonHash(contents: string | Buffer): string { return createHash('sha256').update(contents).digest('hex'); }
 
@@ -196,8 +208,8 @@ function importOnDb(db: Database, version: string): boolean {
       // Keep a legacy per-version title until an explicit retitle unifies the feature identity.
       if (!existing) putItem(db, version, item);
       else {
-        db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.updatedAt, item.updatedBy);
+        db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.updatedAt, item.updatedBy);
       }
     }
     for (const entry of data.history) record(db, version, entry);
@@ -224,12 +236,12 @@ function importOnDb(db: Database, version: string): boolean {
       record(db, version, { at: new Date().toISOString(), by: item.updatedBy, id: item.id, field: 'reimport', from: null, to: item, released: data.released, dev: data.dev });
       continue;
     }
-    const fields = ['title', 'status', 'evidence', 'owner', 'disposition', 'kind'] as const;
+    const fields = ['title', 'status', 'evidence', 'owner', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion'] as const;
     const baseEvidence = (db.query('SELECT evidence FROM assignments WHERE feature_id = ? AND version = ?').get(item.id, version) as { evidence: string | null }).evidence ?? undefined;
     const preserveRefs = item.evidence === baseEvidence || item.evidence === current.evidence;
     const differs = fields.some((field) => field === 'evidence'
       ? (!preserveRefs && current.evidence !== item.evidence)
-      : current[field] !== item[field]);
+      : JSON.stringify(current[field]) !== JSON.stringify(item[field]));
     if (!differs) continue;
     if (!(Date.parse(item.updatedAt) > Date.parse(current.updatedAt))) {
       ledgerWonIds.push(item.id);

@@ -1,0 +1,39 @@
+graph_id: rhythm-weekly
+loop:
+  title: 주간 미팅 자료
+  description: 지난주 성과·이번 주 판·현안·이행 대조·결정·외부 동향을 한 장으로 읽는다
+  trigger:
+    cron: '0 9 * * 1'
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: collect
+    kind: agent
+    recipe: cmd:weekly-collect
+    max_visits: 1
+  - node_id: compose
+    kind: agent
+    recipe: cmd:weekly-compose
+    max_visits: 1
+  - node_id: deliver
+    kind: agent
+    recipe: cmd:weekly-deliver
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  # A failed collect must not let compose deliver an older file of the same week (review round 3).
+  - from: collect
+    on: outcome
+    map: { ok: compose, fail: failed }
+  - from: compose
+    on: outcome
+    map: { ok: deliver, fail: failed }
+  - from: deliver
+    on: outcome
+    map: { ok: done, fail: failed }

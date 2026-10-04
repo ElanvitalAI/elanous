@@ -1,12 +1,35 @@
-import { execFileSync } from 'node:child_process';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 
-/** Check if a binary exists on PATH */
-export function which(name: string): string {
-  try {
-    return execFileSync('which', [name], { encoding: 'utf-8' }).trim();
-  } catch {
-    throw new Error(`필수 바이너리가 없습니다: ${name}`);
+export type AddonName = 'ffmpeg' | 'yt-dlp' | 'whisper';
+
+const ADDON_HINTS: Record<AddonName, string> = {
+  ffmpeg: 'brew install ffmpeg',
+  'yt-dlp': 'brew install yt-dlp',
+  whisper: 'pip install openai-whisper',
+};
+
+/** Locate an optional engine on PATH without throwing when it is absent. */
+export function findAddon(name: AddonName):
+  | { found: true; name: AddonName; path: string }
+  | { found: false; name: AddonName; hint: string } {
+  for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    const path = join(dir, name);
+    try {
+      accessSync(path, constants.X_OK);
+      if (statSync(path).isFile()) return { found: true, name, path };
+    } catch { /* not executable here; try the next PATH entry */ }
   }
+  return { found: false, name, hint: ADDON_HINTS[name] };
+}
+
+/** Require an engine only when its audio stage runs. */
+export function which(name: AddonName): string {
+  const addon = findAddon(name);
+  if (addon.found) return addon.path;
+  const message = `없음: ${addon.name} — 선택 애드온 · ${addon.hint}`;
+  console.error(message);
+  throw Object.assign(new Error(message), { code: 'ADDON_MISSING' });
 }
 
 /** Sanitize a title for use as a filename (max 60 chars) */

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env bun
 import { parseArgs } from 'node:util';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -416,7 +416,7 @@ function printHelp() {
 youtube-master — 통합 YouTube 처리 스킬
 
 사용법:
-  npx tsx scripts/main.ts <URL> [OPTIONS]
+  bun scripts/main.ts <URL> [OPTIONS]
 
 옵션:
   --message, -m <text>     사용자 의도 (자동 라우팅)

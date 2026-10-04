@@ -7,9 +7,10 @@
 // re-appended to argv in `bg-launch.ts`, not via env inheritance.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   extractConfigDirFlag,
   applyConfigDirFlagFromArgv,
@@ -208,6 +209,64 @@ describe('getElanousConfigDir · resolution order (env-var-free)', () => {
   it('trims the override', () => {
     setElanousConfigDir('  /tmp/trimmed  ');
     expect(getElanousConfigDir()).toBe('/tmp/trimmed');
+  });
+});
+
+describe('ignored ELANOUS_CONFIG_DIR · process-wide observation', () => {
+  it('warns once for a divergent env, stays silent for equal or absent env, and never writes stdout', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'config-dir-warning-'));
+    try {
+      const cases = [
+        { name: 'divergent', env: '/tmp/x', flag: undefined, state: '/tmp/actual-state', calls: 1, source: 'state-dir' },
+        { name: 'repeated', env: '/tmp/x', flag: undefined, state: '/tmp/actual-state', calls: 2, source: 'state-dir' },
+        { name: 'different-flag', env: '/tmp/x', flag: '/tmp/same', state: '/tmp/actual-state', calls: 1, source: 'flag' },
+        { name: 'equal-flag', env: '/tmp/flag/../same', flag: '/tmp/same', state: '/tmp/actual-state', calls: 1, source: 'flag' },
+        { name: 'absent', env: undefined, flag: undefined, state: '/tmp/actual-state', calls: 1, source: 'state-dir' },
+        { name: 'late-env', env: undefined, flag: undefined, state: '/tmp/actual-state', calls: 2, afterFirstEnv: '/tmp/x', source: 'state-dir' },
+        { name: 'tilde-equal', env: '~/.elanous', flag: join(homedir(), '.elanous'), state: undefined, calls: 1, source: 'flag' },
+        { name: 'default', env: '/tmp/x', flag: undefined, state: undefined, calls: 1, source: 'default' },
+      ] as const;
+      for (const scenario of cases) {
+        const resultFile = join(scratch, `${scenario.name}.json`);
+        const script = `
+          const { getElanousConfigDir } = await import('./src/elanous-config-dir.ts');
+          const { applyConfigDirFlagFromArgv } = await import('./src/cli/config-dir-flag.ts');
+          if (${JSON.stringify(scenario.flag)} !== undefined) {
+            process.argv = ['bun', 'elanous', '--config-dir', ${JSON.stringify(scenario.flag)}];
+            applyConfigDirFlagFromArgv();
+          }
+          const roots = [getElanousConfigDir()];
+          if (${JSON.stringify('afterFirstEnv' in scenario ? scenario.afterFirstEnv : undefined)} !== undefined) {
+            process.env.ELANOUS_CONFIG_DIR = ${JSON.stringify('afterFirstEnv' in scenario ? scenario.afterFirstEnv : undefined)};
+          }
+          for (let i = 1; i < ${scenario.calls}; i++) roots.push(getElanousConfigDir());
+          const { debug } = await import('./src/debug/log.ts');
+          const events = debug.events(50).filter(e => e.category === 'config.dir' && e.event === 'env-ignored');
+          await Bun.write(${JSON.stringify(resultFile)}, JSON.stringify({ roots, events }));
+        `;
+        const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: 'test' };
+        delete env.ELANOUS_CONFIG_DIR;
+        delete env.ELANOUS_STATE_DIR;
+        if (scenario.env !== undefined) env.ELANOUS_CONFIG_DIR = scenario.env;
+        if (scenario.state !== undefined) env.ELANOUS_STATE_DIR = scenario.state;
+        const child = spawnSync(process.execPath, ['-e', script], { cwd: process.cwd(), env, encoding: 'utf8' });
+        expect(child.status).toBe(0);
+        expect(child.stdout).toBe('');
+        const { roots, events } = JSON.parse(readFileSync(resultFile, 'utf8')) as {
+          roots: string[]; events: Array<{ data: { env: string; resolved: string; source: string } }>;
+        };
+        const actual = scenario.flag ?? scenario.state ?? treeRoot;
+        expect(roots).toEqual(Array(scenario.calls).fill(actual));
+        const divergent = scenario.name === 'divergent' || scenario.name === 'repeated' || scenario.name === 'different-flag' || scenario.name === 'default';
+        expect(child.stderr).toBe(divergent
+          ? `ELANOUS_CONFIG_DIR 는 읽지 않습니다 — 설정 폴더 = ${actual} · 그 폴더를 쓰려면 --config-dir ${resolve(scenario.env!)}\n`
+          : '');
+        expect(events.length).toBe(divergent ? 1 : 0);
+        if (divergent) expect(events[0]?.data).toMatchObject({ env: scenario.env, resolved: actual, source: scenario.source });
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
 

@@ -22,6 +22,9 @@
 
 import { debug } from '../debug/log.js';
 import { botAudienceFor, gateDiscordSchemas } from '../maturity/bot-command-maturity.js';
+import { buildBotSlashCatalog } from '../maturity/bot-slash-catalog.js';
+import { FEATURE_MATURITY } from '../maturity/feature-maturity.js';
+import { SLASH_COMMANDS } from '../chat/index.js';
 import type { DiscordBot } from '../discord.js';
 import {
   loadLayeredPersonaDirs,
@@ -195,6 +198,19 @@ export async function wireSprint21Runtime(opts: WireSprint21Opts): Promise<Sprin
   router.bind(statusCommand);
   router.bind(pollCommand);
   for (const command of botCommands) router.bind(command);
+  const catalog = buildBotSlashCatalog({
+    surface: 'discord', coreCommands: SLASH_COMMANDS, maturity: FEATURE_MATURITY,
+    handledCommands: router.schemas(),
+  });
+  for (const entry of catalog.commands) {
+    if (entry.supported) continue;
+    const { name, description } = entry;
+    router.bind({ schema: { name, description }, handler: async () => ({
+      type: RESPONSE_CHANNEL_MESSAGE_WITH_SOURCE,
+      content: catalog.unsupportedReply(entry.name)!,
+      ephemeral: true,
+    }) });
+  }
 
   // 5. Wire bot callbacks — INTERACTION_CREATE + reactions
   // (Bot must be created with onInteraction/onReaction in opts;

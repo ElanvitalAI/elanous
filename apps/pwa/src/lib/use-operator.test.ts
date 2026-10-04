@@ -107,7 +107,8 @@ test('SidebarNav gates operations separately from role/Labs and remembers group 
   await act(async () => { renderer!.unmount(); renderer = create(createElement(() => SidebarNav({ compact: true }))); });
   expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/chat');
   expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/exec');
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/ops/release');
+  // LOOP-VIEW1 put /loops first in the ops group, so the collapsed compact rail shows it instead of /ops/release.
+  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/loops');
   expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
   operator = false;
   await act(async () => { for (const listener of listeners.get('storage') ?? []) listener({ key: null } as StorageEvent); });

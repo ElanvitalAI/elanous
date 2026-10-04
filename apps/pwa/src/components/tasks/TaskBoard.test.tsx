@@ -117,6 +117,31 @@ describe('TaskBoardView detail wiring', () => {
     }
   });
 
+  test('opens a wish card with the placement and progress from the detail API', async () => {
+    const wire: TaskCardWire = { id: 'wish-1', goalId: 'wish:one', title: '소원', status: 'open',
+      createdAt: '2023-11-14T22:13:20.000Z', sections: [] };
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async (input: RequestInfo | URL) =>
+      Response.json(String(input).endsWith('/wish-1')
+        ? { card: wire, placements: [{ cellId: 'C1', cellTitle: '첫 칸', version: '0.2.14', status: 'yellow' }] }
+        : { cards: [wire] }), { preconnect: fetch.preconnect }));
+    const config = { baseUrl: 'http://board.test', token: '', provider: '' };
+    const client = new DaemonClient(config);
+    let renderer: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => {
+        renderer = create(<DaemonContext.Provider value={{ config, client, sessionId: '', setConfig: () => {}, setSessionId: () => {} }}>
+          <TaskBoard />
+        </DaemonContext.Provider>);
+      });
+      await act(async () => { renderer!.root.findByType('button').props.onClick(); });
+      const line = renderer!.root.findByProps({ 'aria-label': 'Wish placement and progress' });
+      expect(line.props.children).toContain('C1 첫 칸 · 0.2.14판 · 진행 중');
+    } finally {
+      await act(async () => { renderer?.unmount(); });
+      fetchMock.mockRestore();
+    }
+  });
+
   test('keeps list content out of detail while fetching and after the detail API fails', async () => {
     const wire: TaskCardWire = {
       id: 'card-1', goalId: 'goal-1', title: 'List-only title', status: 'open', createdAt: '2023-11-14T22:13:20.000Z',

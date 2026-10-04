@@ -3,6 +3,7 @@ import { createElement } from 'react';
 import { act, create } from 'react-test-renderer';
 import { DaemonContext } from '../components/providers/DaemonProvider';
 import { ChatLayout } from '../components/chat/ChatLayout';
+import { assertTuiSeatAskRestartContract } from '../../../../test/seat-ask-tui-restart-contract';
 import { ChatInput } from '../components/chat/ChatInput';
 import { ChatHistory } from '../components/chat/ChatHistory';
 import type { ChatMessage } from './chat-runtime';
@@ -31,6 +32,7 @@ function captureMetaLog(): { seen: unknown[]; restore: () => void } {
 }
 
 describe('PWA slash-command boundary', () => {
+  it('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
   it('answers TUI commands and aliases locally, without calling an LLM', async () => {
     const cap = captureMetaLog();
     try {

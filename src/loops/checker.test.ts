@@ -1,13 +1,15 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { Command } from 'commander';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync, mkdirSync } from 'node:fs';
+import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
+import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { checkLoops, dueBefore, entriesFromRegistry, notifyOwners, observeLoopCheck, previousLoopFire } from './checker.js';
 import { registerLoopCommands } from './loop-cli.js';
-import { listLoops, type LoopEntry } from './registry.js';
+import { listAllLoops, listLoops, type LoopEntry } from './registry.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -48,6 +50,71 @@ test('six ordered classifications and journal idempotency, preserving existing b
   ]);
   expect(notifyOwners(results, { root: dir, now })).toBe(0);
   expect(readFileSync(path, 'utf8')).toBe(first);
+});
+
+test('late cron-shell log mtime queues exactly one request to its owner per day', () => {
+  const dir = realpathSync(root());
+  const log = join(dir, 'shell.log');
+  writeFileSync(log, 'log contents are not needed');
+  utimesSync(log, new Date('2026-10-04T11:35:00Z'), new Date('2026-10-04T11:35:00Z'));
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ loops: { owners: { owner: 'TC' } } }));
+  const db = openSchedulesDb(join(dir, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: `*/5 * * * * zsh scripts/owner.sh >> ${log} 2>&1 # cron owner\n` });
+    const all = listAllLoops({ root: dir, stateRoot: dir, now, schedules: listSchedules(db), config: buildUserConfig(configPath) });
+    const { entries: adapted, scope } = entriesFromRegistry({ listAllLoops: () => all });
+    expect(scope).toBe('registry');
+    const results = checkLoops(adapted, now);
+    expect(results).toMatchObject([{ state: 'late', owner: 'TC', ownerSource: 'config', evidence: 'log-mtime' }]);
+    expect(notifyOwners(results, { root: dir, now })).toBe(1);
+    expect(notifyOwners(results, { root: dir, now })).toBe(0);
+    const lines = readFileSync(join(dir, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ seat: 'TC', source: 'loop-checker', status: 'queued', key: `loopcheck:${all[0]!.id}:2026-10-04:late` });
+  } finally { db.close(); }
+});
+
+test('CLI --all --notify preserves log-mtime evidence while an unreadable shell log stays unknown', async () => {
+  const dir = realpathSync(root());
+  const lateLog = join(dir, 'late.log');
+  const unreadableLog = join(dir, 'unreadable.log');
+  writeFileSync(lateLog, 'not inspected');
+  utimesSync(lateLog, new Date('2026-10-04T11:35:00Z'), new Date('2026-10-04T11:35:00Z'));
+  symlinkSync(unreadableLog, unreadableLog); // stat fails with ELOOP rather than ENOENT.
+  const db = openSchedulesDb(join(dir, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      `*/5 * * * * zsh scripts/unreadable.sh >> ${unreadableLog} 2>&1`,
+      `*/5 * * * * zsh scripts/late.sh >> ${lateLog} 2>&1`,
+    ].join('\n') + '\n' });
+    const schedules = listSchedules(db);
+    const program = new Command();
+    registerLoopCommands(program, { root: dir, now, listAllLoops: () => listAllLoops({
+      root: dir, stateRoot: dir, now, schedules, config: buildUserConfig(join(dir, 'absent-config.json')),
+    }) });
+    const captured: string[] = [];
+    const original = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      captured.push(String(chunk)); callback?.(); return true;
+    }) as typeof process.stdout.write;
+    try {
+      await program.parseAsync(['loop', 'status', '--all', '--notify', '--json'], { from: 'user' });
+      await program.parseAsync(['loop', 'status', '--all', '--notify', '--json'], { from: 'user' });
+    } finally { process.stdout.write = original; }
+    for (const payload of captured) {
+      const output = JSON.parse(payload);
+      expect(output.scope).toBe('registry');
+      expect(output.results.find((result: { id: string }) => result.id === schedules.find(row => row.command?.includes('unreadable.sh'))!.id))
+        .toMatchObject({ state: 'unknown', owner: 'OP', ownerSource: 'default', reason: 'no valid run recorded' });
+      const late = output.results.find((result: { id: string }) => result.id === schedules.find(row => row.command?.includes('late.sh'))!.id);
+      expect(late).toMatchObject({ state: 'late', owner: 'OP', ownerSource: 'default', evidence: 'log-mtime', lastRunAt: '2026-10-04T11:35:00.000Z' });
+    }
+    expect(captured).toHaveLength(2);
+    const journal = readFileSync(join(dir, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n');
+    expect(journal).toHaveLength(1);
+    expect(JSON.parse(journal[0]!)).toMatchObject({ seat: 'OP', source: 'loop-checker', status: 'queued' });
+  } finally { db.close(); }
 });
 
 test('a recorded run with an unknown or unusable expected interval is not called alive', () => {

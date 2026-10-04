@@ -21,6 +21,8 @@
 
 ## Decision Tree (순서대로 판단)
 
+아래는 **표현 형식 선택**이다. 기본 출력은 `MermaidRender`의 터미널 flowchart 그림 (Python 불필요)이며, 다른 형식/엔진이 필요할 때는 먼저 Python 애드온 설치 여부를 확인한다. 없으면 `이 엔진은 애드온 설치가 필요합니다 (cd skills/diagram-master/references && uv sync --extra python-engines && uv run --extra python-engines playwright install chromium)`라고 안내하고 흐름/구조로 표현 가능한 경우 Mermaid 그림으로 대체한다. 정밀 곡선·3D·AI 이미지 등은 동등한 대체가 불가능하므로 결과물을 가장하지 않는다. 명시 엔진을 대체했다면 사용자에게 알린다. `MermaidRender`는 LR/RL/TB/BT flowchart 노드·화살표 범위만 지원하며, 그 외 Mermaid 타입은 코드 블록 또는 애드온의 PNG 렌더 경로다.
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │ Step 0: 모드 판단                                    │
@@ -75,7 +77,7 @@
 | 관계 모델 | ER 다이어그램, 클래스 다이어그램 |
 | 시간 기반 | 타임라인, 간트 차트, 마일스톤 |
 | 분류/범주 | 마인드맵, 파이 차트 |
-| 수식 포함 구조도 | `@svg-katex` + `render_mermaid_katex.py` |
+| 수식 포함 구조도 | Mermaid 코드 블록 (`@svg-katex` 전용 PNG 렌더러는 이 팩에 없음); 단순 라벨 흐름도만 `MermaidRender` |
 
 ### Matplotlib (수학/과학 정밀)
 
@@ -148,7 +150,7 @@
 ## 경계 사례 판단
 
 ### Mermaid vs Matplotlib
-- 구조 + 수식 라벨 → Mermaid (`@svg-katex`)
+- 구조 + 수식 라벨 → Mermaid 코드 블록 (`@svg-katex` 전용 렌더러 없음). 단순 라벨 흐름도면 `MermaidRender` 그림 가능
 - 연속 곡선 + 정밀 축 → **Matplotlib**
 - XY 데이터 단순 차트 → Mermaid `xychart-beta`도 가능하지만, 축 커스터마이징이 필요하면 Matplotlib
 

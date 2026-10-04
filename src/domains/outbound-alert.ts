@@ -448,7 +448,7 @@ function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-fo
   try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root }); } catch { /* fail-soft */ }
   const hint = universe === 'prod'
     ? '운영 데몬이 떠 있는지 확인: elanous nexus show'
-    : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous ELANOUS_CONFIG_DIR=~/.elanous 를 준다';
+    : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous 와 --config-dir ~/.elanous 를 준다';
   try { console.error(`[outbound] ⛔ 못 보냄(${kind}) — 데몬 ${daemonPath} · 직접 발송도 실패(토큰 없음 또는 전송 실패) · 이 프로세스의 우주 ${universe} (${root}) · ${hint}`); } catch { /* fail-soft */ }
 }
 

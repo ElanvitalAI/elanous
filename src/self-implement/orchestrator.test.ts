@@ -17,6 +17,7 @@ import { GoalRunStore } from './goal-run-store.js';
 import { appendRunLedgerEntry, runLedgerPath } from './run-ledger.js';
 import { compactForLog, debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
+import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { instanceNameForStateDir } from '../instance-identity.js';
 import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-user-question/tool.js';
 import { setUserConfigOverlay } from '../user-config.js';
@@ -33,8 +34,20 @@ import { PIPELINE_EDGES_BY_NODE, PIPELINE_GRAPH_ID, TERMINAL_STAGES_BY_NODE, pip
 
 const isolatedStateDir = mkdtempSync(join(tmpdir(), 'elanous-orchestrator-goal-run-store-'));
 const priorStateDir = process.env.ELANOUS_STATE_DIR;
+const invokingRepo = process.cwd();
+const invokingGitEnv = { ...process.env };
+delete invokingGitEnv.GIT_DIR;
+delete invokingGitEnv.GIT_WORK_TREE;
+delete invokingGitEnv.GIT_INDEX_FILE;
+const invokingRevision = () => {
+  const result = spawnSync('git', ['log', '-1', '--format=%H %s'], { cwd: invokingRepo, env: invokingGitEnv, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(`cannot read invoking repository HEAD: ${result.stderr}`);
+  return result.stdout.trim();
+};
+let initialInvokingRevision: string;
 
 beforeAll(() => {
+  initialInvokingRevision = invokingRevision();
   process.env.ELANOUS_STATE_DIR = isolatedStateDir;
 });
 
@@ -42,6 +55,7 @@ afterAll(() => {
   if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = priorStateDir;
   rmSync(isolatedStateDir, { recursive: true, force: true });
+  expect(invokingRevision()).toBe(initialInvokingRevision);
 });
 
 import { seams as baseSeams } from './test-seams.js';
@@ -3292,6 +3306,16 @@ describe('runSelfImplement — Fix A rework', () => {
     expect(body).toContain('[tsc-gate] PASS');
   });
 
+  test('시험을 전혀 못 찾은 Gate 절은 코드블록 밖에 동작 검증 0과 사람 확인을 크게 표시한다', async () => {
+    let body = '';
+    const s = seams({});
+    const warning = '⚠️ 동작 검증 0: src/cli/private-ledger-commands.ts — 사람 확인 필요';
+    s.gate = async () => ({ passed: true, log: `gate passed\n${warning}`, scopeReason: 'no-related-tests' });
+    s.openPr = async (opts) => { body = opts.body; return { url: 'https://x/3', number: 3 }; };
+    await runSelfImplement({ feature: 'unpaired source', seams: s });
+    expect(body).toContain(`## Gate\n${warning}\n\`\`\``);
+  });
+
   test('PR 본문은 골 파일 경로만 조건부로 싣고 blocked 관측 앵커를 보존한다', async () => {
     const goalFile = reviewGoalFile();
     // ⛔⭐ **`runId` 를 못 박는다** — 이 테스트는 «두 런»의 본문을 문자 단위로 비교한다. 본문에
@@ -3475,10 +3499,12 @@ describe('runSelfImplement — Fix A rework', () => {
     (debug as { log: typeof debug.log }).log = ((category, event, data) => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
+    const repo = mkdtempSync(join(tmpdir(), 'orchestrator-evidence-shell-'));
     const observedSeams = () => seams({
-      createWorktree: async ({ branch, base }) => ({ path: process.cwd(), branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+      createWorktree: async ({ branch, base }) => ({ path: repo, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
     });
     try {
+      expect(spawnSync('git', ['init', '-q'], { cwd: repo, env: invokingGitEnv }).status).toBe(0);
       await runSelfImplement({
         feature: '골\n## REQUIRED EVIDENCE\n- [shell] 하니스 셸 체크 || echo ok',
         seams: observedSeams(),
@@ -3489,6 +3515,7 @@ describe('runSelfImplement — Fix A rework', () => {
       });
     } finally {
       (debug as { log: typeof debug.log }).log = original;
+      rmSync(repo, { recursive: true, force: true });
     }
     const checks = events.filter((entry) => entry.category === 'self-implement' && entry.event === 'required-evidence-check-run');
     expect(checks[0]?.data).toMatchObject({
@@ -6864,6 +6891,26 @@ describe('runSelfImplement — lineage supersede after auto-merge', () => {
   });
 });
 
+describe('merge-time draft supersede dispatch', () => {
+  test('runs after a confirmed merge and preserves the merge result on lookup failure', async () => {
+    const seen: Array<{ number: number; cwd: string }> = [];
+    const s = seams({
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review', reviewed: true, diffTruncated: false }),
+      mergePr: async () => ({ merged: true }),
+      supersedeDraftsOnMerge: async (number, cwd) => { seen.push({ number, cwd }); throw new Error('GitHub unavailable'); },
+    });
+    const result = await runSelfImplement({ feature: '「하니스로 구현」 DRAFT-TRIAGE', autoMerge: true, seams: s });
+    expect(result.stage).toBe('merged');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ number: result.prNumber, cwd: result.worktreePath });
+    seen.length = 0;
+    s.mergePr = async () => ({ merged: false });
+    const failed = await runSelfImplement({ feature: '「하니스로 구현」 DRAFT-TRIAGE', autoMerge: true, seams: s });
+    expect(failed.stage).toBe('pr-opened');
+    expect(seen).toEqual([]);
+  });
+});
+
 describe('runSelfImplement — review-gated merge', () => {
   test('리뷰 clean + --auto-merge → merged(자동 병합)', async () => {
     openPrCalls = [];
@@ -7644,6 +7691,57 @@ describe('runSelfImplement — docs Markdown 대량 삭제 auto-merge guard', ()
     const result = await runSelfImplement({ feature: 'merge attempt failed', autoMerge: true, seams: s });
     expect(result).toMatchObject({ stage: 'pr-opened', merged: false, mergeReason: 'merge-attempt-failed' });
   });
+
+  test('freeze leaves an auto-merge PR ready without running the merge seam', async () => {
+    enableLandingFreeze({ reason: 'drill', until: '2099-01-01T00:00:00Z', by: 'MK' }, isolatedStateDir);
+    try {
+      let merges = 0;
+      const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+      s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+      s.mergePr = async () => { merges++; return { merged: true }; };
+      const result = await runSelfImplement({ feature: 'freeze auto merge', autoMerge: true, seams: s });
+      expect(result).toMatchObject({ ok: true, stage: 'pr-opened', mergeReason: 'frozen' });
+      expect(result.detail).toContain('동결 중 · drill · 끝 시각 2099-01-01T00:00:00.000Z');
+      expect(merges).toBe(0);
+    } finally { disableLandingFreeze(isolatedStateDir); }
+  });
+
+  test('a merge seam that throws synchronously after admission releases the in-flight marker', async () => {
+    const { inFlightLandingMerges } = await import('../release-loop/landing-freeze.js');
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+    let markersInsideSeam = -1;
+    // Throws before returning a promise: nothing was sent, and the marker taken at admission must not stay behind.
+    s.mergePr = (() => { markersInsideSeam = inFlightLandingMerges(isolatedStateDir); throw new Error('merge seam unavailable'); }) as unknown as typeof s.mergePr;
+    let thrown: unknown;
+    await runSelfImplement({ feature: 'freeze pre-merge failure', autoMerge: true, seams: s }).catch((error) => { thrown = error; });
+    expect(markersInsideSeam).toBe(1);
+    expect(String(thrown)).toContain('merge seam unavailable');
+    expect(inFlightLandingMerges(isolatedStateDir)).toBe(0);
+  });
+
+  test('freeze turned on while a merge is in flight waits for it; the merge marker is released afterwards', async () => {
+    const { awaitLandingMergesDrained } = await import('../release-loop/landing-freeze.js');
+    let releaseMerge!: () => void;
+    let mergeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { mergeStarted = resolve; });
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+    s.mergePr = () => new Promise((resolve) => { mergeStarted(); releaseMerge = () => resolve({ merged: true }); });
+    const run = runSelfImplement({ feature: 'freeze in-flight merge', autoMerge: true, seams: s });
+    await started;
+    enableLandingFreeze({ reason: 'drill', by: 'OP' }, isolatedStateDir);
+    try {
+      let freezeOnReturned = false;
+      const freezeOn = awaitLandingMergesDrained(isolatedStateDir, { timeoutMs: 60_000, pollMs: 5 }).then((r) => { freezeOnReturned = true; return r; });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(freezeOnReturned).toBe(false);
+      releaseMerge();
+      expect(await run).toMatchObject({ ok: true, stage: 'merged' });
+      expect(await freezeOn).toEqual({ drained: true, pending: 0 });
+    } finally { disableLandingFreeze(isolatedStateDir); }
+  });
+
 
   test('mergeByHost: clean review and merge guards leave a ready PR with the checked head, never merge in Pod', async () => {
     let mergeCalls = 0;
@@ -14071,24 +14169,73 @@ describe('runSelfImplement — PR title path extraction', () => {
   });
 
   test('uses the optional prose title before extracting first-line paths and leaves branch naming on the original feature', async () => {
-    let openedTitle = '';
-    let createdBranch = '';
-    const s = seams({
-      createWorktree: async ({ branch }) => {
-        createdBranch = branch;
-        return { path: process.cwd(), branch };
-      },
-      openPr: async ({ title, head }) => {
-        openedTitle = title;
-        return { url: `https://pr/${head}`, number: 7 };
-      },
-    });
-    const feature = '대상 경로: src/self-implement/orchestrator.ts · src/self-implement/orchestrator.test.ts\n제목: 산문 제목이 경로 목록보다 우선한다';
-    await runSelfImplement({ feature, seams: s });
+    const repo = mkdtempSync(join(tmpdir(), 'orchestrator-prose-title-'));
+    // Git's repository overrides must not redirect fixture operations into the invoking repository.
+    const gitEnv = { ...process.env };
+    delete gitEnv.GIT_DIR;
+    delete gitEnv.GIT_WORK_TREE;
+    delete gitEnv.GIT_INDEX_FILE;
+    const git = (cwd: string, args: string[]) => {
+      const result = spawnSync('git', args, { cwd, env: gitEnv, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    const invocation = process.cwd();
+    const invokingHead = git(invocation, ['rev-parse', 'HEAD']);
+    const invokingLog = git(invocation, ['log', '-1', '--format=%H %s']);
+    const gitOverrides = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE, GIT_INDEX_FILE: process.env.GIT_INDEX_FILE };
+    try {
+      delete process.env.GIT_DIR;
+      delete process.env.GIT_WORK_TREE;
+      delete process.env.GIT_INDEX_FILE;
+      git(repo, ['init', '-q']);
+      git(repo, ['config', 'user.email', 'test@example.invalid']);
+      git(repo, ['config', 'user.name', 'orchestrator test']);
+      writeFileSync(join(repo, 'seed.txt'), 'seed\n');
+      git(repo, ['add', 'seed.txt']);
+      git(repo, ['commit', '-qm', 'seed']);
+      const initialFixtureHead = git(repo, ['rev-parse', 'HEAD']);
 
-    expect(openedTitle).toBe('산문 제목이 경로 목록보다 우선한다');
-    expect(createdBranch).toStartWith(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature(feature)}-r`);
-    expect(createdBranch).toMatch(/-r[a-z0-9]{6}$/);
+      let openedTitle = '';
+      let createdBranch = '';
+      const s = seams({
+        createWorktree: async ({ branch }) => {
+          createdBranch = branch;
+          return { path: repo, branch };
+        },
+        implement: async () => {
+          writeFileSync(join(repo, 'feature.txt'), 'implemented\n');
+          return { ok: true, summary: 'impl' };
+        },
+        commitWork: (cwd, message) => {
+          expect(cwd).toBe(repo);
+          git(cwd, ['add', 'feature.txt']);
+          git(cwd, ['commit', '-qm', message]);
+        },
+        mergeMain: async () => ({ status: 'up-to-date' }),
+        openPr: async ({ title, head }) => {
+          openedTitle = title;
+          return { url: `https://pr/${head}`, number: 7 };
+        },
+      });
+      const feature = '대상 경로: src/self-implement/orchestrator.ts · src/self-implement/orchestrator.test.ts\n제목: 산문 제목이 경로 목록보다 우선한다';
+      await runSelfImplement({ feature, seams: s });
+
+      expect(openedTitle).toBe('산문 제목이 경로 목록보다 우선한다');
+      expect(createdBranch).toStartWith(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature(feature)}-r`);
+      expect(createdBranch).toMatch(/-r[a-z0-9]{6}$/);
+      expect(git(repo, ['rev-parse', 'HEAD'])).not.toBe(initialFixtureHead);
+      expect(git(repo, ['log', '-1', '--format=%s'])).toBe('산문 제목이 경로 목록보다 우선한다');
+    } finally {
+      for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'] as const) {
+        const value = gitOverrides[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(repo, { recursive: true, force: true });
+      expect(git(invocation, ['rev-parse', 'HEAD'])).toBe(invokingHead);
+      expect(git(invocation, ['log', '-1', '--format=%H %s'])).toBe(invokingLog);
+    }
   });
 
   test.each(['', '   '])('falls back to the unchanged path title for a missing or whitespace-only prose title (%j)', async (titleValue) => {

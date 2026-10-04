@@ -95,7 +95,7 @@ describe('pre-mission resource ladder on PTY dispatch', () => {
 
   test('official suggestion installs before mission and appends only resource names; backend stays selected', async () => {
     const { result, events, calls, installs, prompt } = await launch({ backendExplicit: 'codex' });
-    expect(result.detail).toBe('완료(증거 충족)');
+    expect(result.detail).toBe('완료(증거)');
     expect(calls).toEqual([{ mission: 'List skills', options: { backend: 'codex', plugin: undefined, resources: 'on', deadlineMs: 20_000 } }]);
     expect(installs).toEqual(['elanous-basics@elanous']);
     expect(events.slice(0, 2)).toEqual(['plan', 'install']);
@@ -130,7 +130,7 @@ describe('pre-mission resource ladder on PTY dispatch', () => {
           readInstalledPlugins: () => [], discover: async () => [], decide: () => {},
         },
       });
-      expect(result.result.detail).toBe('완료(증거 충족)');
+      expect(result.result.detail).toBe('완료(증거)');
       expect(result.calls).toEqual([]);
       expect(result.installs).toEqual(['elanous-basics@elanous']);
       expect(result.events[0]).toBe('install');

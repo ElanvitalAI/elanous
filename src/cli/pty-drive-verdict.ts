@@ -8,6 +8,8 @@ export interface FinalPtyEvidence {
   readonly screen: string;
   readonly inputHistory: readonly string[];
   readonly exitCode: number | null;
+  /** A separately verified mission artifact; tool-history failures are not final-answer failures. */
+  readonly artifactEvidence?: boolean;
 }
 
 // eslint-disable-next-line no-control-regex
@@ -16,7 +18,7 @@ const FAILURE = /(?:\bcommand not found\b|\bnot recognized as (?:an internal or 
 const SUCCESS = /(?:\b[1-9]\d*\s+(?:pass|passed)\b|\btests?:\s*[1-9]\d*\s+passed\b|\bbuild successful\b|\b(?:successfully|succeeded)\b|\bGOAL-COMPLETE\b)/i;
 
 /** Failure wins over success; an exit code of zero is not itself proof of the goal. */
-export function verdictForFinalPtyScreen({ screen, inputHistory, exitCode }: FinalPtyEvidence): PtyDriveVerdict {
+export function verdictForFinalPtyScreen({ screen, inputHistory, exitCode, artifactEvidence = false }: FinalPtyEvidence): PtyDriveVerdict {
   if (exitCode !== null && exitCode !== 0) {
     return { kind: 'done-but-failed', reason: `child exit code ${exitCode}`, evidence: null };
   }
@@ -32,7 +34,14 @@ export function verdictForFinalPtyScreen({ screen, inputHistory, exitCode }: Fin
   }));
   const lines = screen.replace(ANSI, '').replace(/\r/g, '\n').split('\n')
     .map((line) => line.trim()).filter((line) => line && !inputs.has(line) && !echoedLiterals.has(line) && ![...inputs].some((input) => line.endsWith(`$ ${input}`) || line.endsWith(`> ${input}`)));
-  const failure = lines.find((line) => FAILURE.test(line));
+  const toolNoMatch = (line: string) =>
+    /\b(?:rg|grep|diff)\b.*\bexit(?:ed)?\s*(?:with\s*)?(?:code\s*)?1\b|\bexit(?:ed)?\s*(?:with\s*)?(?:code\s*)?1\b.*\b(?:rg|grep|diff)\b/i.test(line)
+    && !/(?:\b(?:error|fatal|exception)\s*:|\b(?:build failed|tests? failed|failed to|permission denied|command not found)\b)/i.test(line);
+  // Codex renders tool status as «• Failed (exit 1) …». It is not the agent's final answer.
+  // For artifact-backed missions, consider only answer text following the last tool block.
+  const lastTool = artifactEvidence ? lines.reduce((index, line, i) => /^•\s+(?:Ran|Failed|Running|Worked)\b/i.test(line) ? i : index, -1) : -1;
+  const answer = lastTool < 0 ? lines : lines.slice(lastTool + 1).filter((line) => !/^[└│]/.test(line));
+  const failure = (artifactEvidence ? answer : lines).find((line) => FAILURE.test(line) && !toolNoMatch(line));
   if (failure) return { kind: 'done-but-failed', reason: failure, evidence: null };
   const evidence = lines.find((line) => SUCCESS.test(line) && !/\b0\s+(?:pass|passed)\b/i.test(line));
   if (evidence) return { kind: 'success', reason: 'final PTY screen has success evidence', evidence };

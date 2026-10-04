@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { contextNow, type ContextNowDeps } from './context-now.js';
+import { renderVoiceNow } from './context-now-surfaces.js';
 import { recordExternalEvent } from './external-events.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
@@ -88,6 +89,47 @@ test('crowded ledgers retain decisions and the latest seat status within the fac
   expect(defaultAnswer.facts.filter(f => f.kind === 'seat').map(f => f.status)).toEqual(['launched', 'attempting']);
 });
 
+test('GET /v1/context/now?format=voice returns only rendered text while other formats keep the ledger JSON', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-now-voice-'));
+  const previous = { config: process.env.ELANOUS_CONFIG_DIR, state: process.env.ELANOUS_STATE_DIR };
+  process.env.ELANOUS_CONFIG_DIR = root;
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  try {
+    const now = new Date();
+    const seatPath = seatLedgerPath('TC', root, now);
+    mkdirSync(join(root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(seatPath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'doing',
+      item: { source: 'checklist', id: 'K6', title: 'Voice route work', text: 'PRIVATE CHAT' } }) + '\n');
+    const opts = { metaApi: { bearerToken: 'owner-token' } } as Parameters<typeof routeRequest>[1];
+    const run = (path: string, token = 'owner-token') => routeRequest(
+      new Request(`http://localhost/v1/context/now${path}`, { headers: { authorization: `Bearer ${token}` } }),
+      opts,
+      { requestIP: () => ({ address: '198.51.100.1' }) } as unknown as Parameters<typeof routeRequest>[2],
+      null,
+      createDevProxyRuntimeRef(),
+    );
+    const plain = await run('');
+    expect(plain?.status).toBe(200);
+    const answer = await plain?.json();
+    expect(Object.keys(answer).sort()).toEqual(['at', 'audience', 'events', 'facts', 'guide', 'hiddenCount', 'topic']);
+    expect(answer.facts).toContainEqual(expect.objectContaining({ kind: 'seat', title: 'Voice route work' }));
+    const voice = await run('?format=voice');
+    expect(voice?.status).toBe(200);
+    const voiceBody = await voice?.json();
+    expect(voiceBody).toEqual({ text: renderVoiceNow(answer), audience: 'operator', hiddenCount: 0 });
+    expect(voiceBody.text).toContain('Voice route work');
+    expect(voiceBody.text).not.toContain('PRIVATE CHAT');
+    expect(await (await run('?format=card'))?.json()).toEqual(answer);
+    expect(await (await run('?format=voice', 'wrong-token'))?.json()).toEqual({ error: 'unauthorized' });
+  } finally {
+    resetElanousConfigDir();
+    if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
+    if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('authenticated HTTP and chat runtime return the same JSON from isolated release, decision, seat and context ledgers', async () => {
   const root = mkdtempSync(join(tmpdir(), 'context-now-'));
   const previous = { config: process.env.ELANOUS_CONFIG_DIR, state: process.env.ELANOUS_STATE_DIR };
@@ -127,8 +169,9 @@ test('authenticated HTTP and chat runtime return the same JSON from isolated rel
     expect(response?.status).toBe(200);
     const http = await response?.json();
     const chat = await runtime.run({ topic: 'K6' }, { surface: 'skill' });
-    expect(http).toEqual(chat);
-    expect(await core.dispatch('context_now', { topic: 'K6' })).toEqual(http);
+    // CTX5B: the daemon answer always names its audience (operator → hiddenCount 0); chat/tool surfaces return the bare answer.
+    expect(http).toEqual({ ...chat, audience: 'operator', hiddenCount: 0 });
+    expect(await core.dispatch('context_now', { topic: 'K6' })).toEqual(chat);
     expect(http.facts.map((fact: { kind: string }) => fact.kind)).toEqual(['cell', 'seat']);
     expect(http.events).toHaveLength(1);
     expect(http.guide).toHaveLength(1);

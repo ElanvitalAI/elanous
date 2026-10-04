@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { INVENTORY_REFRESH_COMMAND, auditTestStateWrites, classifyCandidates, classifyStaticIsolation, renderAudit } from '../scripts/audit-test-state-writes';
+import { INVENTORY_REFRESH_COMMAND, auditTestStateWrites, classifyCandidates, classifyStaticIsolation, renderAudit, unclassifiedCandidates } from '../scripts/audit-test-state-writes';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -30,7 +30,7 @@ function createAuditRepository(): string {
   writeFileSync(join(root, 'test', 'candidate.test.ts'), [
     "import { writeFileSync } from 'node:fs';",
     "import { mkdtempSync } from 'node:fs';",
-    "import { tmpdir } from 'node:os';",
+    "import { homedir, tmpdir } from 'node:os';",
     "import { join } from 'node:path';",
     "const stateDir = mkdtempSync(join(tmpdir(), 'audit-candidate-'));",
     "writeFileSync(join(stateDir, '.elanous', 'candidate.txt'), 'candidate');",
@@ -131,21 +131,32 @@ function temporaryBaselineFiles(root: string): string[] {
   return readdirSync(join(root, 'test')).filter((name) => name.includes('.test-home-state-write-audit-baseline.txt.') && name.endsWith('.tmp'));
 }
 
-function expectInventoryMatches(actual: string, expected: string): void {
-  expect(actual, `Refresh the committed audit inventory with: ${INVENTORY_REFRESH_COMMAND}`).toBe(expected);
+function expectDeterministicInventory(root: string): void {
+  const first = renderAudit(auditTestStateWrites(root));
+  const second = renderAudit(auditTestStateWrites(root));
+  expect(Buffer.from(first).equals(Buffer.from(second))).toBe(true);
 }
 
-/** 표 행의 2·4번째 칸(줄번호)과, 표 밖 산문의 `경로.확장자:숫자` 를 자리표시자로 바꾼다. */
-function blankLineNumberColumns(markdown: string): string {
-  return markdown.split('\n').map((line) => {
-    if (line.startsWith('| `')) {
-      const cells = line.split('|');
-      if (cells.length < 8) return line;
-      cells[2] = ' <lines> '; cells[4] = ' <lines> ';
-      return cells.join('|');
+function expectReviewedInventoryRows(report: ReturnType<typeof auditTestStateWrites>, document: string, reviewed: ReadonlySet<string>): void {
+  const fullScan = document.split('## 전체 스캔 (사람 검토 + 자동 분류)\n')[1] ?? '';
+  const rows = new Map(fullScan.split('\n').filter((line) => line.startsWith('| `')).map((line) => {
+    const cells = line.split('|').map((cell) => cell.trim());
+    return [cells[1], cells] as const;
+  }));
+  for (const finding of report.findings.filter(({ file }) => reviewed.has(file))) {
+    const cells = rows.get(`\`${finding.file}\``);
+    const refresh = `Refresh with ${INVENTORY_REFRESH_COMMAND}`;
+    expect(cells && cells.length >= 9, `${finding.file}: inventory row missing or incomplete. ${refresh}`).toBe(true);
+    const expected = {
+      risk: finding.risk,
+      isolation: finding.isolation,
+      staticSafety: `${finding.staticSafety} (${finding.staticIsolationSignals.join(', ') || 'none'})`,
+    };
+    for (const [name, index] of [['risk', -4], ['isolation', -3], ['staticSafety', -2]] as const) {
+      const actual = cells!.at(index);
+      expect(actual, `${finding.file}: ${name}: ${actual} → ${expected[name]}. ${refresh}`).toBe(expected[name]);
     }
-    return line.replace(/(`[^`\s]+\.[A-Za-z0-9]+):\d+/g, '$1:<line>');
-  }).join('\n');
+  }
 }
 
 describe('test home/state write inventory contract', () => {
@@ -155,33 +166,80 @@ describe('test home/state write inventory contract', () => {
     expect(report.findings.length).toBeGreaterThan(0);
   });
 
-  test('every potential home/state writer is listed with AST lines, text lines, risk, and isolation', () => {
-    const report = auditTestStateWrites(repo);
-    const document = readFileSync(inventory, 'utf8');
-    for (const finding of report.findings) {
-      const tail = `| ${finding.writerTargets.map((target) => `\`${target}\``).join('<br>')} | `;
-      const rest = `| ${finding.risk} | ${finding.isolation} | ${finding.staticSafety} (${finding.staticIsolationSignals.join(', ') || 'none'}) |`;
-      const line = document.split('\n').find((line) => line.startsWith(`| \`${finding.file}\` |`));
-      expect(line, `no inventory row for ${finding.file}`).toBeDefined();
-      expect(line!).toMatch(new RegExp(
-        '^\\| `' + finding.file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '` \\| [^|]*'
-          + tail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[^|]*' + rest.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$',
-      ));
+  test('reviewed baseline home/state writers have complete inventory rows', () => {
+    expectReviewedInventoryRows(auditTestStateWrites(repo), readFileSync(inventory, 'utf8'), baselinePaths());
+  });
+
+  test('an added isolated writer in a reviewed file keeps its review attributes, but a HOME writer changes staticSafety', () => {
+    const root = createAuditRepository();
+    try {
+      const file = join(root, 'test', 'candidate.test.ts');
+      const reviewed = new Set(['test/candidate.test.ts']);
+      const originalReport = auditTestStateWrites(root);
+      const original = renderAudit(originalReport, new Set(), reviewed);
+      const finding = originalReport.findings[0]!;
+      const originalAttributes = `| ${finding.risk} | ${finding.isolation} |`;
+      for (const [attribute, alteredAttributes, oldValue, newValue] of [
+        ['risk', `| high | ${finding.isolation} |`, finding.risk, 'high'],
+        ['isolation', `| ${finding.risk} | no local isolation evidence |`, finding.isolation, 'no local isolation evidence'],
+      ] as const) {
+        expect(() => expectReviewedInventoryRows(originalReport, original.replace(originalAttributes, alteredAttributes), reviewed)).toThrow(
+          `test/candidate.test.ts: ${attribute}: ${newValue} → ${oldValue}. Refresh with ${INVENTORY_REFRESH_COMMAND}`,
+        );
+      }
+      writeFileSync(file, readFileSync(file, 'utf8') + "writeFileSync(join(stateDir, '.elanous', 'another.txt'), 'isolated');\n");
+      const isolated = auditTestStateWrites(root);
+      expect(isolated.findings[0]!.writerTargets).toContain("writeFileSync(join(stateDir, '.elanous', 'another.txt'))");
+      expectReviewedInventoryRows(isolated, original, reviewed);
+      const changedTarget = original.replace('`writeFileSync(join(stateDir, \'.elanous\', \'candidate.txt\'))`', '`writeFileSync(join(stateDir, \'.elanous\', \'candidate|changed.txt\'))`');
+      expect(changedTarget).not.toBe(original);
+      expectReviewedInventoryRows(isolated, changedTarget, reviewed);
+
+      writeFileSync(file, readFileSync(file, 'utf8') + "writeFileSync(join(homedir(), '.elanous', 'unsafe.txt'), 'unsafe');\n");
+      const unsafe = auditTestStateWrites(root);
+      expect(unsafe.findings[0]!.staticSafety).toBe('manual-review');
+      expect(unsafe.findings[0]!.writerCalls.some(({ realHomeTarget }) => realHomeTarget)).toBe(true);
+      expect(() => expectReviewedInventoryRows(unsafe, original, reviewed)).toThrow(
+        `test/candidate.test.ts: staticSafety: isolated (mkdtemp) → manual-review (mkdtemp). Refresh with ${INVENTORY_REFRESH_COMMAND}`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('the committed inventory exactly matches the complete current scan', () => {
-    expect(existsSync(inventory)).toBe(true);
-    const actualInventory = readFileSync(inventory, 'utf8');
-    const expectedInventory = renderAudit(auditTestStateWrites(repo));
-    let staleInventoryFailure: unknown;
+  test('inventory generation is deterministic and the committed document names its refresh command', () => {
+    const root = createAuditRepository();
     try {
-      expectInventoryMatches(blankLineNumberColumns(`${expectedInventory}\n`), blankLineNumberColumns(expectedInventory));
-    } catch (error) {
-      staleInventoryFailure = error;
+      expectDeterministicInventory(root);
+      expect(readFileSync(inventory, 'utf8').split('## ')[0]).toContain(INVENTORY_REFRESH_COMMAND);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
-    expect(String(staleInventoryFailure)).toContain('bun scripts/audit-test-state-writes.ts');
-    expectInventoryMatches(blankLineNumberColumns(actualInventory), blankLineNumberColumns(expectedInventory));
+  });
+
+  test('a new isolated writer outside the baseline need not appear in the inventory, but a missing reviewed row fails with its filename', () => {
+    const root = createAuditRepository();
+    try {
+      const reviewed = new Set(['test/candidate.test.ts']);
+      const original = renderAudit(auditTestStateWrites(root), new Set(), reviewed);
+      writeFileSync(join(root, 'test', 'new-isolated.test.ts'), [
+        "import { mkdtempSync, writeFileSync } from 'node:fs';",
+        "import { tmpdir } from 'node:os';",
+        "import { join } from 'node:path';",
+        "const root = mkdtempSync(join(tmpdir(), 'new-isolated-'));",
+        "writeFileSync(join(root, '.elanous', 'fixture.txt'), 'fixture');",
+        '',
+      ].join('\n'));
+      const report = auditTestStateWrites(root);
+      expect(report.findings.map(({ file }) => file)).toContain('test/new-isolated.test.ts');
+      expect(unclassifiedCandidates(report, reviewed)).toEqual([]);
+      expectReviewedInventoryRows(report, original, reviewed);
+      expectDeterministicInventory(root);
+      const withoutReviewedRow = original.split('\n').filter((line) => !line.startsWith('| `test/candidate.test.ts` |')).join('\n');
+      expect(() => expectReviewedInventoryRows(report, withoutReviewedRow, reviewed)).toThrow(`test/candidate.test.ts: inventory row missing or incomplete. Refresh with ${INVENTORY_REFRESH_COMMAND}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // ⛔⭐⭐ 무인 리뷰가 잡은 실결함의 회귀 — 텍스트 경로 렌즈의 «체계적 거짓 음성».
@@ -285,12 +343,51 @@ describe('test home/state write inventory contract', () => {
     }
   });
 
-  test('fails for every new candidate path outside the committed baseline', () => {
+  test('fails for unclassified new writer calls outside the reviewed baseline', () => {
     expect(existsSync(baseline)).toBe(true);
-    const unexpected = auditTestStateWrites(repo).findings
-      .map(({ file }) => file)
-      .filter((file) => !baselinePaths().has(file));
-    expect(unexpected, `New home/state write candidates require review and an intentional baseline refresh:\n${unexpected.join('\n')}`).toEqual([]);
+    const unexpected = unclassifiedCandidates(auditTestStateWrites(repo), baselinePaths());
+    expect(unexpected, `New home/state writer calls write a real HOME path without isolation evidence:\n${unexpected.join('\n')}`).toEqual([]);
+  });
+
+  test('automatically approves isolated fixtures, but rejects a real HOME write with file, line and reason', () => {
+    const root = createAuditRepository();
+    try {
+      const isolated = auditTestStateWrites(root);
+      expect(unclassifiedCandidates(isolated, new Set())).toEqual([]);
+      expect(renderAudit(isolated, new Set(), new Set())).toContain('| `test/candidate.test.ts` | 5, 6 | mkdtemp |');
+      writeFileSync(join(root, 'test', 'unsafe.test.ts'), [
+        "import { writeFileSync } from 'node:fs';",
+        "import { homedir } from 'node:os';",
+        "import { join } from 'node:path';",
+        "writeFileSync(join(homedir(), '.elanous', 'unsafe'), 'x');",
+        '',
+      ].join('\n'));
+      const mixed = auditTestStateWrites(root);
+      const issues = unclassifiedCandidates(mixed, new Set());
+      expect(issues).toEqual(["test/unsafe.test.ts:4 writeFileSync(join(homedir(), '.elanous', 'unsafe')) — writes a real HOME path without isolation evidence"]);
+      expect(unclassifiedCandidates(mixed, new Set(['test/unsafe.test.ts']))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('real HOME target is judged on the path argument in its own scope, not on content or a same-named variable elsewhere', () => {
+    const root = createAuditRepository();
+    try {
+      writeFileSync(join(root, 'test', 'shapes.test.ts'), [
+        "import { mkdtempSync, writeFileSync } from 'node:fs';",
+        "import { homedir, tmpdir } from 'node:os';",
+        "import { join } from 'node:path';",
+        "test('real', () => { const home = homedir(); writeFileSync(join(home, '.elanous', 'x'), 'y'); });",
+        "test('temp', () => { const root = mkdtempSync(join(tmpdir(), 't-')); const home = join(root, 'home'); writeFileSync(join(home, '.elanous', 'x'), 'y'); });",
+        "test('content', () => { const dir = mkdtempSync(join(tmpdir(), 'c-')); writeFileSync(join(dir, 'a.ts'), 'join(homedir(), \\'.elanous\\')'); });",
+        '',
+      ].join('\n'));
+      const issues = unclassifiedCandidates(auditTestStateWrites(root), new Set());
+      expect(issues).toEqual(["test/shapes.test.ts:4 writeFileSync(join(home, '.elanous', 'x')) — writes a real HOME path without isolation evidence"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('updates a complete baseline atomically through the CLI', () => {

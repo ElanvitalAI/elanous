@@ -6,6 +6,10 @@ import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, universeLaunch } from '../autopilot/track-agent.js';
 import { debug } from '../debug/log.js';
+import { surfaceEventsDbPath } from '../domains/surface-events.js';
+import { judgeNeighbor } from '../loops/neighbors.js';
+import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
+import { isRescueAllowedAction } from '../steward/rescue.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { loopEvent } from '../loops/observe.js';
@@ -17,7 +21,7 @@ import { loadLayeredPersonaDirs, resolveRepositoryPersonaDir, resolveStatePerson
 import { orderedPersonaTodos, personaTodoPath, readPersonaTodos, type PersonaTodo } from '../persona/persona-todo.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { recordSeatAskShadow } from '../seat-dispatch/seat-ask.js';
-import { answerSeat, askSeat, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatQuestions, type SeatId } from '../seat-dispatch/seat-questions.js';
+import { answerCrossCheck, answerSeat, askCrossCheck, askSeat, crossCheckAnswer, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatCrossChecks, seatQuestions, type CrossCheckJudgment, type SeatId } from '../seat-dispatch/seat-questions.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { readSchedules, releasedVersion } from '../release-loop/feature-store.js';
@@ -38,7 +42,7 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean };
+export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off' };
 export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null; action?: 'decision' | 'harness' | 'wait'; what?: string };
 export type SeatDeps = {
@@ -55,6 +59,10 @@ export type SeatDeps = {
   now?: () => Date;
   read?: (path: string) => string;
   run?: (args: string[]) => Promise<string>;
+  enqueue?: (seat: string, text: string, root: string, idempotencyKey: string) => Promise<{ id: string }>;
+  queueOutcome?: (id: string, root: string) => ReturnType<typeof harnessQueueOutcome>;
+  queueItems?: (root: string) => ReturnType<typeof listHarnessQueue>;
+  queueIdForKey?: (key: string, root: string) => string | undefined;
   append?: (path: string, entry: SeatEntry) => void;
   versions?: () => string[];
   /** Release schedules (version · cutAt) — a version is open while its cut is still ahead. Default reads the release ledger; unreadable ⇒ no checklist candidates (fail closed). */
@@ -77,6 +85,9 @@ export type SeatDeps = {
   inquire?: (seat: SeatId, item: SeatItem) => Promise<SeatInquiry | null> | SeatInquiry | null;
   /** Supply the receiving seat's answer; absent evidence must not invent a reply. */
   reply?: (seat: SeatId, question: string, from: SeatId) => Promise<SeatReply | null> | SeatReply | null;
+  /** Judge a decision draft against the receiving seat's evidence; null leaves the request pending. */
+  crossCheck?: (seat: SeatId, draft: string, from: SeatId) => Promise<CrossCheckJudgment | null> | CrossCheckJudgment | null;
+  decisionsConfig?: UserConfig['decisions'];
 };
 
 const repoRoot = resolve(import.meta.dir, '../..');
@@ -224,6 +235,64 @@ function versionOrder(a: string, b: string): number {
 
 function itemKey(item: SeatItem): string { return `${item.source}:${item.version ?? ''}:${item.id}`; }
 
+function handledItemKey(item: SeatItem): string {
+  return `${itemKey(item)}:${JSON.stringify([item.evidenceHash ?? null, itemSnapshot(item)])}`;
+}
+
+function queueKey(seat: string, item: SeatItem): string {
+  return `seat-loop:${seat}:${createHash('sha256').update(handledItemKey(item)).digest('hex')}`;
+}
+
+/** A crash (or a failed write) between AUTOQ enqueue and the `queued` row leaves an `attempting`/`outcome-unknown` row with no queue id. Find its queue row by the
+ *  seat-loop idempotency key so the outcome below (retry · launched · still queued) applies to it too (LOOP-LIVE1 review must-fix). */
+function recoverAttemptingQueueIds(ledger: readonly SeatEntry[], root: string, deps: SeatDeps): SeatEntry[] {
+  const unsettled = (entry: SeatEntry) => (entry.status === 'attempting' || entry.status === 'outcome-unknown') && entry.action === 'harness' && !entry.queueId && !!entry.item;
+  const attempting = ledger.filter(unsettled);
+  if (attempting.length === 0) return [...ledger];
+  let rows: ReturnType<typeof listHarnessQueue>;
+  try { rows = (deps.queueItems ?? ((stateRoot: string) => listHarnessQueue({ root: stateRoot })))(root); }
+  catch (error) { observe('queue-recovery-unreadable', { error: String(error).slice(0, 200) }); return [...ledger]; }
+  return ledger.map((entry, index) => {
+    const item = entry.item;
+    if (!unsettled(entry) || !item) return entry;
+    const key = handledItemKey(item);
+    // A later row for the same item already settled this attempt.
+    if (ledger.slice(index + 1).some((later) => later.seat === entry.seat && later.item && handledItemKey(later.item) === key && later.status !== 'attempting' && later.status !== 'outcome-unknown')) return entry;
+    const row = rows.find((candidate) => candidate.seat === entry.seat && candidate.idempotencyKey === queueKey(entry.seat, item)
+      && candidate.input === seatTaskText(entry.seat, item));
+    // The row may already have left the queue (finished · cancelled); its settled id is kept by key.
+    const id = row?.id ?? (deps.queueIdForKey ?? ((key: string, stateRoot: string) => harnessQueueIdForKey(key, { root: stateRoot })))(queueKey(entry.seat, item), root);
+    if (!id) return entry;
+    observe('queue-recovered', { seat: entry.seat, item: item.id, queueId: id, from: row ? 'queue' : 'key-marker' });
+    return { ...entry, status: 'queued' as const, queueId: id };
+  });
+}
+
+function reconciledQueueLedger(recorded: readonly SeatEntry[], root: string, deps: SeatDeps): SeatEntry[] {
+  const ledger = recoverAttemptingQueueIds(recorded, root, deps);
+  const outcome = deps.queueOutcome ?? ((id: string, stateRoot: string) => harnessQueueOutcome(id, { root: stateRoot }));
+  const retryable = new Set(ledger.filter((entry) => entry.status === 'queued' && entry.queueId
+    && outcome(entry.queueId, root) === 'retryable' && entry.item).map((entry) => `${entry.seat}:${handledItemKey(entry.item!)}`));
+  const pending = new Set(ledger.filter((entry) => entry.status === 'queued' && entry.queueId
+    && ['pending', 'unknown'].includes(outcome(entry.queueId, root)) && entry.item).map((entry) => `${entry.seat}:${handledItemKey(entry.item!)}`));
+  const succeeded = new Set(ledger.filter((entry) => entry.status === 'queued' && entry.queueId
+    && outcome(entry.queueId, root) === 'succeeded' && entry.item).map((entry) => `${entry.seat}:${handledItemKey(entry.item!)}`));
+  return ledger.map((entry) => {
+    if (entry.status === 'attempting' && entry.item) {
+      const key = `${entry.seat}:${handledItemKey(entry.item)}`;
+      if (retryable.has(key) && !pending.has(key) && !succeeded.has(key)) return { ...entry, status: 'refused' as const };
+    }
+    if (entry.status !== 'queued' || !entry.queueId) return entry;
+    const state = outcome(entry.queueId, root);
+    if (state === 'retryable') {
+      observe('queue-retryable', { seat: entry.seat, item: entry.item?.id, queueId: entry.queueId });
+      return { ...entry, status: entry.item && (pending.has(`${entry.seat}:${handledItemKey(entry.item)}`) || succeeded.has(`${entry.seat}:${handledItemKey(entry.item)}`)) ? 'queued' as const : 'refused' as const,
+        reason: 'AUTOQ failed or cancelled; eligible for retry' };
+    }
+    return { ...entry, status: state === 'succeeded' ? 'launched' as const : entry.status };
+  });
+}
+
 function itemSnapshot(item: SeatItem): string {
   return JSON.stringify([item.title, item.text, item.evidence ?? null, item.status ?? null]);
 }
@@ -238,14 +307,15 @@ function decisionReceipt(root: string, seat: string, item: SeatItem): DecisionEn
 }
 
 // RM3 (asked/answered · decision-card receipts for seat inquiries) ⊕ main (checklist cells re-picked by evidence, not by a shadow row).
-function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: string): Set<string> {
+function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: string, liveSafe = false): Set<string> {
   const inquiryRow = (entry: SeatEntry) => entry.action === 'seat-question' || entry.action === 'seat-answer' || !!entry.inquiry;
   return new Set(ledger.filter((entry, index) => entry.status === 'asked' || entry.status === 'answered'
+    || entry.status === 'resolved-by-neighbor'
     // RM3a: only TC's other-seat defect ask-shadows are deduplicated here — an ordinary inquiry recorded in shadow must still be delivered once questions turn on.
     || (entry.status === 'shadow' && entry.candidate?.kind === 'other-seat-cell-defect')
     || (entry.status === 'hitl' && (!entry.inquiry || (!!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))))
     || (entry.inquiry?.to === 'CEO' && !!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))
-    || (!inquiryRow(entry) && entry.status === 'outcome-unknown')
+    || (!inquiryRow(entry) && (entry.status === 'queued' || entry.status === 'outcome-unknown'))
     || (!inquiryRow(entry) && entry.status === 'attempting' && !(entry.item?.source === 'checklist' && ledger.slice(index + 1).some((later) =>
       later.seat === entry.seat && later.status === 'launched' && later.item?.source === 'checklist'
       && later.item.version === entry.item?.version && later.item.id === entry.item?.id
@@ -253,12 +323,14 @@ function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: strin
     || (shadow && entry.status === 'shadow' && entry.action !== 'wait' && entry.item?.source !== 'checklist')
     || (entry.status === 'launched' && entry.item?.source !== 'checklist'))
     .filter((entry): entry is SeatEntry & { item: SeatItem } => !!entry.item && !!entry.item.source && typeof entry.item.id === 'string')
-    .map((entry) => itemKey(entry.item)));
+    .map((entry) => !liveSafe || inquiryRow(entry) ? itemKey(entry.item) : handledItemKey(entry.item)));
 }
 
 function eligibleItem(item: SeatItem, ledger: readonly SeatEntry[], handled: ReadonlySet<string>, shadow: boolean): boolean {
   const key = itemKey(item);
-  if (handled.has(key)) return false;
+  if (handled.has(key) || handled.has(handledItemKey(item))) return false;
+  const rejected = [...ledger].reverse().find((entry) => entry.item && itemKey(entry.item) === key && entry.status === 'rejected-no-evidence');
+  if (rejected?.item && itemSnapshot(rejected.item) === itemSnapshot(item)) return false;
   const lastWait = [...ledger].reverse().find((entry) => entry.item && itemKey(entry.item) === key
     && (entry.status === 'wait' || (shadow && entry.status === 'shadow' && entry.action === 'wait')));
   return !lastWait?.item || itemSnapshot(lastWait.item) !== itemSnapshot(item);
@@ -275,7 +347,7 @@ export function alreadyHandled(item: SeatItem, ledger: readonly SeatEntry[]): bo
     const at = Date.parse(entry.at || entry.ts || '');
     return entry.seat === item.seat && at >= now - CHECKLIST_HANDLED_WINDOW_MS && at <= now
       // A shadowed seat question was never delivered — it must be picked again once delivery is on (RM3 · TC merge 10-03).
-      && (entry.status === 'launched' || (entry.status === 'shadow' && !entry.inquiry))
+      && (entry.status === 'launched' || entry.status === 'queued' || (entry.status === 'shadow' && !entry.inquiry))
       && entry.item?.source === 'checklist' && entry.item.id === item.id && entry.item.version === item.version
       && entry.item.title === item.title && entry.item.evidenceHash === item.evidenceHash;
   });
@@ -292,7 +364,8 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
   const read = deps.read ?? defaultRead;
   const root = deps.root ?? effectiveInstanceRoot();
   const activeLedger = ledger ?? readSeatLedger(seat, deps, (deps.now ?? (() => new Date()))());
-  const consumed = handledKeys(activeLedger, (deps.config ?? getUserConfig().loops?.seat)?.mode === 'shadow', root);
+  const mode = (deps.config ?? getUserConfig().loops?.seat)?.mode;
+  const consumed = handledKeys(activeLedger, mode === 'shadow', root, mode === 'live-safe');
   const requests = new Map<string, Record<string, unknown>>();
   for (const row of rows(read(join(root, 'seat-requests', 'requests.jsonl')))) {
     if (typeof row.key === 'string') requests.set(row.key, row);
@@ -330,7 +403,7 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     try { fromSchedule = readSchedules().map((row) => row.version); } catch { /* ledger unreadable — directories only */ }
     return [...new Set([...fromDirs, ...fromSchedule])].filter((v) => /^\d+\.\d+\.\d+$/.test(v));
   });
-  const itemsOf = deps.checklistItems ?? ((version: string) => listChecklist(version).items);
+  const itemsOf = deps.checklistItems ?? ((version: string) => listChecklist(version, releaseRoot).items);
   let shipped: string | undefined;
   try { shipped = releasedVersion(releaseRoot); }
   catch (error) {
@@ -375,6 +448,11 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     debug.log('seat.loop', 'skip-closed-versions', { seat, count: closed.length, newest: closed.at(-1)!, oldest: closed[0]! });
   }
   checklist.sort((a, b) => versionOrder(a.version!, b.version!) || a.id.localeCompare(b.id));
+  const ownedEvidence = checklist.filter((item) => item.evidence?.trim())
+    .map((item) => `${item.id} · ${item.title}: ${item.evidence!.trim()}`).join('\n').slice(0, 8_000);
+  for (const request of pending) {
+    if (request.source === 'seat-question' && ownedEvidence) request.evidence = ownedEvidence;
+  }
   return { requests: pending, checklist, role: read(join(deps.repo ?? repoRoot, 'docs', 'roles', `${seat}.md`)).slice(0, 4_000) };
 }
 
@@ -583,6 +661,10 @@ function escalateStalls(seat: string, deps: SeatDeps, config: SeatLoopConfig, no
           debug.log('org.stall', 'escalate', { ...data, mode: 'shadow' });
           continue;
         }
+        if (config.mode === 'live-safe' && !isRescueAllowedAction('alert')) {
+          observe('refused', { seat, item: item.id, action: 'alert', reason: 'policy denied internal stall alert' });
+          continue;
+        }
         const key = JSON.stringify([schedule.version, item.id, from, to, reason, startedAt]);
         const message: MessageEnvelope = { from, to, kind: 'stall-escalation',
           body: `[stall:${key}] ${schedule.version} 체크리스트 ${item.id} · ${item.title} · ${reason} · ${stalledMin}분 정체 (${from} → ${to})` };
@@ -601,8 +683,8 @@ function escalateStalls(seat: string, deps: SeatDeps, config: SeatLoopConfig, no
 }
 
 // In shadow mode a shadowed item counts as handled, so a rehearsal day walks the queue like the seat would.
-export function pickNext(inputs: SeatInputs, ledger: readonly SeatEntry[], opts: { shadow?: boolean; root?: string; history?: SeatDeps['checklistHistory'] } = {}): SeatItem | null {
-  const handled = handledKeys(ledger, opts.shadow === true, opts.root);
+export function pickNext(inputs: SeatInputs, ledger: readonly SeatEntry[], opts: { shadow?: boolean; liveSafe?: boolean; root?: string; history?: SeatDeps['checklistHistory'] } = {}): SeatItem | null {
+  const handled = handledKeys(ledger, opts.shadow === true, opts.root, opts.liveSafe === true);
   return [...inputs.requests, ...inputs.checklist].find((item) => {
     if (alreadyHandled(item, ledger)) {
       debug.log('seat.loop', 'skip-handled', { id: item.id });
@@ -666,9 +748,85 @@ export function seatTaskText(seat: string, item: SeatItem): string {
   return `[${seat} 자리 · ${where} · 역할 docs/roles/${seat}.md] ${item.title.replace(/[\r\n]+/g, ' ')}`;
 }
 
+function xcheckEvent(event: string, seat: string, neighbor: string, item: string, outcome: string): void {
+  try { debug.log('decisions.xcheck', event, { seat, neighbor, item, outcome }); }
+  catch { /* Observation does not alter delivery. */ }
+}
+
+function neighborLastSeen(root: string, isolated: boolean, now: Date, wanted: ReadonlySet<string>): Map<string, string> {
+  const path = isolated ? join(root, 'surface_events.db') : surfaceEventsDbPath();
+  const last = new Map<string, string>();
+  if (!existsSync(path)) return last;
+  const db = new Database(path, { readonly: true });
+  try {
+    // Same outbound seat events and refs.seat as context day; unlike its 24h display window,
+    // look back across the whole journal so a genuinely old ACK can be judged absent.
+    // Newest first and stop once every wanted seat has an ACK, so a long journal is not read and sorted in full each turn.
+    const statement = db.prepare(`SELECT ts, refs FROM events
+      WHERE surface IN ('coord:channel', 'context:session') AND direction='outbound' AND ts<=? ORDER BY ts DESC`);
+    try {
+      const events = statement.iterate(now.toISOString()) as Iterable<{ ts: string; refs: string | null }>;
+      for (const event of events) {
+        let seat: unknown;
+        try { seat = (JSON.parse(event.refs ?? '{}') as { seat?: unknown }).seat; } catch { continue; }
+        if (typeof seat === 'string' && wanted.has(seat) && !last.has(seat)
+          && Number.isFinite(Date.parse(event.ts)) && Date.parse(event.ts) <= now.getTime()) last.set(seat, event.ts);
+        if (last.size >= wanted.size) break;
+      }
+    } finally { statement.finalize(); }
+    return last;
+  } finally { db.close(); }
+}
+
+function neighborSeat(id: string): string | null {
+  const match = /^(op|tc|mk|ux)-seat$/i.exec(id);
+  return match ? match[1]!.toUpperCase() : null;
+}
+
+function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps, root: string, now: Date): void {
+  const neighbors = config.neighbors?.[seat as keyof NonNullable<SeatLoopConfig['neighbors']>] ?? [];
+  if (!neighbors.length) return;
+  let seen = new Map<string, string>();
+  let unreadable = false;
+  const wanted = new Set(neighbors.flatMap((neighbor) => { const source = neighborSeat(neighbor.id); return source ? [source] : []; }));
+  try { seen = wanted.size ? neighborLastSeen(root, !!deps.root, now, wanted) : seen; }
+  catch (error) { unreadable = true; observe('neighbor-source-unreadable', { seat, error: String(error).slice(0, 200) }); }
+  for (const neighbor of neighbors) {
+    try {
+      const source = neighborSeat(neighbor.id);
+      const lastSeenAt = source ? seen.get(source) : undefined;
+      const judgment = judgeNeighbor({ neighbor, lastSeenAt: unreadable ? null : lastSeenAt, now });
+      // action = what this turn actually did; plannedAction = what onAbsent asks for (shadow only records it).
+      let action: string | null = null;
+      const plannedAction = judgment.state === 'absent' ? judgment.action?.action ?? null : null;
+      if (judgment.state === 'absent') {
+        if (config.mode === 'live-safe' && judgment.action?.action === 'escalate' && isRescueAllowedAction('decision-card')) {
+          const ref = `seat-loop:neighbor:${seat}:${neighbor.id}:${lastSeenAt}`;
+          new DecisionLedger({ stateDir: root, now: () => now }).raiseOnce({ title: `${seat}: 이웃 ${neighbor.id} 결측`, category: 'other',
+            scqa: { s: `${seat} 이웃 ${neighbor.id}의 마지막 맥락 버스 사건: ${lastSeenAt}.`,
+              c: `설정한 heartbeat ${neighbor.heartbeat.everyMinutes}분 × ${neighbor.heartbeat.missedTicks}회 동안 새 사건이 없다.`,
+              q: '결측 이웃의 업무를 어떻게 처리할까?' },
+            options: [{ key: 'a', label: '사람 판단 후 별도 조치', consequence: '자리 루프는 대행하지 않는다' },
+              { key: 'b', label: '현상 유지', consequence: '결측 상태를 계속 관측한다' }],
+            recommendation: { skipped: true, reason: '결측만으로 대행이나 보류를 자동 결정하지 않는다' },
+            raisedBy: { agent: 'seat-loop' }, refs: [ref], raisedAt: now.toISOString(),
+            crossCheckSkipped: '이웃 결측으로 교차 확인 불가' }, ref);
+          action = 'decision-card';
+        }
+      }
+      try { debug.log('loop.neighbors', 'tick', { seat, neighbor: neighbor.id, state: judgment.state, action, plannedAction, mode: config.mode }); }
+      catch { /* Observation cannot change the judgment. */ }
+    } catch (error) {
+      observe('neighbor-judgment-failed', { seat, neighbor: neighbor.id, error: String(error).slice(0, 200) });
+      try { debug.log('loop.neighbors', 'tick', { seat, neighbor: neighbor.id, state: 'unknown', action: null, mode: config.mode }); }
+      catch { /* Observation cannot change the turn. */ }
+    }
+  }
+}
+
 export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promise<SeatLoopResult> {
   if (!/^(?:MK|OP|TC|UX)$/.test(seat)) throw new Error(`unknown seat: ${seat}`);
-  const config = deps.config ?? getUserConfig().loops?.seat ?? { mode: 'off' };
+  const config = deps.config ?? getUserConfig().loops?.seat ?? { mode: 'shadow' };
   if (config.mode === 'off' || !(config.seats ?? ['MK']).includes(seat)) {
     observe('skipped-off', { seat });
     return { seat, status: 'skipped-off' };
@@ -677,10 +835,99 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const path = seatLedgerPath(seat, deps.root ?? effectiveInstanceRoot(), now);
   const directory = dirname(path);
   return withSeatLock(directory, async () => {
-  const ledger = readSeatLedger(seat, deps, now);
   const stateRoot = deps.root ?? effectiveInstanceRoot();
+  const recorded = readSeatLedger(seat, deps, now);
+  const ledger = config.mode === 'live-safe' ? reconciledQueueLedger(recorded, stateRoot, deps) : recorded;
   let turnError: unknown;
   try {
+  if (config.mode === 'on' && config.questions === 'on') {
+    const proposals = ledger.filter((row) => row.status === 'awaiting-resolution' && row.xcheckQuestionId !== undefined
+      && ((row.item?.source === 'checklist' && row.item.version) || row.item?.source === 'seat-question'));
+    for (const proposal of proposals) {
+      if (ledger.some((row) => row.status === 'resolved-by-neighbor' && row.xcheckQuestionId === proposal.xcheckQuestionId)) continue;
+      // Review round 3 ②: a seat question has no checklist cell — it is settled when this seat answers it later
+      // (new evidence) and otherwise follows the same deadline escalation below.
+      const isQuestion = proposal.item!.source === 'seat-question';
+      if (isQuestion && ledger.some((row) => row.item && itemKey(row.item) === itemKey(proposal.item!)
+        && (row.status === 'answered' || row.status === 'hitl') && Date.parse(row.at) > Date.parse(proposal.at))) continue;
+      let cell: { status: string } | undefined;
+      if (!isQuestion) try {
+        cell = (deps.checklistItems ?? ((version: string) => listChecklist(version, stateRoot).items))(proposal.item!.version!)
+          .find((candidate) => candidate.id === proposal.item!.id && candidate.owner === seat);
+      } catch (error) {
+        observe('xcheck-resolution-verification-failed', { seat, neighbor: proposal.xcheckNeighbor, item: itemKey(proposal.item!), error: String(error).slice(0, 200) });
+      }
+      if (cell?.status === 'green' || cell?.status === 'done') {
+        const entry: SeatEntry = { ...proposal, ts: now.toISOString(), at: now.toISOString(), status: 'resolved-by-neighbor' };
+        (deps.append ?? defaultAppend)(path, entry);
+        xcheckEvent('resolved-by-neighbor', seat, proposal.xcheckNeighbor ?? '', itemKey(proposal.item!), cell.status);
+        return entry;
+      }
+      // Review round 3 ①: a neighbor's «I can resolve it» has a deadline — if the cell is still open after the
+      // cross-check wait, escalate to a CEO card instead of excluding the item forever.
+      const waited = proposal.xcheckWaitMinutes ?? 120;
+      const proposedAt = Date.parse(proposal.at);
+      if ((cell || isQuestion) && Number.isFinite(proposedAt) && now.getTime() - proposedAt >= waited * 60_000) {
+        const neighbor = proposal.xcheckNeighbor ?? '';
+        const question = proposal.inquiry?.question ?? proposal.item!.title;
+        const note = `${proposal.xcheckNote ?? ''} — 해결 가능하다고 했으나 ${waited}분 안 해소 안 됨`.trim();
+        if (!decisionReceipt(stateRoot, seat, proposal.item!)) {
+          await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${question}`, '--category', 'other',
+            '--s', `${seat} 질문 · ${proposal.item!.title}`, '--c', '이웃 자리 해결 제안이 기한 안에 해소되지 않았다',
+            '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
+            '--skip-recommend', '근거가 부족하다', '--xcheck', `${neighbor}:${note}`,
+            '--agent', 'seat-loop', '--ref', decisionRef(seat, proposal.item!), '--json']);
+        }
+        const entry: SeatEntry = { ...proposal, ts: now.toISOString(), at: now.toISOString(), status: 'hitl' };
+        (deps.append ?? defaultAppend)(path, entry);
+        xcheckEvent('raised', seat, neighbor, itemKey(proposal.item!), 'resolution-timed-out');
+        return entry;
+      }
+    }
+    const received = seatCrossChecks(stateRoot, seat as SeatId).filter((question) => !crossCheckAnswer(stateRoot, question));
+    const receivedInputs = received.length ? await gatherSeatInputs(seat, deps, ledger) : null;
+    const judgmentEvidence = receivedInputs?.checklist.filter((item) => item.evidence?.trim())
+      .map((item) => `${item.id} · ${item.title}: ${item.evidence!.trim()}`).join('\n').slice(0, 8_000) ?? '';
+    const pending = received.find((question) => {
+      const senderRows = readSeatLedger(question.from, { root: stateRoot }, now).filter((row) => row.xcheckQuestionId === question.id);
+      const latest = senderRows.at(-1);
+      if (latest?.status === 'hitl' || latest?.status === 'resolved-by-neighbor' || latest?.status === 'awaiting-resolution') return false;
+      const request = senderRows.find((row) => row.status === 'awaiting-xcheck' && row.xcheckRequestedAt);
+      const waitMinutes = request?.xcheckWaitMinutes ?? 120;
+      if (request?.xcheckRequestedAt && now.getTime() - Date.parse(request.xcheckRequestedAt) >= waitMinutes * 60_000) return false;
+      return !ledger.some((row) => row.xcheckQuestionId === question.id && row.status === 'awaiting-xcheck'
+        && row.xcheckJudgmentEvidence === judgmentEvidence);
+    });
+    if (pending) {
+      const append = deps.append ?? defaultAppend;
+      const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'awaiting-xcheck',
+        action: 'seat-answer', xcheckQuestionId: pending.id, xcheckNeighbor: pending.from as SeatId,
+        xcheckJudgmentEvidence: judgmentEvidence };
+      try {
+        const judge = deps.crossCheck ?? (async (receiver: SeatId, draft: string, from: SeatId): Promise<CrossCheckJudgment | null> => {
+          const inputs = receivedInputs!;
+          const evidence = judgmentEvidence;
+          if (!evidence) throw new Error('cross-check judgment requires receiving-seat evidence');
+          const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
+            `[${receiver} 자리 · 역할 docs/roles/${receiver}.md] ${from} 자리의 결정 초안을 교차 확인한다. 아래 실제 근거만 사용하고 모르는 사실은 지어내지 마라. JSON 하나만 반환: {"agree":boolean,"note":"근거를 포함한 메모","resolves":boolean}. 이웃 자리에서 직접 해결할 수 있을 때만 resolves=true. 초안: ${draft}\n역할: ${inputs.role}\n${receiver} 체크리스트 근거:\n${evidence || '(없음)'}`])).trim()) as { reply?: unknown };
+          const value: unknown = typeof output.reply === 'string' ? JSON.parse(output.reply) : output;
+          return value as CrossCheckJudgment;
+        });
+        const answer = await judge(seat as SeatId, pending.body, pending.from as SeatId);
+        if (!answer || typeof answer.agree !== 'boolean' || typeof answer.resolves !== 'boolean'
+          || typeof answer.note !== 'string' || !answer.note.trim()) throw new Error('invalid cross-check judgment');
+        answerCrossCheck(stateRoot, pending, answer);
+        entry.status = 'answered';
+        entry.xcheckNote = answer.note.trim();
+        append(path, entry);
+        xcheckEvent('answered', seat, pending.from, String(pending.id), answer.resolves ? 'resolves' : answer.agree ? 'agree' : 'dissent');
+      } catch (error) {
+        append(path, entry);
+        xcheckEvent('answered', seat, pending.from, String(pending.id), `judgment-failed: ${String(error).slice(0, 200)}`);
+      }
+      return entry;
+    }
+  }
   if (seat === 'TC') {
     const candidates = await tcCandidates(deps, now);
     for (const candidate of candidates) {
@@ -759,17 +1006,45 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const inputs = await gatherSeatInputs(seat, deps, ledger);
   const questionsMode = config.mode === 'on' ? config.questions ?? 'shadow' : 'shadow';
   const questionHandled = handledKeys(ledger, questionsMode !== 'on', stateRoot);
-  const pendingQuestion = inputs.requests.find((candidate) => candidate.source === 'seat-question' && !questionHandled.has(itemKey(candidate)));
-  const ordinary = pickNext({ ...inputs, requests: inputs.requests.filter((candidate) => candidate.source !== 'seat-question') }, ledger,
-    { shadow: config.mode === 'shadow', root: stateRoot, history: deps.checklistHistory ?? checklistHistory });
+  const pendingQuestion = inputs.requests.find((candidate) => candidate.source === 'seat-question'
+    && eligibleItem(candidate, ledger, questionHandled, questionsMode !== 'on')
+    && !ledger.some((row) => row.status === 'awaiting-resolution' && row.item
+      && itemKey(row.item) === itemKey(candidate) && itemSnapshot(row.item) === itemSnapshot(candidate)));
+  const ordinary = pickNext({ ...inputs, requests: inputs.requests.filter((candidate) => candidate.source !== 'seat-question'),
+    checklist: inputs.checklist.filter((candidate) => !ledger.some((row) => row.status === 'awaiting-resolution'
+      && row.item && itemKey(row.item) === itemKey(candidate) && itemSnapshot(row.item) === itemSnapshot(candidate))) }, ledger,
+    { shadow: config.mode === 'shadow', liveSafe: config.mode === 'live-safe', root: stateRoot, history: deps.checklistHistory ?? checklistHistory });
   const item = pendingQuestion ?? ordinary;
   const append = deps.append ?? defaultAppend;
+  const revisedProposal = item?.source === 'checklist' && ledger.some((row) => row.status === 'awaiting-resolution'
+    && row.item && itemKey(row.item) === itemKey(item) && itemSnapshot(row.item) !== itemSnapshot(item));
+  if (config.mode === 'live-safe' && !pendingQuestion) {
+    const pendingRows = (deps.queueItems ?? ((root: string) => listHarnessQueue({ root })))(stateRoot);
+    for (const candidate of [...inputs.requests, ...inputs.checklist].filter((row) => row.source !== 'seat-question')) {
+      const pending = pendingRows.find((row) => row.seat === seat && row.kind === 'say'
+        && row.idempotencyKey === queueKey(seat, candidate) && row.input === seatTaskText(seat, candidate)
+        && ['queued', 'launching', 'launched'].includes(row.status)
+        && ['pending', 'unknown'].includes((deps.queueOutcome ?? ((id: string, root: string) => harnessQueueOutcome(id, { root })))(row.id, stateRoot)));
+      if (!pending) continue;
+      if (ledger.some((row) => row.queueId === pending.id && row.status === 'queued')) continue;
+      const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'queued', item: candidate, action: 'harness', queueId: pending.id };
+      append(path, entry);
+      observe('queued', { seat, item: candidate, queueId: pending.id, deduplicated: true });
+      return entry;
+    }
+  }
   // RM3 review must-fix: `questions` now has a default, so it can't be the trigger — a shadow seat loop never calls the model on its own.
-  if (item && (item.source === 'seat-question' || deps.inquire || (config.mode === 'on' && config.questions !== undefined))) {
+  if (item && (!revisedProposal || planAction(item, seat).kind === 'decision')
+    && (item.source === 'seat-question' || (config.mode !== 'live-safe' && (deps.inquire || (config.mode === 'on' && config.questions !== undefined))))) {
     const root = deps.root ?? effectiveInstanceRoot();
-    const unfinished = [...ledger].reverse().find((row) => row.item && itemKey(row.item) === itemKey(item)
-      && (row.status === 'attempting' || row.status === 'outcome-unknown') && (row.action === 'seat-question' || row.action === 'seat-answer'));
-    const inquiry = item.source === 'seat-question' ? null : unfinished?.inquiry ?? await (deps.inquire ?? (async (asking: SeatId, work: SeatItem) => { try {
+      const unfinished = [...ledger].reverse().find((row) => row.item && itemKey(row.item) === itemKey(item)
+        && !(item.source === 'seat-question' && ledger.some((prior) => prior.status === 'awaiting-resolution'
+          && prior.item && itemKey(prior.item) === itemKey(item) && itemSnapshot(prior.item) !== itemSnapshot(item)))
+        && (row.status === 'attempting' || row.status === 'outcome-unknown' || row.status === 'awaiting-xcheck')
+        && (row.action === 'seat-question' || row.action === 'seat-answer' || row.inquiry?.to === 'CEO'));
+    const inquiry = item.source === 'seat-question' ? null : revisedProposal && item.source === 'checklist'
+      ? ledger.find((row) => row.status === 'awaiting-resolution' && row.item && itemKey(row.item) === itemKey(item))?.inquiry ?? null
+      : unfinished?.inquiry ?? await (deps.inquire ?? (async (asking: SeatId, work: SeatItem) => { try {
       const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
         `[${asking} 자리 · 역할 docs/roles/${asking}.md] 이 항목을 판단할 근거가 부족한 경우에만 다른 자리 또는 사람에게 질문한다. 근거가 충분하면 null. JSON 객체 하나만 반환: null 또는 {"to":"OP|TC|MK|UX|CEO","question":"필요한 근거를 묻는 질문"}. 항목: ${work.id} ${work.title}\n내용: ${work.text}\n역할: ${(deps.read ?? defaultRead)(join(deps.repo ?? repoRoot, 'docs', 'roles', `${asking}.md`)).slice(0, 4_000)}`])).trim()) as { reply?: unknown };
       const value: unknown = typeof output?.reply === 'string' ? JSON.parse(output.reply) : output;
@@ -788,7 +1063,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     const reply = item.source === 'seat-question' && item.from && (questionsMode === 'on' || deps.reply || config.questions !== undefined)
       ? unfinished?.answer ? { answer: unfinished.answer } : unfinished?.inquiry ? unfinished.inquiry : await (deps.reply ?? (async (receiver: SeatId, question: string, from: SeatId) => {
       const evidence = inputs.checklist.map((candidate) =>
-        `${candidate.id} · ${candidate.title} (판 ${candidate.version}, ${candidate.kind})`).join('\n').slice(0, 8_000);
+        `${candidate.id} · ${candidate.title} (판 ${candidate.version}, ${candidate.kind})${candidate.evidence?.trim() ? ` · 근거: ${candidate.evidence.trim()}` : ''}`).join('\n').slice(0, 8_000);
       const output = JSON.parse((await (deps.run ?? defaultRun)(['agent', '--json', '--no-tools',
         `[${receiver} 자리 · 역할 docs/roles/${receiver}.md] ${from} 자리의 질문에 근거를 갖고 답하라. 아래 ${receiver} 자리의 실제 체크리스트 근거에 없는 사실은 지어내지 마라. 모르면 사람 결정이 필요한 질문을 작성하라. JSON 하나만 반환: {"answer":"근거를 포함한 답"} 또는 {"to":"CEO","question":"결정할 질문"}. 질문: ${question}\n역할: ${inputs.role}\n${receiver} 체크리스트 근거:\n${evidence || '(없음)'}`])).trim()) as { reply?: unknown };
       const value: unknown = typeof output.reply === 'string' ? JSON.parse(output.reply) : output;
@@ -810,6 +1085,9 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
         entry.action = 'decision';
       }
       if (questionsMode !== 'on') {
+        if (config.mode === 'live-safe' && !isRescueAllowedAction('seat-question')) {
+          observe('refused', { seat, item: item.id, action: 'seat-question', reason: 'question delivery is shadow-only' });
+        }
         append(path, entry);
         observe('question-shadow', { seat, item, inquiry: entry.inquiry, answered: !!entry.answer });
         return entry;
@@ -819,7 +1097,18 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
         append(path, entry);
         return entry;
       }
-      append(path, { ...entry, status: 'attempting' });
+      if (entry.inquiry?.to === 'CEO' && !item.evidence?.trim() && !decisionReceipt(root, seat, item)
+        && !ledger.some((row) => row.item && itemKey(row.item) === itemKey(item) && row.status === 'awaiting-xcheck')
+        && !deliveredSeatQuestion(root, `xcheck:${seat}:${itemKey(item)}`)) {
+        entry.status = 'rejected-no-evidence';
+        append(path, entry);
+        xcheckEvent('rejected-no-evidence', seat, (deps.decisionsConfig ?? getUserConfig().decisions)?.crossCheckNeighbor?.[seat as SeatId] ?? 'OP', itemKey(item), 'no-evidence');
+        return entry;
+      }
+      if (!revisedProposal && (entry.inquiry?.to !== 'CEO' || (unfinished?.status !== 'awaiting-xcheck' && !ledger.some((row) =>
+        row.item && itemKey(row.item) === itemKey(item) && row.status === 'awaiting-xcheck')))) {
+        append(path, { ...entry, status: 'attempting' });
+      }
       try {
         if (item.source === 'seat-question' && reply && 'answer' in reply) {
           const question = { id: Number(item.id), from: item.from!, to: seat, body: item.text, kind: 'seat-question', createdAt: item.createdAt ?? '' };
@@ -829,16 +1118,55 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
           const ask = entry.inquiry!;
           if (!ask.question.trim()) throw new Error('empty seat question');
           if (ask.to === 'CEO') {
+            const settings = deps.decisionsConfig ?? getUserConfig().decisions!;
+            const neighbor = settings.crossCheckNeighbor?.[seat as SeatId] ?? ({ OP: 'TC', TC: 'OP', MK: 'OP', UX: 'OP' } as const)[seat as SeatId];
+            const waitMinutes = settings.crossCheckWaitMinutes ?? 120;
+            const previous = [...ledger].reverse().find((row) => row.item && itemKey(row.item) === itemKey(item)
+              && row.status === 'awaiting-xcheck' && row.xcheckQuestionId !== undefined);
             const prior = decisionReceipt(root, seat, item);
-            if (!prior) {
-              const run = deps.run ?? defaultRun;
-              await run(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
-                '--s', `${seat} 질문 · ${item.title}`, '--c', '판단 근거 부족 — 사람의 결정이 필요하다',
-                '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
-                '--skip-recommend', '근거가 부족하다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②', '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
+            if (prior) {
+              entry.status = 'hitl';
+            } else {
+              const key = `xcheck:${seat}:${itemKey(item)}`;
+              const delivered = deliveredSeatQuestion(root, key);
+              if (delivered && (delivered.kind !== 'seat-xcheck' || delivered.from !== seat || !isSeatId(delivered.to))) {
+                throw new Error('cross-check retry has an invalid recorded recipient');
+              }
+              const requestedNeighbor = delivered ? delivered.to as SeatId : neighbor;
+              if (!delivered && !item.evidence?.trim()) {
+                entry.status = 'rejected-no-evidence';
+                xcheckEvent('rejected-no-evidence', seat, neighbor, itemKey(item), 'no-evidence');
+              } else {
+                const question = delivered ?? askCrossCheck(root, seat as SeatId, neighbor,
+                  `제목: ${seat}: ${ask.question}\nS: ${seat} 질문 · ${item.title}\nC: 판단 근거 부족 — 사람의 결정이 필요하다\n질문: ${ask.question}\n근거: ${item.evidence!.trim()}`, key);
+                const requestedAt = previous?.xcheckRequestedAt ?? (delivered ? delivered.createdAt : now.toISOString());
+                entry.xcheckQuestionId = question.id;
+                entry.xcheckRequestedAt = requestedAt;
+                entry.xcheckNeighbor = requestedNeighbor;
+                entry.xcheckWaitMinutes = previous?.xcheckWaitMinutes ?? waitMinutes;
+                if (!delivered) xcheckEvent('requested', seat, requestedNeighbor, itemKey(item), 'awaiting-xcheck');
+                const answer = delivered ? crossCheckAnswer(root, question) : null;
+                if (!delivered || (!answer && now.getTime() - Date.parse(requestedAt) < entry.xcheckWaitMinutes * 60_000)) {
+                  entry.status = 'awaiting-xcheck';
+                } else if (answer?.resolves) {
+                  entry.status = 'awaiting-resolution';
+                  entry.xcheckNote = answer.note;
+                  if (!revisedProposal) xcheckEvent('answered', seat, requestedNeighbor, itemKey(item), 'resolution-proposed');
+                } else {
+                  if (!answer) xcheckEvent('timed-out', seat, requestedNeighbor, itemKey(item), `unanswered ${entry.xcheckWaitMinutes}m`);
+                  const check = answer ? ['--xcheck', `${requestedNeighbor}:${answer.note}`,
+                    ...(answer.agree ? [] : ['--dissent', `${requestedNeighbor}: ${answer.note}`])]
+                    : ['--no-xcheck', `이웃 ${requestedNeighbor} 무응답 ${entry.xcheckWaitMinutes}분`];
+                  await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
+                    '--s', `${seat} 질문 · ${item.title}`, '--c', '판단 근거 부족 — 사람의 결정이 필요하다',
+                    '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
+                    '--skip-recommend', '근거가 부족하다', ...check, '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
+                  if (!decisionReceipt(root, seat, item)) throw new Error('decisions raise did not deliver a matching card');
+                  entry.status = 'hitl';
+                  xcheckEvent('raised', seat, requestedNeighbor, itemKey(item), answer ? answer.agree ? 'agree' : 'dissent' : 'timed-out');
+                }
+              }
             }
-            if (!decisionReceipt(root, seat, item)) throw new Error('decisions raise did not deliver a matching card');
-            entry.status = 'hitl';
           } else {
             if (!isSeatId(ask.to) || ask.to === seat) throw new Error('invalid recipient seat');
             const key = `ask:${seat}:${itemKey(item)}`;
@@ -861,6 +1189,9 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   }
   if (item) observe('picked', { seat, item, date: seatDay(now) });
   const planned = item ? planAction(item, seat) : undefined;
+  if (item && config.mode === 'live-safe' && deps.inquire && !isRescueAllowedAction('seat-question')) {
+    observe('refused', { seat, item: item.id, action: 'seat-question', reason: 'outbound inquiry not in rescue policy' });
+  }
   const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: item ? 'shadow' : 'skipped-empty',
     ...(item ? { item, action: planned!.kind, ...(planned!.reason ? { reason: planned!.reason } : {}) } : { action: 'skipped-empty' as const }) };
   if (config.mode === 'shadow' || !item) {
@@ -872,6 +1203,19 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     entry.status = 'wait';
     append(path, entry);
     return entry;
+  }
+  if (config.mode === 'live-safe') {
+    const requested = planned!.kind === 'harness' ? 'launch' : 'decision-card';
+    if (planned!.kind === 'decision' && !isRescueAllowedAction(planned!.kind)) {
+      observe('refused', { seat, item: item.id, action: planned!.reason ?? 'decision', reason: 'execution forbidden; decision card only' });
+    }
+    if (!isRescueAllowedAction(requested)) {
+      entry.status = 'refused';
+      entry.reason = `action not permitted: ${requested}`;
+      append(path, entry);
+      observe('refused', { seat, item: item.id, action: requested, reason: entry.reason });
+      return entry;
+    }
   }
   const run = deps.run ?? defaultRun;
   let outcome: string | undefined;
@@ -912,7 +1256,9 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       observe('skipped-budget', { seat, item, reason: budget.reason });
       const parent = (config.stall?.parents ?? {})[seat] ?? DEFAULT_STALL_PARENTS[seat];
       // Dedupe only on a DELIVERED escalation, so a failed send is retried on the next turn (TC harvest · review round 1).
-      if (parent && parent !== seat && !ledger.some((prior) => prior.status === 'skipped-budget' && prior.escalated === true && prior.reason === budget.reason
+      if (parent && parent !== seat && config.mode === 'live-safe' && !isRescueAllowedAction('alert')) {
+        observe('refused', { seat, item: item.id, action: 'alert', reason: 'policy denied budget alert' });
+      } else if (parent && parent !== seat && !ledger.some((prior) => prior.status === 'skipped-budget' && prior.escalated === true && prior.reason === budget.reason
         && prior.item && itemKey(prior.item) === itemKey(item) && seatDay(new Date(prior.ts ?? prior.at)) === seatDay(now))) {
         const line = `[${seat} → ${parent}] ${item.id}: ${budget.reason}`;
         try {
@@ -950,6 +1296,26 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       observe('hitl', { seat, item });
       return entry;
     }
+    if (config.mode === 'live-safe') {
+      let queued: { id: string };
+      try {
+        queued = await (deps.enqueue ?? ((assigned, text, root, idempotencyKey) => addHarnessQueue({ seat: assigned, say: text, idempotencyKey }, { root })))(seat, action.text, stateRoot, queueKey(seat, item));
+      } catch (error) {
+        // Same key, different task body: never adopt the other work. Refuse this turn; the key frees once that item finishes.
+        if (!/idempotency key collision/.test(String(error))) throw error;
+        entry.status = 'refused';
+        entry.reason = 'AUTOQ idempotency key collision: a queued item with this key carries a different task';
+        append(path, entry);
+        observe('refused', { seat, item: item.id, action: 'launch', reason: entry.reason });
+        return entry;
+      }
+      if (!queued || typeof queued.id !== 'string' || !/^hq-[0-9a-f-]{36}$/i.test(queued.id)) throw new Error('AUTOQ returned no queue id');
+      entry.status = 'queued';
+      entry.queueId = queued.id;
+      append(path, entry);
+      observe('queued', { seat, item, queueId: queued.id });
+      return entry;
+    }
     const output = await run(['harness', 'say', action.text, '--substrate', 'pod', '--pod-pool', config.podPool ?? 'pool-node-b@node-b:8', '--base', 'main', '--json']);
     const results: unknown = JSON.parse(output.trim());
     if (!Array.isArray(results) || results.length === 0 || results.some((result) =>
@@ -974,6 +1340,15 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     throw error;
   } finally {
     // A turn ends even when there is no picked item or a launch fails.
+    try { judgeSeatNeighbors(seat, config, deps, stateRoot, (deps.now ?? (() => new Date()))()); }
+    catch (error) {
+      observe('neighbor-judgment-failed', { seat, error: String(error).slice(0, 200) });
+      const neighbors = config.neighbors?.[seat as keyof NonNullable<SeatLoopConfig['neighbors']>] ?? [];
+      for (const neighbor of neighbors) {
+        try { debug.log('loop.neighbors', 'tick', { seat, neighbor: neighbor.id, state: 'unknown', action: null, mode: config.mode }); }
+        catch { /* Observation cannot change the turn. */ }
+      }
+    }
     try { escalateStalls(seat, deps, config, (deps.now ?? (() => new Date()))()); }
     catch (error) {
       debug.log('org.stall', 'escalate-error', { seat, error: String(error).slice(0, 200) }, { level: 'warn' });

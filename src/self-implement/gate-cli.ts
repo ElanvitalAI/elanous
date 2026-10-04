@@ -12,6 +12,8 @@ import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-g
 import { parseReviewDepthFromFilesJson } from '../agent-mission/review-depth.js';
 import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateTestFailure } from './gate-baseline.js';
 import { resolveGateScope } from './gate-scope.js';
+import { publicExposureFiles, runExposeGate } from './expose-gate.js';
+import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { buildDocumentGuardianIndex, formatDocumentGuardians } from './document-guardian-index.js';
 import { buildImporterTestIndex, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
@@ -585,6 +587,9 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     ? buildRouteConsumerTestIndex(cwd, availableIndex.testPaths, selection.files, selection.baseRef) : null;
   const scope = resolveGateScope(selection.files, exists, availableIndex,
     { routeConsumerTestIndex: routeIndex ?? undefined });
+  const expose = publicExposureFiles(selection.files).length > 0
+    ? runExposeGate(cwd, selection.files, getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn', deps.runCommand)
+    : { passed: true, log: '' };
   const testFiles = [...(scope.testArgs ?? [])];
   const unrunImporterTotal = lookupFailed ? null : (scope.importerTestsNotRun?.total ?? 0);
   const importerLookupFailed = Boolean(lookupFailed);
@@ -615,6 +620,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     ...(scope.callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${scope.callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
     changedTestCountNote(cwd, selection.files, selection.baseRef, deps.runCommand, deps.readFile),
   ];
+  if (expose.log) lines.push(expose.log);
   if (options.pr) {
     const worktreeObservation = observePrWorktreeDirtiness(cwd, selection.prHeadRefName, {
       runCommand: deps.runCommand,
@@ -638,7 +644,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   if (scope.skipTestStep) {
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   if (options.shards !== undefined) {
@@ -662,7 +668,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     }
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     return {
-      exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed ? 1 : 0,
+      exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
     };
@@ -674,7 +680,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -695,6 +701,6 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   });
   lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
-  const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
+  const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
 }

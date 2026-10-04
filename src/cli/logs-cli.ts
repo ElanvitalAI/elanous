@@ -14,7 +14,7 @@
 // 같은 케이던스). 레벨 제어만 데몬 REST(/v1/logs/level — 런타임 상태라 프로세스
 // 경유 필수). 설계: 내부 문서 `PLAN-unified-log-fabric-2026-07-13` §LF3.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import type { Command } from 'commander';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -37,7 +37,7 @@ import { isRenderCategory, RENDER_ORIENTED_PREFIXES } from '../mss/logging/rende
 import { readScopedRenderLogs } from '../mss/logging/scoped-level.js';
 import { formatClock } from '../time/format.js';
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
-import { LogCursorNotFoundError, STORE_SAFETY_MAX } from '../mss/logging/log-store.js';
+import { LOG_RETENTION_DEFAULTS, LogCursorNotFoundError, STORE_SAFETY_MAX } from '../mss/logging/log-store.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
@@ -703,6 +703,74 @@ export function categoryCandidateWarning(
   const shown = names.slice(0, NON_CURRENT_SCOPE_NAMES_SHOWN).map(quoteShellArg).join(', ');
   const rest = names.length - Math.min(names.length, NON_CURRENT_SCOPE_NAMES_SHOWN);
   return `안내: 지정한 카테고리 이름은 이 로그 스토어에서 관측된 적 없습니다: ${shown}${rest > 0 ? ` 외 ${rest}개` : ''}.`;
+}
+
+/** A child-observation query can miss Pod-only logs even when the local store was read successfully. */
+export function podObservationGapNotice(
+  query: Pick<LogQuery, 'categories' | 'exactCategories' | 'events'>,
+  podRuns: number,
+): string | null {
+  if (podRuns <= 0) return null;
+  const childCategory = (category: string): boolean => ['self-implement', 'self-dev', 'harness']
+    .some((prefix) => category.startsWith(prefix));
+  const categories = [...(query.categories ?? []), ...(query.exactCategories ?? [])];
+  if (!categories.some(childCategory) && !(categories.length === 0 && (query.events?.length ?? 0) > 0)) return null;
+  return `안내: 이 창에 Pod 에서 돈 런 ${podRuns}개 — Pod 자식의 관측은 이 logs.db 에 수집되지 않는다(POD-OBS). 원장으로 본다: elanous self run-ledger <runId>`;
+}
+
+/** Select ledger roots independently of DB existence; --all includes registered roots with no logs.db. */
+function podLedgerDirectories(opts: LogsCliOpts, targets: readonly LogTarget[], instances: readonly LogInstanceView[]): string[] {
+  const roots = targets.map(({ dbPath }) => dirname(dirname(dbPath)));
+  if (opts.all && !opts.instance) {
+    roots.push(dirname(dirname(prodTarget().dbPath)));
+    for (const instance of instances) {
+      if (instance.kind !== 'test' || opts.includeTest) roots.push(instance.stateDir);
+    }
+  }
+  return [...new Set(roots.map((root) => join(root, 'run-ledger')))];
+}
+
+/** Read-only run-ledger scan over the independently selected instance roots. */
+async function countPodRunLedgers(
+  directories: readonly string[],
+  query: Pick<LogQuery, 'sinceMs' | 'untilMs'>,
+): Promise<{ podRuns: number; unreadableLedgers: number }> {
+  const { loadRunLedger } = await import('../self-implement/run-ledger.js');
+  const untilMs = query.untilMs ?? Date.now();
+  const sinceMs = query.sinceMs ?? untilMs - LOG_RETENTION_DEFAULTS.maxAgeDays * 86_400_000;
+  let podRuns = 0;
+  let unreadableLedgers = 0;
+  for (const directory of directories) {
+    let files: string[];
+    try { files = readdirSync(directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') unreadableLedgers += 1;
+      continue;
+    }
+    for (const file of files) {
+      if (!/^run-[a-zA-Z0-9-]+\.jsonl$/.test(file)) continue;
+      try {
+        const stamp = statSync(join(directory, file));
+        if (!stamp.isFile() || stamp.mtimeMs < sinceMs) continue;
+        const ledger = loadRunLedger(file.slice(0, -'.jsonl'.length), directory);
+        if (!ledger) { unreadableLedgers += 1; continue; }
+        const origin = ledger.find((entry) => entry.event === 'run-origin');
+        if (!origin || typeof origin.data.hostname !== 'string' || !origin.data.hostname.startsWith('si-task-')) continue;
+        let start = Number.POSITIVE_INFINITY;
+        let end = Number.NEGATIVE_INFINITY;
+        for (const entry of ledger) {
+          const time = entry.timestamp === undefined ? NaN : Date.parse(entry.timestamp);
+          if (!Number.isFinite(time)) continue;
+          start = Math.min(start, time);
+          end = Math.max(end, time);
+        }
+        // Older ledgers may have no timestamp at all; their mtime is the only available window evidence.
+        if (start === Number.POSITIVE_INFINITY) { start = stamp.mtimeMs; end = stamp.mtimeMs; }
+        if (start <= untilMs && end >= sinceMs) podRuns += 1;
+      } catch { unreadableLedgers += 1; }
+    }
+  }
+  return { podRuns, unreadableLedgers };
 }
 
 // ── 0건 --event 안내: 이미 찍힌 기록에서만 답한다 ────────────────────────
@@ -1480,9 +1548,25 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
     : {};
   const queryStatus = registryScope.queryStatus;
   const unopenedStoreBanner = unopenedStores === undefined ? '안 본 스토어 수 미측정' : `안 본 스토어 ${unopenedStores}개`;
+  const podGap = !opts.topFailures && podObservationGapNotice(query, 1) !== null
+    ? await countPodRunLedgers(podLedgerDirectories(opts, resolved.targets, registryScope.instances), query)
+    : null;
+  const podNotice = podGap ? podObservationGapNotice(query, podGap.podRuns) : null;
+  const podGapMeta = podGap && (podNotice || podGap.unreadableLedgers > 0)
+    ? { _meta: { type: 'log-query-pod-observation-gap', ...podGap } }
+    : null;
+  const emitPodGap = (): void => {
+    if (!opts.json && podGap) {
+      if (podNotice) console.error(`${podNotice}${podGap.unreadableLedgers > 0 ? ` (못 읽은 원장 ${podGap.unreadableLedgers})` : ''}`);
+      else if (podGap.unreadableLedgers > 0) console.error(`안내: Pod 원장 조회 중 못 읽은 원장 ${podGap.unreadableLedgers}개 — Pod 런 수를 확정할 수 없다(POD-OBS).`);
+    }
+    if (podGapMeta && podGap) debug.log('logs.query', 'pod-observation-gap', podGap);
+  };
   if (opened.length === 0) {
     console.error(`elanous logs: 열 수 있는 로그 스토어 없음 — ${missing.join(' · ') || '타겟 0'} · scope=${JSON.stringify(scope)} · queryStatus=${JSON.stringify(queryStatus)}`);
     console.error('  스토어는 해당 인스턴스 데몬(LF0 이후)이 한 번은 떠야 생성됩니다.');
+    if (opts.json && podGapMeta) console.log(JSON.stringify(podGapMeta));
+    emitPodGap();
     return 1;
   }
   if (missing.length > 0) console.error(`elanous logs: 스킵 — ${missing.join(' · ')}`);
@@ -1666,6 +1750,7 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
     // JSONL 소비자는 stdout만 읽는다. 결손·중복 성격·상한 메타도 별도 행으로 내어 행별 JSON 파싱을 보존한다.
     if (opts.json && multiSurfaceDuplicateMeta) outputLines.unshift(JSON.stringify(multiSurfaceDuplicateMeta));
     if (opts.json && unreadableMeta) outputLines.unshift(JSON.stringify(unreadableMeta));
+    if (opts.json && podGapMeta) outputLines.unshift(JSON.stringify(podGapMeta));
     if (unreadableInstances.length > 0 && !opts.json) {
       outputLines.unshift(`⚠️ 못 읽은 인스턴스 ${unreadableInstances.length}개: ${unreadableInstances.join(', ')}`);
     }
@@ -1676,6 +1761,7 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
       const output = `${outputLines.join('\n')}\n`;
       await new Promise<void>((resolve, reject) => process.stdout.write(output, (error) => error ? reject(error) : resolve()));
     }
+    emitPodGap();
     const eventWarning = eventCategoryWarning(opts.event);
     if (eventWarning) {
       console.error(eventWarning);
@@ -1744,6 +1830,8 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
   }
   seed.sort((a, b) => a.row.ts_ms - b.row.ts_ms || a.row.id - b.row.id);
   for (const m of seed.slice(-20)) emit(m.row, m.name, m.path);
+  if (opts.json && podGapMeta) console.log(JSON.stringify(podGapMeta));
+  emitPodGap();
   const cursors = new Map<string, number>();
   for (const { name, store } of opened) {
     try { cursors.set(name, store.maxId()); } catch { cursors.set(name, 0); }
@@ -1991,6 +2079,20 @@ logsCmd.command('durations')
     const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-tool-durations.js').LogsToolDurationsOpts;
     const { runLogsToolDurations } = await import('./logs-tool-durations.js');
     process.exit(runLogsToolDurations(merged));
+  });
+
+logsCmd.command('model-input')
+  .description('최근 노드 종류별 모델 입력 토큰 기준선 (중앙값·p90·못 잼 별도 집계, 기본 3일)')
+  .option('--since <t>', '조회 시작 (기본 3d · 30s|15m|2h|7d 또는 ISO)')
+  .option('--json', '구조화 JSON 출력')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스')
+  .option('--all', '등록된 모든 로그 인스턴스 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .action(async (o: import('./logs-model-input.js').LogsModelInputOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-model-input.js').LogsModelInputOpts;
+    const { runLogsModelInput } = await import('./logs-model-input.js');
+    process.exitCode = runLogsModelInput(merged);
   });
 
 logsCmd.command('degenerate')

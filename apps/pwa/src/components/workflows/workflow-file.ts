@@ -1,4 +1,20 @@
+import { isMap, parseDocument } from 'yaml';
+
 const MAX_IMPORT_SIZE = 256 * 1024;
+
+/** Add the same top-level lock the workflow store checks, without changing the editor draft. */
+export function readonlyExportYaml(yaml: string): string {
+  const doc = parseDocument(yaml);
+  if (doc.errors.length || !isMap(doc.contents)) {
+    throw new Error('워크플로 YAML을 읽을 수 없어 읽기 전용 사본을 내보내지 못했습니다.');
+  }
+  doc.set('readonly', true);
+  return doc.toString();
+}
+
+export function readonlyExportFileName(name: string): string {
+  return exportFileName(name).replace(/\.yaml$/, '-readonly.yaml');
+}
 
 function safeName(name: string): string {
   return name.trim().replace(/[^a-zA-Z0-9-]+/g, '-').replace(/^-+|-+$/g, '');

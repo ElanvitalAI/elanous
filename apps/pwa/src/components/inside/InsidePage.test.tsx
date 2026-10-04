@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { act, type ComponentProps } from 'react';
@@ -182,6 +182,68 @@ test('ArchitectureScene renders six mapped cells in pillar-foundation-floor orde
   expect(cell.hasAttribute('open')).toBe(false);
 });
 
+const BUILD_TIMEOUT_MS = 300_000;
+const BROWSER_TIMEOUT_MS = 360_000;
+
+function exportedInsideIsFresh(pwaDir: string): boolean {
+  const insideHtml = join(pwaDir, 'out/inside/index.html');
+  if (!existsSync(insideHtml) || !existsSync(join(pwaDir, 'out/_next'))) return false;
+  const builtAt = statSync(insideHtml).mtimeMs;
+  const sourceDirs = ['src', 'public'];
+  const inputs = ['next.config.ts', 'postcss.config.mjs', 'tsconfig.json', 'package.json', 'bun.lock'];
+  for (const input of inputs) {
+    const path = join(pwaDir, input);
+    if (!existsSync(path) || statSync(path).mtimeMs >= builtAt) return false;
+  }
+  const dirs = sourceDirs.map((dir) => join(pwaDir, dir));
+  while (dirs.length) {
+    const dir = dirs.pop()!;
+    if (!existsSync(dir)) return false;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) dirs.push(path);
+      else if (entry.isFile() && statSync(path).mtimeMs >= builtAt) return false;
+    }
+  }
+  return true;
+}
+
+test('exported /inside is reused only when its HTML is newer than PWA sources and build inputs', () => {
+  const pwaDir = mkdtempSync(join(tmpdir(), 'inside-export-freshness-'));
+  const inputFiles = ['next.config.ts', 'postcss.config.mjs', 'tsconfig.json', 'package.json', 'bun.lock'];
+  try {
+    mkdirSync(join(pwaDir, 'src/nested'), { recursive: true });
+    mkdirSync(join(pwaDir, 'public'), { recursive: true });
+    mkdirSync(join(pwaDir, 'out/inside'), { recursive: true });
+    mkdirSync(join(pwaDir, 'out/_next'), { recursive: true });
+    for (const input of [...inputFiles, 'src/nested/InsidePage.tsx', 'public/icon.svg', 'out/inside/index.html']) {
+      const path = join(pwaDir, input);
+      writeFileSync(path, input);
+      utimesSync(path, new Date(1_000), new Date(1_000));
+    }
+    const html = join(pwaDir, 'out/inside/index.html');
+    utimesSync(html, new Date(3_000), new Date(3_000));
+    expect(exportedInsideIsFresh(pwaDir)).toBe(true);
+    utimesSync(join(pwaDir, 'src/nested/InsidePage.tsx'), new Date(3_000), new Date(3_000));
+    expect(exportedInsideIsFresh(pwaDir)).toBe(false);
+    utimesSync(join(pwaDir, 'src/nested/InsidePage.tsx'), new Date(1_000), new Date(1_000));
+    for (const input of ['src/nested/InsidePage.tsx', 'public/icon.svg', ...inputFiles]) {
+      const path = join(pwaDir, input);
+      utimesSync(path, new Date(4_000), new Date(4_000));
+      expect(exportedInsideIsFresh(pwaDir)).toBe(false);
+      utimesSync(path, new Date(1_000), new Date(1_000));
+    }
+    rmSync(html);
+    expect(exportedInsideIsFresh(pwaDir)).toBe(false);
+    writeFileSync(html, 'out/inside/index.html');
+    utimesSync(html, new Date(3_000), new Date(3_000));
+    rmSync(join(pwaDir, 'out/_next'), { recursive: true });
+    expect(exportedInsideIsFresh(pwaDir)).toBe(false);
+  } finally {
+    rmSync(pwaDir, { recursive: true, force: true });
+  }
+});
+
 // Run wherever a browser exists (gate pod: /usr/local/bin/chromium · Mac: Google Chrome · or CHROME_BIN). Only when none is
 // found is the test skipped — and it says so, never silently (OP 12:4x · INSIDE1c follow-up: a Mac gate went red on a
 // hard-coded pod path).
@@ -190,8 +252,10 @@ const CHROMIUM = [process.env.CHROME_BIN, '/usr/local/bin/chromium', '/Applicati
 if (!CHROMIUM) console.warn('[skip] fresh exported /inside browser check — no Chromium/Chrome found (CHROME_BIN · /usr/local/bin/chromium · Google Chrome.app)');
 test.skipIf(!CHROMIUM)('fresh exported /inside renders scene ①② at 375px, 1440px and 1920px in Chromium without overflow', async () => {
   const pwaDir = join(import.meta.dir, '../../..');
-  const build = spawnSync('bun', ['run', 'build'], { cwd: pwaDir, encoding: 'utf8', timeout: 300_000, maxBuffer: 10_000_000 });
-  expect(build.status, build.stderr || build.stdout).toBe(0);
+  if (!exportedInsideIsFresh(pwaDir)) {
+    const build = spawnSync('bun', ['run', 'build'], { cwd: pwaDir, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 10_000_000 });
+    expect(build.status, build.error?.message || build.stderr || build.stdout).toBe(0);
+  }
   const out = join(pwaDir, 'out');
   expect(existsSync(join(out, 'inside/index.html'))).toBe(true);
   const server = Bun.serve({ port: 0, fetch: (request) => {
@@ -321,7 +385,7 @@ test.skipIf(!CHROMIUM)('fresh exported /inside renders scene ①② at 375px, 14
     server.stop(true);
     rmSync(profile, { recursive: true, force: true });
   }
-}, 360_000);
+}, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
 
 test('architecture cells expand to show documented paths with at least 18px base text', async () => {
   await render();
@@ -342,7 +406,7 @@ test('architecture cells expand to show documented paths with at least 18px base
   expect(map.children[3].getAttribute('aria-label')).toBe('바닥');
 });
 
-test('scene ⑥ accumulates live read, judge and answer for one mission, waits before events and unsubscribes on unmount', async () => {
+test('scene ⑥ receives distinct sanitized approval and denial outcomes through live SSE without leaking command text', async () => {
   const listeners = new Set<(event: unknown) => void>();
   let closed = false;
   let streamUrl = '';
@@ -363,21 +427,27 @@ test('scene ⑥ accumulates live read, judge and answer for one mission, waits b
   const context = { client: client as unknown as Context['client'], config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, sessionId: '', setSessionId: () => {} };
   address = new URL('https://example.test/inside?scene=6');
   await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={address.searchParams} liveTrace={<p />} editorScene={<p />} loopScene={<p />} wizardScene={<p />} /></DaemonContext.Provider>));
-  const line = () => host.querySelector('[data-inside-scene="6"] [aria-label="판단 줄"]')!;
+  const line = () => host.querySelector('[data-inside-scene="6"] [aria-label="PTY 인텔리전스"]')!;
   expect(streamUrl).toBe('/v1/logs/stream?exactCategory=pty.decision');
-  expect(line().textContent).toContain('판단을 기다리는 중');
+  expect(line().textContent).toContain('지금 PTY 판단이 없습니다 — 마지막 판단 기록 없음');
   expect(line().querySelectorAll('li')).toHaveLength(0);
-  const base = { ts: '2026-10-03T08:35:00Z', missionId: 'mission-1', sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex' };
+  const base = { ts: new Date().toISOString(), missionId: 'mission-1', sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex' };
   const emit = async (data: Record<string, unknown>) => {
     await act(async () => { for (const listener of listeners) listener({ data: JSON.stringify({ category: 'pty.decision', event: data.step, data }) }); });
   };
-  await emit({ ...base, seq: 1, step: 'read', text: '읽기' });
+  await emit({ ...base, seq: 1, step: 'read', text: 'cat /home/ubuntu/private/command' });
   await emit({ ...base, seq: 2, step: 'judge', text: '판단' });
-  await emit({ ...base, seq: 3, step: 'answer', text: '답변', detail: { question: '진행?', answer: '승인' } });
-  expect([...line().querySelectorAll('li')].map(item => item.querySelector('span')?.textContent)).toEqual(['read', 'judge', 'answer']);
-  expect(line().textContent).toContain('물음 → 진행?');
-  expect(line().textContent).toContain('답 → 승인');
-  expect(line().textContent).not.toContain('판단을 기다리는 중');
+  await emit({ ...base, seq: 3, step: 'answer', text: 'run sensitive command', detail: { question: '진행?', answer: '승인 OP /home/ubuntu/private/command' } });
+  await emit({ ...base, seq: 4, step: 'answer', text: 'rm sensitive command', detail: { question: '거부?', answer: '거부' } });
+  const outcomes = [...line().querySelectorAll('li')].map(item => item.textContent ?? '');
+  expect(outcomes).toHaveLength(2);
+  expect(outcomes[0]).toContain('거부');
+  expect(outcomes[1]).toMatch(/ · 승인$/);
+  expect(line().textContent).not.toContain('COO');
+  expect([...line().querySelectorAll('li time')].map(time => time.getAttribute('dateTime'))).toEqual([base.ts, base.ts]);
+  for (const secret of ['진행?', '거부?', 'private/command', 'run sensitive command', 'rm sensitive command', 'cat /home/ubuntu']) expect(line().textContent).not.toContain(secret);
+  expect(leaksInternal(line().textContent ?? '')).toEqual([]);
+  expect(line().textContent).not.toContain('지금 PTY 판단이 없습니다');
   await act(async () => root.unmount());
   expect(listeners.size).toBe(0);
   expect(closed).toBe(true);
@@ -411,26 +481,29 @@ test('scene ⑥ clears old decisions and releases the old stream when the daemon
     await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={params} liveTrace={<p />} editorScene={<p />} loopScene={<p />} wizardScene={<p />} /></DaemonContext.Provider>));
   };
   const emit = async (url: string, missionId: string, text: string) => {
-    const data = { ts: '2026-10-03T08:35:00Z', missionId, seq: 1, sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex', step: 'read', text };
+    const data = { ts: new Date().toISOString(), missionId, seq: 1, sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex', step: 'read', text };
     await act(async () => { for (const listener of streams.get(url)!.listeners) listener({ data: JSON.stringify({ category: 'pty.decision', event: 'read', data }) }); });
   };
-  const line = () => host.querySelector('[data-inside-scene="6"] [aria-label="판단 줄"]')!;
+  const line = () => host.querySelector('[data-inside-scene="6"] [aria-label="PTY 인텔리전스"]')!;
   params = new URLSearchParams('scene=6');
   await show(a);
   await emit('/daemon-a', 'mission-a', '이전 판단');
-  expect(line().textContent).toContain('이전 판단');
+  expect(line().textContent).toContain('지금 PTY 판단이 없습니다');
+  expect(line().textContent).not.toContain('이전 판단');
 
   await show(unavailable);
   expect(streams.get('/daemon-a')!.closed).toBe(true);
   expect(streams.get('/daemon-a')!.listeners.size).toBe(0);
   expect(streams.size).toBe(1);
-  expect(line().textContent).toContain('판단을 기다리는 중');
+  expect(line().textContent).toContain('지금 PTY 판단이 없습니다 — 마지막 판단 기록 없음');
   expect(line().textContent).not.toContain('이전 판단');
 
   await show(b);
-  expect(line().textContent).toContain('판단을 기다리는 중');
+  expect(line().textContent).toContain('지금 PTY 판단이 없습니다 — 마지막 판단 기록 없음');
   await emit('/daemon-b', 'mission-b', '새 판단');
-  expect([...line().querySelectorAll('li')].map(item => item.textContent)).toEqual([expect.stringContaining('새 판단')]);
+  expect(line().querySelectorAll('li')).toHaveLength(0);
+  expect(line().textContent).toContain('지금 PTY 판단이 없습니다');
+  expect(line().textContent).not.toContain('새 판단');
   expect(line().textContent).not.toContain('이전 판단');
   await act(async () => root.unmount());
   expect(streams.get('/daemon-b')!.closed).toBe(true);

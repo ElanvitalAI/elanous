@@ -1076,6 +1076,21 @@ describe('bindOrchestrateRunLedger — CLI 두 얼굴 공유 원장 기록', () 
     });
   });
 
+  test('a stamped orchestrate launch writes seat beside the PID on every checkpoint', () => {
+    const saved: SelfDevRunState[] = [];
+    const { checkpoint } = bindOrchestrateRunLedger({ saveRun: (state) => saved.push(state),
+      addParticipant: () => {}, checkpointDependencies: () => ({ goal: [] }) }, {
+      runId: 'run-seat-orchestrate', createdAt: 1, prior: null, goals: [{ feature: 'goal' }],
+      pid: 451, seat: 'UX', runIdSource: 'minted', now: () => 2,
+    });
+    checkpoint([{ taskId: 'goal', feature: 'goal', status: 'done' }]);
+    expect(saved).toHaveLength(2);
+    expect(saved.map(({ runId, pid, seat }) => ({ runId, pid, seat }))).toEqual([
+      { runId: 'run-seat-orchestrate', pid: 451, seat: 'UX' },
+      { runId: 'run-seat-orchestrate', pid: 451, seat: 'UX' },
+    ]);
+  });
+
   test('checkpoint와 participant 저장 실패를 같은 stage 이름으로 호출부에 넘긴다', () => {
     const failures: Array<{ stage: string; error: string }> = [];
 

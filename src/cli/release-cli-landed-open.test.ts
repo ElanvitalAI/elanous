@@ -65,7 +65,7 @@ describe('landed-but-yellow --open', () => {
       process.exitCode = 0;
       await h.run('--open', '--apply-evidence');
       expect(h.checks).toEqual(['0.2.13', '0.2.14']);
-      expect(h.gh).toHaveLength(1);
+      expect(h.gh).toEqual(['gh pr list --state merged --search merged:>=2026-10-03 --limit 400 --json number,title,body,mergedAt']);
       expect(h.added).toEqual([{ id: 'CL-AUTO', version: '0.2.13', ref: '#123' }]);
       expect(h.snapshots.get('0.2.13')!.items[0]!.status).toBe('yellow');
       expect(h.logs).toEqual(['— 0.2.13 —', '✅ CL-AUTO 근거 #123', '붙임 1 · 건너뜀(언급만) 1', '판 1 · 붙임 합 1 · 건너뜀(언급만) 합 1']);
@@ -152,6 +152,17 @@ describe('landed-but-yellow --open', () => {
       expect(JSON.parse(h.stdout.at(-1)!)).toEqual([]);
       expect(h.gh).toEqual([]);
     } finally { process.exitCode = exit; h.restore(); }
+  });
+
+  test('open search starts at the earliest updatedAt of all open non-green cells', async () => {
+    const h = harness(['0.2.13', '0.2.15']);
+    try {
+      h.snapshots.set('0.2.15', { ...snapshot('0.2.15'), items: [{ ...snapshot('0.2.15').items[0]!, updatedAt: '2026-09-01T12:00:00Z' }] });
+      await h.run('--open', '--json');
+      expect(h.gh).toEqual(['gh pr list --state merged --search merged:>=2026-09-01 --limit 400 --json number,title,body,mergedAt']);
+      expect(JSON.parse(h.stdout.at(-1)!).map((entry: { version: string }) => entry.version)).toEqual(['0.2.13', '0.2.15']);
+      expect(h.errors).toEqual([]);
+    } finally { h.restore(); }
   });
 
   test('--open 없는 한 판의 기존 사람 출력·JSON rows/plan 모양 보존', async () => {

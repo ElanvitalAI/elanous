@@ -30,19 +30,32 @@ export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = 
     if (observation.completeness !== 'complete') unknownReasons.add(`ledger observation ${observation.completeness}`);
     for (const root of observation.pty.unreadable) unknownReasons.add(`unreadable PTY: ${root}`);
     const active = new Set<string>();
+    let skippedTerminal = 0;
     for (const run of observation.entries) {
-      if (run.status === 'ended-unclosed') continue;
-      if (run.ledgerDirectories.length === 0) { unknown = true; unknownReasons.add(`${run.runId}: ledger directory absent`); continue; }
+      if (run.status === 'ended-unclosed') { skippedTerminal += 1; continue; }
+      const hasObservedPty = run.ptyRefs.length > 0;
+      const live = run.status === 'running' && hasObservedPty;
+      if (run.ledgerDirectories.length === 0) {
+        if (hasObservedPty) { unknown = true; unknownReasons.add(`${run.runId}: ledger directory absent`); }
+        else skippedTerminal += 1;
+        continue;
+      }
       let identified = false;
       for (const directory of run.ledgerDirectories) {
         try {
           const ledger = loadLedger(run.runId, directory);
-          if (ledger === null) { unknown = true; unknownReasons.add(`${run.runId}: ledger unavailable`); continue; }
+          if (ledger === null) {
+            if (hasObservedPty) { unknown = true; unknownReasons.add(`${run.runId}: ledger unavailable`); }
+            continue;
+          }
           const ids = new Set(ledger.flatMap((entry) => entry.goalId ? [entry.goalId] : []));
-          if (ids.size !== 1) { unknown = true; unknownReasons.add(`${run.runId}: expected one goalId, found ${ids.size}`); continue; }
+          if (ids.size !== 1) {
+            if (hasObservedPty) { unknown = true; unknownReasons.add(`${run.runId}: expected one goalId, found ${ids.size}`); }
+            continue;
+          }
           identified = true;
           let matches = ids.has(goalId);
-          if (!matches && goalId.startsWith('request-') && run.status === 'running' && run.ptyRefs.length > 0) {
+          if (!matches && goalId.startsWith('request-') && live) {
             const document = ledger.find((entry) => entry.event === 'start')?.data.goalFile;
             if (typeof document === 'string') {
               try {
@@ -52,20 +65,22 @@ export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = 
             }
           }
           if (matches) {
-            if (run.status === 'running' && run.ptyRefs.length > 0) active.add(run.runId);
+            if (live) active.add(run.runId);
             else { unknown = true; unknownReasons.add(`${run.runId}: matching ledger without live PTY`); }
           }
-        } catch { unknown = true; unknownReasons.add(`${run.runId}: ledger read failed`); }
+        } catch {
+          if (hasObservedPty) { unknown = true; unknownReasons.add(`${run.runId}: ledger read failed`); }
+        }
       }
-      if (!identified) unknown = true;
+      if (!identified && !hasObservedPty) skippedTerminal += 1;
     }
     // Positive evidence wins even if a different process or store is unreadable.
-    if (active.size > 0) return [...active].sort();
-    if (unknown) {
-      try { debug.log('execution-loop.launch-gate', 'active-runs-unknown', { goalId, reasons: [...unknownReasons] }); } catch { /* observation is fail-soft */ }
-      return 'unknown';
-    }
-    return [];
+    const result: ActiveRunsForGoal = active.size > 0 ? [...active].sort() : unknown ? 'unknown' : [];
+    try {
+      debug.log('execution-loop.launch-gate', 'active-runs-result', { goalId, result, skippedTerminal });
+      if (result === 'unknown') debug.log('execution-loop.launch-gate', 'active-runs-unknown', { goalId, reasons: [...unknownReasons], skippedTerminal });
+    } catch { /* observation is fail-soft */ }
+    return result;
   } catch (error) {
     try { debug.log('execution-loop.launch-gate', 'active-runs-unknown', { goalId, reasons: [error instanceof Error ? error.message : String(error)] }); } catch { /* observation is fail-soft */ }
     return 'unknown';

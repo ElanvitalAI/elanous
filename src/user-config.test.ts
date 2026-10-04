@@ -90,6 +90,70 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test('harness revert guard depth defaults, validates, and survives config save', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).harness?.revertGuard?.depth).toBe(50);
+  for (const depth of [0, -2, 1.5, '12', null]) {
+    writeConfig({ harness: { revertGuard: { depth } } });
+    expect(buildUserConfig(configPath).harness?.revertGuard?.depth).toBe(50);
+  }
+  writeConfig({ harness: { revertGuard: { depth: 7 } } });
+  const config = buildUserConfig(configPath);
+  expect(config.harness?.revertGuard?.depth).toBe(7);
+  saveUserConfig(config, configPath);
+  expect(buildUserConfig(configPath).harness?.revertGuard?.depth).toBe(7);
+});
+
+test('loop owners parse seat overrides, default to OP and warn once per invalid value', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).loops).toMatchObject({ owners: {}, defaultOwner: 'OP' });
+  writeConfig({ loops: { defaultOwner: 'MK', owners: { daily: 'TC', 'Some title': 'UX' } } });
+  const parsed = buildUserConfig(configPath);
+  expect(parsed.loops).toMatchObject({ defaultOwner: 'MK', owners: { daily: 'TC', 'Some title': 'UX' } });
+  saveUserConfig(parsed, configPath);
+  expect(buildUserConfig(configPath).loops).toMatchObject({ defaultOwner: 'MK', owners: { daily: 'TC', 'Some title': 'UX' } });
+  writeConfig({ loops: { defaultOwner: 'bad', owners: { daily: 'other', valid: 'OP' } } });
+  const warnings: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((line: string) => { warnings.push(line); return true; }) as typeof process.stderr.write;
+  try { expect(buildUserConfig(configPath).loops).toMatchObject({ defaultOwner: 'OP', owners: { valid: 'OP' } }); }
+  finally { process.stderr.write = original; }
+  expect(warnings.filter(line => line.includes('loops.defaultOwner'))).toHaveLength(1);
+  expect(warnings.filter(line => line.includes('loops.owners.daily'))).toHaveLength(1);
+  writeConfig({ loops: { owners: ['TC'] } });
+  expect(buildUserConfig(configPath).loops).toMatchObject({ owners: {}, defaultOwner: 'OP' });
+  // Review round 3: a loop titled «__proto__»/«constructor» keeps its configured owner (prototype-less map).
+  writeConfig({ loops: { owners: JSON.parse('{"__proto__":"TC","constructor":"UX"}') } });
+  const special = buildUserConfig(configPath).loops!.owners!;
+  expect(Object.hasOwn(special, '__proto__') && special['__proto__']).toBe('TC');
+  expect(Object.hasOwn(special, 'constructor') && special['constructor']).toBe('UX');
+});
+
+test('decision neighbor routing and wait use valid seat overrides and fall back with one warning per invalid field', () => {
+  writeConfig({});
+  const defaults = buildUserConfig(configPath).decisions!;
+  expect(defaults.crossCheckNeighbor).toEqual({ OP: 'TC', TC: 'OP', MK: 'OP', UX: 'OP' });
+  expect(defaults.crossCheckWaitMinutes).toBe(120);
+  writeConfig({ decisions: { crossCheckNeighbor: { MK: 'UX', OP: 'OP', TC: 12 }, crossCheckWaitMinutes: 15 } });
+  const warnings: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((message: string) => { warnings.push(message); return true; }) as typeof process.stderr.write;
+  try {
+    const parsed = buildUserConfig(configPath).decisions!;
+    expect(parsed.crossCheckNeighbor).toEqual({ OP: 'TC', TC: 'OP', MK: 'UX', UX: 'OP' });
+    expect(parsed.crossCheckWaitMinutes).toBe(15);
+  } finally { process.stderr.write = original; }
+  expect(warnings.filter((line) => line.includes('decisions.crossCheckNeighbor.'))).toHaveLength(2);
+  for (const invalid of [0, -1, 2.5, '120', Number.MAX_SAFE_INTEGER + 1]) {
+    writeConfig({ decisions: { crossCheckWaitMinutes: invalid } });
+    const output: string[] = [];
+    process.stderr.write = ((message: string) => { output.push(message); return true; }) as typeof process.stderr.write;
+    try { expect(buildUserConfig(configPath).decisions?.crossCheckWaitMinutes).toBe(120); }
+    finally { process.stderr.write = original; }
+    expect(output.filter((line) => line.includes('decisions.crossCheckWaitMinutes'))).toHaveLength(1);
+  }
+});
+
 test('decision cross-check gate defaults to shadow and resolves only explicit true', () => {
   writeConfig({});
   expect(buildUserConfig(configPath).decisions?.requireCrossCheck).toBe(false);

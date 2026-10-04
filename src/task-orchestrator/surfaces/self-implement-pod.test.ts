@@ -6,12 +6,15 @@ import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-im
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
+import type { SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { parsePodArtifactChunks } from './pod-artifact-return.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, defaultKubectl, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { loadTokens } from '../../oauth/store.js';
@@ -37,6 +40,61 @@ function fakeKubectl(conditions: string[], logs: string) {
   };
   return { k, calls };
 }
+
+describe('Pod kubectl output limit', () => {
+  test('defaultKubectl passes the lease maxBuffer to spawnSync and names ENOBUFS as oversized output', () => {
+    const original = childProcess.spawnSync;
+    const calls: Array<{ command: string; args: string[]; options: SpawnSyncOptionsWithStringEncoding }> = [];
+    const spy = spyOn(childProcess, 'spawnSync').mockImplementation(((command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => {
+      calls.push({ command, args, options });
+      return { status: null, stdout: '', stderr: '', output: [], pid: 0, signal: null, error: Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' }) } as ReturnType<typeof original>;
+    }) as typeof original);
+    try {
+      const result = defaultKubectl(['get', 'pods']);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ command: 'kubectl', args: ['get', 'pods'], options: { encoding: 'utf8', timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER } });
+      expect(result.status).toBeNull();
+      expect(result.stderr).toContain('출력 너무 큼 (ENOBUFS');
+    } finally { spy.mockRestore(); }
+  });
+
+  test('defaultKubectl reads fake kubectl output larger than the Node 1MiB default without ENOBUFS', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-kubectl-buffer-'));
+    const oldPath = process.env.PATH;
+    try {
+      const fake = join(root, 'kubectl');
+      writeFileSync(fake, '#!/bin/sh\nhead -c 1048577 /dev/zero | tr "\\\\000" x\n');
+      chmodSync(fake, 0o755);
+      process.env.PATH = `${root}:${oldPath ?? ''}`;
+      const result = defaultKubectl(['get', 'pods']);
+      expect(result.status).toBe(0);
+      expect(result.stdout.length).toBe(1_048_577);
+      expect(result.stderr).toBe('');
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('lease measurement keeps all namespaces for node reservations; a run-label selector would falsely admit high memory', () => {
+    const calls: string[][] = [];
+    const kubectl: Kubectl = (args) => {
+      calls.push([...args]);
+      const resource = args[args.indexOf('get') + 1];
+      if (resource === 'nodes') return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node-a' }, status: { allocatable: { memory: '64Gi', cpu: '8' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (resource === 'jobs') return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+      if (resource === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'unrelated', namespace: 'other', labels: {} }, status: { phase: 'Running' }, spec: { nodeName: 'node-a', containers: [{ resources: { requests: { memory: '40Gi' } } }] } }] }), stderr: '' };
+      throw new Error(`unexpected kubectl call: ${args.join(' ')}`);
+    };
+    const measurement = measurePoolLease([{ context: 'ctx', capacity: 1, k3dCluster: '' }], { kubectl, dns: () => 'ready' });
+    expect(calls.find((args) => args.includes('get') && args.includes('jobs'))).toEqual(expect.arrayContaining(['-l', 'elanous.substrate=pod']));
+    const podQuery = calls.find((args) => args.includes('get') && args.includes('pods'))!;
+    expect(podQuery).toContain('--all-namespaces');
+    expect(podQuery).not.toContain('-l');
+    expect(measurement.members[0]?.availableMemoryByNodeBytes).toEqual([24 * 1024 ** 3]);
+    expect(recommendConcurrency(measurement, { capacity: 1, perGoalMemory: '32Gi', accounts: 0, perAccount: 0 }).placeableSlots).toBe(0);
+  });
+});
 
 describe('pod source delivery', () => {
   const bundle: PodSource = { kind: 'bundle', bundlePath: '/host/source.bundle', sha256: 'ab'.repeat(32), sizeBytes: 12, headCommit: 'cd'.repeat(20) };
@@ -542,6 +600,14 @@ test('the host detail switch reaches only matching Pod runs before expiry withou
   } finally { resetLiveDetailCacheForTesting(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test('host seat reaches the actual Pod Job as a non-secret environment value', async () => {
+  const { k, calls } = fakeKubectl(['Complete'], '');
+  await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_HARNESS_SEAT: 'UX' } })({ feature: 'fix it', spaceId: 'seat-stamped' }).done;
+  const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+    .find((manifest) => manifest.kind === 'Job');
+  expect(job.spec.template.spec.containers[0].env).toContainEqual({ name: 'ELANOUS_HARNESS_SEAT', value: 'UX' });
+});
+
 test('a host-recorded dispatch marker reaches the actual Pod Job without altering its launch script', async () => {
   const { k, calls } = fakeKubectl(['Complete'], '');
   await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_DISPATCH_RECORDED: '1' } })({ feature: 'fix it', spaceId: 'dispatch-recorded' }).done;
@@ -923,6 +989,14 @@ describe('podSelfImplementSpawn', () => {
     const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, hostRegate: (request) => runHostRegate(request, deps) })({ feature: 'real regate', spaceId: 'pod-real-regate', autoMerge: true }).done;
     expect(ghCalls).toContain(`gh pr merge 9 --squash --match-head-commit ${head}`);
     expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
+  });
+
+  test('frozen host regate keeps ready PR open without treating it as merged or failed', async () => {
+    const headCommit = 'b'.repeat(40);
+    const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 8, checkedHeadCommit: headCommit }));
+    const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, hostRegate: async () => ({ passed: true, status: 'frozen', failures: [], os: process.platform }) })({ feature: 'frozen', spaceId: 'pod-regate-frozen', autoMerge: true }).done;
+    expect(r.disposition).toMatchObject({ stage: 'pr-opened', merged: false, ok: true, hostRegate: { status: 'frozen' } });
+    expect(r.exitCode).toBe(0);
   });
 
   test('host regate failure stays unmerged in disposition', async () => {

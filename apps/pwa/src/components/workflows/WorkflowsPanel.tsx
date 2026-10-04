@@ -13,8 +13,8 @@
 
 'use client';
 
-import { newWorkflowNameProblem, withWorkflowName, workflowSaveErrorText } from './workflow-save';
-import { exportFileName } from './workflow-file';
+import { copyWorkflowDraft, newWorkflowNameProblem, withWorkflowName, workflowIsReadonly, workflowSaveErrorText } from './workflow-save';
+import { exportFileName, readonlyExportFileName, readonlyExportYaml } from './workflow-file';
 import { phonePaneFor, type PhonePane } from './phone-pane';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
@@ -349,7 +349,46 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
     }
   };
 
+  const handleReadonlyExport = () => {
+    if (!draftYaml.trim()) return;
+    setSaveError(null);
+    try {
+      const yaml = readonlyExportYaml(draftYaml);
+      const url = URL.createObjectURL(new Blob([yaml], { type: 'application/x-yaml' }));
+      try {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = readonlyExportFileName(creatingNew ? newName : selectedName ?? '');
+        document.body.appendChild(link);
+        try { link.click(); } finally { link.remove(); }
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const isReadonly = !creatingNew && (detail.data?.source === 'builtin' || workflowIsReadonly(detail.data?.yaml ?? ''));
+
+  const handleCopy = () => {
+    if (!selectedName || !detail.data?.yaml || !isReadonly) return;
+    try {
+      const copy = copyWorkflowDraft(detail.data.yaml, selectedName, (list.data?.workflows ?? []).map((w) => w.name));
+      setDraftYaml(copy.yaml);
+      setNewName(copy.name);
+      setCreatingNew(true);
+      setSelectedName(null);
+      setSelectedNodeId(null);
+      setActiveRunId(null);
+      setSaveError(null);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const handleSave = async () => {
+    if (isReadonly) return;
     setSaveError(null);
     if (creatingNew) {
       const problem = newWorkflowNameProblem(newName);
@@ -385,7 +424,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   };
 
   const handleDelete = async () => {
-    if (!selectedName) return;
+    if (!selectedName || isReadonly) return;
     if (detail.data?.source === 'builtin') return;
     const scope = detail.data?.source === 'global' ? 'global' : 'project';
     try {
@@ -400,7 +439,6 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
     }
   };
 
-  const isReadonly = detail.data?.source === 'builtin';
   const validationStatus: 'ok' | 'error' | 'pending' | 'idle' =
     validateMut.isPending
       ? 'pending'
@@ -702,8 +740,14 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                 <span className="text-sm font-medium">{selectedName}</span>
                 {isReadonly && (
                   <span className="rounded bg-surface-elevated px-1.5 py-0.5 text-[10px] text-text-tertiary">
-                    read-only (built-in)
+                    {detail.data?.source === 'builtin' ? 'read-only (built-in)' : '읽기 전용'}
                   </span>
+                )}
+                {isReadonly && (
+                  <button type="button" onClick={handleCopy}
+                    className="rounded-md border border-border px-2 py-1 text-[11px] text-text-primary hover:bg-surface-elevated">
+                    읽기 전용 — 사본으로 열기
+                  </button>
                 )}
                 <EditorModeToggle mode={editorMode} onChange={setEditorMode} />
               </div>
@@ -822,6 +866,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
             </ul>
           )}
           <footer className="flex items-center justify-end gap-2 border-t border-border px-3 py-2">
+            {isReadonly && <span className="mr-auto rounded bg-surface-elevated px-2 py-0.5 text-[11px] text-text-tertiary">읽기 전용</span>}
             {saveError && <p role="alert" className="mr-auto text-[11px] text-error">{saveError}</p>}
             {selectedName && !creatingNew && (
               <button
@@ -846,7 +891,8 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
               <button
                 type="button"
                 onClick={handleDelete}
-                className="flex items-center gap-1 rounded-md border border-error/40 px-2 py-1 text-[11px] text-error hover:bg-error/10"
+                disabled={isReadonly || remove.isPending}
+                className="flex items-center gap-1 rounded-md border border-error/40 px-2 py-1 text-[11px] text-error hover:bg-error/10 disabled:opacity-50"
               >
                 <Trash2 className="h-3 w-3" />
                 Delete
@@ -860,6 +906,16 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
             >
               <Download className="h-3 w-3" />
               내보내기
+            </button>
+            <button
+              type="button"
+              onClick={handleReadonlyExport}
+              disabled={!draftYaml.trim()}
+              title="현재 초안에 읽기 전용 표시를 붙인 사본을 파일로 내보냅니다"
+              className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-primary hover:bg-surface-elevated disabled:opacity-50"
+            >
+              <Download className="h-3 w-3" />
+              읽기 전용 사본 내보내기
             </button>
             <button
               type="button"

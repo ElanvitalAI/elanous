@@ -13,7 +13,7 @@ import { posix as posixPath } from 'node:path';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime, ToolRuntimeContext } from '../tool-runtime/types.js';
 import { orchestrateSelfDev, type SelfDevJobResult, type OrchestrateSelfDevOptions, type SelfDevGoal } from './orchestrate.js';
-import type { SelfDevRunParticipant, SelfDevRunState } from './run-store.js';
+import { processBirthId, type SelfDevRunParticipant, type SelfDevRunState } from './run-store.js';
 import { HARNESS_RUN_ID_ENV, resolveRunIdentity as defaultResolveRunIdentity } from '../harness/harness-space.js';
 import { decomposeSelfDevGoal, type SelfDevDecomposition, type SelfDevDecomposeOptions } from './decompose.js';
 import { decomposeFabricRequest, type FabricDecomposeRequestOptions, type FabricDecomposeRequestResult } from './fabric-decompose-adapter.js';
@@ -302,6 +302,7 @@ interface OrchestrateRunLedgerInput {
   readonly prior: Pick<SelfDevRunState, 'dependencies' | 'results'> | null;
   readonly goals: readonly SelfDevGoal[];
   readonly pid: number;
+  readonly seat?: SelfDevRunState['seat'];
   readonly runIdSource: SelfDevRunParticipant['runIdSource'];
   readonly now: () => number;
   readonly onPersistenceFailure?: (stage: 'checkpoint' | 'participant', error: unknown) => void;
@@ -421,6 +422,7 @@ export function bindOrchestrateRunLedger(
   input: OrchestrateRunLedgerInput,
 ): OrchestrateRunLedgerBinding {
   const dependencies = deps.checkpointDependencies(input.prior, input.goals);
+  const pidStart = processBirthId(input.pid);
   const checkpoint = (results: SelfDevRunState['results']): void => {
     try {
       deps.saveRun({
@@ -431,6 +433,8 @@ export function bindOrchestrateRunLedger(
         dependencies,
         goals: [...input.goals],
         pid: input.pid,
+        ...(pidStart ? { pidStart } : {}),
+        ...(input.seat ? { seat: input.seat } : {}),
       });
     } catch (error) {
       if (input.onPersistenceFailure) input.onPersistenceFailure('checkpoint', error);

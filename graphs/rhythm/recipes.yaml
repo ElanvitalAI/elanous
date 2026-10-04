@@ -1,0 +1,18 @@
+collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/daily.ts" collect --json'
+  timeout_ms: 400000
+compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/daily.ts" compose --json'
+  timeout_ms: 30000
+deliver:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/daily.ts" deliver --json'
+  timeout_ms: 30000
+weekly-collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/weekly.ts" collect --json'
+  timeout_ms: 400000
+weekly-compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/weekly.ts" compose --json'
+  timeout_ms: 30000
+weekly-deliver:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/rhythm/weekly.ts" deliver --json'
+  timeout_ms: 30000

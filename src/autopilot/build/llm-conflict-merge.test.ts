@@ -1,6 +1,8 @@
 // LLM 지능형 충돌 해결 시퀀서 — seam 주입(merge 성공/충돌·LLM 해결/실패·마커 검출).
-import { test, expect, describe, afterEach } from 'bun:test';
-import { mergeMainWithLlmResolve, hasConflictMarkers, conflictResolvePrompt, remoteFetchSpec, defaultGitMergeSeam, LEGACY_MERGE_TARGET, formatLlmMergeOutcome, type MergeGitSeam, type LlmMergeOutcome } from './llm-conflict-merge.js';
+import { test, expect, describe, afterEach, spyOn } from 'bun:test';
+import { debug } from '../../debug/log.js';
+import { setUserConfigOverlay } from '../../user-config.js';
+import { mergeMainWithLlmResolve, defaultLlmResolve, hasConflictMarkers, conflictResolvePrompt, remoteFetchSpec, defaultGitMergeSeam, LEGACY_MERGE_TARGET, formatLlmMergeOutcome, type MergeGitSeam, type LlmMergeOutcome } from './llm-conflict-merge.js';
 import { countTestDeclarations } from '../../self-implement/test-declarations.js';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
@@ -326,6 +328,27 @@ describe('hasConflictMarkers', () => {
 });
 
 describe('conflictResolvePrompt', () => {
+  test('no intent preserves the exact original prompt', () => {
+    expect(conflictResolvePrompt('src/x.ts', CONFLICTED, 'main')).toBe([
+      '너는 git merge 충돌을 지능적으로 해결하는 엔지니어다. 아래 파일은 3-way merge 충돌 마커를 포함한다:',
+      '  <<<<<<< ours   = 현재 브랜치(walker 가 이 미션에서 만든 산출물)',
+      '  ======= 사이   = 양쪽 버전',
+      '  >>>>>>> theirs = main(호출자가 해석해 전달한 정합 대상)',
+      '', '해결 원칙:',
+      '- 양쪽의 의도를 **모두 보존**하며 종합한다(한쪽을 통째로 버리지 않는다).',
+      '- 같은 목적의 중복(예: 같은 테스트·같은 함수)은 **theirs(main) 버전을 채택**하고 ours 의 중복은 제거.',
+      '- ours 에만 있는 고유 추가분(테스트·헬퍼)은 **보존**해 theirs 와 합친다.',
+      '- 최종본은 문법적으로 유효하고 일관돼야 한다(중복 선언·깨진 블록 없이).',
+      '', '⚠️ 충돌 마커(<<<<<<<, =======, >>>>>>>)가 하나도 없는 **완결된 파일 전체**를 출력하라. 설명·코드펜스 없이 파일 내용만.',
+      '', '파일: src/x.ts', '```', CONFLICTED, '```',
+    ].join('\n'));
+  });
+
+  test('intent block precedes resolution principles', () => {
+    const prompt = conflictResolvePrompt('src/x.ts', CONFLICTED, 'main', { ours: 'keep walker', theirs: ['fix: A (#1)', 'feat: B (#2)'] });
+    expect(prompt).toContain('ours 의 의도: keep walker\ntheirs 에 먼저 착지한 변경: fix: A (#1) · feat: B (#2)\n\n해결 원칙:');
+  });
+
   test('ours/theirs 종합 지시 + 호출자가 전달한 대상과 파일 포함', () => {
     const p = conflictResolvePrompt('src/x.ts', CONFLICTED, 'master');
     expect(p).toContain('ours');
@@ -338,6 +361,68 @@ describe('conflictResolvePrompt', () => {
   });
 });
 
+
+describe('defaultLlmResolve intent modes', () => {
+  test('selfImplement.mergeIntent config selects shadow without changing the default', async () => {
+    const prompts: string[] = [];
+    const stream = (async (messages: Array<{ content: string }>) => {
+      prompts.push(messages[0]!.content);
+      return prompts.length === 1 ? 'plain' : 'intent';
+    }) as typeof import('../../llm.js')['streamLLM'];
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      setUserConfigOverlay((cfg) => ({ ...cfg, raw: { ...cfg.raw, selfImplement: { mergeIntent: 'shadow' } } }));
+      expect(await defaultLlmResolve('src/x.ts', CONFLICTED, 'main', { stream, git: () => ({ status: 0, stdout: 'base' }) })).toBe('plain\n');
+      expect(prompts).toHaveLength(2);
+      expect(log.mock.calls.filter(([, event]) => event === 'intent-shadow')).toHaveLength(1);
+    } finally { setUserConfigOverlay(null); log.mockRestore(); }
+  });
+
+  test('off uses only the original prompt; shadow adopts plain and records comparison', async () => {
+    const prompts: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    const stream = (async (messages: Array<{ content: string }>) => {
+      prompts.push(messages[0]!.content);
+      return prompts.length === 1 ? 'plain' : 'intent\nline';
+    }) as typeof import('../../llm.js')['streamLLM'];
+    const git = (_wt: string, args: string[]) => ({ status: 0, stdout: args[0] === 'merge-base' ? 'base' : args[0] === 'log' ? 'branch title\n' : '' });
+    try {
+      expect(await defaultLlmResolve('src/x.ts', CONFLICTED, 'main', { mode: 'off', stream })).toBe('plain\n');
+      expect(prompts).toHaveLength(1);
+      prompts.length = 0;
+      expect(await defaultLlmResolve('src/x.ts', CONFLICTED, 'main', { mode: 'shadow', stream, git })).toBe('plain\n');
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).not.toContain('ours 의 의도:');
+      expect(prompts[1]).toContain('ours 의 의도: branch title');
+      expect(log.mock.calls.filter(([category, event]) => category === 'self-dev.merge' && event === 'intent-shadow')).toEqual([
+        ['self-dev.merge', 'intent-shadow', {
+          file: 'src/x.ts', same: false, plainMarkers: false, intentMarkers: false,
+          plainLines: 1, intentLines: 2, oursIntent: true, theirsCount: 1,
+        }],
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('shadow provider failure leaves the adopted result untouched', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    let calls = 0;
+    const stream = (async () => {
+      if (++calls === 2) throw new Error('provider unavailable');
+      return 'plain';
+    }) as typeof import('../../llm.js')['streamLLM'];
+    try {
+      expect(await defaultLlmResolve('src/x.ts', CONFLICTED, 'main', { mode: 'shadow', stream, git: () => ({ status: 0, stdout: 'base' }) })).toBe('plain\n');
+      expect(calls).toBe(2);
+      expect(log.mock.calls.filter(([, event]) => event === 'intent-shadow-failed')).toHaveLength(1);
+      expect(log.mock.calls.filter(([, event]) => event === 'intent-shadow')).toHaveLength(0);
+    } finally { log.mockRestore(); }
+  });
+
+  test('on adopts the intent-aware result', async () => {
+    const stream = (async (messages: Array<{ content: string }>) => messages[0]!.content.includes('ours 의 의도:') ? 'intent' : 'plain') as typeof import('../../llm.js')['streamLLM'];
+    expect(await defaultLlmResolve('src/x.ts', CONFLICTED, 'main', { mode: 'on', stream, git: () => ({ status: 0, stdout: 'base' }) })).toBe('intent\n');
+  });
+});
 
 // ⛔⭐⭐ **실 git 회귀** — 위 시험들은 seam «호출»만 본다. 그것만으로는
 //   「`origin/*` 가 «실제로» 갱신됐나」를 못 답한다(리뷰가 그 점을 Goodhart 로 지적했다).

@@ -27,6 +27,7 @@ import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import { createDashboardLogWidgetRuntime } from '../log-widget-runtime.js';
 import type { LogSurfaceStateContract } from '../../widgets/contracts/log-surface.js';
 import { checkSlashCatalogBaseline } from './registry.js';
+import type { dashboardLoops } from '../../domains/dashboard-data.js';
 
 type AskLaunchInput = {
   entrance: { id: 'tui-slash-ask'; status: 'live'; surface: 'slash'; stampability: 'stampable' };
@@ -171,6 +172,128 @@ function createContext(
   } as unknown as DashboardSlashContext;
 }
 
+test('/loops uses the dashboardLoops API contract: category is mode, not owner; only proven owners match the filter', async () => {
+  const registry = buildDashboardSlashRegistry();
+  expect(registry.has('loops')).toBe(true);
+  expect(SLASH_COMMANDS.some(command => command.name === 'loops')).toBe(true);
+  // handleDashboard('loops') serializes dashboardLoops() under `loops`.
+  // Its LoopStatus contract has name/label/armed/category/last, but no owner.
+  const apiLoops: NonNullable<ReturnType<typeof dashboardLoops>> = {
+    loops: [{ name: 'dig', label: 'Dig', armed: true, category: 'exec', today: 1,
+      byStatus: { done: 1 }, last: { at: '2026-01-01T00:00:00Z', status: 'done' } }],
+    generatedAt: '2026-01-01T00:00:00Z',
+  };
+  const lines: string[] = [];
+  const ctx = createContext(lines);
+  ctx.error = (text) => `<red>${text}</red>`;
+  ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: 'secret' }) } as DashboardSlashContext['sessionSlash'];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    expect((init?.headers as Record<string, string>).authorization).toBe('Bearer secret');
+    if (String(url).endsWith('/v1/dashboard/loops')) return new Response(JSON.stringify({ ok: true, loops: apiLoops }), { status: 200 });
+    return new Response(JSON.stringify({ schedules: [
+      { name: 'heartbeat', domain: 'ops', runVia: 'crontab', source: 'crontab', registryEnabled: true, state: 'live',
+        lastRun: { at: '2026-01-01T00:00:00Z', status: 'error', exit: 1 }, intervalMs: 60_000 },
+      { name: 'markets', domain: 'finance', runVia: 'crontab', source: 'crontab', registryEnabled: true, state: 'live', lastRun: null },
+    ] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    await registry.dispatch('loops', [], ctx);
+    expect(lines.join('\n')).toContain('LAYER');
+    expect(lines.join('\n')).toContain('OWNER');
+    expect(lines.join('\n')).toContain('MODE');
+    expect(lines.join('\n')).toContain('LAST RUN');
+    expect(lines.join('\n')).toContain('VERDICT');
+    expect(lines.find(line => line.includes('Dig'))).toMatch(/daemon loop\s+Dig\s+—\s+exec\s+/);
+    lines.length = 0;
+    await registry.dispatch('loops', ['ops'], ctx);
+    expect(lines.join('\n')).toContain('daemon cron');
+    expect(lines.join('\n')).toContain('heartbeat');
+    expect(lines.join('\n')).toContain('<red>failed</red>');
+    expect(lines.join('\n')).not.toContain('markets');
+    expect(lines.join('\n')).not.toContain('Dig');
+    lines.length = 0;
+    await registry.dispatch('loops', ['finance'], ctx);
+    expect(lines.join('\n')).toContain('markets');
+    expect(lines.join('\n')).not.toContain('Dig');
+    expect(lines.join('\n')).not.toContain('heartbeat');
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test('/loops daemon cron uses calendar due instants rather than future interval across a weekend', async () => {
+  const lines: string[] = [];
+  const ctx = createContext(lines);
+  ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
+  ctx.loopsLocalRows = () => [];
+  const previousFetch = globalThis.fetch;
+  const previousNow = Date.now;
+  let currentTime = '2026-01-10T12:00:00Z';
+  Date.now = () => Date.parse(currentTime);
+  globalThis.fetch = (async (url: string | URL | Request) => new Response(JSON.stringify(
+    String(url).includes('/v1/schedules') ? { schedules: [{
+      name: 'weekday', domain: 'ops', runVia: 'crontab', source: 'crontab', cron: '0 9 * * 1-5', state: 'live',
+      lastRun: { at: '2026-01-09T09:00:00Z', status: 'ok', exit: 0 }, intervalMs: 86_400_000,
+    }] } : { loops: { loops: [] } },
+  ), { status: 200 })) as typeof fetch;
+  try {
+    await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
+    expect(lines.find(line => line.includes('weekday'))).toMatch(/daemon cron\s+weekday\s+ops\s+crontab\s+2026-01-09T09:00:00Z\s+alive/);
+    lines.length = 0;
+    currentTime = '2026-01-13T09:01:00Z';
+    await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
+    expect(lines.find(line => line.includes('weekday'))).toContain('late');
+  } finally { globalThis.fetch = previousFetch; Date.now = previousNow; }
+});
+
+test('/loops displays local rows and the other daemon registry when schedules never respond, even if fetch ignores abort', async () => {
+  const lines: string[] = [];
+  const ctx = createContext(lines);
+  ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
+  ctx.loopsLocalRows = () => [{ layer: 'local loop', name: 'local-pulse', owner: 'ops', mode: 'event', lastRun: null, verdict: 'alive' }];
+  const previousFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    requested.push(String(url));
+    if (String(url).includes('/v1/schedules')) return new Promise<Response>(() => {});
+    return new Response(JSON.stringify({ loops: { loops: [
+      { name: 'dig', label: 'Remote dig', armed: true, category: 'exec', last: null },
+    ] } }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const completion = await Promise.race([
+      buildDashboardSlashRegistry().dispatch('loops', [], ctx).then(() => 'completed'),
+      Bun.sleep(3000).then(() => 'timed out'),
+    ]);
+    expect(completion).toBe('completed');
+    expect(requested.some(url => url.endsWith('/v1/dashboard/loops'))).toBe(true);
+    expect(lines.join('\n')).toContain('daemon cron unavailable:');
+    expect(lines.join('\n')).toContain('Remote dig');
+    expect(lines.join('\n')).toContain('local-pulse');
+    expect(lines.join('\n')).toContain('VERDICT');
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test('/loops displays local rows when both daemon responses stall', async () => {
+  const lines: string[] = [];
+  const ctx = createContext(lines);
+  ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
+  ctx.loopsLocalRows = () => [{ layer: 'local cron', name: 'local-ops', owner: 'ops', mode: 'crontab', lastRun: null, verdict: 'late' }];
+  ctx.error = text => `<red>${text}</red>`;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Promise<Response>(() => {})) as unknown as typeof fetch;
+  try {
+    const completion = await Promise.race([
+      buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx).then(() => 'completed'),
+      Bun.sleep(3000).then(() => 'timed out'),
+    ]);
+    expect(completion).toBe('completed');
+    expect(lines.join('\n')).toContain('daemon cron unavailable:');
+    expect(lines.join('\n')).toContain('daemon loops unavailable:');
+    expect(lines.join('\n')).toContain('local-ops');
+    expect(lines.join('\n')).toContain('<red>late</red>');
+  } finally { globalThis.fetch = previousFetch; }
+});
+
 test('/wish follows /now in the visible catalog and registers on the human dashboard', () => {
   const names = SLASH_COMMANDS.map(({ name }) => name);
   expect(names[names.indexOf('now') + 1]).toBe('wish');
@@ -214,8 +337,9 @@ test('/wish creates distinct TUI cards for separate submissions, including ident
     expect(cards.every(card => card.goalId.startsWith('wish:tui:'))).toBe(true);
     expect(new Set(cards.map(card => card.goalId)).size).toBe(2);
     for (const card of cards) {
-      expect(card.sections).toHaveLength(1);
+      expect(card.sections.map(section => section.key)).toEqual(['intake:wish:0', 'intake:reply:0']);
       expect(JSON.parse(card.sections[0]!.content)).toMatchObject({ source: 'tui', text: '새 소원' });
+      expect(JSON.parse(card.sections[1]!.content)).toEqual({ surface: 'tui', address: null });
     }
   } finally {
     store.close();

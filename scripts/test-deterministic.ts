@@ -296,15 +296,11 @@ export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: s
   // resolves the old path through ELANOUS_TEST_HOME rather than the real home.
   delete env.XDG_CONFIG_HOME;
   env.ELANOUS_TEST_HOME = testRoot;
-  // ⚠️ Redirect elanous's OWN roots explicitly — do not merely inherit them.
-  // `ELANOUS_STATE_DIR` / `ELANOUS_CONFIG_DIR` are absolute paths that win over
-  // HOME, so a developer who exports either one keeps pointing the "isolated"
-  // run straight back at their real state while every other signal says the run
-  // is contained. Deleting them is not enough either: absence resolves to the
-  // default under HOME, which is fine here, but pinning them makes the
-  // isolation legible in the child's own environment rather than implied.
+  // HOME and ELANOUS_STATE_DIR isolate both the state and default config roots.
+  // ELANOUS_CONFIG_DIR is not a config-dir override; discard an inherited value
+  // rather than passing an ignored variable that appears to provide isolation.
   env.ELANOUS_STATE_DIR = join(testRoot, 'state');
-  env.ELANOUS_CONFIG_DIR = join(testRoot, 'config');
+  delete env.ELANOUS_CONFIG_DIR;
   // All ambient execution identities are removed by EXECUTION_ORIGIN_ENV_KEYS
   // above, before the child is spawned; logger API-shape tests need their absence.
   // ⚠️ No `ELANOUS_TEST_DETERMINISTIC` marker is exported. Nothing reads it yet,

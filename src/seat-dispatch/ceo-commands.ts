@@ -52,7 +52,7 @@ export interface CeoTaskExtra {
   attachments?: Array<{ name: string; path: string }>;
   /** Paths supplied by callers that do not have attachment names. */
   attachmentPaths?: readonly string[];
-  via?: 'telegram' | 'discord' | 'pwa';
+  via?: 'telegram' | 'discord' | 'pwa' | 'tui';
   /** Request ref written into the message body; with `deps.hasMessage` it makes delivery idempotent per request. */
   ref?: string;
 }
@@ -90,7 +90,7 @@ async function postToChannel(seat: string, task: string, deps: CeoCommandDeps, e
   if (!target) return deps.replyTarget ? 'decisions.replyGhPr 형식이 owner/repo#N 이 아님' : 'decisions.replyGhPr 미설정';
   try {
     const attachmentCount = (extra.attachments?.length ?? 0) + (extra.attachmentPaths?.length ?? 0);
-    const code = await deps.runGh(['pr', 'comment', target[2]!, '--repo', target[1]!, '--body-file', '-'], `${ceoTaskLine(seat, task, deps.now?.() ?? new Date())}${attachmentCount ? ` · 첨부 ${attachmentCount}` : ''}${extra.via === 'pwa' ? ' (PWA)' : ''}`);
+    const code = await deps.runGh(['pr', 'comment', target[2]!, '--repo', target[1]!, '--body-file', '-'], `${ceoTaskLine(seat, task, deps.now?.() ?? new Date())}${attachmentCount ? ` · 첨부 ${attachmentCount}` : ''}${extra.via === 'pwa' ? ' (PWA)' : extra.via === 'tui' ? ' (TUI)' : ''}`);
     return code === 0 ? null : `gh 종료 코드 ${code}`;
   } catch (error) {
     return error instanceof Error ? error.message.slice(0, 80) : 'gh 실행 실패';

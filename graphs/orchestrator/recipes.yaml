@@ -1,0 +1,18 @@
+orchestrator-intake:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" intake'
+  timeout_ms: 120000
+orchestrator-split:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" split'
+  timeout_ms: 120000
+orchestrator-place:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" place'
+  timeout_ms: 120000
+orchestrator-delegate:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" delegate'
+  timeout_ms: 120000
+orchestrator-reconcile:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" reconcile'
+  timeout_ms: 120000
+orchestrator-report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" report'
+  timeout_ms: 120000

@@ -132,6 +132,11 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
 function LivePtyDecisionScene() {
   const { client } = useDaemon();
   const [source, setSource] = useState(() => ({ client, decisions: EMPTY_DECISIONS }));
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
   useEffect(() => {
     let active = true;
     setSource({ client, decisions: EMPTY_DECISIONS });
@@ -143,5 +148,5 @@ function LivePtyDecisionScene() {
     });
     return () => { active = false; unsubscribe(); };
   }, [client]);
-  return <PtyDecisionScene client={client} decisions={source.client === client ? source.decisions : EMPTY_DECISIONS} />;
+  return <PtyDecisionScene decisions={source.client === client ? source.decisions : EMPTY_DECISIONS} now={now} />;
 }

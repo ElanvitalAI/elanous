@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { checkCommands, extractElanousCommands, type HelpRunner } from './docs-cli-check.js';
 
 const help: HelpRunner = (args) => {
@@ -34,6 +37,98 @@ describe('docs-cli-check — 문서의 elanous 호출을 실제 CLI 에 대조',
   test('--help 가 실패하면 «없다»가 아니라 «못 쟀다»', () => {
     const down: HelpRunner = () => ({ ok: false, out: '' });
     expect(checkCommands(extractElanousCommands('x.md', '`elanous doctor`'), down).map((x) => x.kind)).toEqual(['unmeasured']);
+  });
+
+  test('세 번째 명령의 플래그는 그 help 로 확인하고, 위치 인자는 두 번째 help 에 남긴다', () => {
+    const calls: string[] = [];
+    const nestedHelp: HelpRunner = (args) => {
+      const key = args.join(' ');
+      calls.push(key);
+      const outputs: Record<string, string> = {
+        '': 'Usage: elanous\n\nCommands:\n  connector  connectors\n  plugin  plugins\n',
+        connector: 'Usage: elanous connector\n\nCommands:\n  linear  Linear connector\n',
+        'connector linear': 'Usage: elanous connector linear\n\nCommands:\n  sync  pull issues\n',
+        'connector linear sync': 'Usage: elanous connector linear sync\n\nOptions:\n  --team <team>\n  --dry-run\n',
+        plugin: 'Usage: elanous plugin\n\nCommands:\n  add <name>  install\n',
+        'plugin add': 'Usage: elanous plugin add\n\nOptions:\n  --force\n',
+      };
+      return { ok: key in outputs, out: outputs[key] ?? '' };
+    };
+    const refs = extractElanousCommands('x.md', '```bash\nelanous connector linear sync --team X --dry-run\nelanous connector linear sync --absent\nelanous plugin add mypkg --force\nelanous plugin add mypkg --absent\n```');
+    expect(refs.map((r) => [r.cmd, r.sub, r.subsub])).toEqual([
+      ['connector', 'linear', 'sync'], ['connector', 'linear', 'sync'],
+      ['plugin', 'add', 'mypkg'], ['plugin', 'add', 'mypkg'],
+    ]);
+    expect(checkCommands(refs, nestedHelp).map((f) => [f.kind, f.detail])).toEqual([
+      ['unknown-flag', '--absent (elanous connector linear sync)'],
+      ['unknown-flag', '--absent (elanous plugin add)'],
+    ]);
+    expect(calls.filter((key) => key === 'connector linear sync')).toHaveLength(1);
+    expect(calls).not.toContain('plugin add mypkg');
+  });
+
+  test('두 번째 명령 help 실패는 부모 플래그로 판정하지 않고 못 쟀다고 낸다', () => {
+    const calls: string[] = [];
+    const failingHelp: HelpRunner = (args) => {
+      const key = args.join(' ');
+      calls.push(key);
+      const outputs: Record<string, string> = {
+        '': 'Usage: elanous\n\nCommands:\n  connector  connectors\n',
+        connector: 'Usage: elanous connector\n\nCommands:\n  linear  Linear connector\n\nOptions:\n  --parent-only\n',
+      };
+      return { ok: key in outputs, out: outputs[key] ?? '' };
+    };
+    const refs = extractElanousCommands('x.md', '```bash\nelanous connector linear sync --parent-only\nelanous connector linear sync --team X\n```');
+    expect(checkCommands(refs, failingHelp).map((f) => [f.kind, f.detail])).toEqual([
+      ['unmeasured', 'elanous connector linear --help 실패'],
+      ['unmeasured', 'elanous connector linear --help 실패'],
+    ]);
+    expect(calls.filter((key) => key === 'connector linear')).toHaveLength(1);
+    expect(calls).not.toContain('connector linear sync');
+  });
+
+  test('확인된 세 번째 명령의 help 실패는 부모 플래그로 판정하지 않고 못 쟀다고 낸다', () => {
+    const calls: string[] = [];
+    const failingHelp: HelpRunner = (args) => {
+      const key = args.join(' ');
+      calls.push(key);
+      const outputs: Record<string, string> = {
+        '': 'Usage: elanous\n\nCommands:\n  connector  connectors\n',
+        connector: 'Usage: elanous connector\n\nCommands:\n  linear  Linear connector\n',
+        'connector linear': 'Usage: elanous connector linear\n\nCommands:\n  sync  pull issues\n\nOptions:\n  --parent-only\n',
+      };
+      return { ok: key in outputs, out: outputs[key] ?? '' };
+    };
+    const refs = extractElanousCommands('x.md', '```bash\nelanous connector linear sync --parent-only\nelanous connector linear sync --team X\n```');
+    expect(checkCommands(refs, failingHelp).map((f) => [f.kind, f.detail])).toEqual([
+      ['unmeasured', 'elanous connector linear sync --help 실패'],
+      ['unmeasured', 'elanous connector linear sync --help 실패'],
+    ]);
+    expect(calls.filter((key) => key === 'connector linear sync')).toHaveLength(1);
+  });
+
+  test('펜스에서는 세그먼트 머리의 호출만 뽑되 프롬프트·sudo·환경 대입을 허용한다', () => {
+    const md = ['```bash', 'Anyone scripting against elanous can run', '$ elanous status --json', 'ELANOUS_X=1 elanous status', '> elanous status', 'sudo elanous status', 'ELANOUS_X=1 sudo elanous status', 'printf x && elanous status', '```', '`elanous status`'].join('\n');
+    const refs = extractElanousCommands('x.md', md);
+    expect(refs.map((r) => [r.line, r.cmd, r.flags])).toEqual([
+      [3, 'status', ['--json']], [4, 'status', []], [5, 'status', []], [6, 'status', []],
+      [7, 'status', []], [8, 'status', []], [10, 'status', []],
+    ]);
+  });
+
+  test('공개 실물 문서의 connector linear sync 플래그는 실제 CLI help 에 있다', () => {
+    const repo = resolve(import.meta.dir, '..');
+    const file = 'release/public/docs/tasks-and-intake.md';
+    const refs = extractElanousCommands(file, readFileSync(resolve(repo, file), 'utf8'))
+      .filter((r) => r.cmd === 'connector' && r.sub === 'linear' && r.subsub === 'sync');
+    expect(refs.length).toBeGreaterThan(0);
+    const realHelp: HelpRunner = (args) => {
+      const r = spawnSync('bun', ['bin/elanous.mjs', '--test', ...args, '--help'], {
+        cwd: repo, encoding: 'utf8', timeout: 60_000, env: { ...process.env, NO_COLOR: '1' },
+      });
+      return { ok: r.status === 0, out: `${r.stdout ?? ''}\n${r.stderr ?? ''}` };
+    };
+    expect(checkCommands(refs, realHelp)).toEqual([]);
   });
 });
 

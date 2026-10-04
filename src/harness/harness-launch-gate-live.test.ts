@@ -123,7 +123,7 @@ test('unknown active-run observation records the reason instead of an opaque war
       { runId: 'run-missing-goal', event: 'start', data: {} },
     ] })).toBe('unknown');
     expect(log).toHaveBeenCalledWith('execution-loop.launch-gate', 'active-runs-unknown', {
-      goalId: 'request-other', reasons: ['run-missing-goal: expected one goalId, found 0'],
+      goalId: 'request-other', reasons: ['run-missing-goal: expected one goalId, found 0'], skippedTerminal: 0,
     });
   } finally { log.mockRestore(); }
 });

@@ -24,7 +24,7 @@ describe('agent CLI onboarding refusal', () => {
       for (const key of ['XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR', 'ELANOUS_HARNESS_SPACE', 'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_RUN_CONTEXT']) delete env[key];
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'agent', 'hi'], {
         cwd: root,
-        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_CONFIG_DIR: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
         input: '', encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();
@@ -51,7 +51,7 @@ describe('agent CLI onboarding refusal', () => {
       for (const key of ['ELANOUS_HARNESS_SPACE', 'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_RUN_CONTEXT']) delete env[key];
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'chat', 'hi'], {
         cwd: root,
-        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_CONFIG_DIR: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
         input: '', encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();

@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
+import { parseDocument } from 'yaml';
 import {
   getGlobalWorkflowDir,
   getProjectWorkflowDir,
@@ -35,6 +36,17 @@ export interface SaveResult {
   /** When `ok=false`. */
   validation?: ValidationResult;
   error?: string;
+  readonly?: boolean;
+}
+
+/** Read the target file rather than the incoming body: PUT cannot clear its own lock. */
+function fileIsReadonly(filePath: string): boolean {
+  try {
+    const doc = parseDocument(readFileSync(filePath, 'utf-8'));
+    return doc.errors.length === 0 && doc.get('readonly') === true;
+  } catch {
+    return false;
+  }
 }
 
 /** Write YAML to disk after validation. Creates the dir if missing. */
@@ -43,18 +55,6 @@ export function saveWorkflow(
   yamlText: string,
   opts: SaveOpts,
 ): SaveResult {
-  const validation = parseWorkflowYaml(yamlText);
-  if (!validation.ok || !validation.workflow) {
-    return { ok: false, validation };
-  }
-  if (validation.workflow.name !== name) {
-    return {
-      ok: false,
-      error: `name mismatch: YAML declares '${validation.workflow.name}', requested '${name}'`,
-      validation,
-    };
-  }
-
   const dir =
     opts.scope === 'project'
       ? getProjectWorkflowDir(opts.cwd ?? process.cwd())
@@ -68,6 +68,20 @@ export function saveWorkflow(
     };
   }
   const filePath = join(dir, `${name}.yaml`);
+  if (fileIsReadonly(filePath) || fileIsReadonly(join(dir, `${name}.yml`))) {
+    return { ok: false, error: 'readonly workflow cannot be overwritten', readonly: true };
+  }
+  const validation = parseWorkflowYaml(yamlText);
+  if (!validation.ok || !validation.workflow) {
+    return { ok: false, validation };
+  }
+  if (validation.workflow.name !== name) {
+    return {
+      ok: false,
+      error: `name mismatch: YAML declares '${validation.workflow.name}', requested '${name}'`,
+      validation,
+    };
+  }
   if (existsSync(filePath)) {
     try {
       copyFileSync(filePath, `${filePath}.bak`);
@@ -90,6 +104,7 @@ export interface DeleteResult {
   ok: boolean;
   path?: string;
   error?: string;
+  readonly?: boolean;
 }
 
 /** Delete a user-written workflow. Refuses built-in scope. */
@@ -102,9 +117,12 @@ export function deleteWorkflow(
       ? getProjectWorkflowDir(opts.cwd ?? process.cwd())
       : getGlobalWorkflowDir();
   const filePath = join(dir, `${name}.yaml`);
+  const ymlPath = join(dir, `${name}.yml`);
+  if (fileIsReadonly(filePath) || fileIsReadonly(ymlPath)) {
+    return { ok: false, error: 'readonly workflow cannot be deleted', readonly: true };
+  }
   if (!existsSync(filePath)) {
     // Try .yml fallback before declaring missing
-    const ymlPath = join(dir, `${name}.yml`);
     if (existsSync(ymlPath)) {
       try {
         unlinkSync(ymlPath);

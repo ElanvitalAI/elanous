@@ -302,6 +302,7 @@ export async function handleWorkflowPut(
   }
   const r = saveWorkflow(name, yamlText, { scope });
   if (!r.ok) {
+    if (r.readonly) return jsonResponse({ error: 'readonly_workflow', reason: r.error }, 409);
     return jsonResponse(
       {
         error: 'invalid_workflow',
@@ -323,7 +324,7 @@ export function handleWorkflowDelete(
   const url = new URL(req.url);
   const scope = url.searchParams.get('scope') === 'global' ? 'global' : 'project';
   const r = deleteWorkflow(name, { scope });
-  if (!r.ok) return jsonResponse({ error: 'delete_failed', reason: r.error }, 404);
+  if (!r.ok) return jsonResponse({ error: r.readonly ? 'readonly_workflow' : 'delete_failed', reason: r.error }, r.readonly ? 409 : 404);
   return jsonResponse({ ok: true, path: r.path, scope }, 200);
 }
 

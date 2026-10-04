@@ -75,6 +75,25 @@ test('GraphQL walks pages and filters by title prefix or label and updatedAt', a
   expect(events.map(e => e.identifier)).toEqual(['ELA-5', 'ELA-8']);
 });
 
+test('GraphQL excludes wish-labeled issues across pages even when their titles look like wishes', async () => {
+  const pages: Array<string | null> = [];
+  const fakeFetch = async (_url: string | URL | Request, init?: RequestInit) => {
+    const after = JSON.parse(init!.body as string).variables.after as string | null;
+    pages.push(after);
+    return Response.json({ data: { issues: {
+      nodes: after
+        ? [{ ...issue(2, 4), title: '원해요', labels: { nodes: [{ name: 'other' }] } }]
+        : [{ ...issue(1, 1), title: '만들어 줘', labels: { nodes: [{ name: 'wish' }] } },
+          { ...issue(2, 2), title: '해 줘', labels: { nodes: [{ name: 'WISH' }] } },
+          { ...issue(3, 3), title: '있으면 좋겠다', labels: { nodes: [] } }],
+      pageInfo: { hasNextPage: !after, endCursor: after ? null : 'next' },
+    } } });
+  };
+  const events = await fetchLinearIssues({ apiKey: 'key', teamKey: 'ELA', excludeLabel: 'wish', fetch: fakeFetch as typeof fetch });
+  expect(pages).toEqual([null, 'next']);
+  expect(events.map(event => event.identifier)).toEqual(['ELA-4', 'ELA-3']);
+});
+
 test('GraphQL returns Urgent issues first so they are created before High ones', async () => {
   const fakeFetch = async (_url: string | URL | Request, _init?: RequestInit) => Response.json({ data: { issues: {
     nodes: [issue(4, 21), issue(2, 22), issue(0, 23), issue(1, 24), issue(3, 25), issue(1, 26)],

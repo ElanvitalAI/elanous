@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { openSurfaceEventsDb } from '../src/domains/surface-events.js';
 import { listCoordEvents, parseCoordHeader } from '../src/context-bus/coord-events.js';
@@ -107,6 +107,9 @@ async function runPost(
   const stub = join(bin, 'bun');
   await writeFile(stub, `#!/bin/sh\necho "stub gh (exit ${stubExit})"\nexit ${stubExit}\n`);
   await chmod(stub, 0o755);
+  // The ledger record prefers the installed `eln`; stub it so no test writes the real production ledger.
+  await writeFile(join(bin, 'eln'), '#!/bin/sh\nexit 0\n');
+  await chmod(join(bin, 'eln'), 0o755);
   return spawnSync('bash', [script, ...args, file], {
     encoding: 'utf8',
     env: { ...process.env, CH_PR: '99999999', PATH: `${bin}:${process.env.PATH ?? ''}`, ...env },
@@ -369,6 +372,8 @@ describe('coord-post.sh — 신원 관문', () => {
     const stub = join(bin, 'bun');
     await writeFile(stub, `#!/bin/sh\nprintf '%s\\n' '${protectedFile}'\nexit 0\n`);
     await chmod(stub, 0o755);
+    await writeFile(join(bin, 'eln'), '#!/bin/sh\nexit 0\n');
+    await chmod(join(bin, 'eln'), 0o755);
 
     const r = spawnSync('bash', [script, file], {
       encoding: 'utf8',
@@ -505,6 +510,8 @@ async function runPostRouted(prCommentOut: string, prCommentExit: number, apiExi
     'exit 9',
   ].join('\n'));
   await chmod(join(bin, 'bun'), 0o755);
+  await writeFile(join(bin, 'eln'), `#!/bin/sh\necho "eln $*" >> "${calls}"\n`);
+  await chmod(join(bin, 'eln'), 0o755);
   const r = spawnSync('bash', [script, file], {
     encoding: 'utf8',
     env: { ...process.env, CH_PR: '99999999', PATH: `${bin}:${process.env.PATH ?? ''}` },
@@ -543,4 +550,24 @@ describe('coord-post.sh — GraphQL 한도면 REST 로 한 번 물러선다', ()
     expect(r.status).toBe(1);
     expect(log).not.toContain('gh api');
   });
+});
+
+test('without a chosen universe the channel record goes to the installed CLI (production ledger), not this tree', async () => {
+  const dir = realpathSync(await mkdtemp(join(tmpdir(), 'coord-post-prod-record-')));
+  const file = join(dir, 'body.md');
+  await writeFile(file, '**[S]** 내 신원 → OP · 보고 · K6\n');
+  const bin = join(dir, 'bin');
+  await mkdir(bin, { recursive: true });
+  const calls = join(dir, 'calls.log');
+  await writeFile(join(bin, 'bun'), `#!/bin/sh\necho "bun $*" >> "${calls}"\ncase "$*" in *"gh pr comment"*) echo 'https://github.com/o/r/pull/1#issuecomment-7' ;; esac\nexit 0\n`);
+  await writeFile(join(bin, 'eln'), `#!/bin/sh\necho "eln $*" >> "${calls}"\n`);
+  await chmod(join(bin, 'bun'), 0o755);
+  await chmod(join(bin, 'eln'), 0o755);
+  const env: Record<string, string | undefined> = { ...process.env, CH_PR: '99999999', PATH: `${bin}:${process.env.PATH ?? ''}` };
+  delete env.ELANOUS_STATE_DIR;
+  const r = spawnSync('bash', [script, file], { encoding: 'utf8', env, cwd: resolve(import.meta.dir, '..') });
+  expect(r.status).toBe(0);
+  const log = await readFile(calls, 'utf8');
+  expect(log).toContain('eln coord event record --seat S');
+  expect(log).not.toContain('bun bin/elanous.mjs coord event record');
 });

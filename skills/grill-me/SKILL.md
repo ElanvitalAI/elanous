@@ -2,6 +2,7 @@
 name: grill-me
 description: 계획·설계·결정을 «공감대에 이를 때까지» 끈질기게 인터뷰한다. 설계 트리를 가지마다 내려가며 결정 간 의존을 풀고, 산출을 SCQA 카드 ⊕ 골 문면으로 남긴다. "grill me", "그릴미", "캐물어줘", "추궁해줘", "인터뷰해줘", "나를 인터뷰", "계획 캐물어", "설계 캐물어", "이 계획 파고들어", "전제를 캐줘", "요구사항 캐내줘", "뭘 빠뜨렸나", "계획 스트레스 테스트", "설계 스트레스 테스트", "공감대" 등의 언급 시 이 스킬 사용. Use when the user wants to: grill me, grill this plan, grill this design, interview me, stress-test this plan, pressure-test my design, find what I am missing, resolve the decision tree.
 disable-model-invocation: true
+prompt-only: true
 argument-hint: "무엇을 캐물을까 — 계획·설계·결정 하나"
 # 오픈코어 경계(scripts/skill-boundary.ts) — requires = 없으면 이 스킬이 일을 못 하는 catalog/resources.yaml 자원 id
 requires: []

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { readFailureInbox } from '../../src/self-implement/heal-intake.js';
 import {
   fillMissingGateFacts,
   markDeletedUnverified,
@@ -101,6 +102,7 @@ export interface HealRoleDeps {
   loadLedger?: (runId: string) => RunLedgerEntry[] | null;
   ledgerDir?: string;
   search?: (query: string) => unknown;
+  stateRoot?: string;
 }
 
 function gitHeadExists(worktree: string, path: string): PathExists {
@@ -243,6 +245,18 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
   const signature = failureOf(ctx);
   switch (role) {
     case 'observe-ledger': {
+      const selector = asRecord(input.failureEvent);
+      if (selector) {
+        if (typeof selector.source !== 'string' || typeof selector.ref !== 'string' || !selector.source || !selector.ref) {
+          return withAddedFacts({ outcome: 'fail', reason: 'invalid-failure-event-selector' }, []);
+        }
+        const since = typeof input.since === 'string' ? input.since : undefined;
+        const event = readFailureInbox({ since }, deps.stateRoot)
+          .filter(row => row.source === selector.source && row.ref === selector.ref)
+          .sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).at(0);
+        if (!event) return withAddedFacts({ outcome: 'empty', reason: 'inbox-event-not-found' }, []);
+        return withAddedFacts({ outcome: 'ok', entries: [{ errorText: event.summary }], event }, ['errorText']);
+      }
       if (!asRecord(input.failure) && Object.keys(failure).length === 0) return withAddedFacts({ outcome: 'empty' }, []);
       const worktree = typeof input.worktree === 'string' ? input.worktree : '';
       const paths = signature.unverified ?? [];

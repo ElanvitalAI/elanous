@@ -36,12 +36,16 @@ export function LiveTraceView({
   now,
   receivedAt,
   lastSettlement,
+  lastActivityTs = null,
+  activityStatus = 'loading',
   wizardSteps = [],
 }: {
   state: RunsState;
   now: number;
   receivedAt: number;
   lastSettlement?: LastSettlement | null;
+  lastActivityTs?: string | null;
+  activityStatus?: 'loading' | 'ready' | 'unavailable';
   wizardSteps?: WizardStepEvent[];
 }) {
   const run = state.currentRunId ? state.runs[state.currentRunId] : null;
@@ -63,6 +67,9 @@ export function LiveTraceView({
       {idle ? (
         <div className="space-y-4 text-muted-foreground">
           <p>지금 도는 런이 없습니다</p>
+          <p role="status">마지막 활동: {lastActivityTs && Number.isFinite(Date.parse(lastActivityTs))
+            ? <time dateTime={lastActivityTs}>{new Date(lastActivityTs).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })} KST</time>
+            : activityStatus === 'loading' ? '확인 중' : activityStatus === 'unavailable' ? '못 읽음' : '기록 없음'}</p>
           <button type="button" className="rounded-lg border border-border px-5 py-3 text-lg" disabled>녹화 보기</button>
         </div>
       ) : (
@@ -94,18 +101,21 @@ export function LiveTraceView({
 }
 
 interface TraceSnapshot {
-  client: Pick<DaemonClient, 'logsStreamUrl'>;
+  client: Pick<DaemonClient, 'logsStreamUrl' | 'listLogs'>;
   baseUrl: string;
   token: string;
   state: RunsState;
   receivedAt: number;
   lastSettlement: LastSettlement | null;
+  lastActivityTs: string | null;
+  activityStatus: 'loading' | 'ready' | 'unavailable';
 }
 
 export function LiveTraceScene() {
   const { client, config } = useDaemon();
   const [snapshot, setSnapshot] = useState<TraceSnapshot>(() => ({
     client, baseUrl: config.baseUrl, token: config.token, state: EMPTY_RUNS, receivedAt: 0, lastSettlement: null,
+    lastActivityTs: null, activityStatus: 'loading',
   }));
   const [now, setNow] = useState(0);
   const [wizardSteps, setWizardSteps] = useState<WizardStepEvent[]>([]);
@@ -113,8 +123,23 @@ export function LiveTraceScene() {
 
   useEffect(() => {
     let active = true;
-    setSnapshot({ client, baseUrl: config.baseUrl, token: config.token, state: EMPTY_RUNS, receivedAt: 0, lastSettlement: null });
+    setSnapshot({ client, baseUrl: config.baseUrl, token: config.token, state: EMPTY_RUNS, receivedAt: 0, lastSettlement: null,
+      lastActivityTs: null, activityStatus: 'loading' });
     setWizardSteps([]);
+    void client.listLogs({ category: 'graph.run', event: 'node', limit: '1' }).then(response => {
+      if (!active) return;
+      setSnapshot(previous => {
+        if (previous.client !== client || previous.baseUrl !== config.baseUrl || previous.token !== config.token) return previous;
+        const ts = response.logs?.[0]?.ts;
+        const validTs = typeof ts === 'string' && Number.isFinite(Date.parse(ts)) ? ts : null;
+        const lastActivityTs = validTs && (!previous.lastActivityTs || Date.parse(validTs) > Date.parse(previous.lastActivityTs))
+          ? validTs : previous.lastActivityTs;
+        return { ...previous, lastActivityTs, activityStatus: response.ok && Array.isArray(response.logs) ? 'ready' : 'unavailable' };
+      });
+    }).catch(() => {
+      if (active) setSnapshot(previous => previous.client === client && previous.baseUrl === config.baseUrl && previous.token === config.token
+        ? { ...previous, activityStatus: 'unavailable' } : previous);
+    });
     const unsubscribeWizard = subscribeWizardSteps(client, event => {
       if (active) setWizardSteps(previous => event.step === 'request' ? [event] :
         [...previous.filter(item => item.wizardId === event.wizardId), event].slice(-6));
@@ -133,8 +158,11 @@ export function LiveTraceScene() {
           : event.phase === 'start' || previousState.currentRunId !== event.runId ? null
           : duplicate ? previous.lastSettlement
           : { receivedAt, nodeId: event.nodeId, phase: event.phase, ts: event.ts };
+        const lastActivityTs = !sameTarget || !previous.lastActivityTs || Date.parse(event.ts) > Date.parse(previous.lastActivityTs)
+          ? event.ts : previous.lastActivityTs;
         return {
           client, baseUrl: config.baseUrl, token: config.token, receivedAt, lastSettlement,
+          lastActivityTs, activityStatus: sameTarget ? previous.activityStatus : 'loading',
           state: reduceRuns(previousState, event),
         };
       });
@@ -150,6 +178,8 @@ export function LiveTraceScene() {
       now={now}
       receivedAt={snapshot.receivedAt}
       lastSettlement={currentTarget ? snapshot.lastSettlement : null}
+      lastActivityTs={currentTarget ? snapshot.lastActivityTs : null}
+      activityStatus={currentTarget ? snapshot.activityStatus : 'loading'}
       wizardSteps={currentTarget ? wizardSteps : []}
     />
   );

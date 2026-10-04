@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildImporterTestIndex } from './importer-test-index.js';
-import { deriveRelatedTests, isElanousRuntimeArtifactPath, resolveGateScope } from './gate-scope.js';
+import { deriveRelatedTests, formatNoRelatedTestsWarning, isElanousRuntimeArtifactPath, resolveGateScope } from './gate-scope.js';
 import { runIntegrityGate } from '../autopilot/build/integrity-gate.js';
 
 /** 존재 판정 스텁 — 실제 파일시스템 무접촉(순수 계약 검증). */
@@ -177,6 +177,34 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
     expect(s.unverified).toEqual(['src/a/b.ts']);
   });
 
+  test('마지막 라운드만 짝이 없으면 전체 런의 앞 라운드 시험을 실제 실행 집합으로 복구한다', () => {
+    const s = resolveGateScope(['src/cli/private-ledger-commands.ts'], has('src/earlier.test.ts'), undefined,
+      { runChanged: ['src/earlier.ts', 'src/earlier.test.ts', 'src/cli/private-ledger-commands.ts'], round: 3 });
+    expect(s.reason).toBe('changed-tests');
+    expect(s.testArgs).toEqual(['src/earlier.test.ts']);
+    expect(s.skipTestStep).toBe(false);
+    expect(s.unverified).toEqual(['src/cli/private-ledger-commands.ts']);
+  });
+
+  test('앞 라운드 소스에서만 짝 시험을 유도해 실행한다', () => {
+    const s = resolveGateScope(['src/cli/private-ledger-commands.ts'], has('test/earlier.test.ts'), undefined,
+      { runChanged: ['src/earlier.ts', 'src/cli/private-ledger-commands.ts'], round: 3 });
+    expect(s.reason).toBe('derived');
+    expect(s.testArgs).toEqual(['test/earlier.test.ts']);
+    expect(s.skipTestStep).toBe(false);
+  });
+
+  test('런 전체에도 시험이 없으면 기존 no-related-tests 와 사람 확인 경고를 유지한다', () => {
+    const s = resolveGateScope(['src/cli/private-ledger-commands.ts'], none, undefined,
+      { runChanged: ['src/earlier.ts', 'src/cli/private-ledger-commands.ts'], round: 3 });
+    expect(s.reason).toBe('no-related-tests');
+    expect(s.skipTestStep).toBe(true);
+    expect(s.testArgs).toBeUndefined();
+    expect(s.unverified).toEqual(['src/cli/private-ledger-commands.ts', 'src/earlier.ts']);
+    expect(formatNoRelatedTestsWarning(s.unverified))
+      .toBe('⚠️ 동작 검증 0: src/cli/private-ledger-commands.ts, src/earlier.ts — 사람 확인 필요');
+  });
+
   test('src/ 밖 소스 개수를 관측용으로 센다', () => {
     const s = resolveGateScope(['scripts/x.ts', 'src/a.ts'], none);
     expect(s.ignoredOutsideSrc).toBe(1);
@@ -280,6 +308,56 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
     expect(s.callerTests.slice(0, 2)).toEqual([{ file: routeConsumer, reasons: ['route'] }, { file: near, reasons: ['import'] }]);
     expect(s.callerTests).toHaveLength(30);
     expect(s.callerTestsOverflow.map(({ file }) => file)).toEqual(importers.slice(28));
+  });
+});
+
+describe('GATE-CMD — registry companions outside the caller cap', () => {
+  const maturity = [
+    'src/maturity/feature-maturity.test.ts',
+    'src/maturity/tui-slash-maturity.test.ts',
+    'src/maturity/bot-command-maturity.test.ts',
+    'src/maturity/cli-maturity.test.ts',
+    'test/slash-filter.test.ts',
+    'test/bot-slash-parity.test.ts',
+  ];
+  const registries = ['src/chat/index.ts', 'src/telegram-commands.ts', 'src/discord-slash-wire.ts', 'src/index.ts'];
+
+  test('each command registry alone pulls existing maturity, slash-filter and bot parity tests without imports', () => {
+    for (const registry of registries) {
+      const scope = resolveGateScope([registry], has(...maturity));
+      expect(scope.reason).toBe('paired-registry');
+      expect(scope.testArgs).toEqual(maturity);
+      expect(scope.skipTestStep).toBe(false);
+      expect(scope.callerTests).toEqual([]);
+      expect(scope.unverified).toEqual([]);
+    }
+  });
+
+  test('unrelated changes do not pull the companions even when they exist', () => {
+    const scope = resolveGateScope(['src/other.ts'], has(...maturity));
+    expect(scope.reason).toBe('no-related-tests');
+    expect(scope.testArgs).toBeUndefined();
+  });
+
+  test('missing companions are silently dropped; conventional and changed-test order stays first', () => {
+    const existing = [maturity[0]!, maturity[2]!, maturity[4]!];
+    const onlyRegistry = resolveGateScope([registries[1]!], has(...existing));
+    expect(onlyRegistry.testArgs).toEqual(existing);
+    const changed = resolveGateScope([registries[0]!, 'src/a.ts', 'src/a.test.ts'], has('src/a.test.ts', 'test/a.test.ts', ...existing));
+    expect(changed.reason).toBe('changed-tests');
+    expect(changed.testArgs).toEqual(['src/a.test.ts', 'test/a.test.ts', ...existing]);
+    expect(changed.pulledInRelatedTests).toEqual(['test/a.test.ts']);
+    expect(resolveGateScope([registries[2]!], none).testArgs).toBeUndefined();
+  });
+
+  test('the caller cap does not evict any companion and callers keep their order', () => {
+    const callers = Array.from({ length: 31 }, (_, i) => `test/off-${i}.test.ts`);
+    const index = { testsBySource: new Map([[registries[3]!, callers]]), unresolvedRelativeSpecifiers: 0 };
+    const scope = resolveGateScope([registries[3]!], has(...callers, ...maturity), index);
+    expect(scope.callerTests).toHaveLength(30);
+    expect(scope.callerTestsOverflow).toHaveLength(1);
+    expect(scope.testArgs?.slice(0, 30)).toEqual(scope.callerTests.map(({ file }) => file));
+    expect(scope.testArgs?.slice(30)).toEqual(maturity);
   });
 });
 
@@ -506,6 +584,27 @@ describe('resolveGateScope — docs-only 는 문서 allowlist 로 판정한다',
       expect(s.reason).toBe('docs-only');
       expect(s.unverified).toEqual([]);
     }
+    const releaseNotes = resolveGateScope(['release/next.md'], none);
+    expect(releaseNotes.reason).toBe('docs-only');
+    expect(releaseNotes.skipTestStep).toBe(true);
+    expect(releaseNotes.testArgs).toBeUndefined();
+  });
+
+  test('release notes + changed test run the test instead of skipping as docs-only', () => {
+    const testFile = 'scripts/release-loop/publish-node.test.ts';
+    const s = resolveGateScope(['release/next.md', testFile], has(testFile));
+    expect(s.reason).toBe('changed-tests');
+    expect(s.skipTestStep).toBe(false);
+    expect(s.testArgs).toEqual([testFile]);
+    expect(s.documentPaths).toEqual(['release/next.md']);
+  });
+
+  test('changed test alone runs as changed-tests', () => {
+    const testFile = 'scripts/release-loop/publish-node.test.ts';
+    const s = resolveGateScope([testFile], has(testFile));
+    expect(s.reason).toBe('changed-tests');
+    expect(s.skipTestStep).toBe(false);
+    expect(s.testArgs).toEqual([testFile]);
   });
 
   test('⭐⭐ 비문서 변경은 docs-only 가 **아니다** — 종전엔 전부 오분류됐다', () => {

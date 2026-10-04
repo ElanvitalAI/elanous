@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReleaseRunInput, latestPublishedPreviousVersion, runUnattendedRelease } from './unattended-release.js';
+import { enableLandingFreeze, disableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 
 function fixture(body: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'unattended-release-'));
@@ -42,6 +43,26 @@ test('release.loop config builds the full graph input with ledger previousVersio
   writeFileSync(configPath, JSON.stringify({ release: { loop } }));
   expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', ...loop });
 }));
+
+test('freeze stops gate and publish graph; force-freeze records bypass and off resumes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-freeze-'));
+  try {
+    enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    let gates = 0;
+    let published = 0;
+    const deps = { freezeRoot: root, ledgerRoot: root, config: { gatePodPool: 'pool' },
+      checklist: () => { gates++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+      graph: async () => { published++; return { status: 'done' } as never; } };
+    await expect(runUnattendedRelease({ version: '0.2.4' }, deps)).rejects.toThrow('동결 중 · drill');
+    expect([gates, published]).toEqual([0, 0]);
+    await runUnattendedRelease({ version: '0.2.4', forceFreeze: true }, deps);
+    expect([gates, published]).toEqual([1, 1]);
+    disableLandingFreeze(root);
+    await runUnattendedRelease({ version: '0.2.4' }, deps);
+    expect([gates, published]).toEqual([2, 2]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('dry run reports input but never invokes the checklist or graph; execution enforces both', async () => {
   const root = mkdtempSync(join(tmpdir(), 'unattended-release-'));

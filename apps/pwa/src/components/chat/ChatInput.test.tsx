@@ -94,13 +94,13 @@ describe('ChatInput · seat requests', () => {
     </DaemonContext.Provider>;
     await act(async () => { tree = create(view(true)); });
     try {
-      await act(async () => { tree.root.findByType('textarea').props.onChange({ target: { value: 'CTO 에게 물어봐: 상태?' } }); });
+      await act(async () => { tree.root.findByType('textarea').props.onChange({ target: { value: 'CTO에게 물어봐 상태?' } }); });
       const enter = async () => { await act(async () => { tree.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); }); };
       await enter();
       expect(calls).toHaveLength(0);
       await act(async () => { tree.update(view(false)); });
       await enter();
-      expect(calls).toHaveLength(1);
+      expect(calls).toEqual(['CTO에게 물어봐 상태?']);
       await enter();
       expect(calls).toHaveLength(1);
       await act(async () => { finish({ reply: '기다립니다' }); });

@@ -68,6 +68,7 @@ import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSuper
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
+import { recordFailureEvent } from './heal-intake.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { reworkDecision } from './decision-events.js';
@@ -83,6 +84,7 @@ import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } fro
 import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
+import { dropStaleReverts, type RevertGuardResult } from './revert-guard.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, gateGitResidue, observeGitResidue } from '../git-fs/worktree.js';
 import { runGitCommand } from '../git-fs/runner.js';
@@ -96,6 +98,8 @@ import { getHarnessSpace, normalizeSpaceId, resolveRunIdentity } from '../harnes
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment, type ReleaseNoteSection } from '../release-loop/release-note.js';
+import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
+import { admitLandingMerge, owningRepoRoot } from './frozen-merges.js';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
@@ -757,6 +761,33 @@ function declaredPathsFromGoalDocumentText(document: string): { readable: boolea
   return parseDeclaredTargetPathsFromAsk(originalAsk);
 }
 
+/** Only paths explicitly designated as targets in the ask or piece text protect an intentional revert. */
+function declaredRevertGuardPaths(text: string): string[] {
+  const lines = targetScopedGoalText(text).split(/\r?\n/);
+  const pieceTargets: string[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!.replace(/^\s*(?:[-*+]\s+|>\s*)+/, '');
+    const declaration = /^(?:조각\s+)?(?:대상\s*경로|target\s*paths?)\s*[:：]\s*(.*)$/i.exec(line);
+    if (!declaration) continue;
+    const fragments = [declaration[1]!];
+    while (index + 1 < lines.length) {
+      const next = lines[index + 1]!.trim().replace(/^(?:[-*+]\s+|>\s*)+/, '');
+      const paths = parseDeclaredTargetPathsFromAsk(`대상 경로: ${next}`).paths;
+      const tokens = next.split(/[·,]/).map((part) => part.trim().replace(/^`+|`+$/g, ''));
+      if (!tokens.length || !tokens.every((token) => token && paths.includes(normalizeDeclaredScopePath(token)))) break;
+      fragments.push(next);
+      index++;
+    }
+    pieceTargets.push(...parseDeclaredTargetPathsFromAsk(`대상 경로: ${fragments.join(',')}`).paths);
+  }
+  return pieceTargets;
+}
+
+function revertGuardTargetPaths(feature: string, goalDocument?: string): string[] {
+  const originalAsk = goalDocument ? extractVerbatimOriginalAsk(goalDocument)?.ask : undefined;
+  return [...new Set([...declaredRevertGuardPaths(feature), ...(originalAsk ? declaredRevertGuardPaths(originalAsk) : [])])];
+}
+
 export function detectDeclaredScopeDiff(input: {
   goalDocument?: string | null;
   changedFiles?: readonly string[] | null;
@@ -972,7 +1003,7 @@ export interface SelfImplementSeams {
   /** 변경 전 ref의 runtime source 전체. 생략 시 git에서 읽으며, 읽기 실패는 판정 미지로 남긴다. */
   reviewBaselineObservationSource?: (cwd: string, base: string) => Promise<string | undefined>;
   /** ④ gate — cwd 에서 bun test/build. postsync=정합 후 재게이트(merge-base 실행 범위). */
-  gate: (cwd: string, ctx?: { runId?: string; mode?: 'postsync' }) => Promise<SelfImplementGateResult>;
+  gate: (cwd: string, ctx?: { runId?: string; mode?: 'postsync'; round?: number }) => Promise<SelfImplementGateResult>;
   /** Gate가 실행된 worktree HEAD가 local origin/main보다 뒤처진 커밋 수. 실패는 undefined(unknown)로 정직하게 남긴다. */
   gateWorktreeBehindMain?: (cwd: string) => Promise<number | undefined>;
   /** 변경 파일 목록 — 게이트 «라우터»가 「코드가 바뀌었나」를 판정하는 입력.
@@ -1029,6 +1060,8 @@ export interface SelfImplementSeams {
   /** ★ ⑦ 병합 seam(2026-07-21·auto-merge) — 열린 PR 을 실제 병합(gh pr merge --squash). `matchHeadCommit`이 있으면
    * 검사한 고정 head 뒤 변경을 gh가 거부한다. autoMerge + 리뷰 clean 일 때만 호출(outward-facing·main 자율병합). */
   mergePr?: (opts: { number: number; cwd: string; matchHeadCommit?: string }) => Promise<{ merged: boolean; baseRefName?: string; mergeCommit?: string; detail?: string }>;
+  /** Only successful merges trigger this injected, fail-closed draft inventory and mutation seam. */
+  supersedeDraftsOnMerge?: (number: number, cwd: string) => Promise<void>;
   /** Post-merge cleanup is opt-in and injectable so tests never touch the filesystem. */
   postMergeCleanup?: {
     enabled: boolean;
@@ -2551,12 +2584,16 @@ function releaseNoteForRun(goalFile: string | undefined, feature: string): Relea
 }
 
 /** GATE-CALLERS (OP 10-03): caller tests that exceeded the gate cap must stay visible in the PR body even when the gate log is cut. */
+export function exposeGateLines(gateLog?: string): string[] {
+  return (gateLog ?? '').split('\n').filter((line) => line.startsWith('[expose]'));
+}
+
 export function gateNotRunSection(gateLog?: string): string[] {
   const lines = (gateLog ?? '').split('\n').filter((line) => line.startsWith('⚠️ caller test cap exceeded'));
   return lines.length ? ['', '## Gate · 안 돈 소비자 시험(상한 초과)', ...lines.map((line) => `- ${line.replace(/^⚠️ caller test cap exceeded — not run: /, '')}`)] : [];
 }
 
-function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>): string {
+function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>, revertGuard?: RevertGuardResult): string {
   const note = releaseNote ?? releaseNoteForRun(goalFile, feature);
   const relaxation = planRevision?.relaxation
     ? ['', '## 감독 수용 기준 완화', `- 대상: ${planRevision.relaxation.target}`, `- 이전: ${planRevision.relaxation.expected}`, `- 완화: ${planRevision.relaxation.replacement}`, `- 이유: ${planRevision.reason}`, `- 적용: ${planRevision.application?.status ?? 'failed'}${planRevision.application?.detail ? ` (${planRevision.application.detail})` : ''}`, ...(planRevision.disposition ? [`- 충돌 처분: ${planRevision.disposition}`] : [])]
@@ -2577,7 +2614,14 @@ function prBody(feature: string, implSummary: string, gateLog?: string, review?:
       ...(review.shouldFix.length ? ['', '**should-fix (비블로킹):**', ...review.shouldFix.slice(0, 8).map((f) => `- ${f}`)] : [])] : []),
     ...(autoReviewDeclineReasons?.length ? ['', '## Auto-review label not applied', 'The requested auto-review label was declined by the autonomy gate:', ...autoReviewDeclineReasons.map((reason) => `- ${reason}`)] : []),
     ...gateNotRunSection(gateLog),
-    ...(gateLog ? ['', '## Gate', '```', gateLog.trim().slice(0, 3000), '```'] : []),
+    ...(gateLog || revertGuard ? ['', '## Gate',
+      // 경고는 잘린 gate 로그의 코드블록 밖에서도 한눈에 보인다.
+      ...((gateLog ?? '').split('\n').filter((line) => line.startsWith('⚠️ 동작 검증 0:'))),
+      ...exposeGateLines(gateLog),
+      ...(gateLog ? ['```', gateLog.trim().slice(0, 3000), '```'] : []),
+      ...(revertGuard?.reverted.length ? [`- 되돌림 방지: ${revertGuard.reverted.length}파일 제외`] : []),
+      ...(revertGuard?.protected.length ? [`- 되돌림 경고: 대상 경로 ${revertGuard.protected.length}파일 유지 (${revertGuard.protected.join(', ')})`] : []),
+      ...(revertGuard?.warning ? [`- 되돌림 검사 실패(커밋 계속): ${revertGuard.warning}`] : [])] : []),
     ...relaxation,
     '',
     '🤖 self-implement 오케스트레이터 (elanous 자율 구현·리뷰-게이트 병합)',
@@ -2807,7 +2851,7 @@ function blockedDraftPrBody(feature: string, implSummary: string, state: Blocked
     ...(state.gate === undefined
       ? ['(게이트 미실행)']
       : state.gate.log
-        ? ['```', state.gate.log.trim().slice(0, 3000), '```']
+        ? [...state.gate.log.split('\n').filter((line) => line.startsWith('⚠️ 동작 검증 0:')), ...exposeGateLines(state.gate.log), '```', state.gate.log.trim().slice(0, 3000), '```'] // 경고는 절단된 로그 밖에도 보존한다.
         : ['(게이트 실행됨 · 로그 없음)']),
     '',
     '## Main-sync typecheck',
@@ -4087,6 +4131,19 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     throw e;
   } finally {
     if (loopRegistered) registerRunLoop('ended');
+    const terminalStage = terminalResult?.stage ?? 'crashed';
+    try {
+      const mappedStatus = mapStageToRunStatus(terminalStage)?.runStatus;
+      if (!terminalResult || mappedStatus === 'failed' || (mappedStatus === undefined && terminalResult.ok === false) || signalIncompleteState(roundClassifications).latestSignalIncomplete) {
+        recordFailureEvent({
+          source: 'harness-run', kind: terminalStage, ref: runId,
+          summary: opts.feature.split(/\r?\n/, 1)[0]?.trim() || `Harness run ${runId} failed`,
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      logRunAwareFailSoft(runId, 'heal-intake-record-failed', { stage: terminalStage, error: safeErrorDescription(error) });
+    }
     if (terminalResult) await recordGoalExecution(terminalResult);
     // ⛔⭐⭐⭐ 종결을 «못 적고» 죽는 길을 막는다 (2026-08-11 · 🅣 71차 · 대표 「종료 때 정리가 안 되면 설계 문제」).
     //   `terminalResult` 는 «두 자리»에서만 선다 — 정상 종료 ⊕ `StepTimeoutError` 분기.
@@ -5279,6 +5336,13 @@ async function runSelfImplementInner(
   let finishedChildCommitMissing = false;
   let finishedChildCommitFailure: string | undefined;
   let finishedChildCommitted = false;
+  const revertGuard: RevertGuardResult = { reverted: [], protected: [] };
+  const inspectStaleReverts = (targets: readonly string[]): void => {
+    const inspected = dropStaleReverts(wt.path, targets, runId, getUserConfig().harness?.revertGuard?.depth);
+    for (const file of inspected.reverted) if (!revertGuard.reverted.includes(file)) revertGuard.reverted.push(file);
+    for (const file of inspected.protected) if (!revertGuard.protected.includes(file)) revertGuard.protected.push(file);
+    if (inspected.warning) revertGuard.warning = inspected.warning;
+  };
   const classifyUnfinishedRun = (stage: SelfImplementStage, verdict?: ReworkBudgetVerdict, decomposition?: TerminalDecomposition): AbandonedClassificationResult => {
     const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
     const worktree = unfinishedWorktreeObservation(wt.path);
@@ -6306,6 +6370,7 @@ async function runSelfImplementInner(
           .filter((path) => !harnessSeededPaths.includes(path)
             && targets.some((target) => changedFileIsInsideDeclaredTarget(path, target)));
         if (eligible.length) {
+          inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
           const message = `self-implement: ${prTitle(opts.feature)}`;
           let outcome: { ok: boolean; out: string };
           try {
@@ -6514,7 +6579,7 @@ async function runSelfImplementInner(
           return { ...stoppedBeforeGate, ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}) };
         }
         onNodeEntry(node('gate'), round);
-        gate = await stepTimeout(s.gate(wt.path, { runId }), T.gate, 'gate');
+        gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
       } else {
         observe('gate-skipped-by-graph', { ...graphAuthorityFields(graphAuthority, graphTemplate), round, reason: gateRoute.reason, changedFileCount: gateRouteFiles?.length ?? null });
         gate = {
@@ -7106,6 +7171,11 @@ async function runSelfImplementInner(
 
   if (s.mergeMain && s.commitWork) {
     onNodeEntry('main-sync', round);
+    let goalDocument: string | undefined;
+    if (opts.goalFile) {
+      try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* no documented targets */ }
+    }
+    inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
     s.commitWork(wt.path, prTitle(opts.feature));
     // ⛔⭐ resume 경로와 «같은» 해석기를 쓴다 — 두 자리가 갈리면 같은 원인이 다른 얼굴로 나온다.
     const resolvedTarget = resolveDefaultBranchTarget(s.defaultBranchRef ?? defaultBranchRef, wt.path);
@@ -7139,7 +7209,7 @@ async function runSelfImplementInner(
         ? `${mergeTarget} 충돌해결됨 — ${formatLlmMergeOutcome(sync)} — 통합 결과 full 재-gate…`
         : `${mergeTarget} 정합됨 — 통합 결과 full 재-gate…`);
       onNodeEntry('regate', round);
-      const regate = await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync' }), T.gate, 'gate');
+      const regate = await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync', round }), T.gate, 'gate');
       if (!regate.passed) await onFailureVerdict('gate');
       // `mode` name/meaning stay: `full` = existing gate including tests. Both
       // conflict-resolved and clean-merge reuse this same `s.gate` invocation.
@@ -7269,7 +7339,7 @@ async function runSelfImplementInner(
   addNextMdReleaseNote(wt.path, releaseNote);
   const preparedPrBody = preparePrBody(
     [
-      prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote),
+      prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote, revertGuard),
       ...(prEvidenceDecision.body ? ['', '---', '', prEvidenceDecision.body] : []),
     ].join('\n'),
     s.persistPrBodyArtifact,
@@ -7418,11 +7488,45 @@ async function runSelfImplementInner(
       progress('pr-opened', `호스트 재게이트 대기 (#${pr.number})`);
       return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
     }
-    onNodeEntry('merge', round);
-    progress('merging', '자동 병합 (리뷰 clean·squash)…');
-    const m = await withStepTimeout(s.mergePr!({ number: pr.number, cwd: wt.path, matchHeadCommit: checkedHeadCommit! }), T.pr, 'pr');
+    // Landing freeze: the in-flight marker is written before the freeze is read, so a `freeze on` racing this merge waits.
+    // The resume sweep merges from the repository that owns the run worktree (the worktree itself may be cleaned up).
+    const heldEntry = () => {
+      if (!checkedHeadCommit || !/^[0-9a-f]{40}$/i.test(checkedHeadCommit)) return null;
+      const owner = owningRepoRoot(wt.path);
+      // Without a known owning repository the held PR stays queued for a person; no sweep resumes it from a worktree.
+      return owner ? { prNumber: pr.number, headCommit: checkedHeadCommit, repoRoot: owner } : { prNumber: pr.number, headCommit: checkedHeadCommit, repoRoot: wt.path, manual: true as const };
+    };
+    const landing = admitLandingMerge(heldEntry, undefined, {}, { prNumber: pr.number, repoRoot: owningRepoRoot(wt.path) ?? wt.path, ...(checkedHeadCommit ? { headCommit: checkedHeadCommit } : {}) });
+    if (landing.kind === 'held' && !(checkedHeadCommit && /^[0-9a-f]{40}$/i.test(checkedHeadCommit))) {
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: 'merge-guard-unevaluated', prUrl: pr.url, prNumber: pr.number, detail: 'freeze: checked head SHA unavailable; PR left ready for review' };
+    }
+    if (landing.kind !== 'merge') {
+      const detail = landing.kind === 'held' ? landingFreezeMessage(landing.freeze) : 'freeze lifted; a resume sweep is merging this PR';
+      debug.log('harness.merge', 'frozen', { pr: pr.number, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
+      progress('pr-opened', `#${pr.number} ready · ${detail}`);
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: landing.kind === 'held' ? 'frozen' : 'resumed-elsewhere', prUrl: pr.url, prNumber: pr.number, detail };
+    }
+    // The marker and claim live until the merge call itself settles — a step timeout does not stop a merge already
+    // sent — and anything that throws before the merge call is made releases them.
+    let merging: ReturnType<NonNullable<typeof s.mergePr>>;
+    try {
+      onNodeEntry('merge', round);
+      progress('merging', '자동 병합 (리뷰 clean·squash)…');
+      merging = s.mergePr!({ number: pr.number, cwd: wt.path, matchHeadCommit: checkedHeadCommit! });
+    } catch (error) { landing.end(); throw error; }
+    // The default merge seam resolves only after `gh pr view` reads MERGED, so settling is the confirmation.
+    const release = (merged: boolean) => {
+      try { landing.end(merged); } catch (error) { observe('landing-release-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'error' }); }
+    };
+    void merging.then((outcome) => release(outcome.merged === true), () => release(false));
+    const m = await withStepTimeout(merging, T.pr, 'pr');
     observe('merged', { number: pr.number, merged: m.merged, detail: m.detail ?? null });
     if (m.merged) {
+      try {
+        await s.supersedeDraftsOnMerge?.(pr.number, wt.path);
+      } catch (error) {
+        observe('draft-supersede-on-merge-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'warn' });
+      }
       const directory = releaseNotesDir(elanousStateRoot());
       const fragment: ReleaseNoteFragment = {
         pr: pr.number,

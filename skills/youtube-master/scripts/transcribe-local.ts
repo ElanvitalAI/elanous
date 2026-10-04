@@ -8,7 +8,7 @@ initEnv();
 const chunksDir = process.argv[2];
 const outFile = process.argv[3];
 if (!chunksDir || !outFile) {
-  console.error('usage: tsx transcribe-local.ts <chunksDir> <outFile>');
+  console.error('usage: bun transcribe-local.ts <chunksDir> <outFile>');
   process.exit(1);
 }
 

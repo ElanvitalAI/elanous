@@ -193,9 +193,13 @@ function inventory(deps: SchedulesReadDeps): { cards: ScheduleCard[]; names: Map
   return { cards, names };
 }
 
+export function readSchedulesInventory(deps: SchedulesReadDeps = {}): ScheduleCard[] {
+  return inventory(deps).cards;
+}
+
 export function handleSchedulesList(req: Request, opts: MetaApiOpts, deps: SchedulesReadDeps = {}): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
-  const { cards } = inventory(deps);
+  const cards = readSchedulesInventory(deps);
   const schedules = new URL(req.url).searchParams.get('includeOff') === '1' ? cards : cards.filter(c => c.state !== 'off');
   return jsonResponse({ schedules, count: schedules.length }, 200);
 }

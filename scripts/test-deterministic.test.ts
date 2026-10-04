@@ -205,7 +205,7 @@ test('deterministic runner probe', async () => {
       ELANOUS_TEST_HOME: process.env.ELANOUS_TEST_HOME,
       ELANOUS_HOST_ID: process.env.ELANOUS_HOST_ID ?? null,
       ELANOUS_STATE_DIR: process.env.ELANOUS_STATE_DIR,
-      ELANOUS_CONFIG_DIR: process.env.ELANOUS_CONFIG_DIR,
+      ELANOUS_CONFIG_DIR: process.env.ELANOUS_CONFIG_DIR ?? null,
       GIT_DIR: process.env.GIT_DIR ?? null,
       GIT_WORK_TREE: process.env.GIT_WORK_TREE ?? null,
       GIT_COMMON_DIR: process.env.GIT_COMMON_DIR ?? null,
@@ -302,7 +302,8 @@ describe('scripts/test-deterministic.ts preservation', () => {
     expect(source).toContain('delete env.XDG_CONFIG_HOME;');
     expect(source).toContain('env.ELANOUS_TEST_HOME = testRoot;');
     expect(source).toContain("env.ELANOUS_STATE_DIR = join(testRoot, 'state');");
-    expect(source).toContain("env.ELANOUS_CONFIG_DIR = join(testRoot, 'config');");
+    expect(source).toContain('delete env.ELANOUS_CONFIG_DIR;');
+    expect(source).not.toMatch(/env\.ELANOUS_CONFIG_DIR\s*=/);
     expect(source).toContain('env,');
     expect(source).toContain("stdin: 'inherit'");
     expect(source).toContain("stdout: 'inherit'");
@@ -350,7 +351,7 @@ describe('scripts/test-deterministic.ts preservation', () => {
 });
 
 describe('prepareIsolatedTestEnv', () => {
-  test('strips credential-shaped keys while pinning HOME, XDG, and elanous roots', () => {
+  test('strips credential-shaped keys while isolating HOME and the state-backed config root', () => {
     const testRoot = '/isolated/elanous-deterministic-test-root';
     const env = prepareIsolatedTestEnv({
       ANTHROPIC_API_KEY: 'live-secret',
@@ -388,7 +389,7 @@ describe('prepareIsolatedTestEnv', () => {
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(env.ELANOUS_TEST_HOME).toBe(testRoot);
     expect(env.ELANOUS_STATE_DIR).toBe(`${testRoot}/state`);
-    expect(env.ELANOUS_CONFIG_DIR).toBe(`${testRoot}/config`);
+    expect(env.ELANOUS_CONFIG_DIR).toBeUndefined();
     expect(env.ELANOUS_HARNESS_SPACE).toBeUndefined();
     expect(env.ELANOUS_HARNESS_SPACE_ID).toBeUndefined();
     expect(env.ELANOUS_HARNESS_BOUNDARY).toBeUndefined();
@@ -1151,7 +1152,7 @@ describe('runtime entrypoint', () => {
       expect(probe.XDG_CONFIG_HOME).toBeNull();
       expect(probe.ELANOUS_TEST_HOME).toBe(probe.HOME);
       expect(probe.ELANOUS_STATE_DIR).toBe(`${probe.HOME}/state`);
-      expect(probe.ELANOUS_CONFIG_DIR).toBe(`${probe.HOME}/config`);
+      expect(probe.ELANOUS_CONFIG_DIR).toBeNull();
       expect(probe.ANTHROPIC_API_KEY).toBeNull();
       expect(probe.APIFY_TOKEN).toBeNull();
       expect(existsSync(probe.HOME)).toBe(true);

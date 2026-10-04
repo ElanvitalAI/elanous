@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
-import { contextNow, type ContextNowDeps } from './context-now.js';
-import { renderTelegramNow, renderTuiNow, seatsNowLine } from './context-now-surfaces.js';
+import { contextNow, type ContextFact, type ContextNowDeps } from './context-now.js';
+import { renderCardNow, renderTelegramNow, renderTuiNow, renderVoiceNow, seatsNowLine } from './context-now-surfaces.js';
 import { defaultTelegramCommands, parseTelegramSlash } from '../telegram-commands.js';
 import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../dashboard/slash-runtime/dashboard-handlers.js';
 
@@ -175,6 +175,74 @@ test('seatsNowLine selects latest seat per role, orders roles and falls back to 
 test('seatsNowLine returns null with no seat facts', () => {
   const answer = contextNow({}, { ...deps, seatEntries: () => [] });
   expect(seatsNowLine(answer, Date.parse(at))).toBeNull();
+});
+
+test('voice renders two spoken sentences under 120 characters each from current seats and open decision', () => {
+  const privateBody = 'PRIVATE-8927';
+  const seatEntries: NonNullable<ContextNowDeps['seatEntries']> = () => [{
+    entry: { seat: 'TC', at, status: 'shadow', item: {
+      source: 'checklist', id: 'K6', title: 'Context door', text: privateBody,
+    } }, source: 'elanous://seat-loop/TC/1#1',
+  }];
+  expect(seatEntries(new Date(at))[0]?.entry.item?.text).toBe(privateBody);
+  const answer = contextNow({}, { ...deps, seatEntries });
+  expect(renderVoiceNow(answer)).not.toContain(privateBody);
+  expect(answer.facts).toContainEqual(expect.objectContaining({ kind: 'seat', title: 'Context door' }));
+  answer.facts.push({ kind: 'seat', seat: 'TC', at: '2026-10-03T05:00:00.000Z', status: 'now', id: null,
+    title: '새 일 ' + '가'.repeat(200), source: 'fake://tc/new' });
+  answer.facts = answer.facts.map(fact => fact.kind === 'decision'
+    ? { ...fact, title: 'Release review ' + '나'.repeat(200) } : fact);
+  const voice = renderVoiceNow(answer);
+  const sentences = voice.split('。 ').map(part => part.replace(/。$/, ''));
+  expect(sentences).toHaveLength(2);
+  expect(sentences.every(part => Array.from(part).length <= 119)).toBe(true);
+  expect(sentences[0]).toContain('TC 새 일');
+  expect(sentences[0]).not.toContain('Context door');
+  expect(sentences[1]).toContain('Release review');
+  expect(voice).not.toContain(privateBody);
+  expect(voice).not.toContain('elanous://');
+});
+
+test('voice chooses the latest seat record by instant across time zones', () => {
+  const answer = contextNow({}, deps);
+  answer.facts = [
+    { kind: 'seat', seat: 'TC', at: '2026-10-03T10:00:00+09:00', status: 'old', id: null, title: 'Earlier work', source: 'fake://tc/earlier' },
+    { kind: 'seat', seat: 'TC', at: '2026-10-03T02:00:00Z', status: 'now', id: null, title: 'Latest work', source: 'fake://tc/latest' },
+  ];
+  const voice = renderVoiceNow(answer);
+  expect(voice).toContain('TC Latest work');
+  expect(voice).not.toContain('Earlier work');
+});
+
+test('voice handles missing seats and decisions and chooses the remaining cell', () => {
+  const answer = contextNow({}, { ...deps, seatEntries: () => [], decisions: () => [] });
+  expect(renderVoiceNow(answer)).toContain('지금 자리 현황은 확인되지 않았습니다。');
+  expect(renderVoiceNow(answer)).toContain('다음은 Context door 칸을 확인해야 합니다。');
+  answer.facts = [];
+  expect(renderVoiceNow(answer)).toBe('지금 자리 현황은 확인되지 않았습니다。 다음에 필요한 결정이나 미완료 칸은 확인되지 않았습니다。');
+});
+
+test('card keeps source-labelled public facts and events without private bodies or mutating the answer', () => {
+  const answer = contextNow({ topic: 'Context door' }, deps);
+  const before = structuredClone(answer);
+  const card = renderCardNow(answer);
+  expect(card.title).toBe(`지금 · Context door (${answer.at})`);
+  expect(card.sections.map(section => section.label)).toEqual(['판', '칸', '결정', '자리', '최근', '안내']);
+  const text = (fact: ContextFact) => {
+    switch (fact.kind) {
+      case 'version': return fact.version;
+      case 'cell': return `${fact.id} ${fact.title} (${fact.status})`;
+      case 'decision': return `${fact.id} ${fact.title} (${fact.status})`;
+      case 'seat': return `${fact.seat} ${fact.id ?? ''} ${fact.title ?? ''} (${fact.status})`.trim();
+    }
+  };
+  expect(card.sections.flatMap(section => section.items)).toEqual([
+    ...answer.facts.map(fact => ({ text: text(fact), source: fact.source })),
+    ...answer.events.map(event => ({ text: event.summary, source: event.source })),
+    ...answer.guide.map(text => ({ text, source: '' })),
+  ]);
+  expect(JSON.stringify(card)).not.toContain('SECRET CONVERSATION');
+  expect(answer).toEqual(before);
 });
 
 test('topic filtering agrees across Telegram and TUI and never exposes private bodies', async () => {

@@ -3745,6 +3745,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'deliverable-verify',
     // 🧹 draft PR 정리 — `harness drafts`(installHarnessDraftSweepCommand).
     'drafts',
+    // 🎯 골 조회 — `harness goal <pr|runId>`(GOAL-LIFE1B #23800).
+    'goal',
     'incidents',
     'map',
     'mission',
@@ -3849,6 +3851,8 @@ describe('harness orchestrate canonical entrance capability', () => {
 
   test('canonical entrance persists run lifecycle through the real run-store format before invoking the shared execution seam', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'elanous-harness-run-store-'));
+    const previousSeat = process.env.ELANOUS_HARNESS_SEAT;
+    process.env.ELANOUS_HARNESS_SEAT = 'OP';
     try {
       const plan = buildHarnessOrchestratePlan(['goal-a'], { concurrency: '4' });
       expect(plan.ok).toBe(true);
@@ -3877,6 +3881,7 @@ describe('harness orchestrate canonical entrance capability', () => {
             goals: [{ id: 'g1', feature: 'goal-a', dependsOn: ['root'] }],
             participants: [{ id: 'process:4242', kind: 'process', transports: [], runIdSource: 'minted' }],
             pid: 4242,
+            seat: 'OP',
           });
           input.runtime.checkpoint?.([{ taskId: 't1', feature: 'goal-a', status: 'done' }]);
           return { ok: true, results: [{ taskId: 't1', feature: 'goal-a', status: 'done' }], exitCode: 0 };
@@ -3897,11 +3902,14 @@ describe('harness orchestrate canonical entrance capability', () => {
         goals: [{ id: 'g1', feature: 'goal-a', dependsOn: ['root'] }],
         participants: [{ id: 'process:4242', kind: 'process', transports: [], runIdSource: 'minted' }],
         pid: 4242,
+        seat: 'OP',
       });
       expect(runInputs).toHaveLength(1);
       expect(runInputs[0]).toMatchObject({ goals: [{ id: 'g1', feature: 'goal-a', dependsOn: ['root'] }], concurrency: 4 });
       expect((runInputs[0] as { runtime: { checkpoint?: unknown } }).runtime.checkpoint).toBeFunction();
     } finally {
+      if (previousSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+      else process.env.ELANOUS_HARNESS_SEAT = previousSeat;
       await rm(dir, { recursive: true, force: true });
     }
   });

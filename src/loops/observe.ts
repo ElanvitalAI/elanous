@@ -1,4 +1,5 @@
 import { debug } from '../debug/log.js';
+import { recordFailureEvent } from '../self-implement/heal-intake.js';
 
 /** Event vocabulary of the loop-agent manifest observability contract. */
 export const LOOP_EVENTS = [
@@ -46,4 +47,13 @@ export function loopEvent(loopId: string, event: string, data: Record<string, un
   const missingRequired = REQUIRED_CONTEXT.filter(field =>
     typeof data[field] !== 'string' || !(data[field] as string).trim());
   debug.log(`loop.${loopId}`, event, { ...data, loopId, missingRequired });
+  if (event === 'tick' && (data.outcome === 'failed' || data.status === 'failed')) {
+    try {
+      recordFailureEvent({ source: 'loop-tick', kind: event, ref: loopId,
+        summary: `Loop ${loopId} tick failed`, at: new Date().toISOString() });
+    } catch (error) {
+      try { debug.log('heal.intake', 'record-failed', { source: 'loop-tick', kind: event, ref: loopId, error: String(error) }, { level: 'error' }); }
+      catch { /* Heal reporting must not change the tick outcome. */ }
+    }
+  }
 }

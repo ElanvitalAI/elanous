@@ -2,26 +2,31 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAgentMission, codexBackend } from './driver.js';
+import { runAgentMission, codexBackend, type EvidenceMode } from './driver.js';
 import { emitPtyDecision, type PtyDecision } from './pty-decision.js';
 import { runPtyControlLoop } from '../autopilot/pty-control-loop.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
+import { debug } from '../debug/log.js';
 
 type Fixture = { result: Awaited<ReturnType<typeof runAgentMission>>; writes: string[]; events: PtyDecision[]; calls: number };
 
-async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'failed-screen' | 'healthy'): Promise<Fixture> {
+async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'failed-screen' | 'failed-no-evidence' | 'rg-screen' | 'no-success' | 'healthy', evidence: EvidenceMode = { kind: 'doc', dirRel: 'docs', glob: /output/ }): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), 'mission-recover-'));
   const writes: string[] = [];
   const events: PtyDecision[] = [];
-  let screen = mode === 'failed-screen' ? 'Error: build failed' : mode === 'healthy' ? 'MISSION-COMPLETE' : 'frozen terminal';
-  let ready = mode === 'failed-screen' || mode === 'healthy';
+  let screen = mode === 'failed-screen' || mode === 'failed-no-evidence' ? 'Error: build failed'
+    : mode === 'rg-screen' ? '• Failed (exit 1) rg --files -g AGENTS.md\n└ no matches\nThe requested document is ready.'
+    : mode === 'no-success' ? 'The requested document is ready.'
+    : mode === 'healthy' ? 'MISSION-COMPLETE' : 'frozen terminal';
+  let ready = ['failed-screen', 'rg-screen', 'no-success', 'healthy'].includes(mode);
+  const finished = ['failed-screen', 'failed-no-evidence', 'rg-screen', 'no-success', 'healthy'].includes(mode);
   let now = 0;
   let calls = 0;
   let changingFrame = 0;
   try {
     const result = await runAgentMission({
       mission: 'Run the command', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence: { kind: 'doc', dirRel: 'docs', glob: /output/ }, memory: false, resources: 'off', commit: false,
+      evidence, memory: false, resources: 'off', commit: false,
       recoverAfterMs: 40_000, screensDir: join(dir, 'screens'), maxRounds: 12,
     }, {
       createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
@@ -47,7 +52,7 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
         }, kill: () => {},
       } as unknown as PtyHandle)),
       checkEvidence: () => ready ? { ok: true, path: join(dir, 'docs', 'output.md') } : { ok: false, path: null, retry: 'output missing' },
-      controlStream: async () => { calls++; return ready ? '{"action":"verify","reason":"completed"}' : '{"action":"wait"}'; },
+      controlStream: async () => { calls++; return finished ? '{"action":"verify","reason":"completed"}' : '{"action":"wait"}'; },
       runControlLoop: (brain, deps, opts) => runPtyControlLoop(brain, {
         ...deps, settle: async () => {}, now: () => now,
         sleep: async () => { now += ['question', 'choice-question', 'scrollback', 'changing-question', 'progress-after-enter'].includes(mode) ? 1 : 40_000; },
@@ -119,6 +124,35 @@ test('DRIVE-OK failure on the final PTY screen cannot turn passing file evidence
   expect(result.ok).toBe(false);
   expect(result.detail).toContain('DRIVE-OK: Error: build failed');
   expect(events.filter((event) => event.step === 'recover')).toHaveLength(0);
+});
+
+test('rg exit 1 in Codex tool history with verified evidence completes the mission', async () => {
+  const rows: Array<{ verdict: unknown; reason: unknown; evidence: unknown }> = [];
+  const originalLog = debug.log;
+  debug.log = ((category: string, event: string, data: { verdict: unknown; reason: unknown; evidence: unknown }) => {
+    if (category === 'agent-mission' && event === 'drive-ok') rows.push(data);
+  }) as typeof debug.log;
+  try {
+    const { result } = await fakeMission('rg-screen');
+    expect(result).toMatchObject({ ok: true, evidenceSatisfied: true, driveVerdict: 'success-unverified', detail: '완료(증거)' });
+    expect(rows).toContainEqual({ verdict: 'success-unverified', reason: 'final PTY screen has no success evidence', evidence: true });
+  } finally { debug.log = originalLog; }
+});
+
+test.each(['tsc', 'test'] as const)('verified %s evidence completes despite rg exit 1 in tool history', async (kind) => {
+  const evidence: EvidenceMode = kind === 'tsc' ? { kind } : { kind, testPath: 'proof.test.ts' };
+  const { result } = await fakeMission('rg-screen', evidence);
+  expect(result).toMatchObject({ ok: true, evidenceSatisfied: true, driveVerdict: 'success-unverified', detail: '완료(증거)' });
+});
+
+test('an actual error without evidence remains failed', async () => {
+  const { result } = await fakeMission('failed-no-evidence');
+  expect(result).toMatchObject({ ok: false, evidenceSatisfied: false, driveVerdict: 'done-but-failed' });
+});
+
+test('verified evidence completes even without a success phrase on the screen', async () => {
+  const { result } = await fakeMission('no-success');
+  expect(result).toMatchObject({ ok: true, evidenceSatisfied: true, driveVerdict: 'success-unverified', detail: '완료(증거)' });
 });
 
 test('three repetitions of the same question start recovery before the time threshold', async () => {

@@ -220,7 +220,17 @@ fi
 echo "[coord-post] 발신 성공$VIA · 채널 #$PR · 신원 [$ID] · 시각 $TS" >&2
 # Only a successfully sent post is recorded; never pass the body or later lines to the ledger.
 POST_URL=$(printf '%s\n' "$POST_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+#issuecomment-[0-9]+|https://github\.com/[^[:space:]]+/pull/[0-9]+#issuecomment-[0-9]+' | head -1 || true)
-if ! bun bin/elanous.mjs coord event record --seat "$ID" --header "$(head -1 "$TMP")" --url "$POST_URL" >/dev/null 2>&1; then
+# The channel is a production surface, so its record belongs in the production ledger, not this tree's
+# test universe (OP 10-04 18:00). An explicit ELANOUS_STATE_DIR is the caller's chosen universe and wins;
+# otherwise prefer the installed CLI (resolves prod from any tree), else pin the source CLI to prod.
+if [ -n "${ELANOUS_STATE_DIR:-}" ]; then
+  RECORD=(bun bin/elanous.mjs coord event record)
+elif command -v eln >/dev/null 2>&1; then
+  RECORD=(eln coord event record)
+else
+  RECORD=(env ELANOUS_STATE_DIR="$HOME/.elanous" bun bin/elanous.mjs --config-dir "$HOME/.elanous" coord event record)
+fi
+if ! "${RECORD[@]}" --seat "$ID" --header "$(head -1 "$TMP")" --url "$POST_URL" >/dev/null 2>&1; then
   echo '⚠️ 맥락 원장 기록 실패(발신은 됐다)' >&2
 fi
 exit 0

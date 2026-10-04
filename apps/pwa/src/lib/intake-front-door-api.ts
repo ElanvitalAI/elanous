@@ -2,6 +2,7 @@
  * PWA intake 첫 입구 I0 — 이미 있는 데몬 입구 셋만 부른다.
  *   POST /v1/intake-ledger/items
  *   GET  /v1/intake-ledger/items/:id   (원문은 응답에 없다)
+ *   POST /v1/task-cards/wish
  *   POST /v1/harness/ask
  *   GET  /v1/harness/ask-status?acceptanceId=
  *   GET  /v1/harness/run-events?runId=
@@ -81,6 +82,15 @@ export async function submitAbsorb(client: DaemonClient, text: string): Promise<
     body: JSON.stringify({ items, source: 'pwa' }),
   });
   return { ids: body.ids, added: body.added, merged: body.merged };
+}
+
+export interface WishCardResult { cardId: string; title: string; created: boolean }
+
+export function submitWishCard(client: DaemonClient, text: string, sessionId: string, ref: string): Promise<WishCardResult> {
+  return client.fetchJson<WishCardResult>('/v1/task-cards/wish', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text, sessionId, ref }),
+  });
 }
 
 export async function submitGraph(client: DaemonClient, text: string): Promise<GraphAcceptResult> {

@@ -5,6 +5,7 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { FabricStageHeader } from '@/components/shell/FabricStageHeader';
+import Link from 'next/link';
 
 /**
  * Scheduler 표면 (2026-07-08 부활 · registry 기반).
@@ -522,6 +523,7 @@ export function SchedulerPanel() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <Link href="/loops" className="rounded-lg border border-border px-3 py-2 text-sm hover:bg-accent">루프 현황 →</Link>
           {data && (
             <>
               <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs">

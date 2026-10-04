@@ -4,9 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CardStore, foldSections } from '../task-cards/card-store.js';
 import { scanWishFolder } from './wish-folder.js';
+import { wishBenchmarkLedgerPath } from './wish-benchmark-ledger.js';
 
 const roots: string[] = [];
+const originalStateDir = process.env.ELANOUS_STATE_DIR;
 afterEach(() => {
+  if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = originalStateDir;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -26,16 +30,23 @@ test('Wish markdown files become one card each, repeat skips, changed mtime upda
   mkdirSync(join(child, 'deeper'));
   writeFileSync(join(child, 'deeper', 'ignored.md'), '# Too deep');
   const before = [first, second].map(path => ({ content: readFileSync(path), mtime: statSync(path).mtimeMs }));
+  process.env.ELANOUS_STATE_DIR = join(root, 'state');
   const store = new CardStore(join(root, 'state'));
   try {
     expect(scanWishFolder({ dir, store })).toEqual({ added: 2, updated: 0, skipped: 0 });
     const cards = store.listCards();
     expect(cards).toHaveLength(2);
+    const ledger = wishBenchmarkLedgerPath(store.root);
+    const samples = readFileSync(ledger, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(samples).toHaveLength(2);
+    expect(samples).toContainEqual({ id: expect.any(String), at: expect.any(String), surface: 'wish', text: before[0]!.content.toString(), chars: Array.from(before[0]!.content.toString()).length, op_cells: [], note: 'wish-card' });
+    expect(statSync(ledger).mode & 0o777).toBe(0o600);
+    expect(statSync(join(store.root, 'bench')).mode & 0o777).toBe(0o700);
     expect(cards.map(card => card.goalId).sort()).toEqual(['wish:first.md', 'wish:nested/second.md']);
     const card = cards.find(item => item.goalId === 'wish:first.md')!;
     expect(card.title).toBe('First wish');
     expect(JSON.parse(foldSections(card).intake!.content)).toEqual({
-      source: 'wish', path: 'first.md', mtime: before[0]!.mtime, title: 'First wish',
+      source: 'wish', path: 'first.md', mtime: before[0]!.mtime, title: 'First wish', text: before[0]!.content.toString(),
     });
     expect(cards.find(item => item.goalId === 'wish:nested/second.md')?.title).toBe('second');
     expect(scanWishFolder({ dir, store })).toEqual({ added: 0, updated: 0, skipped: 2 });
@@ -52,12 +63,13 @@ test('Wish markdown files become one card each, repeat skips, changed mtime upda
     expect(revised.title).toBe(card.title);
     expect(revised.sections).toHaveLength(2);
     expect(JSON.parse(foldSections(revised).intake!.content)).toEqual({
-      source: 'wish', path: 'first.md', mtime: statSync(first).mtimeMs, title: 'First wish',
+      source: 'wish', path: 'first.md', mtime: statSync(first).mtimeMs, title: 'First wish', text: before[0]!.content.toString(),
     });
     expect(store.listCards()).toHaveLength(2);
     utimesSync(first, new Date(before[0]!.mtime), new Date(before[0]!.mtime));
     expect(scanWishFolder({ dir, store })).toEqual({ added: 0, updated: 1, skipped: 1 });
     expect(store.getCard(card.id)?.sections).toHaveLength(3);
+    expect(readFileSync(ledger, 'utf8').trim().split('\n')).toHaveLength(2);
     expect(readFileSync(first)).toEqual(before[0]!.content);
     expect(statSync(first).mtimeMs).toBe(Math.trunc(before[0]!.mtime));
     expect(readFileSync(second)).toEqual(before[1]!.content);

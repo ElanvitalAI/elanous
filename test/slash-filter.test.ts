@@ -85,9 +85,9 @@ describe('filterSlashCommands', () => {
       'help', 'resume', 'model', 'clear', 'status', 'now', 'wish', 'remaining', 'setup',
     ]);
     expect(names.slice(9)).toEqual([
-      'quit', 'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'fork',
+      'quit', 'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'persona', 'fork',
       'rewind', 'mission', 'resume-turn', 'context', 'paste', 'sync', 'plugin',
-      'widget', 'log', 'memory', 'export', 'delta', 'theme', 'debug', 'rebind',
+      'widget', 'log', 'loops', 'memory', 'export', 'delta', 'theme', 'debug', 'rebind',
       'api-allow', 'prompt', 'history', 'research', 'harness', 'plan', 'chat',
       'dashboard', 'telegram', 'tablet', 'surface', 'term', 'claude', 'codex',
       'gemini', 'acp', 'conv', 'handoff', 'agent-room', 'showroom', 'reply',

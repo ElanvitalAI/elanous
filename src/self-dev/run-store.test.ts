@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addSelfDevRunParticipant, checkpointDependenciesForRun, closeSelfDevRunParticipant, saveSelfDevRun, loadSelfDevRun, listSelfDevRuns, listParkedGoals, listCombinedParkedGoals, parkedGoalsPopulationNotice, scanParkedGoals, countRunningGoals, countUnconvergeableRunLedgers, recordSelfDevRunSupervisorStop, resolveParkedSelfDevRun, failureClassificationForInterruptionVerdict, extractParkedGoalLedgerArtifactEvidence, PARKED_GOALS_LEDGER_STATUS, PARKED_GOALS_LIMITATION, type SelfDevRunState } from './run-store.js';
+import { addSelfDevRunParticipant, checkpointDependenciesForRun, closeSelfDevRunParticipant, saveSelfDevRun, loadSelfDevRun, listSelfDevRuns, listParkedGoals, listCombinedParkedGoals, parkedGoalsPopulationNotice, scanParkedGoals, countRunningGoals, countUnconvergeableRunLedgers, recordSelfDevRunSupervisorStop, resolveParkedSelfDevRun, runSummaryLine, failureClassificationForInterruptionVerdict, extractParkedGoalLedgerArtifactEvidence, PARKED_GOALS_LEDGER_STATUS, PARKED_GOALS_LIMITATION, type SelfDevRunState } from './run-store.js';
 import { analyzeRepairSignals, CLASSIFICATION_HINTS } from './repair-signals.js';
 
 function tmp(): string {
@@ -28,6 +28,115 @@ const run = (id: string, updatedAt: number): SelfDevRunState => ({
   createdAt: 1,
   updatedAt,
   results: [{ taskId: 't1', feature: 'A', status: 'done', prUrl: 'https://x/1' }],
+});
+
+test('checkpoint seat persists when subsequent updates omit the optional seat', () => {
+  const dir = tmp();
+  try {
+    const state = { ...run('run-stamped-seat', 1), seat: 'TC' as const, pid: 456, pidStart: 'linux:boot:17' };
+    saveSelfDevRun(state, dir);
+    saveSelfDevRun({ runId: state.runId, createdAt: 1, updatedAt: 2, results: state.results, pid: 456 }, dir);
+    expect(loadSelfDevRun(state.runId, dir)).toMatchObject({ runId: state.runId, seat: 'TC', pid: 456, pidStart: 'linux:boot:17' });
+    saveSelfDevRun({ runId: state.runId, createdAt: 1, updatedAt: 3, results: state.results, pid: 789 }, dir);
+    expect(loadSelfDevRun(state.runId, dir)?.pidStart).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('self-dev run summary line', () => {
+  const goal = '「하니스로 구현」 CTX-DIGEST — 런 원장 한 줄 요약. 두 번째 구절은 읽지 않는다';
+  const started = (): SelfDevRunState => ({
+    runId: 'summary-run', createdAt: 1, updatedAt: 2,
+    goals: [{ id: 'digest', feature: goal }],
+    results: [{ taskId: 't1', feature: goal, status: 'running' }],
+  });
+
+  test('new run persists the redacted goal head, and does not overwrite its goal or results', () => {
+    const dir = tmp();
+    const state = started();
+    saveSelfDevRun(state, dir);
+    const loaded = loadSelfDevRun(state.runId, dir)!;
+    expect(loaded.summaryLine).toBe('「하니스로 구현」 CTX-DIGEST — 런 원장 한 줄 요약');
+    expect(runSummaryLine(loaded)).toBe(loaded.summaryLine!);
+    expect(loaded.goals).toEqual(state.goals);
+    expect(loaded.results).toEqual(state.results);
+  });
+
+  test('finished run updates stage and PR number, including subsequent checkpoint saves', () => {
+    const dir = tmp();
+    const state = started();
+    saveSelfDevRun(state, dir);
+    saveSelfDevRun({ ...state, updatedAt: 3, results: [{ ...state.results[0]!, status: 'done', stage: 'merged', prNumber: 42 }] }, dir);
+    expect(loadSelfDevRun(state.runId, dir)?.summaryLine).toBe('CTX-DIGEST · merged · PR #42');
+    expect(runSummaryLine(loadSelfDevRun(state.runId, dir)!)).toBe('CTX-DIGEST · merged · PR #42');
+    const fromUrl = { ...state, results: [{ ...state.results[0]!, status: 'done' as const, stage: 'pr-opened', prUrl: 'https://github.com/example/repo/pull/73' }] };
+    expect(runSummaryLine(fromUrl)).toBe('CTX-DIGEST · pr-opened · PR #73');
+  });
+
+  test('mixed finished results keep the failed stage even when another shard merges last', () => {
+    const dir = tmp();
+    const state = started();
+    const failed = { taskId: 'failed', feature: goal, status: 'failed' as const, stage: 'gate-failed' };
+    const merged = { taskId: 'merged', feature: goal, status: 'done' as const, stage: 'merged', prNumber: 42 };
+    state.results = [failed, merged];
+    saveSelfDevRun(state, dir);
+    expect(loadSelfDevRun(state.runId, dir)?.summaryLine).toBe('CTX-DIGEST · gate-failed');
+    expect(runSummaryLine({ ...state, summaryLine: undefined })).toBe('CTX-DIGEST · gate-failed');
+    state.results = [merged, failed];
+    saveSelfDevRun(state, dir);
+    expect(loadSelfDevRun(state.runId, dir)?.summaryLine).toBe('CTX-DIGEST · gate-failed');
+  });
+
+  test('finished summary PR belongs only to the result supplying its stage', () => {
+    const state = started();
+    const failed = { taskId: 'failed', feature: goal, status: 'failed' as const, stage: 'review-blocked', prNumber: 17 };
+    const merged = { taskId: 'merged', feature: goal, status: 'done' as const, stage: 'merged', prNumber: 42 };
+    state.results = [failed, merged];
+    expect(runSummaryLine(state)).toBe('CTX-DIGEST · review-blocked · PR #17');
+    state.results = [{ ...failed, prNumber: undefined }, merged];
+    expect(runSummaryLine(state)).toBe('CTX-DIGEST · review-blocked');
+  });
+
+  test('legacy ledger without the field computes the same line without writing back', () => {
+    const dir = tmp();
+    const state = started();
+    const path = join(dir, `${state.runId}.json`);
+    writeFileSync(path, JSON.stringify(state), 'utf8');
+    const before = readFileSync(path, 'utf8');
+    const legacy = loadSelfDevRun(state.runId, dir)!;
+    expect(legacy.summaryLine).toBeUndefined();
+    expect(runSummaryLine(legacy)).toBe('「하니스로 구현」 CTX-DIGEST — 런 원장 한 줄 요약');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    const oldFinished = { ...legacy, results: [{ ...legacy.results[0]!, status: 'done' as const, stage: 'merged', prNumber: 74 }] };
+    writeFileSync(path, JSON.stringify(oldFinished), 'utf8');
+    const finishedBefore = readFileSync(path, 'utf8');
+    expect(runSummaryLine(loadSelfDevRun(state.runId, dir)!)).toBe('CTX-DIGEST · merged · PR #74');
+    expect(readFileSync(path, 'utf8')).toBe(finishedBefore);
+  });
+
+  test('long goal head is capped at 120 characters without splitting a surrogate pair', () => {
+    const dir = tmp();
+    const state = started();
+    state.goals![0]!.feature = `「하니스로 구현」 CTX-DIGEST — ${'가'.repeat(100)}😀계속`;
+    saveSelfDevRun(state, dir);
+    const line = loadSelfDevRun(state.runId, dir)!.summaryLine!;
+    expect(line.length).toBeLessThanOrEqual(120);
+    expect(line.endsWith('…')).toBeTrue();
+    expect(line).not.toContain('계속');
+    expect(line).not.toMatch(/[\uD800-\uDBFF]…$/);
+  });
+
+  test('secret-shaped text is masked before bounding in both new and legacy ledgers', () => {
+    const dir = tmp();
+    const state = started();
+    state.goals![0]!.feature = `「하니스로 구현」 CTX-DIGEST — token=abcd1234efgh and ghp_${'A'.repeat(36)}`;
+    saveSelfDevRun(state, dir);
+    const persisted = loadSelfDevRun(state.runId, dir)!.summaryLine!;
+    expect(persisted).toContain('token=***');
+    expect(persisted).toContain('ghp_***');
+    expect(persisted).not.toContain('abcd1234efgh');
+    expect(persisted).not.toContain('AAAA');
+    expect(runSummaryLine(state)).toBe(persisted);
+  });
 });
 
 describe('self-dev run-store (S3 persistence)', () => {
@@ -181,7 +290,7 @@ describe('self-dev run-store (S3 persistence)', () => {
     saveSelfDevRun(state, dir);
 
     const loaded = loadSelfDevRun('run-dependencies', dir);
-    expect(loaded).toEqual(state);
+    expect(loaded).toEqual({ ...state, summaryLine: runSummaryLine(state) });
     expect(JSON.parse(readFileSync(join(dir, 'run-dependencies.json'), 'utf8')).dependencies).toEqual({
       prepare: [],
       implement: ['prepare'],

@@ -68,8 +68,8 @@ export function parseLinearWebhook(body: unknown, deliveryId: string, ledger?: E
   return isLinearProjectionEcho(event, ledger ?? new EventLedger()) ? null : event;
 }
 
-export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since, fetch: fetchFn = fetch, ledger }: {
-  apiKey: string; teamKey: string; labelOrPrefix?: string; since?: string; fetch?: typeof fetch; ledger?: EventLedger;
+export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, excludeLabel, since, fetch: fetchFn = fetch, ledger }: {
+  apiKey: string; teamKey: string; labelOrPrefix?: string; excludeLabel?: string; since?: string; fetch?: typeof fetch; ledger?: EventLedger;
 }): Promise<ExternalTaskEvent[]> {
   const query = `query ConnectorIssues($teamKey: String!, $after: String) {
     issues(filter: { team: { key: { eq: $teamKey } } }, first: 100, after: $after) {
@@ -106,8 +106,10 @@ export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since,
       const issue = asIssue(node);
       if (!issue || (since && issue.updatedAt < since) ||
           ['completed', 'canceled', 'duplicate'].includes((node.state as { type?: string } | undefined)?.type ?? '')) continue;
+      const labels = (node.labels as { nodes?: Array<{ name: string }> } | undefined)?.nodes;
+      if (excludeLabel && labels?.some(label => label.name.toLowerCase() === excludeLabel.toLowerCase())) continue;
       if (labelOrPrefix && !issue.title.startsWith(labelOrPrefix) &&
-          !(node.labels as { nodes?: Array<{ name: string }> } | undefined)?.nodes?.some(label => label.name === labelOrPrefix)) continue;
+          !labels?.some(label => label.name === labelOrPrefix)) continue;
       const event: ExternalTaskEvent = { provider: 'linear', eventId: `${issue.id}:${issue.updatedAt}`, kind: 'updated',
         ref: issue.id, identifier: issue.identifier, title: issue.title, body: issue.description ?? '',
         url: issue.url ?? '', priority: priorityOf(issue.priority), occurredAt: issue.updatedAt };

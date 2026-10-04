@@ -4,9 +4,12 @@
 import { describe, expect, test } from 'bun:test';
 import {
   buildDiscordSlashWire,
+  discordWireCatalog,
   synthesizeCommandText,
   ELANOUS_SLASH_COMMANDS,
 } from '../src/discord-slash-wire.js';
+import { SLASH_COMMANDS } from '../src/chat/index.js';
+import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
 import type { DcIncoming } from '../src/discord.js';
 import type { UserConfig } from '../src/user-config.js';
 
@@ -69,6 +72,24 @@ describe('buildDiscordSlashWire.onInteraction', () => {
     expect(sent).toEqual([{ channelId: 'CH1', text: '파이프라인 응답' }]);
   });
 
+  test('only unhandled catalog commands receive a one-line reply, after authorization', async () => {
+    const { wire, acks, handled, sent } = makeWire();
+    for (const name of ELANOUS_SLASH_COMMANDS.map((schema) => schema.name)) {
+      await wire.onInteraction(makeInteraction(name));
+    }
+    expect(handled.map((ctx) => ctx.text)).toEqual(ELANOUS_SLASH_COMMANDS.map((schema) => synthesizeCommandText(schema.name, new Map())));
+    expect(sent).toHaveLength(ELANOUS_SLASH_COMMANDS.length);
+    for (const name of ['status', 'relay', 'showroom', 'persona']) {
+      await wire.onInteraction(makeInteraction(name));
+      const reply = (acks.at(-1)!.body as { data: { content: string } }).data.content;
+      expect(reply).toBe(discordWireCatalog().unsupportedReply(name)!);
+      expect(reply.includes('\n')).toBe(false);
+    }
+    expect(handled).toHaveLength(ELANOUS_SLASH_COMMANDS.length);
+    await wire.onInteraction(makeInteraction('status', [], { member: { user: { id: 'stranger' } } }));
+    expect((acks.at(-1)!.body as { data: { content: string } }).data.content).toContain('⛔');
+  });
+
   test('non-allowlisted user is refused at the interaction layer', async () => {
     const { wire, acks, handled } = makeWire();
     await wire.onInteraction(makeInteraction('cc', [{ name: 'prompt', value: 'x' }], {
@@ -116,11 +137,25 @@ describe('registerCommands', () => {
     await wire.registerCommands();
     expect(puts).toHaveLength(1);
     expect(puts[0]!.url).toContain('/applications/app9/guilds/G7/commands');
-    const names = (puts[0]!.body as Array<{ name: string }>).map((c) => c.name);
-    expect(names).toEqual(ELANOUS_SLASH_COMMANDS.map((c) => c.name));
-    expect(names).toContain('cc');
-    expect(names).toContain('fork');
-    expect(names).toContain('voice-join');
+    const handledNames = ELANOUS_SLASH_COMMANDS.map((schema) => schema.name);
+    const coreNames = SLASH_COMMANDS
+      .filter(({ name }) => Object.hasOwn(FEATURE_MATURITY.discordCommand, name) && !handledNames.includes(name))
+      .map(({ name }) => name);
+    const putBody = puts[0]!.body as Array<Record<string, unknown> & { name: string }>;
+    const names = putBody.map((c) => c.name);
+    expect(names).toEqual([...handledNames, ...coreNames]);
+    for (const command of putBody) expect(command).not.toHaveProperty('supported');
+    for (const name of coreNames) {
+      expect(putBody.find((command) => command.name === name)).toMatchObject({
+        name, description: discordWireCatalog().commands.find((entry) => entry.name === name)!.description,
+      });
+    }
+    expect(names).toHaveLength(new Set(names).size);
+    expect((puts[0]!.body as Array<{ name: string; options?: unknown }>).find((c) => c.name === 'cc')?.options).toEqual(ELANOUS_SLASH_COMMANDS.find((c) => c.name === 'cc')?.options);
+    expect(handledNames).toContain('cc');
+    expect(handledNames).toContain('fork');
+    expect(handledNames).toContain('voice-join');
+    expect(coreNames).toEqual(['status', 'persona', 'showroom', 'relay']);
   });
 });
 

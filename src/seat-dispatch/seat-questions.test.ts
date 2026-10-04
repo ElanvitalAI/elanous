@@ -4,7 +4,7 @@ import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFile
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gatherSeatInputs, runSeatLoopOnce, seatLedgerPath, type SeatDeps } from '../seat-loop/seat-loop.js';
-import { askSeat, hasSeatAnswer, seatQuestions } from './seat-questions.js';
+import { answerCrossCheck, askCrossCheck, askSeat, crossCheckAnswer, hasSeatAnswer, seatCrossChecks, seatQuestions } from './seat-questions.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.js';
 import { registerDecisionsCommands } from '../cli/decisions-cli.js';
@@ -23,6 +23,23 @@ function fixture() {
   const ledger = (seat: string) => readFileSync(seatLedgerPath(seat, root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   return { root, deps, ledger, close: () => rmSync(root, { recursive: true, force: true }) };
 }
+
+test('cross-check messages correlate one answer and do not enter the seat-question channel', () => {
+  const f = fixture();
+  try {
+    const question = askCrossCheck(f.root, 'MK', 'OP', '제목 · S · C · 질문 · 근거', 'xcheck:MK:cell:1');
+    expect(askCrossCheck(f.root, 'MK', 'OP', '제목 · S · C · 질문 · 근거', 'xcheck:MK:cell:1').id).toBe(question.id);
+    expect(seatCrossChecks(f.root, 'OP')).toMatchObject([{ kind: 'seat-xcheck', from: 'MK', body: question.body }]);
+    expect(seatQuestions(f.root, 'OP')).toEqual([]);
+    expect(crossCheckAnswer(f.root, question)).toBeNull();
+    const answer = { agree: false, note: '화면 문구 미정', resolves: false };
+    expect(answerCrossCheck(f.root, question, answer).kind).toBe('seat-xcheck-answer');
+    expect(answerCrossCheck(f.root, question, answer).id).toBeGreaterThan(question.id);
+    expect(crossCheckAnswer(f.root, question)).toEqual(answer);
+    expect(hasSeatAnswer(f.root, question)).toBe(false);
+    expect(() => askCrossCheck(f.root, 'MK', 'OP', '다른 초안', 'xcheck:MK:cell:1')).toThrow('changed its recorded message');
+  } finally { f.close(); }
+});
 
 test('seat question configuration defaults to shadow when not explicitly enabled', () => {
   expect(getUserConfig().loops?.seat?.questions).toBe('shadow');
@@ -247,22 +264,82 @@ test('unanswered inbox question stays ahead of checklist and can be answered on 
   } finally { f.close(); }
 });
 
-test('a receiving seat escalates a question to the existing human decision card', async () => {
+test('an evidence-free receiving seat cannot escalate an unanswered question to the CEO', async () => {
   const f = fixture();
   try {
     const message = askSeat(f.root, 'TC', 'UX', '승인 기준?');
     const calls: string[][] = [];
-    const program = new Command();
-    const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
       reply: () => ({ to: 'CEO', question: '승인 기준을 결정해 주세요' }),
-      run: async (args) => { calls.push(args); output.length = 0; program.parse(args, { from: 'user' }); return output[0]!; } };
-    expect((await runSeatLoopOnce('UX', deps)).status).toBe('hitl');
-    expect(calls.map((args) => args.slice(0, 2))).toEqual([['decisions', 'raise']]);
+      run: async (args) => { calls.push(args); throw Error('no card without evidence'); } };
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('rejected-no-evidence');
+    expect(calls).toEqual([]);
     expect(f.ledger('UX').at(-1)).toMatchObject({ action: 'decision', inquiry: { to: 'CEO' }, item: { id: String(message.id) } });
     expect(hasSeatAnswer(f.root, message)).toBe(false);
-    expect((await gatherSeatInputs('UX', deps)).requests.some((item) => item.source === 'seat-question')).toBe(false);
+    expect((await gatherSeatInputs('UX', deps)).requests.some((item) => item.source === 'seat-question')).toBe(true);
+  } finally { f.close(); }
+});
+
+test('rejected seat question is retried when the receiving checklist gains evidence', async () => {
+  const f = fixture();
+  try {
+    const question = askSeat(f.root, 'TC', 'UX', '승인 기준?');
+    let evidence = '';
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
+      checklistItems: () => [{ id: 'K1', title: '체크리스트', status: 'yellow', owner: 'UX', evidence }],
+      reply: () => evidence ? { answer: `검토 근거: ${evidence}` } : { to: 'CEO', question: '승인 기준을 결정해 주세요' },
+      run: async () => { throw Error('a rejected question cannot raise a card'); } };
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('rejected-no-evidence');
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('skipped-budget');
+    evidence = '체크리스트 검토 기록';
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('answered');
+    expect(hasSeatAnswer(f.root, question)).toBe(true);
+    expect(f.ledger('UX').at(-1)).toMatchObject({ status: 'answered', answer: '검토 근거: 체크리스트 검토 기록' });
+  } finally { f.close(); }
+});
+
+test('default receiving judgment sees evidence added after an evidence-free CEO escalation was rejected', async () => {
+  const f = fixture();
+  try {
+    const question = askSeat(f.root, 'TC', 'UX', '승인 기준?');
+    let evidence = '';
+    const prompts: string[] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
+      checklistItems: () => [{ id: 'K1', title: '체크리스트', status: 'yellow', owner: 'UX', evidence }],
+      run: async (args) => {
+        expect(args.slice(0, 3)).toEqual(['agent', '--json', '--no-tools']);
+        prompts.push(args[3]!);
+        return JSON.stringify({ reply: JSON.stringify(evidence
+          ? { answer: `UX 확인: ${evidence}` }
+          : { to: 'CEO', question: '승인 근거를 결정해 주세요' }) });
+      } };
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('rejected-no-evidence');
+    expect(hasSeatAnswer(f.root, question)).toBe(false);
+    evidence = '검토 원장 #K1';
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('answered');
+    expect(prompts[1]).toContain('근거: 검토 원장 #K1');
+    expect(hasSeatAnswer(f.root, question)).toBe(true);
+  } finally { f.close(); }
+});
+
+test('neighbor resolution proposal for a seat question stays open until its recipient answers from new evidence', async () => {
+  const f = fixture();
+  try {
+    const question = askSeat(f.root, 'TC', 'UX', '승인 기준?');
+    let evidence = '초기 검토 기록';
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
+      checklistItems: () => [{ id: 'K1', title: '검토', status: 'yellow', owner: 'UX', evidence }],
+      reply: () => evidence === '확정된 검토 기록' ? { answer: evidence } : { to: 'CEO', question: '승인 기준?' },
+      run: async () => { throw Error('unresolved question must not raise a card'); } };
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('awaiting-xcheck');
+    const request = seatCrossChecks(f.root, 'OP')[0]!;
+    answerCrossCheck(f.root, request, { agree: true, note: 'UX가 확인 가능', resolves: true });
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('awaiting-resolution');
+    expect(hasSeatAnswer(f.root, question)).toBe(false);
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('skipped-budget');
+    evidence = '확정된 검토 기록';
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('answered');
+    expect(hasSeatAnswer(f.root, question)).toBe(true);
   } finally { f.close(); }
 });
 
@@ -287,13 +364,16 @@ test('human escalation command is accepted by the real decisions raise CLI and w
     const output: string[] = [];
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '사람 판단은?' }),
       run: async (args) => {
         output.length = 0;
         program.parse(args, { from: 'user' });
         return output[0]!;
       } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    const request = seatCrossChecks(f.root, 'OP')[0]!;
+    answerCrossCheck(f.root, request, { agree: true, note: '검토 원장 확인', resolves: false });
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
     const raised = JSON.parse(output[0]!) as { status: string; title: string; options: unknown[] };
     expect(raised).toMatchObject({ status: 'open', title: 'TC: 사람 판단은?' });
@@ -310,7 +390,7 @@ test('failed decisions raise leaves no card and retries the same human question'
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     let fail = true;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '판단 부족', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '판단 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '사람 승인?' }),
       run: async (args) => {
         if (fail) { fail = false; throw Error('decisions raise unavailable'); }
@@ -318,6 +398,8 @@ test('failed decisions raise leaves no card and retries the same human question'
         program.parse(args, { from: 'user' });
         return output[0]!;
       } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '확인', resolves: false });
     await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('decisions raise unavailable');
     expect(f.ledger('TC').at(-1).status).toBe('outcome-unknown');
     expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(0);
@@ -335,45 +417,36 @@ test('pre-send attempting human decision is retried when no card exists', async 
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     let interrupt = true;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '사람 검토', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '사람 검토', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '승인 근거?' }),
       append: (path, entry) => {
         appendFileSync(path, `${JSON.stringify(entry)}\n`);
-        if (interrupt && entry.status === 'attempting') { interrupt = false; throw Error('interrupted before card'); }
+        if (interrupt && entry.status === 'attempting') { interrupt = false; throw Error('interrupted before cross-check'); }
       },
       run: async (args) => { output.length = 0; program.parse(args, { from: 'user' }); return output[0]!; } };
-    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('interrupted before card');
+    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('interrupted before cross-check');
     expect(f.ledger('TC').at(-1).status).toBe('attempting');
     expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(0);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '확인', resolves: false });
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
     expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(1);
   } finally { f.close(); }
 });
 
-test('interrupted decisions raise reconciles a durable card without raising a duplicate', async () => {
+test('an evidence-free receiving seat does not launch a decision even on retry', async () => {
   const f = fixture();
   try {
     const question = askSeat(f.root, 'TC', 'UX', '사람 결정 필요?');
-    const program = new Command();
-    const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
-    let calls = 0;
+    const calls: string[][] = [];
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
       reply: () => ({ to: 'CEO', question: '사람 승인?' }), inquire: () => null,
-      run: async (args) => {
-        if (args[0] === 'harness') return '{"outcome":"wait-reset"}';
-        calls++;
-        output.length = 0;
-        program.parse(args, { from: 'user' });
-        if (calls === 1) throw Error('interrupted after card write');
-        return output[0]!;
-      } };
-    await expect(runSeatLoopOnce('UX', deps)).rejects.toThrow('interrupted after card write');
-    expect(f.ledger('UX').at(-1).status).toBe('outcome-unknown');
-    expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(1);
+      run: async (args) => { calls.push(args); throw Error('no card without evidence'); } };
+    expect((await runSeatLoopOnce('UX', deps)).status).toBe('rejected-no-evidence');
     expect((await runSeatLoopOnce('UX', deps)).status).toBe('skipped-budget');
-    expect(calls).toBe(1);
-    expect((await gatherSeatInputs('UX', deps)).requests.some((item) => item.id === String(question.id))).toBe(false);
+    expect(calls.map((args) => args.slice(0, 2))).not.toContainEqual(['decisions', 'raise']);
+    expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(0);
+    expect((await gatherSeatInputs('UX', deps)).requests.some((item) => item.id === String(question.id))).toBe(true);
   } finally { f.close(); }
 });
 
@@ -385,7 +458,7 @@ test('interrupted ordinary human card delivery is reconciled without duplicate r
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     let calls = 0;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '사람 판단', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '사람 판단', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '승인할까요?' }),
       run: async (args) => {
         calls++;
@@ -394,6 +467,8 @@ test('interrupted ordinary human card delivery is reconciled without duplicate r
         if (calls === 1) throw Error('interrupted after durable card');
         return output[0]!;
       } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '확인', resolves: false });
     await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('interrupted after durable card');
     expect(f.ledger('TC').at(-1).status).toBe('outcome-unknown');
     expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(1);
@@ -410,7 +485,7 @@ test('a reported decision id without a durable card cannot mark the question han
     const output: string[] = [];
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '승인 보류', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '승인 보류', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '승인해도 되나요?' }),
       run: async (args) => {
         calls++;
@@ -419,6 +494,8 @@ test('a reported decision id without a durable card cannot mark the question han
         program.parse(args, { from: 'user' });
         return output[0]!;
       } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '확인', resolves: false });
     await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('decisions raise did not deliver a matching card');
     expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'all' })).toHaveLength(0);
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
@@ -547,9 +624,11 @@ test('a person question uses the existing decisions raise card, never a seat mes
     const output: string[] = [];
     registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
-      checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC' }],
+      checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '사람 판단은?' }),
       run: async (args) => { calls.push(args); output.length = 0; program.parse(args, { from: 'user' }); return output[0]!; } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '확인', resolves: false });
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
     expect(calls).toHaveLength(1);
     expect(calls[0]!.slice(0, 2)).toEqual(['decisions', 'raise']);

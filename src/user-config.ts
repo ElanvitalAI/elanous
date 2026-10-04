@@ -3477,13 +3477,17 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 
 export type OrchestratorSeat = 'OP' | 'TC' | 'MK' | 'UX';
 export interface OrchestratorLoopConfig {
+  /** ORCH1 graph mode — shadow writes observations only; live appends delegations (default shadow). */
+  mode: 'off' | 'shadow' | 'live';
   seatTrees: Partial<Record<OrchestratorSeat, string[]>>;
   seatCaps: Record<OrchestratorSeat, number>;
+  /** Per-seat release gate; absent seats retain the spawn-budget default. */
+  releaseGate?: Partial<Record<OrchestratorSeat, number>>;
   trafficMode: 'shadow' | 'live';
 }
 
 export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
-  seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow',
+  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow',
 };
 
 export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfig {
@@ -3492,25 +3496,34 @@ export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfi
     ? value.seatTrees as Record<string, unknown> : {};
   const rawCaps = value.seatCaps && typeof value.seatCaps === 'object' && !Array.isArray(value.seatCaps)
     ? value.seatCaps as Record<string, unknown> : {};
+  const rawGate = value.releaseGate && typeof value.releaseGate === 'object' && !Array.isArray(value.releaseGate)
+    ? value.releaseGate as Record<string, unknown> : {};
   const seatTrees: OrchestratorLoopConfig['seatTrees'] = {};
   const seatCaps = { ...ORCHESTRATOR_DEFAULTS.seatCaps };
+  const releaseGate: NonNullable<OrchestratorLoopConfig['releaseGate']> = {};
   for (const seat of ['OP', 'TC', 'MK', 'UX'] as const) {
     if (Array.isArray(rawTrees[seat])) seatTrees[seat] = rawTrees[seat].filter((path): path is string => typeof path === 'string' && isAbsolute(path));
     const cap = rawCaps[seat];
     if (typeof cap === 'number' && Number.isSafeInteger(cap) && cap >= 0) seatCaps[seat] = cap;
+    const gate = rawGate[seat];
+    if (typeof gate === 'number' && Number.isSafeInteger(gate) && gate >= 0) releaseGate[seat] = gate;
   }
-  return { seatTrees, seatCaps, trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow' };
+  const mode = value.mode === 'off' || value.mode === 'live' ? value.mode : 'shadow';
+  return { mode, seatTrees, seatCaps, ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
+    trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow' };
 }
 
 export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
 
-export type SeatLoopMode = 'off' | 'shadow' | 'on';
+export type SeatLoopMode = 'off' | 'shadow' | 'on' | 'live-safe';
 
 export interface PersonaLoopConfig { enabled: boolean }
 
 export interface SeatLoopConfig {
-  /** No seat actions by default; shadow observes without execution, on permits the seat loop to act. */
+  /** Shadow observes by default; live-safe acts only through the shared rescue policy, while legacy on retains its behavior. */
   mode: SeatLoopMode;
+  /** Validated loop-agent neighbor entries keyed by the observing seat. */
+  neighbors?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', import('./loops/neighbors.js').Neighbor[]>>;
   /** Seat-to-seat and human questions default to shadow even when the checklist loop is on. */
   questions?: 'shadow' | 'on';
   seats?: string[];
@@ -3575,17 +3588,20 @@ export interface UserConfig {
   hq?: HqConfig;
   /** Root CLI help audience; absent or invalid means owner. */
   cli?: { helpRole?: 'owner' | 'contributor' | 'general' };
+  /** Daemon public demonstration mode; absent means off. */
+  nexus?: { demoMode?: boolean };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
   coo?: { linearProject?: string };
-  decisions?: { linearProjection: { enabled: boolean }; requireCrossCheck: boolean };
+  decisions?: { linearProjection: { enabled: boolean }; requireCrossCheck: boolean;
+    crossCheckNeighbor: Record<EventSeat, EventSeat>; crossCheckWaitMinutes: number };
   /** Per-seat goal and Pod limits; missing or invalid limits use seat-budget defaults. */
   org?: { budget?: Record<string, { dailyGoals?: number; concurrentPods?: number }> };
-  /** Steward and seat loops are parsed independently. An absent seat remains off. */
-  loops?: { orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
+  /** Steward and seat loops are parsed independently. An absent seat defaults to shadow. */
+  loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> } };
+  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> } };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
   pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean } };
   skillRouter: SkillRouterConfig;
@@ -3913,8 +3929,9 @@ function defaultConfig(): UserConfig {
   return {
     cli: { helpRole: 'owner' },
     coo: { linearProject: '외부 행정·큰 일 (COO)' },
-    decisions: { linearProjection: { enabled: false }, requireCrossCheck: false },
-    loops: { orchestrator: parseOrchestratorLoopConfig(undefined), steward: { mode: 'shadow' }, seat: { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' }, persona: { enabled: false } },
+    decisions: { linearProjection: { enabled: false }, requireCrossCheck: false,
+      crossCheckNeighbor: { OP: 'TC', TC: 'OP', MK: 'OP', UX: 'OP' }, crossCheckWaitMinutes: 120 },
+    loops: { owners: {}, defaultOwner: 'OP', orchestrator: parseOrchestratorLoopConfig(undefined), steward: { mode: 'shadow' }, seat: { mode: 'shadow', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' }, persona: { enabled: false } },
     skillRouter: { ...SR_DEFAULTS },
     llm: { ...LLM_DEFAULTS },
     skills: skillsDefaults(),
@@ -3983,7 +4000,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { budgetGate: { ...DEFAULT_BUDGET_GATE }, difficultyPlacement: false },
+    harness: { revertGuard: { depth: 50 }, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false },
     grounding: { sources: [] },
     raw: {},
   };
@@ -4394,20 +4411,95 @@ function parseStewardTracks(input: unknown): Record<string, string> | undefined 
   return Object.keys(out).length ? out : undefined;
 }
 
+function parseDecisionsConfig(input: unknown): NonNullable<UserConfig['decisions']> {
+  const defaults: Record<EventSeat, EventSeat> = { OP: 'TC', TC: 'OP', MK: 'OP', UX: 'OP' };
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const neighbors = { ...defaults };
+  if (raw.crossCheckNeighbor !== undefined) {
+    if (!raw.crossCheckNeighbor || typeof raw.crossCheckNeighbor !== 'object' || Array.isArray(raw.crossCheckNeighbor)) {
+      warnUserConfigDrop('decisions.crossCheckNeighbor', '자리별 이웃 자리 객체가 아닙니다 — 기본값으로 진행합니다.');
+    } else {
+      const values = raw.crossCheckNeighbor as Record<string, unknown>;
+      for (const seat of Object.keys(defaults) as EventSeat[]) {
+        if (values[seat] === undefined) continue;
+        const to = values[seat];
+        if ((to === 'OP' || to === 'TC' || to === 'MK' || to === 'UX') && to !== seat) neighbors[seat] = to;
+        else warnUserConfigDrop(`decisions.crossCheckNeighbor.${seat}`, '다른 자리가 아닙니다 — 기본값으로 진행합니다.');
+      }
+      for (const seat of Object.keys(values)) {
+        if (!(seat in defaults)) warnUserConfigDrop(`decisions.crossCheckNeighbor.${seat}`, '알 수 없는 자리입니다 — 기본값으로 진행합니다.');
+      }
+    }
+  }
+  const wait = raw.crossCheckWaitMinutes;
+  if (wait !== undefined && !(typeof wait === 'number' && Number.isSafeInteger(wait) && wait > 0)) {
+    warnUserConfigDrop('decisions.crossCheckWaitMinutes', '양의 정수가 아닙니다 — 기본값 120으로 진행합니다.');
+  }
+  return { linearProjection: { enabled: (raw.linearProjection as { enabled?: unknown } | undefined)?.enabled === true },
+    requireCrossCheck: raw.requireCrossCheck === true, crossCheckNeighbor: neighbors,
+    crossCheckWaitMinutes: typeof wait === 'number' && Number.isSafeInteger(wait) && wait > 0 ? wait : 120 };
+}
+
+function parseLoopOwners(input: unknown): { owners: Record<string, EventSeat>; defaultOwner: EventSeat } {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const valid = (value: unknown): value is EventSeat => value === 'OP' || value === 'TC' || value === 'MK' || value === 'UX';
+  const defaultOwner = valid(raw.defaultOwner) ? raw.defaultOwner : 'OP';
+  if (raw.defaultOwner !== undefined && !valid(raw.defaultOwner)) warnUserConfigDrop('loops.defaultOwner', '잘못된 자리 — 기본 OP 로 진행');
+  // Prototype-less: a loop titled «__proto__» (or «constructor») must keep its owner (review round 3).
+  const owners: Record<string, EventSeat> = Object.create(null) as Record<string, EventSeat>;
+  if (raw.owners !== undefined) {
+    if (!raw.owners || typeof raw.owners !== 'object' || Array.isArray(raw.owners)) {
+      warnUserConfigDrop('loops.owners', '객체가 아니다 — 기본 자리로 진행');
+    } else {
+      for (const [key, value] of Object.entries(raw.owners)) {
+        if (key.trim() && valid(value)) owners[key] = value;
+        else warnUserConfigDrop(`loops.owners.${key}`, `잘못된 자리 — 기본 ${defaultOwner} 로 진행`);
+      }
+    }
+  }
+  return { owners, defaultOwner };
+}
+
 function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
-  const defaults: SeatLoopConfig = { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' };
+  const defaults: SeatLoopConfig = { mode: 'shadow', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' };
   if (!input || typeof input !== 'object' || Array.isArray(input)) return defaults;
   const seat = (input as Record<string, unknown>).seat;
   if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return defaults;
   const values = seat as Record<string, unknown>;
   const mode = values.mode;
   return {
-    mode: mode === 'on' || mode === 'shadow' ? mode : 'off',
+    mode: mode === 'on' || mode === 'shadow' || mode === 'live-safe' || mode === 'off' ? mode : 'shadow',
     questions: values.questions === 'on' ? 'on' : 'shadow',
     seats: Array.isArray(values.seats) && values.seats.length > 0
       && values.seats.every((value) => typeof value === 'string' && /^(?:MK|OP|TC|UX)$/.test(value))
       ? [...new Set(values.seats as string[])] : ['MK'],
     podPool: typeof values.podPool === 'string' && values.podPool.trim() ? values.podPool.trim() : defaults.podPool,
+    ...(() => {
+      const raw = values.neighbors;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+      const neighbors: NonNullable<SeatLoopConfig['neighbors']> = {};
+      for (const [owner, entries] of Object.entries(raw)) {
+        if (!/^(?:OP|TC|MK|UX)$/.test(owner) || !Array.isArray(entries)) continue;
+        const valid = entries.filter((entry): entry is import('./loops/neighbors.js').Neighbor => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+          const value = entry as Record<string, unknown>;
+          const heartbeat = value.heartbeat && typeof value.heartbeat === 'object' && !Array.isArray(value.heartbeat)
+            ? value.heartbeat as Record<string, unknown> : undefined;
+          const onAbsent = value.onAbsent && typeof value.onAbsent === 'object' && !Array.isArray(value.onAbsent)
+            ? value.onAbsent as Record<string, unknown> : undefined;
+          return typeof value.id === 'string' && /^(?:op|tc|mk|ux)-seat$/.test(value.id)
+            && value.id !== `${owner.toLowerCase()}-seat`
+            && Array.isArray(value.exchange) && value.exchange.length > 0
+            && value.exchange.every((item) => typeof item === 'string' && ['status', 'request', 'decision', 'blocked'].includes(item))
+            && !!heartbeat && Number.isSafeInteger(heartbeat.everyMinutes) && (heartbeat.everyMinutes as number) > 0
+            && Number.isSafeInteger(heartbeat.missedTicks) && (heartbeat.missedTicks as number) > 0
+            && !!onAbsent && typeof onAbsent.action === 'string' && ['delegate', 'defer', 'escalate'].includes(onAbsent.action)
+            && typeof onAbsent.delegateTo === 'string' && onAbsent.delegateTo.trim().length > 0;
+        });
+        neighbors[owner as keyof typeof neighbors] = valid;
+      }
+      return { neighbors };
+    })(),
     ...(typeof values.reportPr === 'number' && Number.isSafeInteger(values.reportPr) && values.reportPr > 0
       ? { reportPr: values.reportPr } : {}),
     ...(() => {
@@ -4598,7 +4690,10 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     };
   }
 
+  const nexus = rawObj.nexus && typeof rawObj.nexus === 'object' && !Array.isArray(rawObj.nexus)
+    ? rawObj.nexus as Record<string, unknown> : {};
   return {
+    nexus: { demoMode: nexus.demoMode === true },
     ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
@@ -4614,8 +4709,14 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       })() },
     },
     harness: {
+      revertGuard: { depth: (() => {
+        const value = harness.revertGuard && typeof harness.revertGuard === 'object' && !Array.isArray(harness.revertGuard)
+          ? (harness.revertGuard as Record<string, unknown>).depth : undefined;
+        return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 50;
+      })() },
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
       difficultyPlacement: harness.difficultyPlacement === true,
+      exposeGate: harness.exposeGate === 'strict' ? 'strict' : 'warn',
       queue: { seatCap: Object.fromEntries(Object.entries(
         harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
           && (harness.queue as Record<string, unknown>).seatCap && typeof (harness.queue as Record<string, unknown>).seatCap === 'object'
@@ -5270,9 +5371,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     cli: { helpRole: parseCliHelpRole(rawObj.cli) },
     coo: { linearProject: typeof (rawObj.coo as { linearProject?: unknown } | undefined)?.linearProject === 'string' && (rawObj.coo as { linearProject: string }).linearProject.trim()
       ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },
-    decisions: { linearProjection: { enabled: ((rawObj.decisions as { linearProjection?: { enabled?: unknown } } | undefined)?.linearProjection?.enabled === true) },
-      requireCrossCheck: (rawObj.decisions as { requireCrossCheck?: unknown } | undefined)?.requireCrossCheck === true },
-    loops: { ...(stewardLoops ?? {}), orchestrator: parseOrchestratorLoopConfig((rawObj.loops as { orchestrator?: unknown } | undefined)?.orchestrator), seat: parseSeatLoopsConfig(rawObj.loops),
+    decisions: parseDecisionsConfig(rawObj.decisions),
+    loops: { ...(stewardLoops ?? {}), ...parseLoopOwners(rawObj.loops), orchestrator: parseOrchestratorLoopConfig((rawObj.loops as { orchestrator?: unknown } | undefined)?.orchestrator), seat: parseSeatLoopsConfig(rawObj.loops),
       persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true } },
     events: parseEventsConfig(rawObj.events),
     // M1-1: sparse — undefined when the user hasn't set anything, so
@@ -5868,6 +5968,8 @@ export function saveUserConfig(
       ...rawHarness,
       pod: cfg.harness?.pod ?? rawHarness.pod,
       budgetGate: cfg.harness?.budgetGate ?? rawHarness.budgetGate,
+      exposeGate: cfg.harness?.exposeGate ?? rawHarness.exposeGate,
+      revertGuard: cfg.harness?.revertGuard ?? rawHarness.revertGuard,
       difficultyPlacement: cfg.harness?.difficultyPlacement ?? rawHarness.difficultyPlacement,
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
       substrate: cfg.harness?.substrate,
@@ -5877,6 +5979,7 @@ export function saveUserConfig(
     ...rawRest,
     ...(cfg.loops ? { loops: {
       ...rawLoops,
+      owners: cfg.loops.owners ?? {}, defaultOwner: cfg.loops.defaultOwner ?? 'OP',
       ...(cfg.loops.steward ? { steward: { ...rawSteward, mode: cfg.loops.steward.mode ?? cfg.loops.steward.launch ?? 'shadow' } } : {}),
       ...(cfg.loops.orchestrator ? { orchestrator: cfg.loops.orchestrator } : {}),
       ...(cfg.loops.seat ? { seat: {
@@ -5884,6 +5987,7 @@ export function saveUserConfig(
         questions: cfg.loops.seat.questions ?? 'shadow',
         seats: cfg.loops.seat.seats ?? ['MK'],
         podPool: cfg.loops.seat.podPool ?? 'pool-node-b@node-b:8',
+        ...(cfg.loops.seat.neighbors ? { neighbors: cfg.loops.seat.neighbors } : {}),
         ...(cfg.loops.seat.reportPr === undefined ? {} : { reportPr: cfg.loops.seat.reportPr }),
       } } : {}),
     } } : {}),

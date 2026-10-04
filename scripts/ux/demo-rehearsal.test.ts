@@ -29,6 +29,17 @@ test('visible scene snapshot carries observed empty text to the scene verdict, e
   expect(judgeScene({ ...obs, emptyStates: snapshot().emptyStates }).verdict).toBe('ok');
 });
 
+test('scene 6 PTY no-judgment copy is classified as no-data, not a healthy scene', () => {
+  const phrase = '지금 PTY 판단이 없습니다';
+  const visible = { hidden: false, getClientRects: () => [1], getAttribute: () => '6', innerText: `PTY 인텔리전스 장면 — ${phrase} — 마지막 판단 12분 전. 새로운 판단이 도착하면 이 장면에서 확인합니다.` };
+  const document = { querySelectorAll: () => [visible] };
+  const state = runInNewContext(sceneSnapshotScript(), { document }) as { sectionsInDom: number; visibleScene: number | null; textLength: number; emptyStates: string[] };
+  expect(EMPTY_STATE_PHRASES).toContain(phrase);
+  expect(state.emptyStates).toEqual([phrase]);
+  const obs: SceneObservation = { scene: 6, title: 'PTY 인텔리전스', hiddenByDemo: false, secs: 1, frames: 1, exceptions: [], failedRequests: [], textLength: state.textLength, leaks: [], sectionsInDom: 6, visibleScene: state.visibleScene, emptyStates: state.emptyStates };
+  expect(judgeScene(obs)).toMatchObject({ verdict: 'no-data', reasons: [`실데이터 없음 — ${phrase}`] });
+});
+
 test('whole captured frame distinguishes dark or grey blank from content at the top above empty space', async () => {
   const width = 320;
   const height = 180;

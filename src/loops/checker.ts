@@ -14,6 +14,8 @@ export type LoopScope = 'graph-only' | 'registry';
 export interface CheckEntry {
   id: string;
   owner?: string;
+  ownerSource?: 'header' | 'config' | 'seat' | 'default';
+  evidence?: 'log-mtime';
   mode?: string;
   expectEveryMinutes?: number;
   /** The scheduled fire before the latest one (cron loops). A run older than this missed two scheduled fires. */
@@ -88,8 +90,8 @@ export interface RegistryAdapterDeps {
 }
 
 export function entriesFromRegistry(deps: RegistryAdapterDeps = {}): { entries: CheckEntry[]; scope: LoopScope } {
-  // The registry integration is optional until LOOP-REG1 lands. Do not import a missing named export.
-  const all = deps.listAllLoops ?? (registry as typeof registry & { listAllLoops?: () => CheckEntry[] }).listAllLoops;
+  // An explicitly injected graph inventory remains the checker test/adapter fallback.
+  const all = deps.listAllLoops ?? (deps.listLoops ? undefined : registry.listAllLoops);
   if (typeof all === 'function') return { entries: all(), scope: 'registry' };
   const now = deps.now ?? new Date();
   return { scope: 'graph-only', entries: (deps.listLoops ?? registry.listLoops)().map(loop => {
@@ -102,7 +104,7 @@ export function entriesFromRegistry(deps: RegistryAdapterDeps = {}): { entries: 
           : registry.loopStatus(loop.id).recentRuns.map(run => run.status)
       : [];
     const dueAt = loop.trigger.cron ? dueBefore(loop.trigger.cron, now, deps.timeZone) : null;
-    return { id: loop.id, enabled: loop.enabled, registered: true,
+    return { id: loop.id, owner: loop.owner ?? undefined, ownerSource: loop.ownerSource, enabled: loop.enabled, registered: true,
       ...(interval !== undefined ? { expectEveryMinutes: interval } : {}),
       ...(dueAt ? { dueAt } : {}),
       ...(loop.lastRun ? { lastRunAt: loop.lastRun.at, lastStatus: loop.lastRun.status } : {}),

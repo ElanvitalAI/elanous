@@ -3,8 +3,10 @@
 
 import type { RotationCandidate } from '../oauth/codex-account-rotation.js';
 import { inspectCodexRotation } from '../oauth/codex-account-store.js';
+import { codexPolicyAllowsCredits } from '../oauth/codex-quota-policy.js';
 import { getUsageStore } from '../budget/usage-store.js';
 import type { UsageSnapshot } from '../budget/types.js';
+import { debug } from '../debug/log.js';
 import {
   DEFAULT_BUDGET_GATE_MAX_USED_PERCENT,
   type BudgetGateMaxUsedPercent,
@@ -25,6 +27,9 @@ export interface BudgetCodexCandidate {
   readonly name: string;
   readonly reached?: boolean;
   readonly usedPercent?: number;
+  /** 선불 크레딧 잔액(계정에 귀속된 신호만). 모르면 비운다. */
+  readonly creditBalance?: number;
+  readonly hasCredits?: boolean;
 }
 
 export interface DecideBudgetInput {
@@ -36,6 +41,8 @@ export interface DecideBudgetInput {
   /** 주간 사용률. `undefined` 는 «모름» — 쓸 수 있다고 보지 않는다. */
   readonly grokUsedPercent: number | undefined;
   readonly maxUsedPercent: BudgetGateMaxUsedPercent;
+  /** codex 한도 정책이 credits 인가(`codexPolicyAllowsCredits` · 회전·Pod 배분과 같은 해석). 없으면 false. */
+  readonly codexCreditsAllowed?: boolean;
 }
 
 export interface BudgetDecision {
@@ -50,6 +57,7 @@ export interface BudgetInputs {
   readonly codexCandidates: readonly BudgetCodexCandidate[];
   readonly grokUsedPercent: number | undefined;
   readonly maxUsedPercent: BudgetGateMaxUsedPercent;
+  readonly codexCreditsAllowed?: boolean;
 }
 
 const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
@@ -98,6 +106,16 @@ function codexCandidateUsable(candidate: BudgetCodexCandidate, cap: number | und
   return candidate.usedPercent < cap;
 }
 
+/** BUDGET-GATE(10-05) — 정책이 credits 면 구독 % 가 차도 크레딧 잔액이 «확인된» 계정으로 계속 간다(Pod 배분과 같은 결론).
+ *  잔액을 모르면 쓰지 않는다 — 크레딧은 돈이라 fail-closed. 잔액이 가장 큰 계정 하나를 돌려준다. */
+function codexCreditCandidate(input: DecideBudgetInput): BudgetCodexCandidate | undefined {
+  if (input.codexCreditsAllowed !== true) return undefined;
+  return input.codexCandidates
+    .filter((candidate) => candidate.hasCredits !== false
+      && typeof candidate.creditBalance === 'number' && Number.isFinite(candidate.creditBalance) && candidate.creditBalance > 0)
+    .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
+}
+
 function slotUsable(
   provider: string,
   input: DecideBudgetInput,
@@ -106,6 +124,13 @@ function slotUsable(
   if (provider === CODEX_PROVIDER) {
     const cap = capFor(input.maxUsedPercent, CODEX_PROVIDER);
     const measuredUsable = input.codexCandidates.some((candidate) => codexCandidateUsable(candidate, cap));
+    const credit = measuredUsable ? undefined : codexCreditCandidate(input);
+    if (credit) {
+      try {
+        debug.log('budget.gate', 'credits-allowed', { used: credit.usedPercent ?? null, balance: credit.creditBalance, policy: 'credits' });
+      } catch { /* observation is fail-soft */ }
+      return { usable: true, reason: `${formatCodexReason(input.codexCandidates, cap)} · credits allowed (balance ${credit.creditBalance})` };
+    }
     const unmeasured = allowUnmeasured && !measuredUsable && (input.codexCandidates.length === 0
       || input.codexCandidates.some((candidate) => candidate.reached !== true
         && (typeof candidate.usedPercent !== 'number' || !Number.isFinite(candidate.usedPercent))));
@@ -188,6 +213,8 @@ export function codexCandidatesFromRotation(
     name: candidate.name,
     ...(candidate.reached !== undefined ? { reached: candidate.reached } : {}),
     ...(candidate.usedPercent !== undefined ? { usedPercent: candidate.usedPercent } : {}),
+    ...(candidate.creditBalance !== undefined ? { creditBalance: candidate.creditBalance } : {}),
+    ...(candidate.hasCredits !== undefined ? { hasCredits: candidate.hasCredits } : {}),
   }));
 }
 
@@ -212,6 +239,8 @@ export function readBudgetInputs(deps: ReadBudgetInputsDeps = {}): BudgetInputs 
     codexCandidates: codexCandidatesFromRotation(rotation.candidates),
     grokUsedPercent: grokWeeklyUsedPercent(snapshot),
     maxUsedPercent,
+    // 회전·Pod 배분과 같은 해석(`resolveCodexQuotaPolicy` → `codexPolicyAllowsCredits`)을 읽는다 — 다시 짓지 않는다.
+    ...(rotation.policy && codexPolicyAllowsCredits(rotation.policy.policy) ? { codexCreditsAllowed: true } : {}),
   };
 }
 

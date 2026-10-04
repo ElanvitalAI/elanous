@@ -1,4 +1,9 @@
 import { cardTitle, type TaskCard, type TaskCardEntry, type TaskCardSection } from '@/lib/task-card-model';
+import type { WishPlacementWire } from '@/nexus/client';
+
+const PROGRESS_LABEL: Record<WishPlacementWire['status'], string> = {
+  green: '순항', yellow: '진행 중', red: '막힘', done: '완료',
+};
 
 const SECTION_ORDER: Exclude<TaskCardSection, 'incidents'>[] = [
   'intake', 'triage', 'gates', 'relations', 'memory', 'workspace', 'run', 'landing', 'release',
@@ -34,7 +39,7 @@ function EntryMeta({ entry }: { entry: TaskCardEntry }) {
   );
 }
 
-export function TaskCardDetail({ card }: { card: TaskCard }) {
+export function TaskCardDetail({ card, placements }: { card: TaskCard; placements?: readonly WishPlacementWire[] }) {
   const gates = card.sections.gates?.data;
   return (
     <section aria-label="Task card detail" className="min-w-0 space-y-4 rounded-2xl border border-border bg-card p-4">
@@ -42,6 +47,12 @@ export function TaskCardDetail({ card }: { card: TaskCard }) {
         <h2 className="text-lg font-semibold">{cardTitle(card)}</h2>
         <p className="break-all text-xs text-muted-foreground">{card.taskId}</p>
       </header>
+      {placements && (
+        <p className="overflow-x-auto whitespace-nowrap text-sm" aria-label="Wish placement and progress">
+          배치 · {placements.length ? placements.map(({ cellId, cellTitle, version, status }) =>
+            `${cellId} ${cellTitle} · ${version}판 · ${PROGRESS_LABEL[status]}`).join(' / ') : '아직 배치되지 않음'}
+        </p>
+      )}
       {gates && (
         <p className="overflow-x-auto whitespace-nowrap text-sm" aria-label="Gate decisions">
           Gate · budget: {decision(gates.budget)} · location: {decision(gates.location)}

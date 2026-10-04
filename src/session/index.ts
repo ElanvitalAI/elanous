@@ -213,6 +213,8 @@ export interface SessionMeta {
   tgBotId?: string;
   /** Stable identity for a persona's resident conversation. */
   personaId?: string;
+  /** Optional persona selected for this conversation's replies (not resident identity). */
+  chatPersonaId?: string;
   /** Telegram session-key used for lookup by chat, e.g.
    *  `telegram:8799226199:dm:123:0` (bot-scoped) or legacy
    *  `telegram:dm:123:0`. Constructed once at create time. */

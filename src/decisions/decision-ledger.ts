@@ -31,7 +31,15 @@ export interface DecisionEntry {
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
 export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume' | 'pendingQuestion' | 'crossCheck' | 'crossCheckSkipped' | 'alternative' | 'dissent'> & { raisedAt?: string };
-type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
+export type Seat = 'OP' | 'MK' | 'TC' | 'UX';
+export interface SeatDecisionRecord {
+  id: string; title: string; decision: string; seat: Seat; delegation: string;
+  reporting: 'posthoc'; recordedAt: string;
+  /** Present only when the actual decision time is known. */
+  decidedAt?: string; versionAtDecision?: Versions; refs?: string[];
+}
+export type SeatDecisionInput = Pick<SeatDecisionRecord, 'title' | 'decision' | 'seat' | 'delegation' | 'refs'> & { decidedAt?: string };
+type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'seat-recorded'; entry: SeatDecisionRecord } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
 export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer }
 
 /** null = the decision resumes no run; otherwise whether the answer file was written (or already matched). */
@@ -196,6 +204,7 @@ export class DecisionLedger {
     if (filters.category && !CATEGORIES.includes(filters.category)) throw new Error('invalid category');
     const map = new Map<string, DecisionEntry>();
     for (const event of this.events()) {
+      if (event.type === 'seat-recorded') continue;
       if (event.type === 'raised') {
         if (map.has(event.entry.id)) throw new Error(`duplicate decision: ${event.entry.id}`);
         map.set(event.entry.id, event.entry);
@@ -220,6 +229,36 @@ export class DecisionLedger {
       && (!filters.version || [e.version?.released, e.version?.dev, e.version?.codename, e.versionAtDecision?.released, e.versionAtDecision?.dev, e.versionAtDecision?.codename].some(v => v === filters.version || v?.startsWith(`${filters.version}-`)))
       && (!filters.decidedBy || e.decidedBy?.kind === filters.decidedBy)
       && (!filters.category || e.category === filters.category)).sort((a, b) => (b.raisedAt ?? b.importedAt ?? '').localeCompare(a.raisedAt ?? a.importedAt ?? '') || a.id.localeCompare(b.id));
+  }
+  /** Delegated decisions are already made: they share the append-only ledger, never the owner's open-card state machine. */
+  recordSeatDecision(input: SeatDecisionInput): SeatDecisionRecord {
+    const seat = input.seat;
+    if (!['OP', 'MK', 'TC', 'UX'].includes(seat)) throw new Error('invalid seat');
+    const title = safe(single(input.title, 'title'));
+    const decision = safe(single(input.decision, 'decision'));
+    const delegation = safe(single(input.delegation, 'delegation'));
+    const refs = input.refs?.map(ref => safe(single(ref, 'ref')));
+    const decidedAt = input.decidedAt === undefined ? undefined : utc(input.decidedAt);
+    return this.locked(() => {
+      const existing = this.seatReport();
+      if (refs?.some(ref => existing.some(entry => entry.seat === seat && entry.title === title && entry.decision === decision && entry.refs?.includes(ref)))) throw new Error('seat decision source already recorded');
+      const recordedAt = utc(this.now().toISOString());
+      const prefix = `SD-${recordedAt.slice(0, 10).replaceAll('-', '')}-`;
+      const next = existing.reduce((n, entry) => entry.id.startsWith(prefix) ? Math.max(n, Number(entry.id.slice(prefix.length)) + 1) : n, 1);
+      const entry: SeatDecisionRecord = { id: `${prefix}${String(next).padStart(2, '0')}`, title, decision, seat, delegation,
+        reporting: 'posthoc', recordedAt, ...(decidedAt ? { decidedAt, versionAtDecision: this.version(decidedAt) } : {}), ...(refs?.length ? { refs } : {}) };
+      this.append({ type: 'seat-recorded', entry });
+      debug.log('decisions', 'seat-recorded', { id: entry.id, seat });
+      return entry;
+    });
+  }
+  seatReport(filters: { since?: string; seat?: Seat } = {}): SeatDecisionRecord[] {
+    const since = filters.since === undefined ? undefined : utc(filters.since);
+    if (filters.seat && !['OP', 'MK', 'TC', 'UX'].includes(filters.seat)) throw new Error('invalid seat');
+    return this.events().filter((event): event is Extract<Event, { type: 'seat-recorded' }> => event.type === 'seat-recorded')
+      .map(event => event.entry)
+      .filter(entry => (!since || (entry.recordedAt ?? entry.decidedAt ?? '') >= since) && (!filters.seat || entry.seat === filters.seat))
+      .sort((a, b) => (b.recordedAt ?? b.decidedAt ?? '').localeCompare(a.recordedAt ?? a.decidedAt ?? '') || a.id.localeCompare(b.id));
   }
   show(id: string): DecisionEntry { const entry = this.list({ status: 'all' }).find(e => e.id === id); if (!entry) throw new Error(`decision not found: ${id}`); return entry; }
   raise(input: RaiseInput): DecisionEntry {

@@ -187,3 +187,10 @@ test('none, running, failed and unmeasured cannot call gh merge; check is author
   expect((await unauth.post('check')).status).toBe(401);
   expect(unauth.calls).toHaveLength(0);
 });
+
+test('a host re-gate held by a landing freeze is never recorded as a passed approval gate', async () => {
+  const input = gateInput(991);
+  startApprovalGate(input, { readPr: currentPr, runHostRegate: async () => ({ passed: true, failures: [], os: 'linux', status: 'frozen' as const }) });
+  await settled();
+  expect(getApprovalGate(991, sha, 'o/r', baseSha, '/install').status).toBe('unmeasured');
+});

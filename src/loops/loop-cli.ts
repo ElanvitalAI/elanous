@@ -1,9 +1,10 @@
 import type { Command } from 'commander';
 import { writeStdoutJson } from '../cli/stdout-json.js';
-import { listLoops, loopStatus, runLoop, setLoopEnabled } from './registry.js';
+import { listAllLoops, listLoops, loopStatus, runLoop, setLoopEnabled, unregisteredCronLoops, type AllLoopEntry, type LoopRegistryOptions } from './registry.js';
 import { checkLoops, countLoopStates, entriesFromRegistry, LOOP_STATES, notifyOwners, observeLoopCheck, type RegistryAdapterDeps } from './checker.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { verifyLoopPackage } from './package/verify.js';
+import { loopActivity } from './activity.js';
 
 async function output(value: unknown, json: boolean): Promise<void> {
   if (json) await writeStdoutJson(JSON.stringify(value) + '\n');
@@ -17,10 +18,41 @@ function handle(action: () => Promise<void> | void): Promise<void> {
   });
 }
 
-export function registerLoopCommands(program: Command, checkerDeps: RegistryAdapterDeps & { root?: string } = {}): void {
+function allLoopTable(entries: AllLoopEntry[]): void {
+  console.log('id\t층\t주인 자리\t모드\t기대 주기\t호스트\t울타리 역할\t관측 카테고리\t마지막 실행');
+  for (const entry of entries) {
+    const interval = entry.expectEveryMinutes === undefined ? '모름'
+      : entry.cronIrregular ? `불규칙 · 최대 ${entry.expectEveryMinutes}분` : `${entry.expectEveryMinutes}분`;
+    console.log([entry.id, entry.kind, entry.owner ?? '모름', entry.mode ?? '모름', interval,
+      entry.host ?? '모름', entry.fenceRole ?? '모름', entry.observationCategory ?? '모름', entry.lastRunAt ?? '모름'].join('\t'));
+  }
+}
+
+export function registerLoopCommands(program: Command, checkerDeps: RegistryAdapterDeps & { root?: string; registryOptions?: LoopRegistryOptions } = {}): void {
   const loop = program.command('loop').description('Inspect and control graph-backed loop agents');
-  loop.command('list').option('--json', 'Print JSON')
-    .action((opts: { json?: boolean }) => handle(() => output(listLoops(), !!opts.json)));
+  loop.command('list').option('--all', 'Show the full loop registry').option('--json', 'Print JSON')
+    .action((opts: { all?: boolean; json?: boolean }) => handle(async () => {
+      if (!opts.all) { await output(listLoops(checkerDeps.registryOptions), !!opts.json); return; }
+      const registryOpts = checkerDeps.registryOptions ?? {};
+      const entries = listAllLoops(registryOpts);
+      if (opts.json) { await output(entries, true); return; }
+      allLoopTable(entries);
+      const missing = unregisteredCronLoops(entries, registryOpts);
+      if (missing.length) console.log(`미등록 ${missing.length}: ${missing.map(row => `${row.id} (${row.command})`).join(', ')}`);
+    }));
+  loop.command('activity').description('Read loop and seat activity in a time window (default: last 24h)')
+    .option('--since <duration-or-date>', 'Start of window: duration (e.g. 24h) or ISO date', '24h')
+    .option('--json', 'Print JSON')
+    .action((opts: { since: string; json?: boolean }) => handle(async () => {
+      const activity = loopActivity({ since: opts.since, root: checkerDeps.root ?? effectiveInstanceRoot() });
+      if (opts.json) { await output(activity, true); return; }
+      console.log(`Loop activity ${activity.since} → ${activity.until}`);
+      console.log(`${activity.nodes.length} nodes · ${activity.edges.length} edges`);
+      console.log('Nodes (id · state · events · last activity)');
+      for (const node of activity.nodes) console.log(`${node.id} · ${node.state ?? '—'} · ${node.events} · ${node.lastAt ?? '—'}`);
+      console.log('Edges (from → to · kind · count · last activity)');
+      for (const edge of activity.edges) console.log(`${edge.from} → ${edge.to} · ${edge.kind} · ${edge.count} · ${edge.lastAt}`);
+    }));
   loop.command('status [id]').option('--all', 'Check all registered loops')
     .option('--json', 'Print JSON').option('--notify', 'Queue late/failing loops for their owners')
     .action((id: string | undefined, opts: { all?: boolean; json?: boolean; notify?: boolean }) => handle(async () => {

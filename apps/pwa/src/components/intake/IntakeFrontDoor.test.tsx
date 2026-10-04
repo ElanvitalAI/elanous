@@ -82,8 +82,7 @@ describe('IntakeFrontDoor', () => {
       absorbIds: null,
       acceptanceId: 'acc-screen-1',
       graph: { phase: 'launch-started', runId: 'run-9' },
-      splitOpen: false,
-      splitMemo: '',
+      wishCardId: null,
       recent: [],
     });
     expect(isDisabled(html, 'intake-graph')).toBe(false);
@@ -96,7 +95,7 @@ describe('IntakeFrontDoor', () => {
   test('가짜 끝 사건을 받아 그래프 기록 줄에 단계·마지막 시각·완료 또는 실패를 표시한다', () => {
     const base: IntakeFrontDoorState = {
       text: '', busy: false, error: null, absorbIds: null, acceptanceId: 'acc-1',
-      graph: { phase: 'launch-started', runId: 'run-9' }, splitOpen: false, splitMemo: '',
+      graph: { phase: 'launch-started', runId: 'run-9' }, wishCardId: null,
       recent: [{ track: 'graph', at: 't0', preview: '그래프 글', acceptanceId: 'acc-1', runId: 'run-9' }],
     };
     const completed = markup({ ...base, runEvents: { 'run-9': [
@@ -378,8 +377,7 @@ describe('IntakeFrontDoor', () => {
       absorbIds: ['item-1', 'item-2'],
       acceptanceId: null,
       graph: null,
-      splitOpen: false,
-      splitMemo: '',
+      wishCardId: null,
       recent: [],
     });
     expect(html).toContain('대기열에 넣었습니다(아침 정기 흡수에서 처리)');
@@ -388,7 +386,7 @@ describe('IntakeFrontDoor', () => {
     expect(html).toContain('item-2');
   });
 
-  test('작업으로 나누기는 칸의 글을 MemoIntakePreview initialMemo 로 연다', () => {
+  test('작업으로 나누기 결과는 카드 id를 보이고 메모 창을 열지 않는다', () => {
     const html = markup({
       text: '나눌 메모',
       busy: false,
@@ -396,13 +394,34 @@ describe('IntakeFrontDoor', () => {
       absorbIds: null,
       acceptanceId: null,
       graph: null,
-      splitOpen: true,
-      splitMemo: '나눌 메모',
+      wishCardId: 'card-9',
       recent: [],
     });
-    expect(html).toContain('data-testid="intake-split-host"');
-    expect(html).toContain('data-testid="memo-intake-preview"');
-    expect(html).toContain('나눌 메모');
+    expect(html).toContain('data-testid="intake-wish-card-id"');
+    expect(html).toContain('card-9');
+    expect(html).not.toContain('memo-intake-preview');
+  });
+
+  test('작업으로 나누기 버튼은 PWA 세션을 회신 대상으로 카드 API에 보내고 id를 기록한다', async () => {
+    const calls: { path: string; body: Record<string, string> }[] = [];
+    const daemon = { ...STUB_DAEMON, client: { fetchJson: async (path: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, string>;
+      calls.push({ path, body });
+      return { cardId: 'card-real-1', title: '작업을 부탁합니다', created: true };
+    } } as never };
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><IntakeFrontDoor /></DaemonContext.Provider>); });
+    try {
+      await act(async () => { tree.root.findByProps({ 'data-testid': 'intake-front-door-field' }).props.onChange({ target: { value: '작업을 부탁합니다' } }); });
+      await act(async () => { tree.root.findByProps({ 'data-testid': 'intake-split' }).props.onClick(); });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.path).toBe('/v1/task-cards/wish');
+      expect(calls[0]!.body).toMatchObject({ text: '작업을 부탁합니다', sessionId: 'sess-test' });
+      expect(calls[0]!.body.ref).toBeTruthy();
+      expect(JSON.stringify(tree.toJSON())).toContain('card-real-1');
+      expect(JSON.stringify(tree.toJSON())).not.toContain('memo-intake-preview');
+      expect(JSON.parse(store.get('elanous.intake.recent')!)[0]).toMatchObject({ track: 'split', cardId: 'card-real-1' });
+    } finally { await act(async () => { tree.unmount(); }); }
   });
 
   test('최근 목록은 앞 40자만 보이고 원문 전체를 저장하지 않는다', async () => {
@@ -418,8 +437,7 @@ describe('IntakeFrontDoor', () => {
       absorbIds: null,
       acceptanceId: null,
       graph: null,
-      splitOpen: false,
-      splitMemo: '',
+      wishCardId: null,
       recent: [{ track: 'absorb', at: '2026-09-26T00:00:00.000Z', preview, ids: ['id-1'] }],
     });
     expect(html).toContain(preview);
@@ -466,8 +484,7 @@ describe('IntakeFrontDoor', () => {
       absorbIds: null,
       acceptanceId: null,
       graph: null,
-      splitOpen: false,
-      splitMemo: '',
+      wishCardId: null,
       recent: [],
       route: { track: 'graph', confidence: 0.9, reason: 'imperative-implement', decidedBy: 'rule' },
     });
@@ -490,7 +507,7 @@ describe('IntakeFrontDoor', () => {
   test('분류기 판정 · 낮은 확신 · 실패는 칩에서 서로 다른 문구이고 자동 실행은 없다', () => {
     const base: IntakeFrontDoorState = {
       text: '어느 갈래?', busy: false, error: null, absorbIds: null, acceptanceId: null,
-      graph: null, splitOpen: false, splitMemo: '', recent: [],
+      graph: null, wishCardId: null, recent: [],
     };
     const normal = markup({ ...base, route: { track: 'graph', confidence: 0.83, reason: 'intent', decidedBy: 'classifier' } });
     expect(normal).toContain('분류기 판정 · 확신 83%');
@@ -564,8 +581,7 @@ describe('IntakeFrontDoor', () => {
       absorbIds: null,
       acceptanceId: null,
       graph: null,
-      splitOpen: false,
-      splitMemo: '',
+      wishCardId: null,
       recent: [],
       route: null,
     });

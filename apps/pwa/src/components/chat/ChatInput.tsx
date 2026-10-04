@@ -32,6 +32,10 @@ const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
 const SEAT_ASK_CLIENT_KEY = 'elanous.seat-ask.client';
 let seatAskClientFallback: string | null = null;
 
+function isCtoAsk(text: string): boolean {
+  return /^\s*CTO\s*에게\s*물어봐(?:\s*[:：]\s*|\s+)\S/i.test(text);
+}
+
 function seatAskClientIdForBrowser(): string {
   let id: string | null = null;
   try { id = window.sessionStorage.getItem(SEAT_ASK_CLIENT_KEY); } catch { /* cookie fallback */ }
@@ -419,7 +423,7 @@ export function ChatInput({
     setSeatPending(true);
     setSeatError('');
     try {
-      if (/^\s*CTO\s*에게\s*물어봐\s*[:：]\s*\S/i.test(request.text)) {
+      if (isCtoAsk(request.text)) {
         const result = await client.submitSeatAsk(request.text, seatAskClientId.current!);
         setSeatAskMessages((previous) => [...previous, { id: crypto.randomUUID(), text: result.reply }]);
         setValue('');
@@ -461,7 +465,7 @@ export function ChatInput({
   const submitText = (text: string): void => {
     if (disabled || seatPending) return;
     const trimmed = text.trim();
-    if (/^CTO\s*에게\s*물어봐\s*[:：]\s*\S/i.test(trimmed)) {
+    if (isCtoAsk(trimmed)) {
       if (attachments.length) { setSeatError('질문에는 첨부를 넣을 수 없습니다'); return; }
       void sendSeatRequest({ seat: 'TC', text: trimmed, attachments: [], key: crypto.randomUUID() });
       return;

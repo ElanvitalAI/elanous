@@ -34,18 +34,13 @@ const statePattern = /(?:\b(?:homedir|HOME|ELANOUS_(?:STATE|CONFIG|NEXUS)_DIR|EL
 export type StaticIsolationSignal = 'ELANOUS_STATE_DIR' | '--config-dir' | 'mkdtemp';
 export type StaticSafetyClassification = 'isolated' | 'manual-review';
 
-const inspectedManualReviews: Record<string, string> = {
-  'src/autopilot/build/config-isolation.test.ts': 'setElanousConfigDir redirects the tested config into an isolated worktree path; SHA assertions prove the real config is unchanged.',
-  'test/artifact-store.test.ts': 'the apparent writes target an in-memory ArtifactFs fake, not the host filesystem.',
-  'test/pty-drive-workdir-decision.test.ts': 'setElanousConfigDir receives only /tmp paths and the afterEach reset restores the override.',
-  'test/working-dir.test.ts': 'the fixed test root is derived from tmpdir() and removed by afterAll.',
-};
-
 export type WriterCall = {
   line: number;
   pattern: string;
   staticIsolationSignals: StaticIsolationSignal[];
   staticSafety: StaticSafetyClassification;
+  /** The expanded target names the real home (homedir(), $HOME, ~/) — the only writer calls that fail the audit. */
+  realHomeTarget: boolean;
 };
 
 type AuditFinding = {
@@ -123,8 +118,10 @@ export function classifyStaticIsolation(text: string): { signals: StaticIsolatio
   return { signals, safety: signals.length ? 'isolated' : 'manual-review' };
 }
 
-function writerIsolation(source: ts.SourceFile, writer: ts.CallExpression | ts.NewExpression, name: string): { signals: StaticIsolationSignal[]; safety: StaticSafetyClassification } {
-  if (name === 'mkdtemp' || name === 'mkdtempSync') return { signals: ['mkdtemp'], safety: 'isolated' };
+const REAL_HOME_TARGET = /\bhomedir\s*\(|process\.env\.HOME\b|process\.env\[\s*['"]HOME['"]\s*\]|['"`]~\//;
+
+function writerIsolation(source: ts.SourceFile, writer: ts.CallExpression | ts.NewExpression, name: string): { signals: StaticIsolationSignal[]; safety: StaticSafetyClassification; realHomeTarget: boolean } {
+  if (name === 'mkdtemp' || name === 'mkdtempSync') return { signals: ['mkdtemp'], safety: 'isolated', realHomeTarget: false };
   const variables = new Map<string, string>();
   const visit = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) variables.set(node.name.text, node.initializer.getText(source));
@@ -138,7 +135,40 @@ function writerIsolation(source: ts.SourceFile, writer: ts.CallExpression | ts.N
     return `(${expand(variables.get(name)!)})`;
   });
   const argumentsText = writer.arguments?.map((argument) => argument.getText(source)).join(' ') ?? '';
-  return classifyStaticIsolation(expand(argumentsText));
+  return { ...classifyStaticIsolation(expand(argumentsText)), realHomeTarget: realHomeTarget(source, writer) };
+}
+
+/** Lexically nearest declaration of `name` visible before `at` (same file-wide name reused across tests must not leak). */
+function scopedInitializer(source: ts.SourceFile, at: ts.Node, name: string): ts.Expression | undefined {
+  for (let scope: ts.Node | undefined = at.parent; scope; scope = scope.parent) {
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope) && !ts.isModuleBlock(scope)) continue;
+    let found: ts.Expression | undefined;
+    for (const statement of scope.statements) {
+      if (statement.pos >= at.pos) break;
+      if (!ts.isVariableStatement(statement)) continue;
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name) && declaration.name.text === name && declaration.initializer) found = declaration.initializer;
+      }
+    }
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** Only the target path (first argument) counts — written content may mention homedir() as fixture text. */
+function realHomeTarget(source: ts.SourceFile, writer: ts.CallExpression | ts.NewExpression): boolean {
+  const target = writer.arguments?.[0];
+  if (!target) return false;
+  const seen = new Set<string>();
+  const expand = (node: ts.Node, text: string): string => text.replace(/\b[A-Za-z_$][\w$]*\b/g, (name) => {
+    if (seen.has(name)) return name;
+    const initializer = scopedInitializer(source, node, name);
+    if (!initializer) return name;
+    seen.add(name);
+    return `(${expand(initializer, initializer.getText(source))})`;
+  });
+  const expanded = expand(target, target.getText(source));
+  return REAL_HOME_TARGET.test(expanded) && classifyStaticIsolation(expanded).safety !== 'isolated';
 }
 
 export type CandidateClassification = {
@@ -158,18 +188,30 @@ export function addedCandidates(report: ReturnType<typeof auditTestStateWrites>,
   return new Set(report.findings.map(({ file }) => file).filter((file) => !previousInventory.has(file)));
 }
 
+/**
+ * Fails only writer calls whose target reaches the real home without isolation evidence. A static scan cannot
+ * follow a temp directory through function returns or parameters, so "no evidence" alone stays visible as
+ * manual review in the rendered inventory instead of failing hundreds of mkdtemp-backed writes.
+ */
+export function unclassifiedCandidates(report: ReturnType<typeof auditTestStateWrites>, previousInventory: ReadonlySet<string>): string[] {
+  const { isolated, manualReview } = classifyCandidates(report, addedCandidates(report, previousInventory));
+  // The file-wide isolation label can be borrowed from a same-named temp variable in another test, so the
+  // scoped real-HOME judgement decides on every call, including ones labelled isolated.
+  return [...isolated, ...manualReview].sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)
+    .filter(({ realHomeTarget }) => realHomeTarget)
+    .map(({ file, line, pattern }) => `${file}:${line} ${pattern} — writes a real HOME path without isolation evidence`);
+}
+
 function classificationSummary(classification: CandidateClassification): string {
   const { findings, isolated, manualReview } = classification;
-  const isolatedFiles = findings.filter(({ staticSafety }) => staticSafety === 'isolated');
   const manualReviewFiles = findings.filter(({ staticSafety }) => staticSafety === 'manual-review');
   return [
     `- August 8 candidate window: **${findings.length} files** (current inventory minus the preserved August 8 inventory).`,
-    `- Candidate classification (files): **${isolatedFiles.length} ㉠ isolated** / **${manualReviewFiles.length} ㉡ manual review**.`,
-    `- ㉡ candidate files: ${manualReviewFiles.length ? manualReviewFiles.map(({ file }) => `\`${file}\``).join(', ') : '0건'}.`,
+    `- Candidate classification (files): **${findings.length - manualReviewFiles.length} ㉠ isolated** / **${manualReviewFiles.length} ㉡ manual review**.`,
     `- Writer-call evidence in the August 8 window: **${isolated.length} isolated** / **${manualReview.length} manual review**; a file is ㉡ whenever any writer call lacks a direct approved signal.`,
     `- ㉡ writer calls: ${manualReview.length ? manualReview.map(({ file, line, pattern }) => `\`${file}:${line} ${pattern}\``).join(', ') : '0건'}.`,
-    `- Manual inspection opened: **${manualReviewFiles.length}**; genuine HOME/state writers: **0건**.`,
-    ...manualReviewFiles.map(({ file }) => `- Manual inspection — \`${file}\`: ${inspectedManualReviews[file] ?? 'opened; no genuine HOME/state write established.'}`),
+    `- Manual review required: **${manualReviewFiles.length}** candidate files. This static audit does not establish whether an unclassified write targets a real HOME/state path.`,
+    ...manualReviewFiles.map(({ file }) => `- Manual review pending — \`${file}\`: isolation is unverified.`),
   ].join('\n');
 }
 
@@ -198,7 +240,7 @@ export function auditTestStateWrites(root = repo): { total: number; findings: Au
     visit(source);
     const writerCalls = writerNodes.map(({ name, node }) => {
       const classification = writerIsolation(source, node, name);
-      return { line: lineOf(source, node), pattern: formatWriterPattern(name, node, source), staticIsolationSignals: classification.signals, staticSafety: classification.safety };
+      return { line: lineOf(source, node), pattern: formatWriterPattern(name, node, source), staticIsolationSignals: classification.signals, staticSafety: classification.safety, realHomeTarget: classification.realHomeTarget };
     });
     const stateLines = text.split('\n').flatMap((line, index) => statePattern.test(line) ? [index + 1] : []);
     if (writerCalls.length && stateLines.length) {
@@ -221,8 +263,9 @@ export function auditTestStateWrites(root = repo): { total: number; findings: Au
   return { total: files.length, findings };
 }
 
-export function renderAudit(report: ReturnType<typeof auditTestStateWrites>, previous = august8Inventory(repo)): string {
+export function renderAudit(report: ReturnType<typeof auditTestStateWrites>, previous = august8Inventory(repo), reviewed = new Set(readFileSync(baselinePath, 'utf8').split('\n').filter((line) => line && !line.startsWith('#')))): string {
   const candidateWindow = classifyCandidates(report, addedCandidates(report, previous));
+  const automatic = classifyCandidates(report, addedCandidates(report, reviewed));
   const rows = report.findings.map((finding) =>
     `| \`${finding.file}\` | ${finding.writerLines.join(', ')} | ${finding.writerTargets.map((target) => `\`${target}\``).join('<br>')} | ${finding.stateLines.join(', ')} | ${finding.risk} | ${finding.isolation} | ${finding.staticSafety} (${finding.staticIsolationSignals.join(', ') || 'none'}) |`,
   );
@@ -230,6 +273,7 @@ export function renderAudit(report: ReturnType<typeof auditTestStateWrites>, pre
     '# Test Home and State Write Audit',
     '',
     'This inventory is generated by `scripts/audit-test-state-writes.ts` using TypeScript AST call detection for filesystem/state writer calls and text detection for home/state-root evidence. It covers every `*.test.*` and `*.spec.*` file under `test/` and `src/`.',
+    `Rows for files outside the reviewed baseline are a snapshot from generation time; refresh with \`${INVENTORY_REFRESH_COMMAND}\`.`,
     '',
     `- Scanned test files: **${report.total}**`,
     `- Potential home/state writers: **${report.findings.length}**`,
@@ -237,6 +281,17 @@ export function renderAudit(report: ReturnType<typeof auditTestStateWrites>, pre
     '- Writer lines are AST-derived call expressions; state lines are text-derived path/environment evidence. The two lenses intentionally intersect to reduce false positives while retaining indirect store writers.',
     '- Static safety classification is approval-gating: only `ELANOUS_STATE_DIR`, `--config-dir`, or `mkdtemp` counts as isolated; all other candidates require manual inspection.',
     classificationSummary(candidateWindow),
+    '',
+    '## 분류기 통과(자동) — 사람 검토 기준선 밖',
+    '',
+    `Reviewed baseline: \`test/test-home-state-write-audit-baseline.txt\`. Regenerate with \`${INVENTORY_REFRESH_COMMAND}\`. Only candidates with every writer call statically isolated appear below; manual-review calls fail the audits rather than expanding the baseline.`,
+    '',
+    '| File | Writer lines | Approved isolation signals |',
+    '| --- | --- | --- |',
+    ...automatic.findings.filter(({ staticSafety }) => staticSafety === 'isolated').map(({ file, writerLines, staticIsolationSignals }) =>
+      `| \`${file}\` | ${writerLines.join(', ')} | ${staticIsolationSignals.join(', ')} |`),
+    '',
+    '## 전체 스캔 (사람 검토 + 자동 분류)',
     '',
     '| File | Writer call lines (AST) | Write target or store argument | Home/state evidence lines (text) | Risk | Current isolation evidence | Static safety |',
     '| --- | --- | --- | --- | --- | --- | --- |',

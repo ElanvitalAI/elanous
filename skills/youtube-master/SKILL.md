@@ -60,52 +60,52 @@ YouTube URL(`youtube.com`, `youtu.be`, `/shorts/`, `/embed/`)이 포함된 모�
 이 스킬 폴더에서 실행합니다.
 
 ```bash
-npx tsx ./scripts/main.ts "<URL>" --message "<사용자 의도>" --print
+bun ./scripts/main.ts "<URL>" --message "<사용자 의도>" --print
 ```
 
 ### 자동 라우팅 예시
 
 ```bash
 # 기본 카드형 요약 → Obsidian 저장
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --print
 
 # 간단 요약
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --message "짧게 요약" --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --message "짧게 요약" --print
 
 # 학습노트 생성
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --message "학습노트로 정리해줘" --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --message "학습노트로 정리해줘" --print
 
 # 상세 분석
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --message "상세 분석" --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --message "상세 분석" --print
 
 # 자막 강화 요약
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --message "자막 강화해서 요약" --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --message "자막 강화해서 요약" --print
 ```
 
 ### 부분 스킬 (자막/메타데이터만)
 
 ```bash
 # 자막만 추출
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --only transcript --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --only transcript --print
 
 # 메타데이터만
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --only metadata
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --only metadata
 ```
 
 ### 강제 옵션
 
 ```bash
 # 형식 강제
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --format detailed --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --format detailed --print
 
 # 타겟 강제
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --target pdf --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --target pdf --print
 
 # Cloud STT 강제
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --cloud-stt --print
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --cloud-stt --print
 
 # 라우팅 확인만 (실행 없이)
-npx tsx scripts/main.ts "https://youtu.be/VIDEO_ID" --message "학습노트" --dry-run
+bun scripts/main.ts "https://youtu.be/VIDEO_ID" --message "학습노트" --dry-run
 ```
 
 ## 옵션 정리
@@ -154,7 +154,7 @@ cc웹/ccv웹 요청 시:
 ```bash
 cd .
 npm install
-npx tsx scripts/main.ts --self-test
+bun scripts/main.ts --self-test
 ```
 
 Cloud STT 경로 사용 시:

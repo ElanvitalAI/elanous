@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import { decideGraphApproval, latestGraphRun, manageGraphRun, runGraph } from '.
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { readFailureInbox, recordFailureEvent } from '../self-implement/heal-intake.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 
 const dirs: string[] = [];
@@ -179,6 +180,7 @@ test('two successful commands reach done and persist both outcomes', async () =>
   expect(result.status).toBe('done');
   expect(result.path).toEqual(['first', 'second', 'done']);
   expect(result.executed).toBe(2);
+  expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).nodes.slice(0, 2)).toEqual([
     { nodeId: 'first', ok: true, exit: 0, executed: true, output: '' },
     { nodeId: 'second', ok: true, exit: 0, executed: true, output: '' },
@@ -376,6 +378,68 @@ test('failed first command branches to failed without executing second', async (
   expect(result.executed).toBe(1);
 });
 
+test('real release-loop failed node writes one heal inbox line without running downstream commands', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-release-heal-'));
+  dirs.push(root);
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  let calls = 0;
+  const result = await runGraph(graph, { deps: { root, runBash: async () => {
+    calls++;
+    return { stdout: '', stderr: 'release failed', exitCode: 1 };
+  } } });
+  expect(result.status).toBe('failed');
+  expect(result.path).toEqual(['version-release', 'failed']);
+  expect(result.nodes[0]).toMatchObject({ ok: false, exit: 1 });
+  expect(result.executed).toBe(1);
+  expect(calls).toBe(1);
+  expect(JSON.parse(readFileSync(result.statePath, 'utf8')).status).toBe('failed');
+  const lines = readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8').trimEnd().split('\n');
+  expect(lines).toHaveLength(1);
+  expect(readFailureInbox({}, root)).toEqual([{
+    source: 'release-run', kind: 'graph-run', ref: `${result.graphId}/${result.runId}`,
+    summary: `Graph ${result.graphId}/${result.runId} failed at failed`, at: result.finishedAt!,
+  }]);
+});
+
+test('release-loop with no outgoing edge records the failed run exactly once', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8')
+    .replace('graph_id: test-graph', 'graph_id: release-loop')
+    .replace('map: { ok: second, fail: failed }', 'map: { fail: failed }'));
+  const run = await runGraph(graph, { deps: { root } });
+  expect(run.status).toBe('failed');
+  expect(run.path).toEqual(['first']);
+  expect(readFailureInbox({}, root)).toEqual([{
+    source: 'release-run', kind: 'graph-run', ref: `${run.graphId}/${run.runId}`,
+    summary: `Graph ${run.graphId}/${run.runId} failed after first (no outgoing edge)`, at: run.finishedAt!,
+  }]);
+  expect(readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8').trimEnd().split('\n')).toHaveLength(1);
+});
+
+test('a broken heal inbox does not replace either persisted release failure verdict and exposes a replay path', async () => {
+  for (const branch of ['terminal', 'no-edge']) {
+    const { graph, root } = fixture(branch === 'terminal' ? 'exit 1' : 'exit 0');
+    writeFileSync(graph, readFileSync(graph, 'utf8')
+      .replace('graph_id: test-graph', 'graph_id: release-loop')
+      .replace('map: { ok: second, fail: failed }', branch === 'no-edge' ? 'map: { fail: failed }' : 'map: { ok: second, fail: failed }'));
+    mkdirSync(join(root, 'heal'));
+    writeFileSync(join(root, 'heal', 'inbox.jsonl'), '{invalid-json}\n');
+    const result = await runGraph(graph, { runId: `broken-${branch}`, deps: { root } });
+    expect(result.status).toBe('failed');
+    expect(JSON.parse(readFileSync(result.statePath, 'utf8')).status).toBe('failed');
+    expect(readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8')).toBe('{invalid-json}\n');
+    expect(debug.events(500).filter(entry => entry.category === 'heal.intake' && entry.event === 'record-failed' &&
+      (entry.data as { ref?: string })?.ref === `${result.graphId}/${result.runId}`)).toMatchObject([
+      { level: 'error', data: { source: 'release-run', kind: 'graph-run', ref: `${result.graphId}/${result.runId}`,
+        statePath: result.statePath, error: expect.stringContaining('SyntaxError') } },
+    ]);
+    writeFileSync(join(root, 'heal', 'inbox.jsonl'), '');
+    expect(recordFailureEvent({ source: 'release-run', kind: 'graph-run', ref: `${result.graphId}/${result.runId}`,
+      summary: `Graph ${result.graphId}/${result.runId} failed`, at: result.finishedAt! }, root)).toEqual({ folded: false });
+    expect(readFailureInbox({}, root)).toHaveLength(1);
+  }
+});
+
 test('missing outcome mapping uses fallback without executing the second command', async () => {
   const { graph, root } = fixture('exit 1');
   writeFileSync(graph, readFileSync(graph, 'utf8').replace('map: { ok: second, fail: failed }', 'map: { ok: second }\n    fallback:\n      - { node: failed, requires: [] }'));
@@ -383,6 +447,7 @@ test('missing outcome mapping uses fallback without executing the second command
   expect(result.status).toBe('failed');
   expect(result.path).toEqual(['first', 'failed']);
   expect(result.executed).toBe(1);
+  expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
 });
 
 test('a revisit beyond max_visits is blocked before running again', async () => {
@@ -1205,27 +1270,38 @@ test('one (node, outcome) growth is reused on a revisit rather than proposed aga
 });
 
 // 09-30 🅢: 작업 트리 `graph run … --config-dir ~/.elanous` 의 `cmd:` 자식이 코드 위치로 시험 우주를 새로 골랐다.
-test('an explicit config dir is pinned into every cmd child env; without one the child env is left as the parent had it', async () => {
+test('an explicit config dir pins the state-backed config root for every cmd child without forwarding an ignored config env', async () => {
   const { graph, root } = fixture('exit 0');
   const explicit = mkdtempSync(join(tmpdir(), 'graph-universe-'));
   const envs: NodeJS.ProcessEnv[] = [];
   const priorConfig = process.env.ELANOUS_CONFIG_DIR;
-  delete process.env.ELANOUS_CONFIG_DIR;
+  const priorState = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_CONFIG_DIR = '/ignored/parent/config';
   try {
     setElanousConfigDir(explicit);
     const expectedConfig = getElanousConfigDir();
     const expectedState = effectiveInstanceRoot();
     const pinned = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => { envs.push(opts.env!); return { stdout: '', stderr: '', exitCode: 0 }; } } });
     expect(pinned.status).toBe('done');
-    expect(envs.length).toBeGreaterThan(0);
-    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === expectedConfig && env.ELANOUS_STATE_DIR === expectedState)).toBe(true);
+    expect(envs).toHaveLength(2);
+    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === undefined && env.ELANOUS_STATE_DIR === expectedState)).toBe(true);
+    expect(expectedConfig).toBe(expectedState);
+    const child = Bun.spawnSync({
+      cmd: [process.execPath, '-e', `import { getElanousConfigDir } from ${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))}; console.log(getElanousConfigDir());`],
+      env: envs[0], stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(child.exitCode).toBe(0);
+    expect(new TextDecoder().decode(child.stdout).trim()).toBe(expectedConfig);
     resetElanousConfigDir();
     envs.length = 0;
+    process.env.ELANOUS_STATE_DIR = '/inherited/state';
     await runGraph(graph, { deps: { root, runBash: async (_body, opts) => { envs.push(opts.env!); return { stdout: '', stderr: '', exitCode: 0 }; } } });
-    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === undefined)).toBe(true);
+    expect(envs).toHaveLength(2);
+    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === undefined && env.ELANOUS_STATE_DIR === '/inherited/state')).toBe(true);
   } finally {
     resetElanousConfigDir();
     if (priorConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = priorConfig;
+    if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = priorState;
     rmSync(explicit, { recursive: true, force: true });
   }
 });

@@ -8,10 +8,11 @@ import type { SeatId } from './seat-questions.js';
 export type AskOrigin =
   | { channel: 'telegram'; chatId: number | string; messageId: number; threadId?: number; botId?: string }
   | { channel: 'discord'; channelId: string; messageId: string; threadId?: string }
-  | { channel: 'pwa'; clientId: string };
+  | { channel: 'pwa'; clientId: string }
+  | { channel: 'tui'; clientId: string };
 
 export const DEFAULT_ASK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-export const parseSeatAsk = (text: string): string | null => /^\s*CTO\s*에게\s*물어봐\s*[:：]\s*(\S[\s\S]*)$/i.exec(text)?.[1]?.trim() ?? null;
+export const parseSeatAsk = (text: string): string | null => /^\s*CTO\s*에게\s*물어봐(?:\s*[:：]\s*|\s+)(\S[\s\S]*)$/i.exec(text)?.[1]?.trim() ?? null;
 
 interface AskRow { id: string; seat: string; origin: string; deadline: number; timeout_minutes: number; answer: string | null; answered_at: number | null }
 
@@ -50,6 +51,17 @@ export function recordSeatAskShadow(root: string, ask: SeatAskShadow, now: numbe
     const origin = JSON.stringify({ channel: 'seat-loop', from: ask.from, itemId: ask.itemId, version: ask.version, question: ask.question.trim() });
     return store.db.query("INSERT OR IGNORE INTO seat_asks (id, seat, origin, deadline, timeout_minutes, status) VALUES (?, ?, ?, ?, ?, 'shadow')")
       .run(id, ask.to, origin, now + DEFAULT_ASK_TIMEOUT_MS, Math.ceil(DEFAULT_ASK_TIMEOUT_MS / 60000)).changes === 1;
+  } finally { store.close(); }
+}
+
+/** A TUI restart must keep the same return address as its prior questions. The instance's
+ * message database owns this identity, so test and production instances cannot share it. */
+export function getTuiSeatAskClientId(open: () => MsgStore = openMsgStore): string {
+  const store = open();
+  try {
+    store.db.exec('CREATE TABLE IF NOT EXISTS seat_ask_clients (channel TEXT PRIMARY KEY, client_id TEXT NOT NULL)');
+    store.db.query('INSERT OR IGNORE INTO seat_ask_clients (channel, client_id) VALUES (?, ?)').run('tui', randomUUID());
+    return (store.db.query('SELECT client_id FROM seat_ask_clients WHERE channel = ?').get('tui') as { client_id: string }).client_id;
   } finally { store.close(); }
 }
 
@@ -133,7 +145,7 @@ export async function deliverSeatAnswers(deps: SeatAskDeps): Promise<void> {
     for (const ask of pending) {
       const origin = JSON.parse(ask.origin) as AskOrigin;
       if (deps.channel && origin.channel !== deps.channel) continue;
-      if (origin.channel === 'pwa' && deps.clientId !== origin.clientId) continue;
+      if ((origin.channel === 'pwa' || origin.channel === 'tui') && deps.clientId !== origin.clientId) continue;
       if (origin.channel === 'telegram' && origin.botId && origin.botId !== deps.botId) continue;
       const status = decide(ask.id, (deps.now ?? Date.now)());
       if (status) debug.log('seat.ask', status, { seat: ask.seat, id: ask.id, via: origin.channel });
@@ -147,6 +159,7 @@ export async function deliverSeatAnswers(deps: SeatAskDeps): Promise<void> {
         if (deps.clientId === origin.clientId) await deps.send(origin, item.text);
         continue; // A browser poll is not a receipt; only its explicit acknowledgement consumes the answer.
       }
+      if (origin.channel === 'tui' && deps.clientId !== origin.clientId) continue;
       const token = randomUUID();
       const now = Date.now();
       // SQLite's conditional write is the claim across concurrent bot loops and processes.

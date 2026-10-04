@@ -9,6 +9,32 @@ type Incomplete = { runId: string; reason: string };
 type ParseResult = Ledger[] | { error: Incomplete[]; ledgers: Ledger[] };
 
 const NON_PROGRESS_EVENTS = new Set(['progress-delivery-outcome']);
+const REEMIT_EXCLUDED_PREFIX = 'progress-delivery';
+type Emit = (category: string, event: string, data: Record<string, unknown>) => void;
+
+/** Reemit only complete ledger records; offsets name the first byte of each line in the Pod ledger. */
+function reemitLedgerLines(jsonl: string, runId: string, startOffset: number, emit: Emit): number {
+  let offset = startOffset;
+  let lines = 0;
+  for (const raw of jsonl.split('\n').slice(0, -1)) {
+    const podLedgerOffset = offset;
+    offset += Buffer.byteLength(raw) + 1;
+    try {
+      const entry: unknown = JSON.parse(raw);
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const { category, event, data } = entry as Record<string, unknown>;
+      if (typeof event !== 'string' || !event || event.startsWith(REEMIT_EXCLUDED_PREFIX)
+        || !data || typeof data !== 'object' || Array.isArray(data)) continue;
+      emit(typeof category === 'string' && category ? category : 'self-implement', event,
+        { ...data, runId, origin: 'pod', podLedgerOffset });
+      lines += 1;
+    } catch (error) {
+      try { debug.log('self-implement.pod', 'reemit-failed', { runId, reason: error instanceof Error ? error.message : String(error) }); }
+      catch { /* Host log failure must not interrupt the ledger append or collection. */ }
+    }
+  }
+  return lines;
+}
 
 /** Reassemble only complete, unambiguous transfers; retain good runs when another run is incomplete. */
 export function parsePodLedgerChunks(logs: string): ParseResult {
@@ -68,9 +94,10 @@ export function parsePodLedgerChunks(logs: string): ParseResult {
  *  except a ledger that THIS run's live follower created (`replace`): that one is a partial copy and the final is complete. */
 export function collectPodLedgers(
   logs: string,
-  { dir = runLedgerDir(), log = (c, e, d) => debug.log(c, e, d), replace = new Set<string>() }: {
+  { dir = runLedgerDir(), log = (c, e, d) => debug.log(c, e, d), emit = (c, e, d) => debug.log(c, e, d), replace = new Set<string>() }: {
     dir?: string;
     log?: (category: string, event: string, data: Record<string, unknown>) => void;
+    emit?: Emit;
     replace?: ReadonlySet<string>;
   } = {},
 ): void {
@@ -82,7 +109,11 @@ export function collectPodLedgers(
   for (const { runId, jsonl } of ledgers) {
     try {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(runLedgerPath(runId, dir), jsonl, { flag: replace.has(runId) ? 'w' : 'wx' });
+      const path = runLedgerPath(runId, dir);
+      const previousBytes = replace.has(runId) && existsSync(path) ? readFileSync(path).length : 0;
+      writeFileSync(path, jsonl, { flag: replace.has(runId) ? 'w' : 'wx' });
+      const newLines = Buffer.from(jsonl).subarray(previousBytes).toString('utf8');
+      reemitLedgerLines(newLines, runId, previousBytes, emit);
       log('self-implement.pod', 'ledger-collected', { runId, lines: jsonl.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(jsonl) });
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -109,12 +140,14 @@ export function createPodLedgerFollower(opts: {
   exec: (script: string) => { status: number | null; stdout: string; stderr: string };
   dir?: string;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  emit?: Emit;
   stallMinutes?: number;
   now?: () => number;
   onStall?: (message: string) => void;
 }): { poll(): void; readonly owned: boolean } {
   const dir = opts.dir ?? runLedgerDir();
   const log = opts.log ?? ((c, e, d) => debug.log(c, e, d));
+  const emit: Emit = opts.emit ?? ((c, e, d) => debug.log(c, e, d));
   const now = opts.now ?? Date.now;
   const stallMinutes = opts.stallMinutes ?? 30;
   if (!Number.isFinite(stallMinutes) || stallMinutes <= 0) throw new RangeError('stallMinutes must be positive');
@@ -188,17 +221,24 @@ export function createPodLedgerFollower(opts: {
       mkdirSync(dir, { recursive: true });
       appendFileSync(path, complete);
       owned = true;
+      const reemitted = reemitLedgerLines(complete, opts.runId, offset - Buffer.byteLength(text), emit);
+      if (reemitted) {
+        try { debug.log('self-implement.pod', 'reemitted', { runId: opts.runId, lines: reemitted }); }
+        catch { /* The observation cannot interrupt following. */ }
+      }
       log('self-implement.pod', 'ledger-live-appended', { runId: opts.runId, lines: complete.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(complete), offset });
       for (const line of complete.split('\n')) {
         if (!line) continue;
         let logEvent: ReturnType<typeof ledgerLineToLogEvent>;
-        try {
-          logEvent = ledgerLineToLogEvent(line, opts.runId);
-          if (logEvent) log(logEvent.category, logEvent.event, logEvent.data);
-        } catch { /* A failed host log write must not interrupt ledger following or stall accounting. */ }
         let entry: unknown;
         try { entry = JSON.parse(line); } catch { continue; }
         const event = (entry && typeof entry === 'object' && 'event' in entry) ? entry.event : undefined;
+        try {
+          if (typeof event === 'string' && !event.startsWith(REEMIT_EXCLUDED_PREFIX)) {
+            logEvent = ledgerLineToLogEvent(line, opts.runId);
+            if (logEvent && opts.log) log(logEvent.category, logEvent.event, logEvent.data);
+          }
+        } catch { /* A failed host log write must not interrupt ledger following or stall accounting. */ }
         if (typeof event !== 'string' || !event || NON_PROGRESS_EVENTS.has(event)) continue;
         const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
         if (stalled) log('self-implement.pod', 'stall-cleared', { runId: opts.runId, idleMinutes });

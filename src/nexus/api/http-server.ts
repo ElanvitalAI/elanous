@@ -184,7 +184,9 @@ import { handleChannelBotsGet, handleChannelBotSet } from './setup-channel-bot.j
 import { handleLlmRoutePredict } from './llm-route-predict.js';
 import type { MissionRouter } from '../../llm/mission-router.js';
 import { handleContextFetchUrl } from './context-url.js';
-import { contextNow } from '../../context-bus/context-now.js';
+import { contextNow, type ContextNowDeps } from '../../context-bus/context-now.js';
+import type { ContextNowAudience } from '../../context-bus/context-now-surfaces.js';
+import { renderVoiceNow } from '../../context-bus/context-now-surfaces.js';
 import type { IntentPredictionService } from '../../intent-prediction/index.js';
 import type { NotificationActionLoopback } from '../../web-push/notification-action-loopback.js';
 import { handlePlatforms } from './platforms.js';
@@ -486,6 +488,8 @@ export interface NexusHttpServerOpts {
   eventBus: NexusEventBus;
   /** Test seam for the read-only usage collector; production uses the cached handler. */
   usageHandler?: () => Promise<Response>;
+  /** Test seam for the context-now ledgers; production reads the live ledgers. */
+  contextNowDeps?: ContextNowDeps;
   /** Supervisor handle — required for the write API (PR ι). When omitted
    *  (skipSupervisor mode), mutation routes return 503. */
   supervisor?: Supervisor;
@@ -2879,7 +2883,19 @@ export async function routeRequest(
   }
   if (pathname === '/v1/context/now') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return jsonResponse(contextNow({ ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }));
+    const audiences = url.searchParams.getAll('audience');
+    if (audiences.length > 1) return jsonResponse({ error: 'invalid_audience' }, 400);
+    const requested = audiences[0];
+    if (requested !== undefined && requested !== 'operator' && requested !== 'user' && requested !== 'public-demo') {
+      return jsonResponse({ error: 'invalid_audience' }, 400);
+    }
+    const forced = getUserConfig().nexus?.demoMode === true;
+    const audience: ContextNowAudience = forced ? 'public-demo' : requested ?? 'operator';
+    const answer = contextNow({ audience, ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }, opts.contextNowDeps);
+    debug.log('context.now', 'served', { audience, hidden: answer.hiddenCount ?? 0, forced });
+    return jsonResponse(url.searchParams.get('format') === 'voice'
+      ? { text: renderVoiceNow(answer, audience), audience, hiddenCount: answer.hiddenCount ?? 0 }
+      : { ...answer, audience, hiddenCount: answer.hiddenCount ?? 0 });
   }
   // §6.3 (2026-05-09) — context URL fetch (showroom).
   // POST /v1/context/fetch-url

@@ -1,14 +1,20 @@
 import { expect, spyOn, test } from 'bun:test';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { debug } from '../debug/log.js';
+import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
 import * as runningRunsModule from '../self-implement/running-runs.js';
 import { dispatchHook } from '../hooks/dispatch.js';
 import { openMsgStore } from '../msg/msg-store.js';
+import { answerCrossCheck, askSeat, hasSeatAnswer, seatCrossChecks, seatQuestions } from '../seat-dispatch/seat-questions.js';
 import * as checklistModule from '../release-loop/checklist.js';
+import { listChecklist, setItem } from '../release-loop/checklist.js';
+import { importJson } from '../release-loop/feature-store.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
@@ -41,6 +47,585 @@ const checklist = (f: ReturnType<typeof fixture>, version: string, items: unknow
   writeFileSync(join(dir, 'checklist.json'), JSON.stringify({ items }));
 };
 const entries = (f: ReturnType<typeof fixture>) => f.deps.read!(seatLedgerPath('TC', f.root, now)).trim().split('\n').map((v) => JSON.parse(v));
+
+const neighborConfig = (mode: 'shadow' | 'live-safe') => ({ mode, seats: ['MK'], neighbors: { MK: [
+  { id: 'op-seat', exchange: ['status' as const], heartbeat: { everyMinutes: 10, missedTicks: 2 },
+    onAbsent: { action: 'escalate' as const, delegateTo: 'orchestrator' } },
+] } });
+
+test('seat tick judges stale context-bus neighbor in shadow without taking action', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-done',
+      text: 'OP update', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('shadow'), versions: () => [],
+      run: async (args) => { calls.push(args); throw Error('shadow action'); } };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(calls).toEqual([]);
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'absent', action: null, plannedAction: 'escalate', mode: 'shadow' }]);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('seat tick drafts exactly one decision card for a stale neighbor in live-safe', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'coord:channel', direction: 'outbound', kind: 'asked',
+      text: 'OP update', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('live-safe'), versions: () => [],
+      queueItems: () => [], run: async (args) => { calls.push(args); throw Error('unexpected command'); } };
+    await runSeatLoopOnce('MK', deps);
+    await runSeatLoopOnce('MK', deps);
+    const cards = new DecisionLedger({ stateDir: f.root }).list();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ status: 'open', raisedBy: { agent: 'seat-loop' }, refs: [expect.stringContaining('neighbor:MK:op-seat')] });
+    expect(calls).toEqual([]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual(Array(2).fill({ seat: 'MK', neighbor: 'op-seat', state: 'absent', action: 'decision-card', plannedAction: 'escalate', mode: 'live-safe' }));
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+}, 30_000); // real DecisionLedger resolves the release version from repository history (~6s on a full clone)
+
+test('a neighbor event arriving during a long live-safe turn is present at judgment, not escalated', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-done',
+      text: 'OP earlier', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    let clock = now;
+    let checkedDuringTurn = false;
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('live-safe'), versions: () => [], now: () => clock,
+      queueItems: () => {
+        checkedDuringTurn = true;
+        recordEvent(bus, { surface: 'coord:channel', direction: 'outbound', kind: 'asked',
+          text: 'OP active during turn', refs: JSON.stringify({ seat: 'OP' }),
+          ts: new Date(now.getTime() + 60_000).toISOString() });
+        clock = new Date(now.getTime() + 2 * 60_000);
+        return [];
+      },
+      run: async () => { throw Error('unexpected command'); } };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(checkedDuringTurn).toBe(true);
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'live-safe' }]);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('seat neighbor configuration parses without admitting malformed heartbeats', () => {
+  const f = fixture();
+  try {
+    const path = join(f.root, 'config.json');
+    writeFileSync(path, JSON.stringify({ loops: { seat: { ...neighborConfig('shadow'), neighbors: {
+      MK: [...neighborConfig('shadow').neighbors.MK, { id: 'tc-seat', exchange: ['status'],
+        heartbeat: { everyMinutes: 0, missedTicks: 2 }, onAbsent: { action: 'delegate', delegateTo: 'OP' } }],
+    } } } }));
+    expect(buildUserConfig(path).loops?.seat?.neighbors?.MK).toEqual(neighborConfig('shadow').neighbors.MK);
+  } finally { f.close(); }
+});
+
+test('live-safe does not delegate or defer a missing neighbor, and a fresh neighbor is present', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-claimed',
+      text: 'OP update', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    const config = neighborConfig('live-safe');
+    const neighbor = config.neighbors.MK[0]!;
+    const deps: SeatDeps = { ...f.deps, config: { ...config, neighbors: { MK: [
+      { ...neighbor, onAbsent: { ...neighbor.onAbsent, action: 'defer' } },
+    ] } }, versions: () => [], queueItems: () => [],
+      run: async () => { throw Error('unexpected action'); } };
+    await runSeatLoopOnce('MK', deps);
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
+    recordEvent(bus, { surface: 'coord:channel', direction: 'outbound', kind: 'asked',
+      text: 'OP fresh', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 2 * 60_000).toISOString() });
+    await runSeatLoopOnce('MK', deps);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'absent', action: null, plannedAction: 'defer', mode: 'live-safe' },
+        { seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'live-safe' }]);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('neighbor judgment failure cannot replace a completed turn or skip stall escalation', async () => {
+  const f = fixture();
+  const logs: Array<{ category: string; event: string; data: unknown }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'loop.neighbors' && event === 'judged') throw Error('judgment unavailable');
+    logs.push({ category, event, data });
+  });
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-done', text: 'OP old',
+      refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R-neighbor', title: 'red', status: 'red', owner: 'MK',
+        updatedAt: new Date(now.getTime() - 45 * 60_000).toISOString(), updatedBy: 'MK' }] };
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('shadow'), versions: () => [],
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(logs.some((row) => row.category === 'seat.loop' && row.event === 'neighbor-judgment-failed'
+      && (row.data as { neighbor?: string }).neighbor === 'op-seat'
+      && String((row.data as { error?: string }).error).includes('judgment unavailable'))).toBe(true);
+    expect(logs.some((row) => row.category === 'loop.neighbors' && row.event === 'tick'
+      && (row.data as { state?: string; action?: unknown }).state === 'unknown'
+      && (row.data as { action?: unknown }).action === null)).toBe(true);
+    expect(logs.some((row) => row.category === 'org.stall' && row.event === 'escalate'
+      && (row.data as { item?: string }).item === 'R-neighbor')).toBe(true);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('failed neighbor decision-card write preserves the turn and still escalates a stall', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'coord:channel', direction: 'outbound', kind: 'asked', text: 'OP old',
+      refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    // A regular file at the decision directory makes raiseOnce fail without mocking the judgment.
+    writeFileSync(join(f.root, 'decisions'), 'unwritable directory');
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R-card', title: 'red', status: 'red', owner: 'MK',
+        updatedAt: new Date(now.getTime() - 45 * 60_000).toISOString(), updatedBy: 'MK' }] };
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('live-safe'), versions: () => [], queueItems: () => [],
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'seat.loop' && event === 'neighbor-judgment-failed'
+      && (data as { neighbor?: string }).neighbor === 'op-seat'
+      && String((data as { error?: string }).error).includes('decisions'))).toBe(true);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'org.stall' && event === 'escalate'
+      && (data as { item?: string }).item === 'R-card')).toBe(true);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'loop.neighbors' && event === 'tick'
+      && (data as { neighbor?: string; state?: string; action?: unknown }).neighbor === 'op-seat'
+      && (data as { state?: string }).state === 'unknown'
+      && (data as { action?: unknown }).action === null)).toBe(true);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'loop.neighbors' && event === 'tick'
+      && (data as { action?: string }).action === 'decision-card')).toBe(false);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('unreadable neighbor event source is observed as unknown without changing the seat result', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    writeFileSync(join(f.root, 'surface_events.db'), 'not sqlite');
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('live-safe'), versions: () => [], queueItems: () => [] };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
+    expect(spy.mock.calls.some(([category, event]) => category === 'seat.loop' && event === 'neighbor-source-unreadable')).toBe(true);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'loop.neighbors' && event === 'tick'
+      && (data as { state?: string; action?: unknown }).state === 'unknown'
+      && (data as { action?: unknown }).action === null)).toBe(true);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('one failed neighbor judgment does not skip the next neighbor', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'loop.neighbors' && event === 'judged'
+      && (data as { neighbor?: string }).neighbor === 'op-seat') throw Error('OP judgment unavailable');
+  });
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    for (const seat of ['OP', 'TC']) recordEvent(bus, { surface: 'context:session', direction: 'outbound',
+      kind: 'task-done', text: `${seat} old`, refs: JSON.stringify({ seat }),
+      ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    const config = neighborConfig('shadow');
+    const deps: SeatDeps = { ...f.deps, config: { ...config, neighbors: { MK: [
+      ...config.neighbors.MK, { ...config.neighbors.MK[0]!, id: 'tc-seat' },
+    ] } }, versions: () => [] };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'seat.loop' && event === 'neighbor-judgment-failed'
+      && (data as { neighbor?: string }).neighbor === 'op-seat')).toBe(true);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'loop.neighbors' && event === 'tick'
+      && (data as { neighbor?: string; state?: string }).neighbor === 'tc-seat'
+      && (data as { state?: string }).state === 'absent')).toBe(true);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('neighbor judgment error does not replace an existing seat failure', async () => {
+  const f = fixture();
+  const seatError = Error('seat action failed');
+  const spy = spyOn(debug, 'log').mockImplementation((category, event) => {
+    if (category === 'loop.neighbors' && event === 'judged') throw Error('judgment unavailable');
+  });
+  const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+  try {
+    recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-done', text: 'OP old',
+      refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 21 * 60_000).toISOString() });
+    checklist(f, '0.2.9', [{ id: 'K-fail', owner: 'MK', title: '구현', status: 'yellow' }]);
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('shadow'),
+      append: () => { throw seatError; } };
+    let caught: unknown;
+    try { await runSeatLoopOnce('MK', deps); } catch (error) { caught = error; }
+    expect(caught).toBe(seatError);
+    expect(spy.mock.calls.some(([category, event]) => category === 'seat.loop' && event === 'neighbor-judgment-failed')).toBe(true);
+  } finally { bus.close(); spy.mockRestore(); f.close(); }
+});
+
+test('seat tick with no readable neighbor timestamp judges unknown and performs no action', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: neighborConfig('live-safe'), versions: () => [],
+      queueItems: () => [], run: async (args) => { calls.push(args); throw Error('unexpected command'); } };
+    await runSeatLoopOnce('MK', deps);
+    expect(calls).toEqual([]);
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'unknown', action: null, plannedAction: null, mode: 'live-safe' }]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+const xcheckFixture = (evidence?: string) => {
+  const f = fixture();
+  f.root = realpathSync(f.root);
+  f.deps.root = f.root;
+  let clock = now;
+  const calls: string[][] = [];
+  const path = seatLedgerPath('MK', f.root, now);
+  const deps: SeatDeps = { ...f.deps, now: () => clock, versions: () => ['0.2.9'],
+    config: { mode: 'on', questions: 'on', seats: ['MK', 'OP'] },
+    checklistItems: () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', ...(evidence === undefined ? {} : { evidence }) }],
+    inquire: () => ({ to: 'CEO', question: '화면 문구를 승인할까요?' }),
+    run: async (args) => {
+      calls.push(args);
+      if (args[0] === 'decisions') {
+        mkdirSync(join(f.root, 'decisions'), { recursive: true });
+        writeFileSync(join(f.root, 'decisions', 'decisions.jsonl'), JSON.stringify({ type: 'raised', entry: {
+          id: 'D-test', title: 'MK: 화면 문구를 승인할까요?', status: 'open', category: 'other',
+          refs: [args[args.indexOf('--ref') + 1]], raisedAt: now.toISOString(), history: [],
+        } }) + '\n');
+      }
+      return '';
+    } };
+  const ledger = () => readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  return { ...f, deps, calls, ledger, advance: (minutes: number) => { clock = new Date(now.getTime() + minutes * 60_000); } };
+};
+
+for (const [label, answer, expectedStatus] of [
+  ['dissent', { agree: false, note: '화면 문구 미정', resolves: false }, 'hitl'],
+  ['resolution', { agree: true, note: 'OP가 문구 확정', resolves: true }, 'awaiting-resolution'],
+] as const) {
+  test(`CEO inquiry cross-check ${label} waits for OP and only raises unresolved cards`, async () => {
+    const f = xcheckFixture('검토 문서 #M1');
+    const spy = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+      expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+      const [question] = seatCrossChecks(f.root, 'OP');
+      expect(seatCrossChecks(f.root, 'OP')).toHaveLength(1);
+      expect(question).toMatchObject({ from: 'MK', to: 'OP', kind: 'seat-xcheck', body: expect.stringContaining('근거: 검토 문서 #M1') });
+      expect(f.ledger().at(-1)).toMatchObject({ status: 'awaiting-xcheck', xcheckRequestedAt: now.toISOString(), xcheckQuestionId: question!.id });
+      expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+      expect(seatCrossChecks(f.root, 'OP')).toHaveLength(1);
+      const op = { ...f.deps, config: { mode: 'on' as const, questions: 'on' as const, seats: ['OP'] },
+        crossCheck: () => answer, run: async () => { throw Error('OP acted on checklist before cross-check'); } };
+      expect((await runSeatLoopOnce('OP', op)).status).toBe('answered');
+      expect((await runSeatLoopOnce('MK', f.deps)).status).toBe(expectedStatus);
+      const raises = f.calls.filter((args) => args[0] === 'decisions');
+      if (label === 'dissent') {
+        expect(raises).toHaveLength(1);
+        expect(raises[0]!.slice(raises[0]!.indexOf('--xcheck'), raises[0]!.indexOf('--xcheck') + 2)).toEqual(['--xcheck', 'OP:화면 문구 미정']);
+        expect(raises[0]!.slice(raises[0]!.indexOf('--dissent'), raises[0]!.indexOf('--dissent') + 2)).toEqual(['--dissent', 'OP: 화면 문구 미정']);
+      } else {
+        expect(raises).toHaveLength(0);
+        expect(f.ledger().at(-1).xcheckNote).toBe('OP가 문구 확정');
+        expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
+        expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
+        expect((await gatherSeatInputs('MK', f.deps)).checklist).toMatchObject([{ id: 'M1', status: 'yellow' }]);
+      }
+      expect(spy.mock.calls.some(([category, event]) => category === 'decisions.xcheck' && event === (label === 'dissent' ? 'raised' : 'answered'))).toBe(true);
+    } finally { spy.mockRestore(); f.close(); }
+  });
+}
+
+test('an OP proposal cannot resolve an actual yellow MK release-ledger cell', async () => {
+  const f = xcheckFixture('검토 원장');
+  const version = '0.2.9';
+  const releaseDir = join(f.root, 'release', version);
+  mkdirSync(releaseDir, { recursive: true });
+  writeFileSync(join(releaseDir, 'checklist.json'), JSON.stringify({ version, released: '0.2.8', dev: version,
+    history: [], items: [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence: '검토 원장',
+      updatedAt: now.toISOString(), updatedBy: 'MK' }] }));
+  setElanousConfigDir(f.root);
+  try {
+    expect(importJson(version)).toBe(true);
+    delete f.deps.checklistItems;
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    const op: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['OP'] },
+      crossCheck: () => ({ agree: true, note: 'OP가 해결 가능', resolves: true }),
+      run: async () => { throw Error('OP acted on checklist before cross-check'); } };
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('answered');
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1')?.status).toBe('yellow');
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
+    expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+    expect((await gatherSeatInputs('MK', f.deps)).checklist).toMatchObject([{ id: 'M1', status: 'yellow' }]);
+    setItem(version, 'M1', { evidence: '이웃 제안 검토 근거' }, 'MK');
+    const resumed = await runSeatLoopOnce('MK', { ...f.deps, inquire: () => null,
+      run: async (args) => args[0] === 'harness' && args[1] === 'budget' ? '{"outcome":"wait-reset"}' : '' });
+    expect(resumed).toMatchObject({ status: 'skipped-budget', item: { id: 'M1', evidence: '이웃 제안 검토 근거' } });
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1')?.status).toBe('yellow');
+    setItem(version, 'M1', { status: 'green' }, 'MK');
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1')?.status).toBe('green');
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('resolved-by-neighbor');
+    expect(f.ledger().at(-1)).toMatchObject({ status: 'resolved-by-neighbor', xcheckNote: 'OP가 해결 가능' });
+  } finally { resetElanousConfigDir(); f.close(); }
+});
+
+test('an updated unresolved checklist snapshot remains eligible after a neighbor proposal', async () => {
+  const f = xcheckFixture('초기 근거');
+  let evidence = '초기 근거';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '보완 제안', resolves: true });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    evidence = '이웃 메모 검토 후 추가 근거';
+    expect((await runSeatLoopOnce('MK', { ...f.deps, inquire: () => null, run: async (args) => args[0] === 'harness' && args[1] === 'budget' ? '{"outcome":"wait-reset"}' : '' })).status).toBe('skipped-budget');
+    expect((await gatherSeatInputs('MK', f.deps)).checklist).toMatchObject([{ id: 'M1', status: 'yellow', evidence }]);
+    expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
+  } finally { f.close(); }
+});
+
+test('revised forbidden-action cell cannot bypass its pending cross-check through the generic decision path', async () => {
+  const f = xcheckFixture('초기 근거');
+  let evidence = '초기 근거';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '공개 발행 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '이웃 해결 제안', resolves: true });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    evidence = '추가 검토 근거';
+    const next = await runSeatLoopOnce('MK', { ...f.deps, run: async (args) => {
+      if (args[0] === 'harness' && args[1] === 'budget') return '{"outcome":"proceed"}';
+      throw Error(`generic path ran ${args[0]}`);
+    } });
+    expect(next.status).toBe('awaiting-resolution');
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+    expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
+  } finally { f.close(); }
+});
+
+test('neighbor resolution proposal becomes resolved only after the checklist cell is green', async () => {
+  const f = xcheckFixture('검토 원장');
+  let status = 'yellow';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status, owner: 'MK', evidence: '검토 원장' }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: 'OP 해결 제안', resolves: true });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
+    expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
+    status = 'green';
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('resolved-by-neighbor');
+    expect(f.ledger().at(-1)).toMatchObject({ status: 'resolved-by-neighbor', xcheckNote: 'OP 해결 제안' });
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('revised checklist evidence while awaiting cross-check keeps the delivered draft and processes the reply', async () => {
+  const f = xcheckFixture('초기 근거');
+  let evidence = '초기 근거';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    const [question] = seatCrossChecks(f.root, 'OP');
+    expect(question!.body).toContain('근거: 초기 근거');
+    evidence = '수정된 근거';
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    expect(seatCrossChecks(f.root, 'OP')).toEqual([question]);
+    answerCrossCheck(f.root, question!, { agree: false, note: '화면 문구 미정', resolves: false });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(1);
+    expect(f.calls.find((args) => args[0] === 'decisions')).toContain('OP:화면 문구 미정');
+  } finally { f.close(); }
+});
+
+test('removed checklist evidence while awaiting cross-check still accepts the delivered reply', async () => {
+  const f = xcheckFixture('초기 근거');
+  let evidence = '초기 근거';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    const [question] = seatCrossChecks(f.root, 'OP');
+    evidence = '';
+    answerCrossCheck(f.root, question!, { agree: true, note: 'OP가 문구 확정', resolves: true });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    expect(seatCrossChecks(f.root, 'OP')).toEqual([question]);
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('revised checklist evidence while awaiting cross-check still times out without redelivery', async () => {
+  const f = xcheckFixture('초기 근거');
+  let evidence = '초기 근거';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    evidence = '수정된 근거';
+    f.advance(121);
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    expect(seatCrossChecks(f.root, 'OP')).toHaveLength(1);
+    expect(f.calls.find((args) => args[0] === 'decisions')).toContain('이웃 OP 무응답 120분');
+  } finally { f.close(); }
+});
+
+test('CEO inquiry without evidence is rejected before cross-check or decision delivery', async () => {
+  const f = xcheckFixture('  ');
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('rejected-no-evidence');
+    expect(f.ledger().at(-1)).toMatchObject({ status: 'rejected-no-evidence', action: 'decision' });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
+    expect(seatCrossChecks(f.root, 'OP')).toHaveLength(0);
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('rejected evidence-free item is retried when its evidence appears, but not while unchanged', async () => {
+  const f = xcheckFixture('');
+  let evidence = '';
+  f.deps.checklistItems = () => [{ id: 'M1', title: '문구 승인', status: 'yellow', owner: 'MK', evidence }];
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('rejected-no-evidence');
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
+    evidence = '새 검토 원장';
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    expect(seatCrossChecks(f.root, 'OP')).toMatchObject([{ body: expect.stringContaining('근거: 새 검토 원장') }]);
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('a delivered neighbor remains authoritative when the configuration changes before the answer', async () => {
+  const f = xcheckFixture('검토 원장');
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    const [question] = seatCrossChecks(f.root, 'OP');
+    f.deps.decisionsConfig = { linearProjection: { enabled: false }, requireCrossCheck: false,
+      crossCheckNeighbor: { OP: 'TC', TC: 'OP', MK: 'UX', UX: 'OP' }, crossCheckWaitMinutes: 120 };
+    answerCrossCheck(f.root, question!, { agree: false, note: '화면 문구 미정', resolves: false });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    expect(seatCrossChecks(f.root, 'UX')).toHaveLength(0);
+    const args = f.calls.find((call) => call[0] === 'decisions')!;
+    expect(args).toContain('OP:화면 문구 미정');
+    expect(args).toContain('OP: 화면 문구 미정');
+  } finally { f.close(); }
+});
+
+test('a delivered neighbor remains authoritative when the configuration changes before timeout', async () => {
+  const f = xcheckFixture('검토 원장');
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    f.deps.decisionsConfig = { linearProjection: { enabled: false }, requireCrossCheck: false,
+      crossCheckNeighbor: { OP: 'TC', TC: 'OP', MK: 'UX', UX: 'OP' }, crossCheckWaitMinutes: 5 };
+    f.advance(121);
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    expect(f.calls.find((call) => call[0] === 'decisions')).toContain('이웃 OP 무응답 120분');
+    expect(seatCrossChecks(f.root, 'UX')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('a failed receiving judgment does not starve other work and retries only when evidence changes', async () => {
+  const f = xcheckFixture('검토 원장');
+  try {
+    await runSeatLoopOnce('MK', f.deps);
+    let judgmentCalls = 0;
+    let evidence = '';
+    const op: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['OP'] },
+      checklistItems: () => [{ id: 'OP-work', title: '검토', status: 'yellow', owner: 'OP', evidence }],
+      pendingDecisions: () => [], crossCheck: () => { judgmentCalls++; return null; } };
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('awaiting-xcheck');
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('shadow');
+    expect(judgmentCalls).toBe(1);
+    evidence = '신규 OP 검토 근거';
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('awaiting-xcheck');
+    expect(judgmentCalls).toBe(2);
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('shadow');
+    f.advance(121);
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('shadow');
+    expect(judgmentCalls).toBe(2);
+  } finally { f.close(); }
+});
+
+test('an unanswerable cross-check does not starve the next ordinary seat question', async () => {
+  const f = xcheckFixture('검토 원장');
+  try {
+    f.deps.decisionsConfig = { linearProjection: { enabled: false }, requireCrossCheck: false,
+      crossCheckNeighbor: { OP: 'TC', TC: 'OP', MK: 'UX', UX: 'OP' }, crossCheckWaitMinutes: 120 };
+    await runSeatLoopOnce('MK', f.deps);
+    const question = askSeat(f.root, 'TC', 'UX', 'UX 판단 근거?');
+    const ux: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['UX'] },
+      checklistItems: () => [], crossCheck: () => null, reply: () => ({ answer: 'UX 기존 근거' }) };
+    expect((await runSeatLoopOnce('UX', ux)).status).toBe('awaiting-xcheck');
+    expect((await runSeatLoopOnce('UX', ux)).status).toBe('answered');
+    expect(hasSeatAnswer(f.root, question)).toBe(true);
+  } finally { f.close(); }
+});
+
+test('CEO inquiry times out only after the configured wait and records its no-xcheck reason', async () => {
+  const f = xcheckFixture('검토 문서 #M1');
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    f.advance(121);
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    const raise = f.calls.find((args) => args[0] === 'decisions')!;
+    expect(raise.slice(raise.indexOf('--no-xcheck'), raise.indexOf('--no-xcheck') + 2)).toEqual(['--no-xcheck', '이웃 OP 무응답 120분']);
+    expect(seatCrossChecks(f.root, 'OP')).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('configured neighbor and wait control the delivered request and timeout reason', async () => {
+  const f = xcheckFixture('검토 문서 #M1');
+  f.deps.decisionsConfig = { linearProjection: { enabled: false }, requireCrossCheck: false,
+    crossCheckNeighbor: { OP: 'TC', TC: 'OP', MK: 'UX', UX: 'OP' }, crossCheckWaitMinutes: 5 };
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    expect(seatCrossChecks(f.root, 'UX')).toHaveLength(1);
+    expect(seatCrossChecks(f.root, 'OP')).toHaveLength(0);
+    f.advance(4);
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    f.advance(6);
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('hitl');
+    const raise = f.calls.find((args) => args[0] === 'decisions')!;
+    expect(raise.slice(raise.indexOf('--no-xcheck'), raise.indexOf('--no-xcheck') + 2)).toEqual(['--no-xcheck', '이웃 UX 무응답 5분']);
+  } finally { f.close(); }
+});
+
+test('failed receiving judgment leaves the cross-check unanswered and records observation', async () => {
+  const f = xcheckFixture('검토 문서 #M1');
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    await runSeatLoopOnce('MK', f.deps);
+    const op: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['OP'] },
+      crossCheck: () => { throw Error('judgment unavailable'); } };
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('awaiting-xcheck');
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'decisions.xcheck' && event === 'answered'
+      && String((data as { outcome?: string }).outcome).includes('judgment-failed'))).toBe(true);
+    expect(f.calls).toEqual([]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('question shadow does not deliver cross-check or decision card', async () => {
+  const f = xcheckFixture('검토 문서 #M1');
+  try {
+    const deps = { ...f.deps, config: { mode: 'on' as const, questions: 'shadow' as const, seats: ['MK'] } };
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('shadow');
+    expect(seatCrossChecks(f.root, 'OP')).toHaveLength(0);
+    expect(f.calls).toEqual([]);
+  } finally { f.close(); }
+});
+
 
 test('persona opt-in shadows two independent next todos after an unchanged TC seat turn', async () => {
   const f = fixture();
@@ -1452,5 +2037,37 @@ test('checklist items come from the injected ledger reader, not checklist.json (
     writeFileSync(join(dir, 'checklist.json'), JSON.stringify({ items: [{ id: 'K9', owner: 'TC', title: 'stale', status: 'yellow' }] }));
     const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.10'], checklistItems: () => [{ id: 'K10', owner: 'TC', title: 'ledger', status: 'yellow' }] });
     expect(inputs.checklist.map((item) => item.id)).toEqual(['K10']);
+  } finally { f.close(); }
+});
+
+test('a neighbor resolution that is not delivered within the wait escalates to a CEO card (review round 3 ①)', async () => {
+  const f = xcheckFixture('검토 근거');
+  try {
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: 'OP가 해결 가능', resolves: true });
+    expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+    f.advance(121);
+    const escalated = await runSeatLoopOnce('MK', f.deps);
+    expect(escalated.status).toBe('hitl');
+    const raise = f.calls.find((args) => args[0] === 'decisions')!;
+    expect(raise[raise.indexOf('--xcheck') + 1]).toContain('OP:OP가 해결 가능');
+    expect(raise[raise.indexOf('--xcheck') + 1]).toContain('120분 안 해소 안 됨');
+  } finally { f.close(); }
+});
+
+test('a seat question left awaiting a neighbor resolution escalates to a CEO card after the wait (review round 3 ②)', async () => {
+  const f = xcheckFixture('검토 근거');
+  try {
+    askSeat(f.root, 'UX', 'MK', '이 문구 써도 되나요?', 'ask:UX:test');
+    const mk: SeatDeps = { ...f.deps, reply: async () => ({ to: 'CEO' as const, question: '이 문구를 승인할까요?' }) };
+    expect((await runSeatLoopOnce('MK', mk)).status).toBe('awaiting-xcheck');
+    answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: 'OP 가이드 3절에 이미 있음', resolves: true });
+    expect((await runSeatLoopOnce('MK', mk)).status).toBe('awaiting-resolution');
+    expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
+    f.advance(121);
+    expect((await runSeatLoopOnce('MK', mk)).status).toBe('hitl');
+    const raise = f.calls.find((args) => args[0] === 'decisions')!;
+    expect(raise[raise.indexOf('--xcheck') + 1]).toContain('120분 안 해소 안 됨');
   } finally { f.close(); }
 });

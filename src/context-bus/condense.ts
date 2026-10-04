@@ -1,24 +1,12 @@
-import { Database } from 'bun:sqlite';
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dlopen, FFIType } from 'bun:ffi';
 import { join } from 'node:path';
 import { listMemories, memoryRoot, saveMemory, type MemoryEntry } from '../memory.js';
-import { surfaceEventsDbPath } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { listCoordEvents } from './coord-events.js';
-import { condenseContextWindowWithReport, type CondenseSkipped, type MemoryDeps, type MemoryItem, type MemorySource, type MemorySummary } from './long-term-memory.js';
+import { condenseContextWindowWithReport, readCondenseEvents, type CondenseFunnel, type CondenseSkipped, type MemoryDeps, type MemoryItem, type MemorySource, type MemorySummary } from './long-term-memory.js';
 
 const summarize = async (source: MemorySource): Promise<MemorySummary> =>
   (await import('./nightly-condense.js')).summarize(source);
-
-/** Reuse the context-bus reader against a strictly read-only SQLite handle. */
-function readContextEvents(since: string) {
-  const path = surfaceEventsDbPath();
-  if (!existsSync(path)) return [];
-  const db = new Database(path, { readonly: true, strict: true });
-  try { return listCoordEvents({ since }, { db }); }
-  finally { db.close(); }
-}
 
 export interface CondenseReport {
   since: string;
@@ -26,7 +14,9 @@ export interface CondenseReport {
   cards: MemoryItem[];
   conflicts: number;
   skipped: CondenseSkipped;
+  funnel: CondenseFunnel;
   folded: number;
+  droppedHarnessChild: number;
   markdown: string;
   applied?: { written: number; retired: number; decisions: string[] };
 }
@@ -35,12 +25,17 @@ function mdCell(value: string): string {
   return value.replaceAll('|', '\\|').replaceAll('\n', ' ');
 }
 
-export function renderCondenseMarkdown(report: Pick<CondenseReport, 'since' | 'until' | 'cards' | 'conflicts' | 'skipped'>): string {
+export function renderCondenseMarkdown(report: Pick<CondenseReport, 'since' | 'until' | 'cards' | 'conflicts' | 'skipped' | 'droppedHarnessChild' | 'funnel'>): string {
+  const seats = (counts: Record<string, number>) => ['OP', 'TC', 'MK', 'UX', ...Object.keys(counts).filter(seat => !['OP', 'TC', 'MK', 'UX'].includes(seat)).sort()]
+    .map(seat => `${seat} ${counts[seat] ?? 0}`).join(' · ');
+  const stage = (name: string, value: { total: number; bySeat: Record<string, number> }) =>
+    `${name} ${value.total} (${seats(value.bySeat)})`;
   const lines = [
     '# Long-term context memory candidates',
     '',
     `Window: ${report.since} → ${report.until} · Cards: ${report.cards.length} · Conflicts: ${report.conflicts}`,
-    `Skipped: ${JSON.stringify(report.skipped)}`,
+    `Funnel: ${stage('read', report.funnel.read)} → ${stage('sources', report.funnel.sources)} → ${stage('summarized', report.funnel.summarized)} → ${stage('cards', report.funnel.cards)}`,
+    `Skipped: ${JSON.stringify(report.skipped)} · Dropped harness-child: ${report.droppedHarnessChild}`,
     '',
   ];
   for (const card of report.cards) {
@@ -180,15 +175,15 @@ export async function runContextCondense(options: {
   const now = options.now ?? new Date();
   const until = now.toISOString();
   const since = new Date(now.getTime() - options.hours * 3_600_000).toISOString();
-  const { cards, skipped, folded } = await condenseContextWindowWithReport(since, until, [], {
+  const { cards, skipped, folded, droppedHarnessChild, funnel } = await condenseContextWindowWithReport(since, until, [], {
     summarize: deps.summarize,
-    events: deps.events ?? readContextEvents,
+    events: deps.events ?? readCondenseEvents,
     decisions: deps.decisions ?? (() => new DecisionLedger(options.root ? { stateDir: options.root } : {}).list({ status: 'all' })
       .filter(decision => decision.raisedBy.agent !== 'context-condense')),
   }, now);
   const conflicts = cards.filter(card => card.conflict !== undefined).length;
-  const report: CondenseReport = { since, until, cards, conflicts, skipped, folded,
-    markdown: renderCondenseMarkdown({ since, until, cards, conflicts, skipped }) };
+  const report: CondenseReport = { since, until, cards, conflicts, skipped, folded, droppedHarnessChild, funnel,
+    markdown: renderCondenseMarkdown({ since, until, cards, conflicts, skipped, droppedHarnessChild, funnel }) };
   if (options.apply === true) report.applied = applyCondensedCards(cards, store ?? defaultStore(options.root));
   return report;
 }

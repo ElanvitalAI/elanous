@@ -45,6 +45,23 @@ describe('pod run-ledger collection', () => {
     } finally { rmSync(f.source, { recursive: true, force: true }); rmSync(f.destination, { recursive: true, force: true }); }
   });
 
+  test('final-only collection re-emits complete records but never an existing host ledger', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-ledger-final-emit-'));
+    try {
+      const jsonl = '{"event":"pre-pr-sync","data":{"status":"llm-resolved"}}\n'
+        + '{"event":"progress-delivery-outcome","data":{}}\n';
+      const emitted: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+      const collect = () => collectPodLedgers(transfer(runId, jsonl).join('\n'), { dir, log: () => {},
+        emit: (category, event, data) => { emitted.push({ category, event, data }); },
+      });
+      collect();
+      collect();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(jsonl);
+      expect(emitted).toEqual([{ category: 'self-implement', event: 'pre-pr-sync',
+        data: { status: 'llm-resolved', runId, origin: 'pod', podLedgerOffset: 0 } }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('a missing middle chunk stays incomplete while an independent run is collected', () => {
     const f = fixture();
     try {
@@ -705,6 +722,53 @@ describe('pod ledger live follower', () => {
       f.poll();
       expect(counts).toEqual([0, 0, 0, 1, 0]);
       expect(messages).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('re-emits each new Pod ledger line once across two polls and final replacement', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-reemit-'));
+    try {
+      const first = '{"event":"start","data":{"phase":"시작"}}\n{"category":"self-implement.review","event":"pre-pr';
+      const second = '-sync","data":{"status":"llm-resolved"}}\n{"event":"progress-delivery-outcome","data":{"count":1}}\n';
+      const final = '{"event":"finished","data":{"outcome":"pass"}}\n';
+      const full = first + second + final;
+      const emitted: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+      const mirrored: string[] = [];
+      const chunks = [first, second];
+      const f = createPodLedgerFollower({ runId, dir, log: (_category, event) => { mirrored.push(event); },
+        emit: (category, event, data) => { emitted.push({ category, event, data }); },
+        exec: () => ({ status: 0, stdout: `${chunks.shift() ?? ''}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
+      });
+      f.poll(); f.poll();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(first + second);
+      expect(emitted.filter(({ event }) => event === 'pre-pr-sync')).toEqual([{
+        category: 'self-implement.review', event: 'pre-pr-sync',
+        data: { status: 'llm-resolved', runId, origin: 'pod', podLedgerOffset: Buffer.byteLength(first.slice(0, first.indexOf('\n') + 1)) },
+      }]);
+      expect(emitted.filter(({ event }) => event.startsWith('progress-delivery'))).toHaveLength(0);
+      expect(mirrored.filter((event) => event.startsWith('progress-delivery'))).toHaveLength(0);
+      collectPodLedgers(transfer(runId, full).join('\n'), { dir, log: noLog, emit: (category, event, data) => { emitted.push({ category, event, data }); }, replace: new Set([runId]) });
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(full);
+      expect(emitted.map(({ event }) => event)).toEqual(['start', 'pre-pr-sync', 'finished']);
+      expect(emitted[0]).toEqual({ category: 'self-implement', event: 'start', data: { phase: '시작', runId, origin: 'pod', podLedgerOffset: 0 } });
+      expect(emitted[2]).toEqual({ category: 'self-implement', event: 'finished', data: { outcome: 'pass', runId, origin: 'pod', podLedgerOffset: Buffer.byteLength(first + second) } });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a throwing emitter cannot prevent live append or final collection', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-reemit-throw-'));
+    try {
+      const first = '{"event":"pre-pr-sync","data":{"status":"llm-resolved"}}\n';
+      const full = first + '{"event":"finished","data":{}}\n';
+      const emit = () => { throw new Error('host log unavailable'); };
+      const f = createPodLedgerFollower({ runId, dir, log: noLog, emit,
+        exec: () => ({ status: 0, stdout: `${first}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
+      });
+      expect(() => f.poll()).not.toThrow();
+      expect(f.owned).toBe(true);
+      expect(() => collectPodLedgers(transfer(runId, full).join('\n'), { dir, log: noLog, emit, replace: new Set([runId]) })).not.toThrow();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8').split('\n').filter(Boolean)).toHaveLength(2);
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(full);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

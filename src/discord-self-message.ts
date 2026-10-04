@@ -64,6 +64,8 @@ import { getUserConfig } from './user-config.js';
 import { detectCard, runCardFollowup, NotACardError } from './card-followup/core.js';
 import { localOcrText } from './telegram-card-followup.js';
 import type { runGraph } from './graph-runner/runner.js';
+import { readSlashContextNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import type { ContextNowDeps } from './context-bus/context-now.js';
 
 const SLASH_FOCUS_TURNS_DEFAULT = 8;
 
@@ -139,6 +141,7 @@ export interface DiscordSelfMessageDeps {
   questionChannelFor?: (channelId: string) => import('./hitl/question.js').QuestionChannel;
   log?: (msg: string) => void;
   cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: typeof runGraph; rootDir?: () => string };
+  nowDeps?: ContextNowDeps;
 }
 
 /** Compose the full discord self+interweave onMessage handler. */
@@ -356,6 +359,11 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
     // Voice text commands pass the guild gate for the voice adapter's
     // sake — never route them into the LLM turn (legacy behavior).
     if (/^\/voice-(join|leave|status)\b/.test(ctx.text.trim())) return undefined;
+    const nowCommand = /^[/!]now(?:\s+([\s\S]*))?$/.exec(ctx.text.trim());
+    if (nowCommand) {
+      const args = nowCommand[1]?.trim().split(/\s+/).filter(Boolean) ?? [];
+      return renderTelegramNow(readSlashContextNow(args, deps.nowDeps));
+    }
     if (!ctx.text.trim() && ctx.attachments.length === 1 && ctx.attachments[0]!.contentType?.startsWith('image/')) {
       const photo = ctx.attachments[0]!;
       if (detectCard({ width: photo.width, height: photo.height, ocrText: null }).decision !== 'skip') {

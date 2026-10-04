@@ -80,6 +80,7 @@ describe('wireSprint21Runtime — composition', () => {
       personasDir, watchPersonas: false, fetchImpl,
     });
     const names = runtime.router.schemas().map((s) => s.name).sort();
+    for (const schema of runtime.router.schemas()) expect(schema).not.toHaveProperty('supported');
     // ⛔ 봇 «아닌» 명령은 이 파일이 계약으로 갖는다(이 축이 늘면 여기도 손댈 일이다).
     for (const required of ['persona', 'poll', 'relay', 'showroom', 'status']) {
       expect(names, `«${required}» 가 사라졌다`).toContain(required);
@@ -116,7 +117,11 @@ describe('registerSlashCommands', () => {
     expect(captured[0]!.method).toBe('PUT');
     expect(captured[0]!.url).toContain('/applications/app/guilds/g-1/commands');
     // ⛔⭐ «보낸» 개수는 정확값으로 걸지 않는다 — 라우터가 «실제로 가진» 수에서 파생한다(자가 안 늙는다).
-    expect((captured[0]!.body as any[]).length).toBe(runtime.router.schemas().length);
+    const putBody = captured[0]!.body as Array<Record<string, unknown> & { name: string }>;
+    expect(putBody.length).toBe(runtime.router.schemas().length);
+    expect(putBody.some((command) => command.name === 'showroom')).toBe(true);
+    expect(putBody.some((command) => command.name === 'persona' && String(command.description).includes('미지원'))).toBe(false);
+    for (const command of putBody) expect(command).not.toHaveProperty('supported');
     runtime.shutdown();
   });
 
@@ -131,6 +136,10 @@ describe('registerSlashCommands', () => {
     await runtime.registerSlashCommands();
     expect(captured[0]!.url).toContain('/applications/app/commands');
     expect(captured[0]!.url).not.toContain('/guilds/');
+    expect(captured[0]!.method).toBe('PUT');
+    for (const command of captured[0]!.body as Array<Record<string, unknown>>) {
+      expect(command).not.toHaveProperty('supported');
+    }
     runtime.shutdown();
   });
 });

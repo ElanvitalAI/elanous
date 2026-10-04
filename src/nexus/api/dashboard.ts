@@ -4,6 +4,7 @@
 //   GET /v1/dashboard/timeline  — 신호 타임라인 (?hours=48&floor=6)
 //   GET /v1/dashboard/heatmap   — 자산×국가×섹터 매력도 + US 섹터 + 뉴스 분포
 //   GET /v1/dashboard/digs      — 디깅 리포트 피드 (?limit=20)
+//   GET /v1/dashboard/loop-activity — 루프 활동 그래프 (?since=24h)
 //
 // 전부 read-only · 캐시/로컬 SQLite 만 (dashboard-data.ts) — 라이브 fetch 없음.
 // PWA 폴링(60s) 대상. reflection.ts 패턴(CORS·checkAuth seam) 상속.
@@ -16,12 +17,15 @@ import {
 } from '../../domains/dashboard-data.js';
 import { readLiveSnapshot } from '../../domains/market-live.js';
 import { marketSessions } from '../../domains/finance.js';
+import { loopActivity } from '../../loops/activity.js';
 
 export interface DashboardRouteOpts {
   /** Auth check seam. */
   checkAuth?: (req: Request) => boolean;
   /** Test seam — 실제 detached 수집 spawn 대체. */
   spawnCollector?: () => void;
+  /** Read-only activity provider for isolated route tests. */
+  loopActivity?: typeof loopActivity;
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -43,7 +47,7 @@ export function parseDashboardPath(pathname: string): string | null {
   const m = /^\/v1\/dashboard\/([^/]+)$/.exec(pathname);
   if (!m) return null;
   const seg = decodeURIComponent(m[1]!);
-  return ['summary', 'timeline', 'heatmap', 'digs', 'schedules', 'ontology', 'backtest', 'loops', 'ops'].includes(seg) ? seg : null;
+  return ['summary', 'timeline', 'heatmap', 'digs', 'schedules', 'ontology', 'backtest', 'loops', 'loop-activity', 'ops'].includes(seg) ? seg : null;
 }
 
 /** POST /v1/dashboard/refresh-live — 온디맨드 라이브 재수집 트리거 (refresh 버튼 설계 ·
@@ -99,6 +103,7 @@ export function handleDashboard(req: Request, section: string, opts: DashboardRo
       case 'ontology': return jsonResponse({ ok: true, ontology: dashboardOntology() }, 200);
       case 'backtest': return jsonResponse({ ok: true, backtest: dashboardBacktest() }, 200);
       case 'loops': return jsonResponse({ ok: true, loops: dashboardLoops() }, 200);
+      case 'loop-activity': return jsonResponse({ ok: true, activity: (opts.loopActivity ?? loopActivity)({ since: q.get('since') ?? '24h' }) }, 200);
       case 'ops': {
         const mid = q.get('mission');
         if (mid) return jsonResponse({ ok: true, missionDetail: dashboardOpsMission(mid) }, 200);

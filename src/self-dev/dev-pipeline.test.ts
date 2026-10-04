@@ -921,6 +921,29 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
     }
   });
 
+  it('persists the stamped seat alongside PID and run ID in the checkpoint', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'elanous-dev-pipeline-seat-'));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const previousSeat = process.env.ELANOUS_HARNESS_SEAT;
+    process.env.ELANOUS_STATE_DIR = stateDir;
+    process.env.ELANOUS_HARNESS_SEAT = 'MK';
+    try {
+      await runDevPipeline(T({ runId: 'run-seat-checkpoint' }), {
+        runSelfImplement: async () => ({ ok: true } as unknown as SelfImplementResult),
+        buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      });
+      expect(loadSelfDevRun('run-seat-checkpoint', selfDevRunsDir(stateDir))).toMatchObject({
+        runId: 'run-seat-checkpoint', pid: process.pid, pidStart: expect.stringMatching(/^(?:linux:[0-9a-f-]{36}:|darwin:)\d+$/), seat: 'MK',
+      });
+    } finally {
+      if (previousSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+      else process.env.ELANOUS_HARNESS_SEAT = previousSeat;
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it('최외곽에서 minted한 identity를 받으면 저장 참가자 출처를 minted로 보존한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'elanous-dev-pipeline-run-'));
     const previousStateDir = process.env.ELANOUS_STATE_DIR;

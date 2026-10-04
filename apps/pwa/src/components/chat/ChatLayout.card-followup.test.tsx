@@ -5,6 +5,7 @@ import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { ChatLayout } from './ChatLayout';
 import { ChatInput } from './ChatInput';
 import { ChatHistory } from './ChatHistory';
+import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
 import { CARD_FOLLOWUP_STORAGE_KEY } from '@/lib/card-followup-client';
 
@@ -72,6 +73,8 @@ async function mount(sessionId = 'session-1') {
   const reply = async (body: object, status = 200) => { await act(async () => { responses.shift()!(Response.json(body, { status })); }); };
   return { calls, streams, messages, send, reply, input, reload, storage: sessionStorage };
 }
+
+test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 test('unmount aborts card polling and prevents further GETs or UI updates', async () => {
   const ui = await mount();
