@@ -736,9 +736,9 @@ See also: [Commands you will use](/using-elanous/commands) · [Troubleshooting](
 
 Source: https://docs.elanous.ai/using-elanous/drive-from-a-coding-agent/
 
-A coding agent that speaks MCP can drive elanous — the steps below use Claude Code and Codex as examples. Once connected, the agent can check what elanous is running, read its logs, and hand it a change to build. Decisions that need you are answered from the elanous CLI.
+A coding agent that speaks MCP can drive elanous — the steps below use Claude Code and Codex as examples. Once connected, the agent can check what elanous is running, read its logs, and hand it a change to build.
 
-This page walks through the whole loop: connect, observe, launch a goal, answer a decision. Every command below was run end to end, first with Claude Code and then with Codex, against a throwaway elanous setup.
+This page walks through the loop: connect, observe, and launch a goal. Every command below was run end to end, first with Claude Code and then with Codex, against a throwaway elanous setup.
 
 ## What you get
 
@@ -839,27 +839,6 @@ Ask the agent again, in plain words:
 - "Is anything failing?" → `ops_status` with `action: health`
 - "What happened in the last 30 minutes?" → `logs_query` with `sinceMinutes`, `level` or `category`
 
-## 5. Answer a decision
-
-When elanous needs you (something irreversible, public, or costly), it raises a decision with a short situation, the options and a recommendation. Decisions are handled from the CLI:
-
-```bash
-elanous decisions list                       # open decisions
-elanous decisions show <id>                  # situation, options, recommendation
-elanous decisions decide <id> <option>       # record your answer
-```
-
-You can also raise one yourself, for example from a script your agent runs:
-
-```bash
-elanous decisions raise --title "Ship now or next release?" --category scope \
-  --s "The flag is drafted." --c "Shipping now skips one review round." \
-  --option "a=Ship now:Faster, less review" --option "b=Next release:One more review" \
-  --recommend b --why "Review first" --json
-```
-
-Option keys are single letters (`a`, `b`, …). In our run the decision was raised as open, then `decisions decide <id> b` closed it as decided by a human.
-
 ## The other direction: elanous drives the agent
 
 MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude Code, Codex or Grok as a child agent and drives it. `elanous acp list` shows the backends this build knows; `elanous acp test --backend <id>` sends one prompt as a smoke test.
@@ -871,7 +850,6 @@ MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude 
 | Codex says the elanous call "required approval" | Set `default_tools_approval_mode = "approve"` and `enabled_tools` for the elanous server |
 | `logs_query` returns nothing | The daemon has not written logs to this state directory yet; start it once (`elanous start`) |
 | `SelfImplement` returns `observed: true` but nothing happens | Observe-only is on: `elanous config set tools.selfImplement.observeOnly false` |
-| `decisions raise` rejects `--option` | Use single-letter keys: `a=Label:Consequence` |
 
 ---
 
@@ -886,10 +864,12 @@ Start from the result you want, then let the harness build toward it. Writing th
 Write three or four sentences, as if you were announcing the change:
 
 ```markdown
-Status now answers in JSON. Anyone scripting against elanous can run
-`elanous status --json` and read the same fields they see on screen,
-without parsing text. The plain output does not change.
+Status now answers in JSON. To automate status checks, run
+`elanous status` (with the proposed JSON output) and read the same fields
+you see on screen, without parsing text. The plain output does not change.
 ```
+
+Today, `elanous status` prints text only. For a structured operational snapshot now, use `elanous ops status --json`; it reports operational state, not the same fields as `elanous status`.
 
 If a sentence is hard to write, that is the part you have not decided yet. Decide it now, not during review.
 
@@ -4837,6 +4817,49 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.14
+
+Source: https://docs.elanous.ai/releases/0-2-14/
+
+## Behavior changes
+
+- `elanous hq promote --to <host>` previews the six-step HQ promotion without writing; `--apply` verifies the lease and standby checksums before copying into an isolated universe, starting nexus without MCP, and setting steward rescue; only one `--apply` runs per host at a time.
+- Agent-mission DRIVE-OK no longer mistakes an `rg`, `grep`, or `diff` no-match tool exit for a failed mission when artifact evidence is verified; genuine final-answer failures still block success.
+- Seat loops gain a live-safe mode (default stays shadow): it enqueues allowed goals through the harness queue with a per-item idempotency key, recovers an enqueue whose ledger row was lost to a crash, and refuses a same-key queue item carrying a different task instead of adopting it.
+- `elanous release place` and `elanous release rebalance` place checklist cells by priority, merged-PR pace, seat limits and dependencies; a freeze window holds operational rollout but the release still exists and takes cells.
+- Setting the ignored `ELANOUS_CONFIG_DIR` variable now prints one warning naming the config directory actually used and the `--config-dir` flag to use instead.
+- the harness gate no longer treats a change to a test file plus docs as docs-only.
+- `elanous loop status --all` now checks seat, cron-shell and orchestrator loops beside graph loops, uses the cron that is actually installed, and judges twice-a-day style schedules by their longest gap.
+- the harness queue attributes running harness processes to seats by working tree on macOS and counts a parent and its child run once.
+- a built-in YouTube summary graph turns a video transcript into a one-line verdict, key points and cards without external skills.
+- when a harness run merges, older drafts of the same goal are marked superseded right away.
+- the built-in YouTube summary falls back to speech-to-text when a video has no captions.
+- `elanous harness goal <pr|runId>` shows the goal, run and outcome behind a harness PR in one view.
+- `elanous loop list --all` shows every loop (graph, seat, cron-shell, orchestrator) in one table and warns about unregistered cron loops.
+- the harness launch budget gate no longer blocks codex launches on subscription usage when the codex quota policy allows credits and a credit balance is confirmed.
+- a Pod launch no longer dies when the host's grok subscription is about to expire: grok is dropped from that run's fallback chain with a warning and the run goes on with codex.
+- `elanous flow tick` splits one Wish card into release cells, routes sensitive portions to owner decisions, and places safe cells with a read-only `flow plan <cardId> --dry-run` preview.
+- the harness drops stale out-of-scope files that would silently revert recent main commits before committing a run's work.
+- The youtube-master skill now runs on bun without tsx and says which optional engine (ffmpeg, yt-dlp, whisper) is missing instead of failing silently.
+- the launch gate's duplicate-run check no longer gives up on old finished run ledgers without a goal id.
+- the loop registry recognises hq-fence role wrappers and periodic elanous commands as named cron loops.
+- the built-in YouTube graph can produce a study note (concepts, terms, steps and self-check questions).
+- the harness gate looks at the whole run's changes before skipping tests for a source without paired tests, and flags the skip loudly.
+- The "now" context view has a public-demo audience that folds internal items and hides seat codes, PR and run ids, host names and home paths.
+- `harness say|ask --seat` stamps the seat into the run ledger so queue caps attribute runs correctly even outside a seat's working tree.
+- the loop registry names cron jobs that run elanous via bun bin/elanous.mjs, and titles hq-fence wrapped lines by their inner command.
+- the daemon's "now" endpoint serves a public-demo audience and enforces it in demo mode.
+- the harness gate always runs the maturity-table tests when a change registers a slash, bot or CLI command.
+- Pod harness kubectl calls no longer die with ENOBUFS on large cluster listings during OOM retry decisions.
+- the loop registry recognises absolute-path eln cron jobs (including the loop checker itself) and never silently drops an elanous-related cron line.
+- `elanous harness goal archive` previews finished goal documents and, with `--apply`, copies them to an indexed state archive and lists the repository files to remove in a PR (it never deletes or commits repository files).
+- goal archive matches run ledgers by run id instead of absolute paths, and can optionally trust a goal document's own finished-run record.
+- harness incident records name the entrance, seat, host and a redacted output tail, and burst warnings say whose burst it was.
+
+Plus 129 internal changes.
 
 ---
 
