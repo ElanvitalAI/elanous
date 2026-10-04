@@ -1,10 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { launchModeOf, rescueAllows } from './rescue.js';
 import { join } from 'node:path';
 import { fetchLinearIssues } from '../connectors/linear.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { getUserConfig } from '../user-config.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug, redactSecretText } from '../debug/log.js';
+import { loopEvent } from '../loops/observe.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { redactSecrets } from '../task-cards/card-store.js';
 import { directiveHash } from './directive.js';
@@ -33,7 +36,8 @@ export interface TriageDecision {
 }
 export interface ScheduledDecision extends TriageDecision { disposition: 'now' | 'wait' | 'hitl' }
 export interface StewardSettings {
-  mode?: 'off' | 'shadow' | 'live'; linearTeam?: string;
+  /** `rescue` (HQ-SEAT): live launches/harvest/alerts/decision cards only — see ./rescue.ts. */
+  mode?: 'off' | 'shadow' | 'live' | 'rescue'; linearTeam?: string;
   roles?: Record<string, { maxConcurrent?: number }>;
   budget?: number;
   tracks?: Record<string, string>;
@@ -62,11 +66,14 @@ export interface StewardDeps {
   stageOwnedByCommand?: boolean;
 }
 
+/** rescue launches/harvests like live (HQ-SEAT). */
+const liveLike = (mode: StewardSettings['mode']): boolean => mode !== undefined && launchModeOf(mode) === 'live';
+
 export function stewardSettings(): StewardSettings {
   return getUserConfig().loops?.steward ?? { mode: 'shadow' };
 }
 
-function effectiveStewardMode(settings: StewardSettings): 'off' | 'shadow' | 'live' {
+function effectiveStewardMode(settings: StewardSettings): 'off' | 'shadow' | 'live' | 'rescue' {
   return settings.mode ?? settings.launch ?? 'shadow';
 }
 
@@ -115,6 +122,9 @@ export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<St
   // Inventory is shared by every classification in this batch; do not spawn --help per issue.
   let inventory: ReturnType<typeof installedCapabilities> | undefined;
   const signal = (result: TriageDecision): void => {
+    try { debug.log('steward.triage', 'decision', {
+      kind: String(result.rung), target: result.issue, wouldAct: false,
+    }); } catch { /* logging must not change the judgment */ }
     decide({ kind: result.rung === 'hitl' ? 'ESCALATE' : 'ROUTE', what: result.issue, reason: result.why,
       purpose: 'steward triage', target: result.owner ? `${result.rung} · ${result.owner}` : String(result.rung), refs: { issue: result.issue } });
   };
@@ -279,6 +289,9 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
   const fetchFn = deps.fetch ?? fetch;
   const skip = skippedPath(root);
   if (stage !== 'sync' && existsSync(skip)) return;
+  const runId = (graphRunId() ?? process.env.ELANOUS_RUN_ID?.trim()) || `steward-stage-${randomUUID()}`;
+  let outcome: 'ok' | 'fail' = 'fail';
+  try {
   const key = await (deps.getSecret ?? getSecretAsync)('connector.linear.apiKey');
   if (!key) throw new Error('connector.linear.apiKey missing');
   if (stage === 'sync') {
@@ -368,6 +381,9 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
         ? { ...row, rung: 'hitl' as const, disposition: 'hitl' as const, hitlReason: 'other' as const, why: 'working-backwards draft invalid' }
         : row);
     }
+    for (const row of rows) try { debug.log('steward.schedule', 'decision', {
+      kind: row.disposition, target: row.issue, wouldAct: row.disposition === 'now' && liveLike(settings.mode),
+    }); } catch { /* logging must not change the schedule */ }
     writeFileSync(schedule, JSON.stringify(rows));
     const ledger = readLaunchLedger(root);
     const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch, gate: deps.launchGate };
@@ -383,6 +399,11 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     for (const item of plan.launches) {
       const entry = launch(item, launchDeps);
       recordLaunchOnCard(item.issue, entry, cardDeps);
+    }
+    if (settings.mode === 'shadow') {
+      const { recordShadowTick } = await import('./readiness.js');
+      const tick = recordShadowTick(root, rows, plan, (deps.now ?? (() => new Date()))());
+      debug.log('steward.readiness', 'shadow-tick', tick);
     }
   } else {
     const rows = JSON.parse(readFileSync(schedule, 'utf8')) as ScheduledDecision[];
@@ -422,7 +443,7 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       const issue = issues.find(item => item.identifier === outcome.issue) ??
         { identifier: outcome.issue, title: outcome.title, ref: '', body: '' };
       recordOutcomeOnCard(issue, outcome, { root, store: deps.cardStore, now: deps.now });
-      notifyOutcome(outcome, { root, ledger, shadow: settings.mode !== 'live', ...deps.outcomeNotify });
+      notifyOutcome(outcome, { root, ledger, shadow: !(settings.mode === 'live' || settings.mode === 'rescue' && rescueAllows(settings.mode, 'alert', { issue: outcome.issue })), ...deps.outcomeNotify });
       const prefix = ['telegram', 'pwa', 'tui', 'cli'].includes(outcome.source) ? `${outcome.source} · ` : '';
       await (deps.sendDigest ?? sendStewardDigest)(`${prefix}${issue.title} · PR ${outcome.prNumber ?? '없음'} · ${outcome.status}`);
       outcome.reported = true;
@@ -430,11 +451,11 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     }
     const justCollected = new Set(outcomes.map(outcome => outcome.issue));
     for (const outcome of Object.values(ledger.launches)) {
-      if ((settings.mode !== 'live' && outcome.status === 'shadow' && !outcome.notified) ||
-          (settings.mode === 'live' && !justCollected.has(outcome.issue) && outcome.reported && outcome.notified !== 'shadow') ||
+      if ((!liveLike(settings.mode) && outcome.status === 'shadow' && !outcome.notified) ||
+          (liveLike(settings.mode) && !justCollected.has(outcome.issue) && outcome.reported && outcome.notified !== 'shadow') ||
           // A finished run whose PR waits for merge still owes the wish's chat its PR link (once; failures retry).
-          (settings.mode === 'live' && outcome.awaitingMerge === true && !outcome.reported && outcome.notified !== 'sent')) {
-        notifyOutcome(outcome, { root, ledger, shadow: settings.mode !== 'live', ...deps.outcomeNotify });
+          (liveLike(settings.mode) && outcome.awaitingMerge === true && !outcome.reported && outcome.notified !== 'sent')) {
+        notifyOutcome(outcome, { root, ledger, shadow: !(settings.mode === 'live' || settings.mode === 'rescue' && rescueAllows(settings.mode, 'alert', { issue: outcome.issue })), ...deps.outcomeNotify });
       }
     }
     const day = at.slice(0, 10);
@@ -445,11 +466,17 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       writeFileSync(path, JSON.stringify(state));
     }
   }
+  outcome = 'ok';
+  } finally {
+    try { loopEvent('steward', 'tick', { runId, stage, outcome, reason: outcome,
+      sourceRef: 'graphs/steward/steward.yaml', profile: settings.mode }); }
+    catch { /* Observation must not change the stage outcome. */ }
+  }
 }
 
 async function sendStewardDigest(text: string): Promise<void> {
   const { deliver } = await import('../domains/outbound-alert.js');
-  if (!deliver(text, 'digest')) throw new Error('steward digest delivery failed');
+  if (!deliver(text, 'ops-report')) throw new Error('steward digest delivery failed');
 }
 
 export interface StewardCommandDeps extends StewardDeps {
@@ -543,13 +570,25 @@ export async function runStewardStageCommand(stage: StewardStage, deps: StewardC
   }, stage === 'sync' ? () => { skipOverlappingRun(root, currentOpen(root, stage)); return 0 as const; } : undefined);
 }
 
+export async function runStewardNodeCommand(
+  stage: StewardStage,
+  deps: StewardCommandDeps = {},
+  registerSink: () => Promise<unknown> = async () => (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('steward'),
+): Promise<0 | 1> {
+  try { await registerSink(); }
+  catch (error) {
+    console.error(`steward ${stage}: log sink registration failed — ${redactSecretText(error instanceof Error ? error.message : String(error))}`);
+  }
+  return runStewardStageCommand(stage, deps);
+}
+
 if (import.meta.main) {
   const stage = process.argv[2];
   if (!['sync', 'triage', 'schedule', 'report'].includes(stage ?? '')) {
     console.error('steward: expected sync|triage|schedule|report');
     process.exitCode = 2;
   } else {
-    runStewardStageCommand(stage as StewardStage).then(code => { process.exitCode = code; }).catch((error: unknown) => {
+    void runStewardNodeCommand(stage as StewardStage).then(code => { process.exitCode = code; }).catch((error: unknown) => {
       console.error(`steward ${stage}: ${redactSecretText(error instanceof Error ? error.message : String(error))}`);
       process.exitCode = 1;
     });

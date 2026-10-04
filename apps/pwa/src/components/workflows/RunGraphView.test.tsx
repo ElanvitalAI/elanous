@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
+import { parse } from 'yaml';
 import { QueryClient } from '@tanstack/react-query';
 import { act, create } from 'react-test-renderer';
 import { ReactFlow } from '@xyflow/react';
@@ -175,6 +176,33 @@ test('mine graph edits consume YAML history through undo, redo and a new branch'
   await act(async () => button('저장').props.onClick());
   expect(savedYaml).toContain('node_id: branch');
   expect(savedYaml).not.toContain('node_id: note');
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
+test('node failure picker persists the chosen outcome fail route in graph YAML', async () => {
+  const { queries, client } = fixture();
+  const original = `graph_id: mine\nversion: 1\nentry_node: investigate\nterminal_nodes: [merge]\nnodes:\n  - { node_id: investigate, kind: agent, recipe: none, max_visits: 1 }\n  - { node_id: judge, kind: judge, recipe: none, max_visits: 1 }\n  - { node_id: merge, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: investigate, to: merge }\n`;
+  let savedYaml = '';
+  const mine = {
+    ...client,
+    getRunGraphs: async () => ({ graphs: [{ id: 'mine', source: 'mine', editable: true, nodeCount: 3 }] }),
+    getRunGraph: async () => ({ ...detail, id: 'mine', source: 'mine', editable: true }),
+    getRunGraphYaml: async () => ({ id: 'mine', source: 'mine', editable: true, yaml: original }),
+    putRunGraphYaml: async (_id: string, text: string) => { savedYaml = text; return { id: 'mine', source: 'mine', editable: true, saved: true }; },
+  } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  const canvas = renderer.root.findByType(ReactFlow);
+  await act(async () => canvas.props.onNodeClick({}, { id: 'investigate' }));
+  const picker = renderer.root.findAllByProps({ 'aria-label': '실패 시 다음 노드' })[0]!;
+  expect(picker.props.value).toBe('');
+  await act(async () => picker.props.onChange({ target: { value: 'judge' } }));
+  expect(renderer.root.findAllByProps({ 'aria-label': '실패 시 다음 노드' })[0]!.props.value).toBe('judge');
+  const save = renderer.root.findAllByType('button').find((button) => button.children.includes('저장'))!;
+  await act(async () => save.props.onClick());
+  expect(parse(savedYaml).edges).toEqual([{ from: 'investigate', on: 'outcome', map: { ok: 'merge', fail: 'judge' } }]);
   await act(async () => renderer.unmount());
   queries.clear();
 });

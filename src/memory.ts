@@ -63,6 +63,16 @@ export function writeFileDurable(path: string, data: string, fsync: (fd: number)
 
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
 
+/** Context-condense metadata travels with the existing curated memory file, not a parallel store. */
+export interface ContextMemoryCard {
+  project: string;
+  seat: string;
+  topic: string;
+  source: string;
+  updatedAt: string;
+  status: 'active' | 'retired';
+}
+
 export interface MemoryEntry {
   id: string;                 // uuid v4
   filename: string;           // "<uuid>-<slug>.md"
@@ -89,6 +99,7 @@ export interface MemoryEntry {
   pinned: boolean;
   /** Optional pinned-memory freshness window; absent memories retain their original injection text. */
   staleAfterMinutes?: number;
+  contextCard?: ContextMemoryCard;
 }
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -192,6 +203,7 @@ export interface SaveMemoryOpts {
   staleAfterMinutes?: number;
   /** Override the generated id (tests). */
   id?: string;
+  contextCard?: ContextMemoryCard;
 }
 
 export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): MemoryEntry {
@@ -207,6 +219,7 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   let existingPriority: number | undefined;
   let existingPinned: boolean | undefined;
   let existingStaleAfterMinutes: number | undefined;
+  let existingContextCard: ContextMemoryCard | undefined;
   if (existsSync(path)) {
     try {
       const parsed = parseFrontmatter(readFileSync(path, 'utf-8'));
@@ -214,6 +227,7 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
       if (parsed.fm.priority) existingPriority = parseInt(parsed.fm.priority, 10) || 0;
       if (parsed.fm.pinned) existingPinned = parsed.fm.pinned === 'true';
       existingStaleAfterMinutes = parseStaleAfterMinutes(parsed.fm['stale-after-minutes']);
+      existingContextCard = parseContextCard(parsed.fm['context-card']);
     } catch { /* keep new createdAt */ }
   }
   const priority = opts.priority ?? existingPriority ?? 0;
@@ -229,6 +243,8 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   if (priority > 0) frontmatter.priority = String(Math.floor(priority));
   if (pinned) frontmatter.pinned = 'true';
   if (staleAfterMinutes !== undefined) frontmatter['stale-after-minutes'] = String(staleAfterMinutes);
+  const contextCard = opts.contextCard ?? existingContextCard;
+  if (contextCard) frontmatter['context-card'] = JSON.stringify(contextCard);
   const raw = renderFrontmatter(frontmatter, opts.body);
   writeFileDurable(path, raw);
 
@@ -248,7 +264,21 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
     priority,
     pinned,
     staleAfterMinutes,
+    ...(contextCard ? { contextCard } : {}),
   };
+}
+
+function parseContextCard(raw: string | undefined): ContextMemoryCard | undefined {
+  if (!raw) return undefined;
+  try {
+    const card: unknown = JSON.parse(raw);
+    if (card && typeof card === 'object' && !Array.isArray(card)) {
+      const c = card as Record<string, unknown>;
+      if (['project', 'seat', 'topic', 'source', 'updatedAt'].every(key => typeof c[key] === 'string')
+        && (c.status === 'active' || c.status === 'retired')) return c as unknown as ContextMemoryCard;
+    }
+  } catch { /* malformed metadata is not a context memory */ }
+  return undefined;
 }
 
 /** Parse one memory file. Returns null on read/parse error. */
@@ -261,6 +291,7 @@ function parseMemoryFile(path: string): MemoryEntry | null {
   const basename = path.split(/[\\/]/).pop() ?? '';
   const match = basename.match(/^([0-9a-f-]{36})-(.+)\.md$/i);
   const id = match ? match[1] : createHash('sha1').update(basename).digest('hex').slice(0, 36);
+  const contextCard = parseContextCard(fm['context-card']);
   return {
     id,
     filename: basename,
@@ -274,6 +305,7 @@ function parseMemoryFile(path: string): MemoryEntry | null {
     priority: fm.priority ? (parseInt(fm.priority, 10) || 0) : 0,
     pinned: fm.pinned === 'true',
     staleAfterMinutes: parseStaleAfterMinutes(fm['stale-after-minutes']),
+    ...(contextCard ? { contextCard } : {}),
   };
 }
 
@@ -364,6 +396,7 @@ export function searchMemories(
   const entries = listMemories({ type: opts.type }, root);
   const hits: SearchHit[] = [];
   for (const entry of entries) {
+    if (entry.contextCard?.status === 'retired') continue;
     // 정확-토큰 매칭(2026-07-19) — 이전 substring `includes(kw)` 는 "ref"가 "reference"·
     // "prefer" 안에까지 걸려 오차용(false-recall)을 냈다(openclaw tool-search.ts 이식:
     // tokenize→Set.has 전체토큰 동등). name/description 은 토큰집합 정확매칭, body 는
@@ -415,7 +448,7 @@ export function rebuildIndex(root: string = memoryRoot()): void {
   const byType: Record<MemoryType, MemoryEntry[]> = {
     user: [], feedback: [], project: [], reference: [],
   };
-  for (const e of entries) byType[e.type].push(e);
+  for (const e of entries) if (e.contextCard?.status !== 'retired') byType[e.type].push(e);
 
   const lines: string[] = [];
   lines.push('# elanous memory index');
@@ -515,7 +548,7 @@ export function buildMemoryInjection(
 
   // 📌 pinned 기억 — 키워드 무관 항상 주입(relevance gate bypass · Letta pinned block /
   //    claude-code MEMORY.md tier 동형). priority 높은 순. core/safety/ref-location 사실용.
-  const pinnedMems = listMemories({}, root).filter(m => m.pinned).sort((a, b) => b.priority - a.priority);
+  const pinnedMems = listMemories({}, root).filter(m => m.pinned && m.contextCard?.status !== 'retired').sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
     const chunk = pinnedChunk(e);
@@ -678,7 +711,7 @@ export async function buildMemoryInjectionLLM(
   }
 
   // pinned 항상주입(키워드/판정 무관).
-  const pinnedMems = listMemories({}, root).filter((m) => m.pinned).sort((a, b) => b.priority - a.priority);
+  const pinnedMems = listMemories({}, root).filter((m) => m.pinned && m.contextCard?.status !== 'retired').sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
     const chunk = pinnedChunk(e);
@@ -693,7 +726,7 @@ export async function buildMemoryInjectionLLM(
   let judged: MemoryEntry[] = [];
   if (!lowContext) {
     const candidates = listMemories({}, root)
-      .filter((m) => !m.pinned && !injected.includes(m.id))
+      .filter((m) => !m.pinned && m.contextCard?.status !== 'retired' && !injected.includes(m.id))
       .slice(0, opts.maxCandidates ?? 60);
     if (candidates.length > 0) {
       try {

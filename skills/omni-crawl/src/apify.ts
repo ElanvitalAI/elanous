@@ -1,6 +1,5 @@
 /** Apify tweet-scraper — absorbed from apify-x-asset-sentiment (Python → TypeScript) */
 
-import { requireEnv } from './env.js';
 import type { CrawlResult, CrawlItem } from './types.js';
 
 const ENDPOINT = 'https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items';
@@ -21,8 +20,20 @@ function buildSearchTerms(query: string, lang: string, addDefaults: boolean): st
   return `${query} ${suffix}`.trim();
 }
 
+let missingApifyReported = false;
+
+export function apifyAvailable(): boolean {
+  if (process.env.APIFY_TOKEN) return true;
+  if (!missingApifyReported) {
+    missingApifyReported = true;
+    console.error('Apify 없음 — X 트윗 벌크 수집 빠짐 · APIFY_TOKEN 설정하면 벌크 검색 켜짐');
+  }
+  return false;
+}
+
 export async function searchApifyTweets(opts: ApifySearchOpts): Promise<CrawlResult> {
-  const token = requireEnv('APIFY_TOKEN');
+  if (!apifyAvailable()) return { engine: 'apify', query: opts.query, items: [], totalItems: 0 };
+  const token = process.env.APIFY_TOKEN!;
   const url = `${ENDPOINT}?token=${token}`;
 
   const lang = opts.lang || 'en';

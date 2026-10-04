@@ -64,7 +64,7 @@ function storedItems(root: string): MemoryItem[] {
   return items;
 }
 
-async function summarize(source: MemorySource, injected?: Record<string, MemorySummary>): Promise<MemorySummary> {
+export async function summarize(source: MemorySource, injected?: Record<string, MemorySummary>): Promise<MemorySummary> {
   if (injected) {
     const result = injected[source.source];
     if (!result) throw new Error(`missing test summary: ${source.source}`);

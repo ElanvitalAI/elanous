@@ -138,6 +138,22 @@ export function validatePersonaShape(
     models = mr.models;
   }
 
+  let seat: string | undefined;
+  if (Object.hasOwn(obj, 'seat')) {
+    if (typeof obj['seat'] !== 'string' || !obj['seat'].trim()) {
+      return err(path, 'seat must be a non-empty string');
+    }
+    seat = obj['seat'];
+  }
+
+  let todo: string | undefined;
+  if (Object.hasOwn(obj, 'todo')) {
+    if (typeof obj['todo'] !== 'string' || !/^[a-z0-9_][a-z0-9_-]*\.todo\.jsonl$/i.test(obj['todo'])) {
+      return err(path, 'todo must be a per-persona .todo.jsonl filename');
+    }
+    todo = obj['todo'];
+  }
+
   let mentionPatterns: readonly string[] | undefined;
   if (obj['mentionPatterns'] !== undefined) {
     if (!Array.isArray(obj['mentionPatterns'])
@@ -149,6 +165,8 @@ export function validatePersonaShape(
 
   const profile: PersonaProfile = {
     personaId, displayName,
+    ...(seat !== undefined ? { seat } : {}),
+    ...(todo !== undefined ? { todo } : {}),
     ...(description.value !== undefined ? { description: description.value } : {}),
     ...(systemPrompt.value !== undefined ? { systemPrompt: systemPrompt.value } : {}),
     ...(brand !== undefined ? { brand } : {}),

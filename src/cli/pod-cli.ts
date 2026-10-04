@@ -6,9 +6,10 @@ import { debug } from '../debug/log.js';
 import { readPodMemoryAdvice } from './pod-memory-advice.js';
 import { getUserConfig } from '../user-config.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
-import { parsePodPool, resolvePodPoolSpec, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
+import { parsePodPool, resolvePodPoolSpec, podPoolHostLease, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl, measurePoolLease, probePoolDns, recommendConcurrency, type PoolLeaseMeasure, type PoolDnsProbe } from '../task-orchestrator/surfaces/pod-lease.js';
 import { POD_COMMAND_DEADLINE_SECONDS, runPodCommand, type PodCommandResult, type RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
+import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
 
 export interface PodCliIo {
   log: (line: string) => void;
@@ -78,8 +79,13 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         const perAccount = (deps.perAccount ?? (() => getUserConfig().pod?.lease?.perAccount ?? 4))();
         const decision = recommendConcurrency(measure, { capacity: members.reduce((sum, m) => sum + m.capacity, 0), accounts: accounts ?? -1, perAccount });
         if (!context) { decision.recommended = null; decision.limitedBy = null; decision.reason = '측정 불가: cluster (current context)'; }
-        const result = { pool: spec, ...measure, accounts, perAccount, ...decision };
-        debug.log('pod.lease', 'status', { pool: spec ? members.map((m) => ({ capacity: m.capacity })) : null, running: decision.running, pending: decision.pending, unleasedRunning: decision.unleasedRunning, recommended: decision.recommended, limitedBy: decision.limitedBy });
+        const records = members.length ? podPoolHostLease(members).live() : [];
+        const host = hostLeaseCounts(records);
+        // Pending Pods and Job-only reservations are disjoint; a lease for an already Pending Job is the same Job.
+        const waitingJobs = decision.pending === null ? null : decision.pending +
+          records.filter((r) => r.stage === 'job' && !leaseHasPendingPod(r, decision.pendingJobs ?? [])).length;
+        const result = { pool: spec, ...measure, accounts, perAccount, ...decision, reserved: host.reserved, waitingJobs };
+        debug.log('pod.lease', 'status', { pool: spec ? members.map((m) => ({ capacity: m.capacity })) : null, running: decision.running, pending: decision.pending, reserved: host.reserved, waitingJobs, unleasedRunning: decision.unleasedRunning, recommended: decision.recommended, limitedBy: decision.limitedBy });
         if (opts.json) io.log(JSON.stringify(result));
         else {
           io.log(`풀: ${(spec ?? context) || '?'}`);
@@ -89,6 +95,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
             io.log(`${m.context} | ${m.capacity} | ${m.running ?? '?'} | ${m.pending ?? '?'} | ${mem(m.memoryLimitBytes)}/${mem(m.allocatableMemoryBytes)} | ${m.allocatableCpuMillicores === null ? '?' : m.allocatableCpuMillicores / 1000}${m.reason ? ` (${m.reason})` : ''}`);
           }
           io.log(`권장 지금 ${decision.recommended ?? '?'} 개 더 (limitedBy=${decision.limitedBy ?? 'unknown'})${decision.reason ? ` · ${decision.reason}` : ''}`);
+          io.log(`예약(저작 중) ${host.reserved} · 대기 Job ${waitingJobs ?? '?'} · 실행 ${decision.running ?? '?'}`);
           io.log(`임대 없는 실행 ${decision.unleasedRunning ?? '?'}`);
           io.log(`capacity: ${decision.capacitySlots ?? '?'} 칸 (상한 ${members.reduce((sum, m) => sum + m.capacity, 0)} − Running ${decision.running ?? '?'} − Pending ${decision.pending ?? '?'}; 권장 수에서 건강한 멤버의 임대 없는 실행 차감)`);
           io.log(`memory: ${decision.memorySlots ?? '?'} 칸 (할당 가능 − Running 하니스 상한 합; 골당 16Gi · 모든 네임스페이스의 노드별 기존 예약을 반영해 배치 가능 ${decision.placeableSlots ?? '?'} 칸)`);

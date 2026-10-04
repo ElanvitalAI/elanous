@@ -1,4 +1,10 @@
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
+import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
+import { fileLeaseStore } from '../hq/lease.js';
+import { join } from 'node:path';
+import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry } from '../decisions/decision-ledger.js';
 
@@ -46,13 +52,19 @@ export function formatDecisionDetail(e: DecisionEntry): string {
     ...(e.refs?.length ? [`참조: ${e.refs.join(' · ')}`] : [])].join('\n');
 }
 
-export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions = {}, out: Pick<Console, 'log'> = console): void {
-  const root = program.command('decisions').description('대표 결정 원장 · 로컬 전용');
+export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
+  const noXcheck = new Option('--no-xcheck <이유>', '교차 확인 생략 이유');
+  // This flag takes a reason, not Commander's negated boolean default.
+  noXcheck.negate = false;
+  const root = program.command('decisions').description('대표 결정 원장 · 로컬 전용').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
+  const mayWrite = (command: string, override?: boolean) => hqCliWriteAllowed(`decisions ${command}`, Boolean(override || root.opts().hqOverride),
+    (getElanousConfigDirOverride() || config.stateDir) && !hqDeps.store && !getUserConfig().hq?.arbiter ? { ...hqDeps, store: fileLeaseStore(join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'lease.json')), seenPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'seen-generation'), localPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'local.json') } : hqDeps);
   const emit = (value: unknown, json?: boolean, text?: string) => out.log(json ? JSON.stringify(value) : text ?? JSON.stringify(value));
   const fail = (action: () => void) => { try { action(); } catch (e) { throw new Error(`decisions: ${e instanceof Error ? e.message : String(e)}`); } };
   root.command('linear-sync').description('열린 결정을 COO Linear 프로젝트에 투영하고 닫힌 결정을 동기화한다')
-    .option('--dry-run').option('--json')
-    .action(async (o: { dryRun?: boolean; json?: boolean }) => {
+    .option('--dry-run').option('--json').option('--hq-override')
+    .action(async (o: { dryRun?: boolean; json?: boolean; hqOverride?: boolean }) => {
+      if (!o.dryRun && !mayWrite('linear-sync', o.hqOverride)) return;
       const result = await projectDecisionsToLinear({ stateDir: config.stateDir, dryRun: o.dryRun });
       emit(result, o.json, result.reason ?? `생성 ${result.created} · 닫음 ${result.closed} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${result.plan?.length ? `\n${result.plan.map(p => `${p.action} ${p.decisionId}${p.issue ? ` ${p.issue}` : ''}`).join('\n')}` : ''}`);
     });
@@ -61,21 +73,36 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .requiredOption('--s <text>').requiredOption('--c <text>').option('--q <text>').option('--a <text>')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
     .option('--recommend <key>').option('--why <text>').option('--skip-recommend <reason>')
+    .option('--xcheck <SEAT:메모>', '교차 확인 (반복)', repeat, [] as string[])
+    .addOption(noXcheck)
+    .option('--alternative <key>').option('--dissent <text>')
     .option('--track <track>').option('--agent <agent>').option('--session <id>')
     .option('--resume-question <qid>').option('--run <runId>')
     .option('--ref <url>', '참조 (반복)', repeat, [] as string[])
     .option('--due <when>', '기한 — UTC ISO(2026-10-04T09:00:00Z) 또는 +Nh(지금부터 N시간) · 기한 2시간 전 텔레그램·디스코드로 다시 알린다')
-    .option('--json')
-    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; track?: DecisionTrack; agent?: string; session?: string; resumeQuestion?: string; run?: string; ref: string[]; json?: boolean }) => fail(() => {
+    .option('--json').option('--hq-override')
+    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; xcheck: string[]; noXcheck?: string; alternative?: string; dissent?: string; track?: DecisionTrack; agent?: string; session?: string; resumeQuestion?: string; run?: string; ref: string[]; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (o.run !== undefined && o.resumeQuestion === undefined) throw new Error('--run requires --resume-question');
       if (o.skipRecommend !== undefined && (o.recommend !== undefined || o.why !== undefined)) throw new Error('choose recommendation or skip, not both');
       if (o.skipRecommend === undefined && (!o.recommend || !o.why)) throw new Error('--recommend and --why required, or --skip-recommend <reason>');
       const options: DecisionOption[] = o.option.map(parseOption);
+      if (o.xcheck.length && o.noXcheck !== undefined) throw new Error('choose --xcheck or --no-xcheck, not both');
+      const crossCheck = o.xcheck.map(raw => {
+        const match = /^([^:\s]+):(.+)$/.exec(raw);
+        if (!match || !match[2]!.trim()) throw new Error(`invalid --xcheck: ${raw} (expected SEAT:메모)`);
+        return { seat: match[1]!, at: new Date().toISOString(), note: match[2]!.trim() };
+      });
+      if (!crossCheck.length && o.noXcheck === undefined && getUserConfig().decisions?.requireCrossCheck) throw new Error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+      const who = agent(o.agent);
+      if (!mayWrite('raise', o.hqOverride)) return;
       const entry = new DecisionLedger(config).raise({ title: o.title, category: o.category, scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) }, options,
+        ...(crossCheck.length ? { crossCheck } : { crossCheckSkipped: o.noXcheck ?? 'missing' }),
+        ...(o.alternative !== undefined ? { alternative: o.alternative } : {}), ...(o.dissent !== undefined ? { dissent: o.dissent } : {}),
         recommendation: o.skipRecommend !== undefined ? { skipped: true, reason: o.skipRecommend } : { option: o.recommend!, why: o.why! },
-        raisedBy: { agent: agent(o.agent), ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}),
+        raisedBy: { agent: who, ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}),
         ...(o.resumeQuestion !== undefined ? { resume: { questionId: o.resumeQuestion, ...(o.run !== undefined ? { runId: o.run } : {}) } } : {}),
         ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
+      if (entry.crossCheckSkipped === 'missing') console.error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
       emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
   root.command('list').description('결정 목록 (기본 열린 것)')
@@ -88,11 +115,12 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
   root.command('show <id>').description('SCQA · 선택지 · 권고 · 이력 · 판').option('--json')
     .action((id: string, o: { json?: boolean }) => fail(() => { const entry = new DecisionLedger(config).show(id); emit(entry, o.json, formatDecisionDetail(entry)); }));
   root.command('decide <id> <option>').description('사람 또는 AUTO 위임 결정 기록')
-    .option('--note <text>').option('--auto').option('--delegation <reason>').option('--track <track>').option('--agent <agent>').option('--json')
-    .action((id: string, choice: string, o: { note?: string; auto?: boolean; delegation?: string; track?: DecisionTrack; agent?: string; json?: boolean }) => fail(() => {
+    .option('--note <text>').option('--auto').option('--delegation <reason>').option('--track <track>').option('--agent <agent>').option('--json').option('--hq-override')
+    .action((id: string, choice: string, o: { note?: string; auto?: boolean; delegation?: string; track?: DecisionTrack; agent?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (o.auto && !o.delegation?.trim()) throw new Error('--auto requires --delegation');
       if (!o.auto && (o.delegation || o.track || o.agent)) throw new Error('delegation/track/agent require --auto');
       const by = o.auto ? { kind: 'auto' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) } : { kind: 'human' as const };
+      if (!mayWrite('decide', o.hqOverride)) return;
       const { entry, delivery } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
       if (delivery && !delivery.ok) {
         // The decision is recorded; only the answer to the waiting run failed — say so and how to retry, never «success».
@@ -103,22 +131,26 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       }
       emit(delivery ? { ...entry, delivery } : entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
     }));
-  root.command('retry-answer <id>').description('기록된 결정의 대기 질문 답 전달만 재시도한다').option('--json')
-    .action((id: string, o: { json?: boolean }) => fail(() => {
+  root.command('retry-answer <id>').description('기록된 결정의 대기 질문 답 전달만 재시도한다').option('--json').option('--hq-override')
+    .action((id: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('retry-answer', o.hqOverride)) return;
       const entry = new DecisionLedger(config).retryAnswer(id);
       emit(entry, o.json, `답 전달: ${entry.id} → ${entry.resume?.questionId}`);
     }));
   root.command('add-options <id>').description('선택지가 미기재된 과거 항목에 확인된 선택지를 추가')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
-    .option('--agent <agent>').option('--json')
-    .action((id: string, o: { option: string[]; agent?: string; json?: boolean }) => fail(() => {
-      const entry = new DecisionLedger(config).addOptions(id, o.option.map(parseOption), agent(o.agent));
+    .option('--agent <agent>').option('--json').option('--hq-override')
+    .action((id: string, o: { option: string[]; agent?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+      const who = agent(o.agent);
+      if (!mayWrite('add-options', o.hqOverride)) return;
+      const entry = new DecisionLedger(config).addOptions(id, o.option.map(parseOption), who);
       emit(entry, o.json, formatDecisionDetail(entry));
     }));
-  root.command('withdraw <id>').description('결정 철회도 원장에 남긴다').requiredOption('--reason <reason>').option('--json')
-    .action((id: string, o: { reason: string; json?: boolean }) => fail(() => { const entry = new DecisionLedger(config).withdraw(id, o.reason); emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
-  root.command('import-markdown <file>').description('기존 대표 결정 문서 씨앗을 가져온다 (재실행 안전)').option('--json')
-    .action((file: string, o: { json?: boolean }) => fail(() => {
+  root.command('withdraw <id>').description('결정 철회도 원장에 남긴다').requiredOption('--reason <reason>').option('--json').option('--hq-override')
+    .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(() => { if (!mayWrite('withdraw', o.hqOverride)) return; const entry = new DecisionLedger(config).withdraw(id, o.reason); emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
+  root.command('import-markdown <file>').description('기존 대표 결정 문서 씨앗을 가져온다 (재실행 안전)').option('--json').option('--hq-override')
+    .action((file: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
+      if (!mayWrite('import-markdown', o.hqOverride)) return;
       const result = importDecisionMarkdown(new DecisionLedger(config), file);
       emit(result, o.json, `가져옴 ${result.imported.length} · 기존 ${result.existing.length} · 불완전 ${result.incomplete.length} · 못 읽음 ${result.unread.length}${result.incomplete.length ? `\n${result.incomplete.join('\n')}` : ''}${result.unread.length ? `\n${result.unread.join('\n')}` : ''}`);
       if (result.unread.length) process.exitCode = 1;

@@ -12,7 +12,7 @@
 import type { CrawlResult, CrawlItem, SearchEngine } from './types.js';
 import { searchTavily } from './tavily.js';
 import { searchFirecrawl, searchDeveloperFirecrawl, agentFirecrawl, mapFirecrawl, crawlSiteFirecrawl } from './firecrawl.js';
-import { searchApifyTweets } from './apify.js';
+import { searchApifyTweets, apifyAvailable } from './apify.js';
 import { searchGrok } from './grok-search.js';
 import { searchDdg } from './free.js';
 import { captureScreenshot } from './capture.js';
@@ -122,7 +122,7 @@ const DESCRIPTORS: EngineDescriptor[] = [
   },
   {
     id: 'apify', capability: 'tweets', tier: 'paid',
-    available: () => hasKey('APIFY_TOKEN'),
+    available: apifyAvailable,
     run: (q, c) => searchApifyTweets({ query: q, minFavs: c.minFavs, maxItems: c.maxItems, lang: c.lang }),
   },
   { id: 'grok-x', capability: 'community', tier: 'paid', available: () => hasKey('XAI_API_KEY'), run: (q) => searchGrok({ query: q, mode: 'x' }) },

@@ -1068,7 +1068,8 @@ describe(':budget · :history · :help', () => {
     const ctx = ctxWith();
     expect((await dispatchMeta('/help', ctx))?.text).toContain(':help');
     expect((await dispatchMeta('/clear', ctx))?.text).toBe('__CLEAR__');
-    expect((await dispatchMeta('/run-skill test', ctx))?.text).toBe('/run-skill 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear');
+    expect((await dispatchMeta('/run-skill test', ctx))?.text).toBe('쓰는 법: /run-skill <이름> <할 일>');
+    expect((await dispatchMeta('/mission', ctx))?.text).toBe('/mission 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear');
     expect(isMetaCommand('/help')).toBe(true);
     expect(isMetaCommand('/run-skill test')).toBe(true);
   });

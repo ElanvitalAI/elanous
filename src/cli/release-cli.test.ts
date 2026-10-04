@@ -11,6 +11,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { fileLeaseStore, serializeLease } from '../hq/lease.js';
+import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 
 function fixture() {
@@ -209,6 +211,116 @@ describe('release checklist CLI', () => {
       expect(lines.at(-4)).toContain('0.2.5 (graph)');
     } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+test('checklist CLI fences every ledger mutation before write; override is observed, bootstrap and reads remain available', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-hq-cli-'));
+  setElanousConfigDir(dir);
+  const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
+  const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100,
+    log: ((_category: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); }) as HqDeps['log'] };
+  const lines: string[] = [];
+  const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { lines.push(line); });
+  const before = process.exitCode;
+  const run = async (...args: string[]) => { const cli = new Command(); registerReleaseCommands(cli, {}, {}, hq); await cli.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+  try {
+    process.exitCode = 0;
+    await run('add', 'K1', 'Bootstrap');
+    expect(listChecklist('9.9.9').items).toHaveLength(1);
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    const writes = [
+      ['set', 'K1', '--status', 'red'], ['add', 'K2', 'Blocked'], ['move', 'K1', '--from', '9.9.9', '--to', '9.9.8'],
+      ['rm', 'K1'], ['evidence', 'add', 'K1', '#blocked'], ['claim', 'K1', '--by', 'TC'], ['retitle', 'K1', 'Blocked'],
+      ['seed', '--from', join(dir, 'roadmap.md')], ['export'],
+    ];
+    writeFileSync(join(dir, 'roadmap.md'), '# Roadmap\n');
+    const original = listChecklist('9.9.9');
+    for (const args of writes) {
+      process.exitCode = 0;
+      await run(...args);
+      expect(process.exitCode).toBe(4);
+      expect(lines.at(-1)).toContain('본부는 node-b gen 2 — 거기서 쓰거나 --hq-override(관측)');
+      expect(listChecklist('9.9.9')).toEqual(original);
+      expect(listChecklist('9.9.8').items).toHaveLength(0);
+    }
+    process.exitCode = 0;
+    await run('status');
+    expect(process.exitCode).toBe(0);
+    expect(lines.some(line => line.includes('🟢'))).toBe(true);
+    process.exitCode = 0;
+    await run('set', 'K1', '--status', 'red', '--hq-override');
+    expect(process.exitCode).toBe(0);
+    expect(listChecklist('9.9.9').items[0]?.status).toBe('red');
+    expect(logs).toContainEqual({ event: 'cli-override', data: expect.objectContaining({ command: 'release checklist set', holder: 'node-b', generation: 2 }) });
+    expect(lines.some(line => line.includes('hq override: release checklist set'))).toBe(true);
+    process.exitCode = 0;
+    await run('evidence', 'add', 'K1', '#override', '--hq-override');
+    expect(listChecklist('9.9.9').items[0]?.evidence).toContain('#override');
+    expect(logs).toContainEqual({ event: 'cli-override', data: expect.objectContaining({ command: 'release checklist add', holder: 'node-b', generation: 2 }) });
+    expect(store.cas(store.read().raw, serializeLease({ holder: 'mbp', generation: 3, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    process.exitCode = 0;
+    await run('set', 'K1', '--status', 'green');
+    expect(process.exitCode).toBe(0);
+    expect(listChecklist('9.9.9').items[0]?.status).toBe('green');
+    expect(store.cas(store.read().raw, '')).toBe(true);
+    process.exitCode = 0;
+    await run('set', 'K1', '--status', 'done');
+    expect(process.exitCode).toBe(4);
+    expect(listChecklist('9.9.9').items[0]?.status).toBe('green');
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('actual CLI exits 4 for non-holder checklist writes, while reads and the observed override remain usable', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-hq-child-'));
+  const store = fileLeaseStore(join(dir, 'hq', 'lease.json'), () => 100);
+  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
+    { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+  try {
+    expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    const blocked = run('set', 'K1', '--status', 'red');
+    expect(blocked.status).toBe(4);
+    expect(blocked.stderr).toContain('본부는 other-host gen 2 — 거기서 쓰거나 --hq-override(관측)');
+    const read = run('status', '--json');
+    expect(read.status).toBe(0);
+    expect(JSON.parse(read.stdout).items).toHaveLength(0);
+    const override = run('add', 'K1', 'Fixture', '--hq-override');
+    expect(override.status, override.stderr).toBe(0);
+    expect(override.stderr).toContain('hq override: release checklist add');
+    expect(JSON.parse(run('list', '--json').stdout).items).toMatchObject([{ id: 'K1' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 180_000);
+
+test('other ledger-writing release CLI routes obey the same HQ fence; read-only previews stay available', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-hq-other-'));
+  setElanousConfigDir(dir);
+  const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { lines.push(line); });
+  const before = process.exitCode;
+  try {
+    const cli = new Command();
+    registerReleaseCommands(cli, {}, { run: () => ({ status: 0, stdout: '[]', stderr: '' }) }, hq);
+    const run = async (...args: string[]) => cli.parseAsync(['release', ...args], { from: 'user' });
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    process.exitCode = 0;
+    await run('schedule', 'set', '--version', '9.9.9', '--cut-at', '2026-10-04T12:00+09:00');
+    expect(process.exitCode).toBe(4);
+    expect(getSchedule('9.9.9')).toBeNull();
+    process.exitCode = 0;
+    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--apply-evidence');
+    expect(process.exitCode).toBe(4);
+    process.exitCode = 0;
+    await run('checklist', '--version', '9.9.9', 'landed-but-yellow', '--dry-run');
+    expect(process.exitCode).toBe(0);
+    await run('schedule', 'set', '--version', '9.9.9', '--cut-at', '2026-10-04T12:00+09:00', '--hq-override');
+    expect(process.exitCode).toBe(0);
+    expect(getSchedule('9.9.9')?.cutAt).toBe('2026-10-04T03:00:00.000Z');
+    expect(lines.some(line => line.includes('hq override: release schedule set'))).toBe(true);
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); log.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 describe('release schedule CLI', () => {

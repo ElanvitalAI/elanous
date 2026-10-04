@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { latestGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
 
 export interface GraphTickOptions {
@@ -35,10 +36,16 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
     acquired = true;
     await options.deps?.notify?.();
     const latest = latestGraphRun(graphId, root);
+    const growthCard = latest?.growthPark
+      ? (options.deps?.growthDecision?.list ?? ((filters: { status: 'all' }) => new DecisionLedger({ stateDir: root }).list(filters)))({ status: 'all' })
+        .find(entry => entry.id === latest.growthPark?.decisionId && entry.refs?.includes(latest.growthPark.decisionRef))
+      : undefined;
+    const growthDecided = growthCard?.status === 'decided' && growthCard.decidedBy?.kind === 'human' &&
+      (growthCard.choice === 'a' || growthCard.choice === 'b');
     let result: GraphTickResult;
-    if (latest?.status === 'awaiting-approval' && !latest.pending?.decision) {
+    if (latest?.status === 'awaiting-approval' && !latest.pending?.decision && !growthDecided) {
       result = { action: 'waiting', runId: latest.runId, status: latest.status };
-    } else if (latest?.status === 'running' || (latest?.status === 'awaiting-approval' && latest.pending?.decision)) {
+    } else if (latest?.status === 'running' || (latest?.status === 'awaiting-approval' && (latest.pending?.decision || growthDecided))) {
       const state = await runGraph(path, { resumeRunId: latest.runId, deps: { ...options.deps, root } });
       result = { action: 'resumed', runId: state.runId, status: state.status };
     } else if (options.startIfIdle) {

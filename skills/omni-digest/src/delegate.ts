@@ -1,6 +1,6 @@
-/** Delegate to youtube-master only (X is now absorbed) */
+/** Delegate to youtube-master only (X is now absorbed). Use a process, not a cross-skill import: each skill can ship alone. */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { SKILL_DIR } from './env.js';
 import type { SummaryFormat, OutputTarget, FORMAT_TO_SUBSKILL } from './types.js';
@@ -17,10 +17,10 @@ export interface DelegateResult { markdown: string; fullOutput: string; savedPat
 
 export function delegateYouTube(url: string, format: SummaryFormat, targets: OutputTarget[], message?: string): DelegateResult {
   const script = resolve(SKILL_DIR, '..', 'youtube-master', 'scripts', 'main.ts');
-  const args = [`"${url}"`, `--format ${FMT[format]}`, `--target ${targetFor(targets)}`, '--print'];
-  if (message) args.push(`--message "${message}"`);
+  const args = [script, url, '--format', FMT[format], '--target', targetFor(targets), '--print'];
+  if (message) args.push('--message', message);
   console.log(`  [delegate] youtube-master: format=${FMT[format]}, target=${targetFor(targets)}`);
-  const output = execSync(`npx tsx "${script}" ${args.join(' ')}`, {
+  const output = execFileSync(process.execPath, args, {
     encoding: 'utf-8', timeout: 300_000, maxBuffer: 10 * 1024 * 1024,
     cwd: resolve(SKILL_DIR, '..', 'youtube-master'),
   });

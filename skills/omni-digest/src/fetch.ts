@@ -211,8 +211,8 @@ export function enrichWithOmniCrawl(query: string): string | null {
   }
   console.log(`  omni-crawl 컨텍스트 보강: "${query}"...`);
   try {
-    const output = execSync(
-      `npx tsx "${scriptPath}" "${query}" --no-save --print`,
+    const output = execFileSync(
+      process.execPath, [scriptPath, query, '--no-save', '--print'],
       { encoding: 'utf-8', timeout: 120_000, stdio: ['pipe', 'pipe', 'pipe'], cwd: join(__dirname, '..', '..', 'omni-crawl') },
     );
     const startMarker = '---BEGIN_OMNI_CRAWL_MARKDOWN---';

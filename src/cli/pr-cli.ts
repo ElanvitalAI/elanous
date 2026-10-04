@@ -53,6 +53,7 @@ import {
 } from './pr-granularity.js';
 import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
+import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -1635,8 +1636,21 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   return 0;
 }
 
-export function registerPrCommands(program: Command, deps: PrLandDeps = {}): void {
+export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queueDeps: L8ShadowQueueDeps = {}): void {
   const pr = program.command('pr').description('PR landing commands');
+  const queue = pr.command('queue').description('Shadow merge queue (never lands PRs)');
+  const queueAction = async (action: () => Promise<unknown>) => {
+    try {
+      (deps.out ?? liveOut).log(JSON.stringify(await action()));
+    } catch (error) {
+      (deps.out ?? liveOut).error(`✗ merge-queue: ${String(error)}`);
+      (deps.setExitCode ?? ((code: number) => { process.exitCode = code; }))(1);
+    }
+  };
+  queue.command('status').description('Show pending PRs and shadow verdicts').action(() => queueAction(() => statusL8ShadowQueue(process.cwd(), queueDeps)));
+  queue.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue').action((prNumber: string) => queueAction(() => enqueueL8ShadowQueue(process.cwd(), shadowPrNumber(prNumber), queueDeps)));
+  queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(() => runL8ShadowQueue(process.cwd(), queueDeps)));
+
   pr.command('land')
     .description('현재 브랜치 PR을 생성 또는 갱신해 ready 상태로 만들고 squash merge')
     .option('--base <branch>', 'PR base branch')

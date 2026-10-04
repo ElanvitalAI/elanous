@@ -3475,7 +3475,34 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 }
 
 
-export type StewardLoopMode = 'off' | 'shadow' | 'live';
+export type OrchestratorSeat = 'OP' | 'TC' | 'MK' | 'UX';
+export interface OrchestratorLoopConfig {
+  seatTrees: Partial<Record<OrchestratorSeat, string[]>>;
+  seatCaps: Record<OrchestratorSeat, number>;
+  trafficMode: 'shadow' | 'live';
+}
+
+export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
+  seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow',
+};
+
+export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfig {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const rawTrees = value.seatTrees && typeof value.seatTrees === 'object' && !Array.isArray(value.seatTrees)
+    ? value.seatTrees as Record<string, unknown> : {};
+  const rawCaps = value.seatCaps && typeof value.seatCaps === 'object' && !Array.isArray(value.seatCaps)
+    ? value.seatCaps as Record<string, unknown> : {};
+  const seatTrees: OrchestratorLoopConfig['seatTrees'] = {};
+  const seatCaps = { ...ORCHESTRATOR_DEFAULTS.seatCaps };
+  for (const seat of ['OP', 'TC', 'MK', 'UX'] as const) {
+    if (Array.isArray(rawTrees[seat])) seatTrees[seat] = rawTrees[seat].filter((path): path is string => typeof path === 'string' && isAbsolute(path));
+    const cap = rawCaps[seat];
+    if (typeof cap === 'number' && Number.isSafeInteger(cap) && cap >= 0) seatCaps[seat] = cap;
+  }
+  return { seatTrees, seatCaps, trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow' };
+}
+
+export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
 
 export type SeatLoopMode = 'off' | 'shadow' | 'on';
 
@@ -3516,25 +3543,51 @@ export function parseEventsConfig(input: unknown): EventsConfig {
   return { mode: events.mode === 'on' ? 'on' : 'shadow', routes, linearAssignees };
 }
 
+export type HqFenceRole = 'telegram-poller' | 'cron' | 'seat-loop' | 'release-run' | 'conatus' | 'git-push' | 'ledger-cli';
+export interface HqConfig {
+  /** ssh host that keeps the lease record — homes push to it; it never sshes back (default cloud-vm). */
+  arbiter?: string;
+  /** This host's identity in the lease (default os.hostname()). */
+  hostName?: string;
+  /** Standby host (default node-b) — the quorum's third member; promoted only by the arbiter. */
+  standby?: string;
+  /** Lease TTL in seconds (default 1500 = 25 min). */
+  ttlSeconds?: number;
+  /** Roles that may still run when this host is fenced only for lack of quorum (never when a newer generation exists). Absent = none. */
+  failOpenRoles?: HqFenceRole[];
+  /** Per-host nexus health URL over the tailnet (default https://<host>.<tailnetDomain>:31415/v1/health). */
+  healthUrls?: Record<string, string>;
+  /** MagicDNS suffix (default: read from `tailscale status --json`). */
+  tailnetDomain?: string;
+  /** `tailscale` binary (default tailscale). */
+  tailscaleBin?: string;
+  /** Highest lease generation this host ever saw (default ~/.elanous-hq/seen-generation · 600). */
+  seenGenerationFile?: string;
+  /** Per-probe timeout in seconds (default 5). */
+  probeTimeoutSeconds?: number;
+}
+
 export interface UserConfig {
   events?: EventsConfig;
   /** Explicit HTTPS destination for doctor diagnostics; absent means no upload. */
   diagnostics?: { uploadUrl?: string };
+  /** HQ lease (본부 임대 · 10-04 HQ-HB/HQ-FENCE): arbiter host over ssh, this host's name, per-role fail-open when the arbiter is unreachable (default: fail closed). */
+  hq?: HqConfig;
   /** Root CLI help audience; absent or invalid means owner. */
   cli?: { helpRole?: 'owner' | 'contributor' | 'general' };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
   coo?: { linearProject?: string };
-  decisions?: { linearProjection: { enabled: boolean } };
+  decisions?: { linearProjection: { enabled: boolean }; requireCrossCheck: boolean };
   /** Per-seat goal and Pod limits; missing or invalid limits use seat-budget defaults. */
   org?: { budget?: Record<string, { dailyGoals?: number; concurrentPods?: number }> };
   /** Steward and seat loops are parsed independently. An absent seat remains off. */
-  loops?: { steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
+  loops?: { orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number };
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> } };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number } };
+  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -3860,8 +3913,8 @@ function defaultConfig(): UserConfig {
   return {
     cli: { helpRole: 'owner' },
     coo: { linearProject: '외부 행정·큰 일 (COO)' },
-    decisions: { linearProjection: { enabled: false } },
-    loops: { steward: { mode: 'shadow' }, seat: { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' }, persona: { enabled: false } },
+    decisions: { linearProjection: { enabled: false }, requireCrossCheck: false },
+    loops: { orchestrator: parseOrchestratorLoopConfig(undefined), steward: { mode: 'shadow' }, seat: { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' }, persona: { enabled: false } },
     skillRouter: { ...SR_DEFAULTS },
     llm: { ...LLM_DEFAULTS },
     skills: skillsDefaults(),
@@ -4388,7 +4441,7 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
     }
   }
   return { steward: {
-    mode: s.mode === 'off' || s.mode === 'shadow' || s.mode === 'live' ? s.mode :
+    mode: s.mode === 'off' || s.mode === 'shadow' || s.mode === 'live' || s.mode === 'rescue' ? s.mode :
       s.launch === 'off' || s.launch === 'shadow' || s.launch === 'live' ? s.launch : 'shadow',
     // A valid legacy launch setting remains effective when mode is absent; explicit mode always wins.
     ...(s.launch === 'off' || s.launch === 'shadow' || s.launch === 'live' ? { launch: s.launch } : {}),
@@ -4405,6 +4458,25 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
 export function parseCliHelpRole(raw: unknown): NonNullable<UserConfig['cli']>['helpRole'] {
   const cli = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   return cli.helpRole === 'general' || cli.helpRole === 'contributor' ? cli.helpRole : 'owner';
+}
+
+const HQ_FENCE_ROLES: readonly HqFenceRole[] = ['telegram-poller', 'cron', 'seat-loop', 'release-run', 'conatus', 'git-push'];
+/** `hq` block (HQ-HB · HQ-FENCE): keep only well-typed fields — absent/invalid fields fall back to the hq module defaults. */
+export function parseHqConfig(raw: unknown): HqConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+  const out: HqConfig = {};
+  for (const key of ['arbiter', 'hostName', 'standby', 'tailnetDomain', 'tailscaleBin', 'seenGenerationFile'] as const) {
+    const v = str(r[key]); if (v) out[key] = v;
+  }
+  if (typeof r.ttlSeconds === 'number' && Number.isFinite(r.ttlSeconds) && r.ttlSeconds > 0) out.ttlSeconds = r.ttlSeconds;
+  if (typeof r.probeTimeoutSeconds === 'number' && Number.isFinite(r.probeTimeoutSeconds) && r.probeTimeoutSeconds > 0) out.probeTimeoutSeconds = r.probeTimeoutSeconds;
+  if (Array.isArray(r.failOpenRoles)) out.failOpenRoles = r.failOpenRoles.filter((v): v is HqFenceRole => HQ_FENCE_ROLES.includes(v as HqFenceRole));
+  if (r.healthUrls && typeof r.healthUrls === 'object' && !Array.isArray(r.healthUrls)) {
+    out.healthUrls = Object.fromEntries(Object.entries(r.healthUrls as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string'));
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 export function buildUserConfig(path: string = defaultPath()): UserConfig {
@@ -4532,6 +4604,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
       ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
       ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),
+      memory: { adviseDefaults: Boolean(legacyPod.memory && typeof legacyPod.memory === 'object' && !Array.isArray(legacyPod.memory)
+        && (legacyPod.memory as Record<string, unknown>).adviseDefaults === true) },
       lease: { perAccount: (() => {
         const lease = legacyPod.lease && typeof legacyPod.lease === 'object' && !Array.isArray(legacyPod.lease)
           ? (legacyPod.lease as Record<string, unknown>) : {};
@@ -4542,6 +4616,12 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     harness: {
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
       difficultyPlacement: harness.difficultyPlacement === true,
+      queue: { seatCap: Object.fromEntries(Object.entries(
+        harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
+          && (harness.queue as Record<string, unknown>).seatCap && typeof (harness.queue as Record<string, unknown>).seatCap === 'object'
+          && !Array.isArray((harness.queue as Record<string, unknown>).seatCap)
+          ? (harness.queue as { seatCap: Record<string, unknown> }).seatCap : {},
+      ).filter(([seat, cap]) => /^(OP|TC|MK|UX)$/.test(seat) && typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0)) },
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
@@ -5186,11 +5266,13 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       && typeof (rawObj.hitl as Record<string, unknown>).executionDeadlineMinutes === 'number'
       ? { hitl: { executionDeadlineMinutes: (rawObj.hitl as { executionDeadlineMinutes: number }).executionDeadlineMinutes } }
       : {}),
+    ...(parseHqConfig(rawObj.hq) ? { hq: parseHqConfig(rawObj.hq)! } : {}),
     cli: { helpRole: parseCliHelpRole(rawObj.cli) },
     coo: { linearProject: typeof (rawObj.coo as { linearProject?: unknown } | undefined)?.linearProject === 'string' && (rawObj.coo as { linearProject: string }).linearProject.trim()
       ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },
-    decisions: { linearProjection: { enabled: ((rawObj.decisions as { linearProjection?: { enabled?: unknown } } | undefined)?.linearProjection?.enabled === true) } },
-    loops: { ...(stewardLoops ?? {}), seat: parseSeatLoopsConfig(rawObj.loops),
+    decisions: { linearProjection: { enabled: ((rawObj.decisions as { linearProjection?: { enabled?: unknown } } | undefined)?.linearProjection?.enabled === true) },
+      requireCrossCheck: (rawObj.decisions as { requireCrossCheck?: unknown } | undefined)?.requireCrossCheck === true },
+    loops: { ...(stewardLoops ?? {}), orchestrator: parseOrchestratorLoopConfig((rawObj.loops as { orchestrator?: unknown } | undefined)?.orchestrator), seat: parseSeatLoopsConfig(rawObj.loops),
       persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true } },
     events: parseEventsConfig(rawObj.events),
     // M1-1: sparse — undefined when the user hasn't set anything, so
@@ -5790,11 +5872,13 @@ export function saveUserConfig(
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
       substrate: cfg.harness?.substrate,
       podPool: cfg.harness?.podPool,
+      queue: cfg.harness?.queue ?? rawHarness.queue,
     }),
     ...rawRest,
     ...(cfg.loops ? { loops: {
       ...rawLoops,
       ...(cfg.loops.steward ? { steward: { ...rawSteward, mode: cfg.loops.steward.mode ?? cfg.loops.steward.launch ?? 'shadow' } } : {}),
+      ...(cfg.loops.orchestrator ? { orchestrator: cfg.loops.orchestrator } : {}),
       ...(cfg.loops.seat ? { seat: {
         mode: cfg.loops.seat.mode,
         questions: cfg.loops.seat.questions ?? 'shadow',

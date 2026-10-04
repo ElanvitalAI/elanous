@@ -1,6 +1,12 @@
 import { test, expect } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { resetUserConfig } from '../user-config.js';
+import { renderCardText } from '../decisions/decision-cards.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
+import { fileLeaseStore, serializeLease } from '../hq/lease.js';
+import type { HqDeps } from '../hq/hq.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -8,6 +14,150 @@ import { createPendingQuestion, writePendingQuestion } from '../ask-user-questio
 import { registerDecisionsCommands } from './decisions-cli.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
+
+test('CLI cross-check, shadow warning, strict config and alternative validation', () => {
+  const stateDir = root();
+  const lines: string[] = [];
+  const errors: string[] = [];
+  const oldError = console.error;
+  console.error = (line: string) => { errors.push(line); };
+  setElanousConfigDir(stateDir);
+  const program = new Command();
+  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  expect(program.commands.find(command => command.name() === 'decisions')!.commands.find(command => command.name() === 'raise')!
+    .options.find(option => option.long === '--no-xcheck')!.negate).toBe(false);
+  const flags = ['raise', '--agent', 'MK', '--title', '피치', '--category', 'scope', '--s', '상황', '--c', '문제', '--q', '질문', '--a', '제안',
+    '--option', 'a=승인:배포', '--option', 'b=보류:일정 지연', '--recommend', 'a', '--why', '근거', '--json'];
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]; };
+  try {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: false } }));
+    resetUserConfig();
+    const checked = JSON.parse(run(...flags, '--xcheck', 'TC:키 경로 영향 없음', '--alternative', 'b', '--dissent', 'UX: 화면 문구 미정')!);
+    expect(checked).toMatchObject({ alternative: 'b', dissent: 'UX: 화면 문구 미정', crossCheck: [{ seat: 'TC', note: '키 경로 영향 없음' }] });
+    expect(checked.crossCheck[0].at).toMatch(/^\d{4}-\d\d-\d\dT/);
+    expect(errors).toEqual([]);
+    expect(renderCardText(new DecisionLedger({ stateDir }).show(checked.id))).toContain('교차 확인: TC ✓ 키 경로 영향 없음');
+    const missing = JSON.parse(run(...flags)!);
+    expect(missing.crossCheckSkipped).toBe('missing');
+    expect(errors).toEqual(['교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유']);
+    expect(renderCardText(new DecisionLedger({ stateDir }).show(missing.id))).toContain('교차 확인 없음(missing)');
+    const explicit = JSON.parse(run(...flags, '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②')!);
+    expect(explicit.crossCheckSkipped).toContain('자리 루프');
+    expect(errors).toHaveLength(1);
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: true } }));
+    resetUserConfig();
+    expect(() => run(...flags)).toThrow('교차 확인 없음');
+    expect(() => run(...flags, '--alternative', 'a', '--xcheck', 'TC:확인')).toThrow('alternative must differ');
+    expect(() => run(...flags, '--xcheck', 'TC:확인', '--no-xcheck', '생략')).toThrow('choose --xcheck or --no-xcheck');
+    const multiple = JSON.parse(run(...flags, '--xcheck', 'TC:키 확인', '--xcheck', 'UX:문구 확인')!);
+    expect(multiple.crossCheck.map((check: { seat: string }) => check.seat)).toEqual(['TC', 'UX']);
+    const strictChild = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...flags],
+      { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+    expect(strictChild.status).toBe(1);
+    expect(strictChild.stderr).toContain('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+    expect(() => run(...flags, '--alternative', 'z', '--xcheck', 'TC:확인')).toThrow('alternative option not found');
+    expect(JSON.parse(run(...flags, '--no-xcheck', '근거 부족')!).crossCheckSkipped).toBe('근거 부족');
+    expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n')).toHaveLength(5);
+  } finally { console.error = oldError; resetElanousConfigDir(); resetUserConfig(); rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('actual CLI parses checked, explicitly skipped, absent and conflicting cross-check flags', () => {
+  const stateDir = root();
+  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'MK',
+    '--title', 'Pitch', '--category', 'scope', '--s', 'Situation', '--c', 'Complication', '--option', 'a=Go:Proceed',
+    '--option', 'b=Wait:Delay', '--recommend', 'a', '--why', 'Ready', '--json', ...args],
+  { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+  const warning = '교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유';
+  try {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: false } }));
+    const checked = run('--xcheck', 'TC:키 경로 영향 없음', '--alternative', 'b', '--dissent', 'UX: 화면 문구 미정');
+    expect(checked.status, checked.stderr).toBe(0);
+    expect(JSON.parse(checked.stdout)).toMatchObject({ crossCheck: [{ seat: 'TC', note: '키 경로 영향 없음' }], alternative: 'b', dissent: 'UX: 화면 문구 미정' });
+    expect(checked.stderr).not.toContain(warning);
+    const skipped = run('--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②');
+    expect(skipped.status, skipped.stderr).toBe(0);
+    expect(JSON.parse(skipped.stdout).crossCheckSkipped).toBe('자리 루프 · 이웃 교환은 DEC-XCHECK ②');
+    expect(skipped.stderr).not.toContain(warning);
+    const absent = run();
+    expect(absent.status, absent.stderr).toBe(0);
+    expect(JSON.parse(absent.stdout).crossCheckSkipped).toBe('missing');
+    expect(absent.stderr.split('\n').filter(line => line === warning)).toHaveLength(1);
+    const conflicting = run('--xcheck', 'TC:확인', '--no-xcheck', '생략');
+    expect(conflicting.status).toBe(1);
+    expect(conflicting.stderr).toContain('choose --xcheck or --no-xcheck');
+    const withoutReason = run('--no-xcheck');
+    expect(withoutReason.status).toBe(1);
+    expect(withoutReason.stderr).toContain("option '--no-xcheck <이유>' argument missing");
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: true } }));
+    const strict = run();
+    expect(strict.status).toBe(1);
+    expect(strict.stderr).toContain(warning);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+}, 180_000);
+
+test('decisions CLI fences raise/decide at generation, permits observed override and pre-lease bootstrap without altering reads', () => {
+  const stateDir = root();
+  const store = fileLeaseStore(join(stateDir, 'lease.json'), () => 100);
+  const logs: string[] = [];
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(stateDir, 'hq-local.json'), seenPath: join(stateDir, 'seen-generation'), now: () => 100,
+    log: ((_category: string, event: string) => { logs.push(event); }) as HqDeps['log'] };
+  const lines: string[] = [];
+  const errors: string[] = [];
+  const prior = process.exitCode;
+  const oldError = console.error;
+  console.error = (line: string) => { errors.push(line); };
+  const cli = new Command();
+  registerDecisionsCommands(cli, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot: join(stateDir, 'missing') }, { log: (s) => lines.push(s) }, hq);
+  const run = (...args: string[]) => { lines.length = 0; cli.parse(['decisions', ...args], { from: 'user' }); return lines[0]; };
+  const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
+  try {
+    process.exitCode = 0;
+    const entry = JSON.parse(run(...raise)!);
+    const path = join(stateDir, 'decisions', 'decisions.jsonl');
+    const before = readFileSync(path, 'utf8');
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    expect(run(...raise)).toBeUndefined();
+    expect(process.exitCode).toBe(4);
+    expect(errors.at(-1)).toContain('본부는 node-b gen 2 — 거기서 쓰거나 --hq-override(관측)');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(JSON.parse(run('show', entry.id, '--json')!).status).toBe('open');
+    process.exitCode = 0;
+    expect(run('decide', entry.id, 'a')).toBeUndefined();
+    expect(process.exitCode).toBe(4);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    process.exitCode = 0;
+    expect(JSON.parse(run('decide', entry.id, 'a', '--hq-override', '--json')!).choice).toBe('a');
+    expect(process.exitCode).toBe(0);
+    expect(logs).toContain('cli-override');
+    expect(errors.some(line => line.includes('hq override: decisions decide'))).toBe(true);
+    process.exitCode = 0;
+    expect(JSON.parse(run(...raise, '--hq-override')!).status).toBe('open');
+    expect(process.exitCode).toBe(0);
+    expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
+  } finally { process.exitCode = prior ?? 0; console.error = oldError; rmSync(stateDir, { recursive: true, force: true }); }
+});
+test('actual decisions CLI refuses a non-holder with exit 4 and allows the observed override', () => {
+  const stateDir = root();
+  const store = fileLeaseStore(join(stateDir, 'hq', 'lease.json'), () => 100);
+  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...args],
+    { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+  const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
+    '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
+  try {
+    expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    const blocked = run(...raise);
+    expect(blocked.status).toBe(4);
+    expect(blocked.stderr).toContain('본부는 other-host gen 2 — 거기서 쓰거나 --hq-override(관측)');
+    const read = run('list', '--json');
+    expect(read.status).toBe(0);
+    expect(JSON.parse(read.stdout)).toEqual([]);
+    const override = run(...raise, '--hq-override');
+    expect(override.status, override.stderr).toBe(0);
+    expect(override.stderr).toContain('hq override: decisions raise');
+    expect(JSON.parse(run('show', JSON.parse(override.stdout).id, '--json').stdout).status).toBe('open');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+}, 180_000);
+
 test('CLI raises, filters, shows and records human/AUTO decisions; validation errors do not append', () => {
   const stateDir = root();
   const lines: string[] = [];

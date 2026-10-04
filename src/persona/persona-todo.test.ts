@@ -24,6 +24,7 @@ describe('persona todo JSONL', () => {
   test('a missing file is empty, and no open todo yields null', () => {
     expect(readPersonaTodos(dir, 'missing')).toEqual({ todos: [], errors: [] });
     expect(nextPersonaTodo([done])).toBeNull();
+    expect(nextPersonaTodo([{ ...newest, dueAt: '2026-10-05T02:00:00+09:00' }, { ...oldest, dueAt: '2026-10-04T18:00:00Z' }])?.id).toBe('new');
     writePersonaTodos(dir, 'empty', []);
     expect(readPersonaTodos(dir, 'empty')).toEqual({ todos: [], errors: [] });
   });
@@ -36,6 +37,19 @@ describe('persona todo JSONL', () => {
     expect(result.errors.map(error => error.line)).toEqual([2, 3]);
     expect(result.errors.every(error => error.message.length > 0)).toBe(true);
     expect(nextPersonaTodo(result.todos)).toEqual(oldest);
+  });
+
+  test('three fake lists choose priority before deadline, then earliest deadline, or no work', () => {
+    const urgent = { ...newest, priority: 3, dueAt: '2026-10-10T00:00:00Z' };
+    const soon = { ...oldest, priority: 3, dueAt: '2026-10-04T00:00:00Z' };
+    const lower = { ...done, status: 'open' as const, priority: 1, dueAt: '2026-10-01T00:00:00Z' };
+    expect(nextPersonaTodo([lower, urgent])).toEqual(urgent);
+    expect(nextPersonaTodo([urgent, soon, lower])).toEqual(soon);
+    expect(nextPersonaTodo([done])).toBeNull();
+    writePersonaTodos(dir, 'alice', [lower, urgent, soon]);
+    expect(nextPersonaTodo(readPersonaTodos(dir, 'alice').todos)).toEqual(soon);
+    expect(() => writePersonaTodos(dir, 'alice', [{ ...soon, priority: -1 }])).toThrow('Invalid todo record');
+    expect(() => writePersonaTodos(dir, 'alice', [{ ...soon, dueAt: 'invalid' }])).toThrow('Invalid todo record');
   });
 
   test('rejects path traversal and invalid records before writing', () => {

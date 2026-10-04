@@ -1,0 +1,20 @@
+name: Small product
+members:
+  - persona: personas/pm.yaml
+    title: PM
+    checklistTemplate:
+      - Define the user problem and scope.
+      - Confirm the acceptance criteria.
+  - persona: personas/backend.yaml
+    title: Backend
+    checklistTemplate:
+      - Review API and data changes.
+      - Verify error handling.
+  - persona: personas/qa.yaml
+    title: QA
+    checklistTemplate:
+      - Exercise acceptance criteria.
+      - Record regression results.
+handoffs:
+  - {from: PM, to: Backend}
+  - {from: Backend, to: QA}

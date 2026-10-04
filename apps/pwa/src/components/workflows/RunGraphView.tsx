@@ -15,6 +15,9 @@ import {
   readRunGraphYaml,
   removeRunGraphEdge,
   removeRunGraphNode,
+  runGraphFailRouteBlocked,
+  runGraphFailTarget,
+  setRunGraphFailTarget,
   setRunGraphNodeKind,
   setRunGraphNodeRecipe,
   writeRunGraphYaml,
@@ -112,6 +115,11 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palet
   const currentYaml = !editable ? null : draftId === selected ? yaml : raw.data?.id === selected && raw.data.source === 'mine' && raw.data.editable ? raw.data.yaml : null;
   const flow = useMemo(() => detail.data && detail.data.id === selected ? runGraphToFlow(detail.data) : null, [detail.data, selected]);
   const nodes = useMemo(() => flow?.nodes.map((node) => ({ ...node, type: 'run' })) ?? [], [flow]);
+  const draftGraph = useMemo(() => currentYaml === null ? null : readRunGraphYaml(currentYaml), [currentYaml]);
+  const formNodeId = draftGraph?.toJS()?.nodes?.some((node: { node_id?: string }) => node.node_id === nodeId) ? nodeId : null;
+  const failTarget = formNodeId && draftGraph ? runGraphFailTarget(draftGraph, formNodeId) ?? '' : '';
+  const failBlocked = formNodeId && draftGraph ? runGraphFailRouteBlocked(draftGraph, formNodeId) : null;
+  const targetIds: string[] = draftGraph?.toJS()?.nodes?.map((node: { node_id?: string }) => node.node_id).filter((id: unknown): id is string => typeof id === 'string' && id !== formNodeId) ?? [];
 
   function edit(next: (text: string) => string) {
     if (!editable || !selected || currentYaml === null || save.isPending) return;
@@ -242,6 +250,17 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palet
                 setRunGraphNodeRecipe(doc, nodeId, recipe);
                 return writeRunGraphYaml(doc);
               })}>kind/recipe</button>
+              {formNodeId && <label className="text-[10px] text-text-tertiary">실패 시 다음 노드
+                <select aria-label="실패 시 다음 노드" value={failTarget} disabled={failBlocked !== null} title={failBlocked ?? undefined} onChange={(event) => edit((text) => {
+                  const doc = readRunGraphYaml(text);
+                  setRunGraphFailTarget(doc, formNodeId, event.target.value || null);
+                  return writeRunGraphYaml(doc);
+                })} className="ml-1 text-xs">
+                  <option value="">선택 안 함</option>
+                  {targetIds.map((id) => <option key={id} value={id}>{id}</option>)}
+                </select>
+                {failBlocked && <span role="note" className="ml-1">{failBlocked}</span>}
+              </label>}
               <input aria-label="간선 from" value={edgeFrom} onChange={(event) => setEdgeFrom(event.target.value)} placeholder="from" className="w-20 rounded border border-border px-1 text-xs" />
               <input aria-label="간선 결과" value={edgeOutcome} onChange={(event) => setEdgeOutcome(event.target.value)} placeholder="결과" className="w-16 rounded border border-border px-1 text-xs" />
               <input aria-label="간선 to" value={edgeTo} onChange={(event) => setEdgeTo(event.target.value)} placeholder="to" className="w-20 rounded border border-border px-1 text-xs" />
@@ -270,6 +289,7 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palet
         {detail.isLoading && <p className="p-4 text-xs text-text-tertiary">불러오는 중…</p>}
         {flow && (
           <ReactFlow key={selected ?? ''} nodes={nodes}
+            onNodeClick={editable ? (_event, selectedNode) => setNodeId(selectedNode.id) : undefined}
             edges={flow.edges} nodeTypes={NODE_TYPES} fitView
             nodesDraggable={false} nodesConnectable={false} elementsSelectable={editable}
             edgesReconnectable={false} deleteKeyCode={null} nodesFocusable={editable} edgesFocusable={false}

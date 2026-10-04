@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { graphTick } from './graph-tick.js';
 import { decideGraphApproval, latestGraphRun, runGraph } from './runner.js';
+import type { DecisionEntry } from '../decisions/decision-ledger.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -76,6 +77,30 @@ test('an approved run resumes, preserves run id and never replays the first comm
   expect(await graphTick(graph, { deps })).toEqual({ action: 'idle' });
   expect(calls).toEqual(['printf a', 'printf b']);
   expect(notified).toBe(3);
+});
+
+test('a tick resumes a parked growth after the decision card is answered', async () => {
+  const { graph, root } = fixture();
+  writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8').replace("  - { from: a, to: gate }", "  - { from: a, on: outcome, map: { ok: gate }, fallback: [{ node: gate, requires: [] }] }")}`);
+  writeFileSync(join(root, 'recipes.yaml'), `${readFileSync(join(root, 'recipes.yaml'), 'utf8')}grow:\n  command: 'printf grow'\n`);
+  const entries: DecisionEntry[] = [];
+  const ledger = { raiseOnce: (value: Record<string, unknown>) => {
+    const entry = { ...value, id: 'D-tick', status: 'open' } as DecisionEntry;
+    entries.push(entry);
+    return entry;
+  } };
+  const deps = { root, growthDecision: { ledger, list: () => entries },
+    runBash: async (body: string) => ({ stdout: body === 'printf a' ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }),
+    growthProposer: () => ({ node: { nodeId: 'grown', kind: 'agent', recipe: 'cmd:grow', maxVisits: 1,
+      contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'gate', reason: 'grow before approval' }) };
+  const first = await graphTick(graph, { startIfIdle: true, deps });
+  expect(first).toMatchObject({ action: 'started', status: 'awaiting-approval' });
+  expect(entries).toHaveLength(1);
+  expect(await graphTick(graph, { deps })).toMatchObject({ action: 'waiting', runId: first.runId });
+  entries[0] = { ...entries[0]!, status: 'decided', choice: 'a', decidedBy: { kind: 'human' } };
+  expect(await graphTick(graph, { deps })).toMatchObject({ action: 'resumed', runId: first.runId });
+  expect(latestGraphRun('tick-test', root)?.path.slice(0, 2)).toEqual(['a', 'grown']);
+  expect(entries).toHaveLength(1);
 });
 
 test('after a terminal run, a new run starts only when explicitly requested', async () => {

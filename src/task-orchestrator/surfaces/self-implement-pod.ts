@@ -58,6 +58,9 @@ import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
 import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
+import { goalTypeOf } from '../../../scripts/measure-pod-memory-by-goal.js';
+import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
+import { getUserConfig } from '../../user-config.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
@@ -132,6 +135,10 @@ export interface PodSpawnOptions {
   env?: NodeJS.ProcessEnv;
   /** Detail switch file (test injection; defaults to the host's local/production selection). */
   liveDetailFile?: string;
+  /** Test seam for the opt-in user configuration; otherwise read the active user config. */
+  adviseDefaults?: boolean;
+  /** Test seam for the read-only measured advice. */
+  memoryAdvice?: () => PodMemoryAdvice;
 }
 
 export function defaultKubectl(args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string } {
@@ -411,7 +418,7 @@ export const POD_MEMORY_HIGH_DEFAULT = '32Gi';
 export const POD_MEMORY_LITE_DEFAULT = '2Gi';
 export const POD_MEMORY_TIERS = ['lite', 'standard', 'high'] as const;
 export type PodMemoryTier = (typeof POD_MEMORY_TIERS)[number];
-export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto';
+export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto' | 'advise';
 const PWA_PATH = /(?:^|[\s`'"(,·])apps\/pwa\//m;
 const GOAL_LINE = /^[ \t]*(?:Pod 메모리|pod-memory)[ \t]*:[ \t]*(lite|standard|high)[ \t]*\r?$/im;
 
@@ -453,14 +460,21 @@ function memoryGi(v: string): number | null {
   return m[2] === 'Gi' ? Number(m[1]) : Number(m[1]) / 1024;
 }
 
-export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>, parentGoal?: string): { limit: string; tier: PodMemoryTier; source: PodMemorySource } {
+export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>, parentGoal?: string, advice?: PodMemoryAdvice): { limit: string; tier: PodMemoryTier; source: PodMemorySource } {
   const option = parsePodMemoryTier(env.ELANOUS_POD_MEMORY_TIER);
   const line = parsePodMemoryTier(GOAL_LINE.exec(feature)?.[1]);
-  const parentLine = !option && !line && !goalTouchesPwa(feature) ? parsePodMemoryTier(GOAL_LINE.exec(parentGoal ?? '')?.[1]) : null;
+  const parentLine = !option && !line ? parsePodMemoryTier(GOAL_LINE.exec(parentGoal ?? '')?.[1]) : null;
+  const goalType = advice && !option && !line && !parentLine
+    ? (broadPodTestWarning(feature) ? 'test' : goalTypeOf(feature))
+      ?? (parentGoal ? (broadPodTestWarning(parentGoal) ? 'test' : goalTypeOf(parentGoal)) : null)
+    : null;
+  const recommendation = advice?.byGoalType.find((entry) => entry.goalType === goalType && entry.evidence.runs > 0)?.recommended;
   const [tier, source]: [PodMemoryTier, PodMemorySource] = option ? [option, 'option']
     : line ? [line, 'goal-line']
+    // 조각 자신의 PWA 경로가 부모 줄·실측 권고보다 먼저다 — 부모 «standard» 가 PWA 조각을 16Gi 로 내리면 OOM(POD7 · #23569 순서 회귀)
     : goalTouchesPwa(feature) ? ['high', 'pwa-auto']
     : parentLine ? [parentLine, 'parent-goal-line']
+    : recommendation ? [recommendation, 'advise']
     : parentGoal && goalTouchesPwa(parentGoal) ? ['high', 'parent-pwa-auto']
     : ['standard', 'default'];
   if (tier === 'lite') return { limit: env.ELANOUS_POD_MEMORY_LITE?.trim() || POD_MEMORY_LITE_DEFAULT, tier, source };
@@ -640,7 +654,6 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   const hostSupervised = options.hostSupervised ?? true;
   return (input) => {
     const name = podJobName(input.spaceId);
-    const featureMemory = podMemoryLimitFor(input.feature, env);
     let parentGoal: string | undefined;
     let parentGoalUnreadable = false;
     let inheritedFrom: string | undefined;
@@ -658,7 +671,14 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         inheritedFrom = withinRoot;
       } catch { parentGoalUnreadable = true; }
     }
-    const { limit: selectedMemoryLimit, tier: memoryTier, source: memorySource } = parentGoal === undefined ? featureMemory : podMemoryLimitFor(input.feature, env, parentGoal);
+    let advice: PodMemoryAdvice | undefined;
+    const explicitMemory = Boolean(parsePodMemoryTier(env.ELANOUS_POD_MEMORY_TIER) || GOAL_LINE.test(input.feature) || GOAL_LINE.test(parentGoal ?? ''));
+    const useAdvice = options.adviseDefaults ?? getUserConfig().pod?.memory?.adviseDefaults === true;
+    if (useAdvice && !explicitMemory) {
+      try { advice = (options.memoryAdvice ?? readPodMemoryAdvice)(); }
+      catch (error) { debug.log('self-implement.pod', 'memory-advice-unavailable', { spaceId: input.spaceId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+    }
+    const { limit: selectedMemoryLimit, tier: memoryTier, source: memorySource } = podMemoryLimitFor(input.feature, env, parentGoal, advice);
     for (const [where, text] of [['feature', input.feature], ['parent-goal', parentGoal]] as const) {
       if (text && text.split(/\r?\n/u).some((line) => /Pod 메모리/u.test(line) && !GOAL_LINE.test(line))) {
         const reason = '한 줄 단독 `Pod 메모리: high|standard` 형식이 아님';
@@ -716,7 +736,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       if (recoveryError) return { exitCode: 1, output: '', error: { code: 'pod-oom-recovery', message: recoveryError } };
       // Each Job attempt has its own host lease; releasing the first after OOM lets the retry
       // compete with other processes for the newly measured capacity before applying another Job.
-      let releaseAdmission: ((() => void) & { applied?: () => void }) | undefined;
+      let releaseAdmission: ((() => void) & { applied?: (job: string, context: string, namespace: string) => void; observed?: () => void }) | undefined;
       try {
       // Every attempt, including an OOM retry, must acquire a pool slot before applying a Job.
       const acquireSlot = async (): Promise<PodPoolMember | null> => {
@@ -1067,6 +1087,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
+        releaseAdmission?.applied?.(name, context, namespace);
         if (options.source?.kind === 'bundle') {
           const podName = await waitForRunningPod(kubectl, namespace, name, sleep);
           if (!podName) {
@@ -1074,6 +1095,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             cleanupSecret();
             return { exitCode: 1, output: '', error: { code: 'pod-source', message: `Pod for ${name} did not become Running` } };
           }
+          releaseAdmission?.observed?.();
+          if (releaseAdmission) delete releaseAdmission.observed;
           const copied = kubectl(['cp', options.source.bundlePath, `${podName}:/tmp/source.bundle`, '-c', 'child', '-n', namespace]);
           if (copied.status !== 0) {
             debug.log('self-implement.pod', 'source-mismatch', { job: name, kind: 'bundle', headCommit: options.source.headCommit });
@@ -1106,7 +1129,6 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         writePodFragment({ spaceId: input.spaceId, context, namespace, job: name, inboxDir: POD_CONTROL_INBOX_DIR, ...(liveChildRunId === normalizeRunId(liveChildRunId) ? { runId: liveChildRunId } : {}), ...(parentRunId && normalizeRunId(parentRunId) === parentRunId ? { parentRunId } : {}) }, env);
         recorded = true;
-        releaseAdmission?.applied?.();
         debug.log('self-implement.pod', 'job-applied', { job: name, namespace, ...(member ? { context: member.context } : {}), image: jobImage, spaceId: input.spaceId, passEnv, extraArgs: options.extraArgs ?? [], ...(options.armEnv?.ELANOUS_ARM_ID ? { armId: options.armEnv.ELANOUS_ARM_ID } : {}) });
         let state: 'complete' | 'failed' | 'aborted' = 'failed';
         let failedReason = '';
@@ -1122,8 +1144,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           const g = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
           const types = g.stdout;
-          if (/Complete|SuccessCriteriaMet/.test(types)) { state = 'complete'; break; }
+          if (/Complete|SuccessCriteriaMet/.test(types)) { releaseAdmission?.observed?.(); state = 'complete'; break; }
           if (/Failed|FailureTarget/.test(types)) {
+            releaseAdmission?.observed?.();
             state = 'failed';
             const reason = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[?(@.type=="Failed")].reason}']);
             failedReason = reason.status === 0 ? reason.stdout.trim() : '';
@@ -1142,6 +1165,13 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             } catch { /* Pod 가 사라졌거나 조회 불가 — 종료 사유는 미상. */ }
             debug.log('self-implement.pod', 'container-terminated', { job: name, container: 'child', reason: containerReason, exitCode: containerExitCode, jobReason: failedReason || null, memoryLimit });
             break;
+          }
+          if (releaseAdmission?.observed) {
+            const podPhase = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'jsonpath={.items[*].status.phase}']);
+            if (podPhase.status === 0 && /\b(?:Running|Succeeded|Failed)\b/.test(podPhase.stdout)) {
+              releaseAdmission.observed();
+              delete releaseAdmission.observed;
+            }
           }
           if (ghTokenExpiresAt !== null && ghTokenExpiresAt - now() <= 10 * 60_000) {
             try {

@@ -13,7 +13,7 @@ import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { writePersonaTodos } from '../persona/persona-todo.js';
-import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, type SeatDeps } from './seat-loop.js';
+import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, type SeatDeps } from './seat-loop.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -75,6 +75,33 @@ test('persona opt-in shadows two independent next todos after an unchanged TC se
     }
     expect(readFileSync(join(f.root, 'personas', 'alice.todo.jsonl'), 'utf8')).toContain('"status":"open"');
   } finally { f.close(); }
+});
+
+test('named persona loop picks its own highest priority earliest due todo without invoking seat execution', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const dir = join(f.root, 'personas');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'alice.yaml'), 'personaId: alice\ndisplayName: Alice\ntodo: alice.todo.jsonl\n');
+    writeFileSync(join(dir, 'bob.yaml'), 'personaId: bob\ndisplayName: Bob\n');
+    writePersonaTodos(dir, 'alice', [
+      { id: 'low', title: 'Low', status: 'open', priority: 1, dueAt: '2026-10-01T00:00:00Z', createdAt: now.toISOString() },
+      { id: 'later', title: 'Later', status: 'open', priority: 2, dueAt: '2026-10-10T00:00:00Z', createdAt: now.toISOString() },
+      { id: 'chosen', title: 'Chosen', status: 'open', priority: 2, dueAt: '2026-10-04T00:00:00Z', createdAt: now.toISOString() },
+    ]);
+    let calls = 0;
+    const deps: SeatDeps = { ...f.deps, run: async () => { calls++; throw Error('shadow executed'); } };
+    const chosen = await runPersonaLoopOnce('Alice', deps);
+    expect(chosen).toMatchObject({ personaId: 'alice', status: 'shadow', todo: { id: 'chosen' }, action: 'harness', what: 'chosen Chosen' });
+    expect(readFileSync(personaShadowLedgerPath('alice', f.root, now), 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(existsSync(personaShadowLedgerPath('bob', f.root, now))).toBe(false);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'persona.loop' && event === 'picked'
+      && (data as { todoId?: string }).todoId === 'chosen')).toBe(true);
+    expect((await runPersonaLoopOnce('bob', deps)).status).toBe('skipped-empty');
+    expect(JSON.parse(readFileSync(personaShadowLedgerPath('bob', f.root, now), 'utf8'))).toMatchObject({ status: 'skipped-empty', todo: null });
+    expect(calls).toBe(0);
+  } finally { spy.mockRestore(); f.close(); }
 });
 
 test('persona disabled by default or explicitly false writes zero lines and preserves the seat result', async () => {
@@ -658,19 +685,31 @@ test('unreadable published-version ledger keeps the former version order and war
   } finally { spy.mockRestore(); f.close(); }
 });
 
-test('only versions whose cut is still ahead are open — a cut version is skipped', async () => {
+test('only versions whose cut is still ahead are open — closed versions share one log line', async () => {
   const f = fixture();
-  const skipped: unknown[] = [];
-  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
-    if (category === 'seat.loop' && event === 'skip-closed-version') skipped.push(data);
-  });
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
   try {
     checklist(f, '0.2.10', [{ id: 'K10', owner: 'TC', title: 'cut already', status: 'yellow' }]);
     checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'cut tomorrow', status: 'red' }]);
     const schedules = () => [{ version: '0.2.10', cutAt: '2026-10-02T22:00:00Z' }, { version: '0.2.11', cutAt: '2026-10-03T23:00:00Z' }];
-    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.10', '0.2.11', '0.2.12'], schedules });
+    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.12', '0.2.11', '0.2.10'], schedules });
     expect(inputs.checklist.map((item) => item.id)).toEqual(['K11']);
-    expect(skipped).toEqual([{ seat: 'TC', version: '0.2.10' }, { seat: 'TC', version: '0.2.12' }]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-versions'))
+      .toEqual([['seat.loop', 'skip-closed-versions', { seat: 'TC', count: 2, newest: '0.2.12', oldest: '0.2.10' }]]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-version')).toHaveLength(0);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('no closed versions write no skip-closed-versions log line', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'open', status: 'red' }]);
+    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.11'],
+      schedules: () => [{ version: '0.2.11', cutAt: '2026-10-03T23:00:00Z' }] });
+    expect(inputs.checklist.map((item) => item.id)).toEqual(['K11']);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-versions')).toHaveLength(0);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-version')).toHaveLength(0);
   } finally { spy.mockRestore(); f.close(); }
 });
 
@@ -678,12 +717,32 @@ test('unreadable schedules pick no checklist cell (fail closed) and warn once', 
   const f = fixture();
   const warnings: string[] = [];
   const spy = spyOn(console, 'warn').mockImplementation((message) => { warnings.push(String(message)); });
+  const logSpy = spyOn(debug, 'log').mockImplementation(() => {});
   try {
     checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'current', status: 'red' }]);
     const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.11'], schedules: () => { throw new Error('ledger locked'); } });
     expect(inputs.checklist).toEqual([]);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('cannot read release schedules');
+    expect(logSpy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'schedule-unreadable'))
+      .toEqual([['seat.loop', 'schedule-unreadable', { seat: 'TC', error: 'Error: ledger locked' }]]);
+    expect(logSpy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-versions')).toHaveLength(0);
+  } finally { logSpy.mockRestore(); spy.mockRestore(); f.close(); }
+});
+
+test('unreadable checklist logs the version and does not block another open version', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.11', '0.2.12'],
+      checklistItems: (version) => {
+        if (version === '0.2.11') throw new Error('checklist locked');
+        return [{ id: 'K12', owner: 'TC', title: 'open', status: 'red' }];
+      } });
+    expect(inputs.checklist.map((item) => item.id)).toEqual(['K12']);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'checklist-unreadable'))
+      .toEqual([['seat.loop', 'checklist-unreadable', { seat: 'TC', version: '0.2.11', error: 'Error: checklist locked' }]]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'skip-closed-versions')).toHaveLength(0);
   } finally { spy.mockRestore(); f.close(); }
 });
 
@@ -821,6 +880,8 @@ test('on: mixed preparation and publication raises a decision without launching 
     } });
     expect(result).toMatchObject({ status: 'hitl', action: 'decision' });
     expect(calls.map((args) => args.slice(0, 2))).toEqual([['harness', 'budget'], ['decisions', 'raise']]);
+    expect(calls[1]).toContain('--no-xcheck');
+    expect(calls[1]?.[calls[1].indexOf('--no-xcheck') + 1]).toBe('자리 루프 · 이웃 교환은 DEC-XCHECK ②');
     expect(entries(f).at(-1)).toMatchObject({ status: 'hitl', action: 'decision' });
   } finally { f.close(); }
 });

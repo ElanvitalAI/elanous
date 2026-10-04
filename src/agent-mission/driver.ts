@@ -491,6 +491,8 @@ export interface AgentMissionSpec {
   memory?: boolean;
   /** PTY 닉네임(휴먼 리더블·goto 로 나중 접근). 기본 branch. */
   nickname?: string;
+  /** Concurrent missions may share one decision stream alias without sharing a PTY or worktree. */
+  decisionMissionId?: string;
   /** ⭐⭐ 그 브랜치를 이미 쥔 «소유» 워크트리가 있으면 지우지 말고 그대로 재사용하라고 요청한다
    *  (`createWorktree` 의 같은 이름 인자로 그대로 내려간다 · 판정은 거기 `gateWorktreeReuse` 가 한다).
    *
@@ -513,11 +515,14 @@ export interface AgentMissionResult {
   paths?: string[];
   rounds: number;
   evidencePath: string | null;
+  /** The evidence check outcome, independent of the final mission and DRIVE-OK verdicts. */
+  evidenceSatisfied?: boolean;
   committed: boolean;
   usedOmniCrawl: boolean;
   detail: string;
   ptyId?: string;
   webUrl?: string | null;
+  driveVerdict?: ReturnType<typeof verdictForFinalPtyScreen>['kind'];
 }
 /** @deprecated codex 특정 이름 — AgentMissionResult 을 쓰라. */
 export type CodexMissionResult = AgentMissionResult;
@@ -1609,7 +1614,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     const finalEv = verifyEvidence(wt.path, spec.evidence);
     if (!finalEv.ok) return {
       ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
-      evidencePath: null, committed: false, usedOmniCrawl: false,
+      evidencePath: null, evidenceSatisfied: false, committed: false, usedOmniCrawl: false,
       detail: `미완(증거 부족): ${finalEv.retry ?? '증거가 아직 부족하다.'}`,
     };
     if (checklist.length) {
@@ -1627,13 +1632,13 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       if (!c.ok) {
         debug.log('agent-mission', 'result', { ok: false, rounds: result.numTurns ?? 0, evidencePath: finalEv.path, committed: false, usedOmni: false });
         return { ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
-          evidencePath: finalEv.path, committed: false, usedOmniCrawl: false,
+          evidencePath: finalEv.path, evidenceSatisfied: true, committed: false, usedOmniCrawl: false,
           detail: `미완(자동 커밋 실패): ${c.out.slice(0, 120)}` };
       }
     }
     debug.log('agent-mission', 'result', { ok: true, rounds: result.numTurns ?? 0, evidencePath: finalEv.path, committed, usedOmni: false });
     return { ok: true, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
-      evidencePath: finalEv.path, committed, usedOmniCrawl: false, detail: '완료(증거 충족)' };
+      evidencePath: finalEv.path, evidenceSatisfied: true, committed, usedOmniCrawl: false, detail: '완료(증거 충족)' };
   }
   env.TERM = 'xterm-256color';
   // ⭐run-identity — runId was resolved before either headless or PTY spawn.
@@ -1713,7 +1718,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   process.stderr.write(`[agent-mission] pty=${h.id} watch=${webAddress.webUrl ?? `(web unavailable: ${webAddress.pwaUnavailableReason ?? 'not-resolved'})`}\n`);
   debug.log('agent-mission', 'pty-link', { id: h.id, webUrl: webAddress.webUrl, webUrlSource: webAddress.webUrlSource });
 
-  const decisionIdentity = { missionId: runId, sessionId: runId, terminalId: h.id, agent: backend.name };
+  const decisionIdentity = { missionId: spec.decisionMissionId ?? runId, sessionId: runId, terminalId: h.id, agent: backend.name };
   const decisionEvent = (event: Omit<DecisionInput, keyof typeof decisionIdentity>): void => {
     try { (deps.emitPtyDecision ?? emitPtyDecision)({ ...decisionIdentity, ...event } as DecisionInput); }
     catch { /* Observation must not change mission control or handoff. */ }
@@ -2142,7 +2147,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     try { h.kill(); } catch { /* noop */ }
     return { ok: true, worktree: wt.path, branch: wt.branch, rounds: control.steps, evidencePath: wt.path, committed: true, usedOmniCrawl: usedOmni,
       ...(handoffPrSkipped ? { pr: 'skipped' as const, reason: 'origin-not-github' as const } : {}),
-      detail: handoffPrSkipped ? '완료(증거 게이트·push·PR 생략)' : '완료(증거 게이트·PR)' };
+      evidenceSatisfied: true, detail: handoffPrSkipped ? '완료(증거 게이트·push·PR 생략)' : '완료(증거 게이트·PR)' };
   }
   const done = control.termination.kind === 'success';
   const round = control.steps;
@@ -2216,8 +2221,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
 
   return {
     ok: accepted, worktree: wt.path, branch: wt.branch, rounds: round,
-    evidencePath, committed, usedOmniCrawl: usedOmni,
-    ptyId: h.id, webUrl: webAddress.webUrl,
+    evidencePath, evidenceSatisfied: finalEv.ok, committed, usedOmniCrawl: usedOmni,
+    ptyId: h.id, webUrl: webAddress.webUrl, driveVerdict: driveVerdict.kind,
     detail: recoverExhausted ? control.termination.reason : driveVerdict.kind === 'done-but-failed' ? `미완(DRIVE-OK: ${driveVerdict.reason})` : done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
   } finally { stopLive(); finishContext(false); }

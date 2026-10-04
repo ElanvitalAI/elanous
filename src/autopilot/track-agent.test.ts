@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { effectiveInstanceRoot, treeDerivedRootFor } from '../instance/resolve.js';
 import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, decideTrackAction, executeTrackAction, universeLaunch } from './track-agent.js';
 
 const input = { missionId: 'apm_test', taskId: 'task:test', title: '티저 제작', prompt: '영상 티저', track: 'T' };
@@ -200,10 +201,32 @@ describe('track agent', () => {
     }
   });
 
-  test('children run in the daemon universe (config and state pinned), never the test universe', () => {
-    const { argv, env } = universeLaunch(['harness', 'say', 'x'], '/tmp/daemon-root');
-    expect(argv).toEqual(['bin/elanous.mjs', '--config-dir', '/tmp/daemon-root', 'harness', 'say', 'x']);
-    expect(argv).not.toContain('--test');
-    expect(env.ELANOUS_STATE_DIR).toBe('/tmp/daemon-root');
+  test('children run in the daemon universe with the matching state-root origin', () => {
+    const previousDir = process.env.ELANOUS_STATE_DIR;
+    const previousSource = process.env.ELANOUS_STATE_DIR_SOURCE;
+    try {
+      process.env.ELANOUS_STATE_DIR = '/tmp/daemon-root';
+      process.env.ELANOUS_STATE_DIR_SOURCE = 'derived';
+      const { argv, env } = universeLaunch(['harness', 'say', 'x'], '/tmp/daemon-root');
+      expect(argv).toEqual(['bin/elanous.mjs', '--config-dir', '/tmp/daemon-root', 'harness', 'say', 'x']);
+      expect(argv).not.toContain('--test');
+      expect(env.ELANOUS_STATE_DIR).toBe('/tmp/daemon-root');
+      expect(env.ELANOUS_STATE_DIR_SOURCE).toBe('derived');
+      const different = universeLaunch([], '/tmp/different-root');
+      expect(different.env.ELANOUS_STATE_DIR_SOURCE).toBe('explicit');
+      delete process.env.ELANOUS_STATE_DIR_SOURCE;
+      expect(universeLaunch([], '/tmp/daemon-root').env.ELANOUS_STATE_DIR_SOURCE).toBe('explicit');
+      const derivedRoot = treeDerivedRootFor(process.cwd());
+      expect(derivedRoot).not.toBeNull();
+      process.env.ELANOUS_STATE_DIR = derivedRoot!;
+      expect(universeLaunch([], derivedRoot!).env.ELANOUS_STATE_DIR_SOURCE).toBe('derived');
+      delete process.env.ELANOUS_STATE_DIR;
+      expect(universeLaunch([], effectiveInstanceRoot()).env.ELANOUS_STATE_DIR_SOURCE).toBe('derived');
+    } finally {
+      if (previousDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousDir;
+      if (previousSource === undefined) delete process.env.ELANOUS_STATE_DIR_SOURCE;
+      else process.env.ELANOUS_STATE_DIR_SOURCE = previousSource;
+    }
   });
 });

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry, type RaiseInput } from './decision-ledger.js';
-import { DecisionCardService, parseTap, raiserReplyText, renderCard, type CardPlatform, type CardRef, type CardTransport, type CardView } from './decision-cards.js';
+import { DecisionCardService, parseTap, raiserReplyText, renderCard, renderCardText, type CardPlatform, type CardRef, type CardTransport, type CardView } from './decision-cards.js';
 import { handleDiscordDecisionInteraction, discordComponents, discordDecisionsCommand } from './discord-decision-cards.js';
 import { defaultTelegramCommands } from '../telegram-commands.js';
 import { attachTelegramDecisionCards } from './telegram-decision-cards.js';
@@ -39,6 +39,18 @@ class FakeTransport implements CardTransport {
   async edit(ref: CardRef, view: CardView) { this.edits.push({ ref, view }); }
   async notify(_chat: string, text: string) { this.notes.push(text); }
 }
+
+test('30-second pitch leads the card in SCQA, recommendation, alternative, cross-check, dissent and deadline order', () => {
+  const ledger = ledgerAt();
+  const entry = ledger.raise(base({ scqa: { s: '상황', c: '문제', q: '질문', a: '제안' }, alternative: 'b',
+    crossCheck: [{ seat: 'TC', at: TEST_NOW().toISOString(), note: '키 경로 영향 없음' }], dissent: 'UX: 화면 문구 미정', dueAt: '2026-10-02T08:00:00Z' }));
+  const text = renderCardText(ledger.show(entry.id));
+  const pitch = text.split('\n').slice(3, 12);
+  expect(pitch).toEqual(['S: 상황', 'C: 문제', 'Q: 질문', 'A: 제안', '권고: 스스로 안 — 대표 지시와 맞다',
+    '대안: 팩트 안 — 내일 반영', '교차 확인: TC ✓ 키 경로 영향 없음', '이견: UX: 화면 문구 미정', '기한: 10. 2. 17:00 KST']);
+  expect(renderCard(entry).buttons).toEqual([[{ label: 'A) 스스로 안', data: `dec:${entry.id}:a` }, { label: 'B) 팩트 안', data: `dec:${entry.id}:b` }],
+    [{ label: '📝 메모 달기', data: `dec:${entry.id}:memo` }]]);
+});
 
 describe('DEC-TG decision cards', () => {
   test('rehearsal: three decisions — Telegram tap, Discord tap, /decisions re-send — all decided, three replies, one refusal', async () => {

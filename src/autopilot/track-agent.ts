@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { getOrCreatePersonaSession } from '../session/index.js';
 import { getUserConfig } from '../user-config.js';
@@ -38,7 +39,9 @@ const log = (event: string, data: Record<string, unknown>) => {
 };
 /** The daemon's own universe, resolved once and pinned on the child (config ⊕ state) — the harness isolates its own workers. */
 export function universeLaunch(args: readonly string[], root: string = effectiveInstanceRoot()): { argv: string[]; env: NodeJS.ProcessEnv } {
-  return { argv: ['bin/elanous.mjs', '--config-dir', root, ...args], env: { ...process.env, ELANOUS_STATE_DIR: root } };
+  return { argv: ['bin/elanous.mjs', '--config-dir', root, ...args], env: {
+    ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root),
+  } };
 }
 const runCli = async (args: string[]): Promise<{ stdout: string }> => {
   const { argv, env } = universeLaunch(args);

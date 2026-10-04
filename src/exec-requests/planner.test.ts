@@ -32,7 +32,7 @@ test('only opted-in runnable core graphs (including subdirectories) appear, whil
   for (const id of ['release-loop', 'steward', 'heal-loop', 'landing-heal', 'nightly-audit', 'self-implement', 'implement-loop', 'plan-loop', 'launch-loop', 'test-diet', 'intake-daily', 'docs-publish'])
     expect(graphs.map(g => g.id)).not.toContain(id);
   const coreIds = graphs.filter(g => g.path.startsWith(defaultGraphsDir())).map(g => g.id);
-  expect(coreIds).toEqual(['field-feed']);
+  expect(coreIds).toEqual(['lecture-note', 'field-feed']);
   const core = join(root, 'core');
   mkdirSync(core);
   writeFileSync(join(core, 'no.yaml'), 'graph_id: no\nloop:\n  exec_request: false\n');

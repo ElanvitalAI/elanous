@@ -19,6 +19,10 @@ export type PersonaBrand =
 export interface PersonaProfile {
   readonly personaId: string;
   readonly displayName: string;
+  /** Seat address (title, id or alias) represented by this persona. */
+  readonly seat?: string;
+  /** Per-persona JSONL todo filename in the state persona directory. */
+  readonly todo?: string;
   readonly description?: string;
 
   /** System prompt to prepend in LLM calls. Markdown text. May

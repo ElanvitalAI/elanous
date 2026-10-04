@@ -38,6 +38,7 @@ export interface DaemonPromptBody {
    *  (`none` · `readonly` · `chat` · `webterm`); invalid values reject
    *  the request rather than silently falling back. */
   tools?: DaemonToolSurfaceKind;
+  personaId?: string;
 }
 
 export interface DaemonPromptRequest {
@@ -53,6 +54,7 @@ export interface DaemonPromptRequest {
    *  not opt in; the caller-side (`handlePromptStreamPost`) interprets
    *  null as "use the daemon's boot-time surface". */
   tools: DaemonToolSurfaceKind | null;
+  personaId?: string;
 }
 
 export type DaemonPromptRequestParseResult =
@@ -117,6 +119,7 @@ export function parseDaemonPromptBody(
         body.source ? writeInputSourceMeta(body.source) : undefined,
       ),
       tools: body.tools ?? null,
+      ...(typeof body.personaId === 'string' && body.personaId.trim() ? { personaId: body.personaId } : {}),
     },
   };
 }

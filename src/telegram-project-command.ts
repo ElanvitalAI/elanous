@@ -35,17 +35,23 @@ export function projectCommand(deps: TelegramProjectCommandDeps = {
         debug.log('telegram.project', 'listed', { projects: projects.slice(0, 20).map(p => ({ id: p.id, name: p.name })) });
         if (ctx.isDm && ctx.chatId === ctx.userId
           && String(ctx.userId) === telegramDecisionOwner(ctxOptions.userConfig) && ctxOptions.sendButtons) {
-          const buttons = projects.filter(p => {
+          const eligible = projects.filter(p => {
             const bytes = Buffer.byteLength(`prj:${p.id}`, 'utf8');
             if (bytes <= 64) return true;
             debug.log('telegram.project', 'button-rejected', { reason: 'callback-data-too-long', projectId: p.id, bytes });
             return false;
-          }).slice(0, 8).map(p => ({ text: p.name, data: `prj:${p.id}` }));
-          buttons.push({ text: '받은 대화로', data: 'prj:-' });
+          });
+          const visible = eligible.slice(0, 7);
+          if (current && eligible.some(p => p.id === current.id) && !visible.some(p => p.id === current.id)) {
+            visible[visible.length - 1] = current;
+          }
+          const buttons = visible.map(p => ({ text: `${p.id === current?.id ? '✓ ' : ''}${p.name}`, data: `prj:${p.id}` }));
+          buttons.push({ text: `${session.projectId ? '' : '✓ '}받은 대화로`, data: 'prj:-' });
           const rows: Array<Array<{ text: string; data: string }>> = [];
           for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
           try {
             await ctxOptions.sendButtons('프로젝트를 선택하세요', rows);
+            return;
           } catch (err) {
             debug.log('telegram.project', 'button-rejected', {
               reason: 'send-failed', error: err instanceof Error ? err.message : String(err),
@@ -140,6 +146,6 @@ export function attachTelegramProjectButtons(
     deps.update(session.id, m => { m.projectId = project.id; });
     debug.log('telegram.project', 'button-moved', { chatId, sessionId: session.id, projectId: project.id });
     await bot.answerCallbackQuery(q.id);
-    await bot.sendMessage(chatId, `이 대화를 ${project.name} 프로젝트로 옮겼습니다`);
+    await bot.sendMessage(chatId, `지금 프로젝트: ${project.name}`);
   });
 }

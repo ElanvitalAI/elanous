@@ -1,9 +1,14 @@
 import { debug } from '../debug/log.js';
 import { resolveMention, type PersonaSource } from '../persona/mention-parser.js';
 import type { PersonaProfile } from '../persona/types.js';
+import { resolveSeat, type SeatEntry } from '../seat-address/seat-address.js';
 
 export interface PersonaAnswerDeps {
   complete?: (prompt: string) => Promise<string>;
+}
+
+export function seatOfPersona(persona: PersonaProfile, resolve = resolveSeat): SeatEntry | null {
+  return persona.seat ? resolve(persona.seat) ?? null : null;
 }
 
 /** Resolve the registry mention first, then an exact display name. */

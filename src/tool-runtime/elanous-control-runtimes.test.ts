@@ -135,10 +135,12 @@ describe('ElanousHold runtime', () => {
     const rootA = mkdtempSync(join(tmpdir(), 'elanous-hold-config-'));
     const rootB = mkdtempSync(join(tmpdir(), 'elanous-hold-state-'));
     const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    const previousSource = process.env.ELANOUS_STATE_DIR_SOURCE;
     let args: string[] = [];
     let env: NodeJS.ProcessEnv | undefined;
     setElanousConfigDir(rootA);
     process.env.ELANOUS_STATE_DIR = rootB;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'derived';
     inject({ spawn: (_command, receivedArgs, options) => {
       args = receivedArgs;
       env = options.env;
@@ -150,6 +152,7 @@ describe('ElanousHold runtime', () => {
       expect(result.ptyId).toBe('pty_deadbeef');
       expect(args).toEqual([expect.stringMatching(/\/bin\/elanous\.mjs$/), '--config-dir', rootA, 'dev', '--elanous', '--hold', '--ready-timeout-ms', '90000', '--cwd', '/tmp/x']);
       expect(env?.ELANOUS_STATE_DIR).toBe(rootA);
+      expect(env?.ELANOUS_STATE_DIR_SOURCE).toBe('explicit');
       expect(debug.events(10_000).some((event) => event.category === 'tool-runtime.elanous-control'
         && event.event === 'hold'
         && (event.data as { ptyId?: string; instanceRoot?: string }).ptyId === 'pty_deadbeef'
@@ -158,6 +161,8 @@ describe('ElanousHold runtime', () => {
       resetElanousConfigDir();
       if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      if (previousSource === undefined) delete process.env.ELANOUS_STATE_DIR_SOURCE;
+      else process.env.ELANOUS_STATE_DIR_SOURCE = previousSource;
       rmSync(rootA, { recursive: true, force: true });
       rmSync(rootB, { recursive: true, force: true });
     }
@@ -167,10 +172,12 @@ describe('ElanousHold runtime', () => {
     const child = spawnedChild();
     const root = mkdtempSync(join(tmpdir(), 'elanous-hold-state-'));
     const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    const previousSource = process.env.ELANOUS_STATE_DIR_SOURCE;
     let args: string[] = [];
     let env: NodeJS.ProcessEnv | undefined;
     resetElanousConfigDir();
     process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'derived';
     inject({ spawn: (_command, receivedArgs, options) => {
       args = receivedArgs;
       env = options.env;
@@ -182,12 +189,15 @@ describe('ElanousHold runtime', () => {
       expect(result.ptyId).toBe('pty_cafe1234');
       expect(args).toEqual([expect.stringMatching(/\/bin\/elanous\.mjs$/), '--config-dir', root, 'dev', '--elanous', '--hold', '--ready-timeout-ms', '90000', '--cwd', '/tmp/x']);
       expect(env?.ELANOUS_STATE_DIR).toBe(root);
+      expect(env?.ELANOUS_STATE_DIR_SOURCE).toBe('derived');
       expect(args.slice(-2)).toEqual(['--cwd', '/tmp/x']);
       expect(args).not.toContain('--worktree');
     } finally {
       resetElanousConfigDir();
       if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      if (previousSource === undefined) delete process.env.ELANOUS_STATE_DIR_SOURCE;
+      else process.env.ELANOUS_STATE_DIR_SOURCE = previousSource;
       rmSync(root, { recursive: true, force: true });
     }
   });

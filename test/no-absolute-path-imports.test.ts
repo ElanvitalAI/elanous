@@ -10,6 +10,8 @@ describe('tracked TypeScript sources import by relative or package path only', (
   test('no `from "/…"` or `import("/…")` in tracked .ts/.tsx/.mts/.cts files', () => {
     const files = execFileSync('git', ['ls-files', '*.ts', '*.tsx', '*.mts', '*.cts'], { encoding: 'utf8' }).split('\n').filter(Boolean);
     const offenders = files.filter((file) => {
+      // The audit's own regex text contains an absolute import example, not an actual import.
+      if (file === 'test/no-absolute-path-imports.test.ts') return false;
       let text: string;
       try { text = readFileSync(file, 'utf8'); } catch { return false; }
       // Only real module specifiers: `import … from '/…'`, `export … from '/…'`, `import '/…'`, `import('/…')`

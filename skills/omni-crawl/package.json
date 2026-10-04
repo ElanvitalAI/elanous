@@ -6,11 +6,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "tsx scripts/main.ts",
-    "test": "tsx scripts/main.ts --self-test"
+    "start": "bun scripts/main.ts",
+    "test": "bun scripts/main.ts --self-test"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "tsx": "^4"
+    "@types/node": "^26.1.1"
   }
 }

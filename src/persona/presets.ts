@@ -88,6 +88,7 @@ export function presetToProfileYaml(p: PersonaPreset, common: PresetCommon, opts
     displayName: opts.name?.trim() ? `${opts.name.trim()} · ${p.role}` : p.displayName,
     description: p.oneLine,
     systemPrompt: presetSystemPrompt(p, common, name),
+    todo: `${opts.personaId}.todo.jsonl`,
     preset: { id: p.personaId, role: p.role, ...(title ? { title } : {}), tools: p.tools.map((t) => t.name), firstQuestions: p.firstQuestions },
   };
   return `# 프리셋 «${p.personaId}» 에서 만든 페르소나 — elanous persona add (원본: persona-presets/${p.personaId}.yaml)\n${stringify(profile, { lineWidth: 0 })}`;
@@ -99,7 +100,7 @@ export interface PersonaWriteResult { personaId: string; displayName: string; pa
 // Only fields in the runtime persona schema may be edited; provenance (`preset`) is retained, not editable.
 const PROFILE_KEYS = new Set([
   'personaId', 'displayName', 'description', 'systemPrompt', 'actionHosts', 'offsiteNavigation',
-  'brand', 'models', 'mentionPatterns', 'avatarUrl', 'brandColor', 'browserPort', 'residence', 'capabilities',
+  'brand', 'models', 'mentionPatterns', 'avatarUrl', 'brandColor', 'browserPort', 'residence', 'capabilities', 'todo',
 ]);
 const NESTED_KEYS: Record<string, readonly string[]> = {
   models: ['primary', 'fallback', 'providers'], 'models.providers': ['ollama', 'openai'],

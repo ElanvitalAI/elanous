@@ -300,7 +300,7 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
     expect(measure.members[0]).toMatchObject({ running: null, pending: null, allocatableMemoryBytes: null, reason: expect.stringContaining('connection refused') });
     expect(recommendConcurrency(measure, { capacity: 20, accounts: 10, perAccount: 4 })).toMatchObject({ recommended: null, limitedBy: null, reason: expect.stringContaining('측정 불가: cluster') });
   });
-  test('host lease admission persists on a Job after the host file lease is released', () => {
+  test('host lease admission annotation persists on a Job while its file lease awaits Pod observation', () => {
     const options = { name: 'leased-job', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', args: [], passEnv: [], deadlineSeconds: 60 };
     const leased = podJobManifest({ ...options, hostLeaseAdmitted: true, execution: { key: 'key', attempt: 2 } });
     expect(leased.metadata).toMatchObject({ annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true', 'elanous.dev/attempt': '2' } });
@@ -318,11 +318,11 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
       : args.includes('pods') ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [...legacy, leased, pending] }) }
         : { status: 0, stderr: '', stdout: node('1024Gi') };
     const m = measurePoolLease(parsePodPool('node-b:20'), { kubectl, dns: () => 'ready' });
-    expect(m.members[0]).toMatchObject({ running: 3, pending: 1, unleasedRunning: 2, memoryLimitBytes: 3 * gi });
+    expect(m.members[0]).toMatchObject({ running: 3, pending: 1, pendingJobs: [{ context: 'node-b', namespace: 'elanous-test', job: 'legacy-job-0' }], unleasedRunning: 2, memoryLimitBytes: 3 * gi });
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       expect(recommendConcurrency(m, { capacity: 20, accounts: 10, perAccount: 4 })).toMatchObject({
-        running: 3, pending: 1, unleasedRunning: 2, capacitySlots: 16, placeableSlots: 16, recommended: 14, limitedBy: 'capacity',
+        running: 3, pending: 1, pendingJobs: [{ context: 'node-b', namespace: 'elanous-test', job: 'legacy-job-0' }], unleasedRunning: 2, capacitySlots: 16, placeableSlots: 16, recommended: 14, limitedBy: 'capacity',
       });
       expect(log).toHaveBeenCalledWith('pod-lease', 'unleased', { unleasedRunning: 2, running: 3, recommended: 14 });
     } finally { log.mockRestore(); }

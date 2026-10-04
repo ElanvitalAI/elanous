@@ -7,6 +7,7 @@ import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
+import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
@@ -17,6 +18,7 @@ import { SessionPill } from './SessionPill';
 import { ChatHud } from './blocks/ChatHud';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
 import { restorableChatMessages } from '@/lib/session-restore';
+import { generateSessionId } from '@/lib/daemon-session';
 import { writeSharePrefill } from '@/lib/share-prefill';
 import { BudgetPill } from './BudgetPill';
 import { VoiceCostPill } from './VoiceCostPill';
@@ -48,6 +50,7 @@ import { toast } from 'sonner';
 import { debugLog, setDebugForwardFallback } from '@/lib/debug';
 import { reduceTurnBusyBanner, type TurnBusyBanner } from '@/lib/turn-busy';
 import { uploadAttachments, type AttachmentMeta } from '@/lib/upload-attachment';
+import { cardFollowupStorage, forgetCardFollowup, isCardRequest, readPendingCardFollowups, rememberCardFollowup, startCardFollowup, waitCardFollowup } from '@/lib/card-followup-client';
 import { extractClipboardFiles, extractDroppedFiles, hasDroppedFiles, type ChatFileExtraction } from '@/lib/chat-paste-drop';
 import {
   buildPromptUserContentFromAttachments,
@@ -113,6 +116,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       sessionGenerationRef.current++;
       queueRef.current = [];
       setQueue([]);
+      setMessages([]);
+      if (cardFollowupControllerRef.current) setPending(false);
     }
     queueSessionRef.current = sessionId;
     adoptedSessionRef.current = null;
@@ -130,6 +135,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // pushes its meta here; submit drains it into the user text and the
   // message body so the LLM sees both the path list and any caption.
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentMeta[]>([]);
+  const cardFollowupControllerRef = useRef<AbortController | null>(null);
+  const cardFollowupOwnerRef = useRef<string | null>(null);
+  useEffect(() => () => {
+    if (cardFollowupOwnerRef.current !== currentSessionRef.current) cardFollowupControllerRef.current?.abort();
+  }, [sessionId]);
+  useEffect(() => () => { cardFollowupControllerRef.current?.abort(); }, []);
   const [dropOverlay, setDropOverlay] = useState<DropOverlayState>({ visible: false, depth: 0 });
 
   useEffect(() => {
@@ -410,10 +421,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // 세션 복원(R4 · 2026-07-09) — 마운트/세션 전환 시 on-disk 저장소에서 대화를
   // 다시 불러와 seed. PWA 챗은 이제 ~/.elanous/sessions 로 write-through(R3) 되므로
   // 탭 이동 후 돌아와도 리셋되지 않는다. 진행 중 메시지는 덮지 않음.
-  const restoredRef = useRef<string>('');
   useEffect(() => {
-    if (!sessionId || restoredRef.current === sessionId) return;
-    restoredRef.current = sessionId;
+    if (!sessionId) return;
     let alive = true;
     void (async () => {
       try {
@@ -422,11 +431,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         );
         if (!alive || !r?.messages || r.messages.length === 0) return;
         setMessages((prev) => {
-          if (prev.length > 0) return prev; // 진행 턴 보존
           // ⛔⭐ 선별은 `session-restore.ts` 가 한다 — 여기 인라인으로 두면 시험이 못 문다.
           //   📏 2026-08-22: 이 자리가 `[tool_use]`/`[tool_result]` 를 «그대로» 그려서
           //     복원된 화면의 **69%(472 중 327줄)** 가 그 글자였다.
-          return restorableChatMessages(r.messages!, Date.now());
+          if (prev.some((message) => !message.id.startsWith('m-card-resume-'))) return prev; // 진행 중인 일반 턴 보존
+          // The store has no card job/message ids. Equal text cannot prove that
+          // a stored reply belongs to this poll, so preserve the entire history.
+          return [...restorableChatMessages(r.messages!, Date.now()), ...prev];
         });
       } catch { /* 저장소에 없으면(신규 세션) 무시 */ }
     })();
@@ -450,6 +461,58 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     setMessages((prev) => [...prev, msg]);
   };
 
+  const pollCard = async (id: string, owner: string, progressId: string, controller: AbortController, startedAt?: number): Promise<'not-card' | 'terminal'> => {
+    const result = await waitCardFollowup(client, id, {
+      signal: controller.signal,
+      ...(startedAt === undefined ? {} : { startedAt }),
+      onStatus: (status) => debugLog('pwa.chat.card-followup', { phase: 'poll', status }),
+    });
+    if (controller.signal.aborted || currentSessionRef.current !== owner) return 'terminal';
+    const storage = cardFollowupStorage();
+    if (storage) forgetCardFollowup(storage, owner, id);
+    if (result.status === 'not-card') {
+      setMessages((prev) => prev.filter((m) => m.id !== progressId));
+      debugLog('pwa.chat.card-followup', { phase: 'fallback', status: result.status });
+      return 'not-card';
+    }
+    if (result.status === 'done' && result.replies?.length === 3 && result.replies.every((reply) => typeof reply === 'string')) {
+      setMessages((prev) => [
+        ...prev.filter((m) => m.id !== progressId),
+        ...result.replies!.map((reply, index) => ({
+          id: `${progressId}-${index}`, role: 'assistant' as const, text: reply,
+          timestamp: Date.now(), meta: { provider: config.provider },
+        })),
+      ]);
+      debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'done' });
+    } else {
+      setMessages((prev) => prev.map((m) => m.id === progressId
+        ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+      debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'failed' });
+    }
+    return 'terminal';
+  };
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const storage = cardFollowupStorage();
+    if (!storage) return;
+    const controllers = readPendingCardFollowups(storage, sessionId).map(({ id, startedAt }) => {
+      const controller = new AbortController();
+      const progressId = `m-card-resume-${id}`;
+      setMessages((prev) => prev.some((m) => m.id === progressId) ? prev : [...prev, {
+        id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', timestamp: startedAt,
+        meta: { provider: config.provider },
+      }]);
+      void pollCard(id, sessionId, progressId, controller, startedAt).catch(() => {
+        if (controller.signal.aborted || currentSessionRef.current !== sessionId) return;
+        setMessages((prev) => prev.map((m) => m.id === progressId
+          ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+      });
+      return controller;
+    });
+    return () => { controllers.forEach((controller) => controller.abort()); };
+  }, [client, sessionId]);
+
   const executeTurn = async (text: string, queued = false): Promise<void> => {
     setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-begin' }));
     debugLog('webterm.chat.input', {
@@ -468,6 +531,49 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // a vision model and re-attach.
     const attached = queued ? [] : pendingAttachments;
     if (!queued) setPendingAttachments([]);
+    const card = !queued ? isCardRequest(text, attached) : { ok: false } as const;
+    let cardWasDisplayed = false;
+    if (card.ok) {
+      let owner = currentSessionRef.current;
+      if (!owner) {
+        owner = generateSessionId();
+        adoptedSessionRef.current = owner;
+        currentSessionRef.current = owner;
+        props.onSessionAdopt?.(owner);
+        setSessionId(owner);
+      }
+      const cardController = new AbortController();
+      cardFollowupControllerRef.current = cardController;
+      cardFollowupOwnerRef.current = owner;
+      cardWasDisplayed = true;
+      if (text.length > 0) append(newUserMessage(text));
+      append(newMetaMessage(`📎 attached: ${attached.map((e) => e.filename).join(', ')}`));
+      const progressId = `m-card-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      append({ id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', timestamp: Date.now(), meta: { provider: config.provider } });
+      setPending(true);
+      debugLog('pwa.chat.card-followup', { phase: 'start', status: 'judging' });
+      try {
+        const id = await startCardFollowup(client, card.attachmentId, card.context, cardController.signal);
+        if (cardController.signal.aborted || currentSessionRef.current !== owner) return;
+        const storage = cardFollowupStorage();
+        const startedAt = Date.now();
+        if (storage) rememberCardFollowup(storage, { sessionId: owner, id, startedAt });
+        const outcome = await pollCard(id, owner, progressId, cardController, startedAt);
+        if (outcome === 'terminal' || cardController.signal.aborted || currentSessionRef.current !== owner) return;
+      } catch {
+        if (cardController.signal.aborted || currentSessionRef.current !== owner) return;
+        setMessages((prev) => prev.map((m) => m.id === progressId
+          ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+        debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'failed' });
+        return;
+      } finally {
+        if (cardFollowupControllerRef.current === cardController) cardFollowupControllerRef.current = null;
+        if (!cardController.signal.aborted && currentSessionRef.current === owner) {
+          setPending(false);
+          setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
+        }
+      }
+    }
     const imageAttachments = attached.filter(isImageAttachment);
     const nonImageAttachments = attached.filter((e) => !isImageAttachment(e));
     const visionCapable = isProviderUserMessageVisionCapable(config.provider);
@@ -517,9 +623,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // Display message: keep the user-typed text in the chat history
     // and surface attachment chips as a meta line so the user can see
     // exactly what was sent without polluting their own message body.
-    if (text.length > 0) append(newUserMessage(text));
-    if (attached.length > 0) {
-      append(newMetaMessage(`📎 attached: ${attached.map((e) => e.filename).join(', ')}`));
+    if (!cardWasDisplayed) {
+      if (text.length > 0) append(newUserMessage(text));
+      if (attached.length > 0) {
+        append(newMetaMessage(`📎 attached: ${attached.map((e) => e.filename).join(', ')}`));
+      }
     }
 
     // Meta commands: only dispatch on the user-typed text (attachments
@@ -1079,6 +1187,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       )}
       <SeatsNowStrip />
       <ChatApprovalsChip />
+      <ChatDecisionsChip />
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}

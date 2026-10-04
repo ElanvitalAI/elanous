@@ -8,6 +8,7 @@ import {
   resolveStatePersonaDir,
 } from '../../persona/global-registry.js';
 import { clonePreset, editPersona, loadPresets } from '../../persona/presets.js';
+import { resolvePersonaAddress } from '../../intake-plane/persona-answer.js';
 import type { PersonaRegistryEvent } from '../../persona/registry.js';
 import type { PersonaProfile } from '../../persona/types.js';
 import {
@@ -99,7 +100,7 @@ export async function handlePersonaGet(
   }
   await awaitGlobalPersonaLoad();
   const registry = getGlobalPersonaRegistry();
-  const persona = registry.get(personaId);
+  const persona = resolvePersonaAddress(personaId, registry);
   if (!persona) return notFound(`persona ${personaId} not found`);
   return jsonResponse({ persona: toWire(persona) }, 200);
 }

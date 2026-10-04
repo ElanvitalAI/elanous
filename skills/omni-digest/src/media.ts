@@ -8,11 +8,11 @@
  * X 는 media.variants 로 MP4 직링크를 주므로 yt-dlp 없이 curl 로 바로 받는다.
  */
 
-import { execFile as execFileCb, execFileSync } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import { promisify } from 'node:util';
 import { env } from './env.js';
 import type { TweetMedia } from './types.js';
@@ -25,10 +25,22 @@ const MAX_DURATION_MS = Number(env('OMNI_DIGEST_MEDIA_MAX_MS', String(20 * 60 * 
 const CHUNK_SECONDS = 600;
 
 function has(bin: string): boolean {
-  try {
-    execFileSync('which', [bin], { stdio: 'ignore' });
-    return true;
-  } catch { return false; }
+  for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    try { accessSync(join(dir, bin), constants.X_OK); return true; } catch { /* try next directory */ }
+  }
+  return false;
+}
+
+const missingEngines = new Set<string>();
+
+export function mediaEngineAvailable(engine: 'ffmpeg' | 'whisper'): boolean {
+  if (has(engine)) return true;
+  if (!missingEngines.has(engine)) {
+    missingEngines.add(engine);
+    if (engine === 'ffmpeg') console.error('ffmpeg 없음 — 영상 오디오 추출·전사 빠짐 · 설치하면 영상 전사 켜짐');
+    else console.error('whisper 없음 — 로컬 음성 전사 빠짐 · 설치하면 오프라인 전사 켜짐 (youtube-master 폴백은 계속)');
+  }
+  return false;
 }
 
 async function run(bin: string, args: string[]): Promise<string> {
@@ -47,7 +59,7 @@ export async function downloadVideo(url: string, outdir: string): Promise<string
 
 /** 영상에서 16kHz 모노 mp3 를 추출한다 (STT 엔진 공통 입력 규격). */
 export async function extractAudio(videoPath: string, outdir: string): Promise<string> {
-  if (!has('ffmpeg')) throw new Error('ffmpeg 가 필요합니다 (brew install ffmpeg)');
+  if (!mediaEngineAvailable('ffmpeg')) throw new Error('ffmpeg 가 필요합니다 (brew install ffmpeg)');
   const out = join(outdir, 'audio.mp3');
   await run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
@@ -61,7 +73,7 @@ export async function extractAudio(videoPath: string, outdir: string): Promise<s
 
 /** 로컬 whisper CLI 전사. 미설치면 null 을 반환해 폴백을 유도한다. */
 async function transcribeLocalWhisper(audioPath: string, outdir: string, lang: string): Promise<string | null> {
-  if (!has('whisper')) return null;
+  if (!mediaEngineAvailable('whisper')) return null;
   const model = env('OMNI_DIGEST_WHISPER_MODEL', 'small');
   try {
     await run('whisper', [
@@ -81,11 +93,12 @@ async function transcribeLocalWhisper(audioPath: string, outdir: string, lang: s
 }
 
 /** youtube-master 의 STT 체인(ElevenLabs → OpenAI → Gemini)으로 폴백. */
-async function transcribeViaYoutubeMaster(audioPath: string, outdir: string): Promise<string | null> {
+export async function transcribeViaYoutubeMaster(audioPath: string, outdir: string): Promise<string | null> {
   const skillRoot = env('YOUTUBE_MASTER_ROOT', join(process.env.HOME || '', '.claude/skills/youtube-master'));
   const script = join(skillRoot, 'scripts/transcribe-local.ts');
   if (!existsSync(script)) return null;
 
+  if (!mediaEngineAvailable('ffmpeg')) return null;
   // transcribe-local.ts 는 chunk_%03d.mp3 가 든 디렉터리를 입력으로 받는다
   const chunksDir = join(outdir, 'chunks');
   await mkdir(chunksDir, { recursive: true });
@@ -98,7 +111,7 @@ async function transcribeViaYoutubeMaster(audioPath: string, outdir: string): Pr
 
   const outFile = join(outdir, 'transcript.txt');
   try {
-    await run('npx', ['tsx', script, chunksDir, outFile]);
+    await run(process.execPath, [script, chunksDir, outFile]);
     const text = (await readFile(outFile, 'utf-8')).trim();
     return text || null;
   } catch {
@@ -137,6 +150,7 @@ export async function transcribeTweetMedia(
     console.log(`  영상 ${Math.round(video.durationMs / 1000)}s — 상한(${Math.round(MAX_DURATION_MS / 1000)}s) 초과로 전사 생략`);
     return null;
   }
+  if (!mediaEngineAvailable('ffmpeg')) return null;
 
   const workdir = join(tmpdir(), `omni-digest-media-${video.mediaKey}`);
   try {

@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { debug } from '../debug/log.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { CardStore, redactSecrets } from '../task-cards/card-store.js';
 import { isGithubSpamText, PUBLIC_GITHUB_REPO } from './providers.js';
@@ -72,8 +76,57 @@ function object(value: unknown): Record<string, unknown> | undefined {
 }
 function gitSha(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value); }
 
+export interface ShadowReviewResult {
+  reviewed: boolean;
+  verdict: 'pass' | 'warn' | 'fail' | null;
+  summary: string;
+}
+
+/** Runs the read-only self-review command from a detached, disposable worktree of trusted HEAD.
+ * The PR is never checked out: only its remote diff enters the reviewer prompt. */
+export async function runGithubShadowReview(number: number, repo = resolve(process.cwd())): Promise<ShadowReviewResult> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error('invalid PR number');
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-review-shadow-'));
+  const worktree = join(dir, 'repo');
+  let attached = false;
+  try {
+    const added = spawnSync('git', ['-C', repo, 'worktree', 'add', '--detach', worktree, 'HEAD'], { encoding: 'utf8', timeout: 30_000 });
+    if (added.status !== 0) throw new Error('isolated worktree unavailable');
+    attached = true;
+    if (existsSync(join(repo, 'node_modules'))) symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+    const output = await new Promise<string>((done, fail) => {
+      const child = spawn(process.execPath, [join(worktree, 'bin/elanous.mjs'), '--test', 'self', 'review', String(number), '--json'], {
+        cwd: worktree, env: { ...process.env, GH_REPO: PUBLIC_GITHUB_REPO }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => child.kill(), 360_000);
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); if (stdout.length > 100_000) child.kill(); });
+      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); if (stderr.length > 100_000) child.kill(); });
+      child.on('error', error => { clearTimeout(timer); fail(error); });
+      child.on('close', code => { clearTimeout(timer); code === 0 ? done(stdout) : fail(new Error(`self review exited ${code}: ${stderr.slice(0, 200)}`)); });
+    });
+    const parsed: unknown = JSON.parse(output);
+    const result = object(parsed);
+    if (!result) throw new Error('self review returned no result');
+    const verdict = result.reviewed === true && ['pass', 'warn', 'fail'].includes(String(result.verdict))
+      ? result.verdict as 'pass' | 'warn' | 'fail' : null;
+    const findings = [...(Array.isArray(result.mustFix) ? result.mustFix : []), ...(Array.isArray(result.shouldFix) ? result.shouldFix : [])]
+      .filter((item): item is string => typeof item === 'string').slice(0, 8);
+    return { reviewed: result.reviewed === true && verdict !== null, verdict,
+      summary: redactSecrets(verdict ? `${verdict}: ${findings.join('; ') || 'no findings'}` : `review unavailable: ${String(result.error ?? 'not reviewed')}`).slice(0, 2000) };
+  } finally {
+    if (attached) {
+      rmSync(join(worktree, 'node_modules'), { force: true });
+      spawnSync('git', ['-C', repo, 'worktree', 'remove', '--force', worktree], { timeout: 30_000 });
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /** Separate shadow ledger/card path: never enter dispatchHook's seat wake or steward launch/report stages. */
-export async function recordGithubShadow(event: QueuedHook, root: string, fetchFn: typeof fetch = fetch): Promise<void> {
+export async function recordGithubShadow(event: QueuedHook, root: string, fetchFn: typeof fetch = fetch,
+  review: (number: number) => Promise<ShadowReviewResult> = runGithubShadowReview): Promise<void> {
   const github = event.task.github;
   if (event.provider !== 'github' || !github || github.repository !== PUBLIC_GITHUB_REPO ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(event.eventId) ||
@@ -94,6 +147,7 @@ export async function recordGithubShadow(event: QueuedHook, root: string, fetchF
       .run(key, github.repository, github.type, github.number, judgment.verdict, judgment.reason, event.task.external.url ?? '');
     const recorded = store.db.query('SELECT verdict, reason FROM github_shadow_judgments WHERE event_key = ?')
       .get(key) as ShadowJudgment;
+    debug.log('steward.intake', 'judged', { eventKey: key, number: github.number, type: github.type, verdict: recorded.verdict, reason: recorded.reason });
     const cards = new CardStore(root);
     try {
       const goalId = `github:${github.repository}:${github.type}:${github.number}`;
@@ -104,5 +158,21 @@ export async function recordGithubShadow(event: QueuedHook, root: string, fetchF
       if (!card.sections.some(section => section.key === sectionKey))
         cards.appendSection(card.id, { key: sectionKey, owner: 'steward', content: redactSecrets(content) });
     } finally { cards.close(); }
+    if (github.type === 'pull_request' && recorded.verdict === 'accepted') {
+      store.db.exec(`CREATE TABLE IF NOT EXISTS github_shadow_reviews (
+        event_key TEXT PRIMARY KEY, repository TEXT NOT NULL, item_number INTEGER NOT NULL,
+        reviewed INTEGER NOT NULL, verdict TEXT, summary TEXT NOT NULL
+      )`);
+      if (!store.db.query('SELECT event_key FROM github_shadow_reviews WHERE event_key = ?').get(key)) {
+        let result: ShadowReviewResult;
+        try { result = await review(github.number); }
+        catch (error) { result = { reviewed: false, verdict: null, summary: `review unavailable: ${error instanceof Error ? error.message : String(error)}` }; }
+        store.db.query(`INSERT OR IGNORE INTO github_shadow_reviews
+          (event_key, repository, item_number, reviewed, verdict, summary) VALUES (?, ?, ?, ?, ?, ?)`)
+          .run(key, github.repository, github.number, result.reviewed ? 1 : 0, result.verdict,
+            redactSecrets(result.summary).slice(0, 2000));
+        debug.log('steward.review-shadow', 'recorded', { eventKey: key, number: github.number, reviewed: result.reviewed, verdict: result.verdict });
+      }
+    }
   } finally { store.close(); }
 }

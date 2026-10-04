@@ -10,7 +10,7 @@ import { DiscordBot } from '../discord.js';
 import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from '../intake-plane/discord-seat-work.js';
 import { handleSeatRequests } from '../nexus/api/seat-requests.js';
 import type { UserConfig } from '../user-config.js';
-import { askSeat, deliverSeatAnswers, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
+import { answerSeatAsk, askSeat, deliverSeatAnswers, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
 
 const config = { raw: { decisions: { telegramOwnerId: 111 } } } as unknown as UserConfig;
 const command = (store: MsgStore, lines: string[]) => ({ ownerId: '111', replyTarget: 'acme/repo#42',
@@ -32,7 +32,7 @@ test('fake Telegram ask reaches the /cto channel and seat inbox; seat mailbox re
     const receipt = await handleTelegramSeatWork('CTO 에게 물어봐: 배포 상태?', { chatId: 111, userId: 111, messageId: 456, threadId: 7 },
       { config, commandDeps: command(store, lines), askDeps });
     expect(receipt).toContain('답을 기다립니다');
-    expect(receipt).toContain('최대 30분');
+    expect(receipt).toContain('최대 120분');
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('→ TC · 질문: 배포 상태?');
     const inbox = store.list('TC');
@@ -40,13 +40,13 @@ test('fake Telegram ask reaches the /cto channel and seat inbox; seat mailbox re
     expect(inbox[0]?.kind).toBe('ceo-task');
     const id = /요청: ask:([\w-]+)/.exec(inbox[0]!.body)?.[1];
     expect(id).toBeTruthy();
-    expect(inbox[0]!.body).toContain(`--kind seat-ask-reply --body '${id}: <답>'`);
-    store.append({ from: 'TC', to: 'CEO', kind: 'seat-ask-reply', body: `${id}: 배포 완료` });
-    store.db.query('UPDATE msg_messages SET created_at = ? WHERE kind = ?').run('1970-01-01T00:01:00.000Z', 'seat-ask-reply');
+    expect(inbox[0]!.body).toContain(`elanous seat answer ${id} "<답>"`);
+    answerSeatAsk(id!, '배포 완료', askDeps);
+    expect((store.db.query('SELECT answer FROM seat_asks WHERE id = ?').get(id!) as { answer: string }).answer).toBe('배포 완료');
     await deliverSeatAnswers(askDeps);
     await deliverSeatAnswers(askDeps);
     expect(sent).toEqual([{ origin: { channel: 'telegram', chatId: 111, messageId: 456, threadId: 7 }, text: `CTO 답변 (${id}): 배포 완료` }]);
-    expect(events).toEqual(['sent', 'answered']);
+    expect(events).toEqual(['sent', 'reply-recorded', 'answered']);
   } finally { log.mockRestore(); store.close(); }
 });
 
@@ -98,7 +98,7 @@ test('two polling Telegram bots route a seat mailbox answer only through the rec
     const id = /요청: ask:([\w-]+)/.exec(inbox.find(({ body }) => body.includes('배포 상태?'))!.body)?.[1];
     expect(id).toBeTruthy();
     expect(lines.some(line => line.includes('→ TC · 질문: 배포 상태?'))).toBe(true);
-    store.append({ from: 'TC', to: 'CEO', kind: 'seat-ask-reply', body: `${id}: 배포 완료` });
+    answerSeatAsk(id!, '배포 완료', { open: () => store });
     releasePoll();
     await answer;
     expect(sent.filter(({ body }) => String(body.text).startsWith('CTO 답변'))).toEqual([
@@ -111,6 +111,72 @@ test('two polling Telegram bots route a seat mailbox answer only through the rec
     await Promise.all(running);
     store.close();
   }
+});
+
+test('seat answer CLI records the request in the existing ledger and the fake Telegram sender replies only to the originating chat and thread', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-answer-cli-'));
+  const open = () => new MsgStore(join(root, 'msg', 'messages.db'));
+  const sent: Array<{ chat: number; body: Record<string, unknown> }> = [];
+  const store = open();
+  let bot!: TelegramBot;
+  let polls = 0;
+  const botOpts = { token: '123:fake', allowedUsers: [111], perChatGapMs: 0,
+    onMessage: async () => { throw Error('ask must not reach ordinary chat'); },
+    seatWorkDeps: { config, commandDeps: command(store, []), askDeps: { open } as SeatAskDeps },
+    fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const method = String(url).split('/').at(-1);
+      if (method === 'getUpdates') {
+        if (++polls > 1) { bot.stop(); return Response.json({ ok: true, result: [] }); }
+        return Response.json({ ok: true, result: [{ update_id: 1, message: {
+          message_id: 456, from: { id: 111 }, chat: { id: 111, type: 'private' },
+          message_thread_id: 7, text: 'CTO 에게 물어봐: 배포 상태?',
+        } }] });
+      }
+      if (method === 'sendMessage') {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        sent.push({ chat: Number(body.chat_id), body });
+      }
+      return Response.json({ ok: true, result: { message_id: 9 } });
+    }) as typeof fetch,
+  };
+  try {
+    await (bot = new TelegramBot(botOpts)).start();
+    const id = /요청: ask:([\w-]+)/.exec(store.list('TC')[0]!.body)?.[1];
+    expect(id).toBeTruthy();
+    const otherReceipt = await askSeat('CTO 에게 물어봐: 다른 채팅?',
+      { channel: 'telegram', chatId: 222, messageId: 99, botId: '123' }, command(store, []),
+      { open, send: async () => {} });
+    const otherId = /요청: ([\w-]+)/.exec(otherReceipt)![1]!;
+    const cli = Bun.spawnSync(['bun', 'bin/elanous.mjs', `--test=${root}`, 'seat', 'answer', id!, '배포 완료'], {
+      cwd: process.cwd(), env: { ...process.env },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(new TextDecoder().decode(cli.stderr)).toBe('');
+    expect(cli.exitCode).toBe(0);
+    expect((store.db.query('SELECT answer FROM seat_asks WHERE id = ?').get(id!) as { answer: string }).answer).toBe('배포 완료');
+    await deliverSeatAnswers({ open, channel: 'telegram', botId: '123', send: async (origin, text) => {
+      if (origin.channel !== 'telegram') throw Error('unexpected surface');
+      const posted = await bot.sendMessage(Number(origin.chatId), text, { replyTo: origin.messageId, threadId: origin.threadId });
+      if (!posted) throw Error('not posted');
+    } });
+    expect(sent.filter(({ body }) => String(body.text).startsWith('CTO 답변'))).toEqual([{ chat: 111,
+      body: { chat_id: 111, text: `CTO 답변 (${id}): 배포 완료`, reply_to_message_id: 456, message_thread_id: 7 },
+    }]);
+    expect(sent.every(({ chat }) => chat === 111)).toBe(true);
+    expect((store.db.query('SELECT status FROM seat_asks WHERE id = ?').get(otherId) as { status: string }).status).toBe('pending');
+    expect(() => answerSeatAsk(id!, '중복 답', { open })).toThrow('not pending');
+    expect(() => answerSeatAsk(otherId, '  ', { open })).toThrow('must not be empty');
+    await deliverSeatAnswers({ open, now: () => Date.now() + 2 * 60 * 60 * 1000 + 1,
+      channel: 'telegram', botId: '123', send: async (origin, text) => {
+        if (origin.channel !== 'telegram') throw Error('unexpected surface');
+        const posted = await bot.sendMessage(Number(origin.chatId), text, { replyTo: origin.messageId, threadId: origin.threadId });
+        if (!posted) throw Error('not posted');
+      } });
+    expect(sent.filter(({ body }) => String(body.text).startsWith('CTO 미답'))).toEqual([{ chat: 222,
+      body: { chat_id: 222, text: `CTO 미답 (${otherId}): 아직 답 없음 (120분 경과).`, reply_to_message_id: 99 },
+    }]);
+    expect(sent.filter(({ chat, body }) => chat === 222 && String(body.text).startsWith('CTO 답변'))).toEqual([]);
+  } finally { bot?.stop(); store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('existing /cto-style task dispatch still reaches the coordination channel and seat mailbox unchanged', async () => {
@@ -139,7 +205,7 @@ test('custom ask deadline is reflected in the unanswered notice', async () => {
     expect(receipt).toContain('최대 1분');
     time = 60_000;
     await deliverSeatAnswers(deps);
-    expect(sent[0]).toContain('1분 안에 답이 오지 않았습니다');
+    expect(sent[0]).toContain('아직 답 없음 (1분 경과)');
   } finally { store.close(); }
 });
 
@@ -167,13 +233,12 @@ test('past deadline marks an unanswered ask and does not forward a late reply', 
     const askDeps = { open: () => store, now: () => time, send: async (_origin: AskOrigin, text: string) => { sent.push(text); } };
     await handleTelegramSeatWork('CTO 에게 물어봐: 배포 상태?', { chatId: 111, userId: 111, messageId: 4 },
       { config, commandDeps: command(store, []), askDeps });
-    time = 30 * 60 * 1000;
+    time = 2 * 60 * 60 * 1000;
     const id = /요청: ask:([\w-]+)/.exec(store.list('TC')[0]!.body)?.[1];
-    store.append({ from: 'TC', to: 'CEO', kind: 'seat-ask-reply', body: `${id}: 늦은 답` });
-    store.db.query('UPDATE msg_messages SET created_at = ? WHERE kind = ?').run('1970-01-01T00:31:00.000Z', 'seat-ask-reply');
+    expect(() => answerSeatAsk(id!, '늦은 답', askDeps)).toThrow('deadline passed');
     await deliverSeatAnswers(askDeps);
     await deliverSeatAnswers(askDeps);
-    expect(sent).toEqual([`CTO 미답 (${id}): 30분 안에 답이 오지 않았습니다.`]);
+    expect(sent).toEqual([`CTO 미답 (${id}): 아직 답 없음 (120분 경과).`]);
     expect(events).toEqual(['sent', 'expired']);
   } finally { log.mockRestore(); store.close(); }
 });

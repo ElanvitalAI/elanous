@@ -16,6 +16,7 @@ import type {
   DiscordTriggerNode,
   ExtractNode,
   FilterNode,
+  KnowledgeNode,
   HttpRequestNode,
   IfNode,
   IterationNode,
@@ -47,7 +48,7 @@ let resolvingSubworkflowReferences = false;
 /** ⛔ 노드 변종의 SSOT — 도움말·문서가 이 배열에서 «파생»한다.
  *  손으로 목록을 옮겨 적으면 늙는다(2026-09-22 실측: `elanous wf --help` 가 13종만 말했고
  *  이 배열은 21종을 받고 있었다 — 여덟이 «안내 없이» 살아 있었다). */
-export const WORKFLOW_NODE_VARIANT_KEYS = WORKFLOW_CORE_KINDS;
+export const WORKFLOW_NODE_VARIANT_KEYS = [...WORKFLOW_CORE_KINDS] as const;
 
 const KEBAB_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const TRIGGER_RULES: readonly TriggerRule[] = [
@@ -825,6 +826,18 @@ export function validateWorkflow(raw: unknown): ValidationResult {
           push(`${path}.filter.condition`, "'filter.condition' is required and must be a non-empty string");
         }
       }
+    } else if (variant === 'knowledge') {
+      if (!isObject(variantValue)) {
+        push(`${path}.knowledge`, "'knowledge' must be an object with a 'query' field");
+      } else {
+        if (typeof variantValue['query'] !== 'string') {
+          push(`${path}.knowledge.query`, "'knowledge.query' is required and must be a string expression");
+        }
+        const limit = variantValue['limit'];
+        if (limit !== undefined && (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 200)) {
+          push(`${path}.knowledge.limit`, "'knowledge.limit' must be an integer from 1 to 200");
+        }
+      }
     } else if (variant === 'iteration') {
       // Node-catalog N1.3 (2026-05-11) — sequential loop.
       if (!isObject(variantValue)) {
@@ -1093,6 +1106,9 @@ export const isFilterNode = (n: DagNode): n is FilterNode =>
   typeof (n as FilterNode).filter === 'object' && (n as FilterNode).filter !== null
   && typeof ((n as FilterNode).filter as { items?: unknown }).items === 'string'
   && typeof ((n as FilterNode).filter as { condition?: unknown }).condition === 'string';
+export const isKnowledgeNode = (n: DagNode): n is KnowledgeNode =>
+  typeof (n as KnowledgeNode).knowledge === 'object' && (n as KnowledgeNode).knowledge !== null
+  && typeof ((n as KnowledgeNode).knowledge as { query?: unknown }).query === 'string';
 export const isTemplateNode = (n: DagNode): n is TemplateNode =>
   typeof (n as TemplateNode).template === 'object' && (n as TemplateNode).template !== null
   && typeof ((n as TemplateNode).template as { template?: unknown }).template === 'string';

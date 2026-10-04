@@ -42,7 +42,7 @@ export function defaultBaseUrl(deps: { runtime?: () => ReturnType<typeof readNex
   return `http://${host}:${rt.httpPort}`;
 }
 
-function defaultToken(): string | null {
+export function defaultToken(): string | null {
   const p = join(getElanousConfigDir(), 'acp-token');
   try { return existsSync(p) ? readFileSync(p, 'utf-8').trim() || null : null; } catch { return null; }
 }

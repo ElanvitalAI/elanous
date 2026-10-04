@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { dirname, join, resolve } from 'node:path';
@@ -8,13 +8,15 @@ import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, universeLaunch } from '../autopilot
 import { debug } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
+import { loopEvent } from '../loops/observe.js';
 import { getUserConfig, type PersonaLoopConfig, type SeatLoopConfig, type UserConfig } from '../user-config.js';
 import { checkSeatBudget, type RunningSeatPod } from '../org/seat-budget.js';
 import { DEFAULT_STALL_PARENTS, findStalls } from '../org/stall-escalation.js';
 import { openMsgStore, type MessageEnvelope } from '../msg/msg-store.js';
 import { loadLayeredPersonaDirs, resolveRepositoryPersonaDir, resolveStatePersonaDir } from '../persona/global-registry.js';
-import { nextPersonaTodo, personaTodoPath, readPersonaTodos, type PersonaTodo } from '../persona/persona-todo.js';
+import { orderedPersonaTodos, personaTodoPath, readPersonaTodos, type PersonaTodo } from '../persona/persona-todo.js';
 import { PersonaRegistry } from '../persona/registry.js';
+import { recordSeatAskShadow } from '../seat-dispatch/seat-ask.js';
 import { answerSeat, askSeat, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatQuestions, type SeatId } from '../seat-dispatch/seat-questions.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
@@ -33,11 +35,12 @@ export type OpCandidate =
   | { kind: 'decision-delegation'; id: string | null; title?: string; category?: DecisionEntry['category']; dueAt?: string; verdict: 'review-delegation' | 'none' };
 export type TcCandidate =
   | { kind: 'merged-pr-yellow-cell'; version: string; id: string; title: string; pr: number; mergedAt: string }
-  | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] };
+  | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
+  | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
 export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off' };
-export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null };
+export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null; action?: 'decision' | 'harness' | 'wait'; what?: string };
 export type SeatDeps = {
   personaConfig?: PersonaLoopConfig;
   personaRegistry?: PersonaRegistry;
@@ -134,8 +137,17 @@ export function personaShadowLedgerPath(personaId: string, root: string, now: Da
   return join(root, 'persona-loop', personaId, `${seatDay(now)}.jsonl`);
 }
 
+export async function runPersonaLoopOnce(name: string, deps: SeatDeps = {}): Promise<PersonaShadowEntry> {
+  const entries = await pickPersonaShadows(deps, name);
+  return entries[0]!;
+}
+
 export async function runPersonaShadowOnce(deps: SeatDeps = {}): Promise<PersonaShadowEntry[]> {
   if ((deps.personaConfig ?? getUserConfig().loops?.persona)?.enabled !== true) return [];
+  return pickPersonaShadows(deps);
+}
+
+async function pickPersonaShadows(deps: SeatDeps, name?: string): Promise<PersonaShadowEntry[]> {
   const root = deps.root ?? effectiveInstanceRoot();
   const dir = deps.personaDir ?? (deps.root ? join(root, 'personas') : resolveStatePersonaDir());
   const registry = deps.personaRegistry ?? new PersonaRegistry();
@@ -145,19 +157,31 @@ export async function runPersonaShadowOnce(deps: SeatDeps = {}): Promise<Persona
   }
   const now = (deps.now ?? (() => new Date()))();
   const entries: PersonaShadowEntry[] = [];
-  for (const profile of registry.list().sort((a, b) => a.personaId.localeCompare(b.personaId))) {
+  const profiles = registry.list().sort((a, b) => a.personaId.localeCompare(b.personaId));
+  const selected = name === undefined ? profiles : profiles.filter((profile) => profile.personaId.toLowerCase() === name.trim().toLowerCase()
+    || profile.displayName.toLowerCase() === name.trim().toLowerCase());
+  if (name !== undefined && selected.length !== 1) throw new Error(selected.length ? `ambiguous persona name: ${name}` : `persona not found: ${name}`);
+  for (const profile of selected) {
     const personaId = profile.personaId;
-    const { todos, errors } = readPersonaTodos(dir, personaId);
+    const todoFile = profile.todo ?? `${personaId}.todo.jsonl`;
+    const { todos, errors } = readPersonaTodos(dir, todoFile.slice(0, -'.todo.jsonl'.length));
     for (const error of errors) observe('persona-todo-error', { personaId, error });
-    const todo = nextPersonaTodo(todos);
-    const entry: PersonaShadowEntry = { personaId, ts: now.toISOString(), status: todo ? 'shadow' : 'skipped-empty', todo };
+    const candidates = orderedPersonaTodos(todos);
+    const picked = pickNext({ requests: candidates.map((candidate) => ({
+      source: 'request', id: candidate.id, title: candidate.title, text: candidate.title, createdAt: candidate.createdAt,
+    })), checklist: [], role: '' }, [], { shadow: true });
+    const todo = picked ? candidates.find((candidate) => candidate.id === picked.id) ?? null : null;
+    const planned = name !== undefined && todo && picked ? planAction(picked, profile.seat) : undefined;
+    const entry: PersonaShadowEntry = { personaId, ts: now.toISOString(), status: todo ? 'shadow' : 'skipped-empty', todo,
+      ...(planned ? { action: planned.kind, what: planned.text } : {}) };
     const path = personaShadowLedgerPath(personaId, root, now);
     if (deps.appendPersona) deps.appendPersona(path, entry);
     else {
       mkdirSync(dirname(path), { recursive: true });
       appendFileSync(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
     }
-    observe('persona-shadow', { personaId, status: entry.status, todoId: todo?.id ?? null });
+    try { debug.log('persona.loop', 'picked', { personaId, status: entry.status, todoId: todo?.id ?? null, title: todo?.title ?? null, action: entry.action ?? null }); }
+    catch { /* observation cannot alter the shadow ledger */ }
     entries.push(entry);
   }
   return entries;
@@ -167,6 +191,25 @@ export async function runSeatLoopTurn(seat: string, deps: SeatDeps = {}): Promis
   const result = await runSeatLoopOnce(seat, deps);
   try { await runPersonaShadowOnce(deps); }
   catch (error) { observe('persona-shadow-error', { error: String(error).slice(0, 200) }); }
+  try {
+    const config = deps.config ?? getUserConfig().loops?.seat ?? { mode: 'off' };
+    const profile = result.status === 'skipped-off' ? 'off' : config.mode;
+    const context = { runId: 'runId' in result && result.runId ? result.runId : `seat-turn-${randomUUID()}`,
+      profile, sourceRef: `docs/roles/${seat}.md` };
+    const loopId = `${seat.toLowerCase()}-seat`;
+    loopEvent(loopId, 'tick', { ...context, outcome: result.status, reason: result.status });
+    if ('inquiry' in result && result.inquiry && (result.status === 'asked' || result.status === 'hitl')) {
+      loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'delegation',
+        from: seat, to: result.inquiry.to, itemId: result.item?.id });
+    }
+    if ('escalated' in result && result.escalated && result.status === 'skipped-budget') {
+      loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'delegation',
+        from: seat, to: (config.stall?.parents ?? {})[seat] ?? DEFAULT_STALL_PARENTS[seat], itemId: result.item?.id });
+    } else if (result.status === 'skipped-budget') {
+      loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'requeue',
+        itemId: result.item?.id });
+    }
+  } catch { /* observation cannot change a completed seat turn */ }
   return result;
 }
 
@@ -198,6 +241,8 @@ function decisionReceipt(root: string, seat: string, item: SeatItem): DecisionEn
 function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: string): Set<string> {
   const inquiryRow = (entry: SeatEntry) => entry.action === 'seat-question' || entry.action === 'seat-answer' || !!entry.inquiry;
   return new Set(ledger.filter((entry, index) => entry.status === 'asked' || entry.status === 'answered'
+    // RM3a: only TC's other-seat defect ask-shadows are deduplicated here — an ordinary inquiry recorded in shadow must still be delivered once questions turn on.
+    || (entry.status === 'shadow' && entry.candidate?.kind === 'other-seat-cell-defect')
     || (entry.status === 'hitl' && (!entry.inquiry || (!!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))))
     || (entry.inquiry?.to === 'CEO' && !!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))
     || (!inquiryRow(entry) && entry.status === 'outcome-unknown')
@@ -303,9 +348,10 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     debug.log('seat.loop', 'schedule-unreadable', { seat, error: String(error).slice(0, 200) });
   }
   const checklist: SeatItem[] = [];
+  const closed: string[] = [];
   for (const version of open === null ? [] : versions().sort(versionOrder)) {
     if (!open!.has(version)) {
-      debug.log('seat.loop', 'skip-closed-version', { seat, version });
+      closed.push(version);
       continue;
     }
     let items: ReturnType<typeof itemsOf>;
@@ -324,6 +370,9 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
           ...(item.evidence ? { evidence: item.evidence } : {}), evidenceHash: createHash('sha256').update(item.evidence ?? '').digest('hex') });
       }
     }
+  }
+  if (closed.length > 0) {
+    debug.log('seat.loop', 'skip-closed-versions', { seat, count: closed.length, newest: closed.at(-1)!, oldest: closed[0]! });
   }
   checklist.sort((a, b) => versionOrder(a.version!, b.version!) || a.id.localeCompare(b.id));
   return { requests: pending, checklist, role: read(join(deps.repo ?? repoRoot, 'docs', 'roles', `${seat}.md`)).slice(0, 4_000) };
@@ -375,7 +424,7 @@ function readTcChecklist(root: string): Array<{ version: string; id: string; tit
   const db = new Database(path, { readonly: true, strict: true });
   try {
     return db.query(`SELECT a.version, f.id, COALESCE(a.title_override, f.title) AS title, a.status, a.owner
-      FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.status = 'yellow' AND a.owner = 'TC'
+      FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.status IN ('yellow', 'red') AND a.owner IN ('OP', 'TC', 'MK', 'UX')
       ORDER BY a.version, f.id`).all() as Array<{ version: string; id: string; title: string; status: string; owner: string | null }>;
   } finally { db.close(); }
 }
@@ -461,16 +510,27 @@ async function tcCandidates(deps: SeatDeps, now: Date): Promise<TcCandidate[]> {
   const candidates: TcCandidate[] = [];
   const releaseRoot = deps.root ?? releaseLedgerRoot();
   try {
-    const cells = merged.length === 0 ? [] : deps.checklistItems && deps.schedules
+    const cells = deps.checklistItems && deps.schedules
       ? deps.schedules().flatMap(({ version }) => deps.checklistItems!(version).map((cell) => ({ ...cell, version })))
       : readTcChecklist(releaseRoot);
+    let shipped: string | undefined;
+    try { shipped = releasedVersion(releaseRoot); }
+    catch (error) { observe('tc-release-unreadable', { seat: 'TC', error: String(error).slice(0, 200) }); }
+    const openVersions = deps.schedules ? new Set(deps.schedules().filter(({ cutAt }) => Number.isFinite(Date.parse(cutAt))
+      && Date.parse(cutAt) > now.getTime()).map(({ version }) => version)) : null;
     for (const cell of cells) {
-      if (cell.owner !== 'TC' || cell.status !== 'yellow') continue;
+      if (cell.owner !== 'TC' && ((shipped && versionOrder(cell.version, shipped) <= 0) || (openVersions && !openVersions.has(cell.version)))) continue;
+      if (cell.status !== 'yellow' && cell.status !== 'red') continue;
+      if (!cell.owner || !isSeatId(cell.owner)) continue;
+      if (cell.owner !== 'TC') {
+        if (cell.status === 'red') candidates.push({ kind: 'other-seat-cell-defect', version: cell.version, id: cell.id, title: cell.title, to: cell.owner });
+        continue;
+      }
       for (const pr of merged) {
         const id = cell.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const reference = new RegExp(`(?<![A-Za-z0-9])${id}(?![A-Za-z0-9])`);
         if (reference.test(pr.title) || reference.test(pr.body ?? '')) {
-          candidates.push({ kind: 'merged-pr-yellow-cell', version: cell.version, id: cell.id, title: cell.title, pr: pr.number, mergedAt: pr.mergedAt! });
+          if (cell.owner === 'TC' && cell.status === 'yellow') candidates.push({ kind: 'merged-pr-yellow-cell', version: cell.version, id: cell.id, title: cell.title, pr: pr.number, mergedAt: pr.mergedAt! });
         }
       }
     }
@@ -624,6 +684,20 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   if (seat === 'TC') {
     const candidates = await tcCandidates(deps, now);
     for (const candidate of candidates) {
+      if (candidate.kind === 'other-seat-cell-defect') {
+        const question = `${candidate.version} 체크리스트 ${candidate.id} · ${candidate.title}: ${candidate.to} 칸 결함을 확인해 주세요.`;
+        const recorded = recordSeatAskShadow(stateRoot, { from: 'TC', to: candidate.to, itemId: candidate.id, version: candidate.version, question }, now.getTime());
+        const inLedger = ledger.some((row) => row.status === 'shadow' && row.candidate?.kind === 'other-seat-cell-defect'
+          && row.candidate.version === candidate.version && row.candidate.id === candidate.id && row.candidate.to === candidate.to);
+        if (!inLedger) {
+          const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate,
+            item: { source: 'checklist', kind: 'cell', id: candidate.id, title: candidate.title, text: candidate.title, version: candidate.version, seat: candidate.to },
+            action: 'seat-question', inquiry: { to: candidate.to, question } };
+          (deps.append ?? defaultAppend)(path, entry);
+        }
+        if (!inLedger || recorded) observe('ask-shadow', { from: seat, to: candidate.to, itemId: candidate.id });
+        continue;
+      }
       if (ledger.some((row) => row.status === 'shadow' && JSON.stringify(row.candidate) === JSON.stringify(candidate))) continue;
       const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate };
       (deps.append ?? defaultAppend)(path, entry);
@@ -761,7 +835,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
               await run(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
                 '--s', `${seat} 질문 · ${item.title}`, '--c', '판단 근거 부족 — 사람의 결정이 필요하다',
                 '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
-                '--skip-recommend', '근거가 부족하다', '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
+                '--skip-recommend', '근거가 부족하다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②', '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
             }
             if (!decisionReceipt(root, seat, item)) throw new Error('decisions raise did not deliver a matching card');
             entry.status = 'hitl';
@@ -866,7 +940,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       const raised = await run(['decisions', 'raise', '--title', title, '--category', 'other',
         '--s', `${seat} 배정 항목: ${action.text.replace(/[\r\n]+/g, ' ')}\n역할: ${inputs.role}`, '--c', '자동 실행 금지 문면에 해당하여 사람 결정이 필요하다',
         '--option', 'a=사람 승인:승인 후 별도로 집행', '--option', 'b=보류:집행하지 않음',
-        '--skip-recommend', '금지 문면은 자동으로 권고하지 않는다', '--agent', 'seat-loop', '--json']);
+        '--skip-recommend', '금지 문면은 자동으로 권고하지 않는다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②', '--agent', 'seat-loop', '--json']);
       const decision: unknown = JSON.parse(raised.trim());
       if (!decision || typeof decision !== 'object' || typeof (decision as { id?: unknown }).id !== 'string') {
         throw new Error('decisions raise returned no decision id');

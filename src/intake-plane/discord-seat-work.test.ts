@@ -92,6 +92,79 @@ describe('Discord persona address', () => {
   });
 });
 
+describe('Discord persona seat alias', () => {
+  const seated: PersonaProfile = { ...sage, seat: 'MK' };
+  const typo: PersonaProfile = { personaId: 'typo', displayName: 'Typo', seat: 'CFO' };
+  const profiles = [seated, typo, ...personaProfiles.slice(1)];
+  const source: PersonaSource = { list: () => profiles, get: (id) => profiles.find((p) => p.personaId === id) };
+
+  test('owner task and question follow @MK exactly, never the persona completion', async () => {
+    const dispatched: unknown[] = []; const answered: unknown[] = []; const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address' && event === 'seat-alias') events.push(data);
+    }) as typeof debug.log);
+    const deps = { config, personaSource: source,
+      personaAnswer: async () => { throw Error('should not answer persona'); },
+      dispatch: async (seat: string, body: string, _deps: unknown, extra: unknown) => {
+        dispatched.push([seat, body, extra]); return { reply: '받음', channel: 'posted' as const };
+      },
+      answer: async (seat: string, body: string) => { answered.push([seat, body]); return { title: 'CMO', text: '자리 답' }; },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    try {
+      expect(await handleDiscordSeatWork('@sage 내일 일정 정리해 줘', OWNER, deps)).toBe('받음');
+      expect(await handleDiscordSeatWork('@MK 내일 일정 정리해 줘', OWNER, deps)).toBe('받음');
+      expect(dispatched).toEqual(Array(2).fill(['MK', '내일 일정 정리해 줘', { via: 'discord' }]));
+      expect(await handleDiscordSeatWork('@sage 오늘 할 일?', OWNER, deps)).toBe('자리 답');
+      expect(await handleDiscordSeatWork('@MK 오늘 할 일?', OWNER, deps)).toBe('자리 답');
+      expect(answered).toEqual([['MK', '오늘 할 일?'], ['MK', '오늘 할 일?']]);
+      expect(events).toEqual(Array(2).fill({ name: 'sage', personaId: 'sage', seat: 'MK', via: 'discord' }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('owner mixed alias and seat submit both seats; one alias falls back to intake on no answer', async () => {
+    const inputs: unknown[] = [];
+    const deps = { config, personaSource: source,
+      personaAnswer: async () => { throw Error('should not answer persona'); },
+      dispatch: async () => { throw Error('should not dispatch'); },
+      answer: async () => null,
+      submit: async (input: { text: string }) => { inputs.push(input.text); return { ok: true as const, track: 'graph' as const, acceptanceId: `R-${inputs.length}` }; },
+    } as never;
+    expect(await handleDiscordSeatWork('@sage,@OP 정리해 줘', OWNER, deps)).toBe('@CMO 접수번호: R-1\n@COO 접수번호: R-2');
+    expect(inputs).toEqual(['@CMO 정리해 줘', '@COO 정리해 줘']);
+    expect(await handleDiscordSeatWork('@sage 오늘 할 일?', OWNER, deps)).toBe('@CMO 접수번호: R-3');
+    expect(inputs).toEqual(['@CMO 정리해 줘', '@COO 정리해 줘', '@CMO 오늘 할 일?']);
+  });
+
+  test('no seat and unresolved seat retain persona voice; non-owner alias is rejected without persona lookup', async () => {
+    const calls: string[] = []; const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address' && event === 'seat-alias') events.push(data);
+    }) as typeof debug.log);
+    const deps = { config, personaSource: source,
+      personaAnswer: async (persona: PersonaProfile) => { calls.push(persona.personaId); return `@${persona.displayName} 답`; },
+      dispatch: async () => { throw Error('should not dispatch'); },
+      answer: async () => { throw Error('should not answer seat'); },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    try {
+      expect(await handleDiscordSeatWork('@mira 질문', OWNER, deps)).toBe('@Mira 답');
+      expect(await handleDiscordSeatWork('@typo 질문', OWNER, deps)).toBe('@Typo 답');
+      const forbiddenSource: PersonaSource = { list: () => { throw Error('should not list personas'); },
+        get: () => { throw Error('should not look up persona'); } };
+      const outsider = { config, personaSource: forbiddenSource,
+        personaAnswer: async () => { throw Error('should not answer persona'); },
+        submit: async () => { throw Error('should not submit'); } } as never;
+      expect(await handleDiscordSeatWork('@sage 질문', { ...OWNER, userId: '22222' }, outsider))
+        .toBe('어느 좌석을 말씀하시나요? @sage은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.');
+      expect(await handleDiscordSeatWork('@sage 질문', { ...OWNER, isDm: false }, outsider))
+        .toBe('어느 좌석을 말씀하시나요? @sage은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.');
+      expect(calls).toEqual(['mira', 'typo']);
+      expect(events).toEqual([]);
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('Discord owner intent', () => {
   test('one seat question answers; null answer falls back to intake', async () => {
     const answers: unknown[] = []; const inputs: unknown[] = [];

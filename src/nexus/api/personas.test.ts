@@ -100,6 +100,8 @@ describe('persona REST routes', () => {
     expect(saved).toContain('preset:');
     expect(saved).toContain('New description');
     expect((await dispatch(path))?.status).toBe(200);
+    const byName = await dispatch('/v1/personas/Edited');
+    expect((await byName!.json()).persona).toMatchObject({ personaId: 'nexus-test', systemPrompt: 'New\nPrompt' });
   });
 
   test('GET keeps decoded IDs with dots or non-ASCII as lookups; PATCH still validates write IDs', async () => {

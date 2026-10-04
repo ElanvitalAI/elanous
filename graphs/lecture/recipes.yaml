@@ -1,0 +1,17 @@
+collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/lecture-note/node.ts" collect'
+  timeout_ms: 120000
+draft:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/lecture-note/node.ts" draft'
+  timeout_ms: 300000
+confirm:
+  approval: '{"kind":"lecture-outline"}'
+render:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/lecture-note/node.ts" render'
+  timeout_ms: 600000
+html:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/lecture-note/node.ts" html'
+  timeout_ms: 120000
+pdf:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/lecture-note/node.ts" pdf'
+  timeout_ms: 120000

@@ -9,7 +9,7 @@ import { askSeat, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-a
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { answerAsSeat } from './seat-answer.js';
-import { answerAsPersona, resolvePersonaAddress, type PersonaAnswerDeps } from './persona-answer.js';
+import { answerAsPersona, resolvePersonaAddress, seatOfPersona, type PersonaAnswerDeps } from './persona-answer.js';
 import {
   submitIntakeWork,
   type SubmitIntakeWorkDeps,
@@ -66,16 +66,23 @@ export async function handleTelegramSeatWork(
   const address = parseSeatAddress(text.replace(/^(@[A-Za-z][A-Za-z0-9_-]*(?:,@?[A-Za-z][A-Za-z0-9_-]*)*)/, (prefix) => prefix.replaceAll(',@', ',')));
   if (!address) return null;
 
-  const seats = address.seats.map((name) => ({ name, seat: resolveSeat(name) }));
+  const initialSeats = address.seats.map((name) => ({ name, seat: resolveSeat(name) }));
   const names = address.seats;
   debug.log('seat-address.telegram', 'parsed', { seats: names });
-  const hasUnresolved = seats.some(({ seat }) => !seat);
+  const hasUnresolved = initialSeats.some(({ seat }) => !seat);
   const auth = hasUnresolved ? owner() : null;
   if (hasUnresolved && auth && !deps.personaSource) await awaitGlobalPersonaLoad();
   const source = hasUnresolved && auth ? (deps.personaSource ?? getGlobalPersonaRegistry()) : null;
-  const addressed = seats.map(({ name, seat }) => ({
-    name, seat, persona: !seat && source ? resolvePersonaAddress(name, source) : null,
-  }));
+  const addressed = initialSeats.map(({ name, seat }) => {
+    const persona = !seat && source ? resolvePersonaAddress(name, source) : null;
+    const personaSeat = persona ? seatOfPersona(persona) : null;
+    if (persona && personaSeat) {
+      debug.log('persona.address', 'seat-alias', { name, personaId: persona.personaId, seat: personaSeat.id, via: 'telegram' });
+      return { name: personaSeat.id, seat: personaSeat, persona: null };
+    }
+    return { name, seat, persona };
+  });
+  const seats = addressed;
   const unknown = addressed.filter(({ seat, persona }) => !seat && (!persona || !auth)).map(({ name }) => `@${name}`);
   if (unknown.length) {
     debug.log('seat-address.telegram', 'rejected', { seats: names, reason: 'unknown-seat' });

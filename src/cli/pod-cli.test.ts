@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { POD_COMMAND_DEADLINE_SECONDS, registerPodCommands } from './pod-cli.js';
 import { POD_HOST_LEASE_ANNOTATION } from '../task-orchestrator/surfaces/pod-lease.js';
+import { podPoolHostLease, parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
+import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import type { RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
+import { HostPoolLease, psProcessStart } from '../pod-lease/host-lease.js';
 
 function capture() {
   const lines: string[] = [];
@@ -32,14 +35,152 @@ describe('elanous pod lease status', () => {
     ? JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '263471132Ki', cpu: '32' }, conditions: [{ type: 'Ready', status: 'True' }] } }] })
     : args.includes('jobs') ? JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }] })
       : JSON.stringify({ items: pods }) });
-  const runStatus = async (json: boolean) => {
+  const runStatus = async (json: boolean, phase?: 'Pending') => {
     const cap = capture();
     const program = new Command();
     program.exitOverride();
-    registerPodCommands(program, { io: cap.io, kubectl, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+    const observe = phase ? (args: readonly string[]) => args.includes('pods')
+      ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [{ ...pods[0], status: { phase } }, ...pods.slice(1)] }) }
+      : kubectl(args) : kubectl;
+    registerPodCommands(program, { io: cap.io, kubectl: observe, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
     await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
     return cap;
   };
+  test('status separates authoring reservations, waiting Jobs, and Running Pods', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-lease-status-'));
+    const previous = process.env.ELANOUS_POD_LEASE_DIR;
+    process.env.ELANOUS_POD_LEASE_DIR = dir;
+    try {
+      const host = podPoolHostLease(parsePodPool('node-b:20'));
+      const authoring = host.tryReserve(() => true)!;
+      const job = host.tryReserve(() => true)!;
+      job.applied('waiting-job', 'node-b', 'elanous-test');
+      const json = await runStatus(true);
+      const table = await runStatus(false);
+      expect(JSON.parse(json.lines[0]!)).toMatchObject({ reserved: 1, waitingJobs: 1, running: 10 });
+      expect(table.lines.join('\n')).toContain('예약(저작 중) 1 · 대기 Job 1 · 실행 10');
+      authoring(); job();
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+      else process.env.ELANOUS_POD_LEASE_DIR = previous;
+      require('node:fs').rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('status counts a Pending Pod and its host lease once as one waiting Job', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-lease-status-'));
+    const previous = process.env.ELANOUS_POD_LEASE_DIR;
+    process.env.ELANOUS_POD_LEASE_DIR = dir;
+    try {
+      const host = podPoolHostLease(parsePodPool('node-b:20'));
+      const job = host.tryReserve(() => true)!;
+      job.applied('harness-job', 'node-b', 'elanous-test');
+      const status = await runStatus(true, 'Pending');
+      expect(JSON.parse(status.lines[0]!)).toMatchObject({ reserved: 0, waitingJobs: 1, pending: 1, running: 9 });
+      job();
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+      else process.env.ELANOUS_POD_LEASE_DIR = previous;
+      require('node:fs').rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('same-name Pending Pod in another context cannot hide an unobserved Job lease or admit a third launch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-lease-scoped-status-'));
+    const previous = process.env.ELANOUS_POD_LEASE_DIR;
+    process.env.ELANOUS_POD_LEASE_DIR = dir;
+    const members = parsePodPool('a:1,b:1');
+    const makeLease = () => new HostPoolLease('a@,b@', { dir });
+    const first = makeLease().tryReserve((n) => n < 2, true)!;
+    const second = makeLease().tryReserve((n) => n < 2, true)!;
+    first.applied('shared-job', 'a', 'elanous-test');
+    second.applied('shared-job', 'b', 'elanous-test');
+    const node = JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '64Gi', cpu: '4' }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
+    const pendingPod = { metadata: { namespace: 'elanous-test', name: 'waiting-a', labels: { 'elanous.substrate': 'pod', 'elanous.job': 'shared-job' } },
+      status: { phase: 'Pending' }, spec: { containers: [{ resources: { requests: { memory: '4Gi' }, limits: { memory: '16Gi' } } }] } };
+    const kubectl = (args: readonly string[]) => ({ status: 0, stderr: '', stdout: args.includes('nodes') ? node
+      : args.includes('jobs') ? JSON.stringify({ items: [{ metadata: { name: 'shared-job', labels: { 'elanous.substrate': 'pod' } } }] })
+        : JSON.stringify({ items: args[1] === 'a' ? [pendingPod] : [] }) });
+    const cap = capture(); const program = new Command(); program.exitOverride();
+    const poolSpec = () => 'a:1,b:1';
+    try {
+      registerPodCommands(program, { io: cap.io, kubectl, dns: () => 'ready', accounts: () => 0, poolSpec });
+      await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+      expect(JSON.parse(cap.lines[0]!)).toMatchObject({ pending: 1, waitingJobs: 2, reserved: 0, running: 0,
+        pendingJobs: [{ context: 'a', namespace: 'elanous-test', job: 'shared-job' }] });
+      const contender = new HostPoolLease('a@,b@', { dir, pid: 101, processStart: (pid) => pid === 101 ? 'contender' : psProcessStart(pid) });
+      const scheduler = new PodPoolScheduler(members, { hostLease: contender, kubectl, dns: () => 'ready', pollMs: 2 });
+      const controller = new AbortController();
+      const third = scheduler.acquireAdmission(controller.signal).then((release) => { release(); return 'admitted'; }, (error: Error) => error.message);
+      try {
+        await Bun.sleep(20);
+        expect(scheduler.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
+      } finally { controller.abort(); }
+      expect(await third).toBe('pod lease admission aborted');
+    } finally {
+      first(); second();
+      if (previous === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+      else process.env.ELANOUS_POD_LEASE_DIR = previous;
+      require('node:fs').rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('actual Job apply binds the lease to its Job so Pending is one waiting Job until Running', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-lease-applied-status-'));
+    const previous = process.env.ELANOUS_POD_LEASE_DIR;
+    process.env.ELANOUS_POD_LEASE_DIR = dir;
+    const host = podPoolHostLease(parsePodPool('node-b:20'));
+    const pool = new PodPoolScheduler(parsePodPool('node-b:20'), { hostLease: host, pollMs: 2, status: () => ({
+      recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+      capacitySlots: 20, memorySlots: 20, placeableSlots: 20, running: 9, pending: 0,
+    }) });
+    let appliedJob: string | undefined;
+    let phase: 'Pending' | 'Running' | 'Complete' = 'Pending';
+    const spawnKubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input) as { kind: string; metadata: { name: string } };
+        if (manifest.kind === 'Job') appliedJob = manifest.metadata.name;
+      }
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: phase === 'Complete' ? 'Complete' : '', stderr: '' };
+      if (args.includes('jsonpath={.items[*].status.phase}')) return { status: 0, stdout: phase, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const controller = new AbortController();
+    let launched: ReturnType<ReturnType<typeof podSelfImplementSpawn>> | undefined;
+    try {
+      const spawn = podSelfImplementSpawn({ pool, kubectl: spawnKubectl, pollMs: 2, imageCommit: null,
+        credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
+      launched = spawn({ spaceId: 'pending-actual-apply', feature: 'f', signal: controller.signal });
+      for (let n = 0; n < 100 && !appliedJob; n++) await Bun.sleep(5);
+      expect(appliedJob).toBe(podJobName('pending-actual-apply'));
+      const expected = appliedJob!;
+      for (let n = 0; n < 100 && host.live()[0]?.job !== expected; n++) await Bun.sleep(5);
+      expect(host.live()).toEqual([expect.objectContaining({ stage: 'job', job: expected })]);
+      const status = capture();
+      const program = new Command();
+      program.exitOverride();
+      const observe = (args: readonly string[]) => {
+        if (args.includes('nodes')) return kubectl(args);
+        if (args.includes('jobs')) return { status: 0, stderr: '', stdout: JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }, { metadata: { name: expected, labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }] }) };
+        if (args.includes('pods')) return { status: 0, stderr: '', stdout: JSON.stringify({ items: [{ ...pods[0], metadata: { ...pods[0]!.metadata, labels: { 'elanous.job': expected, 'elanous.substrate': 'pod' } }, status: { phase: 'Pending' } }, ...pods.slice(1).map((pod) => ({ ...pod, metadata: { ...pod.metadata, labels: { ...pod.metadata.labels, 'elanous.substrate': 'pod' } } }))] }) };
+        return { status: 0, stderr: '', stdout: JSON.stringify({ items: [] }) };
+      };
+      registerPodCommands(program, { io: status.io, kubectl: observe, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+      await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+      expect(JSON.parse(status.lines[0]!)).toMatchObject({ reserved: 0, waitingJobs: 1, pending: 1, running: 9 });
+      expect(host.live()).toHaveLength(1);
+      phase = 'Running';
+      for (let n = 0; n < 100 && host.live().length; n++) await Bun.sleep(5);
+      expect(host.live()).toHaveLength(0);
+      phase = 'Complete';
+      expect((await launched.done).exitCode).toBe(0);
+    } finally {
+      controller.abort();
+      phase = 'Complete';
+      if (launched) await launched.done;
+      if (previous === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+      else process.env.ELANOUS_POD_LEASE_DIR = previous;
+      require('node:fs').rmSync(dir, { recursive: true, force: true });
+    }
+  });
   test('--json and table agree on measurements and recommendation', async () => {
     const json = await runStatus(true);
     const table = await runStatus(false);

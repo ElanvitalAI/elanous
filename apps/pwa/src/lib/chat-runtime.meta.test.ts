@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { dispatchMeta, isMetaCommand, META_COMMANDS, META_HANDLERS, type ChatRuntimeContext } from './chat-runtime';
 import { DaemonClient } from './daemon-client';
+import { selectedChatPersona } from './chat-persona';
 
 const ctx = {
   sessionId: 'test-session',
@@ -33,14 +34,13 @@ describe('PWA slash-command boundary', () => {
   it('answers TUI commands and aliases locally, without calling an LLM', async () => {
     const cap = captureMetaLog();
     try {
-      for (const name of ['/run-skill test', '/rs test', '/resume-turn']) {
+      for (const name of ['/resume-turn', '/mission']) {
         expect(isMetaCommand(name)).toBe(true);
         expect((await dispatchMeta(name, ctx))?.text).toBe(`${name.split(' ')[0]} 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear`);
       }
       expect(cap.seen).toEqual([
-        { cmd: ':run-skill', outcome: 'unsupported-tui' },
-        { cmd: ':rs', outcome: 'unsupported-tui' },
         { cmd: ':resume-turn', outcome: 'unsupported-tui' },
+        { cmd: ':mission', outcome: 'unsupported-tui' },
       ]);
     } finally { cap.restore(); }
   });
@@ -65,7 +65,7 @@ describe('PWA slash-command boundary', () => {
   it('keeps the meta handlers, their slash equivalents and their outcomes', async () => {
     const cap = captureMetaLog();
     try {
-      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'remaining', 'status', 'fork', 'rewind', 'undo', 'budget', 'history', 'clear', 'sessions', 'resume', 'model', 'reasoning', 'provider', 'wish']);
+      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'remaining', 'status', 'fork', 'rewind', 'undo', 'budget', 'history', 'clear', 'sessions', 'resume', 'persona', 'model', 'reasoning', 'provider', 'wish', 'run-skill']);
       expect(Object.keys(META_HANDLERS)).toEqual(META_COMMANDS.map(({ name }) => `:${name}`));
       for (const name of ['help', 'session', 'budget', 'history', 'clear']) {
         expect(await dispatchMeta(`/${name}`, ctx)).toEqual(await dispatchMeta(`:${name}`, ctx));
@@ -158,7 +158,7 @@ describe('PWA slash-command boundary', () => {
     expect((await dispatchMeta('/help', ctx))?.text).toBe(colon);
     expect(colon?.split('\n')).toEqual([
       '메타 명령(:이름 또는 /이름) (Meta commands):',
-      ...META_COMMANDS.map(({ name, description }) => `  ${['remaining', 'status', 'rewind', 'undo', 'sessions', 'resume', 'model', 'reasoning', 'provider'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
+      ...META_COMMANDS.map(({ name, description }) => `  ${['remaining', 'status', 'rewind', 'undo', 'sessions', 'resume', 'persona', 'model', 'reasoning', 'provider', 'run-skill'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
     ]);
     for (const description of META_COMMANDS.map(({ description }) => description)) {
       expect(description).toMatch(/[가-힣]/);
@@ -217,10 +217,11 @@ describe('PWA slash-command boundary', () => {
   it('submits local slash commands through mounted PWA chat input without an LLM request', async () => {
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
     const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    const values = new Map<string, string>();
     const storage = {
-      getItem: () => null,
-      setItem: () => {},
-      removeItem: () => {},
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
     } as unknown as Storage;
     Object.defineProperty(globalThis, 'window', {
       configurable: true,
@@ -241,7 +242,7 @@ describe('PWA slash-command boundary', () => {
       voiceCost: async () => ({}),
       fetchJson: async (path: string) => path === '/v1/sessions/store'
         ? { ok: true, sessions: [{ id: 'abcd1111-other', messageCount: 2, updatedAt: '2026-10-03T02:00:00Z', preview: 'old' }] }
-        : { messages: [] },
+        : path === '/v1/personas/%EB%AF%B8%EB%9D%BC' ? { persona: { personaId: 'mira', displayName: '미라' } } : { messages: [] },
       subscribeChatEvents: () => () => {},
       subscribeChatFeedbackEvents: () => () => {},
       promptStream: async (body: unknown) => {
@@ -270,6 +271,13 @@ describe('PWA slash-command boundary', () => {
       await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
       await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/resume abcd1' } }); });
       await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
+      await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/persona 미라' } }); });
+      await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
+      expect(selectedChatPersona('test-session', storage)).toBe('mira');
+      expect(selectedChatPersona('abcd1111-other', storage)).toBeUndefined();
+      await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/persona -' } }); });
+      await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
+      expect(selectedChatPersona('test-session', storage)).toBeUndefined();
       expect(switchedSessions).toEqual(['abcd1111-other']);
       const messages = tree!.root.findByType(ChatHistory).props.messages as ChatMessage[];
       expect(messages.map(({ role, text }) => ({ role, text }))).toEqual([
@@ -283,6 +291,10 @@ describe('PWA slash-command boundary', () => {
         { role: 'meta', text: '추론 강도는 설정 화면에서 바꾸세요' },
         { role: 'user', text: '/resume abcd1' },
         { role: 'meta', text: 'abcd1111 대화로 옮겼습니다' },
+        { role: 'user', text: '/persona 미라' },
+        { role: 'meta', text: '미라 페르소나를 이 대화에 골랐습니다' },
+        { role: 'user', text: '/persona -' },
+        { role: 'meta', text: '이 대화의 페르소나를 뺐습니다' },
       ]);
       expect(acpRequests.filter((method) => method === 'session/prompt')).toHaveLength(0);
       expect(sseRequests).toHaveLength(0);

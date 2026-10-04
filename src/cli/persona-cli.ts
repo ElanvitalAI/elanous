@@ -9,6 +9,8 @@ import { parsePersonaYaml } from '../persona/loader.js';
 import { resolveRepositoryPersonaDir, resolveStatePersonaDir } from '../persona/global-registry.js';
 import { UnknownPersonaSchemaKeyError, choosePersonaId, clonePreset, describePreset, editPersona, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from '../persona/presets.js';
 import { addTeamSet, listTeamSets, removeTeamSet } from '../persona/team-set.js';
+import { validateTeamFile } from '../persona/team.js';
+import { runPersonaLoopOnce } from '../seat-loop/seat-loop.js';
 
 interface StoredPersona { personaId: string; displayName: string; description?: string; preset?: string; title?: string; path: string }
 
@@ -68,6 +70,18 @@ function editOptions(fromFile: string | undefined, assignments: readonly string[
 }
 
 export function registerPersonaCommands(program: Command): void {
+  program.command('team').description('Validate a YAML team definition')
+    .command('validate <file>').description('Check team schema, persona references and handoff order')
+    .action((file: string) => {
+      try {
+        const definition = validateTeamFile(file);
+        console.log(`Valid team ${definition.name}`);
+      } catch (error) {
+        console.error(error instanceof Error ? error.message.replace(/\s+/g, ' ').trim() : String(error));
+        process.exitCode = 2;
+      }
+    });
+
   const team = program.command('team-set').description('Install, remove and list persona team sets');
   team.command('add <file>').description('Install a YAML team set').action((file: string) => {
     try { const result = addTeamSet(file); console.log(`Installed team-set ${result['team-set']}`); }
@@ -175,6 +189,21 @@ export function registerPersonaCommands(program: Command): void {
       } catch (err) {
         console.error(err instanceof Error ? err.message.replace(/\s+/g, ' ').trim() : String(err));
         process.exitCode = err instanceof UnknownPersonaSchemaKeyError ? 2 : 1;
+      }
+    });
+
+  persona.command('loop <name>')
+    .description('Shadow-pick one todo for a saved persona without executing it')
+    .requiredOption('--once', 'Pick exactly one todo')
+    .option('--json', 'JSON output')
+    .action(async (name: string, opts: { json?: boolean }) => {
+      try {
+        const entry = await runPersonaLoopOnce(name);
+        if (opts.json) console.log(JSON.stringify(entry));
+        else console.log(entry.todo ? `그림자 선택 — ${entry.todo.title} (${entry.todo.id})` : '할 일 없음');
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
       }
     });
 

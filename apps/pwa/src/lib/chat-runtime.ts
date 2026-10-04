@@ -28,8 +28,14 @@ import { fetchDaemonModelTier, type DaemonHttpConfig } from './model-tier-sync';
 import { isLlmTierProvider, lookupLlmTierSpec } from './model-tier-spec';
 import { handleModelCommand, parseModelCommand } from './chat-model-commands';
 import { handleSessionCommand, parseSessionCommand } from './chat-session-commands';
+import { handleChatPersona, selectedChatPersona } from './chat-persona';
+
+function chatPersonaId(sessionId: string): string | undefined {
+  return typeof localStorage === 'undefined' ? undefined : selectedChatPersona(sessionId, localStorage);
+}
 import { harnessAskText } from './chat-harness-ask';
 import { submitGraph } from './intake-front-door-api';
+import { runSkillExec } from './skill-exec-client';
 import { isMcpAppHtmlMime } from '../../../../src/tool-runtime/mcp-app-mime';
 import { mcpResultImages, mcpAppResourceUriOf } from '../../../../src/feedback/media';
 
@@ -508,10 +514,12 @@ export const META_COMMANDS: readonly { name: string; description: string }[] = [
   { name: 'clear', description: '로컬 대화 기록 지우기' },
   { name: 'sessions', description: '최근 대화 목록 보기 (/sessions [N])' },
   { name: 'resume', description: '대화 이어가기 (/resume <id 앞자리>)' },
+  { name: 'persona', description: '이 대화의 페르소나 보기·고르기·빼기 (/persona [이름|-])' },
   { name: 'model', description: '모델 티어 보기·바꾸기 (/model <티어|별칭>)' },
   { name: 'reasoning', description: '추론 단계 보기·설정 안내 (/reasoning <low|medium|high>)' },
   { name: 'provider', description: '프로바이더 보기·바꾸기 (/provider next|use <이름>)' },
   { name: 'wish', description: '소원을 카드로 남기기 (:wish <소원 한 줄> · :wish --pending · :wish --retry <작업 ID>)' },
+  { name: 'run-skill', description: '이름을 댄 스킬 하나 바로 실행 (/run-skill <이름> <할 일>)' },
 ];
 
 const LOCAL_META_NAMES = ['help', 'session', 'fork', 'budget', 'history', 'clear', 'wish'] as const;
@@ -537,9 +545,12 @@ const TUI_SLASH_NAMES = new Set([
   'capture', 'inject', 'relay', 'lane', 'control', 'default', 'qc',
   'voice-chat', 'vc', 'auto-tts', 'tts', 'autotts', 'directive',
 ]);
-const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = { m: 'model', r: 'reasoning', think: 'reasoning', p: 'provider' };
+const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  m: 'model', r: 'reasoning', think: 'reasoning', p: 'provider',
+  rs: 'run-skill', run: 'run-skill',
+};
 const UNSUPPORTED_TUI_SLASH_NAMES = new Set([...TUI_SLASH_NAMES].filter((name) =>
-  name !== 'harness' && !META_COMMANDS.some((command) => command.name === name),
+  name !== 'harness' && !Object.hasOwn(PWA_MODEL_ALIASES, name) && !META_COMMANDS.some((command) => command.name === name),
 ));
 const LEGACY_META_SLASH_NAMES = LOCAL_META_NAMES.filter((name) => name !== 'wish').map((name) => `/${name}`).join(' ');
 
@@ -639,6 +650,7 @@ export const META_HANDLERS: Record<
   ':clear': async () => ({ text: '__CLEAR__' }), // sentinel; UI clears its buffer
   ':sessions': async (args, ctx) => handleSessionCommand(parseSessionCommand('sessions', args), ctx),
   ':resume': async (args, ctx) => handleSessionCommand(parseSessionCommand('resume', args), ctx),
+  ':persona': async (args, ctx) => ({ text: await handleChatPersona(args, ctx.sessionId, ctx.client, localStorage) }),
   ':model': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('model', args), ctx) }),
   ':reasoning': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('reasoning', args), ctx) }),
   ':provider': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('provider', args), ctx) }),
@@ -687,6 +699,17 @@ export const META_HANDLERS: Record<
     } catch (error) {
       return { text: `소원 카드 저장 실패 — ${error instanceof Error ? error.message : String(error)} · 재시도: :wish --retry ${wish.id}` };
     }
+  },
+  ':run-skill': async (args, ctx) => {
+    if (args.length < 2) return { text: '쓰는 법: /run-skill <이름> <할 일>' };
+    const skill = args[0]!;
+    const task = args.slice(1).join(' ');
+    const result = await runSkillExec(ctx.daemon, skill, task);
+    debugLog('webterm.chat.run-skill', { skill, kind: result.kind });
+    if (result.kind === 'rejected') return { text: `이 스킬은 바로 실행할 수 없습니다 — 대화로 «${skill} 으로 …» 라고 부탁해 보세요` };
+    if (result.kind === 'failed') return { text: `스킬 실행을 확인하지 못했습니다(${result.error})` };
+    const output = result.output.length > 8000 ? `${result.output.slice(0, 8000)}… (잘림)` : result.output;
+    return { text: result.ok ? output : `스킬이 실패했습니다\n${output}` };
   },
 };
 
@@ -841,6 +864,7 @@ export async function runChatTurnStreaming(
       feedback: feedbackCount,
     });
   };
+  const personaId = chatPersonaId(ctx.sessionId);
   const res = await ctx.client.promptStream(
     {
       sessionId: ctx.sessionId || undefined,
@@ -849,6 +873,7 @@ export async function runChatTurnStreaming(
         ? { userContent: handlers.userContent }
         : {}),
       provider: ctx.provider || undefined,
+      ...(personaId ? { personaId } : {}),
     },
     {
       onError: handlers.onError,
@@ -1550,9 +1575,11 @@ export async function runChatTurnAcp(
   };
 
   try {
+    const personaId = chatPersonaId(sessionId);
     const res = (await acp.send('session/prompt', {
       sessionId,
       prompt: promptBlocks,
+      ...(personaId ? { _meta: { elanous: { pwaPersonaId: personaId } } } : {}),
     })) as { stopReason?: string } | undefined;
     const stopReason = res?.stopReason ?? 'end_turn';
     // ⛔⭐ 턴이 끝났는데 생각이 «열린 채»면 닫는다 — 본문 없이 끝나는 턴(툴만 돈 경우)이 있다.

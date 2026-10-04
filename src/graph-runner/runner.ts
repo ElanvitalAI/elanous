@@ -11,7 +11,8 @@ import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
-import { proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect } from './graph-grow.js';
+import { growthApprovalRef, proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect, type GrowthDecisionDeps, type GrowthCommand } from './graph-grow.js';
+import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { createLLMGrowthProposer } from './graph-grow-llm.js';
 import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { createGraphVariant, type GraphVariantPlan } from '../self-implement/graph-variant.js';
@@ -43,7 +44,7 @@ export interface GraphRunState {
   variant?: { overlayId: string; goal: string; plan: GraphVariantPlan };
   growth?: GraphGrowth[];
   growthRejections?: Array<{ from: string; outcome: string; reason: string }>;
-  growthPark?: { from: string; outcome: string; reason: string };
+  growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
   resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
   executed: number;
   dryRun: boolean;
@@ -59,7 +60,7 @@ export interface GraphRunOptions {
   resumeGraphId?: string;
   fromNodeId?: string;
   useCurrentGraph?: boolean;
-  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect };
+  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
 }
 
 function safeSegment(value: string): string {
@@ -70,13 +71,16 @@ function safeSegment(value: string): string {
 }
 
 type CommandRecipe = { command: string; dry_run_command?: string; timeout_ms?: number };
-type Recipe = CommandRecipe | { approval: string };
+type Recipe = CommandRecipe | ({ approval: string } & Partial<CommandRecipe>);
 
 /** 접두 없는 recipe 가 카탈로그 역할이고, 그래프 옆 recipes.yaml 에 같은 키의 `{ command }` 가 있을 때만 cmd 처럼 실행한다. */
 function roleCommand(recipe: string, recipes: Record<string, Recipe>, catalogRoles: ReadonlySet<string>): CommandRecipe | undefined {
   if (!recipe || recipe === 'none' || recipe.includes(':') || !catalogRoles.has(recipe)) return undefined;
   const entry = recipes[recipe];
-  return entry && 'command' in entry ? entry : undefined;
+  // An entry that carries an approval only runs through `approval:` — never as a bare command.
+  return entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: entry.command,
+    ...(entry.dry_run_command ? { dry_run_command: entry.dry_run_command } : {}),
+    ...(entry.timeout_ms ? { timeout_ms: entry.timeout_ms } : {}) } : undefined;
 }
 
 function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>, catalogRoles: ReadonlySet<string>): { command?: CommandRecipe; approval?: { approval: string } } {
@@ -84,12 +88,17 @@ function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>,
   if (node.recipe.startsWith('cmd:')) {
     const id = node.recipe.slice(4);
     const entry = recipes[id];
-    return entry && 'command' in entry ? { command: entry } : {};
+    return entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: { command: entry.command,
+      ...(entry.dry_run_command ? { dry_run_command: entry.dry_run_command } : {}),
+      ...(entry.timeout_ms ? { timeout_ms: entry.timeout_ms } : {}) } } : {};
   }
   if (node.recipe.startsWith('approval:')) {
     const id = node.recipe.slice(9);
     const entry = recipes[id];
-    return entry && 'approval' in entry ? { approval: entry } : {};
+    return entry && 'approval' in entry ? { approval: entry,
+      ...('command' in entry && typeof entry.command === 'string' ? { command: { command: entry.command,
+        ...(entry.dry_run_command ? { dry_run_command: entry.dry_run_command } : {}),
+        ...(entry.timeout_ms ? { timeout_ms: entry.timeout_ms } : {}) } } : {}) } : {};
   }
   const command = roleCommand(node.recipe, recipes, catalogRoles);
   return command ? { command } : {};
@@ -113,8 +122,16 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`invalid recipe: ${id}`);
     const item = raw as Record<string, unknown>;
     if (Object.hasOwn(item, 'approval')) {
-      if (typeof item.approval !== 'string' || !item.approval.trim() || Object.keys(item).length !== 1) throw new Error(`invalid recipe: ${id}`);
-      recipes[id] = { approval: item.approval };
+      if (typeof item.approval !== 'string' || !item.approval.trim() ||
+        (item.command !== undefined && (typeof item.command !== 'string' || !item.command.trim())) ||
+        (item.timeout_ms !== undefined && (!Number.isSafeInteger(item.timeout_ms) || (item.timeout_ms as number) <= 0)) ||
+        (item.dry_run_command !== undefined && (typeof item.dry_run_command !== 'string' || !item.dry_run_command.trim())) ||
+        (item.command === undefined && (item.timeout_ms !== undefined || item.dry_run_command !== undefined)) ||
+        Object.keys(item).some(key => !['approval', 'command', 'dry_run_command', 'timeout_ms'].includes(key))) throw new Error(`invalid recipe: ${id}`);
+      recipes[id] = { approval: item.approval,
+        ...(item.command === undefined ? {} : { command: item.command as string }),
+        ...(item.dry_run_command === undefined ? {} : { dry_run_command: item.dry_run_command as string }),
+        ...(item.timeout_ms === undefined ? {} : { timeout_ms: item.timeout_ms as number }) };
     } else {
       if (typeof item.command !== 'string' || !item.command.trim() ||
         (item.timeout_ms !== undefined && (!Number.isSafeInteger(item.timeout_ms) || (item.timeout_ms as number) <= 0)) ||
@@ -493,8 +510,51 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     // Persist the restart boundary before executing it, so previous outputs remain durable.
     persistOwnedRun(state, saved!, true);
   }
+  let resumedGrowth = false;
   if (options.resumeRunId && state.growthPark) {
-    throw new Error(`growth is parked for human confirmation: ${graphId}/${runId}`);
+    if (state.graphId !== graphId || state.runId !== runId || (graphMode === 'current' && state.sourceHash !== approvalSourceHash)) {
+      throw new Error(`growth source changed since run was paused: ${graphId}/${runId}`);
+    }
+    const parked = state.growthPark;
+    const decision = (options.deps?.growthDecision?.list?.({ status: 'all' }) ??
+      new DecisionLedger({ stateDir: root }).list({ status: 'all' }))
+      .find(entry => entry.id === parked.decisionId && entry.refs?.includes(parked.decisionRef));
+    if (!decision || decision.status !== 'decided' || decision.decidedBy?.kind !== 'human' ||
+        (decision.choice !== 'a' && decision.choice !== 'b')) {
+      throw new Error(`growth is parked for human confirmation: ${graphId}/${runId}`);
+    }
+    if (typeof parked.decisionRef !== 'string' ||
+        growthApprovalRef({ graphId, runId, from: parked.from, outcome: parked.outcome },
+          parked.growth, parked.command, parked.approval) !== parked.decisionRef) {
+      throw new Error(`growth approval target changed since card was raised: ${graphId}/${runId}`);
+    }
+    if (state.status !== 'awaiting-approval' || state.dryRun || state.path.at(-1) !== parked.from ||
+        state.path.length !== state.nodes.length || state.nodes.at(-1)?.nodeId !== parked.from ||
+        state.pending?.nodeId !== parked.from || state.growthRejections?.at(-1)?.from !== parked.from ||
+        state.growthRejections.at(-1)?.outcome !== parked.outcome ||
+        parked.growth.undo.removeOutcome.from !== parked.from || parked.growth.undo.removeOutcome.outcome !== parked.outcome) {
+      throw new Error(`invalid parked growth: ${graphId}/${runId}`);
+    }
+    if (decision.choice === 'a') {
+      const currentCommand = resolveNodeRecipe(parked.growth.node, recipes, catalogRoles).command;
+      const currentApproval = resolveNodeRecipe(parked.growth.node, recipes, catalogRoles).approval?.approval;
+      // The approved target is the (approval, command) pair as raised — a command appearing, vanishing or changing all fail.
+      if (parked.growth.node.recipe !== 'none' &&
+          (currentApproval !== parked.approval ||
+            JSON.stringify(currentCommand ?? null) !== JSON.stringify(parked.command ?? null) ||
+            (parked.approval === undefined && !parked.command))) {
+        throw new Error(`growth command changed since approval: ${graphId}/${runId}`);
+      }
+      graph = withGrowth(graph, [parked.growth]);
+      state.growth ??= [];
+      state.growth.push(parked.growth);
+      state.growthRejections!.pop();
+    }
+    resumedGrowth = true;
+    delete state.pending;
+    delete state.growthPark;
+    state.status = 'running';
+    persistOwnedRun(state, saved!);
   }
   if (options.resumeRunId && state.status === 'running' && state.pending) {
     throw new Error(`run is not awaiting approval: ${graphId}/${runId}`);
@@ -593,7 +653,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let exit: number | null = null;
     let error: string | undefined;
     let output: unknown;
-    if (command && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
+    if (command && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
       const outputs: Record<string, unknown> = Object.create(null);
       // 구조 산출(마지막 JSON 줄)이 있으면 그것을, 없으면 원문을 준다 — 다음 노드가 판단을 «값»으로 받는다.
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
@@ -681,7 +741,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const fromNodeId = current;
     const edge = graph.edges.find((candidate) => candidate.from === current);
-    if (document.grow === 'on' && !state.dryRun && namedOutcome !== undefined &&
+    if (!resumedGrowth && document.grow === 'on' && !state.dryRun && namedOutcome !== undefined &&
         edge?.on === 'outcome' && edge.map && !Object.hasOwn(edge.map, namedOutcome) &&
         !state.growth?.some((item) => item.undo.removeOutcome.from === current && item.undo.removeOutcome.outcome === namedOutcome) &&
         !state.growthRejections?.some((item) => item.from === current && item.outcome === namedOutcome)) {
@@ -689,9 +749,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         : await proposeGrowth({ graph, nodeId: current, outcome: namedOutcome, runId, output: state.nodes.at(-1)?.output },
           options.deps?.growthProposer ?? createLLMGrowthProposer(options.deps?.growthLLM), (candidate) => {
             const resolved = resolveNodeRecipe(candidate, recipes, catalogRoles);
-            if (resolved.approval || (!resolved.command && candidate.recipe !== 'none')) return 'unknown';
-            return options.deps?.classifyGrowthRecipe?.(candidate, { command: resolved.command?.command }) ?? 'unknown';
-          });
+            if (!resolved.command && !resolved.approval && candidate.recipe !== 'none') return 'unknown';
+            return { effect: resolved.approval ? 'unknown' : options.deps?.classifyGrowthRecipe?.(candidate, { command: resolved.command?.command }) ?? 'unknown',
+              command: resolved.command, approval: resolved.approval?.approval };
+          }, { ...options.deps?.growthDecision, root });
       if (result.ok) {
         graph = result.graph;
         state.growth ??= [];
@@ -703,10 +764,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       } else {
         state.growthRejections ??= [];
         state.growthRejections.push({ from: current, outcome: namedOutcome, reason: result.reason });
-        if (result.park) {
+        if (result.park && result.growth && result.decisionId && result.decisionRef) {
           state.status = 'awaiting-approval';
           state.pending = { nodeId: current, message: result.reason, since: new Date().toISOString() };
-          state.growthPark = { from: current, outcome: namedOutcome, reason: result.reason };
+          state.growthPark = { from: current, outcome: namedOutcome, reason: result.reason,
+            growth: result.growth, decisionId: result.decisionId, decisionRef: result.decisionRef,
+            ...(result.command ? { command: result.command } : {}), ...(result.approval ? { approval: result.approval } : {}) };
           persist();
           break;
         }
@@ -714,6 +777,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       persist();
     }
     current = nextNode(graph.edges, current, state.dryRun && !command?.dry_run_command ? 'ok' : ok ? 'ok' : 'fail', namedOutcome);
+    resumedGrowth = false;
     if (current !== undefined) publishInsideEvent({ kind: 'edge', graphId, runId, from: fromNodeId, to: current });
     if (current === undefined) {
       state.status = 'failed';

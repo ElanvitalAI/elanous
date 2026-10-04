@@ -26,7 +26,7 @@ export function raiseApprovalCard(state: GraphRunState, pending: Pending, deps: 
   const nodeId = pending.nodeId;
   const identity = { graphId: state.graphId, runId: state.runId, nodeId };
   const visit = state.path.filter(node => node === nodeId).length;
-  if (state.dryRun || state.status !== 'awaiting-approval' || state.pending?.nodeId !== nodeId ||
+  if (state.dryRun || state.growthPark || state.status !== 'awaiting-approval' || state.pending?.nodeId !== nodeId ||
       state.pending.decision || state.path.at(-1) !== nodeId || visit < 1 ||
       existsSync(`${join(root, 'graph-runs', state.graphId, `${state.runId}.json`)}.${state.path.length}.decision.json`)) {
     observation('skipped', identity);
@@ -88,7 +88,7 @@ function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: stri
     observation('skipped', identity, entry.id, entry.choice);
     return false;
   }
-  if (state.graphId !== graphId || state.runId !== runId || state.dryRun || state.status !== 'awaiting-approval' ||
+  if (state.graphId !== graphId || state.runId !== runId || state.dryRun || state.growthPark || state.status !== 'awaiting-approval' ||
       !state.pending || state.pending.nodeId !== nodeId || state.pending.decision || state.path.at(-1) !== nodeId ||
       state.path.filter(node => node === nodeId).length !== visit ||
       existsSync(`${statePath}.${state.path.length}.decision.json`)) {

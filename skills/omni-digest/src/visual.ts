@@ -13,7 +13,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { env, requireEnv } from './env.js';
-import { downloadVideo } from './media.js';
+import { downloadVideo, mediaEngineAvailable } from './media.js';
 import type { TweetMedia } from './types.js';
 
 const MAX_FRAMES = 8;
@@ -101,7 +101,8 @@ export async function absorbTweetVisuals(media: TweetMedia[], opts: { tweetId: s
       } catch (e) { log(`  [시각] 이미지 ${i + 1} 실패: ${String(e).slice(0, 120)}`); }
     }
     const videos = media.filter((m) => (m.type === 'video' || m.type === 'animated_gif') && (m.bestMp4Url || m.sttMp4Url));
-    for (const [i, v] of videos.entries()) {
+    const canExtractFrames = !videos.length || mediaEngineAvailable('ffmpeg');
+    for (const [i, v] of (canExtractFrames ? videos : []).entries()) {
       if (v.durationMs && v.durationMs > MAX_VIDEO_MS_FOR_FRAMES) { log(`  [시각] 영상 ${i + 1} 길어서 프레임 생략`); continue; }
       try {
         const dir = join(work, `v${i + 1}`);

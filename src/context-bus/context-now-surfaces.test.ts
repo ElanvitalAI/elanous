@@ -48,7 +48,7 @@ test('Telegram /now and TUI /now display the same sourced fake-ledger facts with
       expect(tui.join('\n')).toContain(label);
     }
     expect(telegram).toContain(fact.source);
-    expect(tui.join('\n')).toContain(fact.source);
+    expect(tui.join('\n')).toContain(fact.source.startsWith('elanous://release/') ? '원장' : fact.source);
   }
   for (const event of answer.events) {
     expect(telegram).toContain(event.summary);
@@ -77,6 +77,85 @@ test('Telegram /now keeps five lines when ledger titles, event summaries and gui
   expect(telegram).toContain('K6 Context door (red) — elanous://release/0.2.0/ checklist#K6');
   expect(telegram).toContain('K6 ready — https://example.org/ context');
   expect(telegram).toContain('Follow up — https://example.org/guide');
+});
+
+test('TUI /now labels facts and events in Korean, keeps only eight newest events and names the remainder', () => {
+  const answer = contextNow({}, deps);
+  answer.guide = ['참고'];
+  answer.events = Array.from({ length: 12 }, (_, i) => ({
+    at: new Date(Date.parse(at) + i * 60_000).toISOString(),
+    kind: i === 11 ? 'unknown' : i === 10 ? 'report' : i === 9 ? 'dispatch' : i === 8 ? 'decision' : 'other',
+    summary: `사건 ${i}`, source: `source://${i}`,
+  }));
+  const originalOrder = answer.events.map(e => e.summary);
+  const lines = renderTuiNow(answer);
+  expect(lines[0]).toBe(`지금 (${answer.at})`);
+  expect(lines[1]).toBe('| 종류 | 사실 | 출처 |');
+  expect(lines[2]).toBe('| --- | --- | --- |');
+  expect(lines.slice(3, 8).map(line => line.match(/^\| ([^|]+) \|/)?.[1])).toEqual(['판', '칸', '칸', '결정', '자리']);
+  expect(lines.filter(line => /^\| (소식|보고|발사|결정) \| 사건 \d+ \|/.test(line))).toEqual([
+    '| 소식 | 사건 11 | source://11 |',
+    '| 보고 | 사건 10 | source://10 |',
+    '| 발사 | 사건 9 | source://9 |',
+    '| 결정 | 사건 8 | source://8 |',
+    '| 소식 | 사건 7 | source://7 |',
+    '| 소식 | 사건 6 | source://6 |',
+    '| 소식 | 사건 5 | source://5 |',
+    '| 소식 | 사건 4 | source://4 |',
+  ]);
+  expect(lines.at(-2)).toBe('| 안내 | 참고 |  |');
+  expect(lines.at(-1)).toBe('| 안내 | … 사건 4개 더(/now <주제> 로 좁히기) |  |');
+  expect(answer.events.map(e => e.summary)).toEqual(originalOrder);
+});
+
+test('TUI /now chooses the newest eight by instant across time zones', () => {
+  const answer = contextNow({}, deps);
+  answer.events = [
+    ...Array.from({ length: 4 }, (_, i) => ({
+      at: `2026-10-03T10:0${i}:00+09:00`, kind: 'unknown', summary: `offset ${i}`, source: 'offset',
+    })),
+    ...Array.from({ length: 8 }, (_, i) => ({
+      at: `2026-10-03T02:0${i}:00Z`, kind: 'unknown', summary: `utc ${i}`, source: 'utc',
+    })),
+  ];
+  const lines = renderTuiNow(answer);
+  expect(lines.filter(line => /^\| 소식 \| (utc|offset) /.test(line))).toEqual(
+    Array.from({ length: 8 }, (_, i) => `| 소식 | utc ${7 - i} | utc |`),
+  );
+  expect(lines.at(-1)).toBe('| 안내 | … 사건 4개 더(/now <주제> 로 좁히기) |  |');
+});
+
+test('TUI /now bounds fact and event text by code point, shortens sources and retains pipe and newline escaping', () => {
+  const answer = contextNow({}, deps);
+  answer.facts = [
+    { kind: 'version', version: '😀'.repeat(150), source: 'elanous://release/0.2.13/checklist' },
+    { kind: 'decision', id: 'D|1', title: 'Title\ncontinued', status: 'open', dueAt: null, source: 'https://example.org/' + 'x'.repeat(50) },
+  ];
+  answer.events = [
+    { at, kind: 'unknown', summary: '가'.repeat(100) + '|extra', source: 'https://github.com/org/repo/pull/123#issuecomment-456' },
+    { at: '2026-10-03T03:00:00.000Z', kind: 'report', summary: 'line\nwith | pipe', source: 'https://example.org/short' },
+  ];
+  answer.guide = ['guide | one\ntwo'];
+  const lines = renderTuiNow(answer);
+  expect(lines[3]).toBe(`| 판 | ${'😀'.repeat(100)}… | 원장 |`);
+  expect(lines[4]).toBe(`| 결정 | D\\|1 Title continued (open) | ${'https://example.org/' + 'x'.repeat(20)} |`);
+  expect(lines[5]).toBe(`| 소식 | ${'가'.repeat(100)}… | 채널 |`);
+  expect(lines[6]).toBe('| 보고 | line with \\| pipe | https://example.org/short |');
+  expect(lines[7]).toBe('| 안내 | guide \\| one two |  |');
+  expect(renderTelegramNow(answer)).toContain('😀'.repeat(150) + ' — elanous://release/0.2.13/checklist');
+});
+
+test('TUI /now calls only github.com PR comment sources 채널, not lookalike hosts', () => {
+  const answer = contextNow({}, deps);
+  answer.facts = [];
+  answer.guide = [];
+  answer.events = [
+    { at, kind: 'unknown', summary: 'fake host', source: 'https://notgithub.com/org/repo/pull/123#issuecomment-456' },
+    { at: '2026-10-03T03:00:00.000Z', kind: 'unknown', summary: 'real host', source: 'https://github.com/org/repo/pull/123#issuecomment-456' },
+  ];
+  const lines = renderTuiNow(answer);
+  expect(lines[3]).toBe('| 소식 | fake host | https://notgithub.com/org/repo/pull/123# |');
+  expect(lines[4]).toBe('| 소식 | real host | 채널 |');
 });
 
 test('seatsNowLine selects latest seat per role, orders roles and falls back to status', () => {

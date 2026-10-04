@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { loadPresets, presetsDir } from '../persona/presets.js';
+import { writePersonaTodos } from '../persona/persona-todo.js';
+import { debug } from '../debug/log.js';
+import { spyOn } from 'bun:test';
 import { PersonaRegistry } from '../persona/registry.js';
 import { registerPersonaCommands } from './persona-cli.js';
 
@@ -142,6 +145,38 @@ test('edit --dry-run previews without changing the saved persona or preset', asy
   expect(out.lines[0]).toContain('Preview only');
   expect(readFileSync(path, 'utf8')).toBe(before);
   expect(readdirSync(dir)).toEqual([`${id}.yaml`]);
+});
+
+test('persona loop --once records one picked todo in shadow, observes it, and never executes', async () => {
+  const id = await add();
+  const file = join(dir, `${id}.yaml`);
+  expect(parseYaml(readFileSync(file, 'utf8'))).toMatchObject({ todo: `${id}.todo.jsonl` });
+  const edited = await cli(['edit', id, '--set', 'todo=personal-queue.todo.jsonl']);
+  expect(edited.code).toBe(0);
+  expect(parseYaml(readFileSync(file, 'utf8'))).toMatchObject({ todo: 'personal-queue.todo.jsonl' });
+  writePersonaTodos(dir, 'personal-queue', [
+    { id: 'low', title: 'Low', status: 'open', priority: 1, dueAt: '2026-10-01T00:00:00Z', createdAt: '2026-09-01T00:00:00Z' },
+    { id: 'later', title: 'Later', status: 'open', priority: 2, dueAt: '2026-10-08T00:00:00Z', createdAt: '2026-09-01T00:00:00Z' },
+    { id: 'first', title: 'First', status: 'open', priority: 2, dueAt: '2026-10-04T00:00:00Z', createdAt: '2026-09-01T00:00:00Z' },
+  ]);
+  const observe = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = await cli(['loop', id, '--once', '--json']);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.lines[0]!)).toMatchObject({ personaId: id, status: 'shadow', todo: { id: 'first' }, action: 'harness', what: 'first First' });
+    expect(observe.mock.calls.some(([category, event, data]) => category === 'persona.loop' && event === 'picked'
+      && (data as { todoId?: string }).todoId === 'first')).toBe(true);
+    expect(readFileSync(join(dir, 'personal-queue.todo.jsonl'), 'utf8')).toContain('"id":"first"');
+    expect(readdirSync(dir).filter((entry) => entry.endsWith('.yaml'))).toEqual([`${id}.yaml`]);
+    writePersonaTodos(dir, 'personal-queue', []);
+    const empty = await cli(['loop', id, '--once']);
+    expect(empty.lines).toEqual(['할 일 없음']);
+    expect(empty.code).toBe(0);
+    expect((await cli(['loop', 'unknown', '--once'])).code).toBe(1);
+    const invalid = await cli(['edit', id, '--set', 'todo=../outside.todo.jsonl']);
+    expect(invalid.code).toBe(1);
+    expect(parseYaml(readFileSync(file, 'utf8'))).toMatchObject({ todo: 'personal-queue.todo.jsonl' });
+  } finally { observe.mockRestore(); }
 });
 
 test('edit rejects missing names, invalid fields, malformed edits and invalid schema without writing', async () => {

@@ -10,7 +10,7 @@ import {
   appendUserPromptBlocksAndBuildMessages,
 } from './daemon-history-helper.js';
 import type { ContentBlock as AcpContentBlock } from '@agentclientprotocol/sdk';
-import type { DaemonSessionHistory } from './daemon-runtime.js';
+import { personaPromptForChat, type DaemonSessionHistory } from './daemon-runtime.js';
 import type { DaemonPromptRequest } from './daemon-prompt-request.js';
 import type { DaemonToolSurface } from './daemon-tools/types.js';
 import type { ConfirmChannel } from '../hitl/confirm.js';
@@ -199,8 +199,9 @@ export async function runDaemonPromptTurn(opts: {
   // …" + active terminals) to the system prompt so the LLM has the
   // session id + terminal ids without an extra discovery call. Helper
   // returns the original prompt unchanged when there's nothing to add.
+  const personaPrompt = await personaPromptForChat(request.personaId);
   const augmentedSystemPrompt = appendWebtermContext(
-    request.effectiveSystemPrompt,
+    personaPrompt ? [personaPrompt, request.effectiveSystemPrompt].filter(Boolean).join('\n\n') : request.effectiveSystemPrompt,
     request.sessionId,
     activeToolSurface,
   );
@@ -290,6 +291,9 @@ export async function runDaemonPromptTurn(opts: {
   }
   if (!isFirstTurn && opts.projectInstructions) {
     messages.unshift({ role: 'system', content: opts.projectInstructions });
+  }
+  if (!isFirstTurn && personaPrompt) {
+    messages.unshift({ role: 'system', content: personaPrompt });
   }
   const result = await runCoreTurn({
     sessionId: request.sessionId,

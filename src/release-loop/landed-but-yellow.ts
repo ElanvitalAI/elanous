@@ -11,6 +11,18 @@ export interface LandedButYellowRow {
   newer: boolean;
 }
 
+export function evidencePlan(rows: readonly LandedButYellowRow[]): Array<{ id: string; ref: string }> {
+  const seen = new Set<string>();
+  return rows.flatMap((row) => row.prs.flatMap((pr, index) => {
+    if (pr.basis === 'mention' || row.alreadyInEvidence[index]) return [];
+    const ref = `#${pr.number}`;
+    const key = JSON.stringify([row.id, ref]);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ id: row.id, ref }];
+  }));
+}
+
 /** Prefer a dedicated body cell line over title evidence; incidental mentions only qualify for long ids. */
 export function landedButYellow(items: readonly ChecklistItem[], prs: readonly MergedChecklistPr[], { owner }: { owner?: string } = {}): LandedButYellowRow[] {
   const rows: LandedButYellowRow[] = [];

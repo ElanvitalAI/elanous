@@ -77,6 +77,7 @@ import { handleTelegramFieldNote } from './field-note/telegram.js';
 import type { TranscriptionEngine, FieldAudio } from './field-note/transcribe.js';
 import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-followup.js';
 import { attachTelegramProjectButtons } from './telegram-project-command.js';
+import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -229,6 +230,7 @@ export interface TelegramBotOpts {
   fieldNoteDecodeAudio?: (file: string, recordedAt: string) => FieldAudio;
   /** Test seam for the business-card graph and its private run root. */
   cardFollowupDeps?: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
+  fabricPlanDeps?: import('./telegram-fabric-plan.js').TelegramFabricPlanDeps;
 }
 
 /** Surface-unification v2 (FU-2) — Telegram trigger event passed to
@@ -350,6 +352,7 @@ export class TelegramBot {
   private readonly fieldNoteDecodeAudio?: (file: string, recordedAt: string) => FieldAudio;
   private readonly cardFollowupDeps: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
   private readonly seatWorkDeps: TelegramSeatWorkDeps;
+  private readonly handleFabricPlan: (ctx: TgIncoming) => Promise<boolean>;
   private seatAskTimer: ReturnType<typeof setInterval> | null = null;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
@@ -388,6 +391,7 @@ export class TelegramBot {
     this.fieldNoteEngine = opts.fieldNoteEngine;
     this.fieldNoteDecodeAudio = opts.fieldNoteDecodeAudio;
     this.cardFollowupDeps = opts.cardFollowupDeps ?? {};
+    this.handleFabricPlan = attachTelegramFabricPlan(this, opts.fabricPlanDeps);
     this.seatWorkDeps = { ...opts.seatWorkDeps, askDeps: { ...opts.seatWorkDeps?.askDeps,
       channel: 'telegram', botId: this.botId,
       send: opts.seatWorkDeps?.askDeps?.send ?? (async (origin, text) => {
@@ -1539,6 +1543,7 @@ export class TelegramBot {
       await this.refuseMessage(ctx);
       return;
     }
+    if (await this.handleFabricPlan(ctx)) return;
     // 현장 업로드 — `#현장` 캡션(또는 태그된 앨범의 나머지)의 사진·영상은 LLM 대신 현장 폴더로.
     if (await this.tryHandleFieldUpload(ctx)) return;
     if (await handleTelegramFieldNote(ctx, {

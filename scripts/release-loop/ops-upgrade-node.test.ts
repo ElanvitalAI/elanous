@@ -1,7 +1,8 @@
-import { expect, test } from 'bun:test';
-import { existsSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { expect, test, spyOn } from 'bun:test';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../../src/debug/log.js';
 import { runOpsUpgrade, tagFeedSource, type FeedSource } from './ops-upgrade-node.js';
 import type { CommandRunner } from './node-verdict.js';
 
@@ -16,7 +17,7 @@ const good = { status: 0, stdout: '{"exitCode":0,"installedVersion":"0.2.7"}\n',
 const TAG = 'c'.repeat(40);
 const feedGood = { status: 0, stdout: `{"ok":true,"version":"0.2.7","commit":"${TAG}"}\n`, stderr: '' };
 let cleaned = 0;
-const tagSource = (): FeedSource => ({ checkout: '/tmp/tag-tree', commit: TAG, cleanup: () => { cleaned++; } });
+const tagSource = (): FeedSource => ({ checkout: '/tmp/tag-tree', commit: TAG, deps: 'linked', cleanup: () => { cleaned++; } });
 
 test('checkout install fetches tag, detaches, then updates without release version', () => {
   withContext({ opsHosts: ['local'], opsRestart: true }, () => {
@@ -254,7 +255,12 @@ test('feed is packed from the release tag checkout, not the working tree, and ca
       calls.push([cmd, args, cwd]);
       if (cmd === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: `${TAG}\n`, stderr: '' };
       // A real tag checkout has apps/pwa — without it the feed's PWA node_modules link fails on hosts that have one (0.2.12 gate Pod).
-      if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') { mkdirSync(join(args[3]!, 'apps/pwa'), { recursive: true }); return { status: 0, stdout: '', stderr: '' }; }
+      if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+        mkdirSync(join(args[3]!, 'apps/pwa'), { recursive: true });
+        for (const file of ['bun.lock', 'package.json', 'apps/pwa/bun.lock', 'apps/pwa/package.json'])
+          writeFileSync(join(args[3]!, file), readFileSync(join(process.cwd(), file)));
+        return { status: 0, stdout: '', stderr: '' };
+      }
       if (cmd === 'git') return { status: 0, stdout: '', stderr: '' };
       if (cmd === 'bun' && args[0] === 'bin/elanous.mjs') return { status: 0, stdout: 'built\n', stderr: '' };
       if (cmd === 'bun') return feedGood;
@@ -272,6 +278,108 @@ test('feed is packed from the release tag checkout, not the working tree, and ca
     expect(calls).toContainEqual(['git', ['worktree', 'remove', '--force', tree], process.cwd()]);
     expect(existsSync(tree)).toBe(false);
   });
+});
+
+test('feed-source observation records linked or installed dependencies', () => {
+  for (const deps of ['linked', 'installed'] as const) withContext({ opsHosts: ['node-b'], internalDist: '/tmp/dist' }, () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = runOpsUpgrade((_cmd, args) => args[0] === 'scripts/publish-internal-dist.ts' ? feedGood
+        : args.join(' ').includes('update') ? good : { status: 0, stdout: '0.2.7 new\n', stderr: '' },
+      { feedSource: () => ({ ...tagSource(), deps }) });
+      expect(result.feed).toBe('published');
+      expect(log.mock.calls.some(([category, event, data]) => category === 'release-loop.ops-upgrade'
+        && event === 'feed-source' && (data as { deps?: string }).deps === deps)).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+});
+
+test('tag feed links matching dependencies and installs differing locks or manifests before building', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'ops-feed-deps-test-'));
+  const files = ['bun.lock', 'package.json', 'apps/pwa/bun.lock', 'apps/pwa/package.json'];
+  try {
+    mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    mkdirSync(join(repo, 'apps/pwa/node_modules'));
+    for (const file of files) writeFileSync(join(repo, file), file.endsWith('package.json') ? '{"dependencies":{"x":"1"}}' : 'lock-v1');
+    for (const changed of [undefined, 'bun.lock', 'apps/pwa/bun.lock', 'package.json', 'apps/pwa/package.json',
+      'package.json:overrides', 'package.json:trustedDependencies', 'apps/pwa/package.json:overrides']) {
+      const calls: Array<[string, string[], string | undefined]> = [];
+      let tree = '';
+      const [changedFile, changedField] = changed?.split(':') ?? [];
+      const run: CommandRunner = (cmd, args, cwd) => {
+        calls.push([cmd, args, cwd]);
+        if (cmd === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: `${TAG}\n`, stderr: '' };
+        if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+          tree = args[3]!;
+          mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+          for (const file of files) writeFileSync(join(tree, file), file === changedFile
+            ? changedField ? JSON.stringify({ dependencies: { x: '1' }, [changedField]: changedField === 'overrides' ? { x: '2' } : ['x'] })
+              : file.endsWith('package.json') ? '{"dependencies":{"x":"2"}}' : 'lock-v2'
+            : readFileSync(join(repo, file)));
+        }
+        if (cmd === 'bun' && args[0] === 'install') mkdirSync(join(cwd!, 'node_modules'));
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      const source = tagFeedSource(run, repo)('0.2.7');
+      try {
+        expect(source.deps).toBe(changed ? 'installed' : 'linked');
+        expect(calls.filter(([cmd, args]) => cmd === 'bun' && args[0] === 'install'))
+          .toEqual(changed ? [
+            ['bun', ['install', '--frozen-lockfile'], tree],
+            ['bun', ['install', '--frozen-lockfile'], join(tree, 'apps/pwa')],
+          ] : []);
+        if (changed) {
+          expect(lstatSync(join(tree, 'node_modules')).isDirectory()).toBe(true);
+          expect(lstatSync(join(tree, 'apps/pwa/node_modules')).isDirectory()).toBe(true);
+        } else {
+          expect(lstatSync(join(tree, 'node_modules')).isSymbolicLink()).toBe(true);
+          expect(lstatSync(join(tree, 'apps/pwa/node_modules')).isSymbolicLink()).toBe(true);
+        }
+        expect(calls.at(-1)).toEqual(['bun', ['bin/elanous.mjs', 'nexus', 'build'], tree]);
+      } finally { source.cleanup(); }
+      expect(existsSync(tree)).toBe(false);
+    }
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('failed tag dependency install fails the feed, skips remotes and preserves local upgrade', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'ops-feed-install-fail-'));
+  try {
+    mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+    for (const file of ['bun.lock', 'apps/pwa/bun.lock']) writeFileSync(join(repo, file), 'main-lock');
+    for (const file of ['package.json', 'apps/pwa/package.json']) writeFileSync(join(repo, file), '{}');
+    withContext({ opsHosts: ['node-b', 'local'], internalDist: '/tmp/dist' }, () => {
+      const calls: Array<[string, string[], string | undefined]> = [];
+      let tree = '';
+      const run: CommandRunner = (cmd, args, cwd) => {
+        calls.push([cmd, args, cwd]);
+        if (cmd === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: `${TAG}\n`, stderr: '' };
+        if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') {
+          tree = args[3]!;
+          mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+          for (const file of ['package.json', 'apps/pwa/package.json']) writeFileSync(join(tree, file), '{}');
+          writeFileSync(join(tree, 'bun.lock'), 'tag-lock');
+          writeFileSync(join(tree, 'apps/pwa/bun.lock'), 'main-lock');
+        }
+        if (cmd === 'bun' && args[0] === 'install') {
+          mkdirSync(join(cwd!, 'node_modules'));
+          return { status: 1, stdout: '', stderr: 'install failed' };
+        }
+        return args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' };
+      };
+      const result = runOpsUpgrade(run, { feedSource: tagFeedSource(run, repo), installSource: () => null });
+      expect(result).toMatchObject({ outcome: 'fail', feed: 'failed', hosts: [
+        { host: 'node-b', ok: false, skipped: '내부 피드 발행 실패', error: expect.stringContaining('태그 의존성 설치 실패: install failed') },
+        { host: 'local', ok: true },
+      ] });
+      expect(calls.filter(([cmd]) => cmd === 'bun')).toEqual([['bun', ['install', '--frozen-lockfile'], tree]]);
+      expect(calls.filter(([cmd]) => cmd === 'ssh')).toHaveLength(0);
+      expect(calls.filter(([cmd, args]) => cmd === 'elanous' && args[0] === 'update')).toHaveLength(1);
+      expect(calls).toContainEqual(['git', ['worktree', 'remove', '--force', tree], repo]);
+      expect(existsSync(tree)).toBe(false);
+    });
+  } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 
 test('feed refuses a tag that is not the release cut, or a pack that is not the tag commit', () => {

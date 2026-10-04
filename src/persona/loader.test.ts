@@ -1,6 +1,38 @@
 import { describe, expect, test } from 'bun:test';
 import { parsePersonaYaml } from './loader.js';
 
+describe('parsePersonaYaml seat', () => {
+  const base = 'personaId: sage\ndisplayName: Sage\n';
+
+  test('carries a declared seat and leaves existing personas without one unchanged', () => {
+    const result = parsePersonaYaml(`${base}seat: MK\n`, 'sage.yaml');
+    expect(result).toEqual({ ok: true, profile: { personaId: 'sage', displayName: 'Sage', seat: 'MK' } });
+    if (result.ok) expect(Object.isFrozen(result.profile)).toBe(true);
+    expect(parsePersonaYaml(base, 'sage.yaml')).toEqual({
+      ok: true, profile: { personaId: 'sage', displayName: 'Sage' },
+    });
+  });
+
+  test.each(['seat: ""\n', 'seat: "  "\n', 'seat:\n', 'seat: 123\n', 'seat: [MK]\n'])('rejects empty or non-string seat: %s', (declaration) => {
+    expect(parsePersonaYaml(`${base}${declaration}`, 'sage.yaml')).toEqual({
+      ok: false, error: { code: 'invalid-shape', path: 'sage.yaml', message: 'seat must be a non-empty string' },
+    });
+  });
+});
+
+describe('parsePersonaYaml todo', () => {
+  const base = 'personaId: sage\ndisplayName: Sage\n';
+  test('loads a per-persona todo filename and preserves older profiles without it', () => {
+    expect(parsePersonaYaml(`${base}todo: sage.todo.jsonl\n`, 'sage.yaml')).toEqual({
+      ok: true, profile: { personaId: 'sage', displayName: 'Sage', todo: 'sage.todo.jsonl' },
+    });
+    expect(parsePersonaYaml(base, 'sage.yaml')).toEqual({ ok: true, profile: { personaId: 'sage', displayName: 'Sage' } });
+  });
+  test.each(['todo: ../other.todo.jsonl\n', 'todo: []\n', 'todo:\n'])('rejects an invalid todo filename', (declaration) => {
+    expect(parsePersonaYaml(`${base}${declaration}`, 'sage.yaml').ok).toBe(false);
+  });
+});
+
 describe('parsePersonaYaml browserPort', () => {
   test('preserves a declared persona browserPort on the frozen profile', () => {
     const result = parsePersonaYaml(

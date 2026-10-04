@@ -80,26 +80,26 @@ URL (X, YouTube, 웹, GitHub) 또는 파일 (PDF, DOCX, 이미지) + 요약/정�
 이 스킬 폴더에서 실행합니다.
 
 ```bash
-npx tsx scripts/main.ts "<INPUT>" --message "<의도>" --print
+bun scripts/main.ts "<INPUT>" --message "<의도>" --print
 ```
 
 ### 예시
 
 ```bash
 # X 포스트 카드형 요약
-npx tsx scripts/main.ts "https://x.com/user/status/123" --print
+bun scripts/main.ts "https://x.com/user/status/123" --print
 
 # 웹 아티클 상세 + 다이어그램
-npx tsx scripts/main.ts "https://example.com" --format rich --diagram --print
+bun scripts/main.ts "https://example.com" --format rich --diagram --print
 
 # GitHub PR + Obsidian + 웹 동시
-npx tsx scripts/main.ts "https://github.com/o/r/pull/42" --target obsidian,web --print
+bun scripts/main.ts "https://github.com/o/r/pull/42" --target obsidian,web --print
 
 # PDF OCR + 요약
-npx tsx scripts/main.ts "/path/to/scan.pdf" --print
+bun scripts/main.ts "/path/to/scan.pdf" --print
 
 # 이미지 OCR + 요약
-npx tsx scripts/main.ts "photo.png" --print
+bun scripts/main.ts "photo.png" --print
 ```
 
 ## 옵션
@@ -236,13 +236,13 @@ X API media.variants → 최저 비트레이트 MP4 → ffmpeg 오디오 추출 
 
 ```bash
 # sum 모드: summarize 추출 → Grok 요약
-npx tsx scripts/main.ts "https://example.com" -m "sum 요약" --print
+bun scripts/main.ts "https://example.com" -m "sum 요약" --print
 
 # sum full 모드: summarize CLI가 추출+요약 모두 (Grok 스킵)
-npx tsx scripts/main.ts "https://example.com" -m "sum full" --print
+bun scripts/main.ts "https://example.com" -m "sum full" --print
 
 # 기본 모드 (summarize는 firecrawl 폴백으로 동작)
-npx tsx scripts/main.ts "https://example.com" --print
+bun scripts/main.ts "https://example.com" --print
 ```
 
 ### summarize CLI 설치
@@ -263,6 +263,5 @@ summarize --help
 
 ```bash
 cd <installed-skill-folder>
-npm install
-npx tsx scripts/main.ts --self-test
+bun scripts/main.ts --self-test
 ```

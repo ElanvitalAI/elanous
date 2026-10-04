@@ -1,0 +1,28 @@
+# Lecture materials → draft → human outline approval → diagrams → HTML → optional PDF.
+graph_id: lecture-note
+loop:
+  title: 강의 노트 디지털화
+  description: 자료를 모아 종합 노트를 작성하고 사람 확인 뒤 그림·HTML·PDF를 만든다
+  exec_request: true
+  inputs: [folder]
+  trigger:
+    events: [manual]
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }
+  - { node_id: draft, kind: agent, recipe: 'cmd:draft', max_visits: 1 }
+  - { node_id: confirm, kind: hitl, recipe: 'approval:confirm', max_visits: 1 }
+  - { node_id: render, kind: agent, recipe: 'cmd:render', max_visits: 1 }
+  - { node_id: html, kind: agent, recipe: 'cmd:html', max_visits: 1 }
+  - { node_id: pdf, kind: agent, recipe: 'cmd:pdf', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: collect, on: outcome, map: { ok: draft, fail: failed, error: failed } }
+  - { from: draft, on: outcome, map: { ok: confirm, fail: failed, error: failed } }
+  - { from: confirm, on: outcome, map: { ok: render, fail: failed, error: failed } }
+  - { from: render, on: outcome, map: { ok: html, fail: failed, error: failed } }
+  - { from: html, on: outcome, map: { ok: pdf, fail: failed, error: failed } }
+  - { from: pdf, on: outcome, map: { ok: done, skipped: done, fail: failed, error: failed } }

@@ -7,7 +7,7 @@ import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runC
 
 interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
 /** Where the internal feed is packed from: a checkout of the release tag, never the run's working tree. */
-export interface FeedSource { checkout: string; commit: string; cleanup: () => void }
+export interface FeedSource { checkout: string; commit: string; deps: 'linked' | 'installed'; cleanup: () => void }
 interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null; feedSource?: (version: string) => FeedSource }
 
 /** Detached worktree at refs/tags/v<version> with the PWA built — the feed ships what was released (10-04 0.2.11:
@@ -26,16 +26,28 @@ export function tagFeedSource(run: CommandRunner, repo: string = process.cwd()):
     try {
       const added = run('git', ['worktree', 'add', '--detach', tree, commit], repo);
       if (added.status !== 0) throw new Error(`태그 체크아웃 실패: ${reason(added)}`);
-      symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'));
-      if (existsSync(join(repo, 'apps/pwa/node_modules'))) symlinkSync(join(repo, 'apps/pwa/node_modules'), join(tree, 'apps/pwa/node_modules'));
+      const sameDeps = ['bun.lock', 'apps/pwa/bun.lock', 'package.json', 'apps/pwa/package.json'].every((file) => {
+        try { return readFileSync(join(repo, file), 'utf8') === readFileSync(join(tree, file), 'utf8'); }
+        catch { return false; }
+      });
+      const deps: FeedSource['deps'] = sameDeps ? 'linked' : 'installed';
+      if (sameDeps) {
+        symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'));
+        if (existsSync(join(repo, 'apps/pwa/node_modules'))) symlinkSync(join(repo, 'apps/pwa/node_modules'), join(tree, 'apps/pwa/node_modules'));
+      } else {
+        for (const cwd of [tree, join(tree, 'apps/pwa')]) {
+          const installed = run('bun', ['install', '--frozen-lockfile'], cwd, 900_000);
+          if (installed.status !== 0) throw new Error(`태그 의존성 설치 실패: ${reason(installed)}`);
+        }
+      }
       // The feed carries the PWA build (apps/pwa/out is ignored, so a fresh tag checkout has none until built).
       const built = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], tree, 900_000);
       if (built.status !== 0) throw new Error(`태그 PWA 빌드 실패: ${reason(built)}`);
+      return { checkout: tree, commit, deps, cleanup };
     } catch (error) {
       cleanup();
       throw error;
     }
-    return { checkout: tree, commit, cleanup };
   };
 }
 
@@ -96,7 +108,7 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
         const data = lastResult(feed);
         if (feed.status !== 0 || data?.ok !== true || data.version !== version) feedError = `내부 피드 발행 실패: ${feed.status === 0 && data?.ok === true ? `판 불일치 (${String(data.version)})` : reason(feed)}`;
         else if (data.commit !== source.commit) feedError = `내부 피드 발행 실패: 묶은 커밋 ${String(data.commit).slice(0, 12)} ≠ 태그 ${source.commit.slice(0, 12)}`;
-        debug.log('release-loop.ops-upgrade', 'feed-source', { version, commit: source.commit, source: `refs/tags/v${version}`, packed: data?.commit, pwaBuild: data?.pwaBuild });
+        debug.log('release-loop.ops-upgrade', 'feed-source', { version, commit: source.commit, source: `refs/tags/v${version}`, deps: source.deps, packed: data?.commit, pwaBuild: data?.pwaBuild });
       }
     } catch (error) { feedError = `내부 피드 발행 실패: ${firstLine(String(error))}`; }
     finally { source?.cleanup(); }

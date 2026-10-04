@@ -5,7 +5,7 @@ import { resolveDateRange } from '../src/date.js';
 import { route, listProviders } from '../src/router.js';
 import { render } from '../src/render.js';
 import type { Command } from '../src/types.js';
-import { writeStdoutJson } from '../../../src/cli/stdout-json.ts';
+import { writeStdoutJson } from './stdout-json.js';
 
 initEnv();
 

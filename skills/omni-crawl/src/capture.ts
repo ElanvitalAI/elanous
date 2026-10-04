@@ -25,6 +25,8 @@ const CHROME_CANDIDATES = [
   '/usr/bin/chromium-browser',
 ];
 
+let missingChromeReported = false;
+
 function findChrome(): string | null {
   const override = env('OMNI_CRAWL_CHROME');
   if (override && existsSync(override)) return override;
@@ -76,6 +78,10 @@ export async function captureScreenshot(url: string, opts?: CaptureOpts): Promis
 
   // 1순위: headless Chrome 셸아웃
   const chrome = findChrome();
+  if (!chrome && !missingChromeReported) {
+    missingChromeReported = true;
+    console.error('Chrome 없음 — 로컬 스크린샷 빠짐 · 설치하면 headless 캡처 켜짐 (CDP 폴백은 계속)');
+  }
   if (chrome) {
     console.log(`  [capture] headless Chrome 렌더: ${url}`);
     const args = [

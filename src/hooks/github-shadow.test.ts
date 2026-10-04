@@ -1,18 +1,45 @@
 import { expect, test } from 'bun:test';
 import { createHmac, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CardStore } from '../task-cards/card-store.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { startHookReceiver } from './receiver.js';
 import { startPublicHookIngress } from './expose.js';
-import { judgeGithubShadow, publicPrFileNames } from './github-shadow.js';
+import { judgeGithubShadow, publicPrFileNames, runGithubShadowReview } from './github-shadow.js';
 
 async function drained(queue: { count(): number }): Promise<void> {
   for (let i = 0; i < 200; i++) { if (queue.count() === 0) return; await Bun.sleep(10); }
   throw new Error('shadow queue did not drain');
 }
+
+test('shadow runner invokes read-only self review on trusted HEAD in a detached worktree and cleans it up', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'github-review-runner-'));
+  const repo = join(root, 'source');
+  mkdirSync(join(repo, 'bin'), { recursive: true });
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+  try {
+    git('init');
+    git('config', 'user.email', 'test@example.org');
+    git('config', 'user.name', 'Test');
+    writeFileSync(join(repo, 'bin', 'elanous.mjs'), `import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const expected = ['--test', 'self', 'review', '7', '--json'];
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected) ||
+    process.env.GH_REPO !== 'ElanvitalAI/elanous' || existsSync(join(process.cwd(), 'untrusted-pr-code.js')) ||
+    !existsSync(join(process.cwd(), '.git'))) process.exit(2);
+writeFileSync(join(process.cwd(), 'review-invoked'), 'yes');
+console.log(JSON.stringify({ reviewed: true, verdict: 'warn', mustFix: [], shouldFix: ['inspect diff'] }));\n`);
+    git('add', '.');
+    git('commit', '-m', 'trusted reviewer');
+    writeFileSync(join(repo, 'untrusted-pr-code.js'), 'throw new Error("must not run")');
+    const result = await runGithubShadowReview(7, repo);
+    expect(result).toEqual({ reviewed: true, verdict: 'warn', summary: 'warn: inspect diff' });
+    expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('the file risk rule sends sensitive paths to human-check, not accepted', () => {
   expect(judgeGithubShadow('Update hook', 'pull_request', ['src/hooks/receiver.ts']).verdict).toBe('human-check');
@@ -53,6 +80,7 @@ test('signed public PR events become accepted, rejected, human-check shadow judg
   const requests: Array<{ url: string; method: string }> = [];
   let forwards = 0;
   let wakes = 0;
+  const reviews: number[] = [];
   const sha = (digit: string) => digit.repeat(40);
   const githubFetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({ url: String(url), method: init?.method ?? 'GET' });
@@ -82,6 +110,7 @@ test('signed public PR events become accepted, rejected, human-check shadow judg
     return new Response('Not Found', { status: 404 });
   }) as typeof fetch;
   const receiver = startHookReceiver({ port: 0, root, secrets: { github: 'private-key' }, githubFetch,
+    githubShadowReview: async number => { reviews.push(number); return { reviewed: true, verdict: 'warn', summary: 'warn: check docs link' }; },
     forward: async () => { forwards++; return 204; }, wakeSeat: async () => { wakes++; }, retryBaseMs: 10 });
   const ingress = startPublicHookIngress(receiver.url, 0, root);
   const send = (number: number, title: string, body = '', delivery = randomUUID()) => {
@@ -106,6 +135,10 @@ test('signed public PR events become accepted, rejected, human-check shadow judg
         { item_number: 1, verdict: 'accepted' }, { item_number: 2, verdict: 'rejected' }, { item_number: 3, verdict: 'human-check' },
         { item_number: 4, verdict: 'human-check' }, { item_number: 5, verdict: 'human-check' },
       ]);
+      expect(store.db.query('SELECT item_number, reviewed, verdict, summary FROM github_shadow_reviews').all()).toEqual([
+        { item_number: 1, reviewed: 1, verdict: 'warn', summary: 'warn: check docs link' },
+      ]);
+      expect(reviews).toEqual([1]);
       expect(store.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hook_work_cards'").get()).toBeNull();
       expect(store.listByRecipient('OP')).toEqual([]);
     } finally { store.close(); }
@@ -145,7 +178,9 @@ test('existing signed Linear hooks still use their original forward boundary', a
 
 test('untrusted or unverifiable GitHub events cannot silently enter work or bypass human check', async () => {
   const root = mkdtempSync(join(tmpdir(), 'github-shadow-deny-'));
+  const reviews: number[] = [];
   const receiver = startHookReceiver({ port: 0, root, secrets: { github: 'key' }, retryBaseMs: 10,
+    githubShadowReview: async number => { reviews.push(number); throw new Error('unexpected review'); },
     githubFetch: (async (_url: string | URL | Request, _init?: RequestInit): Promise<Response> => { throw new Error('offline'); }) as typeof fetch });
   try {
     const send = (kind: string, action: string, repo: string, number: number, signed: boolean) => {
@@ -165,6 +200,9 @@ test('untrusted or unverifiable GitHub events cannot silently enter work or bypa
     const store = openMsgStore(join(root, 'msg', 'messages.db'));
     try { expect(store.db.query('SELECT item_number, verdict FROM github_shadow_judgments ORDER BY item_number').all()).toEqual([
       { item_number: 9, verdict: 'human-check' }, { item_number: 10, verdict: 'accepted' },
-    ]); } finally { store.close(); }
+    ]);
+      expect(reviews).toEqual([]);
+      expect(store.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'github_shadow_reviews'").get()).toBeNull();
+    } finally { store.close(); }
   } finally { receiver.stop(); rmSync(root, { recursive: true, force: true }); }
 });

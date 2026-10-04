@@ -534,27 +534,47 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
   const root = mkdtempSync(join(tmpdir(), 'release-auto-publish-'));
   const prior = process.env.ELANOUS_GRAPH_CONTEXT;
   try {
-    const metrics = Array.from({ length: 8 }, (_, i) => ({ name: `metric-${i}`, verdict: 'pass' }));
-    const outputs = { 'auto-approve': { outcome: 'ok', decidedBy: 'release-loop metrics', metrics },
-      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' },
-      prepare: { outcome: 'ok', commit: 'a'.repeat(40), out: root }, upgrade: { outcome: 'ok' },
-      tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.5' } };
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
+    const repo = join(root, 'repo');
+    const out = join(root, 'release', '0.2.5', 'prepared');
+    mkdirSync(join(out, 'dist'), { recursive: true });
+    mkdirSync(repo);
+    writeFileSync(join(repo, '.bun-version'), `${Bun.version}\n`);
+    for (let i = 0; i < 5; i++) writeFileSync(join(out, 'dist', `install-${i}`), 'fixture');
+    const input = { version: '0.2.5', previousVersion: '0.2.4' };
+    const outputs: GraphContext['outputs'] = {
+      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok', introduced: [] }, pwa: { outcome: 'ok' },
+      prepare: { outcome: 'ok', commit: 'a'.repeat(40), out }, upgrade: { outcome: 'ok' },
+      tui: { outcome: 'ok' }, 'notes-check': { outcome: 'ok' },
+      docs: { outcome: 'ok', notes: join(root, 'notes.md'), branch: 'release-docs/0.2.5' },
+    };
+    const approval = runAutoApprove({ input, outputs }, { instanceRoot: root, repo });
+    expect(approval).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
+    const metrics = approval.metrics;
+    expect(metrics.some((metric) => metric.name === 'mac-smoke')).toBe(true);
+    const publish = (approvalOutput: Record<string, unknown>, run: Parameters<typeof runPublish>[0]) => {
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input, outputs: { ...outputs, 'auto-approve': approvalOutput } });
+      return runPublish(run);
+    };
     const run = (cmd: string, args: string[]) => ({ status: 0, stderr: '', stdout: cmd === 'git'
       ? args[1]?.endsWith('pages.json') ? '{"pages":[]}' : '# 0.2.5\n\nBody\n'
       : '{"ok":true,"published":true,"tag":"v0.2.5"}' });
-    expect(runPublish(run).outcome).toBe('ok');
-    // 10-04 0.2.11: auto-approve also emits the warning-only rows (tui-regress · mac-smoke) — 8 blocking + 2 shown.
-    metrics.push({ name: 'tui-regress', verdict: 'pass' }, { name: 'mac-smoke', verdict: 'pass' });
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
-    expect(runPublish(run).outcome).toBe('ok');
-    metrics.splice(7, 1);
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
-    expect(runPublish(() => { throw new Error('publish called'); }).outcome).toBe('fail');
-    metrics.splice(7, 0, { name: 'metric-7', verdict: 'pass' });
-    metrics[0]!.verdict = 'unmeasured';
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
-    expect(runPublish(() => { throw new Error('publish called'); }).outcome).toBe('fail');
+    expect(publish(approval, run).outcome).toBe('ok');
+    expect(publish({ ...approval, metrics: [...metrics, { name: 'mac-smoke', value: 'warn', verdict: 'pass' }] }, run).outcome).toBe('ok');
+    const warningOnlyRow = metrics.find((metric) => metric.name === 'mac-smoke');
+    expect(warningOnlyRow).toBeDefined();
+    expect(publish({ ...approval, metrics: [...metrics, { ...warningOnlyRow!, name: 'tui-regress', value: 'warn' }] }, run).outcome).toBe('ok');
+    for (const incomplete of [
+      metrics.filter((metric) => metric.name !== 'installation files'),
+      metrics.map((metric) => metric.name === 'installation files' ? { ...metric, verdict: 'unmeasured' as const } : metric),
+    ]) {
+      let calls = 0;
+      const result = publish({ ...approval, metrics: incomplete }, (cmd, args) => {
+        calls++;
+        return run(cmd, args);
+      });
+      expect(result.outcome).toBe('fail');
+      expect(calls).toBe(0);
+    }
   } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
 });
 

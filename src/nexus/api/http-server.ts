@@ -22,6 +22,9 @@ import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
+import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
+import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
+import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
 import type { NexusState } from '../state/state.js';
@@ -472,6 +475,9 @@ export interface NexusHttpServerOpts {
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
   outputs?: OutputsDeps;
+  decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
+  cardFollowup?: CardFollowupJobs;
+  skillExec?: SkillExecJobs;
   execRequests?: ExecRequestRunner;
   seatRequests?: SeatRequestsDeps;
   consultRequests?: ConsultRequestsDeps;
@@ -850,6 +856,16 @@ let execRequestRunnerInstance: ExecRequestRunner | undefined;
 function execRequestRunner(): ExecRequestRunner {
   execRequestRunnerInstance ??= new ExecRequestRunner();
   return execRequestRunnerInstance;
+}
+
+let cardFollowupJobs: CardFollowupJobs | undefined;
+function defaultCardFollowupJobs(): CardFollowupJobs {
+  return cardFollowupJobs ??= createCardFollowupJobs();
+}
+
+let skillExecJobs: SkillExecJobs | undefined;
+function defaultSkillExecJobs(): SkillExecJobs {
+  return skillExecJobs ??= createSkillExecJobs();
 }
 
 export async function routeRequest(
@@ -1338,6 +1354,23 @@ export async function routeRequest(
     return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
   }
 
+  // Polling must remain outside the non-GET dispatch below.
+  if (method === 'GET' && pathname.startsWith(`${SKILL_EXEC_PATH}/`) && !pathname.slice(SKILL_EXEC_PATH.length + 1).includes('/')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return (opts.skillExec ?? defaultSkillExecJobs()).get(pathname.slice(SKILL_EXEC_PATH.length + 1));
+  }
+  if (method === 'GET' && pathname.startsWith(`${CARD_FOLLOWUP_PATH}/`) && !pathname.slice(CARD_FOLLOWUP_PATH.length + 1).includes('/')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return (opts.cardFollowup ?? defaultCardFollowupJobs()).get(pathname.slice(CARD_FOLLOWUP_PATH.length + 1));
+  }
+
+  if (method === 'GET' && pathname === DECISIONS_PATH) {
+    return handleDecisions(req, {
+      authorize: request => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      ...opts.decisions,
+    });
+  }
+
   if (method === 'GET' && pathname === '/v1/outputs') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleOutputsGet(req, opts.outputs);
@@ -1371,6 +1404,20 @@ export async function routeRequest(
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    if (method === 'POST' && pathname === SKILL_EXEC_PATH) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return (opts.skillExec ?? defaultSkillExecJobs()).post(req);
+    }
+    if (method === 'POST' && pathname === CARD_FOLLOWUP_PATH) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return (opts.cardFollowup ?? defaultCardFollowupJobs()).post(req);
+    }
+    if (method === 'POST' && /^\/v1\/decisions\/[^/]+\/decide$/.test(pathname)) {
+      return handleDecisions(req, {
+        authorize: request => !!opts.metaApi && checkAuth(request, opts.metaApi),
+        ...opts.decisions,
+      });
+    }
     if (method === 'POST' && pathname === '/v1/plugins/install') {
       if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
       return handlePluginsInstall(req, opts.metaApi, opts.pluginStateRoot);

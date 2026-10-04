@@ -36,6 +36,19 @@ test('release approval raises one publish card with exact ref and human-only cho
   expect(ledger.list({ status: 'all' })).toHaveLength(1);
 });
 
+test('a parked growth does not raise or apply a second graph approval card', () => {
+  const { state, ledger, deps, statePath } = fixture();
+  state.growthPark = { from: state.pending!.nodeId, outcome: 'new', reason: 'human review',
+    decisionId: 'D-growth', decisionRef: 'graph-growth:fixture', growth: {
+      node: { nodeId: 'grown', kind: 'agent', recipe: 'none', maxVisits: 1 }, edges: [], reason: 'grow',
+      undo: { removeNode: 'grown', removeOutcome: { from: state.pending!.nodeId, outcome: 'new' } },
+    } };
+  writeFileSync(statePath, JSON.stringify(state));
+  expect(raiseApprovalCard(state, state.pending!, deps)).toBeUndefined();
+  expect(ledger.list({ status: 'all' })).toHaveLength(0);
+  expect(applyDecidedApprovals(deps)).toBe(0);
+});
+
 test('non-release approvals use scope and include the run and node in title', () => {
   const { state, deps } = fixture('other', 'gate');
   const entry = raiseApprovalCard(state, state.pending!, deps);

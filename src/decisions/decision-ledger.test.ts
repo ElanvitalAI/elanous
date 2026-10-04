@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { createVersionResolver } from '../directives/version-at.js';
 import { DecisionLedger, importDecisionMarkdown, type RaiseInput } from './decision-ledger.js';
 import { formatDecisionDetail } from '../cli/decisions-cli.js';
+import { renderCardText } from './decision-cards.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -19,6 +20,50 @@ const base: RaiseInput = { title: 'Publish?', category: 'publish', scqa: { s: 'D
   recommendation: { option: 'b', why: 'Review first' }, raisedBy: { agent: 'codex', track: 'S' } };
 const versions = (at: string) => at < '2026-10-01' ? { released: '0.2.4', dev: '0.2.5-dev.0', codename: '지니의 소원' } : { released: '0.2.5', dev: '0.2.6-dev.0', codename: '내 일에 맞게' };
 const ledger = (stateDir = root()) => new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions });
+
+test('cross-check fields round-trip while an old raised line stays unchanged and renders', () => {
+  const store = ledger();
+  const checked = store.raise({ ...base, crossCheck: [{ seat: 'TC', at: '2026-10-01T00:00:00Z', note: '키 경로 영향 없음' }], alternative: 'a', dissent: 'UX: 화면 문구 미정' });
+  expect(store.show(checked.id)).toMatchObject({ crossCheck: [{ seat: 'TC', at: '2026-10-01T00:00:00.000Z', note: '키 경로 영향 없음' }], alternative: 'a', dissent: 'UX: 화면 문구 미정' });
+  const old = store.raise(base);
+  const line = readFileSync(store.path, 'utf8').trim().split('\n').at(-1)!;
+  const oldEvent = JSON.parse(line);
+  for (const key of ['crossCheck', 'crossCheckSkipped', 'alternative', 'dissent']) expect(oldEvent.entry).not.toHaveProperty(key);
+  expect(store.show(old.id)).toEqual(oldEvent.entry);
+  expect(renderCardText(store.show(old.id))).toContain('교차 확인 없음(미기재)');
+  store.decide(old.id, 'a', { kind: 'human' });
+  expect(readFileSync(store.path, 'utf8').split('\n')[1]).toBe(line);
+  expect(() => store.raise({ ...base, alternative: 'b' })).toThrow('alternative must differ');
+  expect(() => store.raise({ ...base, alternative: 'z' })).toThrow('alternative option not found');
+  expect(() => store.raise({ ...base, crossCheck: [{ seat: 'XX', at: '2026-10-01T00:00:00Z', note: '확인' }] })).toThrow('invalid cross-check seat');
+});
+
+test('raised-crosscheck observation records seats and skipped reason without the memo', () => {
+  const store = ledger();
+  const logs: unknown[][] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+  try {
+    const checked = store.raise({ ...base, crossCheck: [{ seat: 'TC', at: '2026-10-01T00:00:00Z', note: 'private review' }] });
+    const skipped = store.raise({ ...base, crossCheckSkipped: '자리 루프' });
+    expect(logs.filter(row => row[0] === 'decisions' && row[1] === 'raised-crosscheck')).toEqual([
+      ['decisions', 'raised-crosscheck', { id: checked.id, seats: 1, skipped: null }],
+      ['decisions', 'raised-crosscheck', { id: skipped.id, seats: 0, skipped: '자리 루프' }],
+    ]);
+    expect(JSON.stringify(logs)).not.toContain('private review');
+  } finally { spy.mockRestore(); }
+});
+
+test('raiseOnce atomically reuses the same growth source even after a human decision', () => {
+  const store = ledger();
+  const ref = 'graph-growth:same-proposal';
+  const first = store.raiseOnce({ ...base, refs: [ref] }, ref);
+  expect(store.raiseOnce({ ...base, refs: [ref] }, ref).id).toBe(first.id);
+  store.decide(first.id, 'a', { kind: 'human' });
+  expect(store.raiseOnce({ ...base, refs: [ref] }, ref).id).toBe(first.id);
+  expect(store.list({ status: 'all' })).toHaveLength(1);
+  expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(2);
+  expect(() => store.raiseOnce(base, ref)).toThrow('decision source reference required');
+});
 
 test('raise, open listing, human decision, chronological versions and append-only events', () => {
   const store = ledger();

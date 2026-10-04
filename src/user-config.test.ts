@@ -90,6 +90,15 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test('decision cross-check gate defaults to shadow and resolves only explicit true', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).decisions?.requireCrossCheck).toBe(false);
+  writeConfig({ decisions: { requireCrossCheck: true } });
+  expect(buildUserConfig(configPath).decisions?.requireCrossCheck).toBe(true);
+  writeConfig({ decisions: { requireCrossCheck: 'true' } });
+  expect(buildUserConfig(configPath).decisions?.requireCrossCheck).toBe(false);
+});
+
 describe('pod lease config', () => {
   test('perAccount defaults to 4 and accepts only positive safe integers', () => {
     writeConfig({});
@@ -100,6 +109,15 @@ describe('pod lease config', () => {
     }
     writeConfig({ pod: { lease: { perAccount: 7 } } });
     expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(7);
+  });
+});
+
+describe('pod memory advice opt-in', () => {
+  test('only literal true enables measured advice defaults', () => {
+    for (const [value, expected] of [[undefined, false], [false, false], ['true', false], [true, true]] as const) {
+      writeConfig({ pod: { memory: { adviseDefaults: value } } });
+      expect(buildUserConfig(configPath).pod?.memory?.adviseDefaults).toBe(expected);
+    }
   });
 });
 

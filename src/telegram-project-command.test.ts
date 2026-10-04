@@ -67,22 +67,29 @@ describe('/project', () => {
     expect(events()[0]?.[2]).toMatchObject({ projects: expect.arrayContaining([{ id: 'prj_a', name: 'Alpha' }]) });
   });
 
-  it('sends one sorted, two-per-row keyboard for owner DM while preserving the text reply', async () => {
+  it('sends only a sorted, two-per-row keyboard (at most eight buttons) for an owner DM', async () => {
     const available = [...projects, ...Array.from({ length: 12 }, (_, i) => project(`prj_extra_${i}`, `Beta ${String(i).padStart(2, '0')}`))];
     const f = fixture(research.id, available);
     const sent: Array<{ text: string; buttons: Array<Array<{ text: string; data: string }>> }> = [];
     const reply = await f.run([], ctx, async (text, buttons) => { sent.push({ text, buttons }); });
-    expect(reply).toBe([
-      '지금 대화의 프로젝트: Research', '', '프로젝트 목록:',
-      ...available.sort((a, b) => a.name.localeCompare(b.name)).slice(0, 20).map(p => `• ${p.name}`),
-      '', '옮기려면 /project <이름>',
-    ].join('\n'));
+    expect(reply).toBeUndefined();
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.buttons.map(row => row.length)).toEqual([2, 2, 2, 2, 1]);
+    expect(sent[0]?.buttons.map(row => row.length)).toEqual([2, 2, 2, 2]);
     expect(sent[0]?.buttons.flat()).toEqual([
-      ...available.slice(0, 8).map(p => ({ text: p.name, data: `prj:${p.id}` })),
+      ...available.sort((a, b) => a.name.localeCompare(b.name)).slice(0, 6).map(p => ({ text: p.name, data: `prj:${p.id}` })),
+      { text: '✓ Research', data: `prj:${research.id}` },
       { text: '받은 대화로', data: 'prj:-' },
     ]);
+    expect(f.updates).toEqual([]);
+  });
+
+  it('keeps the current project visible and checked when it sorts after the first seven', async () => {
+    const available = [...Array.from({ length: 9 }, (_, i) => project(`prj_${i}`, `Alpha ${i}`)), research];
+    const f = fixture(research.id, available);
+    const sent: Array<Array<{ text: string; data: string }>>[] = [];
+    expect(await f.run([], ctx, async (_text, buttons) => { sent.push(buttons); })).toBeUndefined();
+    expect(sent[0]?.flat()).toHaveLength(8);
+    expect(sent[0]?.flat().at(-2)).toEqual({ text: '✓ Research', data: `prj:${research.id}` });
     expect(f.updates).toEqual([]);
   });
 
@@ -105,7 +112,7 @@ describe('/project', () => {
     const sent: Array<Array<{ text: string; data: string }>>[] = [];
     await f.run([], ctx, async (_text, buttons) => { sent.push(buttons); });
     expect(sent[0]?.flat().map(b => b.data)).toEqual([
-      'prj:prj_a', ...extra.slice(0, 7).map(p => `prj:${p.id}`), 'prj:-',
+      'prj:prj_a', ...extra.slice(0, 6).map(p => `prj:${p.id}`), 'prj:-',
     ]);
     expect(events().find(call => call[1] === 'button-rejected')?.[2]).toMatchObject({ reason: 'callback-data-too-long', projectId: long.id, bytes: 67 });
   });
@@ -137,7 +144,7 @@ describe('/project', () => {
     const f = fixture(undefined, [boundary]);
     const sent: Array<Array<{ text: string; data: string }>>[] = [];
     await f.run([], ctx, async (_text, buttons) => { sent.push(buttons); });
-    expect(sent[0]?.flat()).toEqual([{ text: 'Boundary', data: `prj:${boundary.id}` }, { text: '받은 대화로', data: 'prj:-' }]);
+    expect(sent[0]?.flat()).toEqual([{ text: 'Boundary', data: `prj:${boundary.id}` }, { text: '✓ 받은 대화로', data: 'prj:-' }]);
     expect(Buffer.byteLength(sent[0]![0]![0]!.data, 'utf8')).toBe(64);
   });
 
@@ -238,9 +245,20 @@ describe('project callback buttons', () => {
     expect(f.updates).toEqual(['current-session']);
     expect(f.current.projectId).toBe(research.id);
     expect(f.other.projectId).toBe('prj_z');
-    expect(f.messages).toEqual([[42, '이 대화를 Research 프로젝트로 옮겼습니다']]);
+    expect(f.messages).toEqual([[42, '지금 프로젝트: Research']]);
     expect(f.acks).toEqual(['tap']);
     expect(events().map(call => call[1])).toContain('button-moved');
+    f.unsubscribe();
+  });
+
+  it('switches from an assigned project to a different one and replies with one current-project line', async () => {
+    const f = callbackFixture(research.id);
+    await f.tap('prj:prj_a');
+    expect(f.updates).toEqual(['current-session']);
+    expect(f.current.projectId).toBe('prj_a');
+    expect(f.other.projectId).toBe('prj_z');
+    expect(f.messages).toEqual([[42, '지금 프로젝트: Alpha']]);
+    expect(f.acks).toEqual(['tap']);
     f.unsubscribe();
   });
 
@@ -294,7 +312,7 @@ describe('project callback buttons', () => {
   it('wires a keyboard into the same private chat with the reply target and callback updates it', async () => {
     const sent: Array<{ method: string; body: Record<string, unknown> }> = [];
     const available = [research];
-    const f = fixture(undefined, available);
+    const f = fixture(research.id, available);
     const transport = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const method = String(input).split('/').at(-1)!;
       const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
@@ -319,12 +337,12 @@ describe('project callback buttons', () => {
     const keyboard = sent.find(call => call.method === 'sendMessage' && call.body.reply_markup);
     expect(keyboard?.body).toMatchObject({
       chat_id: 42, reply_to_message_id: 9, text: '프로젝트를 선택하세요',
-      reply_markup: { inline_keyboard: [[{ text: 'Research', callback_data: `prj:${research.id}` }, { text: '받은 대화로', callback_data: 'prj:-' }]] },
+      reply_markup: { inline_keyboard: [[{ text: '✓ Research', callback_data: `prj:${research.id}` }, { text: '받은 대화로', callback_data: 'prj:-' }]] },
     });
-    expect(sent.some(call => call.method === 'sendMessage' && String(call.body.text).includes('프로젝트 목록:'))).toBe(true);
+    expect(sent.some(call => call.method === 'sendMessage' && String(call.body.text).includes('프로젝트 목록:'))).toBe(false);
     expect(f.updates).toEqual(['current-session']);
     expect(f.current.projectId).toBe(research.id);
-    expect(sent.some(call => call.method === 'sendMessage' && call.body.text === '이 대화를 Research 프로젝트로 옮겼습니다')).toBe(true);
+    expect(sent.filter(call => call.method === 'sendMessage' && !call.body.reply_markup).map(call => call.body.text)).toEqual(['지금 프로젝트: Research']);
   });
 
   it('does not change affiliation if the configured owner differs from the allowlist', async () => {

@@ -44,7 +44,7 @@ function safe(value: string): string {
 export function emitPtyDecision(input: DecisionInput, log: typeof debug.log = (category, event, data) => debug.log(category, event, data)): PtyDecision {
   let stream = missionStreams.get(input.missionId);
   if (!stream) {
-    stream = { alias: `mission-${missionStreams.size + 1}`, seq: -1 };
+    stream = { alias: `${input.missionId.startsWith('duo-') ? 'duo' : 'mission'}-${missionStreams.size + 1}`, seq: -1 };
     missionStreams.set(input.missionId, stream);
   }
   stream.seq += 1;

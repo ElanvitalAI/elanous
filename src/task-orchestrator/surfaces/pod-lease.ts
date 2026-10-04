@@ -5,9 +5,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dlopen } from 'bun:ffi';
-import { hostLeaseBaseDir } from '../../pod-lease/host-lease.js';
+import { hostLeaseBaseDir, type PendingJobIdentity } from '../../pod-lease/host-lease.js';
 
-/** Persisted on a Job admitted through the host lease; the file lease is released after apply. */
+/** Persisted on a Job admitted through the host lease; the file lease remains until its Pod is observed Running or terminal. */
 export const POD_HOST_LEASE_ANNOTATION = 'elanous.dev/host-lease-admitted';
 
 // `get pods --all-namespaces -o json` on a busy cluster is several MB — the default spawnSync
@@ -25,6 +25,8 @@ export interface PodLeaseMember {
   capacity: number;
   running: number | null;
   pending: number | null;
+  /** Job names of Pending harness Pods already included in pending (used to avoid counting the same Job's host lease twice). */
+  pendingJobs?: PendingJobIdentity[];
   /** Running harness Pods whose Jobs predate host lease admission. */
   unleasedRunning: number | null;
   memoryLimitBytes: number | null;
@@ -52,6 +54,8 @@ export interface PoolLeaseRecommendation {
   accountSlots: number | null;
   running: number | null;
   pending: number | null;
+  /** Names of Pending Jobs already counted in pending. */
+  pendingJobs?: PendingJobIdentity[];
   /** Absent only for injected legacy status fixtures; real measurements always report a number or null. */
   unleasedRunning?: number | null;
 }
@@ -294,6 +298,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
         }
         if (!jobsValid) reasons.push('cluster jobs: missing name/labels');
         let running = 0, pending = 0, unleasedRunning = 0, limits = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
+        const pendingJobs = new Map<string, PendingJobIdentity>();
         let unknownPhase = false;
         const seenPods = new Set<string>();
         for (const pod of podItems) {
@@ -314,8 +319,14 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           const spec = object(pod.spec);
           let limit: number | null = null;
           if (harness) {
-            if (phase === 'Pending') pending++;
-            else {
+            if (phase === 'Pending') {
+              pending++;
+              const jobName = labels?.['elanous.job'] ?? labels?.['job-name'];
+              if (typeof jobName === 'string' && jobName && typeof metadata.namespace === 'string' && metadata.namespace) {
+                const identity = { context: member.context, namespace: metadata.namespace, job: jobName };
+                pendingJobs.set(JSON.stringify(identity), identity);
+              }
+            } else {
               running++;
               const jobName = labels?.['elanous.job'] ?? labels?.['job-name'];
               if (typeof jobName !== 'string' || !leasedJobs.has(jobName)) unleasedRunning++;
@@ -333,7 +344,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (nodeFree.has(nodeName)) nodeFree.set(nodeName, nodeFree.get(nodeName)! - Math.max(requested, limit ?? 0));
         }
         if (unknownPhase) reasons.push('cluster pods: missing/Unknown phase');
-        if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; result.unleasedRunning = unleasedRunning; }
+        if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; result.pendingJobs = [...pendingJobs.values()]; result.unleasedRunning = unleasedRunning; }
         if (limitsValid && jobsValid && !unknownPhase) result.memoryLimitBytes = limits;
         else if (!limitsValid) reasons.push('cluster pods: Running Pod memory limit missing/invalid');
         if (reservationsValid && limitsValid && jobsValid && !unknownPhase) result.availableMemoryByNodeBytes = [...nodeFree.values()];
@@ -366,6 +377,7 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   if (!Number.isSafeInteger(options.capacity) || options.capacity < 0) return { ...empty, reason: '측정 불가: capacity' };
   const running = measure.members.reduce((sum, m) => sum + m.running!, 0);
   const pending = measure.members.reduce((sum, m) => sum + m.pending!, 0);
+  const pendingJobs = measure.members.flatMap((m) => m.pendingJobs ?? []);
   const unleasedRunning = measure.members.reduce((sum, m) => sum + m.unleasedRunning!, 0);
   // Pool-wide free = sum of per-member free slots: a member over its cap counts as full, never negative,
   // so it cannot zero another member's free slot (and its unleased Pods only consume its own free slots).
@@ -393,5 +405,5 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   const recommended = Math.max(0, Math.min(capacitySlots, memoryBound) - eligibleUnleasedRunning);
   const limitedBy = memoryBound < capacitySlots ? 'memory' : 'capacity';
   if (unleasedRunning > 0) debug.log('pod-lease', 'unleased', { unleasedRunning, running, recommended });
-  return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, unleasedRunning };
+  return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, pendingJobs, unleasedRunning };
 }

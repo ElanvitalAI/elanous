@@ -55,6 +55,33 @@ import { elanousSelfAccessPrompt } from '../agent/self-ambient.js';
 import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
 import { resolveSessionProjectContext } from '../project/session-context.js';
 import { debug } from '../debug/log.js';
+import { resolvePersonaAddress } from '../intake-plane/persona-answer.js';
+import { awaitGlobalPersonaLoad, getGlobalPersonaRegistry } from '../persona/global-registry.js';
+
+const turnPersonaPrompt = new AsyncLocalStorage<string | undefined>();
+
+export function withChatPersonaPrompt<T>(prompt: string | undefined, run: () => T): T {
+  return turnPersonaPrompt.run(prompt, run);
+}
+
+export function prependChatPersonaOnLaterTurn(
+  messages: LLMMessage[], isFirstTurn: boolean,
+): LLMMessage[] {
+  const prompt = turnPersonaPrompt.getStore();
+  if (!isFirstTurn && prompt) messages.unshift({ role: 'system', content: prompt });
+  return messages;
+}
+
+export async function personaPromptForChat(
+  id: unknown,
+  deps: { load: () => Promise<unknown>; registry: () => Parameters<typeof resolvePersonaAddress>[1] } = {
+    load: awaitGlobalPersonaLoad, registry: getGlobalPersonaRegistry,
+  },
+): Promise<string | undefined> {
+  if (typeof id !== 'string' || !id.trim()) return undefined;
+  await deps.load();
+  return resolvePersonaAddress(id, deps.registry())?.systemPrompt;
+}
 
 /** C4 (2026-07-12) — arm the non-detached-PTY kill ONCE per turn signal.
  *  Multiple tool calls in one turn share the same AbortSignal instance;
@@ -135,7 +162,7 @@ export function composeDaemonSystemPrompt(
   promptMeta: Readonly<Record<string, unknown>> | undefined,
   sessionId?: string,
 ): string {
-  return [basePrompt, buildDaemonInputSourceLine(promptMeta), elanousSelfAccessPrompt(sessionId)]
+  return [turnPersonaPrompt.getStore(), basePrompt, buildDaemonInputSourceLine(promptMeta), elanousSelfAccessPrompt(sessionId)]
     .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
     .join('\n\n');
 }
@@ -604,12 +631,11 @@ export function createDaemonRunTurn(
       const hasNonTextBlock = !!promptBlocks?.some(
         (b) => (b as { type?: string }).type !== 'text',
       );
-      if (hasNonTextBlock) {
-        return appendUserPromptBlocksAndBuildMessages(
-          history, sessionId, promptBlocks!, systemPrompt,
-        );
-      }
-      return appendUserAndBuildMessages(history, sessionId, userText, systemPrompt);
+      const isFirstTurn = history.get(sessionId).length === 0;
+      const messages = hasNonTextBlock
+        ? appendUserPromptBlocksAndBuildMessages(history, sessionId, promptBlocks!, systemPrompt)
+        : appendUserAndBuildMessages(history, sessionId, userText, systemPrompt);
+      return prependChatPersonaOnLaterTurn(messages, isFirstTurn);
     },
     getTools: () => surface.specs,
     dispatchTool: terminalCapableDispatch(surfaceHasPtyShell, async (name, args, ctx) => {
@@ -723,15 +749,21 @@ export function createDaemonRunTurn(
         });
         debugBridge.activate();
       }
-      const projectCwd = resolveSessionProjectContext(turnCtx.sessionId)?.cwd;
-      if (projectCwd || opts.acpSessionCwd) {
-        // An ACP session's explicit cwd wins; the project folder is only the default when none was given (IA3 review).
-        const explicitCwd = opts.acpSessionCwd && turnCtx.cwd ? turnCtx.cwd : undefined;
-        const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: explicitCwd ?? projectCwd ?? turnCtx.cwd });
-        await turnToolCwd.run(resolver, () => inner(turnCtx));
-      } else {
-        await inner(turnCtx);
-      }
+      const elanousMeta = turnCtx.promptMeta?.elanous;
+      const personaId = elanousMeta && typeof elanousMeta === 'object' && !Array.isArray(elanousMeta)
+        && 'pwaPersonaId' in elanousMeta ? elanousMeta.pwaPersonaId : undefined;
+      const personaPrompt = await personaPromptForChat(personaId);
+      await withChatPersonaPrompt(personaPrompt, async () => {
+        const projectCwd = resolveSessionProjectContext(turnCtx.sessionId)?.cwd;
+        if (projectCwd || opts.acpSessionCwd) {
+          // An ACP session's explicit cwd wins; the project folder is only the default when none was given (IA3 review).
+          const explicitCwd = opts.acpSessionCwd && turnCtx.cwd ? turnCtx.cwd : undefined;
+          const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: explicitCwd ?? projectCwd ?? turnCtx.cwd });
+          await turnToolCwd.run(resolver, () => inner(turnCtx));
+        } else {
+          await inner(turnCtx);
+        }
+      });
     } finally {
       debugBridge?.dispose();
     }

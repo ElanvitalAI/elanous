@@ -1,8 +1,8 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env bun
 // omni-crawl — 통합 검색/크롤링 (2026-07-06 재편: tavily+firecrawl REST+grok 역할분담)
 //
 // CLI 계약 (asset-attractiveness·research-bridge가 의존 — 절대 유지):
-//   npx tsx main.ts "<query>" [--engine e1,e2] [--print] → exit 0 + 마크다운 마커
+//   bun main.ts "<query>" [--engine e1,e2] [--print] → exit 0 + 마크다운 마커
 import { parseArgs } from 'node:util';
 import { initEnv } from '../src/env.js';
 import { decideCrawl } from '../src/router.js';
@@ -14,7 +14,7 @@ import { chromeAvailable } from '../src/capture.js';
 import { runRegisteredEngine, type EngineCtx } from '../src/registry.js';
 import { renderMarkdown, saveMarkdown, renderSourcesSection } from '../src/render.js';
 import type { CrawlResult, CrawlItem, SearchEngine } from '../src/types.js';
-import { writeStdoutJson } from '../../../src/cli/stdout-json.js';
+import { writeStdoutJson } from '../src/stdout-json.js';
 
 initEnv();
 
@@ -502,8 +502,8 @@ function printHelp() {
   console.log(`
 omni-crawl — 통합 검색/크롤링 (tavily + firecrawl REST + grok + apify 역할분담)
 
-사용법: npx tsx scripts/main.ts "<검색어>" [OPTIONS]
-       npx tsx scripts/main.ts --health          # 전 엔진 라이브 진단
+사용법: bun scripts/main.ts "<검색어>" [OPTIONS]
+       bun scripts/main.ts --health          # 전 엔진 라이브 진단
 
 역할:  일반 웹=tavily · 뉴스=tavily-news+fc-news · 크롤/스크랩=firecrawl(REST)
        커뮤니티/X/레딧=grok · 트윗 벌크=apify · 딥리서치=--mode deep
@@ -532,13 +532,13 @@ omni-crawl — 통합 검색/크롤링 (tavily + firecrawl REST + grok + apify �
   --self-test            라우팅 회귀 테스트
 
 예시:
-  npx tsx scripts/main.ts "Samsung HBM4 경쟁력" --print                # tavily 기본
-  npx tsx scripts/main.ts "삼성전자 뉴스" --time-range day --print      # 뉴스 (오늘)
-  npx tsx scripts/main.ts "SK하이닉스 전망" --mode deep --print          # 딥리서치+인용
-  npx tsx scripts/main.ts "AI 트렌드" --free --print                    # 무료 티어(ddg)
-  npx tsx scripts/main.ts "https://news.samsung.com" --engine capture   # 스크린샷
-  npx tsx scripts/main.ts "bitcoin outlook" --engine apify --min-favs 50 --print
-  npx tsx scripts/main.ts "https://news.samsung.com" --engine fc-crawl  # 사이트 크롤
-  npx tsx scripts/main.ts "NVDA earnings" --json                        # 파이프라인 소비
+  bun scripts/main.ts "Samsung HBM4 경쟁력" --print                # tavily 기본
+  bun scripts/main.ts "삼성전자 뉴스" --time-range day --print      # 뉴스 (오늘)
+  bun scripts/main.ts "SK하이닉스 전망" --mode deep --print          # 딥리서치+인용
+  bun scripts/main.ts "AI 트렌드" --free --print                    # 무료 티어(ddg)
+  bun scripts/main.ts "https://news.samsung.com" --engine capture   # 스크린샷
+  bun scripts/main.ts "bitcoin outlook" --engine apify --min-favs 50 --print
+  bun scripts/main.ts "https://news.samsung.com" --engine fc-crawl  # 사이트 크롤
+  bun scripts/main.ts "NVDA earnings" --json                        # 파이프라인 소비
 `);
 }

@@ -1,5 +1,5 @@
 import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -206,6 +206,9 @@ test('deterministic runner probe', async () => {
       ELANOUS_HOST_ID: process.env.ELANOUS_HOST_ID ?? null,
       ELANOUS_STATE_DIR: process.env.ELANOUS_STATE_DIR,
       ELANOUS_CONFIG_DIR: process.env.ELANOUS_CONFIG_DIR,
+      GIT_DIR: process.env.GIT_DIR ?? null,
+      GIT_WORK_TREE: process.env.GIT_WORK_TREE ?? null,
+      GIT_COMMON_DIR: process.env.GIT_COMMON_DIR ?? null,
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
       APIFY_TOKEN: process.env.APIFY_TOKEN ?? null,
     }));
@@ -229,6 +232,11 @@ test('deterministic runner probe', async () => {
     const resolved = userConfigPath();
     if (resolved !== process.env.ELANOUS_STATE_DIR + '/config.json') throw new Error('config escaped isolated root: ' + resolved);
   }
+  if (mode === 'git-bare-leak') {
+    const { spawnSync } = await import('node:child_process');
+    const result = spawnSync('git', ['init', '--bare'], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error('git init --bare: ' + result.stderr);
+  }
   if (mode === 'stdout-marker') console.log('DETERMINISTIC_STDOUT_VISIBLE');
   if (mode === 'exit-1') throw new Error('forced child failure');
 }, 70_000);
@@ -245,6 +253,9 @@ async function waitForProbe(path: string): Promise<{
   ELANOUS_HOST_ID?: string | null;
   ELANOUS_STATE_DIR?: string;
   ELANOUS_CONFIG_DIR?: string;
+  GIT_DIR?: string | null;
+  GIT_WORK_TREE?: string | null;
+  GIT_COMMON_DIR?: string | null;
   ANTHROPIC_API_KEY?: string | null;
   APIFY_TOKEN?: string | null;
   grandchildPid?: number;
@@ -365,6 +376,9 @@ describe('prepareIsolatedTestEnv', () => {
       ELANOUS_ARM_ID: 'arm-parent',
       ELANOUS_STATE_DIR_SOURCE: 'derived',
       ELANOUS_CODEX_ACCOUNT: 'team',
+      GIT_DIR: '/real/shared/.git',
+      GIT_WORK_TREE: '/real/shared/worktree',
+      GIT_COMMON_DIR: '/real/shared/.git',
       PATH: '/usr/bin',
     }, testRoot);
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
@@ -386,6 +400,9 @@ describe('prepareIsolatedTestEnv', () => {
       'ELANOUS_SUBSTRATE', 'ELANOUS_ARM_ID', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_CODEX_ACCOUNT',
     ]) expect(env[key]).toBeUndefined();
     expect(env.PATH).toBe('/usr/bin');
+    expect(env.GIT_DIR).toBeUndefined();
+    expect(env.GIT_WORK_TREE).toBeUndefined();
+    expect(env.GIT_COMMON_DIR).toBeUndefined();
   });
 });
 
@@ -534,6 +551,237 @@ describe('terminateDirectChild', () => {
     expect(messages.join('\n')).toContain(`failed to signal process group pgid=${child.pid}`);
     expect(messages.join('\n')).toContain('killpg failed: ESRCH');
     await expectDead(child.pid!, 1_000);
+  });
+});
+
+describe('runDeterministicTests core.bare guard', () => {
+  test('restores a changed shared config and fails even when the test child passes', async () => {
+    const repo = makeRoot('elanous-bare-guard-');
+    const common = join(repo, '.git');
+    const configFile = join(common, 'config');
+    mkdirSync(common);
+    writeFileSync(configFile, '[core]\n\tbare = false\n');
+    const messages: string[] = [];
+    const readBare = () => /bare = (true|false)/.exec(readFileSync(configFile, 'utf8'))?.[1] ?? '';
+    const code = await runDeterministicTests({
+      cwd: repo,
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      argv: ['scripts/test-deterministic.test.ts'],
+      gitConfig: (_cwd, args) => {
+        if (args[0] === 'rev-parse') return common;
+        if (args.includes('--get-all')) return readBare();
+        if (args.includes('--replace-all')) {
+          writeFileSync(configFile, `[core]\n\tbare = ${args.at(-1)}\n`);
+          return '';
+        }
+        throw new Error(`unexpected git call: ${args.join(' ')}`);
+      },
+      spawn: () => {
+        writeFileSync(configFile, '[core]\n\tbare = true\n');
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(readBare()).toBe('false');
+    expect(messages).toEqual(['[test-deterministic] core.bare changed false -> true; restored false; failing run']);
+  });
+
+  test('restores an initially unset core.bare by unsetting it again', async () => {
+    const repo = makeRoot('elanous-bare-unset-');
+    const common = join(repo, '.git');
+    mkdirSync(common);
+    writeFileSync(join(common, 'config'), '[core]\n\tfilemode = true\n');
+    const configFile = join(common, 'config');
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      cwd: repo,
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      gitConfig: (_cwd, args) => {
+        if (args[0] === 'rev-parse') return common;
+        if (args.includes('--get-all')) return /bare = true/.test(readFileSync(configFile, 'utf8')) ? 'true' : '';
+        if (args.includes('--unset-all')) {
+          writeFileSync(configFile, '[core]\n\tfilemode = true\n');
+          return '';
+        }
+        throw new Error(`unexpected git call: ${args.join(' ')}`);
+      },
+      spawn: () => {
+        writeFileSync(configFile, '[core]\n\tfilemode = true\n\tbare = true\n');
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(readFileSync(configFile, 'utf8')).toBe('[core]\n\tfilemode = true\n');
+    expect(messages).toEqual(['[test-deterministic] core.bare changed <unset> -> true; restored <unset>; failing run']);
+  });
+
+  test('a real cloned repository worktree is restored after a bare init targets its shared Git directory', async () => {
+    const root = makeRoot('elanous-bare-worktree-');
+    const source = join(root, 'source');
+    const shared = join(root, 'shared');
+    const worktree = join(root, 'worktree');
+    const run = (args: string[], cwd = root, env = process.env): string => {
+      const result = spawnSync('git', args, { cwd, env, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${args.join(' ')}: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    run(['init', '-b', 'main', source]);
+    writeFileSync(join(source, 'initial'), 'initial');
+    run(['add', 'initial'], source);
+    run(['-c', 'user.email=test@example.com', '-c', 'user.name=Tester', 'commit', '-m', 'initial'], source);
+    run(['clone', source, shared]);
+    run(['worktree', 'add', '-b', 'probe', worktree], shared);
+    const configFile = join(shared, '.git', 'config');
+    const readBare = () => run(['config', '--file', configFile, '--get', 'core.bare']);
+    expect(readBare()).toBe('false');
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      cwd: worktree,
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      spawn: () => {
+        run(['init', '--bare'], worktree, { ...process.env, GIT_DIR: join(shared, '.git') });
+        expect(readBare()).toBe('true');
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(readBare()).toBe('false');
+    expect(messages).toEqual(['[test-deterministic] core.bare changed false -> true; restored false; failing run']);
+  });
+
+  test.each([
+    { original: 'false', expected: ['false'], injected: ['false', 'true'] },
+    { original: '', expected: [], injected: ['true', 'true'] },
+  ])('restores duplicate core.bare entries with real Git (original=$original)', async ({ original, expected, injected }) => {
+    const repo = makeRoot('elanous-bare-duplicate-');
+    const gitEnv = { ...process.env };
+    delete gitEnv.GIT_DIR;
+    delete gitEnv.GIT_WORK_TREE;
+    delete gitEnv.GIT_COMMON_DIR;
+    const run = (args: string[]): string => {
+      const result = spawnSync('git', args, { cwd: repo, env: gitEnv, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${args.join(' ')}: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    run(['init']);
+    const configFile = join(repo, '.git', 'config');
+    if (!original) run(['config', '--file', configFile, '--unset-all', 'core.bare']);
+    const values = () => {
+      const result = spawnSync('git', ['config', '--file', configFile, '--get-all', 'core.bare'], { cwd: repo, env: gitEnv, encoding: 'utf8' });
+      if (result.status !== 0 && result.status !== 1) throw new Error(`git config --get-all failed: ${result.stderr}`);
+      return result.stdout.trim().split('\n').filter(Boolean);
+    };
+    expect(values()).toEqual([...expected]);
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      cwd: repo,
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      spawn: () => {
+        for (const value of injected) run(['config', '--file', configFile, '--add', 'core.bare', value]);
+        expect(values()).toEqual([...expected, ...injected]);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(values()).toEqual([...expected]);
+    expect(messages).toEqual([`[test-deterministic] core.bare changed ${original || '<unset>'} -> ${[...expected, ...injected].join(',')}; restored ${original || '<unset>'}; failing run`]);
+  });
+
+  test('preserves an originally duplicated core.bare configuration', async () => {
+    const repo = makeRoot('elanous-bare-original-duplicates-');
+    const gitEnv = { ...process.env };
+    delete gitEnv.GIT_DIR;
+    delete gitEnv.GIT_WORK_TREE;
+    delete gitEnv.GIT_COMMON_DIR;
+    const run = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, env: gitEnv, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${args.join(' ')}: ${result.stderr}`);
+    };
+    run(['init']);
+    const configFile = join(repo, '.git', 'config');
+    run(['config', '--file', configFile, '--add', 'core.bare', 'false']);
+    const values = () => spawnSync('git', ['config', '--file', configFile, '--get-all', 'core.bare'], { cwd: repo, env: gitEnv, encoding: 'utf8' }).stdout.trim().split('\n');
+    expect(values()).toEqual(['false', 'false']);
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      cwd: repo,
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      spawn: () => {
+        run(['config', '--file', configFile, '--add', 'core.bare', 'true']);
+        expect(values()).toEqual(['false', 'false', 'true']);
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(values()).toEqual(['false', 'false']);
+    expect(messages).toEqual(['[test-deterministic] core.bare changed false,false -> false,false,true; restored false,false; failing run']);
+  });
+
+  test('fails visibly when restoring core.bare does not reproduce the original values', async () => {
+    let values = 'false';
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      gitConfig: (_cwd, args) => {
+        if (args[0] === 'rev-parse') return join(process.cwd(), '.git');
+        if (args.includes('--get-all')) return values;
+        if (args.includes('--replace-all')) return '';
+        throw new Error(`unexpected git call: ${args.join(' ')}`);
+      },
+      spawn: () => {
+        values = 'false\ntrue';
+        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+      },
+    });
+    expect(code).toBe(1);
+    expect(messages).toEqual(['[test-deterministic] core.bare changed false -> false,true; restore failed: expected false, got false,true']);
+  });
+
+  test('checks the shared config only once after a normal child exit', async () => {
+    let reads = 0;
+    const code = await runDeterministicTests({
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      gitConfig: (_cwd, args) => {
+        if (args[0] === 'rev-parse') return join(process.cwd(), '.git');
+        reads += 1;
+        return 'false';
+      },
+      spawn: () => ({ pid: process.pid, exited: Promise.resolve(0), kill: () => true }),
+    });
+    expect(code).toBe(0);
+    expect(reads).toBe(2);
+  });
+
+  test('does not raise an alert when core.bare remains unchanged', async () => {
+    const messages: string[] = [];
+    const code = await runDeterministicTests({
+      argv: ['scripts/test-deterministic.test.ts'],
+      mkdtempSync: () => makeRoot(),
+      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
+      report: (message) => messages.push(message),
+      spawn: () => ({ pid: process.pid, exited: Promise.resolve(0), kill: () => true }),
+    });
+    expect(code).toBe(0);
+    expect(messages).toEqual([]);
   });
 });
 
@@ -811,6 +1059,46 @@ describe('runDeterministicTests lifecycle', () => {
 });
 
 describe('runtime entrypoint', () => {
+  test('does not let inherited GIT_DIR redirect a bare init into the shared clone', async () => {
+    const root = makeRoot('elanous-deterministic-bare-child-');
+    const source = join(root, 'source');
+    const shared = join(root, 'shared');
+    const worktree = join(root, 'worktree');
+    const fixtureEnv = { ...process.env };
+    delete fixtureEnv.GIT_DIR;
+    delete fixtureEnv.GIT_WORK_TREE;
+    delete fixtureEnv.GIT_COMMON_DIR;
+    const run = (args: string[], cwd = root): string => {
+      const result = spawnSync('git', args, { cwd, env: fixtureEnv, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`${args.join(' ')}: ${result.stderr}`);
+      return result.stdout.trim();
+    };
+    run(['init', '-b', 'main', source]);
+    writeFileSync(join(source, 'initial'), 'initial');
+    run(['add', 'initial'], source);
+    run(['-c', 'user.email=test@example.com', '-c', 'user.name=Tester', 'commit', '-m', 'initial'], source);
+    run(['clone', source, shared]);
+    run(['worktree', 'add', '-b', 'probe', worktree], shared);
+    const readBare = () => run(['config', '--file', join(shared, '.git', 'config'), '--get', 'core.bare']);
+    const probePath = join(root, 'child.json');
+    const child = spawn(process.execPath, [script, writeProbeTest(worktree)], {
+      cwd: worktree,
+      env: {
+        ...fixtureEnv,
+        DETERMINISTIC_RUNNER_PROBE_PATH: probePath,
+        DETERMINISTIC_RUNNER_PROBE_MODE: 'git-bare-leak',
+        GIT_DIR: join(shared, '.git'),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const result = await collect(child);
+    const probe = await waitForProbe(probePath);
+    expect(result.code).toBe(0);
+    expect(probe.GIT_DIR).toBeNull();
+    expect(readBare()).toBe('false');
+    expect(result.stderr).not.toContain('core.bare changed');
+  }, 15_000);
+
   test('strips parent host identity and keeps the XDG deprecation warning off child stderr with a legacy config present', async () => {
     const directory = makeRoot('elanous-deterministic-live-');
     const legacyHome = makeRoot('elanous-deterministic-legacy-');
@@ -823,6 +1111,9 @@ describe('runtime entrypoint', () => {
       DETERMINISTIC_RUNNER_PROBE_PATH: probePath,
       DETERMINISTIC_RUNNER_PROBE_MODE: 'xdg-warning',
       ELANOUS_HOST_ID: 'x',
+      GIT_DIR: join(directory, 'inherited.git'),
+      GIT_WORK_TREE: directory,
+      GIT_COMMON_DIR: join(directory, 'inherited.git'),
       ELANOUS_TEST_HOME: legacyHome,
       XDG_CONFIG_HOME: join(legacyHome, '.config'),
       ELANOUS_TEST_FORCE_XDG_WARNING: '1',
@@ -832,6 +1123,9 @@ describe('runtime entrypoint', () => {
     const probe = await waitForProbe(probePath);
     expect(result.code).toBe(0);
     expect(probe.ELANOUS_HOST_ID).toBeNull();
+    expect(probe.GIT_DIR).toBeNull();
+    expect(probe.GIT_WORK_TREE).toBeNull();
+    expect(probe.GIT_COMMON_DIR).toBeNull();
     expect(probe.XDG_CONFIG_HOME).toBeNull();
     expect(probe.ELANOUS_TEST_HOME).toBe(probe.HOME);
     expect(result.stderr).not.toContain('XDG_CONFIG_HOME is set');

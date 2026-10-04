@@ -4,7 +4,10 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
+import { evidencePlan, landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
+import { debug } from '../debug/log.js';
+import type { LandedButYellowDeps } from '../cli/release-cli.js';
+import * as checklist from './checklist.js';
 import type { ChecklistItem } from './checklist.js';
 import { registerReleaseCommands, type Runner } from '../cli/release-cli.js';
 
@@ -15,8 +18,16 @@ const pr = (number: number, title: string, body = '', mergedAt = '2026-10-03T01:
 const sample = [item('W3', 'yellow', { evidence: '#12' }), item('R1', 'red', { owner: 'TC', updatedAt: '2026-10-04T00:00:00Z' }), item('G1', 'green')];
 const merges = [pr(11, 'W3d only'), pr(12, 'W3 fixed'), pr(13, 'misc', '칸: R1'), pr(14, 'G1 fixed')];
 
-async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: { status?: number | null; stderr?: string; items?: ChecklistItem[] } = {}) {
+async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: { status?: number | null; stderr?: string; items?: ChecklistItem[]; evidenceAdd?: LandedButYellowDeps['evidenceAdd'] } = {}) {
   const stdout: string[] = [], stderr: string[] = [], calls: Array<{ command: string; args: readonly string[] }> = [];
+  const evidenceCalls: Array<{ id: string; version: string; ref: string; by: string; released: string | undefined; dev: string | undefined }> = [];
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const evidenceAdd: NonNullable<LandedButYellowDeps['evidenceAdd']> = (id, version, ref, by, released, dev) => {
+    evidenceCalls.push({ id, version, ref, by, released, dev });
+    options.evidenceAdd?.(id, version, ref, by, released, dev);
+  };
+  const debugLog = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+  const setItem = spyOn(checklist, 'setItem').mockImplementation(() => { throw new Error('status 변경 호출 금지'); });
   const log = spyOn(console, 'log').mockImplementation((line) => { stdout.push(String(line)); });
   const error = spyOn(console, 'error').mockImplementation((line) => { stderr.push(String(line)); });
   const write = spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array, callback?: unknown) => {
@@ -39,12 +50,13 @@ async function cli(args: string[], prs: MergedChecklistPr[] = merges, options: {
       reads++;
       expect(version).toBe('0.2.12');
       return { version, dev: version, released: '', items: options.items ?? sample, history: [] };
-    }, now: () => new Date('2026-10-04T04:00:00Z') });
+    }, evidenceAdd, now: () => new Date('2026-10-04T04:00:00Z') });
     await program.parseAsync(['release', 'checklist', 'landed-but-yellow', '--version', '0.2.12', ...args], { from: 'user' });
     expect(existsSync(join(root, 'release', 'features.sqlite'))).toBe(false);
-    return { stdout, stderr, calls, reads, exitCode: process.exitCode };
+    expect(setItem).not.toHaveBeenCalled();
+    return { stdout, stderr, calls, reads, evidenceCalls, events, exitCode: process.exitCode };
   } finally {
-    log.mockRestore(); error.mockRestore(); write.mockRestore(); process.exitCode = previous;
+    log.mockRestore(); error.mockRestore(); write.mockRestore(); debugLog.mockRestore(); setItem.mockRestore(); process.exitCode = previous;
     resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
   }
@@ -145,7 +157,45 @@ describe('landedButYellow', () => {
   });
 });
 
+describe('evidencePlan', () => {
+  test('includes only missing cell-line and strong-title pairs, deduplicated by cell and PR', () => {
+    const rows = landedButYellow([item('CL-AUTO', 'yellow', { evidence: '#8' }), item('OTHER')], [
+      pr(7, 'misc', '칸: CL-AUTO'), pr(8, 'CL-AUTO 수확'), pr(9, 'CL-AUTO 셋째 조각'),
+      pr(10, 'unrelated CL-AUTO mention'), pr(11, 'misc', '칸: OTHER, CL-AUTO'),
+    ]);
+    expect(evidencePlan([...rows, rows[0]!])).toEqual([
+      { id: 'CL-AUTO', ref: '#11' }, { id: 'CL-AUTO', ref: '#7' }, { id: 'CL-AUTO', ref: '#9' },
+      { id: 'OTHER', ref: '#11' },
+    ]);
+    expect(rows[0]?.prs.find((p) => p.number === 10)?.basis).toBe('mention');
+    expect(rows[0]?.alreadyInEvidence[rows[0].prs.findIndex((p) => p.number === 8)]).toBe(true);
+  });
+});
+
 describe('release checklist landed-but-yellow CLI', () => {
+  test('--apply-evidence writes the plan only, preserves status, prints summary and logs the sync', async () => {
+    const items = [item('CL-AUTO', 'yellow', { evidence: '#8' }), item('R1', 'red')];
+    const prs = [pr(7, 'misc', '칸: CL-AUTO'), pr(8, 'CL-AUTO 수확'), pr(9, 'CL-AUTO 셋째 조각'),
+      pr(10, 'unrelated CL-AUTO mention'), pr(11, 'misc', '칸: R1')];
+    const initial = items.map(({ status, evidence }) => ({ status, evidence }));
+    const applied = await cli(['--apply-evidence'], prs, { items });
+    expect(applied.evidenceCalls).toEqual([
+      { id: 'CL-AUTO', version: '0.2.12', ref: '#7', by: process.env.ELANOUS_TRACK || 'cli', released: '', dev: '0.2.12' },
+      { id: 'CL-AUTO', version: '0.2.12', ref: '#9', by: process.env.ELANOUS_TRACK || 'cli', released: '', dev: '0.2.12' },
+      { id: 'R1', version: '0.2.12', ref: '#11', by: process.env.ELANOUS_TRACK || 'cli', released: '', dev: '0.2.12' },
+    ]);
+    expect(applied.stdout.slice(-4)).toEqual(['✅ CL-AUTO 근거 #7', '✅ CL-AUTO 근거 #9', '✅ R1 근거 #11', '붙임 3 · 건너뜀(언급만) 1']);
+    expect(applied.events).toContainEqual({ category: 'release.checklist', event: 'evidence-synced', data: { added: 3, skippedMention: 1 } });
+    expect(items.map(({ status, evidence }) => ({ status, evidence }))).toEqual(initial);
+    expect(applied.exitCode).toBe(0);
+
+    const dry = await cli(['--apply-evidence', '--dry-run'], prs, { items });
+    expect(dry.evidenceCalls).toEqual([]);
+    expect(dry.stdout.slice(-4)).toEqual(['· CL-AUTO 근거 #7', '· CL-AUTO 근거 #9', '· R1 근거 #11', '붙임 0 · 건너뜀(언급만) 1']);
+    expect(dry.events.find(({ event }) => event === 'evidence-synced')).toBeUndefined();
+    expect(items.map(({ status, evidence }) => ({ status, evidence }))).toEqual(initial);
+  });
+
   test('human lines, counts, seven-day search and read-only injected ledger', async () => {
     const result = await cli([]);
     expect(result.calls).toEqual([{ command: 'gh', args: ['pr', 'list', '--state', 'merged', '--search', 'merged:>=2026-09-27', '--limit', '400', '--json', 'number,title,body,mergedAt'] }]);

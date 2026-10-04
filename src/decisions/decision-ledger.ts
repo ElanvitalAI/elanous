@@ -22,11 +22,15 @@ export interface DecisionEntry {
   pendingQuestion?: string;
   /** DEC-TG — optional deadline (UTC). Cards remind the owner two hours before it. */
   dueAt?: string;
+  crossCheck?: Array<{ seat: string; at: string; note: string }>;
+  crossCheckSkipped?: string;
+  alternative?: string;
+  dissent?: string;
   decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions;
   withdrawnAt?: string; withdrawReason?: string;
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
-export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume' | 'pendingQuestion'> & { raisedAt?: string };
+export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume' | 'pendingQuestion' | 'crossCheck' | 'crossCheckSkipped' | 'alternative' | 'dissent'> & { raisedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
 export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer }
 
@@ -89,13 +93,27 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
     ? { skipped: true as const, reason: safe(single(input.recommendation.reason, 'skip reason')) }
     : { option: input.recommendation.option, why: safe(single(input.recommendation.why, 'recommendation why')) };
   if ('option' in recommendation && !options.some(o => o.key === recommendation.option)) throw new Error('recommended option not found');
+  const alternative = input.alternative === undefined ? undefined : single(input.alternative, 'alternative');
+  if (alternative && !options.some(o => o.key === alternative)) throw new Error('alternative option not found');
+  if (alternative && 'option' in recommendation && alternative === recommendation.option) throw new Error('alternative must differ from recommendation');
+  if (input.crossCheck?.length && input.crossCheckSkipped !== undefined) throw new Error('cross-check and skipped reason cannot coexist');
+  if (input.crossCheck !== undefined && !Array.isArray(input.crossCheck)) throw new Error('cross-check must be a list');
+  const crossCheck = input.crossCheck?.map(check => {
+    const seat = single(check.seat, 'cross-check seat');
+    if (!['OP', 'MK', 'TC', 'UX'].includes(seat)) throw new Error('invalid cross-check seat');
+    return { seat, at: utc(check.at), note: safe(single(check.note, 'cross-check note')) };
+  });
+  const crossCheckSkipped = input.crossCheckSkipped === undefined ? undefined : safe(single(input.crossCheckSkipped, 'cross-check skipped reason'));
+  const dissent = input.dissent === undefined ? undefined : safe(single(input.dissent, 'dissent'));
   if (input.resume && !/^(?:auq:[0-9a-z]+:[0-9a-z]{5}|execution:[A-Za-z0-9_-]+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![\s\S])/.test(input.resume.questionId)) throw new Error('invalid resume questionId');
   const resume = input.resume ? { questionId: input.resume.questionId,
     ...(input.resume.runId === undefined ? {} : { runId: single(input.resume.runId, 'resume runId') }) } : undefined;
   if (input.pendingQuestion !== undefined) required(input.pendingQuestion, 'pending question');
   return { ...input, title, scqa: { s, c, ...(q ? { q } : {}), ...(a ? { a } : {}) }, options, recommendation,
     ...(input.pendingQuestion === undefined ? {} : { pendingQuestion: safe(input.pendingQuestion) }),
-    ...(resume ? { resume } : {}),
+    ...(resume ? { resume } : {}), ...(crossCheck ? { crossCheck } : {}),
+    ...(crossCheckSkipped !== undefined ? { crossCheckSkipped } : {}),
+    ...(alternative !== undefined ? { alternative } : {}), ...(dissent !== undefined ? { dissent } : {}),
     raisedBy: { agent: safe(single(input.raisedBy.agent, 'agent')), ...(input.raisedBy.track ? { track: input.raisedBy.track } : {}), ...(input.raisedBy.session ? { session: safe(single(input.raisedBy.session, 'session')) } : {}) },
     ...(input.refs ? { refs: input.refs.map(r => safe(single(r, 'ref'))) } : {}),
     ...(input.dueAt ? { dueAt: utc(input.dueAt) } : {}) };
@@ -206,21 +224,29 @@ export class DecisionLedger {
   show(id: string): DecisionEntry { const entry = this.list({ status: 'all' }).find(e => e.id === id); if (!entry) throw new Error(`decision not found: ${id}`); return entry; }
   raise(input: RaiseInput): DecisionEntry {
     const clean = validate(input);
-    return this.locked(() => {
-      const at = utc(clean.raisedAt ?? this.now().toISOString());
-      const day = at.slice(0, 10).replaceAll('-', '');
-      const prefix = `D-${day}-`;
-      let next = 1;
-      for (const entry of this.list({ status: 'all' })) {
-        if (entry.id.startsWith(prefix)) next = Math.max(next, Number(entry.id.slice(prefix.length)) + 1);
-      }
-      const id = `${prefix}${String(next).padStart(2, '0')}`;
-      const version = this.version(at);
-      const entry: DecisionEntry = { ...clean, id, raisedAt: at, version, status: 'open', history: [{ type: 'raised', at, by: clean.raisedBy.agent, version }] };
-      this.append({ type: 'raised', entry });
-      debug.log('decisions', 'raised', { id, category: entry.category, by: entry.raisedBy.agent });
-      return entry;
-    });
+    return this.locked(() => this.raiseLocked(clean));
+  }
+  /** Reuse a card with the same source reference, including across competing raisers. */
+  raiseOnce(input: RaiseInput, ref: string): DecisionEntry {
+    const clean = validate(input);
+    if (!clean.refs?.includes(ref)) throw new Error('decision source reference required');
+    return this.locked(() => this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref)) ?? this.raiseLocked(clean));
+  }
+  private raiseLocked(clean: RaiseInput): DecisionEntry {
+    const at = utc(clean.raisedAt ?? this.now().toISOString());
+    const day = at.slice(0, 10).replaceAll('-', '');
+    const prefix = `D-${day}-`;
+    let next = 1;
+    for (const entry of this.list({ status: 'all' })) {
+      if (entry.id.startsWith(prefix)) next = Math.max(next, Number(entry.id.slice(prefix.length)) + 1);
+    }
+    const id = `${prefix}${String(next).padStart(2, '0')}`;
+    const version = this.version(at);
+    const entry: DecisionEntry = { ...clean, id, raisedAt: at, version, status: 'open', history: [{ type: 'raised', at, by: clean.raisedBy.agent, version }] };
+    this.append({ type: 'raised', entry });
+    debug.log('decisions', 'raised', { id, category: entry.category, by: entry.raisedBy.agent });
+    debug.log('decisions', 'raised-crosscheck', { id, seats: entry.crossCheck?.length ?? 0, skipped: entry.crossCheckSkipped ?? null });
+    return entry;
   }
   /** Record the decision and say whether its answer reached the waiting run (null = the decision resumes nothing). */
   decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery } {

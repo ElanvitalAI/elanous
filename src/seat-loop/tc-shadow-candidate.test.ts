@@ -1,8 +1,9 @@
 import { expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
+import { openMsgStore } from '../msg/msg-store.js';
 import { debug } from '../debug/log.js';
 import { readTcPullRequests, runSeatLoopOnce, seatLedgerPath, tcApprovalWaitAt, type SeatDeps, type TcPullRequest } from './seat-loop.js';
 
@@ -48,6 +49,193 @@ test('TC shadow records merged PR with yellow cell and ready publication PR awai
     await runSeatLoopOnce('TC', f.deps);
     expect(f.rows().filter((row) => row.candidate)).toHaveLength(4);
     expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('TC encountering a UX defect in the fake release ledger records one UX ask-shadow without dispatch', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const deps: SeatDeps = { ...f.deps, pullRequests: async () => [], checklistItems: () => [
+      { id: 'UX1', title: '화면 결함', owner: 'UX', status: 'red', evidence: 'PR #201 merged' },
+    ] };
+    await runSeatLoopOnce('TC', deps);
+    await runSeatLoopOnce('TC', deps);
+    const asks = f.rows().filter((row) => row.action === 'seat-question');
+    expect(asks).toHaveLength(1);
+    expect(f.rows().filter((row) => row.candidate?.kind === 'other-seat-cell-defect')).toHaveLength(1);
+    expect(asks[0]).toMatchObject({ seat: 'TC', status: 'shadow', candidate: { kind: 'other-seat-cell-defect', id: 'UX1', to: 'UX' }, inquiry: { to: 'UX' } });
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query('SELECT seat, status, origin FROM seat_asks').all()).toEqual([{
+        seat: 'UX', status: 'shadow', origin: JSON.stringify({ channel: 'seat-loop', from: 'TC', itemId: 'UX1', version: '0.2.11',
+          question: '0.2.11 체크리스트 UX1 · 화면 결함: UX 칸 결함을 확인해 주세요.' }),
+      }]);
+      expect(store.listByRecipient('UX')).toEqual([]);
+      expect(store.db.query('SELECT id FROM seat_ask_outbox').all()).toEqual([]);
+    } finally { store.close(); }
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow').map(([, , data]) => data))
+      .toEqual([{ from: 'TC', to: 'UX', itemId: 'UX1' }]);
+    expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('TC does not ask about closed or published cross-seat cells', async () => {
+  const f = fixture();
+  try {
+    const release = join(f.root, 'release', '0.2.11');
+    mkdirSync(release, { recursive: true });
+    writeFileSync(join(release, 'release.json'), JSON.stringify({ version: '0.2.11', publishedAt: now.toISOString() }));
+    await runSeatLoopOnce('TC', { ...f.deps, pullRequests: async () => [], checklistItems: () => [
+      { id: 'UX-old', owner: 'UX', title: 'published defect', status: 'red' },
+    ] });
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.db.query("SELECT name FROM sqlite_master WHERE name = 'seat_asks'").all()).toEqual([]); }
+    finally { store.close(); }
+    expect(f.calls).toEqual([]);
+  } finally { f.close(); }
+});
+
+test('TC asks the owning seat rather than routing every other-seat defect to UX', async () => {
+  const f = fixture();
+  try {
+    f.sources.prs = [pr(202, { title: 'MK1 landing', state: 'MERGED', mergedAt: '2026-10-03T10:00:00Z' })];
+    await runSeatLoopOnce('TC', { ...f.deps, checklistItems: () => [
+      { id: 'MK1', owner: 'MK', title: '콘텐츠 결함', status: 'red' },
+    ] });
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query('SELECT seat, status FROM seat_asks').all()).toEqual([{ seat: 'MK', status: 'shadow' }]);
+      expect(store.listByRecipient('MK')).toEqual([]);
+    } finally { store.close(); }
+    expect(f.rows().filter((row) => row.candidate?.kind === 'other-seat-cell-defect')).toMatchObject([
+      { candidate: { id: 'MK1', to: 'MK' }, inquiry: { to: 'MK' } },
+    ]);
+    expect(f.calls).toEqual([]);
+  } finally { f.close(); }
+});
+
+test('a live TC turn records one UX ask-shadow for another seat red cell without dispatch', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'], questions: 'on' }, pullRequests: async () => [], checklistItems: () => [
+      { id: 'UX1', owner: 'UX', title: '화면 결함', status: 'red' },
+    ] };
+    await runSeatLoopOnce('TC', deps);
+    await runSeatLoopOnce('TC', deps);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query('SELECT seat, status FROM seat_asks').all()).toEqual([{ seat: 'UX', status: 'shadow' }]);
+      expect(store.listByRecipient('UX')).toEqual([]);
+      expect(store.db.query('SELECT id FROM seat_ask_outbox').all()).toEqual([]);
+    } finally { store.close(); }
+    expect(f.rows().filter((row) => row.candidate?.kind === 'other-seat-cell-defect')).toHaveLength(1);
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow').map(([, , data]) => data))
+      .toEqual([{ from: 'TC', to: 'UX', itemId: 'UX1' }]);
+    expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('a failed TC seat ledger append resumes the existing shadow ask and records the missing observation on retry', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  let fail = true;
+  try {
+    const deps: SeatDeps = { ...f.deps, pullRequests: async () => [], checklistItems: () => [
+      { id: 'UX1', owner: 'UX', title: '화면 결함', status: 'red' },
+    ], append: (path, entry) => {
+      if (fail && entry.candidate?.kind === 'other-seat-cell-defect') { fail = false; throw new Error('ledger unavailable'); }
+      mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+      const previous = (() => { try { return readFileSync(path, 'utf8'); } catch { return ''; } })();
+      writeFileSync(path, previous + JSON.stringify(entry) + '\n');
+    } };
+    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('ledger unavailable');
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.db.query('SELECT seat, status FROM seat_asks').all()).toEqual([{ seat: 'UX', status: 'shadow' }]); }
+    finally { store.close(); }
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow')).toHaveLength(0);
+    await runSeatLoopOnce('TC', deps);
+    await runSeatLoopOnce('TC', deps);
+    expect(f.rows().filter((row) => row.candidate?.kind === 'other-seat-cell-defect')).toHaveLength(1);
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow').map(([, , data]) => data))
+      .toEqual([{ from: 'TC', to: 'UX', itemId: 'UX1' }]);
+    expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('ordinary inquiries in shadow mode remain question and decision candidates without entering the CTX3 ask ledger', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const requestPath = join(f.root, 'seat-requests', 'requests.jsonl');
+    mkdirSync(join(f.root, 'seat-requests'));
+    writeFileSync(requestPath, [
+      { key: 'tc-ux', seat: 'TC', text: 'UX 화면 결함 검토', status: 'pending', queuedAt: now.toISOString() },
+      { key: 'tc-ceo', seat: 'TC', text: '사람 승인 필요', status: 'pending', queuedAt: now.toISOString() },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['TC'], questions: 'shadow' },
+      inquire: (_seat, item) => item.id === 'tc-ux' ? { to: 'UX', question: 'UX 화면의 결함을 확인해 주세요' }
+        : { to: 'CEO', question: '사람이 승인해야 하나요?' } };
+    await runSeatLoopOnce('TC', deps);
+    await runSeatLoopOnce('TC', deps);
+    const rows = f.rows().filter((row) => row.item?.source === 'request');
+    expect(rows.map((row) => [row.item.id, row.action, row.inquiry.to])).toEqual([
+      ['tc-ceo', 'decision', 'CEO'], ['tc-ux', 'seat-question', 'UX'],
+    ]);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query("SELECT name FROM sqlite_master WHERE name = 'seat_asks'").all()).toEqual([]);
+      expect(store.listByRecipient('UX')).toEqual([]);
+    } finally { store.close(); }
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow')).toHaveLength(0);
+    expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('ordinary TC to UX inquiry uses the existing seat question delivery when questions are on', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const requestDir = join(f.root, 'seat-requests');
+    mkdirSync(requestDir);
+    writeFileSync(join(requestDir, 'requests.jsonl'), JSON.stringify({
+      key: 'tc-ux', seat: 'TC', text: '자료 확인 요청', status: 'pending', queuedAt: now.toISOString(),
+    }) + '\n');
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'], questions: 'on' },
+      pullRequests: async () => [], inquire: () => ({ to: 'UX', question: 'UX 근거를 확인해 주세요' }) };
+    await runSeatLoopOnce('TC', deps);
+    expect(f.rows().filter((row) => row.item?.id === 'tc-ux').map((row) => row.status)).toEqual(['attempting', 'asked']);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query("SELECT name FROM sqlite_master WHERE name = 'seat_asks'").all()).toEqual([]);
+      expect(store.listByRecipient('UX').map(({ from, to, kind, body }) => ({ from, to, kind, body }))).toEqual([
+        { from: 'TC', to: 'UX', kind: 'seat-question', body: 'UX 근거를 확인해 주세요' },
+      ]);
+    } finally { store.close(); }
+    expect(log.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'ask-shadow')).toHaveLength(0);
+    expect(f.calls).toEqual([]);
+  } finally { log.mockRestore(); f.close(); }
+});
+
+test('an ordinary TC to UX inquiry recorded in shadow is delivered once questions turn on (RM3a must-fix)', async () => {
+  const f = fixture();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const requestDir = join(f.root, 'seat-requests');
+    mkdirSync(requestDir);
+    writeFileSync(join(requestDir, 'requests.jsonl'), JSON.stringify({
+      key: 'tc-ux', seat: 'TC', text: '자료 확인 요청', status: 'pending', queuedAt: now.toISOString(),
+    }) + '\n');
+    const inquire = () => ({ to: 'UX' as const, question: 'UX 근거를 확인해 주세요' });
+    await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'], questions: 'shadow' }, pullRequests: async () => [], inquire });
+    expect(f.rows().filter((row) => row.item?.id === 'tc-ux').map((row) => row.status)).toEqual(['shadow']);
+    await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'], questions: 'on' }, pullRequests: async () => [], inquire });
+    expect(f.rows().filter((row) => row.item?.id === 'tc-ux').map((row) => row.status)).toEqual(['shadow', 'attempting', 'asked']);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      expect(store.listByRecipient('UX').map(({ from, to, kind }) => ({ from, to, kind }))).toEqual([{ from: 'TC', to: 'UX', kind: 'seat-question' }]);
+    } finally { store.close(); }
   } finally { log.mockRestore(); f.close(); }
 });
 

@@ -9,7 +9,7 @@ import { askSeat, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-a
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { answerAsSeat } from './seat-answer.js';
-import { answerAsPersona, resolvePersonaAddress, type PersonaAnswerDeps } from './persona-answer.js';
+import { answerAsPersona, resolvePersonaAddress, seatOfPersona, type PersonaAnswerDeps } from './persona-answer.js';
 import {
   submitIntakeWork,
   type SubmitIntakeWorkDeps,
@@ -72,14 +72,21 @@ export async function handleDiscordSeatWork(
     return ['OP', 'TC', 'MK', 'UX'].includes(id) ? sendTask(id, text, auth!.cfg, auth!.id) : null;
   }
 
-  const seats = address.seats.map((name) => ({ name, seat: resolveSeat(name) }));
-  const hasUnresolved = seats.some(({ seat }) => !seat);
+  const initialSeats = address.seats.map((name) => ({ name, seat: resolveSeat(name) }));
+  const hasUnresolved = initialSeats.some(({ seat }) => !seat);
   const auth = hasUnresolved ? owner() : null;
   if (hasUnresolved && auth && !deps.personaSource) await awaitGlobalPersonaLoad();
   const source = hasUnresolved && auth ? (deps.personaSource ?? getGlobalPersonaRegistry()) : null;
-  const addressed = seats.map(({ name, seat }) => ({
-    name, seat, persona: !seat && source ? resolvePersonaAddress(name, source) : null,
-  }));
+  const addressed = initialSeats.map(({ name, seat }) => {
+    const persona = !seat && source ? resolvePersonaAddress(name, source) : null;
+    const personaSeat = persona ? seatOfPersona(persona) : null;
+    if (persona && personaSeat) {
+      debug.log('persona.address', 'seat-alias', { name, personaId: persona.personaId, seat: personaSeat.id, via: 'discord' });
+      return { name: personaSeat.id, seat: personaSeat, persona: null };
+    }
+    return { name, seat, persona };
+  });
+  const seats = addressed;
   const unknown = addressed.filter(({ seat, persona }) => !seat && (!persona || !auth)).map(({ name }) => `@${name}`);
   if (unknown.length) return `어느 좌석을 말씀하시나요? ${unknown.join(', ')}은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.`;
   const personas = addressed.filter(({ persona }) => persona);

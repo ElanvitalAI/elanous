@@ -81,7 +81,7 @@ test('workflow history entry stays in the selected workflow bottom action row an
 
   expect(historyView?.[0]).toMatch(/onLoad=\{\(yaml\) => \{\s*setDraftYaml\(yaml\);\s*setEditorMode\('yaml'\);\s*\}\}/);
   expect(historyView?.[0]).not.toContain('handleSave');
-  expect(bottomActions?.[0]).toMatch(/\{selectedName && !creatingNew && \([\s\S]*?onClick=\{\(\) => setShowHistory\(true\)\}[\s\S]*?이전 판/);
+  expect(bottomActions?.[0]).toMatch(/\{selectedName && !creatingNew && \([\s\S]*?onClick=\{\(\) => \{? ?(?:setShowPublish\(false\); )?setShowHistory\(true\);? ?\}?\}[\s\S]*?이전 판/);
   expect(bottomActions?.[0].indexOf('이전 판')).toBeLessThan(bottomActions?.[0].indexOf('Delete') ?? 0);
 });
 

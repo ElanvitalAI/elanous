@@ -31,8 +31,9 @@
 //     reports the failure.
 
 import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 // The predicate lives in its own side-effect-free module so it can be tested:
 // importing THIS file used to spawn the suite at load time. The runner is now
 // behind `import.meta.main` / `runDeterministicTests()`, but the filter stays
@@ -56,6 +57,8 @@ const HARNESS_TEST_ENV_KEYS = [
 // Discovery: rg -n "process\.env\.ELANOUS_(HOST|RUN|ORIGIN|SUPERVISOR|PARENT)" src
 // These are ambient execution identities, not inputs to a deterministic test.
 // debug.log also attributes SUBSTRATE and ARM_ID to every plain-object record.
+const GIT_LOCATION_ENV_KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'] as const;
+
 const EXECUTION_ORIGIN_ENV_KEYS = [
   'ELANOUS_HOST_ID',
   'ELANOUS_RUN_ID',
@@ -120,6 +123,7 @@ export type DeterministicRunnerDeps = {
   childGraceMs?: number;
   killProcessGroup?: KillProcessGroup;
   getProcessGroupId?: GetProcessGroupId;
+  gitConfig?: (cwd: string, args: string[]) => string;
 };
 
 export function isLivePid(pid: number): boolean {
@@ -269,11 +273,22 @@ export async function terminateDirectChild(
   reportVisible(`failed to terminate child pid=${pid}`, report);
 }
 
+function gitConfig(cwd: string, args: string[]): string {
+  const env = { ...process.env };
+  for (const key of GIT_LOCATION_ENV_KEYS) delete env[key];
+  const result = spawnSync('git', args, { cwd, env, encoding: 'utf8' });
+  if (result.error || (result.status !== 0 && !(result.status === 1 && args.includes('--get-all') && !result.stderr))) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
 export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: string): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
     Object.entries(sourceEnv).filter(([key]) => !isCredentialKey(key)
       && !HARNESS_TEST_ENV_KEYS.includes(key as typeof HARNESS_TEST_ENV_KEYS[number])
-      && !EXECUTION_ORIGIN_ENV_KEYS.includes(key as typeof EXECUTION_ORIGIN_ENV_KEYS[number])),
+      && !EXECUTION_ORIGIN_ENV_KEYS.includes(key as typeof EXECUTION_ORIGIN_ENV_KEYS[number])
+      && !GIT_LOCATION_ENV_KEYS.includes(key as typeof GIT_LOCATION_ENV_KEYS[number])),
   );
   env.HOME = testRoot;
   // userConfigPath() warns whenever XDG_CONFIG_HOME is set, including when
@@ -392,6 +407,38 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   const report = deps.report ?? console.error;
   const spawn = deps.spawn ?? defaultSpawn;
   const argv = deps.argv ?? process.argv.slice(2);
+  const cwd = deps.cwd ?? process.cwd();
+  const config = deps.gitConfig ?? gitConfig;
+  const commonDir = config(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  const configFile = join(resolve(cwd, commonDir), 'config');
+  const bareArgs = ['config', '--file', configFile];
+  const readBare = () => config(cwd, [...bareArgs, '--get-all', 'core.bare']);
+  const bareBefore = readBare();
+  let bareChanged = false;
+  let bareChecked = false;
+  const checkBare = (): void => {
+    bareChecked = true;
+    let bareAfter = '<unreadable>';
+    const visible = (values: string) => values ? values.replaceAll('\n', ',') : '<unset>';
+    try {
+      bareAfter = readBare();
+      if (bareAfter === bareBefore) return;
+      bareChanged = true;
+      const originalValues = bareBefore ? bareBefore.split('\n') : [];
+      if (originalValues.length > 0) {
+        config(cwd, [...bareArgs, '--replace-all', 'core.bare', originalValues[0]!]);
+        for (const value of originalValues.slice(1)) config(cwd, [...bareArgs, '--add', 'core.bare', value]);
+      } else if (bareAfter) {
+        config(cwd, [...bareArgs, '--unset-all', 'core.bare']);
+      }
+      const restored = readBare();
+      if (restored !== bareBefore) throw new Error(`expected ${visible(bareBefore)}, got ${visible(restored)}`);
+      report(`[test-deterministic] core.bare changed ${visible(bareBefore)} -> ${visible(bareAfter)}; restored ${visible(bareBefore)}; failing run`);
+    } catch (error) {
+      bareChanged = true;
+      report(`[test-deterministic] core.bare changed ${visible(bareBefore)} -> ${visible(bareAfter)}; restore failed: ${formatError(error)}`);
+    }
+  };
   // ⛔ 사람이 «경로»를 직접 준 창에서는 아무것도 빼지 않는다 — 그 창은 「이것만 돌려라」다.
   const explicitPaths = argv.some((arg) => !arg.startsWith('-'));
   const cdpPatterns = explicitPaths ? [] : (deps.deriveCdpPatterns ?? deriveCdpTestPatterns)();
@@ -451,6 +498,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       });
       cleanupTemporaryRoot(testRoot, { rmSync: deps.rmSync, report });
       rootCleanupAttempted = true;
+      checkBare();
       gate?.dispose();
       gate = undefined;
       if (deps.killSelf) {
@@ -465,7 +513,8 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
     }
 
     cleanupRoot();
-    return outcome.code ?? 1;
+    checkBare();
+    return bareChanged ? 1 : (outcome.code ?? 1);
   } catch (error) {
     if (child) {
       try {
@@ -484,6 +533,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   } finally {
     gate?.dispose();
     cleanupRoot();
+    if (!bareChecked) checkBare();
   }
 }
 

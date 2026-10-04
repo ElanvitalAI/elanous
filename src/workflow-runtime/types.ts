@@ -6,6 +6,7 @@
 // `depends_on` + `when` + `trigger_rule` topology.
 
 import type { ToolPolicy } from '../tool-runtime/tool-policy.js';
+import type { ElanousObsidianSearchArgs, ElanousObsidianSearchResult } from '../tool-runtime/elanous-obsidian-search-runtime.js';
 import type { CapabilityRequirements } from '../registry/resolver.js';
 
 export type { CapabilityRequirements } from '../registry/resolver.js';
@@ -21,8 +22,10 @@ export interface NodeOutput {
    *  (typically an error message string) so downstream `when` clauses
    *  can branch on `$<id>.error`. */
   ok: boolean;
-  /** Error message when ok=false. */
+  /** Error message (knowledge search errors can also occur with ok=true). */
   error?: string;
+  /** Raw Obsidian matches for a knowledge node; output remains prompt-ready text. */
+  matches?: ElanousObsidianSearchResult['matches'];
   /** Wall-clock duration in ms. */
   durationMs: number;
   /** Run id of the workflow called by a subworkflow node, including failures. */
@@ -183,6 +186,12 @@ export interface FilterNode extends DagNodeBase {
   filter: {
     items: string;
     condition: string;
+  };
+}
+export interface KnowledgeNode extends DagNodeBase {
+  knowledge: {
+    query: string;
+    limit?: number;
   };
 }
 /** Node-catalog N4.1 (2026-05-11) — Schedule trigger. v1 = schema +
@@ -513,6 +522,7 @@ export type DagNode =
   | (ExtractNode & { kind?: undefined })
   | (SetNode & { kind?: undefined })
   | (FilterNode & { kind?: undefined })
+  | (KnowledgeNode & { kind?: undefined })
   | (TemplateNode & { kind?: undefined })
   | (HttpRequestNode & { kind?: undefined })
   | (ShowroomNode & { kind?: undefined })
@@ -699,6 +709,8 @@ export interface WorkflowDeps {
     body: string,
     opts: { timeoutMs?: number; signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv }
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  /** Obsidian search for knowledge nodes. Omitted = in-process vault search. */
+  searchObsidian?: (args: ElanousObsidianSearchArgs) => Promise<ElanousObsidianSearchResult>;
   /** Create a TOX task (`task` node). Omitted = the in-process TOX
    *  `dispatchTaskCreate`. */
   createTask?: (req: WorkflowTaskRequest) => Promise<WorkflowTaskResult>;

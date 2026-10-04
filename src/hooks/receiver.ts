@@ -4,7 +4,7 @@ import { getUserConfig, parseEventsConfig, userConfigPath, type EventsConfig } f
 import { dispatchHook, type HookWake } from './dispatch.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { HookQueue, type QueuedHook } from './queue.js';
-import { recordGithubShadow } from './github-shadow.js';
+import { recordGithubShadow, type ShadowReviewResult } from './github-shadow.js';
 import { toExternalTask, verifyWebhook, type HookProvider } from './providers.js';
 import { drainReports, handleReportPost, ReportLimiter, ReportQueue, type ReceivedReport } from './error-report.js';
 import { ConsultLimiter, ConsultQueue, drainConsults, handleConsultPost, type QueuedConsult } from './consult-intake.js';
@@ -35,6 +35,8 @@ export interface HookReceiverOptions {
   consultEnabled?: boolean;
   /** GET-only public metadata lookup; failure forces human review. */
   githubFetch?: typeof fetch;
+  /** Test seam for the isolated read-only self review; never publishes externally. */
+  githubShadowReview?: (number: number) => Promise<ShadowReviewResult>;
 }
 
 /** `/v1/tasks` lives on the Primary's nexus API, not on the control plane — so the address is its own setting. */
@@ -140,7 +142,7 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
   // L14: public-repository intake events take the shadow ledger path; every other event keeps the seat dispatch path.
   const dispatch = options.forward ?? ((event: QueuedHook) => dispatchHook(event, options.root ?? effectiveInstanceRoot(), events, options.wakeSeat).then(() => 204));
   const forward = (event: QueuedHook) => event.provider === 'github' && event.task.github
-    ? recordGithubShadow(event, options.root ?? effectiveInstanceRoot(), options.githubFetch).then(() => 204)
+    ? recordGithubShadow(event, options.root ?? effectiveInstanceRoot(), options.githubFetch, options.githubShadowReview).then(() => 204)
     : dispatch(event);
   const attempts = new Map<string, { next: number; failures: number }>();
   const pending = new Set<string>();

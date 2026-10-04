@@ -6,6 +6,8 @@ export interface PersonaTodo {
   title: string;
   status: 'open' | 'done';
   createdAt: string;
+  priority?: number;
+  dueAt?: string;
 }
 
 export interface PersonaTodoReadResult {
@@ -28,7 +30,9 @@ function isPersonaTodo(value: unknown): value is PersonaTodo {
     && typeof item.title === 'string' && item.title.length > 0
     && (item.status === 'open' || item.status === 'done')
     && typeof item.createdAt === 'string'
-    && Number.isFinite(Date.parse(item.createdAt));
+    && Number.isFinite(Date.parse(item.createdAt))
+    && (item.priority === undefined || (typeof item.priority === 'number' && Number.isInteger(item.priority) && item.priority >= 0))
+    && (item.dueAt === undefined || (typeof item.dueAt === 'string' && Number.isFinite(Date.parse(item.dueAt))));
 }
 
 /** Missing files are empty; malformed lines are skipped and returned for observation. */
@@ -67,13 +71,14 @@ export function writePersonaTodos(dir: string, personaId: string, todos: readonl
   writeFileSync(path, todos.map(todo => JSON.stringify(todo)).join('\n') + (todos.length ? '\n' : ''), 'utf8');
 }
 
-/** Earliest created open item; original order breaks equal-timestamp ties. */
+/** Higher priority first, then earlier deadline, then earlier creation; file order breaks ties. */
+export function orderedPersonaTodos(todos: readonly PersonaTodo[]): PersonaTodo[] {
+  return [...todos].filter((todo) => todo.status === 'open').sort((a, b) =>
+    (b.priority ?? 0) - (a.priority ?? 0)
+    || (a.dueAt && b.dueAt ? Date.parse(a.dueAt) - Date.parse(b.dueAt) : a.dueAt ? -1 : b.dueAt ? 1 : 0)
+    || Date.parse(a.createdAt) - Date.parse(b.createdAt));
+}
+
 export function nextPersonaTodo(todos: readonly PersonaTodo[]): PersonaTodo | null {
-  let oldest: PersonaTodo | null = null;
-  for (const todo of todos) {
-    if (todo.status === 'open' && (!oldest || Date.parse(todo.createdAt) < Date.parse(oldest.createdAt))) {
-      oldest = todo;
-    }
-  }
-  return oldest;
+  return orderedPersonaTodos(todos)[0] ?? null;
 }

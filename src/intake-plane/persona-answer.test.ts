@@ -2,7 +2,7 @@ import { expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
 import type { PersonaProfile } from '../persona/types.js';
-import { answerAsPersona, resolvePersonaAddress } from './persona-answer.js';
+import { answerAsPersona, resolvePersonaAddress, seatOfPersona } from './persona-answer.js';
 
 const sage: PersonaProfile = { personaId: 'sage', displayName: 'Sage', systemPrompt: '차분하고 간결하게 답하라.', mentionPatterns: ['@현자'] };
 const names: PersonaProfile[] = [sage, { personaId: 'other', displayName: 'Alias' }, { personaId: 'alias', displayName: 'Else' }];
@@ -17,6 +17,16 @@ test('personaId, mentionPatterns, then case-insensitive displayName; no match re
   expect(resolvePersonaAddress('SaGe', source)).toBe(sage);
   expect(resolvePersonaAddress('aLiAs', source)?.personaId).toBe('alias');
   expect(resolvePersonaAddress('nobody', source)).toBeNull();
+});
+
+test('seatOfPersona resolves the declared seat address, and returns null when missing or unknown', () => {
+  const seats: string[] = [];
+  const resolve = (address: string) => { seats.push(address); return address === 'CMO' ? { id: 'MK', title: 'CMO' } : undefined; };
+  expect(seatOfPersona({ ...sage, seat: 'CMO' }, resolve)).toEqual({ id: 'MK', title: 'CMO' });
+  expect(seatOfPersona(sage, resolve)).toBeNull();
+  expect(seatOfPersona({ ...sage, seat: 'CFO' }, resolve)).toBeNull();
+  expect(seats).toEqual(['CMO', 'CFO']);
+  expect(seatOfPersona({ ...sage, seat: 'MK' })).toEqual(expect.objectContaining({ id: 'MK', title: 'CMO' }));
 });
 
 test('persona system prompt heads the question, output starts with displayName and records answered without private content', async () => {

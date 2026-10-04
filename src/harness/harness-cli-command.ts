@@ -29,6 +29,7 @@ import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
+import { addHarnessQueue, listHarnessQueue, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
@@ -1471,7 +1472,7 @@ export function readProcessOwnership(
   }
 }
 
-function defaultListHarnessProcesses(): HarnessProcessListObservation {
+export function defaultListHarnessProcesses(): HarnessProcessListObservation {
   let out: string;
   try {
     out = execFileSync('ps', ['-axo', 'pid=,ppid=,pcpu=,etime=,command='], {
@@ -2104,6 +2105,7 @@ export interface HarnessCliCommandDeps {
   deliverableVerify?: InstallDeliverableVerifyCliDeps;
   processObservation?: HarnessProcessObservationDeps;
   draftSweep?: HarnessDraftSweepDeps;
+  queue?: HarnessQueueDeps;
   ask?: HarnessAskHandler;
   say?: HarnessSayHandler;
   /** Observe-only Pod host dispatch seam. */
@@ -2156,6 +2158,30 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
   installHarnessBudgetCommand(harnessCmd);
   installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
+  const queue = harnessCmd.command('queue').description('자리별 영속 발사 대기열');
+  const queueDeps = deps.queue ?? {};
+  const queueAction = (action: () => Promise<void>): Promise<void> => runInjectedHarnessHandler(action);
+  queue.command('add').requiredOption('--seat <seat>', 'OP|TC|MK|UX')
+    .option('--say <sentence>', '원문 문장').option('--ask <goal-path>', '골 문서 경로')
+    .option('--hold', '자동 병합 금지').option('--heavy', 'Pod high 메모리')
+    .action((opts: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean }) => queueAction(async () => {
+      const row = await addHarnessQueue(opts, queueDeps);
+      console.log(`${row.id} ${row.seat} ${row.kind} queued`);
+    }));
+  queue.command('list').description('대기·발사 원장 조회').action(() => queueAction(async () => {
+    for (const row of listHarnessQueue(queueDeps)) console.log(`${row.id} ${row.seat} ${row.status} ${row.kind} ${row.input}`);
+  }));
+  queue.command('remove <id>').description('대기 중 또는 종료 확인된 항목 제거').action((id: string) => queueAction(async () => {
+    if (!await removeHarnessQueue(id, queueDeps)) throw new Error(`queue item active or not found: ${id}`);
+    console.log(`${id} removed`);
+  }));
+  queue.command('reconcile <id>').description('불확정 발사를 확인하고 종료 또는 미발사 증거가 있으면 예약 해소').action((id: string) => queueAction(async () => {
+    console.log(`${id} ${await reconcileHarnessQueue(id, queueDeps)}`);
+  }));
+  queue.command('tick').description('맨 앞 한 건의 자리 몫과 Pod 풀 여유를 확인하고 발사').action(() => queueAction(async () => {
+    const result = await tickHarnessQueue(queueDeps);
+    console.log(`${result.outcome}${result.item ? ` ${result.item.id}` : ''}: ${result.reason}`);
+  }));
 
   const ask = deps.ask;
   if (ask) {

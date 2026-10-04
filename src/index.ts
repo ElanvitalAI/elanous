@@ -41,6 +41,7 @@ import { registerRepoCommands } from './cli/repo-cli.js';
 import { registerAgentCommands, runChatTurnCli, emitDetachedProgress } from './cli/agent-cli.js';
 export { runChatTurnCli, buildCliAgentTools, setCliAgentDispatchForTesting, emitDetachedProgress, emitHarnessFeedbackProgress } from './cli/agent-cli.js';
 import { registerOpsCommands } from './cli/ops-cli.js';
+import { registerOutputsCommands } from './cli/outputs-cli.js';
 import { registerPublishCommands } from './cli/publish-cli.js';
 import { registerAutopilotCommands } from './cli/autopilot-cli.js';
 import { registerRoleCommands } from './cli/role-cli.js';
@@ -103,7 +104,7 @@ import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
 import { debug, redactSecretText, redactSecrets } from './debug/log.js';
 import { installHarnessCliCommand, type HarnessAskSayChildLlmOptions, type HarnessAskSayOptions, type HarnessPlanOptions } from './harness/harness-cli-command.js';
-import { formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
+import { CliUserError, formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
 import { dispatchSolveMission } from './skills/tools/solve-mission.js';
 import { performBrowserAction, type BrowserActionDeps, type BrowserActionResult } from './harness/browser-act.js';
 import { decideTypeAction, type TypeActionDecision, type TypeTarget } from './harness/browser-act-type.js';
@@ -868,7 +869,75 @@ registerUsageCommand(program);
 registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
+// HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
+const hqCmd = program.command('hq').description('본부 임대 — 하트비트·중재·단일 작성자 래퍼');
+async function hqSink(): Promise<void> {
+  try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('hq'); } catch { /* observation is fail-soft */ }
+}
+hqCmd.command('host').description('이 머신의 HQ 호스트 이름 설정')
+  .command('set <name>').description('호스트 로컬 ~/.elanous-hq/host 에 한 줄로 기록')
+  .action(async (name: string) => {
+    try {
+      const { hqHostSet } = await import('./hq/hq.js');
+      const path = hqHostSet(name);
+      console.log(`hq host set: ${name} (${path})`);
+    } catch (error) { console.error(`hq host set: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('lease').argument('<action>', 'acquire|renew|status|release')
+  .option('--host <name>', '이 호스트 이름(기본 ~/.elanous-hq/host · hq.hostName · os.hostname)')
+  .option('--json', 'JSON 출력')
+  .action(async (action: string, opts: { host?: string; json?: boolean }) => {
+    try {
+      if (!['acquire', 'renew', 'status', 'release'].includes(action)) throw new CliUserError(`hq lease: unknown action ${action}`, 'acquire|renew|status|release');
+      await hqSink();
+      const { hqLease } = await import('./hq/hq.js');
+      const result = hqLease(action as 'acquire', {}, opts.host ? { host: opts.host } : {});
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else console.log(result.ok ? `hq lease ${action}: ok${'record' in result && result.record ? ` · holder ${result.record.holder} · generation ${result.record.generation}` : ''}` : `hq lease ${action}: refused — ${'reason' in result ? result.reason : ''}`);
+      if (!result.ok) process.exitCode = 2;
+    } catch (error) { if (error instanceof CliUserError) throw error; console.error(`hq lease: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('heartbeat').description('보유자는 갱신 · 아니면 대기(보유자에 닿는지 중재자에 보고)').option('--json', 'JSON 출력')
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      await hqSink();
+      const result = (await import('./hq/hq.js')).hqHeartbeat();
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`); else console.log(`hq heartbeat: ${result.outcome}`);
+    } catch (error) { console.error(`hq heartbeat: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('arbiter-check').description('중재자(cloud-vm)에서: 보유자 탐침 · 연속 2회 이중 불통이면 대기 호스트 승격').option('--json', 'JSON 출력')
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      await hqSink();
+      const result = (await import('./hq/hq.js')).hqArbiterCheck();
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`); else console.log(`hq arbiter-check: ${result.promoted ? `promoted ${result.holder} gen ${result.generation}` : `streak ${result.streak}`}`);
+    } catch (error) { console.error(`hq arbiter-check: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('seen').description('이 호스트가 본 가장 높은 임대 세대(한 번도 못 봤으면 exit 3 — 드릴 전 기본 원천 판단용)').option('--json', 'JSON 출력')
+  .action(async (opts: { json?: boolean }) => {
+    const result = (await import('./hq/hq.js')).hqSeen();
+    if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+    else console.log(result.seen ? `hq seen: generation ${result.generation}` : 'hq seen: never');
+    process.exitCode = result.seen ? 0 : 3;
+  });
+hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 명령 실행(아니면 건너뜀 · exit 0)')
+  .requiredOption('--role <role>', 'telegram-poller|cron|seat-loop|release-run|conatus|git-push')
+  .argument('<command...>', '-- 뒤의 명령')
+  .action(async (command: string[], opts: { role: string }) => {
+    const { FENCE_ROLES, hqFenceRun } = await import('./hq/hq.js');
+    if (!(FENCE_ROLES as readonly string[]).includes(opts.role)) throw new CliUserError(`hq fence: unknown role ${opts.role}`, FENCE_ROLES.join('|'));
+    await hqSink();
+    process.exitCode = hqFenceRun(opts.role as 'cron', command);
+  });
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
+seatCmd.command('answer <askId> <answer>').description('자리 질문에 답을 남기고 원래 표면으로 회신 예약')
+  .action(async (askId: string, answer: string) => {
+    try {
+      const { answerSeatAsk } = await import('./seat-dispatch/seat-ask.js');
+      answerSeatAsk(askId, answer);
+      console.log(`자리 답변 기록: ${askId}`);
+    } catch (error) { console.error(`seat answer: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 seatCmd.command('loop').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
   .requiredOption('--once', '한 번 실행')
   .option('--json', 'JSON 출력')
@@ -892,6 +961,20 @@ seatCmd.command('report').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
       else console.log(result.body);
     } catch (error) { console.error(`seat report: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+seatCmd.command('pack').description('자리 묶음').command('export')
+  .requiredOption('--seat <SEAT>', '내보낼 자리')
+  .requiredOption('--out <dir>', '비어 있는 산출 폴더')
+  .action(async (opts: { seat: string; out: string }) => {
+    try {
+      const { exportSeatPack } = await import('./seat-loop/seat-pack.js');
+      const result = exportSeatPack(opts.seat, opts.out);
+      console.log(`seat pack ${result.name} ${result.version}: ${result.files.length} files → ${opts.out}`);
+    } catch (error) {
+      const { SeatPackLeakError } = await import('./seat-loop/seat-pack.js');
+      console.error(`seat pack export: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = error instanceof SeatPackLeakError ? 2 : 1;
+    }
   });
 registerModelWatchCommand(program);
 registerDoctorCommand(program);
@@ -972,6 +1055,19 @@ marketCmd.command('keygen').description('Generate a local test index signing key
     writeFileSync(_joinPath(opts.out, 'index-key.pem'), pair.privateKeyPem, { mode: 0o600, flag: 'wx' });
     writeFileSync(_joinPath(opts.out, 'index-key.pub.json'), JSON.stringify({ keyId: pair.keyId, publicKey: pair.publicKey }, null, 2) + '\n', { flag: 'wx' });
     console.log(`Generated local index key ${pair.keyId}`);
+  });
+
+const stewardCmd = program.command('steward').description('Steward loop controls');
+stewardCmd.command('readiness').description('Read-only shadow evidence for a live decision')
+  .option('--since <duration>', 'Lookback duration, e.g. 24h', '24h')
+  .option('--json', 'JSON output')
+  .action(async (opts: { since: string; json?: boolean }) => {
+    process.exitCode = (await import('./steward/readiness.js')).runStewardReadinessCli(opts);
+  });
+stewardCmd.command('mode [mode]').description('Show or set the steward mode: off|shadow|live|rescue (rescue = HQ move: launch·harvest·alert·decision cards only)')
+  .option('--json', 'JSON output')
+  .action(async (mode: string | undefined, opts: { json?: boolean }) => {
+    process.exitCode = await (await import('./steward/rescue.js')).runStewardModeCli(mode, opts);
   });
 
 program.command('directive').description('Turn instructions into Linear issues')
@@ -3029,6 +3125,39 @@ const harnessOrchestrateCmd = registerHarnessOrchestrateCapabilityOptions(
   });
 
 const contextCmd = program.command('context').description('외부 에이전트 맥락 이벤트');
+contextCmd.command('day')
+  .description('자리 넷과 외부 세션의 최근 맥락 이벤트 수·마지막 시각 (읽기 전용)')
+  .option('--since <hours>', '최근 시간 창 (예: 24h)', '24h')
+  .option('--json', '구조화된 JSON 출력')
+  .action(async (opts: { since: string; json?: boolean }) => {
+    try {
+      const { contextDay, renderContextDay } = await import('./context-bus/context-day.js');
+      const report = contextDay(opts.since);
+      await writeStdoutJson(`${opts.json ? JSON.stringify(report) : renderContextDay(report)}\n`);
+    } catch (error) {
+      console.error(`context day: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+  });
+contextCmd.command('condense')
+  .description('최근 맥락 이벤트·결정·조율 요약을 프로젝트/자리별 장기 기억 후보 JSON ⊕ Markdown 으로 응축')
+  .option('--since <hours>', '최근 시간 창 (예: 24h)', '24h')
+  .option('--dry-run', '읽고 stdout 에만 출력 (기본 동작)')
+  .option('--apply', '충돌은 OP 결정 원장으로 올리고 비충돌 후보를 기존 프로젝트 기억에 저장 · 이전 버전 은퇴')
+  .option('--json', '구조화된 JSON 출력')
+  .action(async (opts: { since: string; dryRun?: boolean; apply?: boolean; json?: boolean }) => {
+    try {
+      if (opts.apply && opts.dryRun) throw new Error('--apply and --dry-run cannot be combined');
+      if (!/^[1-9]\d*h$/.test(opts.since)) throw new Error('--since requires positive hours, e.g. 24h');
+      const { runContextCondense } = await import('./context-bus/condense.js');
+      const report = await runContextCondense({ hours: Number(opts.since.slice(0, -1)), apply: opts.apply === true });
+      await writeStdoutJson(JSON.stringify({ since: report.since, until: report.until, cards: report.cards, conflicts: report.conflicts, skipped: report.skipped, folded: report.folded, ...(report.applied ? { applied: report.applied } : {}) }) + '\n');
+      if (!opts.json) await writeStdoutFully(report.markdown);
+    } catch (error) {
+      console.error(`context condense: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+  });
 contextCmd.command('hooks').description('Claude Code 맥락 훅 설정').command('install')
   .requiredOption('--print', '설정 조각만 출력하고 설정 파일은 수정하지 않음')
   .action(async () => {
@@ -5616,6 +5745,7 @@ registerFleetCommands(program);
 
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
 registerOpsCommands(program);
+registerOutputsCommands(program);
 
 registerPublishCommands(program);
 
@@ -5792,6 +5922,33 @@ agentCmd
     if (!outcome.ok) { console.error(`❌ ${outcome.message}`); process.exit(outcome.exitCode); }
     await writeStdoutJson(JSON.stringify(outcome.result, null, 2) + '\n');
     process.exit(outcome.exitCode);
+  });
+
+agentCmd.command('duo [text...]')
+  .description('Run Codex and Claude Code concurrently on the same mission in separate worktrees; summarize both PTY decisions and evidence.')
+  .requiredOption('--left <backend>', 'codex or claude')
+  .requiredOption('--right <backend>', 'codex or claude')
+  .requiredOption('--branch <name>', 'base name for two distinct worktree branches')
+  .option('--base <ref>', 'common branch base (default HEAD)')
+  .option('--mission-file <path>', 'read the same verbatim mission from a file')
+  .option('--evidence <mode>', 'doc|tsc|test (default tsc)', 'tsc')
+  .option('--doc-dir <rel>', 'doc evidence directory')
+  .option('--doc-glob <re>', 'doc evidence filename pattern')
+  .option('--test-path <p>', 'test evidence test path')
+  .option('--file <rel>', 'test evidence output file')
+  .option('--max-rounds <n>', 'maximum PTY control rounds', '16')
+  .option('--no-commit', 'do not commit completed worktrees')
+  .action(async (textParts: string[], opts: import('./agent-mission/duo.js').DuoOptions) => {
+    try {
+      delete process.env.OPENAI_API_KEY;
+      const { runAgentMissionDuo } = await import('./agent-mission/duo.js');
+      const result = await runAgentMissionDuo(textParts, opts);
+      console.log(`[duo] missionId=${result.missionId}\n${result.lines.join('\n')}`);
+      process.exitCode = result.exitCode;
+    } catch (error) {
+      console.error(`duo: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
   });
 
 // ★ 리뷰 반응 완결 루프 (L1) — PR 리뷰(OK/보강/거절)를 트리거로 codex 가 자율 rework→재제출.
@@ -6515,6 +6672,12 @@ const selfDevCmd = program
     let devRunId = '';
     let devRunIdSource: import('./harness/harness-space.js').RunIdSource | undefined;
     let preparedWorktree: import('./harness/harness-worktree-auto.js').PreparedDevWorktree | undefined;
+    let authoringLease: import('./pod-lease/host-lease.js').HostLeaseHandle | undefined;
+    const releaseAuthoringLease = () => {
+      if (!authoringLease) return;
+      authoringLease(); authoringLease = undefined;
+      process.off('exit', releaseAuthoringLease);
+    };
     try {
       // ⛔ raw 입력 배타성 검증은 try 안의 selectDevAuthorInput 하나가 소유한다 — 실패도 아래 catch가 관측한다.
       const { buildDevCommandInput, selectDevAuthorInput } = await import('./self-dev/dev-cli.js');
@@ -6607,6 +6770,23 @@ const selfDevCmd = program
           priorBlockSamples: () => askIo.priorBlockSamplesFrom(askLogRows),
           recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(askLogRows),
           authorGoal: (args, options) => runGoalAuthorCli([...args], options as never),
+          ...(devAskSubstrate?.substrate === 'pod' ? { beforeAuthoring: async () => {
+            const { parsePodPool, podPoolHostLease } = await import('./task-orchestrator/surfaces/pod-pool.js');
+            const { measurePoolLease, recommendConcurrency } = await import('./task-orchestrator/surfaces/pod-lease.js');
+            const members = parsePodPool(devAskSubstrate.pool!);
+            const host = podPoolHostLease(members);
+            while (!authoringLease) {
+              const status = recommendConcurrency(measurePoolLease(members), { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
+              if (status.recommended !== null && status.recommended > 0) {
+                const { leaseHasPendingPod } = await import('./pod-lease/host-lease.js');
+                const pendingJobs = status.pendingJobs ?? [];
+                authoringLease = host.tryReserve((others) =>
+                  others - host.live().filter((r) => leaseHasPendingPod(r, pendingJobs)).length < status.recommended!, true) ?? undefined;
+                if (authoringLease) process.once('exit', releaseAuthoringLease);
+              }
+              if (!authoringLease) await new Promise((resolve) => setTimeout(resolve, 15_000));
+            }
+          } } : {}),
           relativeToCwd: (file) => relativeToCwdPath(process.cwd(), file),
         });
         // ⛔ 종료는 «표면»이 한다 — 흐름은 세 값만 낸다.
@@ -6616,6 +6796,7 @@ const selfDevCmd = program
         }
         askAuthoredFile = flowResult.goalFile;
         if (flowResult.kind === 'stopped-by-preflight') {
+          releaseAuthoringLease();
           completionGuard.conclude();
           process.exit(1);
         }
@@ -6633,12 +6814,21 @@ const selfDevCmd = program
         warnRecentIncidentBurst();
         let podOutput = '';
         let podRunId: string | undefined;
-        const status = await dispatchHarnessOnPod(devAskPodDispatchInput(opts, askAuthoredFile!, devAskSubstrate.pool!), {
-          onOutput: (text) => {
-            podRunId ??= harnessPodRunId(podOutput + text);
-            podOutput = (podOutput + text).slice(-16_000);
-          },
-        });
+        const previousLeaseId = process.env.ELANOUS_POD_RESERVED_LEASE;
+        if (authoringLease) process.env.ELANOUS_POD_RESERVED_LEASE = authoringLease.id;
+        let status: number;
+        try {
+          status = await dispatchHarnessOnPod(devAskPodDispatchInput(opts, askAuthoredFile!, devAskSubstrate.pool!), {
+            onOutput: (text) => {
+              podRunId ??= harnessPodRunId(podOutput + text);
+              podOutput = (podOutput + text).slice(-16_000);
+            },
+          });
+        } finally {
+          releaseAuthoringLease();
+          if (previousLeaseId === undefined) delete process.env.ELANOUS_POD_RESERVED_LEASE;
+          else process.env.ELANOUS_POD_RESERVED_LEASE = previousLeaseId;
+        }
         if (status !== 0) {
           const classified = classifyHarnessPodExit({ status }, podOutput, { ...(podRunId ? { runId: podRunId } : {}) });
           recordClassifiedHarnessPodExit(podRunId ?? harnessPodRunId(podOutput), classified.reason, status);
@@ -6940,9 +7130,11 @@ const selfDevCmd = program
         completionGuard.conclude();
         process.exit(r.result.exitCode);
       }
+      releaseAuthoringLease();
       completionGuard.conclude();
       process.exit(ok ? 0 : 2);
     } catch (e) {
+      releaseAuthoringLease();
       const msg = e instanceof Error ? e.message : String(e);
       // ⚠️ 관측은 결론을 막지 않는다(리뷰 should-fix 5R) — 여기서 로거가 던지면 아래 `console.error` 와
       //    의도한 `exit(1)` 까지 통째로 우회해, 사용자는 이유도 모른 채 다른 종료코드를 받는다.

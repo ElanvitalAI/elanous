@@ -1,4 +1,4 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env bun
 import { absorbTweetVisuals } from '../src/visual.js';
 import { parseArgs } from 'node:util';
 import { initEnv } from '../src/env.js';
@@ -273,7 +273,7 @@ async function digestSummarizeFull(source: DetectedSource, route: RouteDecision,
     if (dir) savedPaths.push(await saveMarkdown({
       title: result.title, sourceType: source.type,
       sourceUrl: source.input, summaryBody: finalBody,
-      genre: '', keywords: '', saveDir: dir,
+      genre: '', keywords: [], saveDir: dir,
     }));
   }
   return { markdown: finalBody, title: result.title, source, savedPaths, signals: buildSignals(route.targets) };
@@ -382,7 +382,7 @@ function printHelp() {
   console.log(`
 omni-digest — 통합 콘텐츠 요약 스킬
 
-사용법: npx tsx scripts/main.ts <INPUT> [OPTIONS]
+사용법: bun scripts/main.ts <INPUT> [OPTIONS]
 
 입력: URL (X, YouTube, GitHub, 웹) 또는 로컬 파일 경로
 

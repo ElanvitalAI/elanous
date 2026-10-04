@@ -59,6 +59,7 @@ import type {
 import { WorkflowGraph } from './WorkflowGraph';
 import { WorkflowCreateModal } from './WorkflowCreateModal';
 import { WorkflowHistoryPanel } from './WorkflowHistoryPanel';
+import { WorkflowPublishPanel } from './WorkflowPublishPanel';
 import { WorkflowNLPrompt } from './WorkflowNLPrompt';
 import { WorkflowNodeEditor } from './WorkflowNodeEditor';
 import { NodeRunPanel } from './NodeRunPanel';
@@ -152,6 +153,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   // editor with the run loaded into the right panel.
   const [showRunsList, setShowRunsList] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showPublish, setShowPublish] = useState(false);
   // ROADMAP Tier 1 W1 (2026-05-11) — natural-language workflow generator.
   const [showNLPrompt, setShowNLPrompt] = useState(false);
   // ROADMAP Tier 1 W2 (2026-05-11) — inline node editor selection.
@@ -306,6 +308,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
 
   const handleSelect = (name: string) => {
     setShowHistory(false);
+    setShowPublish(false);
     setPreviewWorkflow(null);
     setDraftForName(null);
     setSelectedName(name);
@@ -318,6 +321,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
 
   const handleNew = (yaml: string, suggestedName?: string) => {
     setShowHistory(false);
+    setShowPublish(false);
     setPreviewWorkflow(null);
     setDraftForName(null);
     setCreatingNew(true);
@@ -649,6 +653,12 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
               onLoad={(yaml) => { setDraftYaml(yaml); setEditorMode('yaml'); }}
               onClose={() => setShowHistory(false)}
             />
+          ) : showPublish && selectedName && !creatingNew ? (
+            <WorkflowPublishPanel
+              yaml={detail.data?.name === selectedName ? detail.data.yaml : ''}
+              baseUrl={nexusClientForCredentials.baseUrl}
+              onClose={() => setShowPublish(false)}
+            />
           ) : (
           <>
           {showNLPrompt && (
@@ -816,11 +826,20 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
             {selectedName && !creatingNew && (
               <button
                 type="button"
-                onClick={() => setShowHistory(true)}
+                onClick={() => { setShowPublish(false); setShowHistory(true); }}
                 className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-primary hover:bg-surface-elevated"
               >
                 <History className="h-3 w-3" />
                 이전 판
+              </button>
+            )}
+            {selectedName && !creatingNew && (
+              <button
+                type="button"
+                onClick={() => { setShowHistory(false); setShowPublish(true); }}
+                className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-primary hover:bg-surface-elevated"
+              >
+                게시
               </button>
             )}
             {selectedName && !isReadonly && !creatingNew && (

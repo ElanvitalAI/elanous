@@ -9,10 +9,57 @@ import { DEFAULT_BRANCH_WORKTREE_BASE } from '../src/git-fs/worktree.js';
 import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import type { PrManager } from '../src/autopilot/pr-manager.js';
 
+function gitTestEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  return env;
+}
+
 function runGit(cwd: string, args: string[]): void {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const result = spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' });
   if (result.status !== 0) throw new Error(`${args.join(' ')}: ${result.stderr}`);
 }
+
+describe('git test helper isolation', () => {
+  it('does not send git init --bare or config writes into an inherited GIT_DIR', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-git-env-'));
+    const shared = join(root, 'shared');
+    const bare = join(root, 'origin.git');
+    const previous = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE, GIT_COMMON_DIR: process.env.GIT_COMMON_DIR };
+    try {
+      runGit(root, ['init', shared]);
+      const sharedConfig = join(shared, '.git', 'config');
+      const readSharedBare = () => spawnSync('git', ['config', '--file', sharedConfig, '--get', 'core.bare'], { cwd: root, env: gitTestEnv(), encoding: 'utf8' }).stdout.trim();
+      expect(readSharedBare()).toBe('false');
+      const explicitTarget = spawnSync('git', ['init', '--bare', bare], { cwd: shared, env: { ...gitTestEnv(), GIT_DIR: join(shared, '.git') }, encoding: 'utf8' });
+      expect(explicitTarget.status).toBe(0);
+      expect(readSharedBare()).toBe('false');
+      const leakedInit = spawnSync('git', ['init', '--bare'], { cwd: shared, env: { ...gitTestEnv(), GIT_DIR: join(shared, '.git') }, encoding: 'utf8' });
+      expect(leakedInit.status).toBe(0);
+      expect(readSharedBare()).toBe('true');
+      runGit(root, ['config', '--file', sharedConfig, 'core.bare', 'false']);
+      process.env.GIT_DIR = join(shared, '.git');
+      runGit(root, ['init', '--bare']);
+      expect(readSharedBare()).toBe('false');
+      process.env.GIT_WORK_TREE = shared;
+      process.env.GIT_COMMON_DIR = join(shared, '.git');
+      runGit(root, ['init', '--bare', join(root, 'isolated.git')]);
+      runGit(bare, ['config', 'user.email', 'test@example.com']);
+      const isolated = spawnSync('git', ['config', '--file', join(bare, 'config'), '--get', 'user.email'], { cwd: root, env: gitTestEnv(), encoding: 'utf8' });
+      expect(isolated.stdout.trim()).toBe('test@example.com');
+      const sharedBare = spawnSync('git', ['config', '--file', join(shared, '.git', 'config'), '--get', 'core.bare'], { cwd: root, env: gitTestEnv(), encoding: 'utf8' });
+      expect(sharedBare.stdout.trim()).toBe('false');
+    } finally {
+      for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'] as const) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('assertBaseBranchOnOrigin', () => {
   it('기본 브랜치 표식을 origin 기본 브랜치로 해석해 PR manager에도 전달한다', async () => {
@@ -630,7 +677,7 @@ describe('defaultSeams.gate — gate.baseline 귀속 네 수', () => {
   it('브랜치 관측이 예외를 던져도 게이트는 완료하고 branch 는 null 이다', async () => {
     setGitCommandRunnerForTesting((_cwd, args) => {
       if (args[0] === 'symbolic-ref' && args.includes('HEAD')) throw new Error('injected branch observation failure');
-      const actual = spawnSync('git', args, { cwd: _cwd, encoding: 'utf8' });
+      const actual = spawnSync('git', args, { cwd: _cwd, env: gitTestEnv(), encoding: 'utf8' });
       return { status: actual.status, stdout: actual.stdout ?? '', stderr: actual.stderr ?? '' };
     });
     const worktreeLog = ['test/a.test.ts:', '(fail) new case'].join('\n');

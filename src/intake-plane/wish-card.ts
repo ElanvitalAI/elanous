@@ -2,7 +2,7 @@ import { debug } from '../debug/log.js';
 import { CardStore } from '../task-cards/card-store.js';
 
 export function createWishCard(
-  { text, source, ref }: { text: string; source: 'telegram' | 'pwa' | 'tui'; ref: string },
+  { text, source, ref }: { text: string; source: 'telegram' | 'pwa' | 'tui' | 'linear'; ref: string },
   store: CardStore = new CardStore(),
 ): { cardId: string; title: string; created: boolean } {
   const title = text.trim().split(/\r?\n/, 1)[0]!.trim().slice(0, 80);

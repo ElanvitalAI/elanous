@@ -18,6 +18,7 @@ import {
   isClassifyNode,
   isExtractNode,
   isFilterNode,
+  isKnowledgeNode,
   isHttpRequestNode,
   isIfNode,
   isIterationNode,
@@ -57,6 +58,7 @@ import { executeExtractNode } from './nodes/extract.js';
 import { executeSetNode } from './nodes/set.js';
 import { executeTaskNode } from './nodes/task.js';
 import { executeFilterNode } from './nodes/filter.js';
+import { executeKnowledgeNode } from './nodes/knowledge.js';
 import { executeTemplateNode } from './nodes/template.js';
 import { executeHttpRequestNode } from './nodes/http.js';
 import { executeShowroomNode } from './nodes/showroom.js';
@@ -706,6 +708,7 @@ async function dispatchNode(
   if (isExtractNode(node)) return executeExtractNode(node, ctx, deps);
   if (isSetNode(node)) return executeSetNode(node, ctx, deps);
   if (isFilterNode(node)) return executeFilterNode(node, ctx, deps);
+  if (isKnowledgeNode(node)) return executeKnowledgeNode(node, ctx, deps);
   if (isTemplateNode(node)) return executeTemplateNode(node, ctx, deps);
   if (isHttpRequestNode(node)) return executeHttpRequestNode(node, ctx, deps);
   if (isShowroomNode(node)) return executeShowroomNode(node, ctx, deps);
@@ -748,6 +751,7 @@ function isTriggerVariant(node: DagNode): boolean {
 
 function variantOf(node: DagNode): string {
   if (isPluginKindNode(node)) return node.kind;
+  if (isKnowledgeNode(node)) return 'knowledge';
   const guards: ReadonlyArray<(node: DagNode) => boolean> = [
     isPromptNode, isBashNode, isSkillNode, isCftNode, isApprovalNode, isIfNode,
     isSwitchNode, isIterationNode, isClassifyNode, isExtractNode, isSetNode,

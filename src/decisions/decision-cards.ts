@@ -35,21 +35,27 @@ export function isIrreversible(entry: Pick<DecisionEntry, 'category'>): boolean 
 
 const kst = (at: string) => new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at));
 
-/** The card body: title, SCQA in four short lines, options with consequences, recommendation, deadline. */
+/** The card opens with a short pitch; the full question and choice buttons remain below it. */
 export function renderCardText(e: DecisionEntry, extra: { note?: string; confirm?: string } = {}): string {
+  const recommendedKey = 'option' in e.recommendation ? e.recommendation.option : undefined;
+  const recommended = e.options.find(o => o.key === recommendedKey);
+  const alternative = e.options.find(o => o.key === e.alternative);
   const lines = [
     `🗳 결정 요청 ${e.id}${isIrreversible(e) ? ' · ⚠️ 되돌릴 수 없음' : ''}`,
     `«${e.title}» · 올린 자리: ${e.raisedBy.agent}${e.raisedBy.track ? `(${e.raisedBy.track})` : ''}`,
     '',
-    `상황: ${e.scqa.s}`,
-    `문제: ${e.scqa.c}`,
+    `S: ${e.scqa.s.replace(/\s+/g, ' ')}`,
+    `C: ${e.scqa.c.replace(/\s+/g, ' ')}`,
+    `Q: ${(e.scqa.q ?? '(비움)').replace(/\s+/g, ' ')}`,
+    `A: ${(e.scqa.a ?? '(비움)').replace(/\s+/g, ' ')}`,
+    'skipped' in e.recommendation ? `권고 없음: ${e.recommendation.reason}` : `권고: ${recommended?.label ?? e.recommendation.option} — ${e.recommendation.why}`,
+    ...(alternative ? [`대안: ${alternative.label} — ${alternative.consequence}`] : []),
+    e.crossCheck?.length ? `교차 확인: ${e.crossCheck.map(check => `${check.seat} ✓ ${check.note.replace(/\s+/g, ' ')}`).join(' · ')}` : `교차 확인 없음(${e.crossCheckSkipped ?? '미기재'})`,
+    ...(e.dissent ? [`이견: ${e.dissent}`] : []),
+    ...(e.dueAt ? [`기한: ${kst(e.dueAt)} KST`] : []),
     ...(e.pendingQuestion ? ['', `대기 질문 전문:\n${e.pendingQuestion}`] : []),
-    ...(e.scqa.q ? [`질문: ${e.scqa.q}`] : []),
-    ...(e.scqa.a ? [`제안: ${e.scqa.a}`] : []),
     '',
     ...e.options.map((o) => `${o.key.toUpperCase()}) ${o.label} — ${o.consequence}`),
-    'skipped' in e.recommendation ? `권고 없음: ${e.recommendation.reason}` : `권고: ${e.recommendation.option.toUpperCase()} — ${e.recommendation.why}`,
-    ...(e.dueAt ? [`기한: ${kst(e.dueAt)}`] : []),
     ...(extra.note ? ['', `📝 메모: ${extra.note}`] : []),
   ];
   if (extra.confirm) {

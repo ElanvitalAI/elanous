@@ -3,11 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runStewardStageCommand, type TriageIssue, type TriageDecision } from './triage.js';
+import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runStewardStageCommand, runStewardNodeCommand, type TriageIssue, type TriageDecision } from './triage.js';
 import { markStageStart, readFailureStreak, writeFailureStreak } from './failure-streak.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { triageInputHash, triageWithinBudget } from './triage-budget.js';
 import { readLaunchLedger } from './launch.js';
+import { debug } from '../debug/log.js';
+import { setInProcessOutbound } from '../domains/outbound-alert.js';
+import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
 
 // Real Bun subprocesses can exceed Bun's 5 s test default under gate-pod load.
 setDefaultTimeout(60_000);
@@ -294,6 +297,75 @@ test('LLM decisions emit route/escalate and mandatory HITL for paid sale', async
   expect(result.map(d => d.rung)).toEqual([4, 'hitl']);
   expect(result[1]?.hitlReason).toBe('money');
   expect(events.map((e: any) => [e.kind, e.refs.issue])).toEqual([['ROUTE', 'ELA-1'], ['ESCALATE', 'ELA-2']]);
+});
+
+test('triage and schedule emit one structured decision per fresh judgment and scheduled row without changing results', async () => {
+  const recorded: Array<{ category: string; event: string; data: unknown }> = [];
+  const off = debug.registerSink({ name: 'steward-decision-test', emit: record => {
+    if (record.event === 'decision' && record.category.startsWith('steward.')) {
+      const { kind, target, wouldAct } = record.data as { kind: string; target: string; wouldAct: boolean };
+      recorded.push({ category: record.category, event: record.event, data: { kind, target, wouldAct } });
+    }
+  } });
+  const root = mkdtempSync(join(tmpdir(), 'steward-observation-'));
+  try {
+    const judged = await triageIssues(issues, async () => ({ rung: 4, dependsOn: [], priority: 2, why: 'work' }), () => true);
+    expect(recorded.filter(row => row.category === 'steward.triage').map(row => row.data)).toEqual([
+      { kind: '4', target: 'ELA-1', wouldAct: false },
+      { kind: 'hitl', target: 'ELA-2', wouldAct: false },
+    ]);
+    mkdirSync(join(root, 'steward'));
+    writeFileSync(join(root, 'steward', 'triage.json'), JSON.stringify(judged));
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' } });
+    const scheduled = JSON.parse(readFileSync(join(root, 'steward', 'schedule.json'), 'utf8'));
+    expect(scheduled).toEqual(scheduleTriage(judged));
+    expect(recorded.filter(row => row.category === 'steward.schedule').map(row => row.data)).toEqual(
+      scheduled.map((row: { disposition: string; issue: string }) => ({ kind: row.disposition, target: row.issue, wouldAct: false })));
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('failed standalone sink registration still runs triage and schedule with unchanged decisions', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-sink-registration-failure-'));
+  const dir = join(root, 'steward');
+  const judged: string[] = [];
+  const decisions: string[] = [];
+  const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' as const },
+    judge: async (issue: TriageIssue) => { judged.push(issue.identifier); return { rung: 4, dependsOn: [], priority: 2, why: 'work' }; },
+    decide: (event: { kind: string }) => { decisions.push(event.kind); return true; } };
+  let attempts = 0;
+  const failedRegistration = async () => { attempts++; throw new Error('sink unavailable'); };
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify(issues));
+    expect(await runStewardNodeCommand('triage', deps, failedRegistration)).toBe(0);
+    expect(judged).toEqual(['ELA-1', 'ELA-2']);
+    expect(decisions).toEqual(['ROUTE', 'ESCALATE']);
+    const rows = JSON.parse(readFileSync(join(dir, 'triage.json'), 'utf8')) as TriageDecision[];
+    expect(rows.map(row => row.rung)).toEqual([4, 'hitl']);
+    expect(await runStewardNodeCommand('schedule', deps, failedRegistration)).toBe(0);
+    expect(attempts).toBe(2);
+    expect(JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8'))).toEqual(scheduleTriage(rows));
+    expect(readFailureStreak(root).consecutive).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a failed decision observation does not change triage or scheduling', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-observation-failure-'));
+  const log = debug.log;
+  const events: string[] = [];
+  try {
+    debug.log = (category, event, data, opts) => {
+      if ((category === 'steward.triage' || category === 'steward.schedule') && event === 'decision') throw new Error('log sink unavailable');
+      return log.call(debug, category, event, data, opts);
+    };
+    const judged = await triageIssues(issues, async () => ({ rung: 4, dependsOn: [], priority: 2, why: 'work' }), event => { events.push(event.kind); return true; });
+    expect(judged.map(row => row.rung)).toEqual([4, 'hitl']);
+    expect(events).toEqual(['ROUTE', 'ESCALATE']);
+    mkdirSync(join(root, 'steward'));
+    writeFileSync(join(root, 'steward', 'triage.json'), JSON.stringify(judged));
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' } });
+    expect(JSON.parse(readFileSync(join(root, 'steward', 'schedule.json'), 'utf8'))).toEqual(scheduleTriage(judged));
+  } finally { debug.log = log; rmSync(root, { recursive: true, force: true }); }
 });
 
 test('dependencies precede dependents, caps and budget wait, unsafe decisions never auto-approve', () => {
@@ -718,6 +790,31 @@ test('schedule stage checks completed Linear dependencies read-only before relea
     // Linear IssueFilter has no `identifier` field — that query was HTTP 400 in production (10-02).
     expect(calls.some(query => query.includes('identifier:{in:'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('steward report sends its daily digest through the operational kind, never the trading digest kind', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-ops-digest-'));
+  const dir = join(root, 'steward');
+  const sent: Array<{ text: string; kind: string }> = [];
+  const previous = process.env.SEND_VIA_ELANOUS;
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), '[]');
+    writeFileSync(join(dir, 'schedule.json'), '[]');
+    process.env.SEND_VIA_ELANOUS = '1';
+    setInProcessOutbound(async (text, kind) => { sent.push({ text, kind }); return true; });
+    await runStewardStage('report', { root, getSecret: async () => 'key', now: () => new Date('2026-10-04T00:00:00Z') });
+    expect(sent).toEqual([{ text: '스튜어드 2026-10-04: ', kind: 'ops-report' }]);
+    const kinds = sent.map(message => message.kind);
+    expect(DEFAULT_KIND_ROLES[kinds[0]!]).toBe('system');
+    expect(isTradingKind(kinds[0])).toBe(false);
+    expect(isTradingKind('digest')).toBe(true);
+  } finally {
+    setInProcessOutbound(null);
+    if (previous === undefined) delete process.env.SEND_VIA_ELANOUS;
+    else process.env.SEND_VIA_ELANOUS = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('card write failure warns and does not block observe report, comments or digest', async () => {

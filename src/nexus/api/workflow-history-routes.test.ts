@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProjectWorkflowDir } from '../../workflow-runtime/discovery.js';
@@ -95,7 +95,8 @@ test('failed snapshots do not alter accepted or rejected PUT status/body', async
   try {
     const accepted = await dispatch(request('/v1/workflows/my-flow', 'PUT', newYaml));
     expect(accepted.status).toBe(200);
-    expect(await accepted.json()).toEqual({ ok: true, path: file, scope: 'project' });
+    // macOS: $TMPDIR is /var/folders → /private/var/folders; the server reports the real path.
+    expect(await accepted.json()).toEqual({ ok: true, path: realpathSync(file), scope: 'project' });
     expect(readFileSync(file, 'utf8')).toBe(newYaml);
     expect(log).toHaveBeenCalledWith('nexus.workflow-history', 'snapshot-failed',
       expect.objectContaining({ name: 'my-flow', scope: 'project' }), { level: 'warn' });

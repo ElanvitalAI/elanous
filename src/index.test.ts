@@ -3751,6 +3751,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'orchestrate',
     'plan',
     'processes',
+    // 📋 자리별 발사 대기열 — `harness queue`(AUTOQ-LOOP #23651).
+    'queue',
     'replay',
     'say',
     // 🛑 런 정지 — `harness stop <runId>`(stopHarnessRun).

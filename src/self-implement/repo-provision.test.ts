@@ -38,7 +38,14 @@ const createDirectory = (prefix = 'repo-provision-') => {
   directories.push(directory);
   return directory;
 };
-const git = (cwd: string, args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+const gitTestEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  return env;
+};
+const git = (cwd: string, args: string[]) => execFileSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }).trim();
 const resolution = (target: string) => resolveHarnessTarget(target, { home: tmpdir() });
 const availableRepositoryGh = (args: string[], ok: { ok: boolean; exitCode: number; stdout: Buffer; stderr: Buffer; maybeTruncated: boolean }) => {
   if (args[0] !== 'api') return ok;
@@ -284,7 +291,7 @@ describe('provisionRepository', () => {
     expect(() => provisionRepository(incompleteGitResolution, {
       runGit: (cwd, args) => {
         if (args[0] === 'commit') return { status: 1, stdout: '', stderr: 'commit rejected' };
-        const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+        const result = spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' });
         return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
       },
     })).toThrow('commit rejected');
@@ -336,7 +343,7 @@ describe('provisionRepository', () => {
     expect(() => provisionRepository(resolution(directory), {
       runGit: (cwd, args) => {
         if (args[0] === 'add') return { status: 1, stdout: '', stderr: 'add rejected' };
-        const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+        const result = spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' });
         return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
       },
     })).toThrow('add rejected');
@@ -622,7 +629,7 @@ describe('repository publication', () => {
     };
     const confirmed = preflightRepositoryPublish(directory, { runGh });
     lookup = 'exists';
-    const result = publishRepository(directory, { runGh, runGit: (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' }) as never }, confirmed);
+    const result = publishRepository(directory, { runGh, runGit: (cwd, args) => spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never }, confirmed);
 
     expect(result.status).toBe('blocked');
     expect(calls.some((args) => args[0] === 'repo' && args[1] === 'create')).toBe(false);
@@ -638,7 +645,7 @@ describe('repository publication', () => {
     const report = preflightRepositoryPublish(directory, {
       runGit: (cwd, args) => args[0] === 'rev-list'
         ? { status: 1, stdout: '', stderr: 'scan denied' }
-        : spawnSync('git', args, { cwd, encoding: 'utf8' }) as never,
+        : spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never,
     });
     expect(report.committed).toEqual([]);
     expect(report.blockers).toContain('could not scan reachable repository history (git rev-list --all failed)');
@@ -688,7 +695,7 @@ describe('repository publication', () => {
       runGh: (args) => { if (args[0] === 'api') return availableRepositoryGh(args, ok); expect(confirmed).toBe(true); ghCalls.push(args); return ok; },
       runGit: (cwd, args) => {
         if (args[0] === 'push') { pushes.push(args); return { status: 0, stdout: '', stderr: '' }; }
-        return spawnSync('git', args, { cwd, encoding: 'utf8' }) as never;
+        return spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
       out: { log: () => {}, error: (line) => errors.push(line) },
     });
@@ -715,7 +722,7 @@ describe('repository publication', () => {
 
     const result = publishRepository(directory, {
       runGh: (args) => { ghCalls.push(args); return availableRepositoryGh(args, ok); },
-      runGit: (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' }) as never,
+      runGit: (cwd, args) => spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never,
     }, undefined as unknown as ReturnType<typeof preflightRepositoryPublish>);
 
     expect(result.status).toBe('blocked');
@@ -743,7 +750,7 @@ describe('repository publication', () => {
       },
       runGit: (cwd, args) => {
         if (args[0] === 'push') { pushed.push(args); return { status: 0, stdout: '', stderr: '' }; }
-        return spawnSync('git', args, { cwd, encoding: 'utf8' }) as never;
+        return spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
     }, confirmed);
     expect(result.status).toBe('created');
@@ -769,7 +776,7 @@ describe('repository publication', () => {
       },
       runGit: (_cwd, args) => {
         if (args[0] === 'push') pushed = true;
-        return spawnSync('git', args, { cwd: directory, encoding: 'utf8' }) as never;
+        return spawnSync('git', args, { cwd: directory, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
     }, confirmed);
     expect(result.status).toBe('blocked');
@@ -789,11 +796,40 @@ describe('repository publication', () => {
       runGh: gh,
       runGit: (_cwd, args) => args[0] === 'push'
         ? { status: 1, stdout: '', stderr: 'push failed' }
-        : spawnSync('git', args, { cwd: directory, encoding: 'utf8' }) as never,
+        : spawnSync('git', args, { cwd: directory, env: gitTestEnv(), encoding: 'utf8' }) as never,
     }, confirmed);
     expect(result.status).toBe('push-failed');
     if (result.status === 'push-failed') expect(result.guidance).toContain('was created');
   });
+});
+
+test('git test helper keeps bare init in its target when GIT_DIR points at a linked worktree shared config', () => {
+  const source = createDirectory('repo-bare-source-');
+  const shared = createDirectory('repo-bare-shared-');
+  const worktree = createDirectory('repo-bare-worktree-');
+  const remote = createDirectory('repo-bare-origin-');
+  git(source, ['init']);
+  writeFileSync(join(source, 'initial'), 'initial');
+  git(source, ['add', 'initial']);
+  git(source, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'initial']);
+  git(shared, ['clone', source, '.']);
+  git(shared, ['worktree', 'add', '-b', 'probe', worktree]);
+  const sharedConfig = join(shared, '.git', 'config');
+  const readBare = () => execFileSync('git', ['config', '--file', sharedConfig, '--get', 'core.bare'], { encoding: 'utf8' }).trim();
+  expect(readBare()).toBe('false');
+  const previous = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE, GIT_COMMON_DIR: process.env.GIT_COMMON_DIR };
+  try {
+    process.env.GIT_DIR = join(shared, '.git');
+    git(remote, ['init', '--bare']);
+    expect(readBare()).toBe('false');
+    expect(git(remote, ['rev-parse', '--is-bare-repository'])).toBe('true');
+  } finally {
+    for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'] as const) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    if (readBare() !== 'false') execFileSync('git', ['config', '--file', sharedConfig, 'core.bare', 'false']);
+  }
 });
 
 describe('repository public transition', () => {
@@ -801,7 +837,7 @@ describe('repository public transition', () => {
 
   const synchronizedGit = (cwd: string, args: string[]) => args[0] === 'fetch'
     ? { status: 0, stdout: '', stderr: '' }
-    : spawnSync('git', args, { cwd, encoding: 'utf8' }) as never;
+    : spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
 
   function privateRepository(directory: string): void {
     git(directory, ['init']);
@@ -939,7 +975,7 @@ describe('repository public transition', () => {
       isTerminal: () => true,
       runGit: (cwd: string, args: string[]) => {
         gitCalls.push(args);
-        return spawnSync('git', args, { cwd, encoding: 'utf8' }) as never;
+        return spawnSync('git', args, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
       confirm: async () => 'y',
       runGh: (args: string[]) => { calls.push(args); return { ...ok, stdout: Buffer.from('{"isPrivate":false}') }; },
@@ -1002,7 +1038,7 @@ describe('repository public transition', () => {
       confirm: async () => 'y',
       runGit: (cwd, args) => {
         const command = args[0] === 'fetch' ? ['fetch', ...args.slice(1, 2), remote, ...args.slice(3)] : args;
-        return spawnSync('git', command, { cwd, encoding: 'utf8' }) as never;
+        return spawnSync('git', command, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
       runGh: (args) => args[1] === 'view' ? { ...ok, stdout: Buffer.from('{"isPrivate":true}') } : ok,
       out: { log: () => {}, error: () => {} },
@@ -1038,7 +1074,7 @@ describe('repository public transition', () => {
       runGit: (cwd, args) => {
         gitCalls.push(args);
         const command = args[0] === 'fetch' ? ['fetch', ...args.slice(1, 2), remote, ...args.slice(3)] : args;
-        return spawnSync('git', command, { cwd, encoding: 'utf8' }) as never;
+        return spawnSync('git', command, { cwd, env: gitTestEnv(), encoding: 'utf8' }) as never;
       },
       runGh: (args) => { calls.push(args); return { ...ok, stdout: Buffer.from('{"isPrivate":true}') }; },
       out: { log: () => {}, error: (line) => errors.push(line) },
@@ -1050,7 +1086,7 @@ describe('repository public transition', () => {
     ]);
     const fetch = gitCalls.find((args) => args[0] === 'fetch');
     expect(fetch).toEqual(['fetch', '--no-write-fetch-head', 'git@github.com:elanous-test/private-repository.git', '+refs/*:refs/remotes/public-scan/*']);
-    expect(spawnSync('git', ['cat-file', '-e', `${pullCommit}^{commit}`], { cwd: directory, encoding: 'utf8' }).status).not.toBe(0);
+    expect(spawnSync('git', ['cat-file', '-e', `${pullCommit}^{commit}`], { cwd: directory, env: gitTestEnv(), encoding: 'utf8' }).status).not.toBe(0);
     expect(errors.join('\n')).toContain('.elanous/auth.json');
   });
 
@@ -1283,8 +1319,8 @@ test('ensureInfoExclude — 별도 워크트리에서도 elanous 실행 산출�
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'info-exclude-')));
   const repo = join(root, 'repo'); const wt = join(root, 'wt');
   try {
-    const g = (cwd: string, ...a: string[]) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    execFileSync('git', ['init', '-q', repo]); writeFileSync(join(repo, 'README.md'), 'x\n');
+    const g = (cwd: string, ...a: string[]) => execFileSync('git', ['-C', cwd, ...a], { env: gitTestEnv(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['init', '-q', repo], { env: gitTestEnv() }); writeFileSync(join(repo, 'README.md'), 'x\n');
     g(repo, 'add', '.'); g(repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
     const first = ensureInfoExclude(repo);
     expect(first?.added).toBeGreaterThan(0);

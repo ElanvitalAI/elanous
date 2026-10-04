@@ -1,4 +1,4 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env bun
 // omni-crawl monitor — Firecrawl Monitors 관리 CLI (specs/firecrawl/monitor-*.md 기준)
 //
 // 페이지 변경감지 모니터(뉴스룸/IR/공시 등)를 생성·조회·삭제한다.
@@ -7,18 +7,18 @@
 // /v1/outbound(텔레그램)로 발송한다. 여기는 셋업/디버그 표면.
 //
 // 사용:
-//   npx tsx scripts/monitor.ts create --name "삼성 뉴스룸" --urls "https://news.samsung.com/kr" \
+//   bun scripts/monitor.ts create --name "삼성 뉴스룸" --urls "https://news.samsung.com/kr" \
 //       --schedule "every 1 hours" --goal "새 기사/공지 등장 시 알림"
-//   npx tsx scripts/monitor.ts list
-//   npx tsx scripts/monitor.ts checks <monitorId> [--limit 5]
-//   npx tsx scripts/monitor.ts check <monitorId> <checkId>
-//   npx tsx scripts/monitor.ts run <monitorId>          # 즉시 1회 체크
-//   npx tsx scripts/monitor.ts delete <monitorId>
+//   bun scripts/monitor.ts list
+//   bun scripts/monitor.ts checks <monitorId> [--limit 5]
+//   bun scripts/monitor.ts check <monitorId> <checkId>
+//   bun scripts/monitor.ts run <monitorId>          # 즉시 1회 체크
+//   bun scripts/monitor.ts delete <monitorId>
 
 import { parseArgs } from 'node:util';
 import { initEnv, env } from '../src/env.js';
 import { validatePublicHttpUrl } from '../src/url-safety.js';
-import { writeStdoutJson } from '../../../src/cli/stdout-json.ts';
+import { writeStdoutJson } from '../src/stdout-json.js';
 
 initEnv();
 

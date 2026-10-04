@@ -208,6 +208,19 @@ export const NODE_CATALOG: readonly NodeSpec[] = [
     related: ['iteration'],
   },
   {
+    kind: 'knowledge',
+    category: 'transform',
+    summary: '볼트 검색 · 찾은 조각을 다음 노드에',
+    yamlKey: 'knowledge',
+    required: ['query'],
+    optional: ['limit'],
+    example: `- id: notes
+  knowledge:
+    query: $ARGUMENTS
+    limit: 3`,
+    related: ['prompt'],
+  },
+  {
     kind: 'template',
     category: 'transform',
     summary: 'Handlebars-lite text template · {{ <id>.output }} substitution',

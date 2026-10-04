@@ -158,6 +158,8 @@ export interface AskLaunchFlowDeps {
   /** ⛔ 못 얻으면 `null` — 같은 이유. */
   recentAuthoringSamples(): RecentAuthoringSample[] | null;
   authorGoal(args: readonly string[], options: Record<string, unknown>): Promise<AskAuthoredGoal>;
+  /** Pod launches reserve a host slot before goal authoring begins. */
+  beforeAuthoring?(): Promise<void>;
   /** 발사 전 권고용 분해 seam. 생략하면 전용 관측명을 준 기존 분해기를 쓴다. */
   decomposeGoal?(goal: string): Promise<SelfDevDecomposition>;
   /**
@@ -825,6 +827,7 @@ export async function runAskLaunchFlow(
   const launchPreflight = await runPrePreflight(input, deps);
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
 
+  await deps.beforeAuthoring?.();
   const authorAndPreflight = async (): Promise<{
     readonly goalFile: string;
     readonly decision: ReturnType<typeof decideAskPreflight>;

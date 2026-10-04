@@ -151,6 +151,7 @@ export interface PromptRequest {
   /** P-3 §6.9 (2026-05-07) — see {@link PromptUserContentBlock}. */
   userContent?: PromptUserContentBlock[];
   provider?: string;
+  personaId?: string;
 }
 
 export interface PromptResponse {
@@ -879,6 +880,7 @@ export class DaemonClient {
         userText: req.userText,
         ...(req.userContent !== undefined ? { userContent: req.userContent } : {}),
         ...(req.provider !== undefined ? { provider: req.provider } : {}),
+        ...(req.personaId !== undefined ? { personaId: req.personaId } : {}),
       }),
     };
     if (handlers.signal) init.signal = handlers.signal;

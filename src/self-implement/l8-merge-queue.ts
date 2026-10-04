@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-merge.js';
+import { getDefaultLogStore } from '../mss/logging/log-store.js';
 
 type Command = (bin: string, args: readonly string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
 export type L8MergeQueueInput = { number: number; cwd: string; matchHeadCommit: string };
@@ -12,6 +13,161 @@ export type L8MergeQueueDeps = {
   /** Must identify the same shared repository across all harness processes. */
   acquire?: (cwd: string) => Promise<() => void>;
 };
+
+export type L8ShadowVerdict = { number: number; head: string; base?: string; verdict: 'pass' | 'conflict' | 'fail'; detail?: string; tests: string[]; at: string };
+export type L8ShadowQueueState = { pending: { number: number; head: string }[]; verdicts: L8ShadowVerdict[] };
+export type L8ShadowQueueDeps = L8MergeQueueDeps & { observe?: (verdict: L8ShadowVerdict) => void | Promise<void> };
+
+function shadowCommand(execute: Command, bin: string, args: string[], cwd: string): string {
+  const result = execute(bin, args, cwd);
+  if (result.status !== 0) throw new Error(`${bin} ${args.join(' ')}: ${(result.stderr || result.stdout || `exit ${result.status}`).trim().slice(0, 500)}`);
+  return args.includes('-z') ? result.stdout : result.stdout.trim();
+}
+
+function shadowQueuePath(cwd: string, execute: Command): string {
+  const dir = shadowCommand(execute, 'git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
+  if (!dir) throw new Error('merge queue common git directory unavailable');
+  return join(dir, 'elanous-l8-shadow-queue.json');
+}
+
+function readShadowQueue(path: string): L8ShadowQueueState {
+  if (!existsSync(path)) return { pending: [], verdicts: [] };
+  const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!value || typeof value !== 'object' || !('pending' in value) || !Array.isArray(value.pending)
+    || !value.pending.every((p: { number?: number; head?: string }) => Number.isSafeInteger(p?.number) && p.number! > 0 && typeof p.head === 'string' && /^[0-9a-f]{40}$/i.test(p.head))
+    || !('verdicts' in value) || !Array.isArray(value.verdicts)) throw new Error('invalid shadow queue ledger');
+  return value as L8ShadowQueueState;
+}
+
+function writeShadowQueue(path: string, state: L8ShadowQueueState): void {
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temp, JSON.stringify(state, null, 2) + '\n', { flag: 'wx' });
+    renameSync(temp, path);
+  } finally { rmSync(temp, { force: true }); }
+}
+
+async function withShadowQueue<T>(cwd: string, deps: L8ShadowQueueDeps, fn: (state: L8ShadowQueueState, path: string) => Promise<T>): Promise<T> {
+  const release = await (deps.acquire ?? acquireL8MergeQueue)(cwd);
+  try {
+    const path = shadowQueuePath(cwd, deps.command ?? command);
+    return await fn(readShadowQueue(path), path);
+  } finally { release(); }
+}
+
+export function shadowPrNumber(raw: string): number {
+  const text = raw.replace(/^#/, '');
+  const number = Number(text);
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(number)) throw new Error('expected a positive PR number');
+  return number;
+}
+
+export async function statusL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowQueueState> {
+  return withShadowQueue(cwd, deps, async (state) => state);
+}
+
+export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowQueueState> {
+  if (!Number.isSafeInteger(number) || number <= 0) throw new Error('expected a positive PR number');
+  return withShadowQueue(cwd, deps, async (state, path) => {
+    const execute = deps.command ?? command;
+    const view = JSON.parse(shadowCommand(execute, 'gh', ['pr', 'view', String(number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'], cwd)) as {
+      headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+    };
+    if (!view.headRefOid || !/^[0-9a-f]{40}$/i.test(view.headRefOid) || view.baseRefName !== 'main'
+      || view.state !== 'OPEN' || view.isDraft !== false || view.isCrossRepository !== false) throw new Error('PR is not an open, ready, same-repository main PR');
+    if (state.pending.some((p) => p.number === number)) throw new Error(`PR #${number} already queued`);
+    state.pending.push({ number, head: view.headRefOid });
+    writeShadowQueue(path, state);
+    return state;
+  });
+}
+
+/** Evaluate one pinned queue head against freshly fetched main. Never push or call a merge API. */
+export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowVerdict | null> {
+  return withShadowQueue(cwd, deps, async (state, path) => {
+    const item = state.pending[0];
+    if (!item) return null;
+    const execute = deps.command ?? command;
+    const run = (bin: string, args: string[], where = cwd) => shadowCommand(execute, bin, args, where);
+    const verdict: L8ShadowVerdict = { number: item.number, head: item.head, verdict: 'fail', tests: [], at: new Date().toISOString() };
+    const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'])) as {
+      headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+    };
+    if (view.headRefOid !== item.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
+      || view.isDraft !== false || view.isCrossRepository !== false) throw new Error('queued PR changed or is not ready');
+    run('git', ['fetch', 'origin', 'refs/heads/main']);
+    const base = run('git', ['rev-parse', 'FETCH_HEAD']);
+    if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
+    verdict.base = base;
+    run('git', ['fetch', 'origin', `refs/pull/${item.number}/head`]);
+    if (run('git', ['rev-parse', 'FETCH_HEAD']) !== item.head) throw new Error('fetched PR head changed');
+    let temp: string | undefined;
+    let attached = false;
+    try {
+      temp = mkdtempSync(join(tmpdir(), 'elanous-l8-shadow-'));
+      run('git', ['worktree', 'add', '--detach', temp, base]);
+      attached = true;
+      const fork = run('git', ['merge-base', base, item.head], temp);
+      const changed = run('git', ['diff', '--name-only', '-z', fork, item.head], temp).split('\0').filter(Boolean);
+      if (!changed.length) throw new Error('PR changed-file paths unavailable');
+      const diff = run('git', ['diff', '--name-only', '-z', '--diff-filter=ACMRT', fork, item.head], temp);
+      const files = diff.split('\0').filter(Boolean);
+      if (changed.some((file) => file.startsWith('-') || file.startsWith('/') || file.split('/').includes('..') || file.includes('\\'))) throw new Error('unsafe changed-file path');
+      verdict.tests = files.filter((file) => /(?:^|\/)[^/]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/.test(file));
+      const merge = execute('git', ['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'merge', '--no-ff', '--no-edit', item.head], temp);
+      if (merge.status !== 0) {
+        const unresolved = run('git', ['diff', '--name-only', '--diff-filter=U'], temp);
+        if (!unresolved) throw new Error(`git merge failed: ${merge.stderr.trim() || `exit ${merge.status}`}`);
+        verdict.verdict = 'conflict';
+        verdict.detail = unresolved;
+      } else {
+        if (verdict.tests.length) {
+          if (verdict.tests.some((file) => !existsSync(join(temp!, file)))) throw new Error('changed test path unavailable');
+          run('bun', ['install', '--frozen-lockfile'], temp);
+          const result = execute('bun', ['run', 'test:deterministic', ...verdict.tests], temp);
+          const output = `${result.stdout}\n${result.stderr}`;
+          const counts = /\b(\d+) pass\b[\s\S]*?\b(\d+) fail\b[\s\S]*?Ran ([1-9]\d*) tests? across ([1-9]\d*) files?/.exec(output);
+          if (!counts || Number(counts[1]) + Number(counts[2]) !== Number(counts[3])
+            || Number(counts[4]) !== verdict.tests.length || (result.status !== 0 && Number(counts[2]) === 0)) {
+            throw new Error(`changed tests unmeasured: ${output.slice(-400)}`);
+          }
+          if (Number(counts[2]) > 0 || Number(counts[1]) === 0) {
+            verdict.detail = `changed tests failed: ${output.slice(-400)}`;
+          } else {
+            verdict.verdict = 'pass';
+          }
+        } else {
+          verdict.verdict = 'pass';
+        }
+      }
+    } finally {
+      try {
+        if (attached && temp) run('git', ['worktree', 'remove', '--force', temp]);
+      } finally {
+        if (temp) rmSync(temp, { recursive: true, force: true });
+      }
+    }
+    if (verdict.verdict === 'pass') {
+      run('git', ['fetch', 'origin', 'refs/heads/main']);
+      if (run('git', ['rev-parse', 'FETCH_HEAD']) !== verdict.base) throw new Error('main advanced during shadow verification');
+      const current = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'])) as {
+        headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+      };
+      if (current.headRefOid !== item.head || current.baseRefName !== 'main' || current.state !== 'OPEN'
+        || current.isDraft !== false || current.isCrossRepository !== false) throw new Error('PR changed during shadow verification');
+    }
+    // A rejected insert leaves the pinned item queued for a later evaluation.
+    await (deps.observe ?? ((entry) => {
+      const store = getDefaultLogStore();
+      if (!store) throw new Error('merge-queue observation store unavailable');
+      store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'merge-queue', event: 'shadow-verdict', data: entry }, surface: 'merge-queue' }]);
+    }))(verdict);
+    state.pending.shift();
+    state.verdicts.push(verdict);
+    writeShadowQueue(path, state);
+    return verdict;
+  });
+}
 
 const command: Command = (bin, args, cwd) => {
   const r = spawnSync(bin, [...args], { cwd, encoding: 'utf8', timeout: 600_000, maxBuffer: 32 * 1024 * 1024 });

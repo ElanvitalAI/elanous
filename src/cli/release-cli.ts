@@ -23,13 +23,15 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
-import { userConfigPath } from '../user-config.js';
+import { getUserConfig, userConfigPath } from '../user-config.js';
 import { addItem, claimItem, decodeClaimHistoryEntry, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
-import { landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
+import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
+import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
+import { fileLeaseStore } from '../hq/lease.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -504,12 +506,44 @@ export interface LandedButYellowDeps {
   run?: Runner;
   checklist?: typeof listChecklist;
   now?: () => Date;
+  evidenceAdd?: typeof features.evidenceAdd;
+  schedules?: typeof features.readSchedules;
+  released?: typeof features.releasedVersion;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}): void {
+function printLandedRows(rows: ReturnType<typeof landedButYellow>, items: ReturnType<typeof listChecklist>['items']): void {
+  const updatedAtById = new Map(items.map((item) => [item.id, item.updatedAt]));
+  const date = (iso: string) => {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso));
+    const part = (name: string) => parts.find((entry) => entry.type === name)?.value;
+    return `${part('month')}-${part('day')} ${part('hour')}:${part('minute')}`;
+  };
+  for (const row of rows) {
+    const icon = row.status === 'yellow' ? '🟡' : '🔴';
+    console.log(`${row.id} ${row.owner ?? '-'} ${icon} ← ${row.prs.map((pr, i) => `#${pr.number} «${pr.title}» (${date(pr.mergedAt)} · 근거에 ${row.alreadyInEvidence[i] ? '있음' : '없음'}${pr.mergedAt > (updatedAtById.get(row.id) ?? '') ? ' · 칸보다 새것' : ''})`).join(' · ')}`);
+  }
+  console.log(`${rows.length}칸 · 그중 근거에 없는 PR 이 있는 칸 ${rows.filter((row) => row.alreadyInEvidence.includes(false)).length}`);
+}
+
+function compareReleaseVersions(a: string, b: string): number {
+  const parse = (version: string) => {
+    const [core, pre] = version.split('-');
+    const [major, minor, patch] = core!.split('.').map(Number);
+    const [stage, sequence] = pre?.split('.') ?? [];
+    return [major!, minor!, patch!, stage === undefined ? 3 : ({ alpha: 0, beta: 1, rc: 2 } as Record<string, number>)[stage]!, Number(sequence ?? 0)];
+  };
+  const left = parse(a), right = parse(b);
+  for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i]! - right[i]!;
+  return 0;
+}
+
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
+  const ledgerFenceDeps = (): HqDeps => getElanousConfigDirOverride() && !hqDeps.store && !getUserConfig().hq?.arbiter
+    ? { ...hqDeps, store: fileLeaseStore(join(effectiveInstanceRoot(), 'hq', 'lease.json')), seenPath: join(effectiveInstanceRoot(), 'hq', 'seen-generation'), localPath: join(effectiveInstanceRoot(), 'hq', 'local.json') }
+    : hqDeps;
   schedule.command('list').option('--json', '결과 JSON').action((o: { json?: boolean }) => {
     const rows = listSchedules(scheduleLedgerRoot());
     if (o.json) console.log(JSON.stringify(rows));
@@ -522,21 +556,25 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (o.json) console.log(JSON.stringify(row)); else console.log(formatSchedule(row));
     });
   schedule.command('set').requiredOption('--version <v>', '갱신할 판')
-    .option('--cut-at <iso>', '오프셋 포함 컷 시각').option('--land-by <iso>', '오프셋 포함 착지 마감').option('--json', '결과 JSON')
-    .action((o: { version: string; cutAt?: string; landBy?: string; json?: boolean }) => {
+    .option('--cut-at <iso>', '오프셋 포함 컷 시각').option('--land-by <iso>', '오프셋 포함 착지 마감').option('--json', '결과 JSON').option('--hq-override')
+    .action((o: { version: string; cutAt?: string; landBy?: string; json?: boolean; hqOverride?: boolean }) => {
       if (o.cutAt === undefined && o.landBy === undefined) throw new CliUserError('갱신할 시각을 지정하라', '--cut-at <iso> 또는 --land-by <iso>');
+      if (!hqCliWriteAllowed('release schedule set', Boolean(o.hqOverride), ledgerFenceDeps())) return;
       const row = setSchedule(o.version, { cutAt: o.cutAt, landBy: o.landBy }, process.env.ELANOUS_TRACK || 'cli', scheduleLedgerRoot());
       if (o.json) console.log(JSON.stringify(row)); else console.log(formatSchedule(row));
     });
   const checklist = release.command('checklist').description('판별 확인표 조회·갱신')
     .option('--version <v>', '판 또는 별칭(기본: package.json 의 개발판에서 -dev.N 제거)')
-    .option('--json', '결과 JSON');
+    .option('--json', '결과 JSON')
+    .option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
+  const mayWrite = (cmd: Command) => hqCliWriteAllowed(`release checklist ${cmd.name()}`, Boolean(cmd.optsWithGlobals().hqOverride), ledgerFenceDeps());
   const context = (cmd: Command) => {
     const opts = { ...(cmd.parent?.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.opts() as { version?: string; json?: boolean }) };
     const codenames = checklistCodenames();
     return { version: checklistVersion(opts.version, codenames), codenames, json: opts.json };
   };
-  const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON');
+  const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
+  const actor = () => process.env.ELANOUS_TRACK || 'cli';
   withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = context(cmd);
     await checklistOutput(version, codenames, 'list', json, opts.owner);
@@ -545,32 +583,66 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     const { version, codenames, json } = context(cmd);
     await checklistOutput(version, codenames, 'status', json, opts.owner);
   });
-  withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(읽기 전용)'))
+  withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(기본 읽기 전용)'))
     .option('--owner <owner>', '자리 또는 하위 자리로 거르기')
-    .action(async (opts: { owner?: string }, cmd: Command) => {
-      const { version, json } = context(cmd);
+    .option('--open', '미발행 일정 판 중 칸이 있는 판 전부')
+    .option('--apply-evidence', '확실한 PR 짝의 근거를 붙인다(상태는 그대로)')
+    .option('--dry-run', '근거 추가 없이 계획만 출력')
+    .action(async (opts: { owner?: string; open?: boolean; applyEvidence?: boolean; dryRun?: boolean }, cmd: Command) => {
       try {
+        const inherited = cmd.parent?.opts() as { version?: string; json?: boolean } | undefined;
+        const local = cmd.opts() as { version?: string; json?: boolean };
+        if (opts.open && (local.version !== undefined || inherited?.version !== undefined)) throw new CliUserError('--open 과 --version 을 함께 쓸 수 없다');
+        const json = local.json ?? inherited?.json;
         if (opts.owner !== undefined) parseOwner(opts.owner);
+        const released = opts.open ? (landedDeps.released ?? features.releasedVersion)() : '';
+        const openSnapshots = opts.open
+          ? (landedDeps.schedules ?? features.readSchedules)()
+            .filter(({ version }) => isReleaseVersion(version) && (!released || compareReleaseVersions(version, released) > 0))
+            .sort((a, b) => compareReleaseVersions(a.version, b.version))
+            .map(({ version }) => (landedDeps.checklist ?? listChecklist)(version)).filter((snapshot) => snapshot.items.length > 0)
+          : [];
+        if (opts.open && !openSnapshots.length) {
+          if (json) await writeStdoutJson('[]\n'); else console.log('열린 판 없음');
+          return;
+        }
+        if (opts.applyEvidence && !opts.dryRun && !mayWrite(cmd)) return;
         const since = new Date((landedDeps.now ?? (() => new Date()))().getTime() - 7 * 86_400_000).toISOString().slice(0, 10);
         const raw = must((landedDeps.run ?? defaultRunner)('gh', ['pr', 'list', '--state', 'merged', '--search', `merged:>=${since}`, '--limit', '400', '--json', 'number,title,body,mergedAt'], process.cwd()), '병합 PR 조회(gh)');
         const prs = JSON.parse(raw) as MergedChecklistPr[];
         if (!Array.isArray(prs)) throw new Error('병합 PR 조회(gh): 배열이 아니다');
-        const items = (landedDeps.checklist ?? listChecklist)(version).items;
-        const rows = landedButYellow(items, prs, { owner: opts.owner });
-        if (json) await writeStdoutJson(`${JSON.stringify(rows)}\n`);
-        else {
-          const updatedAtById = new Map(items.map((item) => [item.id, item.updatedAt]));
-          const date = (iso: string) => {
-            const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso));
-            const part = (name: string) => parts.find((entry) => entry.type === name)?.value;
-            return `${part('month')}-${part('day')} ${part('hour')}:${part('minute')}`;
-          };
-          for (const row of rows) {
-            const icon = row.status === 'yellow' ? '🟡' : '🔴';
-            console.log(`${row.id} ${row.owner ?? '-'} ${icon} ← ${row.prs.map((pr, i) => `#${pr.number} «${pr.title}» (${date(pr.mergedAt)} · 근거에 ${row.alreadyInEvidence[i] ? '있음' : '없음'}${pr.mergedAt > (updatedAtById.get(row.id) ?? '') ? ' · 칸보다 새것' : ''})`).join(' · ')}`);
+        const snapshots = opts.open ? openSnapshots : [(landedDeps.checklist ?? listChecklist)(context(cmd).version)];
+        const results: Array<{ version: string; rows?: ReturnType<typeof landedButYellow>; plan?: ReturnType<typeof evidencePlan> }> = [];
+        let totalAdded = 0, totalSkipped = 0;
+        for (const snapshot of snapshots) {
+          const { version, items } = snapshot;
+          const rows = landedButYellow(items, prs, { owner: opts.owner });
+          const skippedMention = new Set(rows.flatMap((row) => row.prs.flatMap((pr) =>
+            pr.basis === 'mention' ? [JSON.stringify([row.id, pr.number])] : []))).size;
+          if (opts.open) totalSkipped += skippedMention;
+          if (opts.open && !json) console.log(`— ${version} —`);
+          if (opts.applyEvidence || opts.dryRun) {
+            const plan = evidencePlan(rows);
+            const log = json ? console.error : console.log;
+            for (const { id, ref } of plan) {
+              if (!opts.dryRun) (landedDeps.evidenceAdd ?? features.evidenceAdd)(id, version, ref, actor(), snapshot.released, snapshot.dev);
+              log(`${opts.dryRun ? '·' : '✅'} ${id} 근거 ${ref}`);
+            }
+            const added = opts.dryRun ? 0 : plan.length;
+            totalAdded += added;
+            log(`붙임 ${added} · 건너뜀(언급만) ${skippedMention}`);
+            if (!opts.open && !opts.dryRun) debug.log('release.checklist', 'evidence-synced', { added, skippedMention });
+            results.push({ version, plan });
+          } else {
+            if (!json) printLandedRows(rows, items);
+            results.push({ version, rows });
           }
-          console.log(`${rows.length}칸 · 그중 근거에 없는 PR 이 있는 칸 ${rows.filter((row) => row.alreadyInEvidence.includes(false)).length}`);
         }
+        if (opts.open) {
+          if (opts.applyEvidence && !opts.dryRun) debug.log('release.checklist', 'evidence-synced', { versions: snapshots.map(({ version }) => version), added: totalAdded, skippedMention: totalSkipped });
+          if (!json) console.log(`판 ${snapshots.length} · 붙임 합 ${totalAdded} · 건너뜀(언급만) 합 ${totalSkipped}`);
+          else await writeStdoutJson(`${JSON.stringify(results)}\n`);
+        } else if (json) await writeStdoutJson(`${JSON.stringify(opts.applyEvidence || opts.dryRun ? results[0]!.plan : results[0]!.rows)}\n`);
         if (prs.length >= 400) console.error('⚠ 병합 PR 400개 상한: 목록이 잘렸을 수 있다');
       } catch (error) {
         console.error(`⛔ ${error instanceof Error ? error.message : String(error)}`);
@@ -581,6 +653,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
     .action((id: string, title: string, opts: { owner?: string; kind?: string; allowDuplicateId?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
+    if (!mayWrite(cmd)) return;
     const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
@@ -592,6 +665,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
       if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--status · --evidence · --owner · --disposition · --kind 중 하나');
+      if (!mayWrite(cmd)) return;
       const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       const item = data.items.find((entry) => entry.id === id);
       const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
@@ -605,40 +679,45 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .requiredOption('--by <owner>', '잡을 자리 또는 하위 자리').option('--force', '기존 주인에서 강제로 바꾼다')
     .action((id: string, opts: { by: string; force?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
+      if (!mayWrite(cmd)) return;
       const data = claimItem(version, id, opts.by, { force: opts.force });
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 주인 ${opts.by}`);
     });
   withContext(checklist.command('rm <id>').description('칸 삭제')).action((id: string, _opts: unknown, cmd: Command) => {
     const { version, json } = context(cmd);
+    if (!mayWrite(cmd)) return;
     const data = removeItem(version, id, process.env.ELANOUS_TRACK || 'cli');
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 삭제`);
   });
   withContext(checklist.command('seed').description('마크다운 로드맵에서 빈 칸 들이기')).requiredOption('--from <file>', '로드맵 파일')
     .action((opts: { from: string }, cmd: Command) => {
       const { version, json } = context(cmd);
+      if (!mayWrite(cmd)) return;
       const data = seedFromRoadmap(version, readFileSync(opts.from, 'utf8'));
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${version} ${data.items.length}칸`);
     });
-  const actor = () => process.env.ELANOUS_TRACK || 'cli';
   withContext(checklist.command('move <id>').description('칸을 한 트랜잭션으로 다른 판에 옮긴다'))
     .requiredOption('--from <v>', '현재 판').requiredOption('--to <v>', '새 판').option('--reason <reason>', '이동 사유')
     .action((id: string, opts: { from: string; to: string; reason?: string }, cmd: Command) => {
       const { codenames, json } = context(cmd);
       const from = checklistVersion(opts.from, codenames), to = checklistVersion(opts.to, codenames);
+      if (!mayWrite(cmd)) return;
       features.move(id, from, to, actor(), undefined, undefined, opts.reason);
       if (json) console.log(JSON.stringify(listChecklist(to))); else console.log(`✅ ${id} ${from} → ${to}`);
     });
   withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).action((id: string, title: string, _opts: unknown, cmd: Command) => {
     const { version, json } = context(cmd);
+    if (!mayWrite(cmd)) return;
     const snapshot = listChecklist(version);
     features.retitle(id, title, actor(), snapshot.released, snapshot.dev);
     if (json) console.log(JSON.stringify(listChecklist(version))); else console.log(`✅ ${id} 제목 수정`);
   });
   const evidence = checklist.command('evidence').description('칸의 PR·커밋 근거');
   withContext(evidence.command('add <id> <ref>').description('근거 참조 추가')).action((id: string, ref: string, _opts: unknown, cmd: Command) => {
-    const { version, json } = context(cmd);
-    const snapshot = listChecklist(version);
-    features.evidenceAdd(id, version, ref, actor(), snapshot.released, snapshot.dev);
+      const { version, json } = context(cmd);
+      if (!mayWrite(cmd)) return;
+      const snapshot = listChecklist(version);
+      features.evidenceAdd(id, version, ref, actor(), snapshot.released, snapshot.dev);
     if (json) console.log(JSON.stringify(features.history(id).map(decodeClaimHistoryEntry))); else console.log(`✅ ${id} 근거 ${ref}`);
   });
   withContext(checklist.command('history <id>').description('칸의 판 이동·변경 이력')).action((id: string, _opts: unknown, cmd: Command) => {
@@ -654,6 +733,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   });
   withContext(checklist.command('export').description('SQLite 에서 checklist.json 스냅샷 생성')).action((_opts: unknown, cmd: Command) => {
     const { version, json } = context(cmd);
+    if (!mayWrite(cmd)) return;
     const snapshot = listChecklist(version);
     features.exportJson(version, snapshot.released, snapshot.dev);
     if (json) console.log(JSON.stringify(listChecklist(version))); else console.log(`✅ ${version} checklist.json 내보냄`);

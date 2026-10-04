@@ -19,7 +19,7 @@ import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
-import { HostPoolLease } from '../../pod-lease/host-lease.js';
+import { HostPoolLease, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
 import { measurePoolLease, recommendConcurrency, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
 
 export interface PodPoolMember {
@@ -143,6 +143,10 @@ export function genericConfigPodPool(config: { pod?: { pool?: string }; harness?
 }
 
 /** 노드 자리 배분 — 우선순위 순서로 첫 빈 자리. 순수(시각·대기는 호출자가). */
+export function podPoolHostLease(members: readonly PodPoolMember[]): HostPoolLease {
+  return new HostPoolLease([...members.map((m) => `${m.context}@${m.sshHost ?? ''}`)].sort().join(','));
+}
+
 export class PodPoolScheduler {
   private readonly inflight = new Map<string, number>();
   private readonly admission: PodLeaseAdmission;
@@ -157,7 +161,7 @@ export class PodPoolScheduler {
   constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
-    this.hostLease = options.hostLease ?? new HostPoolLease([...members.map((m) => `${m.context}@${m.sshHost ?? ''}`)].sort().join(','));
+    this.hostLease = options.hostLease ?? podPoolHostLease(members);
     const measureStatus = options.status ?? (() => {
       const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) });
       return recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
@@ -166,9 +170,13 @@ export class PodPoolScheduler {
     this.admission = new PodLeaseAdmission({ status: async () => {
       const measured = await measureStatus();
       this.lastRaw = measured;
-      // Launches admitted by other processes on this host but not yet visible as Jobs hold free slots too.
-      const others = measured.recommended === null ? 0 : this.hostLease.othersPending();
-      const decision = measured.recommended === null ? measured : { ...measured, recommended: Math.max(0, measured.recommended - others) };
+      const pendingJobs = measured.pendingJobs ?? [];
+      const ownStart = this.hostLease.selfStart();
+      const transferId = process.env.ELANOUS_POD_RESERVED_LEASE;
+      const transferIsOther = !!transferId && this.hostLease.reservationIsOther(transferId);
+      const others = measured.recommended === null ? 0 : this.hostLease.live().filter((r) =>
+        (r.pid !== process.pid || r.startedAt !== ownStart) && !leaseHasPendingPod(r, pendingJobs)).length;
+      const decision = measured.recommended === null ? measured : { ...measured, recommended: Math.max(0, measured.recommended - others + (transferIsOther ? 1 : 0)) };
       // An unknown reading cannot erase permits already granted: on recovery,
       // the first healthy recommendation must still account for their slots.
       if (decision.recommended === null) return decision;
@@ -181,19 +189,28 @@ export class PodPoolScheduler {
     }, ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: options.dependencyMerged ?? ((after, signal) => predecessorState(after, {}, signal)) });
   }
   /** FIFO gate within this process, then a host lease so independent CLI processes cannot over-admit the same pool. */
-  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor): Promise<PodLeaseRelease & { applied: () => void }> {
+  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor): Promise<PodLeaseRelease & { applied: (job: string, context: string, namespace: string) => void; observed: () => void }> {
     const local = await this.acquireLocalAdmission(signal, after);
     try {
       for (;;) {
         if (signal?.aborted) throw new Error('pod lease admission aborted');
         const free = this.lastRaw?.recommended ?? null;
-        // Same check as the local gate, but atomic across processes: other unapplied leases must stay under the free slots.
-        const lease = free !== null && free > 0 ? this.hostLease.tryReserve((others) => others < free) : null;
+        // Same check as the local gate, but atomic across processes: other authoring and pre-Running leases hold slots.
+        const reservedId = process.env.ELANOUS_POD_RESERVED_LEASE;
+        const transferred = reservedId ? this.hostLease.claim(reservedId) : null;
+        if (reservedId && !transferred) throw new Error('pod lease: authoring reservation could not be transferred');
+        if (transferred) delete process.env.ELANOUS_POD_RESERVED_LEASE;
+        const pendingJobs = this.lastRaw?.pendingJobs ?? [];
+        const lease = transferred ?? (free !== null && free > 0 ? this.hostLease.tryReserve((others) =>
+          others - this.hostLease.live().filter((r) => leaseHasPendingPod(r, pendingJobs) &&
+            (r.pid !== process.pid || r.startedAt !== this.hostLease.selfStart())).length < free) : null);
         if (lease) {
           let hostReleased = false;
           const releaseHost = () => { if (!hostReleased) { hostReleased = true; lease(); } };
-          // Once the Job is applied the cluster measurement counts it — the host lease would double count.
-          return Object.assign(() => { releaseHost(); local(); }, { applied: releaseHost });
+          return Object.assign(() => { releaseHost(); local(); }, {
+            applied: (job: string, context: string, namespace: string) => lease.applied(job, context, namespace),
+            observed: releaseHost,
+          });
         }
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, this.pollMs);

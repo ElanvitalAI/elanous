@@ -3,6 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import type { LLMToolSpec } from '../llm.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { debug } from '../debug/log.js';
 import { canonicalizeForBoundary, isWithinBoundary, resolveHarnessBoundary } from '../harness/harness-write-boundary.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
@@ -133,7 +134,7 @@ async function spawnHeldElanous(command: string[], cwd: string, instanceRoot: st
     try {
       child = deps.spawn(command[0]!, command.slice(1), {
         cwd,
-        env: { ...process.env, ELANOUS_STATE_DIR: instanceRoot },
+        env: { ...process.env, ELANOUS_STATE_DIR: instanceRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(instanceRoot) },
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

@@ -21,6 +21,17 @@
 import { debug } from '../debug/log.js';
 import { getCapturedEnv, capturedEnvAvailable } from '../shell-env-bootstrap.js';
 import { resolveCurrentInstance } from '../instance/current.js';
+import { treeDerivedRootFor } from '../instance/resolve.js';
+
+/** Pin a child state root together with its origin; only reuse a parent's tag for the same root. */
+export function stateDirSourceForChild(root: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (env.ELANOUS_STATE_DIR === root && env.ELANOUS_STATE_DIR_SOURCE?.trim()) {
+    return env.ELANOUS_STATE_DIR_SOURCE;
+  }
+  const current = resolveCurrentInstance();
+  return root === treeDerivedRootFor(process.cwd()) || (current.root === root && current.layer === 'default')
+    ? 'derived' : 'explicit';
+}
 
 // ── 전파 allowlist ─────────────────────────────────────────────────────────
 //

@@ -54,7 +54,7 @@ requires: []
 
 ## 무료로 쓰는 길 (키 없이)
 
-이 스킬 폴더에서 `npx tsx scripts/main.ts "<검색어>" --free --print`로 DDG 검색을 사용합니다. URL 본문은 키 없는 Jina Reader 또는 로컬 HTML 추출을 사용할 수 있습니다. `--free`는 유료 엔진을 피하려는 명시적 선택이며, 검색 서비스 접속이 막히면 결과가 없을 수 있습니다.
+이 스킬 폴더에서 `bun scripts/main.ts "<검색어>" --free --print`로 DDG 검색을 사용합니다. URL 본문은 키 없는 Jina Reader 또는 로컬 HTML 추출을 사용할 수 있습니다. `--free`는 유료 엔진을 피하려는 명시적 선택이며, 검색 서비스 접속이 막히면 결과가 없을 수 있습니다.
 
 ## 내 키로 쓰는 길
 
@@ -93,34 +93,34 @@ requires: []
 이 스킬 폴더에서 실행합니다.
 
 ```bash
-npx tsx scripts/main.ts "<검색어>" [OPTIONS]
+bun scripts/main.ts "<검색어>" [OPTIONS]
 ```
 
 ### 예시
 
 ```bash
 # 기본 (tavily · OMNI_CRAWL_TAVILY=0 이면 ddg 무료)
-npx tsx scripts/main.ts "Samsung HBM4 경쟁력" --print
+bun scripts/main.ts "Samsung HBM4 경쟁력" --print
 
 # 뉴스 (오늘자)
-npx tsx scripts/main.ts "삼성전자 뉴스" --time-range day --print
+bun scripts/main.ts "삼성전자 뉴스" --time-range day --print
 
 # 딥리서치
-npx tsx scripts/main.ts "SK하이닉스 전망" --mode deep --print
+bun scripts/main.ts "SK하이닉스 전망" --mode deep --print
 
 # Conatus 파이프라인 (구조화 JSON)
-npx tsx scripts/main.ts "NVDA earnings" --json
+bun scripts/main.ts "NVDA earnings" --json
 
 # 전 엔진 라이브 진단 (+크레딧 잔량)
-npx tsx scripts/main.ts --health
+bun scripts/main.ts --health
 
 # 개발 아티팩트 (라이브러리 동작·에러·버그 수정 여부)
-npx tsx scripts/main.ts "pydantic model_validator wrap mode" --engine fc-dev --print
+bun scripts/main.ts "pydantic model_validator wrap mode" --engine fc-dev --print
 
 # X 트윗 벌크 / 커뮤니티 / 사이트 크롤
-npx tsx scripts/main.ts "bitcoin outlook" --engine apify --min-favs 50 --print
-npx tsx scripts/main.ts "Claude Code 반응" --engine grok-community --print
-npx tsx scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
+bun scripts/main.ts "bitcoin outlook" --engine apify --min-favs 50 --print
+bun scripts/main.ts "Claude Code 반응" --engine grok-community --print
+bun scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
 ```
 
 ## 옵션
@@ -189,13 +189,13 @@ changed/new 페이지를 텔레그램(/v1/outbound)으로 알림. 첫 체크는 
 
 ```bash
 # 생성 (자연어 스케줄 · goal=judge 판정으로 노이즈 억제·변경페이지당 1cr)
-npx tsx scripts/monitor.ts create --name "삼성전자 뉴스룸" \
+bun scripts/monitor.ts create --name "삼성전자 뉴스룸" \
   --urls "https://news.samsung.com/kr/latest" --schedule "every 1 hours" \
   --goal "새 기사 등장 시 알림. 날짜/배너 등 사소한 변경 무시."
-npx tsx scripts/monitor.ts list                 # 목록+예상 크레딧/월
-npx tsx scripts/monitor.ts checks <monitorId>   # 체크 이력 (same/changed/new)
-npx tsx scripts/monitor.ts run <monitorId>      # 즉시 1회 체크
-npx tsx scripts/monitor.ts delete <monitorId>
+bun scripts/monitor.ts list                 # 목록+예상 크레딧/월
+bun scripts/monitor.ts checks <monitorId>   # 체크 이력 (same/changed/new)
+bun scripts/monitor.ts run <monitorId>      # 즉시 1회 체크
+bun scripts/monitor.ts delete <monitorId>
 ```
 
 운영 중(2026-07-06~): 삼성전자 뉴스룸·SK하이닉스 뉴스룸 (각 1h·~1,440cr/월).

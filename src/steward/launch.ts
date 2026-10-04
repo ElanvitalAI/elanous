@@ -7,6 +7,7 @@ import { redactSecrets } from '../task-cards/card-store.js';
 import { preLaunchGate, type PreLaunchGateDecision } from '../execution-loop/launch-gate.js';
 import type { BudgetDecision } from '../self-implement/budget-gate.js';
 import type { ScheduledDecision, StewardSettings, TriageIssue } from './triage.js';
+import { launchModeOf, rescueAllows } from './rescue.js';
 
 /** `completed` = the run finished without a merge (a non-code artifact, or nothing to deliver) — never reported as a failure. */
 export type LaunchStatus = 'shadow' | 'launched' | 'skipped-budget' | 'blocked-duplicate' | 'blocked-location' | 'failed' | 'running' | 'merged' | 'completed';
@@ -50,7 +51,7 @@ const RUN_ID = /\brun-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const DEFAULT_POOL = 'pool-node-b@node-b:8';
 // `harness budget --json` outcomes: proceed | next-provider | wait-reset | stop. next-provider still runs (the harness switches provider itself).
 const BUDGET_PROCEED: readonly string[] = ['proceed', 'next-provider'];
-const launchMode = (settings: StewardSettings): 'off' | 'shadow' | 'live' => settings.mode ?? settings.launch ?? 'shadow';
+const launchMode = (settings: StewardSettings): 'off' | 'shadow' | 'live' => launchModeOf(settings.mode ?? settings.launch ?? 'shadow');
 const cli = (args: string[]) => ['bun', 'bin/elanous.mjs', ...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args];
 const sourceOf = (issue: TriageIssue): string => /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1] ?? `linear:${issue.identifier}`;
 const promptOf = (issue: TriageIssue): string => `${issue.title}\n${issue.body.slice(0, 1500)}`;
@@ -125,6 +126,7 @@ export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
   const { ledger, settings, root } = deps;
   if (item.row.rung !== 4 || item.row.hitlReason || item.row.disposition !== 'now' || (ledger.launches[item.issue.identifier] && !['skipped-budget', 'blocked-duplicate', 'blocked-location'].includes(ledger.launches[item.issue.identifier].status) && !(launchMode(settings) === 'live' && ledger.launches[item.issue.identifier].status === 'shadow'))) throw new Error('steward launch is not eligible');
   if (launchMode(settings) === 'off') throw new Error('steward launch is off');
+  if (!rescueAllows(settings.mode, 'launch', { issue: item.issue.identifier })) throw new Error('steward rescue refused launch');
   const key = item.issue.identifier;
   const entry: LaunchEntry = { issue: key, title: redactSecrets(item.issue.title), source: item.source, command: redactSecrets(item.command), status: 'shadow' };
   if (launchMode(settings) !== 'live') {
@@ -187,6 +189,7 @@ export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
 export function raiseHitl(issue: TriageIssue, row: ScheduledDecision, deps: LaunchDeps): HitlEntry {
   const old = deps.ledger.hitl[issue.identifier];
   if (old && (old.attempted || launchMode(deps.settings) !== 'live')) return old;
+  if (!rescueAllows(deps.settings.mode, 'decision-card', { issue: issue.identifier })) return old ?? { issue: issue.identifier, reason: redactSecrets(row.hitlReason ?? row.why), raised: false };
   const entry: HitlEntry = old ?? { issue: issue.identifier, reason: redactSecrets(row.hitlReason ?? row.why), raised: false };
   deps.ledger.hitl[issue.identifier] = entry;
   if (launchMode(deps.settings) !== 'live') {
@@ -215,6 +218,7 @@ function alive(pid: number | undefined): boolean {
 
 export function collectOutcomes(ledger: LaunchLedger, deps: LaunchDeps): LaunchEntry[] {
   if (launchMode(deps.settings) !== 'live') return [];
+  if (!rescueAllows(deps.settings.mode, 'harvest')) return [];
   const done: LaunchEntry[] = [];
   for (const entry of Object.values(ledger.launches)) {
     if (entry.reported || entry.status === 'shadow' || entry.status === 'skipped-budget' || entry.status === 'blocked-duplicate' || entry.status === 'blocked-location') continue;

@@ -43,10 +43,23 @@ export function renderTelegramNow(answer: ContextNowAnswer): string {
 }
 
 export function renderTuiNow(answer: ContextNowAnswer): string[] {
+  const shortText = (text: string) => {
+    const characters = Array.from(text);
+    return characters.length > 100 ? `${characters.slice(0, 100).join('')}…` : text;
+  };
+  const shortSource = (source: string) => {
+    if (/^https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+#issuecomment-/.test(source)) return '채널';
+    if (source.startsWith('elanous://release/')) return '원장';
+    return Array.from(source).slice(0, 40).join('');
+  };
+  const factLabels = { version: '판', cell: '칸', decision: '결정', seat: '자리' } as const;
+  const eventLabels: Record<string, string> = { report: '보고', dispatch: '발사', decision: '결정' };
+  const events = answer.events.slice().sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
   const rows = [
-    ...answer.facts.map(f => [f.kind, factText(f), f.source]),
-    ...answer.events.map(e => [e.kind, e.summary, e.source]),
+    ...answer.facts.map(f => [factLabels[f.kind], shortText(factText(f)), shortSource(f.source)]),
+    ...events.slice(0, 8).map(e => [eventLabels[e.kind] ?? '소식', shortText(e.summary), shortSource(e.source)]),
     ...answer.guide.map(guide => ['안내', guide, '']),
+    ...(events.length > 8 ? [['안내', `… 사건 ${events.length - 8}개 더(/now <주제> 로 좁히기)`, '']] : []),
   ];
   return [
     `지금${answer.topic ? ` · ${answer.topic}` : ''} (${answer.at})`,

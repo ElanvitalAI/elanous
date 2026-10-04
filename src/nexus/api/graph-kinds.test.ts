@@ -28,7 +28,7 @@ test('owner-only GET kinds exposes separately scoped core catalogs', async () =>
   const entries = (await all!.json() as { kinds: Array<{ graph: string; kind: string; description: string; core: boolean }> }).kinds;
   expect(entries.filter((entry) => entry.graph === 'harness' && entry.core)).toHaveLength(7);
   // W8 둘째 조각 #23226 — subworkflow(하위 워크플로 노드)가 core 종류에 더해졌다.
-  expect(entries.filter((entry) => entry.graph === 'workflow' && entry.core)).toHaveLength(23);
+  expect(entries.filter((entry) => entry.graph === 'workflow' && entry.core)).toHaveLength(24);
   expect(entries.every((entry) => entry.description.length > 0)).toBe(true);
   expect((await (await request('/v1/graph/kinds?graph=workflow'))!.json() as { kinds: Array<{ graph: string }> }).kinds.every((entry) => entry.graph === 'workflow')).toBe(true);
   const added = registerNodeKind({ graph: 'workflow', kind: 'palette-probe:node', plugin: 'palette-probe', core: false, description: 'A plugin node', schema: { type: 'object' } });

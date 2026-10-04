@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { checkPodPool, genericConfigPodPool, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type RemoteRun } from './pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
+import { HostPoolLease } from '../../pod-lease/host-lease.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
   test('parses context[@ssh][:capacity] in priority order', () => {
@@ -136,6 +140,62 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     }
   });
 
+  test('a Job remains leased after apply until its Pod phase is observed Running', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-running-lease-'));
+    const host = new HostPoolLease('p', { dir });
+    const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2,
+      status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0 }) });
+    let phase = 'Pending';
+    let applied = false;
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input && JSON.parse(input).kind === 'Job') applied = true;
+      if (args.includes('jsonpath={.metadata.uid} ')) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: phase === 'Complete' ? 'Complete' : '', stderr: '' };
+      if (args.includes('jsonpath={.items[*].status.phase}')) return { status: 0, stdout: phase, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ pool, kubectl, pollMs: 2, imageCommit: null,
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
+    const controller = new AbortController();
+    try {
+      const job = spawn({ spaceId: 'pending-phase', feature: 'f', signal: controller.signal } as Parameters<typeof spawn>[0]);
+      for (let n = 0; n < 100 && !applied; n++) await Bun.sleep(5);
+      expect(applied).toBe(true);
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
+      phase = 'Running';
+      for (let n = 0; n < 100 && host.live().length; n++) await Bun.sleep(5);
+      expect(host.live()).toHaveLength(0);
+      phase = 'Complete';
+      await job.done;
+    } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('terminal Job without a Running Pod also releases its host lease', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-lease-'));
+    const host = new HostPoolLease('p', { dir });
+    const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2,
+      status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0 }) });
+    let phase = 'Pending';
+    let applied = false;
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input && JSON.parse(input).kind === 'Job') applied = true;
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: phase === 'Failed' ? 'Failed' : '', stderr: '' };
+      if (args.includes('jsonpath={.items[*].status.phase}')) return { status: 0, stdout: 'Pending', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ pool, kubectl, pollMs: 2, imageCommit: null,
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
+    const controller = new AbortController();
+    try {
+      const job = spawn({ spaceId: 'terminal-before-running', feature: 'f', signal: controller.signal } as Parameters<typeof spawn>[0]);
+      for (let n = 0; n < 100 && !applied; n++) await Bun.sleep(5);
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
+      phase = 'Failed';
+      await job.done;
+      expect(host.live()).toHaveLength(0);
+    } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+  });
   test('pool admission forwards after goal ID and PR number to the dependency gate before reserving a free slot', async () => {
     let merged = false;
     const checked: Array<string | number> = [];
@@ -196,6 +256,72 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     } finally { controller.abort(); await job.done; }
   });
 
+  test('an authored lease transfers to admission and remains held after Job apply until Running observation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-pool-transfer-'));
+    const oldId = process.env.ELANOUS_POD_RESERVED_LEASE;
+    try {
+      const starts: Record<number, string> = { 101: 'parent', [process.pid]: 'child' };
+      const host = new HostPoolLease('p', { dir, processStart: (pid) => starts[pid] ?? null });
+      const parent = new HostPoolLease('p', { dir, pid: 101, processStart: (pid) => starts[pid] ?? null });
+      const reservation = parent.tryReserve((n) => n < 2)!;
+      process.env.ELANOUS_POD_RESERVED_LEASE = reservation.id;
+      const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2, status: () => ({
+        recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0,
+      }) });
+      const release = await pool.acquireAdmission();
+      reservation();
+      expect(host.live()).toHaveLength(1);
+      release.applied('created-job', 'p', 'elanous-test');
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job', job: 'created-job' }));
+      release.observed();
+      expect(host.live()).toHaveLength(0);
+      release();
+    } finally {
+      if (oldId === undefined) delete process.env.ELANOUS_POD_RESERVED_LEASE;
+      else process.env.ELANOUS_POD_RESERVED_LEASE = oldId;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('a Pending Job already counted by cluster status does not consume a second host slot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-pool-pending-'));
+    const starts: Record<number, string> = { 101: 'other', [process.pid]: 'self' };
+    const host = new HostPoolLease('p', { dir, processStart: (pid) => starts[pid] ?? null });
+    const other = new HostPoolLease('p', { dir, pid: 101, processStart: (pid) => starts[pid] ?? null });
+    const pending = other.tryReserve((n) => n < 2)!;
+    pending.applied('pending-job', 'p', 'elanous-test');
+    try {
+      const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2, status: () => ({
+        recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 1, memorySlots: 1, placeableSlots: 1, running: 0, pending: 1,
+        pendingJobs: [{ context: 'p', namespace: 'elanous-test', job: 'pending-job' }],
+      }) });
+      const admitted = await pool.acquireAdmission();
+      expect(host.live()).toHaveLength(2);
+      admitted();
+    } finally { pending(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('an observed same-name Pending Pod in another namespace does not make a foreign Job lease free', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-pool-scoped-pending-'));
+    const starts: Record<number, string> = { 101: 'other', [process.pid]: 'self' };
+    const host = new HostPoolLease('p', { dir, processStart: (pid) => starts[pid] ?? null });
+    const other = new HostPoolLease('p', { dir, pid: 101, processStart: (pid) => starts[pid] ?? null });
+    const lease = other.tryReserve(() => true)!;
+    lease.applied('same-name', 'p', 'other-namespace');
+    const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2, status: () => ({
+      recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+      capacitySlots: 1, memorySlots: 1, placeableSlots: 1, running: 0, pending: 1,
+      pendingJobs: [{ context: 'p', namespace: 'elanous-test', job: 'same-name' }],
+    }) });
+    const controller = new AbortController();
+    try {
+      const waiting = pool.acquireAdmission(controller.signal).then((release) => { release(); return 'admitted'; }, (error: Error) => error.message);
+      await Bun.sleep(12);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
+      controller.abort();
+      expect(await waiting).toBe('pod lease admission aborted');
+    } finally { controller.abort(); lease(); rmSync(dir, { recursive: true, force: true }); }
+  });
   test('a stale free-slot measurement never admits a third Job before a release', async () => {
     const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: 2,
       accountSlots: 100, limitedBy: 'capacity', reason: null, capacitySlots: 3, memorySlots: 3,
