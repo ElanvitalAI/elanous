@@ -1,25 +1,35 @@
-import { streamLLM } from '../llm.js';
+import { PROVIDERS, streamLLM } from '../llm.js';
+import { getUserConfig, resolveRoleLlm, type UserConfig } from '../user-config.js';
 import type { GrowthProposal, GrowthProposer } from './graph-grow.js';
 
 type GrowthLLM = (prompt: string) => Promise<string>;
-const OUTPUT_TAIL_LENGTH = 4000;
+const OUTPUT_TAIL_LENGTH = 2000;
+
+export function graphGrowthLlmOptions(config: UserConfig): { model?: string; provider?: string } {
+  const role = config.roleLlm?.['graph-grow'];
+  if (!role || (!role.provider && !role.model && !role.tier)) return {};
+  const selected = resolveRoleLlm('graph-grow', { config });
+  return { model: selected.model, provider: selected.provider };
+}
+
+async function defaultGrowthLLM(prompt: string): Promise<string> {
+  const selected = graphGrowthLlmOptions(getUserConfig());
+  return streamLLM([{ role: 'user', content: prompt }], () => {}, {
+    ...(selected.model ? { model: selected.model, provider: PROVIDERS[selected.provider!] } : {}),
+    reasoningEffort: 'low',
+  });
+}
 
 /** Model output is untrusted: structural and side-effect validation belongs to proposeGrowth. */
-export function createLLMGrowthProposer(callLLM: GrowthLLM = (prompt) =>
-  streamLLM([{ role: 'user', content: prompt }], () => {}, { reasoningEffort: 'low' })): GrowthProposer {
+export function createLLMGrowthProposer(callLLM: GrowthLLM = defaultGrowthLLM): GrowthProposer {
   return async (input: Parameters<GrowthProposer>[0]) => {
     const serializedOutput = typeof input.output === 'string' ? input.output : input.output === undefined ? '' : JSON.stringify(input.output);
-    const graphSummary = {
-      graphId: input.graph.graphId,
-      nodes: input.graph.nodes.map(({ nodeId, kind, recipe }) => ({ nodeId, kind, recipe })),
-      edges: input.graph.edges.map(({ from, to, on, map, fallback }) => ({ from, ...(to === undefined ? {} : { to }),
-        ...(on === undefined ? {} : { on }), ...(map === undefined ? {} : { map }), ...(fallback === undefined ? {} : { fallback }) })),
-    };
     const prompt = [
-      'Propose exactly one new contracted graph node to handle the unseen outcome, then return to an existing node.',
-      'Reply with only JSON: {"node":{"nodeId":"...","kind":"...","recipe":"none","maxVisits":1,"contract":{"inputs":[],"tools":"read-only","outputs":[]}},"returnTo":"existing-node-id","reason":"..."}.',
+      'Propose exactly one new contracted graph node to handle the unseen outcome and one return edge to an existing node.',
+      'Reply with only JSON: {"node":{"nodeId":"...","kind":"agent","recipe":"none","maxVisits":1,"contract":{"inputs":[],"tools":"read-only","outputs":[]}},"returnTo":"existing-node-id","reason":"..."}.',
+      'Use only an existing recipe type (none, an existing cmd:/approval: recipe ID, or a catalog role); never invent commands. The missing-outcome edge and the return edge are built from node and returnTo after validation.',
       'Do not alter existing nodes or edges. The proposal will be validated independently; do not assume a recipe is safe.',
-      `Graph summary: ${JSON.stringify(graphSummary)}`,
+      `Graph snapshot: ${JSON.stringify(input.graph)}`,
       `Blocked node ID: ${JSON.stringify(input.nodeId)}`,
       `Unseen outcome: ${JSON.stringify(input.outcome)}`,
       `Blocked node output tail: ${JSON.stringify(serializedOutput.slice(-OUTPUT_TAIL_LENGTH))}`,

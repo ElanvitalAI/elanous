@@ -24,7 +24,7 @@ import { debug } from '../debug/log.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
-import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
+import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, decideLaunchBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
@@ -338,6 +338,8 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
 }
 type PodExit = { status: number | null; signal?: string | null };
 type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown';
+/** GitHub lists at most this many files for one pull request; a list that reaches it is not provably complete. */
+export const GITHUB_PR_FILES_LIST_CAP = 3000;
 const STOPPING_SUPERVISOR_VERDICTS = new Set(['UNCONVERGEABLE', 'CONTRACT-CONFLICT']);
 // Ledger events that only exist once the child actually ran — any of them rules out «never reached the Pod».
 const LAUNCH_EVIDENCE_EVENTS = new Set(['job-applied', 'pod-child-run', 'reviewed', 'rework-budget', 'pr-opened']);
@@ -578,8 +580,12 @@ const LAUNCH_BUDGET_PROVIDER: Readonly<Record<string, string>> = { 'codex-rotate
 export function harnessLaunchBudgetDecision(
   inputs: BudgetInputs,
   opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
-): { readonly decision: BudgetDecision; readonly warning?: string } {
+): { readonly decision: BudgetDecision; readonly warning?: string; readonly unmeasuredProvider?: string } {
   const explicit = opts.childLlmProvider?.trim();
+  const judged = (selected: BudgetInputs) => {
+    const { decision, unmeasuredProvider } = decideLaunchBudget(selected);
+    return { decision, ...(unmeasuredProvider ? { unmeasuredProvider, warning: `budget: ${unmeasuredProvider} usage unmeasured — launching` } : {}) };
+  };
   if (explicit) {
     if (explicit !== CODEX_PROVIDER && explicit !== GROK_PROVIDER) {
       return {
@@ -588,13 +594,14 @@ export function harnessLaunchBudgetDecision(
       };
     }
     const chain = [{ provider: explicit, ...(opts.childLlmModel ? { model: opts.childLlmModel } : {}) }];
-    return { decision: decideBudget({ ...inputs, preference: { ...inputs.preference, chain } }) };
+    return judged({ ...inputs, preference: { ...inputs.preference, chain } });
   }
-  if (inputs.preference.chain.length > 0) return { decision: decideBudget(inputs) };
+  if (inputs.preference.chain.length > 0) return judged(inputs);
   const chain = DEFAULT_FALLBACK_CHAIN.map((step) => ({ provider: LAUNCH_BUDGET_PROVIDER[step] ?? step }));
+  const result = judged({ ...inputs, preference: { ...inputs.preference, chain } });
   return {
-    decision: decideBudget({ ...inputs, preference: { ...inputs.preference, chain } }),
-    warning: `budget: no chain in this universe's config — judged with the code default ${DEFAULT_FALLBACK_CHAIN.join(',')}`,
+    ...result,
+    warning: `budget: no chain in this universe's config — judged with the code default ${DEFAULT_FALLBACK_CHAIN.join(',')}${result.warning ? ` · ${result.warning}` : ''}`,
   };
 }
 
@@ -602,10 +609,13 @@ async function readHarnessLaunchBudget(
   opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
 ): Promise<BudgetDecision | 'unknown'> {
   try {
-    const { decision, warning } = harnessLaunchBudgetDecision(await readBudgetInputsLive(), opts);
+    const { decision, warning, unmeasuredProvider } = harnessLaunchBudgetDecision(await readBudgetInputsLive(), opts);
     if (warning) {
       console.error(`⚠️ launch gate: ${warning}`);
-      try { debug.log('execution-loop.launch-gate', 'budget-chain-defaulted', { warning, action: decision.action, provider: decision.provider }); } catch { /* observation is fail-soft */ }
+      try {
+        if (unmeasuredProvider) debug.log('execution-loop.launch-gate', 'budget-unmeasured', { provider: unmeasuredProvider });
+        if (!opts.childLlmProvider?.trim() && warning.includes('code default')) debug.log('execution-loop.launch-gate', 'budget-chain-defaulted', { warning, action: decision.action, provider: decision.provider });
+      } catch { /* observation is fail-soft */ }
     }
     return decision;
   }
@@ -644,8 +654,8 @@ async function dispatchHarnessAskSay(
     }
     goalId ??= launchRequestId(identity);
     // Under bun test with no injected gate deps, skip the live reads (≈5 s of codex rotation + run scans) —
-    // CLI wiring tests time out on them. Gate tests inject deps and still run the gate (0.2.11 gate 10-03).
-    if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0) {
+    // CLI wiring tests time out on them. Gate tests inject deps or opt in with ELANOUS_LAUNCH_GATE_LIVE=1.
+    if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0 && process.env.ELANOUS_LAUNCH_GATE_LIVE !== '1') {
       try { debug.log('execution-loop.launch-gate', 'skipped-test-env', { goalId }); } catch { /* observation is fail-soft */ }
       await dispatch(resolved);
       return;
@@ -1577,10 +1587,13 @@ type GithubPull = {
   draft: boolean;
   state: 'open' | 'closed';
   head: { ref: string };
+  base?: { ref: string };
   labels: Array<{ name: string }>;
   created_at: string;
   updated_at?: string;
   merged_at: string | null;
+  body?: string | null;
+  merge_commit_sha?: string | null;
 };
 
 type GhExecute = (args: string[]) => string;
@@ -1629,7 +1642,23 @@ export function draftSweepRunStatus(ledgerMatches: readonly RunLedgerMatch[], ru
       ['completed', 'failed', 'cancelled', 'abandoned'].includes(terminal) ? terminal : undefined);
     if (status && status !== 'unknown') statuses.add(status);
   }
+  if (statuses.has('running')) return 'running';
+  if (statuses.has('probable-running')) return 'probable-running';
   return statuses.size === 1 ? [...statuses][0] : undefined;
+}
+
+function currentDraftSweepRunId(matches: readonly RunLedgerMatch[], repository: string, number: number): string | undefined {
+  const owners = matches.flatMap((match) => {
+    const events = match.entries.filter((entry) => entry.event === 'pr-opened' && entry.data.number === number);
+    if (events.length === 0 || events.some((entry) => ledgerPrRepository(entry.data, number) !== repository)) return [];
+    const times = events.map((entry) => Date.parse(entry.timestamp ?? ''));
+    return [{ runId: match.runId, time: times.every(Number.isFinite) ? Math.max(...times) : NaN }];
+  });
+  if (owners.length === 1) return owners[0]!.runId;
+  if (owners.some((owner) => !Number.isFinite(owner.time))) return undefined;
+  owners.sort((a, b) => b.time - a.time);
+  if (owners.length > 1 && owners[0]!.time === owners[1]!.time) return undefined;
+  return owners[0]?.runId;
 }
 
 type DraftSweepGitExecute = (cwd: string, args: string[]) => Pick<ReturnType<typeof runGitCommand>, 'status' | 'stdout' | 'stderr'>;
@@ -1669,24 +1698,117 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     if (!cache.has(repository)) cache.set(repository, inventory(repository, state));
     return cache.get(repository)!;
   };
+  // GitHub stops listing a pull request's files at 3,000, and the cut looks like a normal last page.
+  // A list that reaches the cap cannot prove it is complete, so it is reported as unknown (undefined):
+  // a draft without a provable file list never qualifies for the all-files-landed close.
+  const filesFor = (repository: string, number: number): string[] | undefined => {
+    const files: string[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const batch = ghJson<Array<{ filename: string }>>(['api', `repos/${repository}/pulls/${number}/files?per_page=100&page=${page}`], execute);
+      if (!Array.isArray(batch) || batch.length > 100 || batch.some((file) => typeof file.filename !== 'string')) throw new Error('Incomplete PR file inventory');
+      files.push(...batch.map((file) => file.filename));
+      if (files.length >= GITHUB_PR_FILES_LIST_CAP) {
+        debug.log('drafts.cleanup', 'file-inventory-capped', { number, listed: files.length });
+        return undefined;
+      }
+      if (batch.length < 100) return files;
+    }
+    throw new Error('PR file inventory exceeded pagination limit');
+  };
+  const latestFileChangesFor = (draft: SweepDraft, repository: string): Record<string, string> | undefined => {
+    if (!draft.changedFiles?.length) return undefined;
+    const changes: Record<string, string> = {};
+    for (let page = 1; page <= 100; page++) {
+      const batch = ghJson<Array<{ sha: string; commit: { committer: { date: string } } }>>(
+        ['api', `repos/${repository}/pulls/${draft.number}/commits?per_page=100&page=${page}`], execute);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete draft commit inventory');
+      for (const commit of batch) {
+        const changedAt = commit.commit?.committer?.date;
+        if (!commit.sha || !changedAt || !Number.isFinite(Date.parse(changedAt))) return undefined;
+        const detail = ghJson<{ files?: Array<{ filename: string; previous_filename?: string }> }>(
+          ['api', `repos/${repository}/commits/${commit.sha}?per_page=100`], execute);
+        // GitHub truncates very large commit file lists; never infer coverage from a partial list.
+        if (!Array.isArray(detail.files) || detail.files.length >= 100) return undefined;
+        for (const file of detail.files) {
+          for (const name of [file.filename, file.previous_filename]) {
+            if (!name || !draft.changedFiles.includes(name)) continue;
+            if (!changes[name] || Date.parse(changes[name]) < Date.parse(changedAt)) changes[name] = changedAt;
+          }
+        }
+      }
+      if (batch.length < 100) return draft.changedFiles.every((file) => changes[file]) ? changes : undefined;
+    }
+    return undefined;
+  };
+  const landingCommentsFor = (repository: string, number: number): string[] => {
+    const comments: string[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const batch = ghJson<Array<{ body?: string }>>(['api', `repos/${repository}/issues/${number}/comments?per_page=100&page=${page}`], execute);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete landing comment inventory');
+      comments.push(...batch.filter((comment) => /\blanding-verified\b/i.test(comment.body ?? '')).map((comment) => comment.body!));
+      if (batch.length < 100) return comments;
+    }
+    throw new Error('Landing comment inventory exceeded pagination limit');
+  };
   let ledgerMatches: readonly RunLedgerMatch[] | undefined;
   let running: ReadonlyMap<string, string> | undefined;
-  const runStatusFor = (repository: string, number: number): string | undefined => {
+  const runStatusFor = (draft: SweepDraft, repository: string): string | undefined => {
     ledgerMatches ??= listRunLedgers().matches;
     running ??= new Map(queryRunningRuns().entries.map((entry) => [entry.runId, entry.status]));
-    return draftSweepRunStatus(ledgerMatches, running, repository, number);
+    if (draft.runId) {
+      const match = ledgerMatches.find((entry) => entry.runId === draft.runId);
+      return match ? draftSweepRunStatus([match], running, repository, draft.number) : undefined;
+    }
+    return draftSweepRunStatus(ledgerMatches, running, repository, draft.number);
   };
   return {
     listDrafts: async (page, perPage, repository): Promise<SweepDraft[]> =>
       (await listed(open, repository, 'open')).filter((pr) => pr.draft)
         .slice((page - 1) * perPage, page * perPage)
         .map((pr) => ({ number: pr.number, title: pr.title, branch: pr.head.ref,
-          labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}) })),
+          labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, body: pr.body ?? undefined,
+          changedFiles: filesFor(repository, pr.number), ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}),
+          runId: currentDraftSweepRunId(ledgerMatches ??= listRunLedgers().matches, repository, pr.number) })),
     listMerged: async (page, perPage, repository): Promise<SweepMergedPr[]> =>
-      (await listed(closed, repository, 'closed')).filter((pr) => pr.merged_at !== null)
+      (await listed(closed, repository, 'closed')).filter((pr) => pr.merged_at !== null && pr.base?.ref === 'main')
         .slice((page - 1) * perPage, page * perPage)
-        .map((pr) => ({ number: pr.number, title: pr.title, branch: pr.head.ref })),
-    getRunStatus: async (draft, repository) => runStatusFor(repository, draft.number),
+        .map((pr) => ({ number: pr.number, title: pr.title, branch: pr.head.ref, body: pr.body ?? undefined,
+          mergedAt: pr.merged_at ?? undefined, changedFiles: filesFor(repository, pr.number),
+          mergeCommitMessage: pr.merge_commit_sha ? ghJson<{ commit: { message: string } }>(
+            ['api', `repos/${repository}/commits/${pr.merge_commit_sha}`], execute).commit.message : undefined,
+          landingVerifiedComments: landingCommentsFor(repository, pr.number) })),
+    getRunStatus: async (draft, repository) => runStatusFor(draft, repository),
+    getLatestFileChanges: async (draft, repository) => latestFileChangesFor(draft, repository),
+    hasFinalRunResult: async (draft, repository) => {
+      ledgerMatches ??= listRunLedgers().matches;
+      const ownedRuns = new Set(ledgerMatches.filter((match) => {
+        const prEvents = match.entries.filter((entry) => entry.event === 'pr-opened' && entry.data.number === draft.number);
+        return prEvents.length > 0 && prEvents.every((entry) => ledgerPrRepository(entry.data, draft.number) === repository);
+      }).map((match) => match.runId));
+      if (ownedRuns.size === 0) return false;
+      // A previous owner's final does not establish finality for a later owner of this PR.
+      if (draft.runId && !ownedRuns.has(draft.runId)) return false;
+      if (!draft.runId && ownedRuns.size > 1) return false;
+      const currentOwners = draft.runId ? new Set([draft.runId]) : ownedRuns;
+      const path = logsDbPath();
+      if (!existsSync(path)) return false;
+      const store = LogStore.openReadOnly(path);
+      try {
+        let beforeId: number | undefined;
+        for (;;) {
+          const rows = store.query({ exactCategories: ['self-implement.result'], events: ['final'], grep: String(draft.number),
+            limit: 1_000, ...(beforeId === undefined ? {} : { beforeId }) });
+          for (const row of rows) {
+            try {
+              const data = JSON.parse(row.data ?? '{}') as { runId?: string; prNumber?: number };
+              if (data.prNumber === draft.number && data.runId && currentOwners.has(data.runId)) return true;
+            } catch { /* A malformed result cannot establish finality. */ }
+          }
+          if (rows.length < 1_000) return false;
+          beforeId = rows.at(-1)!.id;
+        }
+      } finally { store.close(); }
+    },
     listLiveBranches: async (repository) => {
       const cwd = process.cwd();
       const remote = git(cwd, ['config', '--get', 'remote.origin.url']);

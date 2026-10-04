@@ -23,7 +23,9 @@ import { forkConversation, userTurns } from './chat-fork';
 import { SessionsStoreApi } from './sessions-store-api';
 import { debugLog } from './debug';
 import { fetchBudgetStatus, type BudgetStatusBody } from './budget-status';
-import type { DaemonHttpConfig } from './model-tier-sync';
+import { remainingLines, statusText, type UsageBody } from './chat-status';
+import { fetchDaemonModelTier, type DaemonHttpConfig } from './model-tier-sync';
+import { isLlmTierProvider, lookupLlmTierSpec } from './model-tier-spec';
 import { handleModelCommand, parseModelCommand } from './chat-model-commands';
 import { handleSessionCommand, parseSessionCommand } from './chat-session-commands';
 import { harnessAskText } from './chat-harness-ask';
@@ -408,6 +410,74 @@ const HISTORY_DEFAULT_N = 10;
 const HISTORY_PREVIEW_CHARS = 80;
 const EMPTY_HISTORY_TEXT = '아직 대화가 없습니다';
 const BUDGET_UNREAD_TEXT = '예산 상태를 읽지 못했습니다';
+const USAGE_UNREAD_TEXT = '남은 양을 읽지 못했습니다';
+interface PendingWish {
+  id: string;
+  baseUrl: string;
+  sessionId: string;
+  text: string;
+  ref: string;
+}
+
+const WISH_PENDING_PREFIX = 'elanous:wish:pending:';
+
+function pendingWish(id: string): PendingWish | undefined {
+  if (!/^[0-9a-f-]{36}$/.test(id)) return undefined;
+  const raw = localStorage.getItem(`${WISH_PENDING_PREFIX}${id}`);
+  if (!raw) return undefined;
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== 'object') return undefined;
+  const wish = value as Record<string, unknown>;
+  if (wish.id !== id || typeof wish.baseUrl !== 'string' || typeof wish.sessionId !== 'string'
+    || typeof wish.text !== 'string' || typeof wish.ref !== 'string'
+    || !wish.ref.startsWith(`${wish.sessionId}:`) || !wish.ref.endsWith(`:${id}`)) return undefined;
+  return { id, baseUrl: wish.baseUrl, sessionId: wish.sessionId, text: wish.text, ref: wish.ref };
+}
+
+function pendingWishes(baseUrl: string, sessionId: string): PendingWish[] {
+  const wishes: PendingWish[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(WISH_PENDING_PREFIX)) continue;
+    try {
+      const wish = pendingWish(key.slice(WISH_PENDING_PREFIX.length));
+      if (wish?.baseUrl === baseUrl && wish.sessionId === sessionId) wishes.push(wish);
+    } catch { /* A corrupt entry does not hide other pending wishes. */ }
+  }
+  return wishes;
+}
+
+async function fetchChatStatusJson(cfg: DaemonHttpConfig | undefined, path: string): Promise<unknown | null> {
+  if (!cfg?.baseUrl) return null;
+  try {
+    const res = await fetch(`${cfg.baseUrl.replace(/\/$/, '')}${path}`, {
+      headers: cfg.token ? { authorization: `Bearer ${cfg.token}` } : {},
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readUsage(cfg: DaemonHttpConfig | undefined): Promise<UsageBody | undefined> {
+  const body = await fetchChatStatusJson(cfg, '/v1/usage');
+  if (!body || typeof body !== 'object' || !('ok' in body) || body.ok !== true
+    || !('rows' in body) || !Array.isArray(body.rows)) return undefined;
+  return body as UsageBody;
+}
+
+async function readCurrentModel(cfg: DaemonHttpConfig | undefined, provider: string): Promise<{ provider: string; model?: string }> {
+  const [selection, tier] = await Promise.all([
+    fetchChatStatusJson(cfg, '/v1/setup/llm-providers'),
+    cfg?.baseUrl ? fetchDaemonModelTier(cfg) : null,
+  ]);
+  const active = selection && typeof selection === 'object' && 'activeProvider' in selection
+    && typeof selection.activeProvider === 'string' && selection.activeProvider
+    ? selection.activeProvider : provider;
+  return { provider: active,
+    ...(selection && isLlmTierProvider(active) && tier?.llm
+      ? { model: lookupLlmTierSpec(active, tier.llm).model } : {}) };
+}
 
 export function formatBudgetLine(body: BudgetStatusBody): string {
   const usd = Number.isFinite(body.monthSoFarUsd) ? body.monthSoFarUsd : 0;
@@ -428,6 +498,8 @@ export function formatHistoryLines(
 export const META_COMMANDS: readonly { name: string; description: string }[] = [
   { name: 'help', description: '이 도움말 보기' },
   { name: 'session', description: '현재 대화 ID 보기' },
+  { name: 'remaining', description: '계정별 남은 양과 초기화 시각 보기' },
+  { name: 'status', description: '현재 대화·모델·데몬 판·남은 양 보기' },
   { name: 'fork', description: '현재 대화를 복사해 새 대화로 분기' },
   { name: 'rewind', description: 'N개 사용자 턴 이전으로 분기 (/rewind N)' },
   { name: 'undo', description: '마지막 사용자 턴 이전으로 분기' },
@@ -439,9 +511,10 @@ export const META_COMMANDS: readonly { name: string; description: string }[] = [
   { name: 'model', description: '모델 티어 보기·바꾸기 (/model <티어|별칭>)' },
   { name: 'reasoning', description: '추론 단계 보기·설정 안내 (/reasoning <low|medium|high>)' },
   { name: 'provider', description: '프로바이더 보기·바꾸기 (/provider next|use <이름>)' },
+  { name: 'wish', description: '소원을 카드로 남기기 (:wish <소원 한 줄> · :wish --pending · :wish --retry <작업 ID>)' },
 ];
 
-const LOCAL_META_NAMES = ['help', 'session', 'fork', 'budget', 'history', 'clear'] as const;
+const LOCAL_META_NAMES = ['help', 'session', 'fork', 'budget', 'history', 'clear', 'wish'] as const;
 const HELP_TEXT = [
   '메타 명령(:이름 또는 /이름) (Meta commands):',
   ...META_COMMANDS.map(({ name, description }) => `  ${(LOCAL_META_NAMES as readonly string[]).includes(name) ? ':' : '/'}${name.padEnd(16)}${description}`),
@@ -450,7 +523,7 @@ const HELP_TEXT = [
 // TUI src/chat/index.ts SLASH_COMMANDS names + aliases (not imported into the PWA bundle).
 // Recheck: bun test apps/pwa/src/lib/chat-runtime.meta.test.ts -t 'keeps the local TUI-name snapshot'
 const TUI_SLASH_NAMES = new Set([
-  'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now',
+  'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now', 'wish',
   'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
   'ad', 'design', 'design-check',
   'local', 'll', 'session', 'sess', 'fork', 'rewind', 'mission',
@@ -468,7 +541,7 @@ const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = { m: 'model', r: 're
 const UNSUPPORTED_TUI_SLASH_NAMES = new Set([...TUI_SLASH_NAMES].filter((name) =>
   name !== 'harness' && !META_COMMANDS.some((command) => command.name === name),
 ));
-const LEGACY_META_SLASH_NAMES = LOCAL_META_NAMES.map((name) => `/${name}`).join(' ');
+const LEGACY_META_SLASH_NAMES = LOCAL_META_NAMES.filter((name) => name !== 'wish').map((name) => `/${name}`).join(' ');
 
 async function forkFromCommand(
   command: 'fork' | 'rewind' | 'undo',
@@ -527,6 +600,24 @@ export const META_HANDLERS: Record<
 > = {
   ':help': async () => ({ text: HELP_TEXT }),
   ':session': async (_args, ctx) => ({ text: `session = ${ctx.sessionId}` }),
+  ':remaining': async (_args, ctx) => {
+    const usage = await readUsage(ctx.daemon);
+    const lines = usage ? remainingLines(usage) : [];
+    const ok = usage !== undefined;
+    debugLog('webterm.chat.status', { cmd: 'remaining', rows: lines.length, ok });
+    return { text: ok ? (lines.length ? lines.join('\n') : '등록된 계정이 없습니다') : USAGE_UNREAD_TEXT };
+  },
+  ':status': async (_args, ctx) => {
+    const [health, usage, selected] = await Promise.all([
+      fetchChatStatusJson(ctx.daemon, '/v1/health'), readUsage(ctx.daemon), readCurrentModel(ctx.daemon, ctx.provider),
+    ]);
+    const version = health && typeof health === 'object' && 'nexusVersion' in health
+      && typeof health.nexusVersion === 'string' ? health.nexusVersion : undefined;
+    const lines = usage ? remainingLines(usage) : [];
+    debugLog('webterm.chat.status', { cmd: 'status', rows: lines.length, ok: !!version || usage !== undefined });
+    return { text: statusText({ sessionId: ctx.sessionId, ...selected,
+      ...(version ? { version } : {}), ...(usage ? { usage } : {}) }) };
+  },
   ':fork': async () => {
     const id = forkSession();
     return { text: `forked → new session ${id}`, newSessionId: id };
@@ -551,6 +642,52 @@ export const META_HANDLERS: Record<
   ':model': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('model', args), ctx) }),
   ':reasoning': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('reasoning', args), ctx) }),
   ':provider': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('provider', args), ctx) }),
+  ':wish': async (args, ctx) => {
+    const text = args.join(' ').trim();
+    if (!text) return { text: ':wish <소원 한 줄>' };
+    const cfg = ctx.daemon;
+    if (!cfg?.baseUrl) return { text: '소원 카드 저장 실패 — 데몬 연결이 없습니다' };
+    const baseUrl = cfg.baseUrl.replace(/\/$/, '');
+    let wish: PendingWish;
+    try {
+      if (text === '--pending') {
+        const pending = pendingWishes(baseUrl, ctx.sessionId);
+        return { text: pending.length
+          ? pending.map(({ id, text: pendingText }) => `${id} — ${pendingText}`).join('\n')
+          : '재시도할 소원이 없습니다' };
+      }
+      if (text.startsWith('--retry ')) {
+        const id = text.slice('--retry '.length).trim();
+        const saved = pendingWish(id);
+        if (!saved || saved.baseUrl !== baseUrl || saved.sessionId !== ctx.sessionId) {
+          return { text: '소원 카드 저장 실패 — 재시도할 작업을 찾을 수 없습니다' };
+        }
+        wish = saved;
+      } else {
+        const id = crypto.randomUUID();
+        wish = { id, baseUrl, sessionId: ctx.sessionId, text,
+          ref: `${ctx.sessionId}:${Date.now()}:${id}` };
+        // Persist before sending: a committed request can lose its response or be interrupted by reload.
+        localStorage.setItem(`${WISH_PENDING_PREFIX}${id}`, JSON.stringify(wish));
+      }
+    } catch (error) {
+      return { text: `소원 카드 저장 실패 — 작업 보존 불가: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    try {
+      const res = await fetch(`${baseUrl}/v1/task-cards/wish`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(cfg.token ? { authorization: `Bearer ${cfg.token}` } : {}) },
+        body: JSON.stringify({ text: wish.text, ref: wish.ref }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const card: unknown = await res.json();
+      if (!card || typeof card !== 'object' || !('title' in card) || typeof card.title !== 'string') throw new Error('잘못된 응답');
+      localStorage.removeItem(`${WISH_PENDING_PREFIX}${wish.id}`);
+      return { text: `소원 카드로 남겼습니다 — ${card.title}` };
+    } catch (error) {
+      return { text: `소원 카드 저장 실패 — ${error instanceof Error ? error.message : String(error)} · 재시도: :wish --retry ${wish.id}` };
+    }
+  },
 };
 
 // The existing command catalog is also the legacy help snapshot; keep its enumeration stable.

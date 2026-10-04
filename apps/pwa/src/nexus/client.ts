@@ -157,6 +157,8 @@ export interface NexusClient {
   // ---- workflows (Archon-port T2.3) ----
   getWorkflows(): Promise<{ workflows: WorkflowSummary[] }>;
   getWorkflow(name: string): Promise<WorkflowDetail>;
+  getWorkflowHistory(name: string): Promise<WorkflowHistoryResponse>;
+  getWorkflowHistoryVersion(name: string, id: string): Promise<WorkflowHistoryVersionResponse>;
   getWorkflowPins(name: string): Promise<WorkflowPinsResponse>;
   putWorkflowPin(name: string, nodeId: string, value: unknown, note?: string): Promise<WorkflowPinResponse>;
   deleteWorkflowPin(name: string, nodeId: string): Promise<{ workflow: string; removed: number }>;
@@ -236,6 +238,9 @@ export interface NexusClient {
   // ---- /settings PersonaCard (Phase 3 · 2026-05-19) ----
   /** §6.4 (existing) — list loaded personas + descriptions. */
   getPersonas(): Promise<PersonasListResponse>;
+  getPersonaPresets(): Promise<PersonaPresetsResponse>;
+  createPersona(body: CreatePersonaBody): Promise<PersonaPatchResponse>;
+  patchPersona(id: string, edits: PersonaEdits): Promise<PersonaPatchResponse>;
   /** Phase 3 — update description for a single persona. Surgical yaml
    *  edit (comments/custom keys preserved). Empty string clears. */
   patchPersonaDescription(
@@ -391,6 +396,20 @@ export interface WorkflowDetail {
     nodes: Array<{ id: string; depends_on?: string[]; [variantKey: string]: unknown }>;
     [topKey: string]: unknown;
   };
+}
+
+export interface WorkflowHistoryVersion {
+  id: string;
+  createdAt: string;
+  size: number;
+}
+
+export interface WorkflowHistoryResponse {
+  versions: WorkflowHistoryVersion[];
+}
+
+export interface WorkflowHistoryVersionResponse {
+  yaml: string;
 }
 
 export interface WorkflowPinEntry {
@@ -655,6 +674,26 @@ export interface PersonasListResponse {
 export interface PersonaPatchResponse {
   persona: PersonaWireEntry;
 }
+
+export interface PersonaPresetEntry {
+  personaId: string;
+  displayName: string;
+  names: string[];
+  role: string;
+  title?: string | null;
+  oneLine: string;
+  voice: { rule: string; examples: string[] };
+  tasks: Array<{ when: string; what: string }>;
+  tools: Array<{ name: string; from: string; optional?: boolean }>;
+  firstQuestions: string[];
+  askBefore?: string[];
+  doesNot: string[];
+  forWhom: string;
+}
+
+export interface PersonaPresetsResponse { presets: PersonaPresetEntry[] }
+export interface CreatePersonaBody { preset: string; name: string }
+export interface PersonaEdits { displayName?: string; description?: string; systemPrompt?: string }
 
 // BACKLOG #2 — GET /v1/platforms wire format. Mirrors
 // `src/nexus/api/platforms.ts:PlatformEntry`. Server never returns
@@ -1244,6 +1283,8 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     // ---- workflows (Archon-port T2.3) ----
     getWorkflows: () => request('GET', '/v1/workflows'),
     getWorkflow: (name) => request('GET', `/v1/workflows/${encodeURIComponent(name)}`),
+    getWorkflowHistory: (name) => request<WorkflowHistoryResponse>('GET', `/v1/workflows/${encodeURIComponent(name)}/history`),
+    getWorkflowHistoryVersion: (name, id) => request<WorkflowHistoryVersionResponse>('GET', `/v1/workflows/${encodeURIComponent(name)}/history/${encodeURIComponent(id)}`),
     getWorkflowPins: (name) => request('GET', `/v1/workflows/${encodeURIComponent(name)}/pins`),
     putWorkflowPin: (name, nodeId, value, note) => request('PUT', `/v1/workflows/${encodeURIComponent(name)}/pins/${encodeURIComponent(nodeId)}`, {
       value,
@@ -1303,6 +1344,9 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     setAnswerPriority: (value) => request<{ value: AnswerPriorityValue }>('POST', '/v1/setup/answer-priority', { value }),
     // ---- /settings PersonaCard (Phase 3 · 2026-05-19) ----
     getPersonas: () => request<PersonasListResponse>('GET', '/v1/personas'),
+    getPersonaPresets: () => request<PersonaPresetsResponse>('GET', '/v1/persona-presets'),
+    createPersona: (body) => request<PersonaPatchResponse>('POST', '/v1/personas', body),
+    patchPersona: (id, edits) => request<PersonaPatchResponse>('PATCH', `/v1/personas/${encodeURIComponent(id)}`, edits),
     patchPersonaDescription: (personaId, description) =>
       request<PersonaPatchResponse>(
         'PATCH',

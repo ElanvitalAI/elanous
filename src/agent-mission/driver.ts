@@ -22,8 +22,10 @@ import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { emitPtyDecision, type DecisionInput } from './pty-decision.js';
 import { observeExternalEvent } from '../context-bus/external-events.js';
+import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
+import { verdictForFinalPtyScreen } from '../cli/pty-drive-verdict.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
 import type { FallbackStep } from '../oauth/fallback-chain.js';
@@ -451,6 +453,8 @@ export interface AgentMissionSpec {
   evidence: EvidenceMode;
   /** RFC 최대 라운드(기본 16). */
   maxRounds?: number;
+  /** 화면 무변화 회복 문턱(ms, 기본 45초). */
+  recoverAfterMs?: number;
   /** 완료 시 자동 commit(기본 true). */
   commit?: boolean;
   /** 스크린 캡처 저장 디렉토리. */
@@ -538,6 +542,12 @@ export interface AgentMissionDeps {
   checkEvidence?: typeof checkEvidence;
   commitWorktree?: typeof commitWorktree;
   dispatchOpenPullRequest?: typeof dispatchOpenPullRequest;
+  /** Optional context-journal sink for isolated missions. */
+  emitContextEvent?: (input: SessionEventInput) => void;
+  /** Internal continuation retains the original mission's context-event owner. */
+  contextEventRun?: boolean;
+  /** Carries a PR number back to the outer mission's context event. */
+  onMissionPrNumber?: (number: number) => void;
   terminateProcessTree?: typeof terminateMissionProcessTree;
   repoStatus?: (repo: string) => string | Promise<string>;
   emitDecision?: typeof emitDecision;
@@ -835,18 +845,36 @@ export interface MissionControlBrainOpts {
   /** Screen-grounded brain summary for the next backend, never the raw PTY screen. */
   readonly onSummary?: (summary: string) => void;
   readonly onDecision?: (text: string, reply?: { question: string; answer: string }) => void;
+  readonly recoverAfterMs?: number;
+  readonly initialCommand?: string;
+  readonly onRecover?: (blocked: string, action: string) => void;
 }
 
 /** 기존 5-action mission 판단을 canonical PTY control-loop 결정으로 축소한다. search는 이 경계에서만
  * 부작용(context 기록)을 끝내고, child에는 context를 읽고 계속하라는 단일 input만 전달한다. */
-export function createMissionControlBrain(opts: MissionControlBrainOpts): RunSupervisor {
+export type MissionControlBrain = RunSupervisor & {
+  /** Report whether the last returned input was accepted by the PTY; recovery stages and events commit only on acceptance. */
+  readonly onInputResult: (text: string, accepted: boolean) => void;
+};
+
+export function createMissionControlBrain(opts: MissionControlBrainOpts): MissionControlBrain {
   const history: string[] = [];
   const backendName = (opts.backend ?? codexBackend).name;
   // ★ P4 dedup(제한적 재시도·리뷰) — (layer:spec)별 시도횟수. 성공 시 영구 차단, 실패는 최대 2회까지
   //   허용(일시 네트워크/프로세스 오류는 재시도, 지속 실패는 루프 차단).
   const provisionAttempts = new Map<string, number>();
   const PROVISION_MAX_ATTEMPTS = 2;
-  return createLlmControlBrain({
+  const recoverAfterMs = opts.recoverAfterMs ?? 45_000;
+  if (!Number.isFinite(recoverAfterMs) || recoverAfterMs <= 0) throw new Error('recoverAfterMs must be positive');
+  let lastScreen: string | undefined;
+  let repeatedQuestion = 0;
+  let lastQuestion: string | undefined;
+  let recoveryStage = 0;
+  let pendingReplayBlocked: string | undefined;
+  // The recovery input returned by the last decide(); committed (stage advance + event) only when the PTY accepts it.
+  let pendingRecovery: { blocked: string; action: string; text: string; replay?: boolean } | undefined;
+  let lastCommand = opts.initialCommand ?? opts.mission;
+  const llmBrain = createLlmControlBrain({
     goal: opts.mission,
     stream: opts.stream,
     maxTokens: 500,
@@ -887,7 +915,10 @@ ${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/c
       if (decision.reason && decision.action !== 'ask-human') opts.onSummary?.(decision.reason.slice(0, 2000));
       if (decision.action === 'handoff' && decision.to && decision.mission) return { action: 'handoff', to: decision.to, mission: decision.mission, ...(decision.carry ? { carry: decision.carry } : {}) };
       if (decision.action === 'ask-human') return { action: 'ask-human', reason: decision.reason, ...(decision.url ? { url: decision.url } : {}), ...(decision.code ? { code: decision.code } : {}) };
-      if (decision.action === 'send') return { action: 'input', text: `${decision.text || 'continue'}\r` };
+      if (decision.action === 'send') {
+        lastCommand = decision.text || 'continue';
+        return { action: 'input', text: `${lastCommand}\r` };
+      }
       if (decision.action === 'verify' || decision.action === 'done') return { action: 'done', reason: decision.reason || 'agent completed' };
       if (decision.action === 'search') {
         await opts.search(decision.query || opts.mission.slice(0, 120), obs.step);
@@ -922,6 +953,57 @@ ${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/c
       return { action: 'wait' };
     },
   });
+  return {
+    onInputResult: (text, accepted) => {
+      const recovery = pendingRecovery;
+      // Only the input this brain returned settles its recovery step (a trust answer in between does not).
+      if (!recovery || recovery.text !== text) return;
+      pendingRecovery = undefined;
+      if (!accepted) return;
+      if (recovery.replay) { pendingReplayBlocked = undefined; opts.onRecover?.(recovery.blocked, recovery.action); return; }
+      recoveryStage += 1;
+      if (recovery.action === 'Ctrl-C and replay previous command') pendingReplayBlocked = recovery.blocked;
+      else opts.onRecover?.(recovery.blocked, recovery.action);
+    },
+    decide: async (obs, signal) => {
+      pendingRecovery = undefined;
+      if (signal?.aborted) return { action: 'wait' };
+      const lines = classifierFrameLines(obs.screen);
+      // Only the active bottom line can be a repeated prompt; a question left in
+      // scrollback while new work appears is not a request for input.
+      const tail = lines.at(-1);
+      const question = tail && /\?(?:\s*\[[^\]\r\n]+\])?\s*$/.test(tail) ? tail : undefined;
+      const screenChanged = lastScreen !== undefined && obs.screen !== lastScreen;
+      if (screenChanged) recoveryStage = 0;
+      repeatedQuestion = question ? (!screenChanged && question === lastQuestion ? repeatedQuestion + 1 : 1) : 0;
+      lastQuestion = question;
+      lastScreen = obs.screen;
+      if (pendingReplayBlocked !== undefined) {
+        // Ctrl-C consumes its own step; replay on the next observation even when the
+        // interrupted child keeps redrawing a non-prompt screen. A rejected replay is retried.
+        const text = `${lastCommand}\r`;
+        pendingRecovery = { blocked: pendingReplayBlocked, action: 'Ctrl-C and replay previous command', text, replay: true };
+        return { action: 'input', text };
+      }
+      const blocked = repeatedQuestion >= 3 ? `same question repeated three times: ${question}`
+        : (obs.sameScreenMs ?? 0) >= recoverAfterMs ? `screen unchanged for ${obs.sameScreenMs}ms` : undefined;
+      if (blocked && opts.evidenceReady()) return { action: 'done', reason: 'Evidence ready on stalled screen' };
+      if (blocked && !signal?.aborted) {
+        const action = ['Enter', 'Esc', 'Ctrl-C and replay previous command', 'Human needed'] as const;
+        const next = action[Math.min(recoveryStage, 3)]!;
+        if (next !== 'Human needed') {
+          const text = next === 'Enter' ? '\r' : next === 'Esc' ? '\x1b' : '\x03';
+          pendingRecovery = { blocked, action: next, text };
+          return { action: 'input', text };
+        }
+        recoveryStage += 1;
+        opts.onRecover?.(blocked, next);
+        const summary = lines.slice(-3).join(' | ').slice(0, 240) || '(empty screen)';
+        return { action: 'no-progress', terminal: true, reason: `사람 필요 · 마지막 화면 요약: ${summary}` };
+      }
+      return llmBrain.decide(obs, signal);
+    },
+  };
 }
 
 /**
@@ -1273,6 +1355,21 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     } finally { signal?.removeEventListener('abort', stopWaiting); }
   }
   const startedAt = Date.now();
+  const contextOwner = !deps.contextEventRun;
+  const contextRunId = contextOwner ? ensureRunId() : undefined;
+  let contextPrNumber: number | undefined;
+  const emitContext = (kind: 'task-claimed' | 'task-done', detail: string): void => {
+    if (!contextOwner) return;
+    try {
+      (deps.emitContextEvent ?? emitSessionEvent)({ kind, seat: 'TC', text: `Agent mission ${detail}: ${spec.mission.split(/\r?\n/, 1)[0]}`,
+        ref: `runId=${contextRunId}${contextPrNumber === undefined ? '' : ` PR=#${contextPrNumber}`}` });
+    } catch (error) {
+      try { debug.log('agent-mission', 'context-event-failed', { kind, runId: contextRunId, error: String(error) }, { level: 'warn' }); } catch { /* fail-soft */ }
+    }
+  };
+  emitContext('task-claimed', 'claimed');
+  let result: AgentMissionResult | undefined;
+  try {
   const initialFiles = workdir && spec.evidence.kind === 'doc' ? initialEvidenceFiles(workdir, spec.evidence) : undefined;
   let handle: PtyHandle | undefined;
   let childPid: number | undefined;
@@ -1306,10 +1403,12 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   });
   signal?.addEventListener('abort', abort, { once: true });
   if (signal?.aborted) abort();
-  let result: AgentMissionResult;
   try {
     if (cancelled) await aborted;
-    const body = runAgentMissionBody(spec, { ...deps, onControlActive: (pending) => {
+    const body = runAgentMissionBody(spec, { ...deps, contextEventRun: true, onMissionPrNumber: (number) => {
+      contextPrNumber = number;
+      try { deps.onMissionPrNumber?.(number); } catch { /* context propagation never changes a mission result */ }
+    }, onControlActive: (pending) => {
       activeSettled = false;
       activeControl = pending.then(() => { activeSettled = true; }, () => { activeSettled = true; });
     }, onControlPending: (pending) => {
@@ -1377,10 +1476,12 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     if (paths.length) {
       debug.log('agent-mission', 'outside-write', { workdir, pids: [], reason: paths.join(', ') });
       (deps.emitDecision ?? emitDecision)({ kind: 'ESCALATE', what: '작업 폴더 밖 쓰기', reason: paths.join(', '), purpose: '사람이 확인한다', target: 'human' });
-      return { ...result, ok: false, reason: 'outside-write', paths, committed: false };
+      result = { ...result, ok: false, reason: 'outside-write', paths, committed: false };
+      return result;
     }
   }
   return result;
+  } finally { emitContext('task-done', result?.ok ? 'completed' : 'ended'); }
 }
 
 async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDeps, startedAt: number, initialFiles?: ReadonlyMap<string, string>): Promise<AgentMissionResult> {
@@ -1779,6 +1880,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   // 미션 전송 — 인핸싱/기억으로 가공됐으면(멀티라인) 파일로 떨궈 read 지시(TUI 멀티라인 위험·verbatim 보존).
   //   원문 그대로면(단문) 타이핑.
+  let submittedCommand = spec.mission;
+  const submittedInputs: string[] = [];
   if (missionText !== spec.mission) {
     const pf = join(wt.path, '.mission-prompt.md');
     try { writeFileSync(pf, missionText); } catch { /* noop */ }
@@ -1786,9 +1889,12 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       ? '.mission-prompt.md 파일을 읽고 그 안의 미션을 완수하라. [elanous 인핸싱]의 커버리지 체크리스트 모든 항목을 산출물에 빠짐없이 반영하고(요약·일반화 금지), 완료하면 MISSION-COMPLETE 라고 답하라.'
       : '.mission-prompt.md 파일을 읽고 그 안의 미션을 완수하라(원문 그대로·[elanous 기억]은 참조 컨텍스트). 완료하면 MISSION-COMPLETE 라고 답하라.';
     debug.log('agent-mission', 'mission-send', { via: 'file', file: '.mission-prompt.md', chars: missionText.length, enhanced: enhanceActive });
+    submittedCommand = note;
+    submittedInputs.push(note);
     drive(note); await sleep(800); drive('\r');
   } else {
     debug.log('agent-mission', 'mission-send', { via: 'type', chars: spec.mission.length });
+    submittedInputs.push(spec.mission);
     drive(spec.mission); await sleep(800); drive('\r');
   }
 
@@ -1803,6 +1909,9 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     backend,
     stream: deps.controlStream,
     handoffEnabled: true,
+    recoverAfterMs: spec.recoverAfterMs,
+    initialCommand: submittedCommand,
+    onRecover: (blocked, action) => { decisionEvent({ step: 'recover', text: action, detail: { blocked, action } }); },
     onSummary: (summary) => { controllerSummary = summary; },
     onDecision: (text, reply) => {
       pendingAnswer = reply ? { text: `${reply.answer || 'continue'}\r`, ...reply } : undefined;
@@ -1824,6 +1933,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   // before asking the LLM — otherwise the mission text is typed into the prompt and the run stalls.
   const trustAwareBrain: RunSupervisor = {
     decide: (obs, signal) => {
+      decisionEvent({ step: 'read', text: `step ${obs.step} (${obs.state}): ${classifierFrameLines(obs.screen).at(-1) ?? 'empty screen'}` });
       pendingAnswer = undefined;
       let answer: string | undefined;
       if (backend.handleTrust?.(obs.screen, (bytes) => { answer = bytes; }) && answer !== undefined) {
@@ -1889,7 +1999,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
         handoffPrSkipped = true;
         debug.log('agent-mission', 'handoff-pr-skipped', { reason: 'origin-not-github' });
       } else {
-        (deps.dispatchOpenPullRequest ?? dispatchOpenPullRequest)({ title: `agent-mission: ${spec.branch}`, body: deps.originalMission ?? spec.mission, head: spec.branch, base: spec.base ?? 'main' }, { cwd: worktree });
+        const opened = (deps.dispatchOpenPullRequest ?? dispatchOpenPullRequest)({ title: `agent-mission: ${spec.branch}`, body: deps.originalMission ?? spec.mission, head: spec.branch, base: spec.base ?? 'main' }, { cwd: worktree });
+        if (opened.number !== null) deps.onMissionPrNumber?.(opened.number);
       }
       gatedHandoff = true;
     },
@@ -1916,7 +2027,6 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     renderPng: () => h.renderScreenPng(),
     bus,
     ident: { ptyId: h.id, instance: resolveInstanceName(), runId },
-    onPublishedFrame: (obs) => decisionEvent({ step: 'read', text: `step ${obs.step} (${obs.state}): ${classifierFrameLines(obs.screen).at(-1) ?? 'empty screen'}` }),
   });
   debug.log('agent-mission', 'takeover-wait', { id: h.id, maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS });
   const controlRun = runWithControlObserve(
@@ -1932,7 +2042,12 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
           pendingAnswer = undefined;
           const accepted = inject(text);
           if (accepted) {
+            submittedInputs.push(text);
             decisionEvent({ step: 'input', text: `Sent ${text.startsWith('\x1b') ? 'key' : 'text'}: ${text.startsWith('\x1b') ? 'navigation' : text}` });
+          }
+          // Recovery stages and recover events are committed only after the PTY accepted the input.
+          brain.onInputResult(text, accepted);
+          if (accepted) {
             if (reply) decisionEvent({ step: 'answer', text: 'Answered agent question', detail: { question: reply.question, answer: reply.answer } });
           }
           return accepted;
@@ -1948,6 +2063,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
         } : {}),
         awaitOwnership: { maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS },
         settle: async () => {
+          // A frozen screen goes quiet after 6 s, so stall recovery is still observed; work that keeps
+          // drawing output keeps the original 360 s settle and round budget.
           const quiet = waitForQuiet(h, 6000, 360000);
           await (deps.awaitMission ? deps.awaitMission(quiet) : quiet);
         },
@@ -1986,7 +2103,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
           throw error;
         }
       },
-      }, { maxSteps: maxRounds });
+      }, { maxSteps: maxRounds, stuckLimit: maxRounds + 1 });
       deps.onControlActive?.(pending);
       return pending;
     },
@@ -2079,24 +2196,29 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
     rounds: round, evidencePath: null, committed: false, usedOmniCrawl: usedOmni, detail: 'aborted' };
   const finalEv = verifyEvidence(wt.path, spec.evidence);
-  const evidencePath = finalEv.ok ? finalEv.path : null;
+  const finalScreen = await h.renderScreen();
+  const driveVerdict = verdictForFinalPtyScreen({ screen: finalScreen, inputHistory: submittedInputs, exitCode: h.exitCode ?? null });
+  debug.log('agent-mission', 'drive-verdict', { kind: driveVerdict.kind, reason: driveVerdict.reason.slice(0, 200) });
+  const recoverExhausted = control.termination.kind === 'stuck' && control.termination.reason.startsWith('사람 필요');
+  const accepted = finalEv.ok && !recoverExhausted && driveVerdict.kind !== 'done-but-failed';
+  const evidencePath = accepted ? finalEv.path : null;
   let committed = false;
-  if (!deps.isMissionAborted?.() && !spec.workdir && finalEv.ok && (spec.commit ?? true)) {
+  if (!deps.isMissionAborted?.() && !spec.workdir && accepted && (spec.commit ?? true)) {
     const c = (deps.commitWorktree ?? commitWorktree)(wt.path, `chore(agent-mission): ${spec.branch} — ${backend.name}-in-elanous PTY RFC 산출`);
     committed = c.ok;
     debug.log('agent-mission', 'commit', { ok: c.ok, out: c.out.slice(0, 120) });
   }
-  debug.log('agent-mission', 'result', { ok: finalEv.ok, rounds: round, evidencePath, committed, usedOmni });
-  decisionEvent({ step: 'done', text: finalEv.ok ? 'Mission evidence accepted' : 'Mission ended without sufficient evidence', detail: { result: { kind: evidencePath ? 'file' : 'text', ref: evidencePath ?? (control.termination.kind === 'error' ? control.termination.message : 'evidence unavailable') } } });
-  stopLive(finalEv.ok);
+  debug.log('agent-mission', 'result', { ok: accepted, rounds: round, evidencePath, committed, usedOmni });
+  decisionEvent({ step: 'done', text: accepted ? 'Mission evidence accepted' : 'Mission ended without sufficient evidence', detail: { result: { kind: evidencePath ? 'file' : 'text', ref: evidencePath ?? (control.termination.kind === 'error' ? control.termination.message : recoverExhausted ? control.termination.reason : 'evidence unavailable') } } });
+  stopLive(accepted);
   if (h.pid) await terminateMissionProcessTree(h.pid);
   try { h.kill(); } catch { /* noop */ }
 
   return {
-    ok: finalEv.ok, worktree: wt.path, branch: wt.branch, rounds: round,
+    ok: accepted, worktree: wt.path, branch: wt.branch, rounds: round,
     evidencePath, committed, usedOmniCrawl: usedOmni,
     ptyId: h.id, webUrl: webAddress.webUrl,
-    detail: done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
+    detail: recoverExhausted ? control.termination.reason : driveVerdict.kind === 'done-but-failed' ? `미완(DRIVE-OK: ${driveVerdict.reason})` : done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
   } finally { stopLive(); finishContext(false); }
 }

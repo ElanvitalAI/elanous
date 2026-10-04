@@ -50,12 +50,13 @@ function open(root = releaseLedgerRoot()): Database {
     db.exec('PRAGMA foreign_keys = ON');
     if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'imported_versions'").get()) db.exec(`CREATE TABLE IF NOT EXISTS features (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT, kind TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS assignments (feature_id TEXT NOT NULL REFERENCES features(id), version TEXT NOT NULL, status TEXT NOT NULL, disposition TEXT, evidence TEXT, title_override TEXT, owner TEXT, kind TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY(feature_id, version));
-    CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, feature_id TEXT NOT NULL, version TEXT NOT NULL, field TEXT NOT NULL, "from" TEXT, "to" TEXT, released TEXT NOT NULL, dev TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, feature_id TEXT NOT NULL, version TEXT NOT NULL, field TEXT NOT NULL, "from" TEXT, "to" TEXT, released TEXT NOT NULL, dev TEXT NOT NULL, reason TEXT);
     CREATE TABLE IF NOT EXISTS evidence (feature_id TEXT NOT NULL, version TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS imported_versions (version TEXT PRIMARY KEY, json_hash TEXT, imported_at TEXT);`);
     const columns = db.query('PRAGMA table_info(imported_versions)').all() as Array<{ name: string }>;
     if (!columns.some((column) => column.name === 'json_hash')) db.exec('ALTER TABLE imported_versions ADD COLUMN json_hash TEXT');
     if (!columns.some((column) => column.name === 'imported_at')) db.exec('ALTER TABLE imported_versions ADD COLUMN imported_at TEXT');
+    if (!(db.query('PRAGMA table_info(events)').all() as Array<{ name: string }>).some((column) => column.name === 'reason')) db.exec('ALTER TABLE events ADD COLUMN reason TEXT');
     db.exec('CREATE TABLE IF NOT EXISTS release_schedules (version TEXT PRIMARY KEY, cut_at TEXT NOT NULL, land_by TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)');
     return db;
   } catch (error) { db.close(); throw error; }
@@ -119,14 +120,15 @@ function readTransaction<T>(db: Database, work: () => T): T {
   catch (error) { db.exec('ROLLBACK'); throw error; }
 }
 
-type EventRow = { seq: number; at: string; by: string; feature_id: string; version: string; field: string; from: string; to: string; released: string; dev: string };
+type EventRow = { seq: number; at: string; by: string; feature_id: string; version: string; field: string; from: string; to: string; released: string; dev: string; reason: string | null };
 function decode(value: string | null): unknown { return value === null ? null : JSON.parse(value); }
 function historyRow(row: EventRow): ChecklistHistory {
-  return { at: row.at, by: row.by, id: row.feature_id, field: row.field, from: decode(row.from), to: decode(row.to), released: row.released, dev: row.dev };
+  return { at: row.at, by: row.by, id: row.feature_id, field: row.field, from: decode(row.from), to: decode(row.to), released: row.released, dev: row.dev,
+    ...(row.reason !== null ? { reason: row.reason } : {}) };
 }
 function record(db: Database, version: string, entry: ChecklistHistory): void {
-  db.query('INSERT INTO events (at, by, feature_id, version, field, "from", "to", released, dev) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(entry.at, entry.by, entry.id, version, entry.field, JSON.stringify(entry.from ?? null), JSON.stringify(entry.to ?? null), entry.released, entry.dev);
+  db.query('INSERT INTO events (at, by, feature_id, version, field, "from", "to", released, dev, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(entry.at, entry.by, entry.id, version, entry.field, JSON.stringify(entry.from ?? null), JSON.stringify(entry.to ?? null), entry.released, entry.dev, entry.reason ?? null);
 }
 function evidenceRefs(db: Database, version: string, id: string): string[] {
   return (db.query('SELECT ref FROM evidence WHERE feature_id = ? AND version = ? ORDER BY rowid').all(id, version) as Array<{ ref: string }>).map((row) => row.ref);
@@ -288,7 +290,9 @@ export function list(version: string, released?: string, dev = devVersion(), roo
 }
 
 /** The checklist API supplies its existing validation, field ordering and legacy history shape. */
-export function mutate(version: string, released: string, dev: string, apply: (data: Checklist) => boolean): Checklist {
+export interface ChecklistCollision { version: string; owner?: string; title: string }
+
+export function mutate(version: string, released: string, dev: string, apply: (data: Checklist, otherItems: (id: string) => ChecklistCollision[]) => boolean): Checklist {
   validateVersion(version);
   const db = open();
   try {
@@ -298,7 +302,16 @@ export function mutate(version: string, released: string, dev: string, apply: (d
       const data = snapshot(db, version, released, dev);
       const before = new Map(data.items.map((item) => [item.id, JSON.stringify(item)]));
       const count = data.history.length;
-      if (apply(data)) {
+      if (apply(data, (id) => {
+        for (const other of legacyVersions()) if (other !== version) importOnDb(db, other);
+        return db.query(`SELECT a.version, a.owner, COALESCE(a.title_override, f.title) AS title
+          FROM assignments a JOIN features f ON f.id = a.feature_id
+          WHERE a.feature_id = ? AND a.version <> ? ORDER BY a.version`).all(id, version)
+          .map((row) => {
+            const item = row as { version: string; owner: string | null; title: string };
+            return { version: item.version, ...(item.owner !== null ? { owner: item.owner } : {}), title: item.title };
+          });
+      })) {
         for (const item of data.items) if (before.get(item.id) !== JSON.stringify(item)) {
           const previous = before.get(item.id);
           const evidenceChanged = previous && (JSON.parse(previous) as ChecklistItem).evidence !== item.evidence;
@@ -356,7 +369,7 @@ export function remove(version: string, id: string, by: string, released = relea
     return true;
   });
 }
-export function move(id: string, from: string, to: string, by: string, released = releasedVersion(), dev = devVersion()): Checklist {
+export function move(id: string, from: string, to: string, by: string, released = releasedVersion(), dev = devVersion(), reason?: string): Checklist {
   validateVersion(from); validateVersion(to);
   if (from === to) throw new CliUserError('같은 판으로 옮길 수 없다');
   const db = open();
@@ -366,11 +379,12 @@ export function move(id: string, from: string, to: string, by: string, released 
       importedFrom = importOnDb(db, from); importedTo = importOnDb(db, to);
       const item = items(db, from).find((i) => i.id === id);
       if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
-      if (db.query('SELECT 1 FROM assignments WHERE feature_id = ? AND version = ?').get(id, to)) throw new CliUserError(`이미 있는 칸: ${id}`);
+      const collision = items(db, to).find((i) => i.id === id);
+      if (collision) throw new CliUserError(`이미 있는 칸: ${JSON.stringify(id).slice(1, -1)} — ${to} · 담당 ${JSON.stringify(collision.owner ?? '-').slice(1, -1)} · ${collision.title.replace(/\s+/g, ' ').slice(0, 40)}`);
       const at = new Date().toISOString();
       db.query('UPDATE assignments SET version = ?, updated_at = ?, updated_by = ? WHERE feature_id = ? AND version = ?').run(to, at, by, id, from);
       db.query('UPDATE evidence SET version = ? WHERE feature_id = ? AND version = ?').run(to, id, from);
-      record(db, to, { at, by, id, field: 'move', from, to, released, dev });
+      record(db, to, { at, by, id, field: 'move', from, to, released, dev, ...(reason !== undefined ? { reason } : {}) });
       return snapshot(db, to, released, dev);
     });
     if (importedFrom) debug.log('release.features', 'imported', { version: from });

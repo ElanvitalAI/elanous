@@ -53,7 +53,7 @@ afterEach(async () => {
 async function render(query = '', liveTrace: import('react').ReactNode = <p data-live-trace>라이브 트레이스</p>) {
   address = new URL(`https://example.test/inside${query}`);
   params = address.searchParams;
-  await act(async () => root.render(<InsidePageContent search={params} liveTrace={liveTrace} editorScene={<p data-editor-scene>편집기</p>} loopScene={<p data-loop-scene>루프</p>} ptyScene={<p data-pty-scene>PTY</p>} />));
+  await act(async () => root.render(<InsidePageContent search={params} liveTrace={liveTrace} editorScene={<p data-editor-scene>편집기</p>} loopScene={<p data-loop-scene>루프</p>} wizardScene={<p data-wizard-scene>마법사 단계</p>} ptyScene={<p data-pty-scene>PTY</p>} />));
 }
 
 async function key(value: string, target: Element = document.body) {
@@ -86,9 +86,8 @@ test('six tabs, default and out-of-range query fall back to ①; scene ③ is ad
   expect(scenes()[1].querySelector('[data-live-trace]')).not.toBeNull();
   expect(scenes()[3].querySelector('[data-editor-scene]')).not.toBeNull();
   expect(scenes()[2].querySelector('[data-loop-scene]')).not.toBeNull();
-  const wizard = '방문자가 한 줄로 요청하면 조사 → 커넥터·스킬·그래프 생성 → 시험 → 마켓 게시까지 이어지는 장면 — 마법사 연결 뒤 이 자리에서 실행됩니다';
-  expect(scenes()[4].textContent).toBe(wizard);
-  expect(scenes()[4].textContent).not.toContain('곧');
+  expect(scenes()[4].querySelector('[data-wizard-scene]')?.textContent).toBe('마법사 단계');
+  expect(scenes()[5].querySelector('[data-pty-scene]')).not.toBeNull();
   expect(leaksInternal(scenes()[4].textContent ?? '')).toEqual([]);
   await render('?scene=3');
   expect(selected()).toContain('3 루프 에이전트');
@@ -111,17 +110,21 @@ test('arrow keys change scene, editable targets do not; F requests fullscreen on
   expect(fullscreenCalls).toBe(1);
 });
 
-test('demo query and D persist, hide fifth tab and leave only public text on the stage', async () => {
+test('demo query and D persist, keep fifth tab and leave only public text on the stage', async () => {
   await render('?scene=5&demo=1');
-  expect(host.querySelectorAll('nav button')).toHaveLength(5);
+  expect(host.querySelectorAll('nav button')).toHaveLength(6);
+  expect(host.querySelectorAll('nav button')[4].textContent).toContain('5 마법사 → 마켓');
   expect(host.textContent).toContain('시연');
-  expect(selected()).toContain('1 문서 아키텍처');
+  expect(selected()).toContain('5 마법사 → 마켓');
+  expect(scenes()[4].querySelector('[data-wizard-scene]')).not.toBeNull();
   expect(leaksInternal(host.textContent ?? '')).toEqual([]);
   await key('d');
   expect(host.querySelectorAll('nav button')).toHaveLength(6);
+  expect(selected()).toContain('5 마법사 → 마켓');
   expect(storage.get('elanous.inside.demo')).toBe('0');
   await key('D');
-  expect(host.querySelectorAll('nav button')).toHaveLength(5);
+  expect(host.querySelectorAll('nav button')).toHaveLength(6);
+  expect(selected()).toContain('5 마법사 → 마켓');
   expect(storage.get('elanous.inside.demo')).toBe('1');
   expect(address.searchParams.get('demo')).toBe('1');
 });
@@ -130,7 +133,8 @@ test('?demo=1 alone is remembered, so a later bare /inside opens in demo mode (r
   await render('?demo=1');
   expect(storage.get('elanous.inside.demo')).toBe('1');
   await render();
-  expect(host.querySelectorAll('nav button')).toHaveLength(5);
+  expect(host.querySelectorAll('nav button')).toHaveLength(6);
+  expect(host.querySelector('[aria-label="시연 모드"]')).not.toBeNull();
   await render('?demo=0');
   expect(storage.get('elanous.inside.demo')).toBe('0');
 });
@@ -138,13 +142,14 @@ test('?demo=1 alone is remembered, so a later bare /inside opens in demo mode (r
 test('demo state is restored from storage; denied reads and writes fall back to the URL', async () => {
   storage.set('elanous.inside.demo', '1');
   await render();
-  expect(host.querySelectorAll('nav button')).toHaveLength(5);
+  expect(host.querySelectorAll('nav button')).toHaveLength(6);
+  expect(host.querySelector('[aria-label="시연 모드"]')).not.toBeNull();
   storageFails = true;
   await key('d');
   expect(address.searchParams.get('demo')).toBe('0');
   await key('d');
   expect(address.searchParams.get('demo')).toBe('1');
-  expect(host.querySelectorAll('nav button')).toHaveLength(5);
+  expect(host.querySelectorAll('nav button')).toHaveLength(6);
   await render('?demo=0');
   expect(host.querySelectorAll('nav button')).toHaveLength(6);
 });
@@ -357,7 +362,7 @@ test('scene ⑥ accumulates live read, judge and answer for one mission, waits b
   type Context = NonNullable<ComponentProps<typeof DaemonContext.Provider>['value']>;
   const context = { client: client as unknown as Context['client'], config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, sessionId: '', setSessionId: () => {} };
   address = new URL('https://example.test/inside?scene=6');
-  await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={address.searchParams} liveTrace={<p />} editorScene={<p />} loopScene={<p />} /></DaemonContext.Provider>));
+  await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={address.searchParams} liveTrace={<p />} editorScene={<p />} loopScene={<p />} wizardScene={<p />} /></DaemonContext.Provider>));
   const line = () => host.querySelector('[data-inside-scene="6"] [aria-label="판단 줄"]')!;
   expect(streamUrl).toBe('/v1/logs/stream?exactCategory=pty.decision');
   expect(line().textContent).toContain('판단을 기다리는 중');
@@ -403,7 +408,7 @@ test('scene ⑥ clears old decisions and releases the old stream when the daemon
   const b = client('/daemon-b');
   const show = async (current: typeof a) => {
     const context: Context = { client: current as unknown as Context['client'], config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, sessionId: '', setSessionId: () => {} };
-    await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={params} liveTrace={<p />} editorScene={<p />} loopScene={<p />} /></DaemonContext.Provider>));
+    await act(async () => root.render(<DaemonContext.Provider value={context}><InsidePageContent search={params} liveTrace={<p />} editorScene={<p />} loopScene={<p />} wizardScene={<p />} /></DaemonContext.Provider>));
   };
   const emit = async (url: string, missionId: string, text: string) => {
     const data = { ts: '2026-10-03T08:35:00Z', missionId, seq: 1, sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex', step: 'read', text };
@@ -432,13 +437,21 @@ test('scene ⑥ clears old decisions and releases the old stream when the daemon
   expect(streams.get('/daemon-b')!.listeners.size).toBe(0);
 });
 
-test('scene ⑥ is addressable; in demo mode the arrows step over the hidden ⑤ (④ → ⑥ → ④)', async () => {
+test('scene ⑥ is addressable; demo arrows visit ⑤ in both directions (④ → ⑤ → ⑥ → ⑤)', async () => {
   await render('?scene=6');
   expect(scenes()[5].hasAttribute('hidden')).toBe(false);
   expect(scenes()[5].querySelector('[data-pty-scene]')).not.toBeNull();
   await render('?demo=1&scene=4');
+  const previous = scenes().filter((_, index) => index !== 4);
+  await key('ArrowRight');
+  expect(scenes()[4].hasAttribute('hidden')).toBe(false);
+  expect(selected()).toContain('5 마법사 → 마켓');
+  expect(address.searchParams.get('scene')).toBe('5');
+  for (const old of previous) expect(scenes()).toContain(old);
   await key('ArrowRight');
   expect(scenes()[5].hasAttribute('hidden')).toBe(false);
   await key('ArrowLeft');
-  expect(scenes()[3].hasAttribute('hidden')).toBe(false);
+  expect(scenes()[4].hasAttribute('hidden')).toBe(false);
+  await click(host.querySelectorAll('nav button')[4]);
+  expect(selected()).toContain('5 마법사 → 마켓');
 });

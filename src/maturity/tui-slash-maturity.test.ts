@@ -25,6 +25,10 @@ describe('MAT1b TUI slash maturity', () => {
     expect(Object.keys(FEATURE_MATURITY.tuiSlash).sort()).toEqual([...names].sort());
   });
 
+  test('wish is beta in the canonical TUI maturity map', () => {
+    expect(FEATURE_MATURITY.tuiSlash.wish).toBe('beta');
+  });
+
   test('aliases inherit the canonical grade', () => {
     for (const command of SLASH_COMMANDS) for (const alias of command.aliases ?? [])
       for (const role of ['owner', 'contributor', 'general'] as const) for (const showBeta of [false, true])

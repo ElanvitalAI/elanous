@@ -4,6 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { claudeBackend, codexBackend, runAgentMission } from './driver.js';
 import type { ClaudeHeadlessResult } from './claude-headless.js';
+import { openSurfaceEventsDb } from '../domains/surface-events.js';
+import { listCoordEvents } from '../context-bus/coord-events.js';
+import { contextNow } from '../context-bus/context-now.js';
+import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 
 const success: ClaudeHeadlessResult = {
   ok: true, reason: 'success', exitCode: 0, result: 'done', subtype: 'success', sessionId: 'session-1',
@@ -56,6 +60,54 @@ describe('runAgentMission Claude headless execution', () => {
     expect(received?.env.ELANOUS_RUN_ID).toBeTruthy();
     expect(missionResult).toMatchObject({ ok: true, rounds: 2, evidencePath: join(dir, 'docs', 'PLAN-new.md'), committed: true, usedOmniCrawl: false });
     expect(missionResult.ptyId).toBeUndefined();
+  });
+
+  test('a headless mission publishes one claimed and one done event visible in context_now', async () => {
+    const db = openSurfaceEventsDb(':memory:');
+    const dir = mkdtempSync(join(tmpdir(), 'mission-context-'));
+    try {
+      const publish = (input: SessionEventInput) => { emitSessionEvent(input, { db }); };
+      const result = await runAgentMission({ mission: 'CTX1 agent mission', repo: dir, branch: 'fixture',
+        agent: claudeBackend, headless: true, memory: false, commit: false,
+        screensDir: join(dir, 'screens'), evidence: { kind: 'doc', dirRel: 'docs', glob: /PLAN/ },
+      }, {
+        emitContextEvent: publish,
+        createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+        recordWorktreeProvenance: () => {},
+        checkClaudeSubscription: () => ({ ok: true, reason: 'subscription', authMethod: 'claude.ai', apiProvider: 'firstParty' }),
+        runClaudeHeadless: async () => success,
+        checkEvidence: () => ({ ok: true, path: join(dir, 'docs', 'PLAN-new.md') }),
+      });
+      const answer = contextNow({}, {
+        version: () => '0.2.0',
+        checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+        decisions: () => [], seatEntries: () => [],
+        events: since => listCoordEvents({ since }, { db }),
+      });
+      expect(result.ok).toBe(true);
+      expect(answer.events.map(event => event.kind).reverse()).toEqual(['task-claimed', 'task-done']);
+      const refs = listCoordEvents({ since: '2000-01-01T00:00:00.000Z' }, { db });
+      expect(refs[0]?.refs.ref).toMatch(/^runId=run-/);
+      expect(refs[1]?.refs.ref).toBe(refs[0]?.refs.ref);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('journal write failure preserves successful headless mission result', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mission-context-failure-'));
+    try {
+      const result = await runAgentMission({ mission: 'CTX1 fail-soft', repo: dir, branch: 'fixture',
+        agent: claudeBackend, headless: true, memory: false, commit: false,
+        screensDir: join(dir, 'screens'), evidence: { kind: 'doc', dirRel: 'docs', glob: /PLAN/ },
+      }, {
+        emitContextEvent: () => { throw new Error('journal unavailable'); },
+        createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+        recordWorktreeProvenance: () => {},
+        checkClaudeSubscription: () => ({ ok: true, reason: 'subscription', authMethod: 'claude.ai', apiProvider: 'firstParty' }),
+        runClaudeHeadless: async () => success,
+        checkEvidence: () => ({ ok: true, path: join(dir, 'docs', 'PLAN-new.md') }),
+      });
+      expect(result).toMatchObject({ ok: true, committed: false, rounds: 2 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('explicit maxRounds reaches headless CLI as maxTurns', async () => {

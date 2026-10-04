@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
+import { readPodMemoryAdvice } from './pod-memory-advice.js';
 import { getUserConfig } from '../user-config.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { parsePodPool, resolvePodPoolSpec, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
@@ -24,6 +25,7 @@ export interface PodCliDeps {
   perAccount?: () => number;
   poolSpec?: (explicit?: string) => string | null;
   harnessPool?: () => string | undefined;
+  memoryAdvice?: (logsDb?: string) => ReturnType<typeof readPodMemoryAdvice>;
 }
 
 const HELP = `elanous pod run [--pool <스펙>] [--skill <이름,…>] [--llm grok] [--clone] [--deadline <초>] -- <명령…>
@@ -38,6 +40,21 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
   };
   const run = deps.run ?? ((options: RunPodCommandOptions) => runPodCommand(options));
   const pod = program.command('pod').description('Pod 명령 Job — 하니스 없이 명령 하나를 돌리고 산출을 돌려받는다');
+  pod.command('memory').description('실측 기반 Pod 메모리 권고 (읽기 전용)')
+    .command('advise').description('골 종류별 standard 16Gi / high 32Gi 권고와 근거')
+    .option('--json', '권고와 측정 근거를 JSON 으로')
+    .option('--logs-db <path>', '기존 logs.db 경로')
+    .action((opts: { json?: boolean; logsDb?: string }) => {
+      try {
+        const advice = (deps.memoryAdvice ?? readPodMemoryAdvice)(opts.logsDb);
+        if (opts.json) io.log(JSON.stringify(advice));
+        else for (const row of advice.byGoalType) io.log(`${row.goalType}: ${row.recommended} ${row.limit} · ${row.reason}`);
+        io.exit(0);
+      } catch (err) {
+        io.error(err instanceof Error ? err.message : String(err));
+        io.exit(1);
+      }
+    });
   pod.command('lease').description('Pod 풀 동시 실행 권장 (DNS 점검용 Pod 를 잠깐 만들었다 지움)')
     .command('status').description('지금 추가로 쏠 수 있는 Pod 골과 제한 근거')
     .option('--pool <spec>', '풀 스펙 — 컨텍스트[@ssh호스트][:상한][#레지스트리:포트] 쉼표')

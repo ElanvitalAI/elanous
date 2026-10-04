@@ -83,8 +83,27 @@ function makeCtx(sessionId = 'session-1', provider = 'anthropic'): ChatRuntimeCo
   };
 }
 
-beforeEach(() => { calls = []; });
-afterEach(() => { globalThis.fetch = realFetch; });
+const realStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+let wishStorage = new Map<string, string>();
+const mockStorage: Storage = {
+  get length() { return wishStorage.size; },
+  key: (index) => [...wishStorage.keys()][index] ?? null,
+  getItem: (key) => wishStorage.get(key) ?? null,
+  setItem: (key, value) => { wishStorage.set(key, value); },
+  removeItem: (key) => { wishStorage.delete(key); },
+  clear: () => { wishStorage.clear(); },
+};
+
+beforeEach(() => {
+  calls = [];
+  wishStorage.clear();
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: mockStorage });
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  if (realStorage) Object.defineProperty(globalThis, 'localStorage', realStorage);
+  else Reflect.deleteProperty(globalThis, 'localStorage');
+});
 
 // ── Phase B-2 (PWA chat streaming · 2026-05-06) ────────────────────
 //
@@ -1058,6 +1077,245 @@ describe(':budget · :history · :help', () => {
     expect(new Set(META_COMMANDS.map(({ name }) => name))).toEqual(
       new Set(Object.keys(META_HANDLERS).map((key) => key.slice(1))),
     );
+  });
+});
+
+describe('PWA :wish', () => {
+  it('posts exactly once with a per-wish ref and bearer, and displays the returned title', async () => {
+    globalThis.fetch = mockResponse({ status: 201, body: { cardId: 'card-1', title: '새 소원', created: true } });
+    const ctx = { ...makeCtx('session-1'), daemon: { baseUrl: 'http://localhost:31415/', token: 'tok' } };
+    expect((await dispatchMeta(':wish 새 소원', ctx))?.text).toBe('소원 카드로 남겼습니다 — 새 소원');
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/task-cards/wish');
+    expect(calls[0]!.init?.method).toBe('POST');
+    expect(calls[0]!.init?.headers).toEqual({ 'content-type': 'application/json', authorization: 'Bearer tok' });
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ text: '새 소원', ref: expect.stringMatching(/^session-1:\d+:[0-9a-f-]{36}$/) });
+    expect((await dispatchMeta(':help', ctx))?.text).toContain(':wish');
+    expect((await dispatchMeta(':help', ctx))?.text).toContain(':wish --retry <작업 ID>');
+  });
+
+  it('accepts /wish as the chat slash alias without sending a model prompt', async () => {
+    globalThis.fetch = mockResponse({ status: 201, body: { title: '별도 소원' } });
+    const ctx = { ...makeCtx(), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    expect((await dispatchMeta('/wish 별도 소원', ctx))?.text).toBe('소원 카드로 남겼습니다 — 별도 소원');
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0]!.init?.body))).toMatchObject({ text: '별도 소원' });
+  });
+
+  it('uses distinct refs for concurrent wishes even in the same millisecond', async () => {
+    const clock = spyOn(Date, 'now').mockReturnValue(12345);
+    const ctx = { ...makeCtx('same-session'), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    globalThis.fetch = mockResponse({ status: 201, body: { title: '저장됨' } });
+    try {
+      const results = await Promise.all([dispatchMeta(':wish 첫 소원', ctx), dispatchMeta(':wish 둘째 소원', ctx)]);
+      expect(results.map((result) => result?.text)).toEqual([
+        '소원 카드로 남겼습니다 — 저장됨', '소원 카드로 남겼습니다 — 저장됨',
+      ]);
+      expect(calls).toHaveLength(2);
+      const bodies = calls.map((call) => JSON.parse(String(call.init?.body)) as { text: string; ref: string });
+      expect(bodies.map(({ text }) => text)).toEqual(['첫 소원', '둘째 소원']);
+      expect(new Set(bodies.map(({ ref }) => ref)).size).toBe(2);
+      expect(bodies.every(({ ref }) => ref.startsWith('same-session:'))).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('keeps separate work IDs for identical failed wishes and retries only the selected work after reload', async () => {
+    const ctx = { ...makeCtx('retry-session'), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    let attempt = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      attempt++;
+      if (attempt <= 2) throw new Error('response lost after commit');
+      return Response.json({ title: '반복 소원', created: attempt === 4 }, { status: attempt === 4 ? 201 : 200 });
+    }) as typeof fetch;
+    const first = (await dispatchMeta(':wish 반복 소원', ctx))!.text;
+    const second = (await dispatchMeta(':wish 반복 소원', ctx))!.text;
+    const firstId = first.match(/:wish --retry ([0-9a-f-]{36})/)?.[1];
+    const secondId = second.match(/:wish --retry ([0-9a-f-]{36})/)?.[1];
+    expect(firstId).toBeTruthy();
+    expect(secondId).toBeTruthy();
+    expect(secondId).not.toBe(firstId);
+    expect((await dispatchMeta(':wish --pending', ctx))?.text).toContain(firstId!);
+    expect((await dispatchMeta(':wish --pending', ctx))?.text).toContain(secondId!);
+    const refs = () => calls.map((call) => (JSON.parse(String(call.init?.body)) as { ref: string }).ref);
+    expect(refs()[1]).not.toBe(refs()[0]);
+    // A fresh runtime can recover each pending work solely from persistent storage.
+    expect((await dispatchMeta(`:wish --retry ${firstId}`, { ...makeCtx('retry-session'), daemon: ctx.daemon }))?.text)
+      .toBe('소원 카드로 남겼습니다 — 반복 소원');
+    expect(refs()[2]).toBe(refs()[0]);
+    expect((await dispatchMeta(':wish --pending', ctx))?.text).not.toContain(firstId!);
+    expect((await dispatchMeta(':wish --pending', ctx))?.text).toContain(secondId!);
+    expect((await dispatchMeta(':wish 반복 소원', ctx))?.text).toBe('소원 카드로 남겼습니다 — 반복 소원');
+    expect(refs()[3]).not.toBe(refs()[0]);
+    expect(refs()[3]).not.toBe(refs()[1]);
+    expect(wishStorage.size).toBe(1);
+    expect((await dispatchMeta(`:wish --retry ${secondId}`, { ...makeCtx('other-session'), daemon: ctx.daemon }))?.text)
+      .toContain('재시도할 작업을 찾을 수 없습니다');
+    expect(calls).toHaveLength(4);
+    expect((await dispatchMeta(`:wish --retry ${secondId}`, ctx))?.text).toBe('소원 카드로 남겼습니다 — 반복 소원');
+    expect(refs()[4]).toBe(refs()[1]);
+    expect(wishStorage.size).toBe(0);
+  });
+
+  it('persists a wish before fetch and retains its ref if the response is lost on reload', async () => {
+    const ctx = { ...makeCtx('reload-session'), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    let savedBeforeFetch = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      if (calls.length === 1) {
+        savedBeforeFetch = wishStorage.size === 1;
+        throw new Error('response lost after commit');
+      }
+      return Response.json({ title: '복원 소원', created: false });
+    }) as typeof fetch;
+    const failure = (await dispatchMeta(':wish 복원 소원', ctx))!.text;
+    expect(savedBeforeFetch).toBe(true);
+    const id = failure.match(/:wish --retry ([0-9a-f-]{36})/)?.[1];
+    expect(id).toBeTruthy();
+    // Recreate the storage adapter and context, as on a browser reload.
+    wishStorage = new Map(wishStorage);
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: mockStorage });
+    expect((await dispatchMeta(':wish --pending', { ...makeCtx('reload-session'), daemon: ctx.daemon }))?.text).toContain(id!);
+    expect((await dispatchMeta(`:wish --retry ${id}`, { ...makeCtx('reload-session'), daemon: ctx.daemon }))?.text)
+      .toBe('소원 카드로 남겼습니다 — 복원 소원');
+    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual(JSON.parse(String(calls[0]!.init?.body)));
+    expect(wishStorage.size).toBe(0);
+  });
+
+  it('does not send when the retry record cannot be persisted', async () => {
+    const ctx = { ...makeCtx('no-storage'), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+      setItem: () => { throw new Error('quota exceeded'); },
+    } });
+    globalThis.fetch = mockResponse({ status: 201, body: { title: '잃어버릴 소원' } });
+    expect((await dispatchMeta(':wish 잃어버릴 소원', ctx))?.text).toContain('작업 보존 불가: quota exceeded');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not post empty text and returns errors on failed responses or unavailable daemon', async () => {
+    const ctx = { ...makeCtx(), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
+    expect((await dispatchMeta(':wish', ctx))?.text).toBe(':wish <소원 한 줄>');
+    expect(calls).toHaveLength(0);
+    globalThis.fetch = mockResponse({ status: 401, body: { error: 'unauthorized' } });
+    expect((await dispatchMeta(':wish 소원', ctx))?.text).toContain('소원 카드 저장 실패 — HTTP 401');
+    expect((await dispatchMeta(':wish 소원', makeCtx()))?.text).toContain('소원 카드 저장 실패');
+  });
+});
+
+describe('PWA /remaining and /status daemon replies', () => {
+  const daemon = { baseUrl: 'http://localhost:31415/', token: 'tok' };
+  const usage = { ok: true, rows: [
+    { provider: 'codex', account: '계정 1', subscription: { status: 'available', remainingPercent: 72, resetsInMs: 3 * 60 * 60_000 } },
+    { provider: 'codex', account: '계정 2', subscription: { status: 'available', remainingPercent: 8, resetsInMs: 45 * 60_000 } },
+  ] };
+
+  it('fetches usage once with the daemon bearer for /remaining', async () => {
+    globalThis.fetch = mockResponse({ status: 200, body: usage });
+    const result = await dispatchMeta('/remaining', { ...makeCtx(), daemon });
+    expect(result?.text).toBe('codex 계정 1 · 남은 72% · 3시간 뒤 초기화\ncodex 계정 2 · 남은 8% · 45분 뒤 초기화');
+    expect(result?.text).not.toContain('아직 안 됩니다');
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/usage');
+    expect(calls[0]!.init?.headers).toEqual({ authorization: 'Bearer tok' });
+  });
+
+  it('treats a successful empty usage list as no accounts for both commands', async () => {
+    const original = console.debug;
+    const seen: unknown[] = [];
+    console.debug = (...args: unknown[]) => { if (String(args[0]).includes('webterm.chat.status')) seen.push(args.at(-1)); };
+    globalThis.fetch = ((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      return Response.json(String(input).endsWith('/v1/health')
+        ? { nexusVersion: '0.2.12' } : { ok: true, rows: [] });
+    }) as unknown) as typeof fetch;
+    try {
+      expect((await dispatchMeta('/remaining', { ...makeCtx(), daemon }))?.text).toBe('등록된 계정이 없습니다');
+      expect((await dispatchMeta('/status', { ...makeCtx('abcdefgh-123'), daemon }))?.text)
+        .toContain('남은 양: 등록된 계정이 없습니다');
+    } finally { console.debug = original; }
+    expect(calls.filter((call) => String(call.url).endsWith('/v1/usage'))).toHaveLength(2);
+    expect(seen).toEqual([
+      { cmd: 'remaining', rows: 0, ok: true },
+      { cmd: 'status', rows: 0, ok: true },
+    ]);
+  });
+
+  it('reports unread usage on failed request and does not fetch without daemon settings', async () => {
+    globalThis.fetch = mockResponse({ status: 503, body: { ok: false } });
+    expect((await dispatchMeta(':remaining', { ...makeCtx(), daemon }))?.text).toBe('남은 양을 읽지 못했습니다');
+    expect((await dispatchMeta('/remaining', makeCtx()))?.text).toBe('남은 양을 읽지 못했습니다');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('answers /status with health and usage even when health fails', async () => {
+    globalThis.fetch = ((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      return Response.json(String(input).endsWith('/v1/health') ? { error: 'down' } : usage,
+        { status: String(input).endsWith('/v1/health') ? 503 : 200 });
+    }) as unknown) as typeof fetch;
+    const result = await dispatchMeta('/status', { ...makeCtx('abcdefgh-123', 'codex'), daemon,
+      messages: [{ id: 'a', role: 'assistant', text: '', timestamp: 1, meta: { model: 'terra' } }] });
+    expect(result?.text).toContain('대화: abcdefgh');
+    expect(result?.text).toContain('모델: codex/미확인');
+    expect(result?.text).not.toContain('codex/terra');
+    expect(result?.text).toContain('데몬 판: 확인할 수 없음');
+    expect(result?.text).toContain('남은 양: codex 계정 2 · 남은 8%');
+    expect(result?.text).not.toContain('아직 안 됩니다');
+    expect(calls.map((c) => String(c.url)).sort()).toEqual([
+      'http://localhost:31415/v1/config/model-tier', 'http://localhost:31415/v1/health',
+      'http://localhost:31415/v1/setup/llm-providers', 'http://localhost:31415/v1/usage',
+    ]);
+  });
+
+  it('uses the current daemon selection after provider and model switches, not an earlier assistant turn', async () => {
+    let activeProvider = 'openai-codex';
+    let llm = 'better';
+    globalThis.fetch = ((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      const path = String(input);
+      const body = path.endsWith('/v1/setup/llm-providers') ? { activeProvider }
+        : path.endsWith('/v1/config/model-tier') ? { modelTier: { llm } }
+          : path.endsWith('/v1/health') ? { nexusVersion: '0.2.12' } : usage;
+      return Response.json(body);
+    }) as unknown) as typeof fetch;
+    const ctx = { ...makeCtx('abcdefgh-123', 'anthropic'), daemon,
+      messages: [{ id: 'old', role: 'assistant' as const, text: '', timestamp: 1,
+        meta: { provider: 'anthropic', model: 'claude-haiku-4-5' } }] };
+    const before = await dispatchMeta('/status', ctx);
+    expect(before?.text).toContain('모델: openai-codex/gpt-5.4');
+    activeProvider = 'grok';
+    llm = 'budget';
+    const after = await dispatchMeta('/status', ctx);
+    expect(after?.text).toContain('모델: grok/grok-4.20-non-reasoning');
+    expect(after?.text).not.toContain('grok/claude-haiku-4-5');
+    expect(calls.filter((call) => String(call.url).endsWith('/v1/setup/llm-providers'))).toHaveLength(2);
+    expect(calls.filter((call) => String(call.url).endsWith('/v1/config/model-tier'))).toHaveLength(2);
+  });
+
+  it('answers /status with the health version when usage fails and lists both in /help', async () => {
+    globalThis.fetch = ((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      return Response.json(String(input).endsWith('/v1/health') ? { ok: true, nexusVersion: '0.2.12' } : { ok: false },
+        { status: String(input).endsWith('/v1/health') ? 200 : 503 });
+    }) as unknown) as typeof fetch;
+    const result = await dispatchMeta(':status', { ...makeCtx(), daemon });
+    expect(result?.text).toContain('데몬 판: 0.2.12');
+    expect(result?.text).toContain('남은 양: 남은 양을 읽지 못했습니다');
+    const help = (await dispatchMeta('/help', makeCtx()))?.text;
+    expect(help).toContain('/remaining');
+    expect(help).toContain('/status');
+  });
+
+  it('logs only the command, row count, and success flag', async () => {
+    const original = console.debug;
+    const seen: unknown[][] = [];
+    console.debug = (...args: unknown[]) => { if (String(args[0]).includes('webterm.chat.status')) seen.push(args); };
+    globalThis.fetch = mockResponse({ status: 200, body: usage });
+    try {
+      await dispatchMeta('/remaining', { ...makeCtx(), daemon });
+    } finally { console.debug = original; }
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.at(-1)).toEqual({ cmd: 'remaining', rows: 2, ok: true });
   });
 });
 

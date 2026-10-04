@@ -1,12 +1,15 @@
 import { debug } from '../debug/log.js';
 import { discordDecisionOwner } from '../decisions/discord-decision-cards.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
+import { awaitGlobalPersonaLoad, getGlobalPersonaRegistry } from '../persona/global-registry.js';
+import type { PersonaSource } from '../persona/mention-parser.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../seat-dispatch/ceo-commands.js';
 import { ceoTaskDeps, classifyCeoIntent } from '../seat-dispatch/ceo-intent.js';
 import { askSeat, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-ask.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { answerAsSeat } from './seat-answer.js';
+import { answerAsPersona, resolvePersonaAddress, type PersonaAnswerDeps } from './persona-answer.js';
 import {
   submitIntakeWork,
   type SubmitIntakeWorkDeps,
@@ -24,6 +27,9 @@ export interface DiscordSeatWorkDeps extends SubmitIntakeWorkDeps {
   submit?: typeof submitIntakeWork;
   config?: UserConfig;
   answer?: typeof answerAsSeat;
+  personaSource?: PersonaSource;
+  personaAnswer?: typeof answerAsPersona;
+  personaAnswerDeps?: PersonaAnswerDeps;
   dispatch?: typeof dispatchCeoTask;
   commandDeps?: CeoCommandDeps;
   askDeps?: SeatAskDeps;
@@ -54,7 +60,7 @@ export async function handleDiscordSeatWork(
       ...(msg.threadId ? { threadId: msg.threadId } : {}) },
     deps.commandDeps ?? ceoTaskDeps(auth.cfg, auth.id), deps.askDeps);
   }
-  const address = parseSeatAddress(text);
+  const address = parseSeatAddress(text.replace(/^(@[A-Za-z][A-Za-z0-9_-]*(?:,@?[A-Za-z][A-Za-z0-9_-]*)*)/, (prefix) => prefix.replaceAll(',@', ',')));
   if (!address) {
     if (!text.trim() || /^\s*[/@＠]/.test(text)) return null;
     const auth = owner();
@@ -67,10 +73,30 @@ export async function handleDiscordSeatWork(
   }
 
   const seats = address.seats.map((name) => ({ name, seat: resolveSeat(name) }));
-  const unknown = seats.filter(({ seat }) => !seat).map(({ name }) => `@${name}`);
+  const hasUnresolved = seats.some(({ seat }) => !seat);
+  const auth = hasUnresolved ? owner() : null;
+  if (hasUnresolved && auth && !deps.personaSource) await awaitGlobalPersonaLoad();
+  const source = hasUnresolved && auth ? (deps.personaSource ?? getGlobalPersonaRegistry()) : null;
+  const addressed = seats.map(({ name, seat }) => ({
+    name, seat, persona: !seat && source ? resolvePersonaAddress(name, source) : null,
+  }));
+  const unknown = addressed.filter(({ seat, persona }) => !seat && (!persona || !auth)).map(({ name }) => `@${name}`);
   if (unknown.length) return `어느 좌석을 말씀하시나요? ${unknown.join(', ')}은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.`;
+  const personas = addressed.filter(({ persona }) => persona);
+  if (personas.length && addressed.length !== 1) {
+    debug.log('persona.address', 'rejected', { reason: 'mixed', via: 'discord' });
+    return '페르소나는 한 번에 하나만 부를 수 있습니다';
+  }
   const body = address.body.trim();
   if (!body) return '어떤 일을 맡길까요? 좌석 주소 뒤에 요청 내용을 적어 다시 보내 주세요.';
+
+  if (personas.length === 1 && personas[0]?.persona) {
+    const { name, persona } = personas[0];
+    debug.log('persona.address', 'resolved', { name, personaId: persona.personaId, via: 'discord' });
+    const answer = await (deps.personaAnswer ?? answerAsPersona)(persona, body, deps.personaAnswerDeps);
+    debug.log('persona.address', 'answered', { personaId: persona.personaId, via: 'discord' });
+    return answer;
+  }
 
   if (seats.length === 1 && seats[0]?.seat) {
     const auth = owner();

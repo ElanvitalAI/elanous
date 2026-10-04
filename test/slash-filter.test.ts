@@ -81,10 +81,10 @@ describe('filterSlashCommands', () => {
   it('reorders only existing essential commands without changing the order of others', () => {
     const names = filterSlashCommands('', SLASH_COMMANDS).map(c => c.name);
     expect(names).not.toContain('new');
-    expect(names.slice(0, 8)).toEqual([
-      'help', 'resume', 'model', 'clear', 'status', 'now', 'remaining', 'setup',
+    expect(names.slice(0, 9)).toEqual([
+      'help', 'resume', 'model', 'clear', 'status', 'now', 'wish', 'remaining', 'setup',
     ]);
-    expect(names.slice(8)).toEqual([
+    expect(names.slice(9)).toEqual([
       'quit', 'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'fork',
       'rewind', 'mission', 'resume-turn', 'context', 'paste', 'sync', 'plugin',
       'widget', 'log', 'memory', 'export', 'delta', 'theme', 'debug', 'rebind',

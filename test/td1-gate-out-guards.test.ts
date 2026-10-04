@@ -49,7 +49,8 @@ test('TD1 gate-out candidates with defect guards are retained without new exclus
   expect(accounted.map(({ file }) => file).sort()).toEqual(gateOut.map((cells) => cells[fileAt]!).sort());
   expect(accounted.every(({ reason }) => reason.trim().length > 0)).toBe(true);
   expect(new Set(gateOut.map((cells) => cells[fileAt])).size).toBe(gateOut.length);
-  expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts']);
+  // review-model-ab: OP-approved Pod exclusion (#23439 · 10-04 · Pod no-output 2/2, local 4/0) — no other new exclusion.
+  expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts', 'scripts/review-model-ab.test.ts']);
   expect(GATE_NIGHTLY_AUDITS).toEqual([
     'test/f12-sweep.test.ts',
     'scripts/unwired-exports.test.ts',

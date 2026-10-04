@@ -27,6 +27,25 @@ test('each breakage has a Korean reason', () => {
   expect(judgeScene({ ...clean(), failedRequests: ['/v1/data?token=private'] }).reasons).toEqual(['API 요청 실패 1건']);
 });
 
+test('visible empty states mean no-data only after every broken condition has been excluded', () => {
+  expect(judgeScene({ ...clean(), emptyStates: ['데이터가 없습니다', '아직 기록이 없습니다'] })).toMatchObject({
+    verdict: 'no-data', reasons: ['실데이터 없음 — 데이터가 없습니다', '실데이터 없음 — 아직 기록이 없습니다'],
+  });
+  expect(judgeScene({ ...clean(), emptyStates: [] })).toMatchObject({ verdict: 'ok', reasons: [] });
+  expect(judgeScene({ ...clean(), hiddenByDemo: true, emptyStates: ['데이터가 없습니다'] })).toMatchObject({
+    verdict: 'unverified', reasons: ['시연 모드에서 숨긴 장면 — WIZ1 착지 뒤 실물 필요'],
+  });
+  const breakages: Array<Partial<SceneObservation>> = [
+    { exceptions: ['boom'] }, { failedRequests: ['/v1/data'] }, { textLength: 39 },
+    { blankFrames: 1 }, { sectionsInDom: 5 }, { visibleScene: null }, { leaks: ['token'] },
+  ];
+  for (const breakage of breakages) {
+    const result = judgeScene({ ...clean(), emptyStates: ['데이터가 없습니다'], ...breakage });
+    expect(result.verdict).toBe('broken');
+    expect(result.reasons.some((reason) => reason.startsWith('실데이터 없음'))).toBe(false);
+  }
+});
+
 test('a failed API path keeps its shape but collapses ids', () => {
   expect(failedApiResponse('http://localhost/v1/workflows/runs/0f3a9c1e2b4d5f60?x=1', 404)).toBe('/v1/workflows/runs/:id 404');
   expect(failedApiResponse('http://localhost/v1/harness/runs/run-1a2b3c4d-5e6f-7a8b-9c0d-112233445566', 500)).toBe('/v1/harness/runs/:id 500');
@@ -61,8 +80,10 @@ test('run verdict counts each status and breaks on any broken scene', () => {
   const ok = judgeScene(clean());
   const broken = judgeScene({ ...clean(), exceptions: ['boom'] });
   const skipped = judgeScene({ ...clean(), scene: 5, hiddenByDemo: true });
-  expect(judgeRun([ok, broken, skipped])).toEqual({ verdict: 'broken', ok: 1, broken: 1, unverified: 1, banner: ['⑤ 미검증 — WIZ1 착지 뒤 실물 필요'], scenes: [ok, broken, skipped] });
-  expect(judgeRun([ok, skipped]).verdict).toBe('unverified');
-  expect(judgeRun([ok]).verdict).toBe('ok');
-  expect(judgeRun([ok]).banner).toEqual([]);
+  const noData = judgeScene({ ...clean(), emptyStates: ['데이터가 없습니다'] });
+  expect(judgeRun([ok, broken, skipped])).toEqual({ verdict: 'broken', ok: 1, broken: 1, unverified: 1, noData: 0, banner: ['⑤ 미검증 — WIZ1 착지 뒤 실물 필요'], scenes: [ok, broken, skipped] });
+  expect(judgeRun([ok, broken, skipped, noData])).toMatchObject({ verdict: 'broken', ok: 1, broken: 1, unverified: 1, noData: 1 });
+  expect(judgeRun([ok, skipped, noData])).toMatchObject({ verdict: 'unverified', ok: 1, broken: 0, unverified: 1, noData: 1 });
+  expect(judgeRun([ok, noData])).toMatchObject({ verdict: 'no-data', ok: 1, broken: 0, unverified: 0, noData: 1, banner: ['③ 실데이터 없음 — 런·PTY·마법사가 도는 판에서 다시'] });
+  expect(judgeRun([ok])).toMatchObject({ verdict: 'ok', noData: 0, banner: [] });
 });

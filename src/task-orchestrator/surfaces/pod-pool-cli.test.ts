@@ -71,6 +71,9 @@ else if (args.includes('config')) console.log('fake');
     ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_CONFIG_DIR: join(root, 'config'),
     TEST_JOBS: state, TEST_HEAD: head, TEST_SKILLS: digest, ELANOUS_POD_POOL: 'fake:3',
     ELANOUS_GROUNDING_URL: '', ELANOUS_RUN_ID: '', NODE_ENV: '',
+    // L7e: the child CLI runs with NODE_ENV cleared, so without this it took leases in the REAL host lease dir
+    // (`$TMPDIR/elanous-pod-leases-<uid>/fake_` — counted against live node-b slots · 10-03 19:26 26/20).
+    ELANOUS_POD_LEASE_DIR: join(root, 'pod-leases'),
   };
   return { root, state, env };
 }

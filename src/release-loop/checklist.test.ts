@@ -1,17 +1,48 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, claimItem, checklistGate, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, claimItem, checklistGate, checklistHistory, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import * as features from './feature-store.js';
 
 const roots: string[] = [];
 function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checklist-')); roots.push(dir); setElanousConfigDir(dir); return dir; }
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('checklistHistory unifies cross-version moves, timestamps and reasons without mixing ids', () => {
+    const dir = root();
+    expect(checklistHistory('K1')).toEqual([]);
+    addItem('0.2.9', { id: 'K1', title: 'carry' });
+    addItem('0.2.9', { id: 'OTHER', title: 'unrelated' });
+    setItem('0.2.9', 'K1', { evidence: '#first' }, 'TC');
+    features.move('K1', '0.2.9', '0.2.10', 'OP', '', '', 'next cut');
+    setItem('0.2.10', 'K1', { evidence: '#revised' }, 'TC');
+    features.move('K1', '0.2.10', '0.2.11', 'OP', '', '', 'needs more work');
+    const entries = checklistHistory('K1');
+    expect(entries.map((entry) => [entry.version, entry.field])).toEqual([
+      ['0.2.9', 'add'], ['0.2.9', 'evidence'], ['0.2.10', 'move'], ['0.2.10', 'evidence'], ['0.2.11', 'move'],
+    ]);
+    expect(entries.filter((entry) => entry.field === 'move').map(({ from, to, at, reason }) => ({ from, to, at, reason }))).toEqual([
+      { from: '0.2.9', to: '0.2.10', at: expect.any(String), reason: 'next cut' },
+      { from: '0.2.10', to: '0.2.11', at: expect.any(String), reason: 'needs more work' },
+    ]);
+    expect(entries.every((entry) => entry.id === 'K1' && !Number.isNaN(Date.parse(entry.at)))).toBe(true);
+    expect(entries.every((entry, index) => index === 0 || entry.at >= entries[index - 1]!.at)).toBe(true);
+    expect(listChecklist('0.2.11').history.at(-1)).toMatchObject({ field: 'move', reason: 'needs more work' });
+    expect(checklistHistory('OTHER').map((entry) => entry.field)).toEqual(['add']);
+    const db = new Database(join(dir, 'release/features.sqlite'));
+    try {
+      expect(db.query('SELECT reason FROM events WHERE feature_id = ? AND field = ? ORDER BY seq').all('K1', 'move'))
+        .toEqual([{ reason: 'next cut' }, { reason: 'needs more work' }]);
+    } finally { db.close(); }
+    expect(checklistHistory('K1')).toEqual(entries);
+  });
+
   test('짝 판정 문면과 조건을 보존하고 짝 경고만으로 gate ok 를 바꾸지 않는다', () => {
     root();
     const valid = '짝: PWA ✅ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅';

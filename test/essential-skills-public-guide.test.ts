@@ -63,18 +63,28 @@ describe('essential skills public guide', () => {
     expect(rows[0]).toContain('[read the guide](essential-skills.md)');
   });
 
-  test('the release note retains the requested internal line and target', () => {
-    expect(read('release/next.md')).toContain('- New guide page for the five essential skills — what each does, free and own-key paths, and how to use them in Claude Code, Codex and the Claude app (pack listed, not yet published). Documentation: release/public/docs/essential-skills.md. Target: next.');
-    expect(read('release/next.md')).toMatch(/^## Internal$/m);
+  // The guide ships in the version named by its `since`. Until that version is cut the note line must be in
+  // release/next.md; once a later dev version starts, the line has already gone out with that release.
+  const baseVersion = (JSON.parse(read('package.json')) as { version: string }).version.replace(/-dev\..*$/, '');
+  const guideSince = (): string => pages.pages.find(page => page.source === guidePath)?.since ?? '';
+  const versionKey = (v: string) => v.split('.').map(n => n.padStart(4, '0')).join('.');
+
+  test('the release note line is in release/next.md until the guide\'s version is released', () => {
+    if (guideSince() === baseVersion) {
+      expect(read('release/next.md')).toContain('- New guide page for the five essential skills');
+      expect(read('release/next.md')).toMatch(/^## Internal$/m);
+    } else {
+      expect(versionKey(guideSince()) < versionKey(baseVersion)).toBe(true);
+    }
   });
 
-  test('the site has exactly one guide source under using-elanous for the next public version', () => {
+  test('the site has exactly one guide source under using-elanous, introduced in a released or the next version', () => {
     const entries = pages.pages.filter(page => page.source === guidePath);
     expect(entries).toHaveLength(1);
     expect(entries[0].id).toBe('using-elanous/essential-skills');
     expect(entries[0].read_when).toHaveLength(1);
     expect(entries[0].read_when?.[0]).toMatch(/essential skills/);
-    const version = (JSON.parse(read('package.json')) as { version: string }).version;
-    expect(entries[0].since).toBe(version.replace(/-dev\..*$/, ''));
+    expect(entries[0].since).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(versionKey(entries[0].since!) <= versionKey(baseVersion)).toBe(true);
   });
 });

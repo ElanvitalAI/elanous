@@ -544,6 +544,14 @@ test('publish accepts measured automatic approval but refuses incomplete metrics
       ? args[1]?.endsWith('pages.json') ? '{"pages":[]}' : '# 0.2.5\n\nBody\n'
       : '{"ok":true,"published":true,"tag":"v0.2.5"}' });
     expect(runPublish(run).outcome).toBe('ok');
+    // 10-04 0.2.11: auto-approve also emits the warning-only rows (tui-regress · mac-smoke) — 8 blocking + 2 shown.
+    metrics.push({ name: 'tui-regress', verdict: 'pass' }, { name: 'mac-smoke', verdict: 'pass' });
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
+    expect(runPublish(run).outcome).toBe('ok');
+    metrics.splice(7, 1);
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
+    expect(runPublish(() => { throw new Error('publish called'); }).outcome).toBe('fail');
+    metrics.splice(7, 0, { name: 'metric-7', verdict: 'pass' });
     metrics[0]!.verdict = 'unmeasured';
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.5', previousVersion: '0.2.4' }, outputs });
     expect(runPublish(() => { throw new Error('publish called'); }).outcome).toBe('fail');

@@ -4,6 +4,23 @@ export function readSlashContextNow(args: string[], deps?: ContextNowDeps): Cont
   return contextNow({ topic: args.join(' ').trim() }, deps);
 }
 
+export function seatsNowLine(answer: ContextNowAnswer, now: number): string | null {
+  const seats = [ ['OP', 'COO'], ['MK', 'CMO'], ['TC', 'CTO'], ['UX', 'CXO'] ] as const;
+  const facts = answer.facts.filter(fact => fact.kind === 'seat');
+  const lines = seats.flatMap(([seat, label]) => {
+    const latest = facts.filter(fact => fact.seat === seat)
+      .sort((a, b) => b.at.localeCompare(a.at))[0];
+    if (!latest) return [];
+    const minutes = Math.max(0, Math.floor((now - Date.parse(latest.at)) / 60_000));
+    const age = minutes >= 24 * 60 ? '하루 넘음'
+      : minutes >= 60 ? `${Math.floor(minutes / 60)}시간 전`
+      : minutes > 0 ? `${minutes}분 전` : '방금';
+    const title = latest.title?.split(/\r?\n/, 1)[0]?.trim();
+    return [`${label} ${title ? title.slice(0, 20) : latest.status} · ${age}`];
+  });
+  return lines.length ? `지금 자리들: ${lines.join(' | ')}` : null;
+}
+
 function factText(fact: ContextFact): string {
   switch (fact.kind) {
     case 'version': return fact.version;

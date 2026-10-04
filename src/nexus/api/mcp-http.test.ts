@@ -12,7 +12,7 @@ import type { ToolRuntime, ToolRuntimeContext } from '../../tool-runtime/types.j
 /** Frozen default initialize envelope — HTTP layer must emit this byte-for-byte
  *  when streaming is not opted in. Produced by JSON.stringify of handleMcpRequest. */
 const DEFAULT_INITIALIZE_BODY =
-  '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"monad-agent","version":"0.1.0"}}}';
+  '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"elanous-agent","version":"0.1.0"}}}';
 
 const DEFAULT_TOOL_CALL_BODY =
   '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"xcode.build done"}],"structuredContent":{"output":"xcode.build done"}}}';
@@ -276,7 +276,7 @@ describe('handleMcpHttpPost — catalog automatic SSE progress', () => {
     expect(nonCall.headers.get('content-type')).toBe('application/json');
   });
 
-  test('actual MCP catalog routes all 49 injected tools through the HTTP response policy', async () => {
+  test('actual MCP catalog routes every injected tool through the HTTP response policy', async () => {
     const catalog = listNativeToolsForHost('mcp');
     for (const tool of catalog) registerToolRuntime(makeProgressRuntime(tool.id));
 
@@ -301,18 +301,20 @@ describe('handleMcpHttpPost — catalog automatic SSE progress', () => {
       }
     }
 
-    // The four additional entries are legitimate: their catalog metadata is
-    // MCP-only and default-enabled, and handleMcpRequest filters runtimes to
-    // the MCP surface. They must therefore remain visible here.
-    expect(catalog).toHaveLength(49);
-    expect(catalog.map((tool) => tool.id)).toEqual(expect.arrayContaining([
+    // Catalog membership can grow; every returned MCP tool must be routed
+    // exactly once, with no missing or duplicated tools in either mode.
+    const ids = catalog.map((tool) => tool.id);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(expect.arrayContaining([
       'self_recall',
       'logs_query',
       'ops_status',
       'memory_recall',
     ]));
-    expect(automatic).toHaveLength(4);
-    expect(unchanged).toHaveLength(45);
+    expect(automatic.length).toBeGreaterThan(0);
+    expect(unchanged.length).toBeGreaterThan(0);
+    expect([...automatic, ...unchanged].map((tool) => tool.id).sort()).toEqual([...ids].sort());
   });
 
   test('removing automatic detection makes the long-running decision fail', () => {

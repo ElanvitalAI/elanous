@@ -387,15 +387,25 @@ describe('harness CLI sink hook', () => {
     expect(called).toBe(0);
   });
 
-  test('plan is registered even without an injected handler — it defaults to the RFC plan path', () => {
-    const { harnessCmd } = productionHarness(async () => {});
-    const help = harnessCmd.helpInformation();
+  test('plan without an injected handler is registered and dispatches to the default RFC path', async () => {
+    const calls: string[] = [];
+    const program = new Command().exitOverride();
+    const harnessCmd = installHarnessCliCommand(program, {
+      registerSink: async (surface) => { calls.push(`sink:${surface}`); },
+      resolveSurface: async () => 'harness',
+      planRfc: async (sentence, opts) => {
+        calls.push(`rfc:${sentence}:${opts?.dryRun}`);
+        return { path: 'docs/RFC-test.md', markdown: '# RFC', openQuestions: [], dryRun: false };
+      },
+    });
     const names = harnessCmd.commands.map((command) => command.name());
 
     expect(names).toContain('plan');
     expect(names).not.toContain('ask');
     expect(names).not.toContain('say');
-    expect(help).toMatch(/^\s+deliverable-verify\b/m);
+    expect(harnessCmd.helpInformation()).toMatch(/^\s+plan \[options\] <sentence\.\.\.>/m);
+    await program.parseAsync(['node', 'elanous', 'harness', 'plan', 'write', 'the', 'plan']);
+    expect(calls).toEqual(['sink:harness', 'rfc:write the plan:false']);
   });
 
   test('plan is present on harness help commands only when a plan handler is injected', () => {
@@ -429,23 +439,17 @@ describe('harness CLI sink hook', () => {
     expect(calls).toEqual(['sink:harness', 'plan']);
   });
 
-  test('plan help exposes only the four promoted dev knobs', () => {
-    const { harnessCmd } = productionHarness(async () => {}, undefined, undefined, undefined, async () => {});
-    const plan = harnessCmd.commands.find((command) => command.name() === 'plan');
+  test('plan help shares the ask/say common launch knobs and adds only role-llm', () => {
+    const { harnessCmd } = productionHarness(async () => {}, undefined, async () => {}, async () => {}, async () => {});
+    const options = (name: string) => harnessCmd.commands.find((command) => command.name() === name)!.options.map((option) => option.long);
+    const common = options('ask').slice(0, 7);
 
-    expect(plan?.options.map((option) => option.long)).toEqual([
-      '--json',
-      '--base',
-      '--no-auto-merge',
-      '--merge-by-host',
-      '--observe-only',
-      '--no-supervise',
-      '--dry-run',
-      '--role-llm',
-    ]);
+    expect(options('say').slice(0, 7)).toEqual(common);
+    expect(common).toEqual(['--json', '--base', '--no-auto-merge', '--merge-by-host', '--observe-only', '--no-supervise', '--dry-run']);
+    expect(options('plan')).toEqual([...common, '--role-llm']);
   });
 
-  test('injected plan forwards the four promoted dev knobs', async () => {
+  test('injected plan forwards common launch knobs and the repeated plan-specific role-llm values', async () => {
     const received: Array<{ words: string[]; opts: object }> = [];
     const { program } = productionHarness(
       async () => {},
@@ -455,9 +459,9 @@ describe('harness CLI sink hook', () => {
       async (words, opts) => { received.push({ words, opts }); },
     );
 
-    await program.parseAsync(['node', 'elanous', 'harness', 'plan', '--json', '--base', 'release', '--no-auto-merge', '--observe-only', 'write', 'plan']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'plan', '--json', '--base', 'release', '--no-auto-merge', '--observe-only', '--role-llm', 'planning=grok/best', '--role-llm', 'review=anthropic', 'write', 'plan']);
 
-    expect(received).toEqual([{ words: ['write', 'plan'], opts: { json: true, base: 'release', autoMerge: false, observeOnly: true, supervise: true, supervisorSource: 'default', dryRun: false } }]);
+    expect(received).toEqual([{ words: ['write', 'plan'], opts: { json: true, base: 'release', autoMerge: false, observeOnly: true, supervise: true, supervisorSource: 'default', roleLlm: ['planning=grok/best', 'review=anthropic'], dryRun: false } }]);
   });
 
   test('injected plan without the required sentence ends with a non-zero Commander rejection', async () => {

@@ -304,13 +304,15 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
 
   let member: PodPoolMember | null = null;
   let pool = options.poolScheduler;
-  if (!pool && options.pool) {
-    const spec = resolvePodPoolSpec(options.pool, env);
-    if (!spec) throw new Error('pod command: 풀 스펙이 비었다');
-    const members = parsePodPool(spec);
-    const checked = (options.checkPool ?? checkPodPool)(members, baseKubectl as PoolKubectl);
-    if (!checked.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
-    pool = new PodPoolScheduler(checked.ready);
+  if (!pool) {
+    const spec = resolvePodPoolSpec(options.pool, env, () => options.kubectl ? undefined : getUserConfig().pod?.pool);
+    if (options.pool && !spec) throw new Error('pod command: 풀 스펙이 비었다');
+    if (spec) {
+      const members = parsePodPool(spec);
+      const checked = (options.checkPool ?? checkPodPool)(members, baseKubectl as PoolKubectl);
+      if (!checked.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
+      pool = new PodPoolScheduler(checked.ready);
+    }
   }
   if (pool) {
     for (;;) {
@@ -357,6 +359,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       if (synced && !synced.ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ${synced.detail}`);
       if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
     }
+    const imageRef = member?.imageRef;
+    if (!imageRef) log('pod.command-job', 'image-fallback-local', { reason: !member ? 'no-pool-member' : !imageCommit ? 'image-commit-unavailable' : 'registry-tag-unavailable' });
     const ghToken = options.clone ? (options.ghToken ?? defaultGhToken)() : undefined;
     const secret = commandJobSecret({ name, namespace, launch, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
     if (secret) {
@@ -364,8 +368,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       if (applied.status !== 0) throw new Error(applied.stderr.trim() || 'pod command: Secret 적용 실패');
     }
     const manifest = podCommandJobManifest({
-      name, namespace, launch, image: member?.imageRef ?? image,
-      ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
+      name, namespace, launch, image: imageRef ?? image,
+      ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
       ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(memoryLimit ? { memoryLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
@@ -398,7 +402,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       llm: llm ?? null,
       command: command.join(' ').slice(0, COMMAND_LOG_CHARS),
     });
-    return { exitCode, artifactsDir, job: name, image: member?.imageRef ?? image };
+    return { exitCode, artifactsDir, job: name, image: imageRef ?? image };
   } catch (err) {
     cleanupSecret();
     throw err;

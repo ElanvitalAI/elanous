@@ -27,13 +27,14 @@
 // that boolean before falling back to direct Telegram).
 
 import { createHash } from 'node:crypto';
+import { debug } from '../../debug/log.js';
 import { sendTelegramReport } from '../../telegram-report.js';
 import { getPushcutClient } from '../../pushcut/client.js';
 import type { UserConfig } from '../../user-config.js';
 import { formatForChannel, type OutboundChannelType, type OutboundMsg } from './format.js';
 import { spillLongContent } from '../../storage/content-spill.js';
 import {
-  openDeliveryDb, deliveryDedupKey, recentlyDelivered, recordDelivery, type ChannelDelivery,
+  openDeliveryDb, deliveryDedupKey, successfulDeliveryId, recordDelivery, type ChannelDelivery,
 } from './delivery-ledger.js';
 
 // 채널 타입·메시지·분할기는 format.ts가 단일 출처 — 기존 소비처(test 등) 호환 재export.
@@ -71,6 +72,8 @@ export interface RouteResult {
   channels: ChannelResult[];
   /** 중복 발사 제어(dedup)로 재팬아웃이 억제됨 — 최근 동일 발송 존재. */
   suppressed?: boolean;
+  /** 억제 근거가 된 앞선 성공 발송의 식별자. */
+  suppressedBy?: string;
   /** 이 발송의 식별자(리드 동기화·회상 교차참조용). */
   messageId?: string;
 }
@@ -207,9 +210,11 @@ export async function routeOutbound(cfg: UserConfig, msg: OutboundMsg, deps: Rou
   // ① 중복 발사 제어 — 최근(120s) 동일 발송이면 재팬아웃 억제.
   if (ledger && deps.dedup !== false) {
     try {
-      if (recentlyDelivered(ledger, dedupKey)) {
+      const suppressedBy = successfulDeliveryId(ledger, dedupKey);
+      if (suppressedBy) {
         if (ownLedger) ledger.close();
-        return { delivered: true, channels: [], suppressed: true, messageId };
+        try { debug.log('outbound.send', 'suppressed', { kind: msg.kind, suppressedBy }); } catch { /* 관측 실패는 발송 결과에 영향 없음 */ }
+        return { delivered: true, channels: [], suppressed: true, suppressedBy, messageId };
       }
     } catch { /* 원장 조회 실패 — 억제 없이 진행 */ }
   }

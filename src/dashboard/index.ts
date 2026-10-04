@@ -884,6 +884,7 @@ import { getInputHistoryStore, inputHistoryDbPath, inputHistoryJsonPath } from '
 import { inspectActiveProvider } from '../provider-summary.js';
 import { activeCodexAccountView } from '../oauth/codex-account-store.js';
 import { buildDashboardStatusLines } from './dashboard-status-lines.js';
+import { readSlashContextNow, seatsNowLine } from '../context-bus/context-now-surfaces.js';
 import { buildFirstScreenBand } from './first-screen-band.js';
 import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
@@ -6405,7 +6406,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const active = inspectActiveProvider(cfg);
     const reasoningProvider = (['openai-codex', 'openai', 'anthropic', 'gemini', 'grok', 'local', 'openrouter'] as const)
       .find(provider => active.provider === provider || active.provider === `auto:${provider}`);
+    let seatsNow: string | null = null;
+    try {
+      seatsNow = seatsNowLine(readSlashContextNow([]), Date.now());
+    } catch (error) {
+      debug.log('dashboard.status', 'seats-unreadable', { error: String(error) });
+    }
     return buildDashboardStatusLines({
+      seatsNow,
       provider: active.provider,
       model: active.model,
       reasoning: reasoningProvider

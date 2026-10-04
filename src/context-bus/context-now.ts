@@ -66,7 +66,7 @@ export function contextNow(options: { topic?: string; limit?: number } = {}, dep
         ? redactSecretText(entry.item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120) : null, source });
   }
   const rawEvents = (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
-  const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id));
+  const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at));
   const matches = (text: string) => !topic || text.toLocaleLowerCase().includes(topic.toLocaleLowerCase());
   const selectedFacts = facts.filter(f => !topic || (f.kind === 'cell' && matches(`${f.id} ${f.title}`))
     || (f.kind === 'seat' && matches(`${f.id ?? ''} ${f.title ?? ''}`)));
@@ -95,7 +95,7 @@ export function contextNow(options: { topic?: string; limit?: number } = {}, dep
     source: event.refs.source ?? event.refs.url ?? `elanous://context/event/${encodeURIComponent(event.id)}`,
   }));
   const selectedEvents = summaries.filter(event => matches(event.summary)).reverse().slice(0, limit);
-  const guide = summaries.filter(event => event.kind === 'guide-changed' || event.summary.startsWith('📌안내'))
+  const guide = summaries.filter(event => event.kind === 'guide-changed' || event.kind === 'guidance-changed' || event.summary.startsWith('📌안내'))
     .filter(event => matches(event.summary)).reverse().slice(0, limit)
     .map(event => `📌 ${event.summary} — ${event.source}`);
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };

@@ -544,32 +544,74 @@ test('a shadowed K9 moved from 0.2.11 to 0.2.12 is skipped unless its evidence o
   try {
     const old = { id: 'K9', owner: 'TC', title: 'carry K9', status: 'yellow', evidence: 'same evidence' };
     checklist(f, '0.2.11', [old]);
-    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.11', '0.2.12'], config: { mode: 'shadow', seats: ['TC'] } };
+    let carried = false;
+    const history: NonNullable<SeatDeps['checklistHistory']> = (id) => id === 'K9' && carried ? [{
+      id, at: now.toISOString(), by: 'TC', field: 'move', from: '0.2.11', to: '0.2.12',
+      version: '0.2.12', seq: 1, released: '0.2.10', dev: '0.2.12', reason: 'carry forward',
+    }] : [];
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.11', '0.2.12'], config: { mode: 'shadow', seats: ['TC'] }, checklistHistory: history };
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('shadow');
+    carried = true;
     checklist(f, '0.2.11', []);
     checklist(f, '0.2.12', [old, { id: 'Z10', owner: 'TC', title: 'next', status: 'yellow' }]);
     const inputs = await gatherSeatInputs('TC', deps);
     const ledger = entries(f);
-    expect(alreadyHandled(inputs.checklist[0]!, ledger)).toBe(true);
-    expect(pickNext(inputs, ledger, { shadow: true })?.id).toBe('Z10');
-    expect(spy.mock.calls).toContainEqual(['seat.loop', 'skip-handled', { id: 'K9' }]);
+    expect(alreadyHandled(inputs.checklist[0]!, ledger)).toBe(false);
+    expect(pickNext(inputs, ledger, { shadow: true, history })?.id).toBe('Z10');
+    expect(spy.mock.calls).toContainEqual(['seat.loop', 'skip-carried', { id: 'K9', from: '0.2.11', version: '0.2.12' }]);
     expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string } }).item?.id).toBe('Z10');
     checklist(f, '0.2.12', [{ ...old, evidence: 'changed evidence' }]);
     const changed = await gatherSeatInputs('TC', deps);
     expect(alreadyHandled(changed.checklist[0]!, entries(f))).toBe(false);
-    expect(pickNext(changed, entries(f), { shadow: true })?.id).toBe('K9');
+    expect(pickNext(changed, entries(f), { shadow: true, history })?.id).toBe('K9');
     expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string } }).item?.id).toBe('K9');
     checklist(f, '0.2.12', [{ ...old, title: 'retitled K9' }]);
     const retitled = await gatherSeatInputs('TC', deps);
     expect(alreadyHandled(retitled.checklist[0]!, entries(f))).toBe(false);
-    expect(pickNext(retitled, entries(f), { shadow: true })?.id).toBe('K9');
+    expect(pickNext(retitled, entries(f), { shadow: true, history })?.id).toBe('K9');
   } finally { spy.mockRestore(); f.close(); }
+});
+
+test('carry selection requires an actual move and prior shadow with unchanged evidence', () => {
+  const item = { source: 'checklist' as const, id: 'K9', version: '0.2.12', seat: 'TC', title: 'carry', text: 'carry',
+    evidenceHash: 'same', asOf: now.toISOString() };
+  const before = new Date(now.getTime() - 60_000).toISOString();
+  const moved = new Date(now.getTime() - 30_000).toISOString();
+  const row = { seat: 'TC', at: before, status: 'shadow' as const, action: 'harness' as const,
+    item: { ...item, version: '0.2.11' } };
+  const history: NonNullable<SeatDeps['checklistHistory']> = () => [{ id: 'K9', at: moved, by: 'TC', field: 'move',
+    from: '0.2.11', to: '0.2.12', version: '0.2.12', seq: 1, released: '0.2.10', dev: '0.2.12' }];
+  const inputs = { requests: [], checklist: [item], role: '' };
+  expect(pickNext(inputs, [row], { shadow: true, history })).toBeNull();
+  expect(pickNext(inputs, [row], { shadow: true, history: () => [] })).toEqual(item);
+  expect(pickNext(inputs, [{ ...row, status: 'launched' }], { history })).toEqual(item);
+  expect(pickNext(inputs, [{ ...row, item: { ...row.item, title: 'old title' } }], { shadow: true, history })).toEqual(item);
+  expect(pickNext(inputs, [{ ...row, item: { ...row.item, evidenceHash: 'old' } }], { shadow: true, history })).toEqual(item);
+  expect(pickNext(inputs, [{ ...row, at: now.toISOString() }], { shadow: true, history })).toEqual(item);
+  expect(pickNext(inputs, [row, { ...row, at: now.toISOString(), item: { ...row.item, evidenceHash: 'old' } }],
+    { shadow: true, history })).toEqual(item);
+  expect(pickNext(inputs, [row], { shadow: true, history: () => [{ ...history('K9')[0]!, to: '0.2.13' }] })).toEqual(item);
+});
+
+test('carried cells with unchanged evidence are reconsidered after the seven-day shadow window', () => {
+  const item = { source: 'checklist' as const, id: 'K9', version: '0.2.12', seat: 'TC', title: 'carry', text: 'carry',
+    evidenceHash: 'same', asOf: now.toISOString() };
+  const moved = new Date(now.getTime() - 86400_000).toISOString();
+  const history: NonNullable<SeatDeps['checklistHistory']> = () => [{ id: 'K9', at: moved, by: 'TC', field: 'move',
+    from: '0.2.11', to: '0.2.12', version: '0.2.12', seq: 1, released: '0.2.10', dev: '0.2.12' }];
+  const oldShadow = { seat: 'TC', at: new Date(now.getTime() - 8 * 86400_000).toISOString(), status: 'shadow' as const,
+    action: 'harness' as const, item: { ...item, version: '0.2.11' } };
+  const inputs = { requests: [], checklist: [item], role: '' };
+  expect(pickNext(inputs, [oldShadow], { shadow: true, history })).toEqual(item);
+  expect(pickNext(inputs, [{ ...oldShadow, at: new Date(now.getTime() - 7 * 86400_000).toISOString() }],
+    { shadow: true, history })).toBeNull();
 });
 
 test('alreadyHandled only matches the same seat, recent shadow or launch, id, title and evidence hash', () => {
   const item = { source: 'checklist' as const, id: 'K9', version: '0.2.12', title: 'carry', text: 'carry',
     seat: 'TC', evidenceHash: 'hash', asOf: now.toISOString() };
-  const row = { seat: 'TC', at: now.toISOString(), status: 'launched' as const, item: { ...item, version: '0.2.11' } };
+  const row = { seat: 'TC', at: now.toISOString(), status: 'launched' as const, item };
+  expect(alreadyHandled(item, [{ ...row, item: { ...item, version: '0.2.11' } }])).toBe(false);
   expect(alreadyHandled(item, [row])).toBe(true);
   expect(alreadyHandled(item, [{ ...row, status: 'shadow' }])).toBe(true);
   expect(alreadyHandled(item, [{ ...row, seat: 'MK' }])).toBe(false);

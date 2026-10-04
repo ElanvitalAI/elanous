@@ -44,7 +44,7 @@ export function classifyGoalDifficulty(signals: DifficultySignals): DifficultyLe
 /** Only the baseline role default is adjustable; explicit roleLlm and older config/env layers win. */
 export function implementDifficultyTier(level: DifficultyLevel, role: RoleLlmResolution): ModelTier | undefined {
   if (role.source !== 'default') return undefined;
-  return level === 'small' ? 'budget' : level === 'large' ? 'better' : ROLE_MODEL_DEFAULTS.implement.tier;
+  return level === 'small' ? 'budget' : level === 'large' ? 'best' : ROLE_MODEL_DEFAULTS.implement.tier;
 }
 
 export function resolveImplementDifficulty(role: RoleLlmResolution, level: DifficultyLevel): RoleLlmResolution {

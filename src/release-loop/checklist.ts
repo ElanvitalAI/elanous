@@ -29,6 +29,7 @@ export interface ChecklistHistory {
   released: string;
   dev: string;
   force?: true;
+  reason?: string;
 }
 export interface Checklist {
   version: string;
@@ -72,13 +73,18 @@ export function listChecklist(v: string, root?: string): Checklist {
   return decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root));
 }
 
+/** Events for this id across every release, ordered by event time (then ledger sequence). */
+export function checklistHistory(id: string): Array<ChecklistHistory & { version: string; seq: number }> {
+  return store.history(id).map(decodeClaimHistoryEntry);
+}
+
 /** Status events in the requested window; other ledger fields never become status changes. */
 export function statusChangesSince(history: readonly ChecklistHistory[], sinceIso: string): ChecklistHistory[] {
   const since = Date.parse(sinceIso);
   return history.filter((entry) => entry.field === 'status' && Date.parse(entry.at) >= since);
 }
 
-function mutate(v: string, apply: (data: Checklist) => boolean): Checklist {
+function mutate(v: string, apply: (data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]) => boolean): Checklist {
   return decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply));
 }
 
@@ -87,13 +93,19 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
   debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
 }
 
-export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind }): Checklist {
+export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
   if (input.owner !== undefined) parseOwner(input.owner);
-  return mutate(v, (data) => {
+  return mutate(v, (data, otherItems) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
+    const collisions = otherItems(input.id);
+    if (collisions.length) {
+      const displayedId = JSON.stringify(input.id).slice(1, -1);
+      console.error(`⚠ 중복 id: ${displayedId} — ${collisions.map((item) => `${item.version} · 담당 ${JSON.stringify(item.owner ?? '-').slice(1, -1)} · ${item.title.replace(/\s+/g, ' ').slice(0, 40)}`).join(' / ')}`);
+      if (!options.allowDuplicateId) throw new CliUserError(`다른 판에 이미 있는 칸: ${displayedId}`, '--allow-duplicate-id 로 허용');
+    }
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
     const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), updatedAt: at, updatedBy: by };

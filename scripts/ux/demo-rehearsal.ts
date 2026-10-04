@@ -5,6 +5,11 @@ import { Frames, launch, PUBLIC_LEAK_CHECK, sleep } from './lib/cdp.js';
 import { failedApiResponse, judgeRun, judgeScene, worstSceneState, type SceneObservation, type SceneState } from './lib/rehearsal-verdict.js';
 
 const TITLES = ['문서 아키텍처', '라이브 트레이스', '루프 에이전트', '그래프 편집기', '마법사 → 마켓', 'PTY 인텔리전스'];
+export const EMPTY_STATE_PHRASES = ['지금 도는 런이 없습니다', '마법사가 아직 돌지 않았습니다', '터미널을 기다리는 중', '판단을 기다리는 중', '못 읽음'] as const;
+
+export function sceneSnapshotScript(): string {
+  return `(()=>{const sections=[...document.querySelectorAll('[data-inside-scene]')]; const visible=sections.filter(s=>!s.hidden && s.getClientRects().length>0); const text=visible.length===1?visible[0].innerText:''; return {sectionsInDom:sections.length,visibleScene:visible.length===1?Number(visible[0].getAttribute('data-inside-scene')):null,textLength:text.length,emptyStates:${JSON.stringify(EMPTY_STATE_PHRASES)}.filter(phrase=>text.includes(phrase))}})()`;
+}
 
 type Args = { url: string; out: string; secs: number; width: number; height: number; demo: boolean; tokenStdin: boolean };
 
@@ -168,23 +173,20 @@ export async function run(args: Args): Promise<number> {
     const initialEvents = observer.take();
     const scenes = [];
     for (let scene = 1; scene <= 6; scene++) {
-      const hiddenByDemo = args.demo && scene === 5;
-      if (hiddenByDemo) {
-        const result = judgeScene({ scene, title: TITLES[scene - 1]!, hiddenByDemo, secs: 0, frames: 0, exceptions: [], failedRequests: [], textLength: 0, leaks: [], sectionsInDom: 0, visibleScene: null });
-        scenes.push(result);
-        console.log(`scene ${scene} ${result.verdict} 0s frames=0`);
-        continue;
-      }
+      const hiddenByDemo = false;
       if (scene !== 1) {
         await cdp.ev<boolean>(`(()=>{const n=${scene}; const nav=document.querySelector('nav[aria-label="장면 선택"]'); const button=[...(nav?.querySelectorAll('button')??[])].find(b=>b.textContent?.trim().startsWith(n+' ')); button?.click(); return !!button})()`);
         await sleep(300);
       }
       const frames = new Frames(join(args.out, `scene-${scene}`));
       const states: SceneState[] = [];
+      const emptyStates = new Set<string>();
       const sceneRect = await cdp.ev<FrameRect | null>(`(()=>{const s=document.querySelector('[data-inside-scene="${scene}"]'); if (!s || s.hidden) return null; const r=s.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height}})()`);
       let blankFrames = 0;
       const inspect = async () => {
-        states.push(await cdp.ev<SceneState>(`(()=>{const sections=[...document.querySelectorAll('[data-inside-scene]')]; const visible=sections.filter(s=>!s.hidden && s.getClientRects().length>0); return {sectionsInDom:sections.length,visibleScene:visible.length===1?Number(visible[0].getAttribute('data-inside-scene')):null,textLength:visible.length===1?visible[0].innerText.length:0}})()`));
+        const { emptyStates: observedEmpty, ...state } = await cdp.ev<SceneState & { emptyStates: string[] }>(sceneSnapshotScript());
+        states.push(state);
+        for (const phrase of observedEmpty) emptyStates.add(phrase);
       };
       const until = Date.now() + args.secs * 1000;
       await inspect();
@@ -203,7 +205,7 @@ export async function run(args: Args): Promise<number> {
         failedRequests: [...initialEvents.failedRequests, ...observed.failedRequests],
       } : observed;
       frames.toMp4(join(args.out, `scene-${scene}.mp4`), args.width, args.height);
-      const obs: SceneObservation = { scene, title: TITLES[scene - 1]!, hiddenByDemo, secs: args.secs, frames: frames.list.length, ...events, ...dom, leaks: bad, blankFrames };
+      const obs: SceneObservation = { scene, title: TITLES[scene - 1]!, hiddenByDemo, secs: args.secs, frames: frames.list.length, ...events, ...dom, leaks: bad, blankFrames, emptyStates: [...emptyStates] };
       const result = judgeScene(obs);
       scenes.push(result);
       console.log(`scene ${scene} ${result.verdict} ${args.secs}s frames=${result.frames}`);
@@ -222,13 +224,15 @@ export async function run(args: Args): Promise<number> {
       '|---|---|---:|---:|---|',
       ...scenes.map((s) => `| ${s.scene} ${s.title} | ${s.verdict} | ${s.secs} | ${s.frames} | ${s.reasons.join('; ') || '없음'} |`),
       '',
-      `ok ${result.ok} · broken ${result.broken} · 미검증 ${result.unverified}`,
+      `ok ${result.ok} · broken ${result.broken} · 미검증 ${result.unverified} · 실데이터 없음 ${result.noData}`,
+      '',
+      '종료 코드: ok=0 · broken=1 · unverified=2 · no-data=3',
       '',
     ].join('\n'));
     for (const line of result.banner) console.log(`⚠️ ${line}`);
-    console.log(`rehearsal ${result.verdict} ok=${result.ok} broken=${result.broken} unverified=${result.unverified}`);
-    // 0 = all seen and ok · 1 = broken · 2 = nothing broken but a scene was not seen (not a pass).
-    return result.verdict === 'broken' ? 1 : result.verdict === 'unverified' ? 2 : 0;
+    console.log(`rehearsal ${result.verdict} ok=${result.ok} broken=${result.broken} unverified=${result.unverified} no-data=${result.noData}`);
+    // 0 = ok · 1 = broken · 2 = unverified · 3 = no-data.
+    return result.verdict === 'broken' ? 1 : result.verdict === 'unverified' ? 2 : result.verdict === 'no-data' ? 3 : 0;
   } finally { observer?.close(); cdp.close(); }
 }
 

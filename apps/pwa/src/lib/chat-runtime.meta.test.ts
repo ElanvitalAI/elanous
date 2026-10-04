@@ -33,14 +33,13 @@ describe('PWA slash-command boundary', () => {
   it('answers TUI commands and aliases locally, without calling an LLM', async () => {
     const cap = captureMetaLog();
     try {
-      for (const name of ['/run-skill test', '/rs test', '/status', '/resume-turn']) {
+      for (const name of ['/run-skill test', '/rs test', '/resume-turn']) {
         expect(isMetaCommand(name)).toBe(true);
         expect((await dispatchMeta(name, ctx))?.text).toBe(`${name.split(' ')[0]} 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear`);
       }
       expect(cap.seen).toEqual([
         { cmd: ':run-skill', outcome: 'unsupported-tui' },
         { cmd: ':rs', outcome: 'unsupported-tui' },
-        { cmd: ':status', outcome: 'unsupported-tui' },
         { cmd: ':resume-turn', outcome: 'unsupported-tui' },
       ]);
     } finally { cap.restore(); }
@@ -66,7 +65,7 @@ describe('PWA slash-command boundary', () => {
   it('keeps the meta handlers, their slash equivalents and their outcomes', async () => {
     const cap = captureMetaLog();
     try {
-      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'fork', 'rewind', 'undo', 'budget', 'history', 'clear', 'sessions', 'resume', 'model', 'reasoning', 'provider']);
+      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'remaining', 'status', 'fork', 'rewind', 'undo', 'budget', 'history', 'clear', 'sessions', 'resume', 'model', 'reasoning', 'provider', 'wish']);
       expect(Object.keys(META_HANDLERS)).toEqual(META_COMMANDS.map(({ name }) => `:${name}`));
       for (const name of ['help', 'session', 'budget', 'history', 'clear']) {
         expect(await dispatchMeta(`/${name}`, ctx)).toEqual(await dispatchMeta(`:${name}`, ctx));
@@ -159,7 +158,7 @@ describe('PWA slash-command boundary', () => {
     expect((await dispatchMeta('/help', ctx))?.text).toBe(colon);
     expect(colon?.split('\n')).toEqual([
       '메타 명령(:이름 또는 /이름) (Meta commands):',
-      ...META_COMMANDS.map(({ name, description }) => `  ${['rewind', 'undo', 'sessions', 'resume', 'model', 'reasoning', 'provider'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
+      ...META_COMMANDS.map(({ name, description }) => `  ${['remaining', 'status', 'rewind', 'undo', 'sessions', 'resume', 'model', 'reasoning', 'provider'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
     ]);
     for (const description of META_COMMANDS.map(({ description }) => description)) {
       expect(description).toMatch(/[가-힣]/);
@@ -172,19 +171,18 @@ describe('PWA slash-command boundary', () => {
     for (const name of ['sessions', 'resume', 'model', 'reasoning', 'provider']) expect(colon).toContain(`/${name}`);
   });
 
-  it('routes /resume locally and preserves unsupported /resume-turn and /status', async () => {
+  it('routes /resume locally and preserves unsupported /resume-turn (PCH-4b: /status is now local)', async () => {
     const cap = captureMetaLog();
     try {
       const result = await dispatchMeta('/resume abc', ctx);
       expect(result).toEqual({ text: '쓰는 법: /resume <id 앞자리> (4자 이상)' });
       expect(result?.text).not.toContain('아직 안 됩니다');
-      for (const name of ['/resume-turn', '/status']) {
+      for (const name of ['/resume-turn']) {
         expect((await dispatchMeta(name, ctx))?.text).toContain('PWA 채팅에서 아직 안 됩니다');
       }
       expect(cap.seen).toEqual([
         { cmd: ':resume', outcome: 'ok' },
         { cmd: ':resume-turn', outcome: 'unsupported-tui' },
-        { cmd: ':status', outcome: 'unsupported-tui' },
       ]);
     } finally { cap.restore(); }
   });
@@ -298,6 +296,15 @@ describe('PWA slash-command boundary', () => {
       if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
       else delete (globalThis as { localStorage?: Storage }).localStorage;
     }
+  });
+
+  it('keeps wish immediately after now in the local TUI-name snapshot', () => {
+    const source = readFileSync(resolve(import.meta.dir, 'chat-runtime.ts'), 'utf8');
+    const list = source.match(/const TUI_SLASH_NAMES = new Set\(\[([\s\S]*?)\]\);/)?.[1];
+    expect(list).toBeDefined();
+    const names = [...list!.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    expect(names.slice(names.indexOf('now'), names.indexOf('now') + 3)).toEqual(['now', 'wish', 'remaining']);
+    expect(names.filter((name) => name === 'wish')).toHaveLength(1);
   });
 
   it('keeps the local TUI-name snapshot in sync with names and aliases, without a runtime server import', () => {

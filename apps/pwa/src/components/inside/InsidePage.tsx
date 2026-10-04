@@ -8,6 +8,7 @@ import { LiveTraceScene } from './LiveTraceScene';
 import { GraphEditorScene } from './GraphEditorScene';
 import { LoopAgentsScene } from './LoopAgentsScene';
 import { PtyDecisionScene } from './PtyDecisionScene';
+import { WizardMarketScene } from './WizardMarketScene';
 import { EMPTY_DECISIONS, reduceDecisions } from './pty-decisions';
 import { subscribePtyDecisions } from '@/lib/inside-events';
 import { useDaemon } from '@/components/providers/DaemonProvider';
@@ -15,8 +16,6 @@ import { toPublicText } from './public-text';
 
 const SCENES = ['문서 아키텍처', '라이브 트레이스', '루프 에이전트', '그래프 편집기', '마법사 → 마켓', 'PTY 인텔리전스'] as const;
 const LAST_SCENE = SCENES.length;
-/** ⑤ (wizard → market) is hidden in demo mode until WIZ1 lands; arrows step over it. */
-const DEMO_HIDDEN_SCENE = 5;
 const DEMO_KEY = 'elanous.inside.demo';
 
 function insideScene(value: string | null): number {
@@ -28,12 +27,9 @@ export function InsidePage() {
   return <InsidePageContent search={search} />;
 }
 
-/** Scenes ②③④⑥ need a daemon / React Flow; tests pass stand-ins. */
-export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, editorScene = <GraphEditorScene />, loopScene = <LoopAgentsScene />, ptyScene = <LivePtyDecisionScene /> }: { search: URLSearchParams; liveTrace?: ReactNode; editorScene?: ReactNode; loopScene?: ReactNode; ptyScene?: ReactNode }) {
-  const [scene, setScene] = useState(() => {
-    const selected = insideScene(search.get('scene'));
-    return search.get('demo') === '1' && selected === DEMO_HIDDEN_SCENE ? 1 : selected;
-  });
+/** Scenes ②③④⑤⑥ need a daemon / React Flow; tests pass stand-ins. */
+export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, editorScene = <GraphEditorScene />, loopScene = <LoopAgentsScene />, wizardScene = <WizardMarketScene />, ptyScene = <LivePtyDecisionScene /> }: { search: URLSearchParams; liveTrace?: ReactNode; editorScene?: ReactNode; loopScene?: ReactNode; wizardScene?: ReactNode; ptyScene?: ReactNode }) {
+  const [scene, setScene] = useState(() => insideScene(search.get('scene')));
   const [demo, setDemo] = useState(() => search.get('demo') === '1');
   const stageRef = useRef<HTMLElement>(null);
   const sceneRef = useRef(scene);
@@ -48,7 +44,7 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
   }, []);
 
   const selectScene = useCallback((next: number) => {
-    if (next < 1 || next > LAST_SCENE || (demoRef.current && next === DEMO_HIDDEN_SCENE)) return;
+    if (next < 1 || next > LAST_SCENE) return;
     sceneRef.current = next;
     setScene(next);
     updateAddress({ scene: String(next) });
@@ -58,10 +54,9 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
     const next = !demoRef.current;
     demoRef.current = next;
     setDemo(next);
-    if (next && sceneRef.current === DEMO_HIDDEN_SCENE) selectScene(1);
     updateAddress({ demo: next ? '1' : '0' });
     try { window.localStorage.setItem(DEMO_KEY, next ? '1' : '0'); } catch { /* address remains authoritative */ }
-  }, [selectScene, updateAddress]);
+  }, [updateAddress]);
 
   useEffect(() => {
     const fromAddress = search.get('demo');
@@ -75,10 +70,9 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
     demoRef.current = next;
     setDemo(next);
     const selected = insideScene(search.get('scene'));
-    sceneRef.current = next && selected === DEMO_HIDDEN_SCENE ? 1 : selected;
-    setScene(sceneRef.current);
-    if (next && selected === DEMO_HIDDEN_SCENE) updateAddress({ scene: '1' });
-  }, [search, updateAddress]);
+    sceneRef.current = selected;
+    setScene(selected);
+  }, [search]);
 
   useEffect(() => {
     window.dispatchEvent(new window.Event('elanous:inside-demo'));
@@ -90,9 +84,7 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
         event.preventDefault();
         const step = event.key === 'ArrowRight' ? 1 : -1;
-        let next = sceneRef.current + step;
-        if (demoRef.current && next === DEMO_HIDDEN_SCENE) next += step;
-        selectScene(Math.min(LAST_SCENE, Math.max(1, next)));
+        selectScene(Math.min(LAST_SCENE, Math.max(1, sceneRef.current + step)));
       } else if (event.key.toLowerCase() === 'd') {
         toggleDemo();
       } else if (event.key.toLowerCase() === 'f') {
@@ -121,7 +113,7 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
         {demo && <span aria-label="시연 모드" style={{ fontSize: 18 }}>시연</span>}
       </header>
       <nav aria-label="장면 선택" style={{ display: 'flex', minHeight: 48, overflowX: 'auto', gap: 8, margin: '18px 0', whiteSpace: 'nowrap' }}>
-        {SCENES.map((name, index) => (!demo || index !== DEMO_HIDDEN_SCENE - 1) && (
+        {SCENES.map((name, index) => (
           <button key={name} type="button" aria-current={scene === index + 1 ? 'page' : undefined} onClick={() => selectScene(index + 1)}
             style={{ flexShrink: 0, minHeight: 48, padding: '8px 16px', fontSize: 18, borderRadius: 8, border: '1px solid #7188a5', color: '#fff', background: scene === index + 1 ? '#22558b' : '#203147' }}>
             {toPublicText(`${index + 1} ${name}`)}
@@ -130,7 +122,7 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
       </nav>
       {SCENES.map((name, index) => (
         <section key={name} data-inside-scene={index + 1} hidden={scene !== index + 1} aria-label={toPublicText(`${index + 1} ${name}`)} style={{ minWidth: 0 }}>
-          {index === 0 ? <ArchitectureScene /> : index === 1 ? liveTrace : index === 2 ? loopScene : index === 3 ? editorScene : index === 5 ? ptyScene : <p>{toPublicText('방문자가 한 줄로 요청하면 조사 → 커넥터·스킬·그래프 생성 → 시험 → 마켓 게시까지 이어지는 장면 — 마법사 연결 뒤 이 자리에서 실행됩니다')}</p>}
+          {index === 0 ? <ArchitectureScene /> : index === 1 ? liveTrace : index === 2 ? loopScene : index === 3 ? editorScene : index === 4 ? wizardScene : ptyScene}
         </section>
       ))}
     </main>

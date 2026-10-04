@@ -7,7 +7,7 @@ import { emitNodeResult } from './node-verdict.js';
 import { debug } from '../../src/debug/log.js';
 
 type Kind = 'release' | 'dev-bump';
-type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; worktree?: string; error?: string };
+type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string };
 
 export function nextDevVersion(version: string): string {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
@@ -120,12 +120,22 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
     const old = `"version": "${current}"`;
     if (!text.includes(old)) throw new Error(`package.json version field not found: ${current}`);
     writeFileSync(path, text.replace(old, `"version": "${target}"`));
+    const files = ['package.json'];
     const serverPath = join(worktree, 'server.json');
     if (existsSync(serverPath)) {
       const server = JSON.parse(readFileSync(serverPath, 'utf8')) as { version: string; packages: Array<{ version: string }> };
       server.version = target;
       server.packages[0]!.version = target;
       writeFileSync(serverPath, `${JSON.stringify(server, null, 2)}\n`);
+      files.push('server.json');
+    }
+    const agentPath = join(worktree, 'integrations', 'acp-registry', 'elanous', 'agent.json');
+    if (existsSync(agentPath)) {
+      const agent = JSON.parse(readFileSync(agentPath, 'utf8')) as { version: string; distribution: { npx: { package: string } } };
+      agent.version = target;
+      agent.distribution.npx.package = `elanous@${target}`;
+      writeFileSync(agentPath, `${JSON.stringify(agent, null, 2)}\n`);
+      files.push('agent.json');
     }
     const lockPath = join(worktree, 'bun.lock');
     const lock = readFileSync(lockPath, 'utf8');
@@ -185,7 +195,7 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
     fetchMain(repo);
     const commit = git(repo, 'rev-parse', 'origin/main');
     if (versionAt(repo) !== target || commit === before) throw new Error(`origin/main did not advance to ${target} after merge`);
-    const output: Output = { outcome: 'ok', kind, version: target, commit, pr: pr ? Number(pr[1]) : null };
+    const output: Output = { outcome: 'ok', kind, version: target, commit, pr: pr ? Number(pr[1]) : null, files };
     if (kind === 'release') debug.log('release-loop.cut', 'chosen', { version: releaseVersion, source: 'main', commit });
     git(repo, 'worktree', 'remove', '--force', worktree);
     rmSync(temp, { recursive: true, force: true });
@@ -240,7 +250,7 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
 
 if (import.meta.main) {
   const output = main();
-  debug.log(`release-loop.version-${output.kind ?? 'unknown'}`, 'result', { version: output.version, outcome: output.outcome });
+  debug.log(`release-loop.version-${output.kind ?? 'unknown'}`, 'result', { version: output.version, outcome: output.outcome, files: output.files ?? [] });
   emitNodeResult({ ...output, verdict: output.outcome === 'ok' ? 'pass' : 'fail', summary: output.outcome === 'ok' ? `${output.kind} ${output.version} · ${output.commit}` : `${output.kind ?? 'version'}: ${output.error ?? 'failed'}` });
   if (output.outcome === 'error') process.exitCode = 1;
 }

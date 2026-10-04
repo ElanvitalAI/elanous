@@ -26,17 +26,20 @@ export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = 
     const loadLedger = deps.loadLedger ?? loadRunLedger;
     const readGoalDocument = deps.readGoalDocument ?? ((path: string) => readFileSync(path, 'utf8'));
     let unknown = observation.completeness !== 'complete' || observation.pty.unreadable.length > 0;
+    const unknownReasons = new Set<string>();
+    if (observation.completeness !== 'complete') unknownReasons.add(`ledger observation ${observation.completeness}`);
+    for (const root of observation.pty.unreadable) unknownReasons.add(`unreadable PTY: ${root}`);
     const active = new Set<string>();
     for (const run of observation.entries) {
       if (run.status === 'ended-unclosed') continue;
-      if (run.ledgerDirectories.length === 0) { unknown = true; continue; }
+      if (run.ledgerDirectories.length === 0) { unknown = true; unknownReasons.add(`${run.runId}: ledger directory absent`); continue; }
       let identified = false;
       for (const directory of run.ledgerDirectories) {
         try {
           const ledger = loadLedger(run.runId, directory);
-          if (ledger === null) { unknown = true; continue; }
+          if (ledger === null) { unknown = true; unknownReasons.add(`${run.runId}: ledger unavailable`); continue; }
           const ids = new Set(ledger.flatMap((entry) => entry.goalId ? [entry.goalId] : []));
-          if (ids.size !== 1) { unknown = true; continue; }
+          if (ids.size !== 1) { unknown = true; unknownReasons.add(`${run.runId}: expected one goalId, found ${ids.size}`); continue; }
           identified = true;
           let matches = ids.has(goalId);
           if (!matches && goalId.startsWith('request-') && run.status === 'running' && run.ptyRefs.length > 0) {
@@ -45,20 +48,26 @@ export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = 
               try {
                 const ask = extractVerbatimOriginalAsk(readGoalDocument(document));
                 matches = ask?.range !== undefined && launchRequestId(ask.ask) === goalId;
-              } catch { unknown = true; }
+              } catch { unknown = true; unknownReasons.add(`${run.runId}: goal document unreadable`); }
             }
           }
           if (matches) {
             if (run.status === 'running' && run.ptyRefs.length > 0) active.add(run.runId);
-            else unknown = true;
+            else { unknown = true; unknownReasons.add(`${run.runId}: matching ledger without live PTY`); }
           }
-        } catch { unknown = true; }
+        } catch { unknown = true; unknownReasons.add(`${run.runId}: ledger read failed`); }
       }
       if (!identified) unknown = true;
     }
     // Positive evidence wins even if a different process or store is unreadable.
-    return active.size > 0 ? [...active].sort() : unknown ? 'unknown' : [];
-  } catch {
+    if (active.size > 0) return [...active].sort();
+    if (unknown) {
+      try { debug.log('execution-loop.launch-gate', 'active-runs-unknown', { goalId, reasons: [...unknownReasons] }); } catch { /* observation is fail-soft */ }
+      return 'unknown';
+    }
+    return [];
+  } catch (error) {
+    try { debug.log('execution-loop.launch-gate', 'active-runs-unknown', { goalId, reasons: [error instanceof Error ? error.message : String(error)] }); } catch { /* observation is fail-soft */ }
     return 'unknown';
   }
 }

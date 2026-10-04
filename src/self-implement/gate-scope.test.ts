@@ -268,6 +268,19 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
     expect(s.importerTestsNotRun).toMatchObject({ total: 0, truncated: false, unresolvedRelativeSpecifiers: 0 });
     expect(s.callerTests).toHaveLength(21);
   });
+
+  test('over the caller cap, the route consumer on the changed line and nearby importers are kept (GATE-CALLERS2)', () => {
+    const importers = Array.from({ length: 31 }, (_, index) => `apps/x/off-${String(index).padStart(2, '0')}.test.ts`);
+    const near = 'src/debug/near.test.ts';
+    const routeConsumer = 'test/zz-route.test.ts';
+    const index = { testsBySource: new Map([['src/debug/log.ts', [...importers, near]]]), unresolvedRelativeSpecifiers: 0 };
+    const routeConsumerTestIndex = { testsBySource: new Map([['src/debug/log.ts', [routeConsumer]]]), lookupFailures: [] };
+    const s = resolveGateScope(['src/debug/log.ts'], has(...importers, near, routeConsumer), index, { routeConsumerTestIndex });
+
+    expect(s.callerTests.slice(0, 2)).toEqual([{ file: routeConsumer, reasons: ['route'] }, { file: near, reasons: ['import'] }]);
+    expect(s.callerTests).toHaveLength(30);
+    expect(s.callerTestsOverflow.map(({ file }) => file)).toEqual(importers.slice(28));
+  });
 });
 
 // ── integrity-gate 경계 계약 (리뷰 should-fix 2026-07-26) ─────────────────────────────

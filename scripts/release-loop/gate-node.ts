@@ -124,7 +124,8 @@ export const POD_MEMORY_SOURCE = 'docs/measurements/td1-whole-gate-mechanical-20
 /** GT1 — files per retry chunk when a root shard fails (0.2.7: bundles of 54+ files OOMed at 16Gi, smaller passed). */
 export const POD_SHARD_FILE_CAP = 27;
 
-export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts'];
+// review-model-ab: Pod 에서 출력 없이 멈춤 2/2(10-04 0.2.11 · 로컬 단독 4/0 · 1.7s) — GATE-STALL 수리 전까지 Pod 밖.
+export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts', 'scripts/review-model-ab.test.ts'];
 /** Nightly-only whole-repository cases; gate runs the fixture cases in these same files. */
 export const GATE_NIGHTLY_AUDITS: readonly string[] = [
   // Replaces F12's real-repo bucket B apps/pwa scope check and its whole-repo export partition check.
@@ -267,7 +268,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     }, 0);
     const knownTimes = assignable.map((file) => durations.get(file)).filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
     const unknownSeconds = knownTimes.length ? (knownTimes[Math.floor((knownTimes.length - 1) / 2)]! + knownTimes[Math.floor(knownTimes.length / 2)]!) / 2 : 1;
-    const runShard = async (paths: string[], shard: number, depth = 0, branch = ''): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       const ignores = cdpPatterns.filter((pattern) => paths.includes(pattern))
         .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
@@ -353,6 +354,11 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             } catch { /* 그래도 못 맞추면 원래대로 멈춘다 */ }
           }
         }
+      }
+      if (reason === 'no-output' && !retriedNoOutput) {
+        const retry = await runShard(paths, shard, depth, `${branch}-retry`, true);
+        debug.log('release-loop.gate', 'pod-shard-retry', { shard, files: paths, reason, outcome: retry.stalled[0]?.reason ?? 'ok' });
+        return retry;
       }
       if (reason) {
         // 깊이 2 에서 «이름 없는 실패»·«불완전»도 파일 단위로 가른다 — 아니면 149파일 조각의 실패 하나가 끝까지 주인 없이 남는다(09-30 G1e 7번 조각: 요약 28 · 이름 27).

@@ -21,7 +21,7 @@ const tg = defaultTelegramCommands();
 const dc = [...ELANOUS_SLASH_COMMANDS, ...[personaCommand, pollCommand, relayCommand, showroomCommand, statusCommand, ...botCommands].map((c) => c.schema)];
 const names = (items: readonly { name: string }[]) => items.map((item) => item.name);
 const stableTg = 'help status new clear reset ping provider sessions fork resume decisions work cancel'.split(' ');
-const betaTg = 'skills skill digest intake ad taste missions attach detach now project'.split(' ');
+const betaTg = 'skills skill digest intake ad taste missions attach detach now project wish'.split(' ');
 const stableDc = 'status sessions new fork'.split(' ');
 const betaDc = 'persona poll attach'.split(' ');
 

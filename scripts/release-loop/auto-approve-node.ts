@@ -15,7 +15,7 @@ const outcomeMetric = (name: string, node: Record<string, unknown> | undefined):
 });
 
 /** Rows shown in auto-approval.md but never counted toward the 8 blocking metrics. */
-const WARNING_ONLY = new Set(['tui-regress', 'mac-smoke']);
+export const WARNING_ONLY = new Set(['tui-regress', 'mac-smoke']);
 
 /** `ok` · `warn` (a failure) · `unmeasured` (error or no output) — the macOS smoke never blocks publishing. */
 function macSmokeLevel(node: Record<string, unknown> | undefined): 'ok' | 'warn' | 'unmeasured' {

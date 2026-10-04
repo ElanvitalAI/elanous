@@ -26,6 +26,7 @@ import { envLiteral } from '../platform/env-literal.js';
 import { userConfigPath } from '../user-config.js';
 import { addItem, claimItem, decodeClaimHistoryEntry, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
+import { landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
@@ -499,7 +500,13 @@ async function checklistOutput(v: string, codenames: Record<string, string>, mod
   }
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}): void {
+export interface LandedButYellowDeps {
+  run?: Runner;
+  checklist?: typeof listChecklist;
+  now?: () => Date;
+}
+
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
@@ -538,10 +545,43 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     const { version, codenames, json } = context(cmd);
     await checklistOutput(version, codenames, 'status', json, opts.owner);
   });
+  withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(읽기 전용)'))
+    .option('--owner <owner>', '자리 또는 하위 자리로 거르기')
+    .action(async (opts: { owner?: string }, cmd: Command) => {
+      const { version, json } = context(cmd);
+      try {
+        if (opts.owner !== undefined) parseOwner(opts.owner);
+        const since = new Date((landedDeps.now ?? (() => new Date()))().getTime() - 7 * 86_400_000).toISOString().slice(0, 10);
+        const raw = must((landedDeps.run ?? defaultRunner)('gh', ['pr', 'list', '--state', 'merged', '--search', `merged:>=${since}`, '--limit', '400', '--json', 'number,title,body,mergedAt'], process.cwd()), '병합 PR 조회(gh)');
+        const prs = JSON.parse(raw) as MergedChecklistPr[];
+        if (!Array.isArray(prs)) throw new Error('병합 PR 조회(gh): 배열이 아니다');
+        const items = (landedDeps.checklist ?? listChecklist)(version).items;
+        const rows = landedButYellow(items, prs, { owner: opts.owner });
+        if (json) await writeStdoutJson(`${JSON.stringify(rows)}\n`);
+        else {
+          const updatedAtById = new Map(items.map((item) => [item.id, item.updatedAt]));
+          const date = (iso: string) => {
+            const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso));
+            const part = (name: string) => parts.find((entry) => entry.type === name)?.value;
+            return `${part('month')}-${part('day')} ${part('hour')}:${part('minute')}`;
+          };
+          for (const row of rows) {
+            const icon = row.status === 'yellow' ? '🟡' : '🔴';
+            console.log(`${row.id} ${row.owner ?? '-'} ${icon} ← ${row.prs.map((pr, i) => `#${pr.number} «${pr.title}» (${date(pr.mergedAt)} · 근거에 ${row.alreadyInEvidence[i] ? '있음' : '없음'}${pr.mergedAt > (updatedAtById.get(row.id) ?? '') ? ' · 칸보다 새것' : ''})`).join(' · ')}`);
+          }
+          console.log(`${rows.length}칸 · 그중 근거에 없는 PR 이 있는 칸 ${rows.filter((row) => row.alreadyInEvidence.includes(false)).length}`);
+        }
+        if (prs.length >= 400) console.error('⚠ 병합 PR 400개 상한: 목록이 잘렸을 수 있다');
+      } catch (error) {
+        console.error(`⛔ ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
-    .action((id: string, title: string, opts: { owner?: string; kind?: string }, cmd: Command) => {
+    .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
+    .action((id: string, title: string, opts: { owner?: string; kind?: string; allowDuplicateId?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
-    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) });
+    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
@@ -581,11 +621,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     });
   const actor = () => process.env.ELANOUS_TRACK || 'cli';
   withContext(checklist.command('move <id>').description('칸을 한 트랜잭션으로 다른 판에 옮긴다'))
-    .requiredOption('--from <v>', '현재 판').requiredOption('--to <v>', '새 판')
-    .action((id: string, opts: { from: string; to: string }, cmd: Command) => {
+    .requiredOption('--from <v>', '현재 판').requiredOption('--to <v>', '새 판').option('--reason <reason>', '이동 사유')
+    .action((id: string, opts: { from: string; to: string; reason?: string }, cmd: Command) => {
       const { codenames, json } = context(cmd);
       const from = checklistVersion(opts.from, codenames), to = checklistVersion(opts.to, codenames);
-      features.move(id, from, to, actor());
+      features.move(id, from, to, actor(), undefined, undefined, opts.reason);
       if (json) console.log(JSON.stringify(listChecklist(to))); else console.log(`✅ ${id} ${from} → ${to}`);
     });
   withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).action((id: string, title: string, _opts: unknown, cmd: Command) => {

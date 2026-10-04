@@ -760,6 +760,64 @@ describe('createNexusClient · getChatBackendDetection', () => {
   });
 });
 
+describe('Persona client wire', () => {
+  test('reads typed preset catalog and creates a persona with the supplied preset and name', async () => {
+    const preset = {
+      personaId: 'haru', displayName: '하루 · Haru', names: ['하루'], role: '개인 비서',
+      oneLine: '링크를 정리한다', voice: { rule: '정중하게', examples: [] },
+      tasks: [], tools: [], firstQuestions: [], doesNot: [], forWhom: '모두',
+    };
+    const persona = { personaId: 'my-haru', displayName: '내 하루', description: '링크를 정리한다' };
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/persona-presets': () => ({ status: 200, body: { presets: [preset] } }),
+      'POST /v1/personas': () => ({ status: 201, body: { persona } }),
+    });
+    const client = createNexusClient({ baseUrl: `${BASE}/`, token: 'owner', fetchImpl });
+    const catalog = await client.getPersonaPresets();
+    expect(catalog.presets[0]?.voice.rule).toBe('정중하게');
+    expect(catalog).toEqual({ presets: [preset] });
+    expect(await client.createPersona({ preset: 'haru', name: '내 하루' })).toEqual({ persona });
+    expect(calls.map(({ url, init }) => [url, init?.method, init?.body])).toEqual([
+      [`${BASE}/v1/persona-presets`, 'GET', undefined],
+      [`${BASE}/v1/personas`, 'POST', JSON.stringify({ preset: 'haru', name: '내 하루' })],
+    ]);
+    expect(calls[0]?.init?.headers).toEqual({ authorization: 'Bearer owner' });
+    expect(calls[1]?.init?.headers).toEqual({ authorization: 'Bearer owner', 'content-type': 'application/json' });
+  });
+
+  test('patches only requested persona edits and preserves the existing description-only method', async () => {
+    const persona = { personaId: 'my-haru', displayName: '하루', systemPrompt: '첫 줄\n둘째 줄', description: '' };
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/personas/my-haru': () => ({ status: 200, body: { persona } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, token: 'owner', fetchImpl });
+    const edits = { displayName: '하루', description: '', systemPrompt: '첫 줄\n둘째 줄' };
+    expect(await client.patchPersona('my-haru', edits)).toEqual({ persona });
+    expect(await client.patchPersonaDescription('my-haru', '')).toEqual({ persona });
+    expect(calls.map(({ url, init }) => [url, init?.method, JSON.parse(String(init?.body))])).toEqual([
+      [`${BASE}/v1/personas/my-haru`, 'PATCH', edits],
+      [`${BASE}/v1/personas/my-haru`, 'PATCH', { description: '' }],
+    ]);
+  });
+
+  test('encodes persona id as a single path segment and forwards errors through NexusApiError', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/personas/a/b?x=1': () => ({ status: 404, body: { error: 'not-found' } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl });
+    const path = '/v1/personas/a%2Fb%3Fx%3D1';
+    try {
+      await client.patchPersona('a/b?x=1', { description: 'edited' });
+      throw new Error('expected a 404');
+    } catch (error) {
+      expect(error).toBeInstanceOf(NexusApiError);
+      expect((error as NexusApiError).status).toBe(404);
+      expect((error as NexusApiError).path).toBe(path);
+    }
+    expect(calls[0]?.url).toBe(`${BASE}${path}`);
+  });
+});
+
 describe('/setup wizard wire (Phase 1 · 2026-05-19)', () => {
   test('answer priority GET and POST use the authenticated setup endpoint', async () => {
     const sample: AnswerPriorityResponse = { value: null, effective: 'balanced', choices: [

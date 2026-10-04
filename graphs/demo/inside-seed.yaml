@@ -1,0 +1,20 @@
+graph_id: inside-seed
+version: 1
+loop:
+  title: Inside-seed demo
+  description: Plan, build, review once for rework, then publish on the second review.
+  trigger:
+    events: [manual]
+entry_node: plan
+terminal_nodes: [done]
+nodes:
+  - { node_id: plan, kind: agent, recipe: 'cmd:plan', max_visits: 1 }
+  - { node_id: build, kind: agent, recipe: 'cmd:build', max_visits: 2 }
+  - { node_id: review, kind: judge, recipe: 'cmd:review', max_visits: 2 }
+  - { node_id: publish, kind: agent, recipe: 'cmd:publish', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+edges:
+  - { from: plan, on: outcome, map: { ok: build } }
+  - { from: build, on: outcome, map: { ok: review } }
+  - { from: review, on: outcome, map: { rework: build, ok: publish } }
+  - { from: publish, on: outcome, map: { ok: done } }

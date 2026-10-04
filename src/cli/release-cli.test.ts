@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { listChecklist, devVersion } from '../release-loop/checklist.js';
+import { checklistHistory, listChecklist, devVersion } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import { tmpdir } from 'node:os';
@@ -113,6 +113,35 @@ describe('release checklist CLI', () => {
       expect(JSON.parse(lines.at(-1)!).history.find((entry: { field: string; id: string }) => entry.field === 'claim' && entry.id === 'C')).toMatchObject({ to: 'TC/docs', force: true });
       expect(listChecklist('9.9.9').items.find((item) => item.id === 'C')?.owner).toBe('TC/docs');
     } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('move CLI --reason is persisted across versions in checklistHistory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-move-reason-cli-'));
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const run = async (...args: string[]) => {
+      const cmd = new Command();
+      registerReleaseCommands(cmd);
+      await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' });
+    };
+    try {
+      await run('add', 'K1', 'carry', '--version', '0.2.9');
+      await run('add', 'OTHER', 'unrelated', '--version', '0.2.9');
+      await run('move', 'K1', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'next cut');
+      await run('move', 'K1', '--from', '0.2.10', '--to', '0.2.11', '--reason', 'needs more work');
+      const entries = checklistHistory('K1');
+      expect(entries.map(({ version, field }) => [version, field])).toEqual([
+        ['0.2.9', 'add'], ['0.2.10', 'move'], ['0.2.11', 'move'],
+      ]);
+      expect(entries.filter(({ field }) => field === 'move').map(({ from, to, at, reason }) => ({ from, to, at, reason }))).toEqual([
+        { from: '0.2.9', to: '0.2.10', at: expect.any(String), reason: 'next cut' },
+        { from: '0.2.10', to: '0.2.11', at: expect.any(String), reason: 'needs more work' },
+      ]);
+      expect(entries.every(({ id, at }) => id === 'K1' && !Number.isNaN(Date.parse(at)))).toBe(true);
+      expect(entries.every((entry, index) => index === 0 || entry.at >= entries[index - 1]!.at)).toBe(true);
+      expect(checklistHistory('OTHER').map(({ field }) => field)).toEqual(['add']);
+      expect(listChecklist('0.2.11').history.at(-1)).toMatchObject({ field: 'move', reason: 'needs more work' });
+    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('move · retitle · evidence add · history · export CLI 가 SQLite 기록과 JSON 스냅샷을 만든다', async () => {

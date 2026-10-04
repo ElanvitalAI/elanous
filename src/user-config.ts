@@ -3240,7 +3240,7 @@ export interface AutoReviewConfig {
   };
 }
 
-export type ModelRole = 'implement' | 'review' | 'research' | 'planning' | 'audit' | 'classify';
+export type ModelRole = 'implement' | 'review' | 'research' | 'planning' | 'audit' | 'classify' | 'graph-grow';
 
 export interface RoleModelConfig {
   implement?: string;
@@ -3249,6 +3249,7 @@ export interface RoleModelConfig {
   planning?: string;
   audit?: string;
   classify?: string;
+  'graph-grow'?: string;
 }
 
 /** Sparse provider-agnostic model tier preferences by execution role. */
@@ -3315,6 +3316,7 @@ export const ROLE_MODEL_DEFAULTS: Record<ModelRole, { environment: string; tier:
   planning: { environment: 'ELANOUS_SKILL_PLAN_MODEL', tier: 'best' },
   audit: { environment: 'ELANOUS_MEMORY_JUDGE_MODEL', tier: 'better' },
   classify: { environment: 'ELANOUS_ACTION_CLASSIFIER_MODEL', tier: 'budget' },
+  'graph-grow': { environment: 'ELANOUS_GRAPH_GROW_MODEL', tier: 'better' },
 };
 
 /** Resolve `auto` through the same runtime provider selector that dispatches LLM calls.
@@ -3530,7 +3532,7 @@ export interface UserConfig {
   loops?: { steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number };
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
   pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number } };
   skillRouter: SkillRouterConfig;
@@ -3700,7 +3702,7 @@ export function parseRoleLlmEntry(raw: unknown): { ok: true; spec: RoleLlmSpec }
   return { ok: true, spec };
 }
 
-export const MODEL_ROLES: readonly ModelRole[] = ['implement', 'review', 'research', 'planning', 'audit', 'classify'];
+export const MODEL_ROLES: readonly ModelRole[] = ['implement', 'review', 'research', 'planning', 'audit', 'classify', 'graph-grow'];
 
 export function isModelRole(v: unknown): v is ModelRole {
   return typeof v === 'string' && (MODEL_ROLES as readonly string[]).includes(v);
@@ -3928,7 +3930,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { budgetGate: { ...DEFAULT_BUDGET_GATE } },
+    harness: { budgetGate: { ...DEFAULT_BUDGET_GATE }, difficultyPlacement: false },
     grounding: { sources: [] },
     raw: {},
   };
@@ -4539,6 +4541,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     },
     harness: {
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
+      difficultyPlacement: harness.difficultyPlacement === true,
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
@@ -5783,6 +5786,7 @@ export function saveUserConfig(
       ...rawHarness,
       pod: cfg.harness?.pod ?? rawHarness.pod,
       budgetGate: cfg.harness?.budgetGate ?? rawHarness.budgetGate,
+      difficultyPlacement: cfg.harness?.difficultyPlacement ?? rawHarness.difficultyPlacement,
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
       substrate: cfg.harness?.substrate,
       podPool: cfg.harness?.podPool,

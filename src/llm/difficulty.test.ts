@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test, spyOn } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultSeams } from '../self-implement/seams.js';
@@ -7,7 +7,7 @@ import { pickImplementRoleForGoal, runHeadlessGoalLoopPty } from '../self-implem
 import { debug } from '../debug/log.js';
 import { classifyGoalDifficulty, goalDifficultySignals, resolveImplementDifficulty } from './difficulty.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
-import { clearLaunchRoleLlmOverrides, getUserConfig, resolveRoleLlm, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
+import { buildUserConfig, clearLaunchRoleLlmOverrides, getUserConfig, resolveRoleLlm, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
 
 // Deterministic runs carry no ambient LLM credentials — pin a provider only when config left it on «auto».
 beforeAll(() => setUserConfigOverlay((c) => (c.llm.provider === 'auto' ? { ...c, llm: { ...c.llm, provider: 'openai-codex' } } : c)));
@@ -43,11 +43,11 @@ describe('goal difficulty at implement launch', () => {
     expect(role.model).toBe(lookupLlmTierSpec('local', 'budget').model);
   });
 
-  test('more than five target paths use better', () => {
+  test('more than five target paths use best', () => {
     const signals = goalDifficultySignals(document(Array.from({ length: 6 }, (_, n) => `src/${n}.ts`), 1));
     expect(signals.targetPathCount).toBe(6);
     expect(classifyGoalDifficulty(signals)).toBe('large');
-    expect(resolveImplementDifficulty(resolveRoleLlm('implement', { config: config() }), 'large').tier).toBe('better');
+    expect(resolveImplementDifficulty(resolveRoleLlm('implement', { config: config() }), 'large').tier).toBe('best');
   });
 
   test('medium retains the current implement default and explicit roleLlm wins', () => {
@@ -67,31 +67,55 @@ describe('goal difficulty at implement launch', () => {
     expect(resolveImplementDifficulty(olderTier, 'small')).toEqual(olderTier);
   });
 
-  test('the harness launch picker emits the selected level and honors the launch role override', () => {
-    const log = spyOn(debug, 'log').mockImplementation(() => {});
+  test('config parses an opt-in boolean and defaults invalid values to off', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'difficulty-config-'));
     try {
-      const goal = document(['src/a.ts'], 1);
-      const picked = pickImplementRoleForGoal(goal);
-      expect(picked?.tier).toBe('budget');
-      expect(log).toHaveBeenCalledWith('llm.difficulty', 'pick', {
-        level: 'small', tier: 'budget',
-        signals: { targetPathCount: 1, decisionSignalCount: 1, expectedChangedFileCount: null, goalType: 'implement' },
-      });
+      for (const [raw, expected] of [[true, true], [false, false], ['true', false], [1, false]] as const) {
+        const path = join(dir, 'config.json');
+        writeFileSync(path, JSON.stringify({ harness: { difficultyPlacement: raw } }));
+        expect(buildUserConfig(path).harness?.difficultyPlacement).toBe(expected);
+      }
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ harness: {} }));
+      expect(buildUserConfig(join(dir, 'config.json')).harness?.difficultyPlacement).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('opt-in picks three tiers on one provider and records the placement; off preserves the role model', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const provider = 'openai-codex';
+    setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider }, harness: { ...c.harness, difficultyPlacement: false },
+      roleLlm: undefined, roleModels: undefined, roleModelTiers: undefined }));
+    try {
+      const cases = [
+        { goal: document(['src/a.ts'], 1), difficulty: 'small', tier: 'budget' },
+        { goal: document(['src/a.ts', 'src/b.ts'], 1), difficulty: 'medium', tier: 'better' },
+        { goal: document(Array.from({ length: 6 }, (_, n) => `src/${n}.ts`), 1), difficulty: 'large', tier: 'best' },
+      ] as const;
+      const baseline = resolveRoleLlm('implement');
+      for (const { goal } of cases) expect(pickImplementRoleForGoal(goal)).toEqual(baseline);
+      expect(log).not.toHaveBeenCalledWith('harness.role-llm', 'difficulty-placement', expect.anything());
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider }, harness: { ...c.harness, difficultyPlacement: true },
+        roleLlm: undefined, roleModels: undefined, roleModelTiers: undefined }));
+      for (const { goal, difficulty, tier } of cases) {
+        const picked = pickImplementRoleForGoal(goal);
+        expect(picked).toMatchObject({ provider, model: lookupLlmTierSpec(provider, tier).model, tier });
+        expect(log).toHaveBeenCalledWith('harness.role-llm', 'difficulty-placement', { difficulty, tier, source: 'default' });
+      }
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider }, harness: { ...c.harness, difficultyPlacement: true },
+        roleLlm: { implement: { model: 'configured-role', provider } } }));
+      expect(pickImplementRoleForGoal(cases[0].goal)).toMatchObject({ source: 'config-role', model: 'configured-role' });
       setLaunchRoleLlmOverrides({ implement: { tier: 'best' } });
-      const explicit = pickImplementRoleForGoal(goal);
-      expect(explicit?.source).toBe('flag');
-      expect(explicit?.tier).toBe('best');
-      expect(log).toHaveBeenCalledWith('llm.difficulty', 'pick', {
-        level: 'small', tier: 'best',
-        signals: { targetPathCount: 1, decisionSignalCount: 1, expectedChangedFileCount: null, goalType: 'implement' },
-      });
+      expect(pickImplementRoleForGoal(cases[0].goal)).toMatchObject({ source: 'flag', tier: 'best' });
+      expect(log.mock.calls.filter(([category, event]) => category === 'harness.role-llm' && event === 'difficulty-placement')).toHaveLength(3);
     } finally {
       clearLaunchRoleLlmOverrides();
+      setUserConfigOverlay(null);
       log.mockRestore();
     }
   });
 
   test('the headless harness spawn relays the difficulty model; an explicit child choice wins', async () => {
+    setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: true } }));
     const inheritedModel = process.env.ELANOUS_LLM_MODEL;
     delete process.env.ELANOUS_LLM_MODEL;
     try {
@@ -114,6 +138,11 @@ describe('goal difficulty at implement launch', () => {
         return env!;
       };
       const defaultRole = resolveRoleLlm('implement');
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: false } }));
+      const off = await launch();
+      expect(off.ELANOUS_LLM_PROVIDER).toBe(defaultRole.provider);
+      expect(off.ELANOUS_LLM_MODEL).toBe(defaultRole.model);
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: true } }));
       if (defaultRole.source === 'default') {
         const automatic = await launch();
         expect(automatic.ELANOUS_LLM_PROVIDER).toBe(defaultRole.provider);
@@ -134,10 +163,12 @@ describe('goal difficulty at implement launch', () => {
     } finally {
       if (inheritedModel === undefined) delete process.env.ELANOUS_LLM_MODEL;
       else process.env.ELANOUS_LLM_MODEL = inheritedModel;
+      setUserConfigOverlay(null);
     }
   });
 
   test('the sync fallback spawn relays the authored goal tier and preserves explicit roleLlm', async () => {
+    setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: true } }));
     const cwd = mkdtempSync(join(tmpdir(), 'difficulty-fallback-'));
     const inheritedModel = process.env.ELANOUS_LLM_MODEL;
     delete process.env.ELANOUS_LLM_MODEL;
@@ -151,27 +182,33 @@ describe('goal difficulty at implement launch', () => {
         }) as never,
       }).implement;
       const goal = document(['src/a.ts'], 1);
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: false } }));
+      await implementation({ cwd, feature: goal, runId: 'run-difficulty-fallback' });
+      const offRole = resolveRoleLlm('implement');
+      expect(captured[0]?.ELANOUS_LLM_MODEL).toBe(offRole.model);
+      setUserConfigOverlay((c) => ({ ...c, llm: { ...c.llm, provider: 'openai-codex' }, harness: { ...c.harness, difficultyPlacement: true } }));
       await implementation({ cwd, feature: goal, runId: 'run-difficulty-fallback' });
       const role = resolveRoleLlm('implement');
       if (role.source === 'default') {
-        expect(captured[0]?.ELANOUS_LLM_MODEL).toBe(lookupLlmTierSpec(role.provider, 'budget').model);
+        expect(captured[1]?.ELANOUS_LLM_MODEL).toBe(lookupLlmTierSpec(role.provider, 'budget').model);
       } else {
-        expect(captured[0]?.ELANOUS_LLM_MODEL).toBe(role.model);
+        expect(captured[1]?.ELANOUS_LLM_MODEL).toBe(role.model);
       }
       setLaunchRoleLlmOverrides({ implement: { tier: 'best' } });
       const configured = resolveRoleLlm('implement');
       await implementation({ cwd, feature: goal, runId: 'run-difficulty-fallback' });
-      expect(captured[1]?.ELANOUS_LLM_MODEL).toBe(configured.model);
-      expect(captured[1]?.ELANOUS_LLM_PROVIDER).toBe(configured.provider);
+      expect(captured[2]?.ELANOUS_LLM_MODEL).toBe(configured.model);
+      expect(captured[2]?.ELANOUS_LLM_PROVIDER).toBe(configured.provider);
       await implementation({ cwd, feature: goal, runId: 'run-difficulty-fallback',
         childLlm: { provider: 'openai-codex', model: 'explicit-model', source: 'flag' } });
-      expect(captured[2]?.ELANOUS_LLM_MODEL).toBe('explicit-model');
-      expect(captured[2]?.ELANOUS_LLM_PROVIDER).toBe('openai-codex');
+      expect(captured[3]?.ELANOUS_LLM_MODEL).toBe('explicit-model');
+      expect(captured[3]?.ELANOUS_LLM_PROVIDER).toBe('openai-codex');
     } finally {
       clearLaunchRoleLlmOverrides();
       if (inheritedModel === undefined) delete process.env.ELANOUS_LLM_MODEL;
       else process.env.ELANOUS_LLM_MODEL = inheritedModel;
       rmSync(cwd, { recursive: true, force: true });
+      setUserConfigOverlay(null);
     }
   });
 
@@ -183,7 +220,7 @@ describe('goal difficulty at implement launch', () => {
     expect(classifyGoalDifficulty(goalDifficultySignals(goal))).toBe('medium');
   });
 
-  test('a six-path authored goal without an ask block still selects better', () => {
+  test('a six-path authored goal without an ask block still selects large', () => {
     const goal = [
       'Goal', '- GoalType: implement', '', '## TRACED PATHS',
       ...Array.from({ length: 6 }, (_, n) => `${n + 1}. src/${n}.ts — read-verified`),

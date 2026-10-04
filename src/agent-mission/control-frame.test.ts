@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { ChannelBus } from '../terminal-matrix/channel-bus.js';
 import { subscribeSurfaceFrames, subscribeAllFrames, type SelfReportFrame } from '../capture/self-report-frame.js';
 import { execSurfaceId } from '../self-implement/executor-contract.js';
-import { publishControlObservationFrame, makeMissionObserveStep } from './driver.js';
+import { publishControlObservationFrame, makeMissionObserveStep, createMissionControlBrain } from './driver.js';
 import { observeSurfaceFromBus, type ControlObserveDigest } from '../capture/control-observe-adapter.js';
 import { classifyFrameState } from '../capture/frame-state-detect.js';
 import { runPtyControlLoop, type ControlObservation, type ControlDecision, type RunSupervisor } from '../autopilot/pty-control-loop.js';
@@ -28,6 +28,20 @@ const OBS = (screen: string, step = 1): ControlObservation => ({
   changed: true,
 });
 const DEC: ControlDecision = { action: 'wait' };
+
+describe('mission brain screen progress', () => {
+  it('the same choice question on an advancing screen does not trigger recovery', async () => {
+    const actions: string[] = [];
+    const brain = createMissionControlBrain({
+      mission: 'Build', evidenceReady: () => false, search: () => {}, recoverAfterMs: 40_000,
+      stream: async () => '{"action":"wait"}', onRecover: (_blocked, action) => { actions.push(action); },
+    });
+    for (let step = 0; step < 4; step++) {
+      expect(await brain.decide({ ...OBS(`progress ${step}\nProceed? [y/N]`, step), sameScreenMs: 0 })).toEqual({ action: 'wait' });
+    }
+    expect(actions).toEqual([]);
+  });
+});
 
 describe('publishControlObservationFrame — 제어루프 관측 → 프레임 버스(U5)', () => {
   it('surface 구독자가 executor 프레임 수신(surfaceId=exec:<ptyId>·text=screen·runId join)', () => {

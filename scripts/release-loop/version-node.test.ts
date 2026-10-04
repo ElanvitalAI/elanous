@@ -42,6 +42,11 @@ else if (args[0] === 'worktree' && args[1] === 'add') {
   fs.writeFileSync(path.join(tree, 'package.json'), JSON.stringify({name:'fixture',version:state.version}, null, 2) + '\\n');
   fs.writeFileSync(path.join(tree, 'bun.lock'), JSON.stringify({workspaces:{'':{name:'fixture',version:state.version,dependencies:{}}}}));
   if (state.serverJson !== undefined) fs.writeFileSync(path.join(tree, 'server.json'), JSON.stringify(state.serverJson, null, 2) + '\\n');
+  if (state.agentJson !== undefined) {
+    const agentDir = path.join(tree, 'integrations', 'acp-registry', 'elanous');
+    fs.mkdirSync(agentDir, {recursive:true});
+    fs.writeFileSync(path.join(agentDir, 'agent.json'), JSON.stringify(state.agentJson, null, 2) + '\\n');
+  }
   if (state.nextMd !== undefined) {
     fs.mkdirSync(path.join(tree, 'release'), {recursive:true});
     fs.writeFileSync(path.join(tree, 'release', 'next.md'), state.nextMd);
@@ -77,6 +82,9 @@ if (args[0] === 'install' && args[1] === '--frozen-lockfile') {
   state.landedNextMd = fs.existsSync(nextPath) ? fs.readFileSync(nextPath, 'utf8') : null;
   const serverPath = path.join(process.cwd(), 'server.json');
   if (fs.existsSync(serverPath)) state.landedServerJson = JSON.parse(fs.readFileSync(serverPath, 'utf8'));
+  const agentPath = path.join(process.cwd(), 'integrations', 'acp-registry', 'elanous', 'agent.json');
+  state.landedAgentJson = fs.existsSync(agentPath) ? JSON.parse(fs.readFileSync(agentPath, 'utf8')) : null;
+  state.landedAgentText = fs.existsSync(agentPath) ? fs.readFileSync(agentPath, 'utf8') : null;
   if (state.land === 'fail') { console.error('merge rejected'); process.exit(1); }
   if (state.land === 'no-marker') { console.log('nothing merged'); process.exit(0); }
   if (state.land !== 'no-advance') {
@@ -151,6 +159,41 @@ test('release and dev-bump keep package.json and both server.json versions align
     expect(landed.landedServerJson.version).toBe(landed.version);
     expect(landed.landedServerJson.packages[0].version).toBe(landed.version);
     expect(landed.landedServerJson.packages[0]).toMatchObject({ registryType: 'npm', identifier: 'elanous', transport: { type: 'stdio' } });
+  }
+});
+
+test('release and dev-bump align package.json, server.json and ACP agent.json while preserving registry fields and tolerating a missing agent', () => {
+  for (const [kind, current, target] of [
+    ['release', '0.2.4-dev.0', '0.2.4'],
+    ['dev-bump', '0.2.4', '0.2.5-dev.0'],
+  ] as const) {
+    for (const withAgent of [true, false]) {
+      const { root, run } = fixture(current);
+      const agent = {
+        id: 'elanous', name: 'Elanous', icon: 'icon.svg', version: current,
+        description: 'ACP integration', distribution: { npx: { package: `elanous@${current}`, args: ['--acp-server'] } },
+      };
+      const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+      writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state,
+        serverJson: { name: 'elanous', version: current, packages: [{ version: current, identifier: 'elanous' }] },
+        ...(withAgent ? { agentJson: agent } : {}),
+      }));
+      const { status, output } = run(kind, '--version', '0.2.4', '--json');
+      expect(status).toBe(0);
+      expect(output).toMatchObject({ outcome: 'ok', version: target,
+        files: withAgent ? ['package.json', 'server.json', 'agent.json'] : ['package.json', 'server.json'] });
+      const landed = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+      expect(landed.version).toBe(target);
+      expect(landed.landedServerJson.version).toBe(target);
+      expect(landed.landedServerJson.packages[0].version).toBe(target);
+      if (withAgent) {
+        expect(landed.landedAgentJson).toEqual({ ...agent, version: target,
+          distribution: { npx: { ...agent.distribution.npx, package: `elanous@${target}` } } });
+        expect(landed.landedAgentText).toBe(`${JSON.stringify(landed.landedAgentJson, null, 2)}\n`);
+      } else {
+        expect(landed.landedAgentJson).toBeNull();
+      }
+    }
   }
 });
 

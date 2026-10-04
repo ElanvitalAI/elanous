@@ -30,6 +30,7 @@
 
 import { importerTestsNotInRunSet, type ImporterTestIndex } from './importer-test-index.js';
 import type { RouteConsumerTestIndex } from './route-consumer-test-index.js';
+import { rankGateCallerCandidates } from './gate-candidate-ranking.js';
 
 export const GATE_CALLER_TEST_LIMIT = 30;
 export type GateCallerReason = 'import' | 'route';
@@ -249,11 +250,7 @@ interface GateScopeDecision {
   readonly unverified: readonly string[];
   /** elanous 자체가 남긴 런타임 산출물. 미검증 사용자 변경에서 제외하되 경로를 보존한다. */
   readonly elanousRuntimeArtifacts: readonly string[];
-  /** ⭐ **편집되지 않았는데 함께 끌어와 돌린** 연관 테스트(`changed-tests` 분기 전용).
-   *  ⚠️ 직전 판본은 이 자리에 `unrunRelatedTests`(=실행집합에 없는 연관 테스트)를 뒀는데,
-   *  실행집합이 연관 테스트를 **전부 포함**하도록 바뀌었으므로 그 값은 **정의상 항상 빈 배열**이었다.
-   *  빈 배열을 보고 *"안 돈 게 없다"* 고 읽게 되지만 그건 사실 확인이 아니라 계산의 결과였다
-   *  (관측이 사실 아닌 값을 나르는 형태). ⇒ **실제로 일어난 일**을 센다: 합집합이 구제한 파일들. */
+  /** ⭐ 편집되지 않았는데 함께 끌어와 돌린 연관 테스트(`changed-tests` 분기) — 합집합이 실제로 구제한 파일들. */
   readonly pulledInRelatedTests: readonly string[];
   /** 실행 집합에 없는, 변경 소스를 상대 import 하는 테스트. 색인이 주입되지 않으면 null. */
   readonly importerTestsNotRun: {
@@ -352,8 +349,9 @@ export function resolveGateScope(
       }
     }
   }
-  const candidates = [...callers].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
-    .map(([file, reasons]) => ({ file, reasons: [...reasons] }));
+  // GATE-CALLERS2 — the cap keeps the candidates closest to the change, not the alphabetically first.
+  const candidates = rankGateCallerCandidates(userChanged, [...callers].map(([file, reasons]) => ({ file, reasons: [...reasons] })),
+    importerTestIndex?.testsBySource ?? new Map());
   const callerTests = candidates.slice(0, GATE_CALLER_TEST_LIMIT);
   const callerTestsOverflow = candidates.slice(GATE_CALLER_TEST_LIMIT);
   const runWithCallers = (tests: readonly string[]) => [...new Set([...tests, ...callerTests.map(({ file }) => file)])];
@@ -364,11 +362,14 @@ export function resolveGateScope(
   });
 
   if (testFiles.length > 0) {
+    // Edited tests ⊕ every related test of the changed sources ⊕ capped callers (restored 10-04: #23467 narrowed this
+    // to edited tests only, so a co-located sibling of a changed source stopped running — 0.2.12 gate introduced).
     const allRelatedTests = conventional;
     const runSet = runWithCallers([...testFiles, ...allRelatedTests]);
     // 편집된 테스트만 돌렸다면 빠졌을 것들 — 이 목록이 비어있지 않다는 것은 합집합이 실제로 구제했다는 뜻이다.
     const pulledInRelatedTests = allRelatedTests.filter((f) => !testFiles.includes(f));
-    return { ...base, ...withDocumentNonContribution(runSet), testArgs: runSet, unverified: unverifiedFor(runSet), pulledInRelatedTests, importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: 'changed-tests' };
+    return { ...base, ...withDocumentNonContribution(runSet), testArgs: runSet, unverified: unverifiedFor(runSet), pulledInRelatedTests,
+      importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: 'changed-tests' };
   }
   if (userChanged.length === 0) {
     // postsync 빈 범위는 기존 no-changes(깨끗함)와 다른 값이다. 일반 호출자는 계속 no-changes를 읽는다.

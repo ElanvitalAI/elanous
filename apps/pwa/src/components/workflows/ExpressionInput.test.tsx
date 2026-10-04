@@ -1,9 +1,8 @@
-import { expect, it } from 'bun:test';
+import { expect, it, spyOn } from 'bun:test';
 import { act, create } from 'react-test-renderer';
 import { useState, type ChangeEvent } from 'react';
 import type { WorkflowDefinitionLike } from './workflow-graph-layout';
-import { ExpressionInput, cursorFragment, insertCandidate } from './ExpressionInput';
-import { WorkflowNodeEditor } from './WorkflowNodeEditor';
+import { ExpressionInput, cursorFragment, insertAtSelection, insertCandidate } from './ExpressionInput';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -37,6 +36,7 @@ function setup(initial: string, multiline = false) {
   let renderer!: ReturnType<typeof create>;
   act(() => { renderer = create(<Harness />, { createNodeMock: ({ type }) => type === 'input' || type === 'textarea' ? element : null }); });
   const control = () => renderer.root.findByType(multiline ? 'textarea' : 'input');
+  const button = () => renderer.root.findByProps({ 'aria-label': '변수 넣기' });
   const type = (next: string, position = next.length) => {
     element.value = next;
     element.selectionStart = position;
@@ -47,8 +47,116 @@ function setup(initial: string, multiline = false) {
     act(() => control().props.onKeyDown({ key: name, preventDefault: () => { prevented = true; } }));
     return prevented;
   };
-  return { renderer, control, element, type, key, get value() { return value; }, get edits() { return edits; } };
+  return { renderer, control, button, element, type, key, get value() { return value; }, get edits() { return edits; } };
 }
+
+it('shows the no-variable message when the candidate source returns an empty list', async () => {
+  const completion = await import('./expression-completion');
+  const candidateSource = spyOn(completion, 'getExpressionCandidates').mockReturnValue([]);
+  try {
+    const ui = setup('plain');
+    act(() => ui.button().props.onClick());
+    expect(ui.renderer.root.findByProps({ role: 'listbox', 'aria-label': '사용 가능한 변수' }).children).toHaveLength(1);
+    expect(ui.renderer.root.findAllByType('span').some((item) => item.children.includes('쓸 수 있는 변수가 없습니다'))).toBe(true);
+    expect(ui.renderer.root.findAllByProps({ role: 'option' })).toHaveLength(0);
+    act(() => ui.renderer.unmount());
+  } finally {
+    candidateSource.mockRestore();
+  }
+});
+
+it('inserts at a plain cursor and replaces the selected range without requiring a $ fragment', () => {
+  expect(insertAtSelection('say  now', 4, 4, '$ARGUMENTS')).toEqual({ value: 'say $ARGUMENTS now', cursor: 14 });
+  expect(insertAtSelection('say replace now', 4, 11, '$fetch.output')).toEqual({ value: 'say $fetch.output now', cursor: 17 });
+});
+
+it('keeps Enter and Tab insertion for typed $ suggestions', () => {
+  const previousInput = globalThis.HTMLInputElement;
+  Object.defineProperty(globalThis, 'HTMLInputElement', {
+    configurable: true,
+    value: class {
+      set value(updated: string) { Object.defineProperty(this, 'value', { value: updated, writable: true, configurable: true }); }
+    },
+  });
+  try {
+    for (const key of ['Enter', 'Tab']) {
+      const ui = setup('');
+      ui.type('say $fe now', 7);
+      ui.element.selectionEnd = 7;
+      expect(ui.key(key)).toBe(true);
+      expect(ui.value).toBe('say $fetch.output now');
+      expect(ui.element.selectionStart).toBe(17);
+      expect(ui.renderer.root.findAllByProps({ role: 'option' })).toHaveLength(0);
+      act(() => ui.renderer.unmount());
+    }
+  } finally {
+    if (previousInput === undefined) Reflect.deleteProperty(globalThis, 'HTMLInputElement');
+    else Object.defineProperty(globalThis, 'HTMLInputElement', { configurable: true, value: previousInput });
+  }
+});
+
+it('opens the variable list with descriptions, inserts at the saved selection, and closes on Escape', () => {
+  const ui = setup('say replace now');
+  expect(ui.button().props['aria-haspopup']).toBe('listbox');
+  ui.element.selectionStart = 4;
+  ui.element.selectionEnd = 11;
+  act(() => ui.control().props.onSelect({ currentTarget: ui.element }));
+  act(() => ui.button().props.onMouseDown({ preventDefault: () => {} }));
+  act(() => ui.button().props.onClick());
+  expect(ui.renderer.root.findByProps({ role: 'listbox', 'aria-label': '사용 가능한 변수' })).toBeDefined();
+  const options = ui.renderer.root.findAllByProps({ role: 'option' });
+  expect(options.map((option) => option.findByType('span').children[0])).toEqual([
+    '$ARGUMENTS', '$ARTIFACTS_DIR', '$fetch.output', '$fetch.output.status',
+  ]);
+  expect(options[0].children.slice(1)).toEqual([' · ', '실행할 때 받은 인자']);
+  expect(options[2].children.slice(1)).toEqual([' · ', 'fetch 노드 결과']);
+  const previousInput = globalThis.HTMLInputElement;
+  Object.defineProperty(globalThis, 'HTMLInputElement', {
+    configurable: true,
+    value: class {
+      set value(updated: string) { Object.defineProperty(this, 'value', { value: updated, writable: true, configurable: true }); }
+    },
+  });
+  try {
+    act(() => options[2].props.onClick());
+  } finally {
+    if (previousInput === undefined) Reflect.deleteProperty(globalThis, 'HTMLInputElement');
+    else Object.defineProperty(globalThis, 'HTMLInputElement', { configurable: true, value: previousInput });
+  }
+  expect(ui.value).toBe('say $fetch.output now');
+  expect(ui.edits).toBe(1);
+  expect(ui.element.selectionStart).toBe(17);
+  expect(ui.renderer.root.findAllByProps({ role: 'listbox' })).toHaveLength(0);
+  act(() => ui.button().props.onClick());
+  expect(ui.key('Escape')).toBe(true);
+  expect(ui.renderer.root.findAllByProps({ role: 'listbox' })).toHaveLength(0);
+  act(() => ui.renderer.unmount());
+});
+
+it('closes the variable list on a pointer press outside the input', () => {
+  const listeners = new Map<string, EventListener>();
+  const previousDocument = globalThis.document;
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: {
+      addEventListener: (name: string, listener: EventListener) => { listeners.set(name, listener); },
+      removeEventListener: (name: string) => { listeners.delete(name); },
+    },
+  });
+  try {
+    const ui = setup('plain');
+    const root = { contains: (target: unknown) => target === root };
+    ui.renderer.root.findByType('span').props.ref.current = root;
+    act(() => ui.button().props.onClick());
+    expect(ui.renderer.root.findAllByProps({ role: 'listbox' })).toHaveLength(1);
+    act(() => listeners.get('pointerdown')?.({ target: {} } as PointerEvent));
+    expect(ui.renderer.root.findAllByProps({ role: 'listbox' })).toHaveLength(0);
+    act(() => ui.renderer.unmount());
+  } finally {
+    if (previousDocument === undefined) Reflect.deleteProperty(globalThis, 'document');
+    else Object.defineProperty(globalThis, 'document', { configurable: true, value: previousDocument });
+  }
+});
 
 it('preserves input and textarea contracts and shows only the $ fragment at the cursor', () => {
   for (const multiline of [false, true]) {

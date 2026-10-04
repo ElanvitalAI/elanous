@@ -36,6 +36,37 @@ describe('harness launch budget — empty chain (L6b2 incident 10-03)', () => {
     expect(warning).toContain('outside the budget gate');
   });
 
+  test('unmeasured codex and grok launch with their own warning', () => {
+    const noUsage = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default' }], grokUsedPercent: undefined } as BudgetInputs;
+    const codex = harnessLaunchBudgetDecision(noUsage);
+    expect(codex.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }));
+    expect(codex.warning).toContain('openai-codex usage unmeasured');
+    expect(codex.unmeasuredProvider).toBe('openai-codex');
+    const grok = harnessLaunchBudgetDecision(noUsage, { childLlmProvider: 'grok' });
+    expect(grok.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'grok' }));
+    expect(grok.warning).toContain('grok usage unmeasured');
+  });
+
+  test('measured exhausted codex falls through to unmeasured grok, but not vice versa', () => {
+    const mixed = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default', usedPercent: 95 }], grokUsedPercent: undefined } as BudgetInputs;
+    const { decision, warning } = harnessLaunchBudgetDecision(mixed);
+    expect(decision).toEqual(expect.objectContaining({ action: 'next-provider', provider: 'grok' }));
+    expect(warning).toContain('grok usage unmeasured');
+    const exhausted = harnessLaunchBudgetDecision({ ...mixed, grokUsedPercent: 48 });
+    expect(exhausted.decision.action).toBe('stop');
+    expect(exhausted.warning).toBeUndefined();
+    expect(exhausted.unmeasuredProvider).toBeUndefined();
+  });
+
+  test('empty chain warns once even when default provider usage is unmeasured', () => {
+    const unknown = { ...inputs([]), codexCandidates: [], grokUsedPercent: undefined } as BudgetInputs;
+    const { decision, warning, unmeasuredProvider } = harnessLaunchBudgetDecision(unknown);
+    expect(decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }));
+    expect(warning).toContain('code default');
+    expect(warning).toContain('openai-codex usage unmeasured');
+    expect(unmeasuredProvider).toBe('openai-codex');
+  });
+
   test('configured chain is judged as before (exhausted → stop)', () => {
     const exhausted = { ...inputs([{ provider: 'openai-codex' }]), codexCandidates: [{ name: 'default', usedPercent: 99 }] } as BudgetInputs;
     const { decision, warning } = harnessLaunchBudgetDecision(exhausted);

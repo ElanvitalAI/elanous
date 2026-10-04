@@ -68,7 +68,8 @@ test('installed plugin graphs receive only their own credential environment', as
     const graph = join(root, 'plugins', 'local', 'sample-plugin', '1.0.0', 'graphs', 'graph.yaml');
     mkdirSync(join(graph, '..'), { recursive: true });
     writeFileSync(graph, readFileSync(source, 'utf8'));
-    writeFileSync(join(graph, '..', 'recipes.yaml'), readFileSync(join(source, '..', 'recipes.yaml'), 'utf8'));
+    writeFileSync(join(graph, '..', 'recipes.yaml'), readFileSync(join(source, '..', 'recipes.yaml'), 'utf8')
+      .replaceAll('command: "exit 0"', 'command: "exit 0"\n  dry_run_command: "exit 0"'));
     const envs: NodeJS.ProcessEnv[] = [];
     process.env.OTHER_PLUGIN_KEY = 'inherited-other-secret';
     process.env.SAMPLE_PLUGIN_KEY = 'inherited-own-secret';
@@ -83,6 +84,16 @@ test('installed plugin graphs receive only their own credential environment', as
     expect(JSON.stringify(run.nodes)).toContain('[REDACTED]');
     expect(JSON.stringify(run)).not.toContain('sample-secret');
     expect(JSON.stringify(run)).not.toContain('other-secret');
+    envs.length = 0;
+    const preview = await runGraph(graph, { dryRun: true, deps: { root, runBash: async (_body, opts) => {
+      envs.push(opts.env!);
+      return { stdout: 'sample-secret', stderr: '', exitCode: 0 };
+    } } });
+    expect(preview.status).toBe('done');
+    expect(envs).toHaveLength(2);
+    expect(envs[0]?.SAMPLE_PLUGIN_KEY).toBe('sample-secret');
+    expect(envs[0]?.OTHER_PLUGIN_KEY).toBeUndefined();
+    expect(JSON.stringify(preview)).not.toContain('sample-secret');
     const outside = await runGraph(source, { deps: { root, runBash: async (_body, opts) => {
       expect(opts.env?.SAMPLE_PLUGIN_KEY).toBeUndefined();
       expect(opts.env?.OTHER_PLUGIN_KEY).toBeUndefined();

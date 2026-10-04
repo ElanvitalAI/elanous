@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { contextNow, type ContextNowDeps } from './context-now.js';
-import { renderTelegramNow, renderTuiNow } from './context-now-surfaces.js';
+import { renderTelegramNow, renderTuiNow, seatsNowLine } from './context-now-surfaces.js';
 import { defaultTelegramCommands, parseTelegramSlash } from '../telegram-commands.js';
 import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../dashboard/slash-runtime/dashboard-handlers.js';
 
@@ -77,6 +77,25 @@ test('Telegram /now keeps five lines when ledger titles, event summaries and gui
   expect(telegram).toContain('K6 Context door (red) — elanous://release/0.2.0/ checklist#K6');
   expect(telegram).toContain('K6 ready — https://example.org/ context');
   expect(telegram).toContain('Follow up — https://example.org/guide');
+});
+
+test('seatsNowLine selects latest seat per role, orders roles and falls back to status', () => {
+  const now = Date.parse('2026-10-03T04:00:00.000Z');
+  const answer = contextNow({}, deps);
+  answer.facts = [
+    { kind: 'seat', seat: 'UX', at: new Date(now - 30_000).toISOString(), status: 'shadow', id: null, title: null, source: 'fake://UX' },
+    { kind: 'seat', seat: 'TC', at: new Date(now - 10 * 60_000).toISOString(), status: 'old', id: null, title: 'Old work', source: 'fake://TC/old' },
+    { kind: 'seat', seat: 'TC', at: new Date(now - 3 * 60_000).toISOString(), status: 'now', id: null, title: 'Twenty characters in a long title', source: 'fake://TC/new' },
+  ];
+  expect(seatsNowLine(answer, now)).toBe('지금 자리들: CTO Twenty characters in · 3분 전 | CXO shadow · 방금');
+  answer.facts.push({ kind: 'seat', seat: 'OP', at: new Date(now - 2 * 3_600_000).toISOString(), status: 'on', id: null, title: 'Operations', source: 'fake://OP' });
+  answer.facts.push({ kind: 'seat', seat: 'MK', at: new Date(now - 30 * 3_600_000).toISOString(), status: 'on', id: null, title: 'Marketing', source: 'fake://MK' });
+  expect(seatsNowLine(answer, now)).toBe('지금 자리들: COO Operations · 2시간 전 | CMO Marketing · 하루 넘음 | CTO Twenty characters in · 3분 전 | CXO shadow · 방금');
+});
+
+test('seatsNowLine returns null with no seat facts', () => {
+  const answer = contextNow({}, { ...deps, seatEntries: () => [] });
+  expect(seatsNowLine(answer, Date.parse(at))).toBeNull();
 });
 
 test('topic filtering agrees across Telegram and TUI and never exposes private bodies', async () => {

@@ -17,7 +17,8 @@ function packageFiles(dir: string, prefix = ''): string[] {
   const files: string[] = [];
   for (const entry of readdirSync(join(dir, prefix), { withFileTypes: true })) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.name === '.git' || entry.name === '.elanous' || entry.name === 'node_modules') continue;
+    if (entry.name === '.git' || entry.name === '.elanous' || entry.name === '.elanous-local' ||
+      entry.name === '.elanous-test' || entry.name === 'graph-runs' || entry.name === 'node_modules') continue;
     if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) throw new Error(`unsafe market bundle entry: ${path}`);
     if (entry.isDirectory()) files.push(...packageFiles(dir, path));
     else files.push(path);

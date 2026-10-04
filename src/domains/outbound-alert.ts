@@ -17,6 +17,8 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
+import { registerLogStoreSink, setLogInstanceName } from '../mss/logging/log-store.js';
+import type { LogSink } from '../mss/logging/sink.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
@@ -35,6 +37,29 @@ function nexusUrl(): string | null {
 // /v1/outbound 로 POST — getElanousConfigDir() 치환은 prod 동치(~/.elanous) + --config-dir 정합.
 const ACP_TOKEN_PATH = join(getElanousConfigDir(), 'acp-token');
 const DEFERRED_PATH = conatusPath('outbound_deferred.jsonl');
+
+// CLI/cron do not inherit the daemon's StoreSink. Register once before the first
+// send, but never attach a second sink to a daemon which already owns one.
+let outboundLogSink: (() => void) | null = null;
+function ensureOutboundLogSink(): void {
+  if (outboundLogSink || inProcessOutbound || process.env.NODE_ENV === 'test') return;
+  try {
+    const logs = getUserConfig().logs;
+    setLogInstanceName(logs.instanceName);
+    outboundLogSink = registerLogStoreSink((s: LogSink) => debug.registerSink(s), 'outbound', logs.retention);
+    if (outboundLogSink) process.once('exit', outboundLogSink);
+  } catch { /* observations must not prevent delivery */ }
+}
+
+function botLabel(token: string): string {
+  // Telegram bot IDs are public numeric IDs; never log the token's secret suffix.
+  const id = token.split(':', 1)[0];
+  return /^\d+$/.test(id ?? '') ? `telegram:${id}` : 'telegram:configured';
+}
+
+function safeObservationLabel(value: string): string {
+  return /^[a-zA-Z0-9_./-]{1,160}$/.test(value) ? value : 'unknown';
+}
 
 // ── 발송 관측 (대표 지시 2026-07-15): 발송 시각·mode·밀림(burst/lag) 를 logs.db 에 남겨
 //    "실시간인지 밀린 것인지" 를 `elanous logs --category outbound.send` 로 판단 가능하게. ──
@@ -61,7 +86,7 @@ function logSend(
   extra: Record<string, unknown> = {},
   opts?: { level?: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'critical' },
 ): void {
-  try { debug.log('outbound.send', mode, { kind, ...extra }, opts); } catch { /* fail-open */ }
+  try { debug.log('outbound.send', mode, { kind: safeObservationLabel(kind), ...extra }, opts); } catch { /* fail-open */ }
 }
 
 /** 밀림 경고 임계 env 이름 — 비교 값은 여기서만 읽는다(호출부에 리터럴을 박지 않는다). */
@@ -143,12 +168,13 @@ function resolveBotToken(botId?: string): string | null {
 }
 
 /** origin(발신 채널)으로 직접 발송. 실패하면 호출자가 report 폴백/재시도한다. */
-function deliverToOrigin(origin: MissionOrigin, text: string): boolean {
+function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: string) => void): boolean {
   if (origin.channel === 'discord') {
     if (!origin.channelId) return false;
     try {
       const token = resolveChannelBotToken('discord', getUserConfig())?.token;
       if (!token) return false;
+      onBot?.('discord:configured');
       const channelId = origin.discordThreadId || origin.channelId;
       const out = spillLongContent(text).text;
       for (let start = 0; start < out.length;) {
@@ -168,19 +194,21 @@ function deliverToOrigin(origin: MissionOrigin, text: string): boolean {
   if (origin.channel !== 'telegram' || origin.chatId == null) return false;
   const token = resolveBotToken(origin.botId);
   if (!token) return false;
+  onBot?.(botLabel(token));
   try { return sendTelegramRaw(token, origin.chatId, text, origin.threadId); } catch { return false; }
 }
 
 /** 보류분 일괄 발송 — 묶음 1건(아침 폭주 방지). 발송 건수 반환.
  *  무음 창 밖 첫 sendOutbound 가 자동 호출 + 06:31 플러시 크론이 보장. */
 export function flushDeferred(path = DEFERRED_PATH): number {
+  ensureOutboundLogSink();
   const observeFlush = (count: number, lagMin: number, kinds: string[]): void => {
     const lagWarnMin = flushLagWarnMin();
     const over = count > 0 && lagMin > lagWarnMin;
     logSend(
       'flush',
       'deferred-batch',
-      { count, lagMin, kinds, path, lagWarnMin },
+      { count, lagMin, kinds: kinds.map(safeObservationLabel), path, lagWarnMin },
       over ? { level: 'warn' } : undefined,
     );
   };
@@ -209,14 +237,28 @@ export function flushDeferred(path = DEFERRED_PATH): number {
     ...list.map(i => `\n── [${kst(i.ts)} · ${i.kind}] ──\n${i.text}`),
   ].join('\n');
   observeFlush(items.length, lagMin, [...new Set(items.map(i => i.kind))]);
+  const sendBatch = (text: string, kind: string, origin?: MissionOrigin): boolean => {
+    let bot = 'unknown';
+    const path = origin
+      ? (deliverToOrigin(origin, text, label => { bot = label; }) ? 'origin' : false)
+      : deliver(text, kind, label => { bot = label; }, 'deferred-flush');
+    if (path === 'daemon') return true;
+    try {
+      debug.log('outbound.send', path ? 'sent' : 'failed', {
+        kind: safeObservationLabel(kind), source: 'deferred-flush', bot,
+        chars: text.length, path: path || 'undeliverable',
+      });
+    } catch { /* observation must not change delivery */ }
+    return path !== false;
+  };
   let delivered = 0;
   // origin 없는 매매 알림만 report 묶음. 그 외는 kind 별로 운영 봇 경계를 유지한다.
   const noOrigin = items.filter(i => !i.origin);
   const tradingBatch = noOrigin.filter(i => !isOperationalKind(i.kind));
-  if (tradingBatch.length && deliver(fmt(tradingBatch), 'report')) delivered += tradingBatch.length;
+  if (tradingBatch.length && sendBatch(fmt(tradingBatch), 'report')) delivered += tradingBatch.length;
   for (const kind of new Set(noOrigin.filter(i => isOperationalKind(i.kind)).map(i => i.kind))) {
     const batch = noOrigin.filter(i => i.kind === kind);
-    if (deliver(fmt(batch), kind)) delivered += batch.length;
+    if (sendBatch(fmt(batch), kind)) delivered += batch.length;
   }
   // origin 있는 것 = 발신 채널·스레드별로 묶어 서로 다른 수신자에게 섞이지 않게 발송.
   const groups = new Map<string, { origin: MissionOrigin; list: Item[] }>();
@@ -228,7 +270,10 @@ export function flushDeferred(path = DEFERRED_PATH): number {
     if (!groups.has(key)) groups.set(key, { origin: it.origin, list: [] });
     groups.get(key)!.list.push(it);
   }
-  for (const g of groups.values()) { if (deliverToOrigin(g.origin, fmt(g.list))) delivered += g.list.length; }
+  for (const g of groups.values()) {
+    const kinds = new Set(g.list.map(i => i.kind));
+    if (sendBatch(fmt(g.list), kinds.size === 1 ? g.list[0]!.kind : 'mixed', g.origin)) delivered += g.list.length;
+  }
   // 전량 배달 성공 시에만 파일 제거(부분 실패는 다음 flush 재시도 — 성공분 중복은 드문 엣지 수용).
   if (delivered >= items.length) { try { unlinkSync(path); } catch { /* */ } }
   return delivered;
@@ -268,17 +313,19 @@ export function sendOutbound(text: string, kind = 'alert', origin?: (MissionOrig
   const source = origin?.surface || (callerPath
     ? relative(repoRoot, callerPath.startsWith('file://') ? fileURLToPath(callerPath) : callerPath).replace(/\\/g, '/')
     : 'unknown');
-  const logOutcome = (event: 'sent' | 'deferred' | 'failed'): void => {
-    try { debug.log('outbound.send', event, { kind, source, chars: text.length }); } catch { /* fail-open */ }
+  ensureOutboundLogSink();
+  let bot = origin?.channel === 'discord' ? 'discord:configured' : 'unknown';
+  const logOutcome = (event: 'sent' | 'deferred' | 'failed', path?: string): void => {
+    try { debug.log('outbound.send', event, { kind: safeObservationLabel(kind), source: safeObservationLabel(source), chars: text.length, bot, ...(path ? { path } : {}) }); } catch { /* fail-open */ }
   };
   // ★ 무음 우회(대표 2026-07-14) — 사용자가 최근(기본 30분) genuine 인텐트(타이핑/버튼탭)를 냈으면
   //   깨어있으므로 야간 무음이어도 즉시 발송(사용자 발원 흐름의 결과물이 아침까지 묶이지 않게).
   //   우회 시 flushDeferred 로 그간 보류분도 함께 전달(사용자가 지금 볼 수 있음).
   if (inQuietHours() && !userRecentlyActive()) {
     const queued = deferOutbound(text, kind, origin);
-    recordOutbound(text, kind); // 보류도 논리적 발송 — 회상 대상(데몬 미경유라 클라 기록)
-    logOutcome(queued ? 'deferred' : 'failed');
-    return true; // 보류 시 수락 — 적재 오류에서도 기존 호출측 재시도 계약 유지
+    if (queued) recordOutbound(text, kind); // 성공한 보류만 회상 대상
+    logOutcome(queued ? 'deferred' : 'failed', queued ? 'deferred' : 'queue-failed');
+    return queued; // 적재가 성공했을 때만 보류 수락
   }
   const bypass = inQuietHours();
   if (bypass) console.error('[outbound] 야간 무음 우회 — 최근 사용자 활동(깨어있음) → 즉시 발송 + 보류분 flush');
@@ -288,16 +335,15 @@ export function sendOutbound(text: string, kind = 'alert', origin?: (MissionOrig
   const { recentCount, burst } = recentSendBurst();
   logSend(bypass ? 'quiet-bypass' : 'realtime', kind, { burst, recentCount, ...(burst ? { backlog: true } : {}) });
   // ★ origin 되돌림(무음 밖) — 발신 채널로 직접 발송. 성공 시 종료, 실패면 report 폴백.
-  if (origin && deliverToOrigin(origin, text)) {
+  if (origin && deliverToOrigin(origin, text, (label) => { bot = label; })) {
     recordOutbound(text, kind);
-    logOutcome('sent');
+    logOutcome('sent', 'origin');
     return true;
   }
-  const path = deliver(text, kind);
-  // 원장 기록은 정확히 1회. 데몬 경유(daemon)면 /v1/outbound 핸들러(outbound-report.ts)
-  // 가 기록하므로 클라는 중복 금지 — 직접 폴백(direct·데몬 다운)만 클라가 기록.
+  const path = deliver(text, kind, (label) => { bot = label; }, source);
+  // 데몬 경유는 실제 라우터의 최종 결과만 기록한다. 직접 폴백과 미전달만 여기서 기록.
   if (path === 'direct') recordOutbound(text, kind);
-  logOutcome(path === false ? 'failed' : 'sent');
+  if (path !== 'daemon') logOutcome(path === false ? 'failed' : 'sent', path === false ? 'undeliverable' : path);
   return path !== false;
 }
 
@@ -318,7 +364,14 @@ export function classifyDaemonResponse(j: unknown): DaemonPathClass {
 /** 데몬 경로를 못 쓴 이유를 남긴다. 관측 실패가 발송을 막지 않음(recordOutbound 과 같은 fail-soft).
  *  비-ok 분류는 크론 운영자가 읽는 표준 출력에도 한 줄 — 싱크 미등록 스크립트에서도 즉시 보이게. */
 function logDaemonPath(classification: DaemonPathClass, kind: string, extra: Record<string, unknown> = {}): void {
-  try { debug.log('outbound.send', 'daemon-path', { classification, kind, ...extra }); } catch { /* fail-soft */ }
+  ensureOutboundLogSink();
+  try {
+    debug.log('outbound.send', 'daemon-path', {
+      classification, kind: safeObservationLabel(kind),
+      ...('hasToken' in extra ? { hasToken: extra.hasToken === true } : {}),
+      ...('inProcess' in extra ? { inProcess: extra.inProcess === true } : {}),
+    });
+  } catch { /* fail-soft */ }
   if (classification === 'ok') return;
   try { console.error(`[outbound] daemon-path ${classification}`); } catch { /* fail-soft */ }
 }
@@ -326,23 +379,33 @@ function logDaemonPath(classification: DaemonPathClass, kind: string, extra: Rec
 /** OB8 — the daemon registers its own in-process sender at startup. Inside the daemon, deliver() must never curl
  *  its own `/v1/outbound`: the curl is synchronous, the event loop that would answer it is the one it blocks, and the
  *  whole daemon freezes until the curl times out (~25 s · `unreachable`) — the message is lost (CS1 · 10-01). */
-export type InProcessOutbound = (text: string, kind: string) => Promise<boolean>;
+export type InProcessOutbound = (text: string, kind: string, source?: string, deferFailureObservation?: boolean) => Promise<boolean>;
 let inProcessOutbound: InProcessOutbound | null = null;
 export function setInProcessOutbound(send: InProcessOutbound | null): void { inProcessOutbound = send; }
 
 /** elanous `/v1/outbound` 우선 → 실패 시 텔레그램 직접. 성공 경로 반환(원장 중복방지용). */
-export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | false {
+export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => void, source?: string): 'daemon' | 'direct' | false {
   // 0) inside the daemon — route in-process, asynchronously; the caller's synchronous answer is «accepted».
   if (inProcessOutbound && process.env.SEND_VIA_ELANOUS !== '0') {
+    onBot?.('daemon:configured');
     const send = inProcessOutbound;
-    void send(text, kind)
+    const fallback = (): void => {
+      let bot = 'unknown';
+      const ok = sendTelegramDirect(text, kind, {}, label => { bot = label; });
+      if (ok) recordOutbound(text, kind);
+      try { debug.log('outbound.send', ok ? 'sent' : 'failed', {
+        kind: safeObservationLabel(kind), source: safeObservationLabel(source ?? 'daemon-fallback'),
+        bot, path: ok ? 'direct' : 'undeliverable', chars: text.length,
+      }); } catch { /* fail-open */ }
+    };
+    void send(text, kind, source, true)
       .then((ok) => {
         logDaemonPath(ok ? 'ok' : 'rejected', kind, { inProcess: true });
-        if (!ok && sendTelegramDirect(text, kind)) recordOutbound(text, kind);
+        if (!ok) fallback();
       })
-      .catch((error: unknown) => {
-        logDaemonPath('rejected', kind, { inProcess: true, error: error instanceof Error ? error.message : String(error) });
-        if (sendTelegramDirect(text, kind)) recordOutbound(text, kind);
+      .catch(() => {
+        logDaemonPath('rejected', kind, { inProcess: true });
+        fallback();
       });
     return 'daemon';
   }
@@ -351,20 +414,22 @@ export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | fal
   if (process.env.SEND_VIA_ELANOUS !== '0') {
     let token = '';
     try { if (existsSync(ACP_TOKEN_PATH)) token = readFileSync(ACP_TOKEN_PATH, 'utf-8').trim(); } catch { /* no token */ }
-    const headers = ['Content-Type: application/json', ...(token ? [`Authorization: Bearer ${token}`] : [])];
+    const headers = ['Content-Type: application/json', 'X-Elanous-Client-Fallback: direct',
+      ...(source ? [`X-Elanous-Outbound-Source: ${safeObservationLabel(source)}`] : []),
+      ...(token ? [`Authorization: Bearer ${token}`] : [])];
     const nexus = nexusUrl();
     const j = nexus
       ? curlPost(`${nexus}/v1/outbound`, JSON.stringify({ text, markdown: false, kind }), headers)
       : null;
     const classification = classifyDaemonResponse(j);
-    if (classification === 'ok') return 'daemon';
+    if (classification === 'ok') { onBot?.('daemon:configured'); return 'daemon'; }
     daemonPath = nexus ? classification : 'not-found';
     const extra: Record<string, unknown> = { hasToken: token.length > 0 };
     if (j && typeof j === 'object' && 'error' in (j as object)) extra.error = (j as { error?: unknown }).error;
     logDaemonPath(classification, kind, extra);
   }
   // 2) fallback: 텔레그램 sendMessage 직접(3900자 분할) — 데몬 미경유라 클라가 원장 기록.
-  if (sendTelegramDirect(text, kind)) return 'direct';
+  if (sendTelegramDirect(text, kind, {}, onBot)) return 'direct';
   reportUndeliverable(kind, daemonPath);
   return false;
 }
@@ -379,7 +444,8 @@ function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-fo
     root = effectiveInstanceRoot();
     universe = root === prodInstanceRoot() ? 'prod' : 'test';
   } catch { /* the report still goes out */ }
-  try { debug.log('outbound.send', 'undeliverable', { kind, daemonPath, universe, root }); } catch { /* fail-soft */ }
+  ensureOutboundLogSink();
+  try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root }); } catch { /* fail-soft */ }
   const hint = universe === 'prod'
     ? '운영 데몬이 떠 있는지 확인: elanous nexus show'
     : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous ELANOUS_CONFIG_DIR=~/.elanous 를 준다';
@@ -411,6 +477,7 @@ function sendTelegramRaw(token: string, chatId: string | number, text: string, t
 export function sendTelegramDirect(
   text: string, kind?: string,
   deps: { config?: UserConfig; sendRaw?: typeof sendTelegramRaw; legacyEnv?: typeof conatusEnv } = {},
+  onBot?: (bot: string) => void,
 ): boolean {
   const sendRaw = deps.sendRaw ?? sendTelegramRaw;
   let cfg: UserConfig | undefined;
@@ -418,7 +485,7 @@ export function sendTelegramDirect(
   if (cfg) {
     try {
       const target = kindRouteTarget(cfg, kind);
-      if (target) return sendRaw(target.botToken, String(target.chatId), text);
+      if (target) { onBot?.(botLabel(target.botToken)); return sendRaw(target.botToken, String(target.chatId), text); }
     } catch { /* unavailable channel routing: fall through */ }
     // A declared table is authoritative: missing roles cannot escape to an env bot.
     if (cfg.telegram.channels?.length) {
@@ -437,7 +504,7 @@ export function sendTelegramDirect(
     } catch { /* unavailable main bot */ }
     const rcToken = cfg?.telegram.reportChannel?.botToken;
     logKindRouteFallback(kind, home ? 'main-home' : 'none', !!mainToken && !!cfg?.telegram.reportChannel && (!rcToken || rcToken === mainToken));
-    if (home) return sendRaw(home.botToken, String(home.chatId), text);
+    if (home) { onBot?.(botLabel(home.botToken)); return sendRaw(home.botToken, String(home.chatId), text); }
     console.error('[outbound] 운영 kind 메인 봇/홈 미설정 — 콘솔 출력\n' + text);
     return false;
   }
@@ -450,5 +517,6 @@ export function sendTelegramDirect(
   }
   logKindRouteFallback(kind, tok && chat ? 'conatus-env' : 'none', false);
   if (!tok || !chat) { console.error('[outbound] 토큰/chat 미설정 — 콘솔 출력\n' + text); return false; }
+  onBot?.(botLabel(tok));
   return sendRaw(tok, chat, text);
 }

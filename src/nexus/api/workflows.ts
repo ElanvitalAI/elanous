@@ -32,7 +32,9 @@ import { requirePosixShellCommand } from '../../platform/default-shell.js';
 import { spawn } from 'child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
+import { debug } from '../../debug/log.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { getWorkflowHistoryVersion, listWorkflowHistory, snapshotBeforeSave } from './workflow-history.js';
 import {
   deleteWorkflow,
   discoverWorkflows,
@@ -232,6 +234,45 @@ export function handleWorkflowGet(
   );
 }
 
+export function handleWorkflowHistoryList(
+  req: Request,
+  name: string,
+  opts: MetaApiOpts,
+): Response {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method: req.method }, 405);
+  const scope = new URL(req.url).searchParams.get('scope') === 'global' ? 'global' : 'project';
+  try {
+    return jsonResponse({ versions: listWorkflowHistory(name, { scope }) }, 200);
+  } catch (err) {
+    if (err instanceof Error && err.message === 'invalid workflow name') {
+      return jsonResponse({ error: 'bad_request', reason: err.message }, 400);
+    }
+    throw err;
+  }
+}
+
+export function handleWorkflowHistoryVersionGet(
+  req: Request,
+  name: string,
+  id: string,
+  opts: MetaApiOpts,
+): Response {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method: req.method }, 405);
+  const scope = new URL(req.url).searchParams.get('scope') === 'global' ? 'global' : 'project';
+  try {
+    const yaml = getWorkflowHistoryVersion(name, id, { scope });
+    if (yaml === null) return jsonResponse({ error: 'not_found', name, id }, 404);
+    return jsonResponse({ yaml }, 200);
+  } catch (err) {
+    if (err instanceof Error && (err.message === 'invalid workflow name' || err.message === 'invalid workflow history version id')) {
+      return jsonResponse({ error: 'bad_request', reason: err.message }, 400);
+    }
+    throw err;
+  }
+}
+
 export async function handleWorkflowPut(
   req: Request,
   name: string,
@@ -248,6 +289,17 @@ export async function handleWorkflowPut(
     return jsonResponse({ error: 'bad_request', reason: '`yaml` must be a string' }, 400);
   }
   const scope = scopeRaw === 'global' ? 'global' : 'project';
+  const parsed = parseWorkflowYaml(yamlText);
+  if (parsed.ok && parsed.workflow?.name === name) {
+    // Capture the existing file before saveWorkflow overwrites it; a failed snapshot is non-fatal.
+    try {
+      snapshotBeforeSave(name, { scope });
+    } catch (err) {
+      debug.log('nexus.workflow-history', 'snapshot-failed', {
+        name, scope, error: err instanceof Error ? err.message : String(err),
+      }, { level: 'warn' });
+    }
+  }
   const r = saveWorkflow(name, yamlText, { scope });
   if (!r.ok) {
     return jsonResponse(

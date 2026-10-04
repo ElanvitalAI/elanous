@@ -1,27 +1,13 @@
-// NEXUS · personas REST handlers (§6.4 · 2026-05-09).
-//
-// Endpoints
-//   GET  /v1/personas              — list all loaded personas
-//   GET  /v1/personas/:personaId   — single persona profile
-//
-// Architecture: read-only thin wrapper over the global PersonaRegistry
-// (`src/persona/global-registry.ts`). Disk yaml is the source of truth;
-// editing requires text editor + `elanous persona reload` (or fs.watch
-// auto-reload). PWA Showroom consumes this for the per-panel persona
-// picker (§6.4 Q2 = REST read-only).
-//
-// PLAN: 내부 문서 `PLAN-cv-3-showroom-mvp-2026-05-07` §6.4
-// Cross-ref: src/persona/global-registry.ts (singleton accessor)
-//            src/persona/types.ts (PersonaProfile shape)
-
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+// NEXUS · personas REST handlers. Presets clone into the state persona store;
+// writes reload the global registry so subsequent reads see the saved profile.
 
 import {
   awaitGlobalPersonaLoad,
   getGlobalPersonaRegistry,
   reloadGlobalPersonaRegistry,
+  resolveStatePersonaDir,
 } from '../../persona/global-registry.js';
+import { clonePreset, editPersona, loadPresets } from '../../persona/presets.js';
 import type { PersonaRegistryEvent } from '../../persona/registry.js';
 import type { PersonaProfile } from '../../persona/types.js';
 import {
@@ -193,22 +179,41 @@ export function handlePersonasEvents(
   });
 }
 
-/** Resolve personas dir same way `global-registry.ts` does, so the PATCH
- *  endpoint targets the file the registry will reload. */
-function resolvePersonasDir(): string {
-  const env = process.env.ELANOUS_PERSONAS_DIR;
-  if (env && env.length > 0) return env;
-  return join(homedir(), '.elanous', 'personas');
+/** GET /v1/persona-presets — shipped preset catalog in index order. */
+export function handlePersonaPresets(req: Request, opts: PersonaRouteOpts = {}): Response {
+  if (opts.checkAuth && !opts.checkAuth(req)) return jsonResponse({ error: 'unauthorized' }, 401);
+  return jsonResponse({ presets: loadPresets() }, 200);
 }
 
-/** PATCH /v1/personas/:personaId — update description.
- *
- *  Body: `{ description: "<string, ≤ 280 chars>" }` — empty string clears.
- *  Other fields ignored (yaml surgical edit pattern).
- *
- *  Returns 200 with the updated `PersonaWire` after reload, 400 / 404 /
- *  500 with structured `{ error, reason? }`.
- */
+/** POST /v1/personas — clone a shipped preset into the user's persona store. */
+export async function handlePersonaCreate(req: Request, opts: PersonaRouteOpts = {}): Promise<Response> {
+  if (opts.checkAuth && !opts.checkAuth(req)) return jsonResponse({ error: 'unauthorized' }, 401);
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return jsonResponse({ error: 'invalid-json' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonResponse({ error: 'invalid-body' }, 400);
+  const { preset, name } = body as Record<string, unknown>;
+  if (typeof preset !== 'string' || !preset.trim() || typeof name !== 'string' || !name.trim()) {
+    return jsonResponse({ error: 'preset-and-name-required' }, 400);
+  }
+  await awaitGlobalPersonaLoad();
+  if (!loadPresets().some((p) => p.personaId === preset)) return notFound(`preset ${preset} not found`);
+  try {
+    const created = clonePreset(preset, name.trim(), { dir: resolveStatePersonaDir() });
+    await reloadGlobalPersonaRegistry();
+    const persona = getGlobalPersonaRegistry().get(created.personaId);
+    if (!persona) return notFound(`persona ${created.personaId} not found after reload`);
+    return jsonResponse({ persona: toWire(persona) }, 201);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('persona name already exists:')) {
+      return jsonResponse({ error: 'persona-name-conflict' }, 409);
+    }
+    return jsonResponse({ error: 'create-failed' }, 500);
+  }
+}
+
+/** PATCH /v1/personas/:personaId — description-only edits retain the
+ *  existing surgical YAML behavior; multi-field edits use the persona store. */
 export async function handlePersonaPatch(
   req: Request,
   personaId: string,
@@ -217,17 +222,23 @@ export async function handlePersonaPatch(
   if (opts.checkAuth && !opts.checkAuth(req)) {
     return jsonResponse({ error: 'unauthorized' }, 401);
   }
-  let body: { description?: unknown };
-  try {
-    body = (await req.json()) as { description?: unknown };
-  } catch {
-    return jsonResponse({ error: 'invalid-json' }, 400);
+  let parsed: unknown;
+  try { parsed = await req.json(); }
+  catch { return jsonResponse({ error: 'invalid-json' }, 400); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return jsonResponse({ error: 'invalid-body' }, 400);
   }
-  if (typeof body.description !== 'string') {
-    return jsonResponse({ error: 'description-required' }, 400);
+  const body = parsed as Record<string, unknown>;
+  const fields = Object.keys(body);
+  if (!fields.length) return jsonResponse({ error: 'description-required' }, 400);
+  if (fields.some((field) => !['displayName', 'description', 'systemPrompt'].includes(field))) {
+    return jsonResponse({ error: 'invalid-persona-field' }, 400);
   }
-  if (body.description.length > MAX_PERSONA_DESCRIPTION_LENGTH * 4) {
-    // Guard against pathological inputs before the helper trims.
+  if (fields.some((field) => typeof body[field] !== 'string')
+    || (body.displayName !== undefined && !(body.displayName as string).trim())) {
+    return jsonResponse({ error: 'invalid-persona-field' }, 400);
+  }
+  if (typeof body.description === 'string' && body.description.length > MAX_PERSONA_DESCRIPTION_LENGTH * 4) {
     return jsonResponse({ error: 'description-too-long' }, 400);
   }
 
@@ -237,14 +248,37 @@ export async function handlePersonaPatch(
     return notFound(`persona ${personaId} not found`);
   }
 
-  const dir = resolvePersonasDir();
-  const result = updatePersonaDescription(dir, personaId, body.description);
-  if (!result.ok) {
-    const status = result.reason === 'file-not-found' ? 404 : 400;
-    return jsonResponse({ error: 'patch-failed', reason: result.reason }, status);
+  const dir = resolveStatePersonaDir();
+  if (fields.length === 1 && typeof body.description === 'string') {
+    const result = updatePersonaDescription(dir, personaId, body.description);
+    if (!result.ok) {
+      const status = result.reason === 'file-not-found' ? 404 : 400;
+      return jsonResponse({ error: 'patch-failed', reason: result.reason }, status);
+    }
+  } else {
+    const edits: Record<string, unknown> = {};
+    for (const field of fields) edits[field] = body[field];
+    if (typeof edits.description === 'string') {
+      const description = edits.description.trim();
+      edits.description = description;
+      if (description.length > MAX_PERSONA_DESCRIPTION_LENGTH) {
+        return jsonResponse({ error: 'description-too-long' }, 400);
+      }
+    }
+    try {
+      editPersona(personaId, edits, { dir });
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('persona not found:')) {
+        return notFound(`persona ${personaId} not found in state store`);
+      }
+      if (error instanceof Error && error.message.startsWith('persona name already exists:')) {
+        return jsonResponse({ error: 'persona-name-conflict' }, 409);
+      }
+      return jsonResponse({ error: 'patch-failed', reason: error instanceof Error ? error.message : 'invalid-persona' }, 400);
+    }
   }
 
-  // Reload so the in-memory registry reflects the new description on the
+  // Reload so the in-memory registry reflects the saved fields on the
   // next GET. fs.watch would auto-reload but is async + race-y vs the
   // immediate echo below.
   await reloadGlobalPersonaRegistry();
@@ -255,7 +289,7 @@ export async function handlePersonaPatch(
   return jsonResponse({ persona: toWire(reloaded) }, 200);
 }
 
-/** Combined dispatcher — `/v1/personas[/:id]` + `/v1/personas/events`.
+/** Combined dispatcher — `/v1/persona-presets` + `/v1/personas[/:id]` + `/v1/personas/events`.
  *  Returns null when the pathname doesn't match so the caller chains. */
 export async function dispatchPersonaRoute(
   req: Request,
@@ -263,11 +297,14 @@ export async function dispatchPersonaRoute(
   opts: PersonaRouteOpts = {},
 ): Promise<Response | null> {
   const method = req.method.toUpperCase();
+  if (pathname === '/v1/persona-presets') {
+    if (method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
+    return handlePersonaPresets(req, opts);
+  }
   if (pathname === '/v1/personas') {
-    if (method !== 'GET') {
-      return jsonResponse({ error: 'method not allowed' }, 405);
-    }
-    return handlePersonasList(req, opts);
+    if (method === 'GET') return handlePersonasList(req, opts);
+    if (method === 'POST') return handlePersonaCreate(req, opts);
+    return jsonResponse({ error: 'method not allowed' }, 405);
   }
   // SSE — must come BEFORE the single-persona regex so that the
   // literal "events" segment isn't misread as a personaId.
@@ -279,8 +316,13 @@ export async function dispatchPersonaRoute(
   }
   const match = pathname.match(/^\/v1\/personas\/([^/]+)$/);
   if (!match) return null;
-  const personaId = decodeURIComponent(match[1]!);
+  let personaId: string;
+  try { personaId = decodeURIComponent(match[1]!); }
+  catch { return jsonResponse({ error: 'invalid-persona-id' }, 400); }
   if (method === 'PATCH') {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(personaId)) {
+      return jsonResponse({ error: 'invalid-persona-id' }, 400);
+    }
     return handlePersonaPatch(req, personaId, opts);
   }
   if (method !== 'GET') {

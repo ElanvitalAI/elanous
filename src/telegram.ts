@@ -73,7 +73,10 @@ import { effectiveInstanceRoot } from './instance/resolve.js';
 import { getElanousConfigDir } from './elanous-config-dir.js';
 import { defaultFieldEvent, FieldUploadError, parseFieldCaption, resolveFieldMime, saveFieldMedia } from './field/field-media.js';
 import { scheduleFieldReel, type FieldReelOptions } from './field/field-reel.js';
+import { handleTelegramFieldNote } from './field-note/telegram.js';
+import type { TranscriptionEngine, FieldAudio } from './field-note/transcribe.js';
 import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-followup.js';
+import { attachTelegramProjectButtons } from './telegram-project-command.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -101,6 +104,8 @@ export interface TgIncoming {
   text: string;
   messageId: number;
   threadId?: number;
+  /** Telegram message timestamp, not poll time. */
+  receivedAt?: string;
   isDm: boolean;
   isGroup: boolean;
   /** Zero or more attached media — populated by parseUpdate from
@@ -219,6 +224,9 @@ export interface TelegramBotOpts {
   fieldRootDir?: () => string;
   /** 시험에서는 실제 렌더 대신 가짜 실행기를 주입한다. */
   fieldReel?: FieldReelOptions;
+  /** NOTE3a engine and audio decoder are injected; no transcription provider is assumed. */
+  fieldNoteEngine?: TranscriptionEngine;
+  fieldNoteDecodeAudio?: (file: string, recordedAt: string) => FieldAudio;
   /** Test seam for the business-card graph and its private run root. */
   cardFollowupDeps?: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
 }
@@ -278,7 +286,7 @@ export function classifyTelegramText(
 
 export class TelegramBot {
   private readonly token: string;
-  private readonly botId: string;
+  readonly botId: string;
   private readonly allowedUsers: Set<number>;
   private readonly onMessage: TelegramBotOpts['onMessage'];
   private readonly fetchImpl: typeof fetch;
@@ -338,6 +346,8 @@ export class TelegramBot {
   private readonly fieldDefaultEventOpt?: string;
   private readonly fieldRootDir: () => string;
   private readonly fieldReel?: FieldReelOptions;
+  private readonly fieldNoteEngine?: TranscriptionEngine;
+  private readonly fieldNoteDecodeAudio?: (file: string, recordedAt: string) => FieldAudio;
   private readonly cardFollowupDeps: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
   private readonly seatWorkDeps: TelegramSeatWorkDeps;
   private seatAskTimer: ReturnType<typeof setInterval> | null = null;
@@ -375,6 +385,8 @@ export class TelegramBot {
     this.fieldDefaultEventOpt = opts.fieldDefaultEvent;
     this.fieldRootDir = opts.fieldRootDir ?? getElanousConfigDir;
     this.fieldReel = opts.fieldReel;
+    this.fieldNoteEngine = opts.fieldNoteEngine;
+    this.fieldNoteDecodeAudio = opts.fieldNoteDecodeAudio;
     this.cardFollowupDeps = opts.cardFollowupDeps ?? {};
     this.seatWorkDeps = { ...opts.seatWorkDeps, askDeps: { ...opts.seatWorkDeps?.askDeps,
       channel: 'telegram', botId: this.botId,
@@ -1214,6 +1226,7 @@ export class TelegramBot {
               userId: cq.from.id,
               userName: cq.from.username ?? cq.from.first_name,
               chatId: cq.message?.chat.id,
+              threadId: cq.message?.message_thread_id,
               messageId: cq.message?.message_id,
               data: cq.data ?? '',
             };
@@ -1528,6 +1541,13 @@ export class TelegramBot {
     }
     // 현장 업로드 — `#현장` 캡션(또는 태그된 앨범의 나머지)의 사진·영상은 LLM 대신 현장 폴더로.
     if (await this.tryHandleFieldUpload(ctx)) return;
+    if (await handleTelegramFieldNote(ctx, {
+      rootDir: this.fieldRootDir(),
+      download: (fileId) => this.downloadFile(fileId),
+      reply: async (incoming, text) => { await this.sendMessage(incoming.chatId, text, { replyTo: incoming.messageId, threadId: incoming.threadId }); },
+      engine: this.fieldNoteEngine, decodeAudio: this.fieldNoteDecodeAudio,
+      now: () => new Date(this.nowImpl()),
+    })) return;
     if (await maybeHandleCardPhoto(ctx, {
       isOwner: (userId) => this.isOwnerAllowed(userId),
       isFieldAlbum: (id) => this.fieldGroups.has(id),
@@ -1827,6 +1847,7 @@ export class TelegramBot {
             const reply = await slashParse.cmd.handler(slashParse.args, ctx, {
               userConfig: this.slashContext.userConfig,
               allCommands: this.slashCommands,
+              sendButtons: async (text, buttons) => { await this.sendInlineKeyboard(ctx.chatId, text, buttons, { replyTo: ctx.messageId, threadId: ctx.threadId }); },
               downloadAttachments: () => this.downloadCtxAttachments(ctx),
               daemonBridge: this.slashContext.daemonBridge,
               hitlConfirmChannel: this.hitlConfirmChannelForChat(ctx.chatId, ctx.threadId),
@@ -2011,6 +2032,7 @@ export class TelegramBot {
               return await slashParse.cmd.handler(slashParse.args, ctx, {
                 userConfig: this.slashContext!.userConfig,
                 allCommands: this.slashCommands,
+                sendButtons: async (text, buttons) => { await this.sendInlineKeyboard(ctx.chatId, text, buttons, { replyTo: ctx.messageId, threadId: ctx.threadId }); },
                 streamer,
                 downloadAttachments: () => this.downloadCtxAttachments(ctx),
                 daemonBridge: this.slashContext!.daemonBridge,
@@ -2030,6 +2052,7 @@ export class TelegramBot {
               return await runAcpViaSlash(activeBackend, [ctx.text], ctx, {
                 userConfig: this.slashContext!.userConfig,
                 allCommands: this.slashCommands,
+                sendButtons: async (text, buttons) => { await this.sendInlineKeyboard(ctx.chatId, text, buttons, { replyTo: ctx.messageId, threadId: ctx.threadId }); },
                 streamer,
                 downloadAttachments: () => this.downloadCtxAttachments(ctx),
                 daemonBridge: this.slashContext!.daemonBridge,
@@ -2270,6 +2293,7 @@ interface RawUpdate {
   update_id: number;
   message?: {
     message_id: number;
+    date?: number;
     from?: { id: number; first_name?: string; username?: string };
     chat: { id: number; type: 'private' | 'group' | 'supergroup' | 'channel' };
     text?: string;
@@ -2286,7 +2310,7 @@ interface RawUpdate {
   callback_query?: {
     id: string;
     from: { id: number; first_name?: string; username?: string };
-    message?: { message_id: number; chat: { id: number } };
+    message?: { message_id: number; message_thread_id?: number; chat: { id: number } };
     data?: string;
     chat_instance?: string;
   };
@@ -2305,6 +2329,7 @@ export interface TgCallbackQuery {
   userId: number;
   userName?: string;
   chatId?: number;
+  threadId?: number;
   messageId?: number;
   data: string;
 }
@@ -2397,6 +2422,7 @@ export function parseUpdate(u: RawUpdate): TgIncoming | null {
     text: (typeof m.text === 'string' ? m.text : (m.caption ?? '')),
     messageId: m.message_id,
     threadId: m.message_thread_id,
+    ...(typeof m.date === 'number' ? { receivedAt: new Date(m.date * 1000).toISOString() } : {}),
     isDm,
     isGroup: !isDm,
     attachments,
@@ -2912,9 +2938,10 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
   botRef.ensureSurfaceHitl();
   // DEC-TG(대표 10-02) — decision cards on the MAIN bot only (other channel pollers carry other tokens). The ticker
   // itself sends only while this bot polls, so a send-only nexus bot never duplicates the standalone poller's cards.
-  if (opts.userConfig.raw?.decisions === undefined || (opts.userConfig.raw.decisions as { cards?: unknown }).cards !== false) {
-    const mainToken = resolveChannelBotToken('telegram', opts.userConfig)?.token;
-    if (mainToken && botToken === mainToken) {
+  const mainToken = resolveChannelBotToken('telegram', opts.userConfig)?.token;
+  if (mainToken && botToken === mainToken) {
+    attachTelegramProjectButtons(botRef, opts.userConfig);
+    if (opts.userConfig.raw?.decisions === undefined || (opts.userConfig.raw.decisions as { cards?: unknown }).cards !== false) {
       const bot = botRef;
       void import('./decisions/telegram-decision-cards.js')
         .then(({ attachTelegramDecisionCards }) => { attachTelegramDecisionCards(bot, opts.userConfig); })

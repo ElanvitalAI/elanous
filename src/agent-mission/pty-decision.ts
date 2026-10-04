@@ -41,7 +41,7 @@ function safe(value: string): string {
 }
 
 /** The only emission point for the inside-PTY decision stream. Never log unsanitized input. */
-export function emitPtyDecision(input: DecisionInput, log: typeof debug.log = debug.log): PtyDecision {
+export function emitPtyDecision(input: DecisionInput, log: typeof debug.log = (category, event, data) => debug.log(category, event, data)): PtyDecision {
   let stream = missionStreams.get(input.missionId);
   if (!stream) {
     stream = { alias: `mission-${missionStreams.size + 1}`, seq: -1 };

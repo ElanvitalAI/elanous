@@ -46,6 +46,9 @@ import { classifyIntake } from './ad-pipeline/intake.js';
 import { createAdPipelineDeps, runAdPipeline } from './ad-pipeline/run.js';
 import { projectCommand } from './telegram-project-command.js';
 import { telegramNowSlash } from './context-bus/context-now-surfaces.js';
+import { createWishCard } from './intake-plane/wish-card.js';
+import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
+import { CardStore } from './task-cards/card-store.js';
 import type { ContextNowDeps } from './context-bus/context-now.js';
 
 /** How many prior user/assistant turns to pass into `executeSkill` as
@@ -155,6 +158,7 @@ export interface TgCommandContext {
   userConfig: UserConfig;
   /** All registered commands — used by `/help` to enumerate. */
   allCommands: TgSlashCommand[];
+  sendButtons?: (text: string, buttons: Array<Array<{ text: string; data: string }>>) => Promise<void>;
   /** When the caller posted a placeholder for a streaming command,
    *  the streamer edits it in-place as the handler accumulates
    *  output. Undefined for instant commands. Handlers must tolerate
@@ -590,6 +594,23 @@ export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashComman
       },
     },
     projectCommand(),
+    {
+      name: 'wish',
+      description: '소원을 카드로 남기기',
+      handler: async (args, ctx, { userConfig }) => {
+        if (String(ctx.userId) !== telegramDecisionOwner(userConfig) || ctx.chatId !== ctx.userId || !ctx.isDm) {
+          return '대표만 쓸 수 있습니다';
+        }
+        if (args.length === 0) return '/wish <소원 한 줄>';
+        const store = new CardStore();
+        try {
+          const card = createWishCard({ text: args.join(' '), source: 'telegram', ref: `${ctx.chatId}:${ctx.messageId}` }, store);
+          return `소원 카드로 남겼습니다 — ${card.title} (카드 ${card.cardId.slice(0, 8)})`;
+        } finally {
+          store.close();
+        }
+      },
+    },
     {
       name: 'fork',
       description: 'Fork the current chat session (or /fork <prefix>) and continue HERE on the fork · time-travel: /fork before:N',

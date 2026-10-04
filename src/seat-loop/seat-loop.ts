@@ -17,7 +17,7 @@ import { nextPersonaTodo, personaTodoPath, readPersonaTodos, type PersonaTodo } 
 import { PersonaRegistry } from '../persona/registry.js';
 import { answerSeat, askSeat, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatQuestions, type SeatId } from '../seat-dispatch/seat-questions.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
-import { listChecklist, type Checklist } from '../release-loop/checklist.js';
+import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { readSchedules, releasedVersion } from '../release-loop/feature-store.js';
 
 // `kind`/`createdAt` are the V3 shadow-compare keys (내부 문서 `METHOD-v3-shadow-compare-2026-10-02` · MK 10-02 18:54).
@@ -31,7 +31,11 @@ export type OpCandidate =
   | { kind: 'release-readiness'; version: string | null; verdict: 'ready' | 'not-ready' | 'no-open-release'; cutAt?: string; landBy?: string | null; red: string[]; undecided: string[]; blocked: string[] }
   | { kind: 'unassigned-cell'; version: string | null; id: string | null; title?: string; status?: string; verdict: 'assign' | 'none' }
   | { kind: 'decision-delegation'; id: string | null; title?: string; category?: DecisionEntry['category']; dueAt?: string; verdict: 'review-delegation' | 'none' };
-export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate; action?: SeatAction; reason?: string; runId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean };
+export type TcCandidate =
+  | { kind: 'merged-pr-yellow-cell'; version: string; id: string; title: string; pr: number; mergedAt: string }
+  | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] };
+export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
+export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off' };
 export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null };
 export type SeatDeps = {
@@ -54,12 +58,16 @@ export type SeatDeps = {
   schedules?: () => Array<{ version: string; cutAt: string; landBy?: string | null }>;
   /** Checklist items of one version — default reads the release ledger DB (checklist.json is only a legacy import source since REL5b). */
   checklistItems?: (version: string) => Array<{ id: string; title: string; status: string; owner?: string | null; disposition?: string; evidence?: string }>;
+  /** Chronological release-ledger events for a checklist id; injected for isolated release fixtures. */
+  checklistHistory?: (id: string) => ReturnType<typeof checklistHistory>;
   /** Full checklist snapshot including history, for stall detection. */
   stallChecklist?: (version: string) => Checklist;
   /** Inject a mailbox write for isolated failure tests; production uses the seat message store. */
   stallDelivery?: (message: MessageEnvelope, key: string, root: string) => boolean;
   /** Open cards from the decision ledger; injected only for isolated ledger tests. */
   pendingDecisions?: () => Array<Pick<DecisionEntry, 'id' | 'title' | 'category' | 'dueAt'>>;
+  /** Read-only PR snapshot for TC judgment; defaults to GitHub CLI reads. */
+  pullRequests?: () => Promise<TcPullRequest[]>;
   ledgerFiles?: (directory: string) => string[];
   lockContended?: () => void;
   /** Supply a question only when this seat lacks evidence for the selected work item. */
@@ -211,17 +219,19 @@ function eligibleItem(item: SeatItem, ledger: readonly SeatEntry[], handled: Rea
   return !lastWait?.item || itemSnapshot(lastWait.item) !== itemSnapshot(item);
 }
 
-// Compare checklist snapshots without consulting release history or treating a version move as new work.
+const CHECKLIST_HANDLED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Same-version snapshots are handled here; carried work requires an explicit release-ledger move.
 export function alreadyHandled(item: SeatItem, ledger: readonly SeatEntry[]): boolean {
   if (item.source !== 'checklist' || !item.seat || !item.asOf || item.evidenceHash === undefined) return false;
   const now = Date.parse(item.asOf);
   if (!Number.isFinite(now)) return false;
   return ledger.some((entry) => {
     const at = Date.parse(entry.at || entry.ts || '');
-    return entry.seat === item.seat && at >= now - 7 * 24 * 60 * 60 * 1000 && at <= now
+    return entry.seat === item.seat && at >= now - CHECKLIST_HANDLED_WINDOW_MS && at <= now
       // A shadowed seat question was never delivered — it must be picked again once delivery is on (RM3 · TC merge 10-03).
       && (entry.status === 'launched' || (entry.status === 'shadow' && !entry.inquiry))
-      && entry.item?.source === 'checklist' && entry.item.id === item.id
+      && entry.item?.source === 'checklist' && entry.item.id === item.id && entry.item.version === item.version
       && entry.item.title === item.title && entry.item.evidenceHash === item.evidenceHash;
   });
 }
@@ -357,6 +367,126 @@ function opCandidates(deps: SeatDeps, now: Date): OpCandidate[] {
   ];
 }
 
+const TC_APPROVAL_WAIT_MS = 2 * 60 * 60 * 1000;
+
+function readTcChecklist(root: string): Array<{ version: string; id: string; title: string; status: string; owner: string | null }> {
+  const path = join(root, 'release', 'features.sqlite');
+  if (!existsSync(path)) return [];
+  const db = new Database(path, { readonly: true, strict: true });
+  try {
+    return db.query(`SELECT a.version, f.id, COALESCE(a.title_override, f.title) AS title, a.status, a.owner
+      FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.status = 'yellow' AND a.owner = 'TC'
+      ORDER BY a.version, f.id`).all() as Array<{ version: string; id: string; title: string; status: string; owner: string | null }>;
+  } finally { db.close(); }
+}
+
+type TcTimelineEvent = { event: string; created_at: string };
+
+export function tcApprovalWaitAt(pr: TcPullRequest, timeline: readonly TcTimelineEvent[]): { readyAt: string; approvalWaitAt: string } | undefined {
+  if (pr.state !== 'OPEN' || pr.isDraft || pr.reviewDecision !== 'REVIEW_REQUIRED') return undefined;
+  const events = timeline.filter((event) => typeof event.created_at === 'string' && Number.isFinite(Date.parse(event.created_at)))
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  let readyAt: string | undefined = pr.createdAt;
+  let waitAt: string | undefined = pr.createdAt;
+  for (const event of events) {
+    if (event.event === 'converted_to_draft') { readyAt = undefined; waitAt = undefined; }
+    if (event.event === 'ready_for_review') { readyAt = event.created_at; waitAt = event.created_at; }
+    if (event.event === 'review_requested' && readyAt && Date.parse(event.created_at) >= Date.parse(readyAt)) waitAt = event.created_at;
+  }
+  return readyAt && waitAt && Number.isFinite(Date.parse(readyAt)) && Date.parse(waitAt) >= Date.parse(readyAt)
+    ? { readyAt, approvalWaitAt: waitAt } : undefined;
+}
+
+export async function readTcPullRequests(query: (args: string[]) => Promise<string> = async (args) => {
+  const { stdout } = await exec('gh', args, { cwd: repoRoot, encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
+  return stdout;
+}): Promise<TcPullRequest[]> {
+  const pages: unknown = JSON.parse(await query(['api', '--paginate', '--slurp', 'repos/{owner}/{repo}/pulls?state=all&per_page=100']));
+  if (!Array.isArray(pages) || !pages.every((page) => Array.isArray(page))) throw new Error('PR list is not an array of pages');
+  const prs = pages.flatMap((page: unknown[]) => page).filter((pr) => pr && typeof pr === 'object'
+    && ((pr as Record<string, unknown>).state === 'open' || typeof (pr as Record<string, unknown>).merged_at === 'string'));
+  const results: TcPullRequest[] = [];
+  for (let offset = 0; offset < prs.length; offset += 10) {
+    results.push(...await Promise.all(prs.slice(offset, offset + 10).map(async (pr): Promise<TcPullRequest> => {
+    const listing = pr as Record<string, unknown>;
+    if (typeof listing.number !== 'number' || typeof listing.title !== 'string' || typeof listing.created_at !== 'string'
+      || typeof listing.draft !== 'boolean' || (listing.state !== 'open' && listing.state !== 'closed')) {
+      throw new Error('incomplete PR record');
+    }
+    const details: unknown = listing.state === 'open'
+      ? JSON.parse(await query(['pr', 'view', String(listing.number), '--json', 'number,title,body,state,isDraft,createdAt,mergedAt,files,reviewDecision']))
+      : { number: listing.number, title: listing.title, body: listing.body, state: 'MERGED', isDraft: listing.draft,
+        createdAt: listing.created_at, mergedAt: listing.merged_at, files: [] };
+    if (!details || typeof details !== 'object' || Array.isArray(details)) throw new Error('invalid PR record');
+    const row = details as Record<string, unknown>;
+    if (typeof row.number !== 'number' || typeof row.title !== 'string' || typeof row.createdAt !== 'string'
+      || typeof row.isDraft !== 'boolean' || (row.state !== 'OPEN' && row.state !== 'MERGED' && row.state !== 'CLOSED')) {
+      throw new Error('incomplete PR record');
+    }
+    const paths = Array.isArray(row.files) ? row.files.flatMap((file: unknown) =>
+      file && typeof file === 'object' && typeof (file as { path?: unknown }).path === 'string' ? [(file as { path: string }).path] : []) : [];
+    const result: TcPullRequest = { number: row.number, title: row.title, body: typeof row.body === 'string' ? row.body : '',
+      state: row.state, isDraft: row.isDraft, createdAt: row.createdAt,
+      mergedAt: typeof row.mergedAt === 'string' ? row.mergedAt : null, paths,
+      reviewDecision: typeof row.reviewDecision === 'string' ? row.reviewDecision : undefined };
+    if (result.state === 'OPEN' && !result.isDraft && result.reviewDecision === 'REVIEW_REQUIRED'
+      && paths.some((path) => path.startsWith('release/public/') || path.startsWith('scripts/public-export') || path.startsWith('src/market/'))) {
+      try {
+        const pages: unknown = JSON.parse(await query(['api', '--paginate', '--slurp', `repos/{owner}/{repo}/issues/${result.number}/timeline`]));
+        if (!Array.isArray(pages) || !pages.every((page) => Array.isArray(page))) throw new Error('PR timeline is not an array of pages');
+        const timeline: unknown[] = pages.flatMap((page: unknown[]) => page);
+        const transitions = timeline.filter((event): event is Record<string, unknown> => event !== null && typeof event === 'object'
+          && ['converted_to_draft', 'ready_for_review', 'review_requested'].includes((event as Record<string, unknown>).event as string));
+        if (!transitions.every((event) => typeof event.created_at === 'string' && Number.isFinite(Date.parse(event.created_at)))) {
+          throw new Error('invalid PR timeline transition date');
+        }
+        Object.assign(result, tcApprovalWaitAt(result, transitions as TcTimelineEvent[]));
+      } catch (error) { observe('tc-pr-timeline-unreadable', { pr: result.number, error: String(error).slice(0, 200) }); }
+    }
+    return result;
+    })));
+  }
+  return results;
+}
+
+async function tcCandidates(deps: SeatDeps, now: Date): Promise<TcCandidate[]> {
+  let prs: TcPullRequest[];
+  // An injected instance root must not fetch unrelated live GitHub state.
+  try { prs = await (deps.pullRequests ?? (deps.root ? async () => [] : readTcPullRequests))(); }
+  catch (error) {
+    observe('tc-pr-unreadable', { seat: 'TC', error: String(error).slice(0, 200) });
+    return [];
+  }
+  const merged = prs.filter((pr) => pr.state === 'MERGED' && pr.mergedAt && Number.isFinite(Date.parse(pr.mergedAt)) && Date.parse(pr.mergedAt) <= now.getTime());
+  const candidates: TcCandidate[] = [];
+  const releaseRoot = deps.root ?? releaseLedgerRoot();
+  try {
+    const cells = merged.length === 0 ? [] : deps.checklistItems && deps.schedules
+      ? deps.schedules().flatMap(({ version }) => deps.checklistItems!(version).map((cell) => ({ ...cell, version })))
+      : readTcChecklist(releaseRoot);
+    for (const cell of cells) {
+      if (cell.owner !== 'TC' || cell.status !== 'yellow') continue;
+      for (const pr of merged) {
+        const id = cell.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const reference = new RegExp(`(?<![A-Za-z0-9])${id}(?![A-Za-z0-9])`);
+        if (reference.test(pr.title) || reference.test(pr.body ?? '')) {
+          candidates.push({ kind: 'merged-pr-yellow-cell', version: cell.version, id: cell.id, title: cell.title, pr: pr.number, mergedAt: pr.mergedAt! });
+        }
+      }
+    }
+  } catch (error) { observe('tc-checklist-unreadable', { seat: 'TC', error: String(error).slice(0, 200) }); }
+  for (const pr of prs) {
+    if (pr.state !== 'OPEN' || pr.isDraft || pr.reviewDecision !== 'REVIEW_REQUIRED'
+      || !pr.paths?.some((path) => path.startsWith('release/public/') || path.startsWith('scripts/public-export') || path.startsWith('src/market/'))) continue;
+    const readyAt = pr.readyAt;
+    const age = now.getTime() - Date.parse(pr.approvalWaitAt ?? '');
+    if (!readyAt || !Number.isFinite(Date.parse(readyAt)) || Date.parse(readyAt) > now.getTime()
+      || !Number.isFinite(age) || age < TC_APPROVAL_WAIT_MS) continue;
+    candidates.push({ kind: 'publication-pr-approval-wait', pr: pr.number, title: pr.title, readyAt, approvalWaitAt: pr.approvalWaitAt!, paths: pr.paths });
+  }
+  return candidates;
+}
+
 function deliverStall(message: MessageEnvelope, key: string, root: string): boolean {
   const store = openMsgStore(join(root, 'msg', 'messages.db'));
   try {
@@ -411,12 +541,33 @@ function escalateStalls(seat: string, deps: SeatDeps, config: SeatLoopConfig, no
 }
 
 // In shadow mode a shadowed item counts as handled, so a rehearsal day walks the queue like the seat would.
-export function pickNext(inputs: SeatInputs, ledger: readonly SeatEntry[], opts: { shadow?: boolean; root?: string } = {}): SeatItem | null {
+export function pickNext(inputs: SeatInputs, ledger: readonly SeatEntry[], opts: { shadow?: boolean; root?: string; history?: SeatDeps['checklistHistory'] } = {}): SeatItem | null {
   const handled = handledKeys(ledger, opts.shadow === true, opts.root);
   return [...inputs.requests, ...inputs.checklist].find((item) => {
     if (alreadyHandled(item, ledger)) {
       debug.log('seat.loop', 'skip-handled', { id: item.id });
       return false;
+    }
+    if (item.source === 'checklist' && item.version && item.seat && item.asOf && item.evidenceHash !== undefined && opts.history
+      && ledger.some((entry) => entry.seat === item.seat && entry.status === 'shadow'
+        && entry.item?.source === 'checklist' && entry.item.id === item.id && entry.item.version !== item.version)) {
+      // Only an actual move into this version identifies a carried cell; unrelated releases may reuse an id.
+      const moves = opts.history(item.id).filter((event) => event.field === 'move'
+        && typeof event.from === 'string' && typeof event.to === 'string' && Date.parse(event.at) <= Date.parse(item.asOf!));
+      const latest = moves.at(-1);
+      if (latest?.to === item.version) {
+        const processed = [...ledger].reverse().find((entry) => entry.seat === item.seat
+          && entry.status === 'shadow' && !entry.inquiry && entry.action !== 'wait'
+          && entry.item?.source === 'checklist' && entry.item.id === item.id);
+        if (processed && processed.item && processed.item.version === latest.from && processed.item.title === item.title
+          && processed.item.evidenceHash === item.evidenceHash
+          && Date.parse(processed.at || processed.ts || '') >= Date.parse(item.asOf) - CHECKLIST_HANDLED_WINDOW_MS
+          && Date.parse(processed.at || processed.ts || '') <= Date.parse(item.asOf)
+          && Date.parse(processed.at || processed.ts || '') <= Date.parse(latest.at)) {
+          debug.log('seat.loop', 'skip-carried', { id: item.id, from: latest.from, version: item.version });
+          return false;
+        }
+      }
     }
     return eligibleItem(item, ledger, handled, opts.shadow === true);
   }) ?? null;
@@ -470,6 +621,15 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const stateRoot = deps.root ?? effectiveInstanceRoot();
   let turnError: unknown;
   try {
+  if (seat === 'TC') {
+    const candidates = await tcCandidates(deps, now);
+    for (const candidate of candidates) {
+      if (ledger.some((row) => row.status === 'shadow' && JSON.stringify(row.candidate) === JSON.stringify(candidate))) continue;
+      const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate };
+      (deps.append ?? defaultAppend)(path, entry);
+      observe('tc-shadow-candidate', { seat, candidate });
+    }
+  }
   if (seat === 'OP' && !seatQuestions(stateRoot, 'OP').some((question) =>
     !hasSeatAnswer(stateRoot, question)
     && !handledKeys(ledger, config.mode !== 'on' || (config.questions ?? 'shadow') !== 'on', stateRoot).has(`seat-question::${question.id}`))) {
@@ -526,7 +686,8 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const questionsMode = config.mode === 'on' ? config.questions ?? 'shadow' : 'shadow';
   const questionHandled = handledKeys(ledger, questionsMode !== 'on', stateRoot);
   const pendingQuestion = inputs.requests.find((candidate) => candidate.source === 'seat-question' && !questionHandled.has(itemKey(candidate)));
-  const ordinary = pickNext({ ...inputs, requests: inputs.requests.filter((candidate) => candidate.source !== 'seat-question') }, ledger, { shadow: config.mode === 'shadow', root: stateRoot });
+  const ordinary = pickNext({ ...inputs, requests: inputs.requests.filter((candidate) => candidate.source !== 'seat-question') }, ledger,
+    { shadow: config.mode === 'shadow', root: stateRoot, history: deps.checklistHistory ?? checklistHistory });
   const item = pendingQuestion ?? ordinary;
   const append = deps.append ?? defaultAppend;
   // RM3 review must-fix: `questions` now has a default, so it can't be the trigger — a shadow seat loop never calls the model on its own.

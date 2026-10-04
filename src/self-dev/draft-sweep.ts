@@ -27,6 +27,10 @@ export interface DraftSweepAdapters {
   closeDraft(repository: string, number: number, comment: string): Promise<void>;
   /** Resolve the latest claim comment owner; a failed lookup must not authorize a close. */
   getClaimOwner?(repository: string, number: number): Promise<string | undefined>;
+  /** Whether the current owned run has a self-implement.result final observation, even if its worktree remains. */
+  hasFinalRunResult?(draft: SweepDraft, repository: string): Promise<boolean | undefined>;
+  /** Per-file last change on the draft branch; undefined means file coverage is unverified. */
+  getLatestFileChanges?(draft: SweepDraft, repository: string): Promise<Readonly<Record<string, string>> | undefined>;
 }
 
 export interface DraftSweepOptions {
@@ -120,9 +124,23 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     return finish();
   }
   let statuses: Map<number, string | undefined>;
+  let finality: Map<number, boolean | undefined>;
+  let latestFileChanges: Map<number, Readonly<Record<string, string>> | undefined>;
   try {
     statuses = new Map<number, string | undefined>();
-    for (const draft of drafts) statuses.set(draft.number, await adapters.getRunStatus(draft, repository));
+    finality = new Map<number, boolean | undefined>();
+    latestFileChanges = new Map<number, Readonly<Record<string, string>> | undefined>();
+    for (const draft of drafts) {
+      const status = await adapters.getRunStatus(draft, repository);
+      // A prior final cannot terminate a new active run on the same draft.
+      const active = status === 'running' || status === 'probable-running';
+      const final = active ? false : await adapters.hasFinalRunResult?.(draft, repository);
+      finality.set(draft.number, final);
+      statuses.set(draft.number, final ? 'self-implement.result final' : status);
+      if (draft.changedFiles?.length && adapters.getLatestFileChanges) {
+        latestFileChanges.set(draft.number, await adapters.getLatestFileChanges(draft, repository));
+      }
+    }
   } catch (error) {
     result.error = String(error);
     return finish();
@@ -132,8 +150,10 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   let unobserved = 0;
   let claimed = 0;
   let claimExpired = 0;
-  for (const draft of drafts) {
+  for (const listedDraft of drafts) {
+    const draft = { ...listedDraft, latestFileChanges: latestFileChanges.get(listedDraft.number) };
     const runStatus = statuses.get(draft.number);
+    const finalRunResult = finality.get(draft.number);
     const states = stateLabels.filter((state) => draft.labels.includes(state.name));
     const contradiction = states.length > 1 || draft.labels.includes(approvalLabel ?? '');
     if (draft.labels.includes(releaseHoldLabel ?? '') || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
@@ -147,8 +167,14 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       ? (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000 : NaN;
     // An unobserved claim may still have a merged twin: liveness/holds retain their priority,
     // but a superseded draft must not be hidden by the six-hour claim window.
-    const mergedDecision = isClaimed ? decideDraft({ draft, runStatus, mergedTwins: merged, liveBranches, ageHours: idleHours }) : undefined;
-    const supersededClaim = mergedDecision?.reason.startsWith('superseded-by #') === true;
+    const mergedDecision = isClaimed ? decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+      finalRunResult, ageHours: idleHours }) : undefined;
+    const supersededClaim = mergedDecision?.reason.startsWith('superseded-by #') === true
+      || mergedDecision?.reason.startsWith('duplicate-of-open #') === true;
+    if (!contradiction && mergedDecision?.reason === 'branch-finality-unobserved') {
+      record({ number: draft.number, action: 'keep', reason: mergedDecision.reason, applied: false });
+      continue;
+    }
     // Without an observed update time, neither expiration nor a fallback to creation time can authorize mutation —
     // but a merged twin does not need the update time, so superseded keeps its priority over the unobserved claim.
     if (isClaimed && !supersededClaim && (typeof draft.updatedAt !== 'string' || !Number.isFinite(Date.parse(draft.updatedAt)))) {
@@ -162,13 +188,21 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     if (isClaimed && !supersededClaim && Number.isFinite(idleHours) && idleHours >= CLAIM_IDLE_HOURS) {
       claimExpired += 1;
-      if (runStatus === 'running' || runStatus === 'probable-running' || liveBranches.has(draft.branch)) {
+      if (liveBranches.has(draft.branch) && finalRunResult === undefined
+        && runStatus !== 'running' && runStatus !== 'probable-running') {
+        record({ number: draft.number, action: 'keep', reason: 'branch-finality-unobserved', applied: false });
+        continue;
+      }
+      if (runStatus === 'running' || runStatus === 'probable-running' ||
+        (runStatus !== 'self-implement.result final' && liveBranches.has(draft.branch))) {
         record({ number: draft.number, action: 'keep', reason: 'claim-expired-but-live', applied: false });
         continue;
       }
       const action = closes >= DRAFT_SWEEP_CLOSE_CAP ? 'keep' : 'close';
       if (action === 'close') closes += 1;
-      const entry: DraftSweepEntry = { number: draft.number, action, reason: action === 'close' ? 'claim-expired' : 'close-cap',
+      const entry: DraftSweepEntry = { number: draft.number, action,
+        reason: action === 'close' ? runStatus === 'self-implement.result final'
+          ? 'claim-expired (self-implement.result final; worktree is not live)' : 'claim-expired' : 'close-cap',
         ...(action === 'close' ? { statusLabel: stalledLabel } : {}), applied: false };
       record(entry);
       if (!apply || action !== 'close') continue;
@@ -178,7 +212,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         await adapters.setLabels(repository, draft.number, { add: stalledLabel, remove: [runningLabel] });
         labelsChanged = true;
         await adapters.closeDraft(repository, draft.number,
-          `Draft sweep: 처리 중 표식이 ${CLAIM_IDLE_HOURS}시간 갱신 없음 — 런·워크트리 없음 · 주인 ${owner}. Closed as stalled. Branch preserved; reopen to restore.`);
+          `Draft sweep: 처리 중 표식이 ${CLAIM_IDLE_HOURS}시간 갱신 없음 — ${runStatus === 'self-implement.result final' ? 'self-implement.result final · 남은 워크트리는 live 아님' : '런·워크트리 없음'} · 주인 ${owner}. Closed as stalled. Branch preserved; reopen to restore.`);
         entry.applied = true;
       } catch (error) {
         if (labelsChanged) entry.partialApplied = true;
@@ -191,8 +225,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       record({ number: draft.number, action: 'keep', reason: 'outside-harness', applied: false });
       continue;
     }
-    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, liveBranches,
-      ageHours: runStatus ? ageHours : idleHours });
+    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+      finalRunResult, ageHours: runStatus ? ageHours : idleHours });
     if (!runStatus && (decision.reason === 'unobserved' || decision.reason === 'stale-unobserved')) unobserved += 1;
     if (!contradiction && decision.action === 'close') {
       if (closes >= DRAFT_SWEEP_CLOSE_CAP) decision = { action: 'keep', reason: 'close-cap' };
@@ -204,7 +238,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       : decision.reason;
     const isLive = decision.reason === 'live';
     const target = action === 'report' ? undefined : action === 'close'
-      ? decision.reason.startsWith('superseded-by #') ? supersededLabel : stalledLabel
+      ? decision.reason.startsWith('superseded-by #') || decision.reason.startsWith('duplicate-of-open #') ? supersededLabel : stalledLabel
       : isLive ? (states.length ? runningLabel : undefined) : runStatus && (states[0]?.name === runningLabel || states.length === 0) ? stalledLabel : undefined;
     const entry: DraftSweepEntry = { number: draft.number, action, reason, ...(target ? { statusLabel: target } : {}), applied: false };
     record(entry);

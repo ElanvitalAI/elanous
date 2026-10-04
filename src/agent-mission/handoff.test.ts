@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handoffMission, loginCard, missionDiff, waitForHumanLogin, type HandoffOperations } from './handoff.js';
 import { runPtyControlLoop } from '../autopilot/pty-control-loop.js';
-import { runAgentMission, codexBackend } from './driver.js';
+import { runAgentMission, codexBackend, createMissionControlBrain } from './driver.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 
 function fakeOps(events: string[], worktree: string): HandoffOperations {
@@ -23,6 +23,28 @@ function fakeOps(events: string[], worktree: string): HandoffOperations {
     diff: () => 'diff --git a/a b/a\n+new',
   };
 }
+
+test('mission brain leaves repeated-question recovery after a different screen appears', async () => {
+  const actions: string[] = [];
+  const brain = createMissionControlBrain({
+    mission: 'Build', evidenceReady: () => false, search: () => {},
+    stream: async () => '{"action":"wait"}', onRecover: (_blocked, action) => { actions.push(action); },
+  });
+  const makeObs = (screen: string, step: number) => ({ screen, step, state: 'blocked' as const,
+    changed: step > 0, sameScreenMs: 0,
+    intervention: {} as Parameters<typeof brain.decide>[0]['intervention'] });
+  // The control loop reports each input back; a recovery step commits only when it was accepted.
+  const decideAccepted = async (obs: ReturnType<typeof makeObs>) => {
+    const decision = await brain.decide(obs);
+    if (decision.action === 'input') brain.onInputResult(decision.text, true);
+    return decision;
+  };
+  for (let step = 0; step < 3; step++) await decideAccepted(makeObs('Proceed? [y/N]', step));
+  expect(actions).toEqual(['Enter']);
+  expect(await brain.decide(makeObs('Proceed? [y/N]\ncompiling 1/3', 3))).toEqual({ action: 'wait' });
+  expect(await brain.decide(makeObs('Proceed? [y/N]\ncompiling 2/3', 4))).toEqual({ action: 'wait' });
+  expect(actions).toEqual(['Enter']);
+});
 
 test('fake PTYs: codex → claude(diff file) → codex(review findings) → elanous(gate/PR), same worktree', async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-handoff-'));

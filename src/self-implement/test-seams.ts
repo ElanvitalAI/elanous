@@ -21,6 +21,7 @@ export function seams(over: Partial<SelfImplementSeams> & { gateResults?: boolea
     //   ⭐ 실제 경로는 그것을 «의도한» 전용 테스트에서만 탄다(그 테스트가 심을 명시로 준다).
     refreshCodexQuotaSignals: async () => ({ accounts: [] }),
     writeRunLedger: () => {},
+    emitContextEvent: () => {},
     registerLoopAgent: () => {},
     createWorktree: async ({ branch, base }) => ({ path: `/wt/${branch}`, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
     implement: async ({ feature }) => { features.push(feature); return { ok: true, summary: 'impl' }; },

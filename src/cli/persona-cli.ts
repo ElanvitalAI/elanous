@@ -7,7 +7,7 @@ import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { parsePersonaYaml } from '../persona/loader.js';
 import { resolveRepositoryPersonaDir, resolveStatePersonaDir } from '../persona/global-registry.js';
-import { choosePersonaId, clonePreset, describePreset, editPersona, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from '../persona/presets.js';
+import { UnknownPersonaSchemaKeyError, choosePersonaId, clonePreset, describePreset, editPersona, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from '../persona/presets.js';
 import { addTeamSet, listTeamSets, removeTeamSet } from '../persona/team-set.js';
 
 interface StoredPersona { personaId: string; displayName: string; description?: string; preset?: string; title?: string; path: string }
@@ -43,11 +43,11 @@ function mapping(value: unknown): value is Record<string, unknown> {
 
 function setEdit(edits: Record<string, unknown>, assignment: string): void {
   const equals = assignment.indexOf('=');
-  if (equals < 1) throw new Error(`--set requires key=value: ${assignment}`);
+  if (equals < 0) throw new Error(`--set requires key=value: ${assignment}`);
   const key = assignment.slice(0, equals);
   const parts = key.split('.');
   if (parts.some((part) => !part || ['__proto__', 'prototype', 'constructor'].includes(part))) {
-    throw new Error(`invalid --set key: ${key}`);
+    throw new UnknownPersonaSchemaKeyError(key);
   }
   const value: unknown = parseYaml(assignment.slice(equals + 1));
   let target = edits;
@@ -94,7 +94,7 @@ export function registerPersonaCommands(program: Command): void {
       if (opts.json) { console.log(JSON.stringify({ presets: presets.map((p) => ({ id: p.personaId, displayName: p.displayName, role: p.role, oneLine: p.oneLine })), mine }, null, 2)); return; }
       if (!presets.length) console.log('페르소나 프리셋을 찾지 못했습니다(persona-presets/ 가 이 설치본에 없습니다).');
       else {
-        console.log('프리셋 — 골라서 내 페르소나로 만들기: elanous persona add <프리셋> [--name <이름>]');
+        console.log('프리셋 — 골라서 내 페르소나로 만들기: elanous persona add <이름> [--from <프리셋>]');
         const width = Math.max(...presets.map((p) => p.personaId.length));
         for (const p of presets) console.log(`  ${p.personaId.padEnd(width)}  ${p.displayName} — ${p.role} · ${p.oneLine}`);
       }
@@ -105,24 +105,27 @@ export function registerPersonaCommands(program: Command): void {
       }
     });
 
-  persona.command('add <preset>')
-    .description('Make your own persona from a preset (id, name or role) — the preset file is not changed')
+  persona.command('add <name>')
+    .description('Make your own persona from a preset — the preset file is not changed')
+    .option('--from <preset>', 'Preset to clone (defaults to the named preset)')
     .option('--name <name>', 'What to call it (default: the preset’s first name)')
     .option('--as <name>', 'Clone this preset under a new, unique name')
     .option('--title <title>', 'Optional title, e.g. CMO')
     .option('--json', 'JSON output')
-    .action((query: string, opts: { name?: string; as?: string; title?: string; json?: boolean }) => {
+    .action((query: string, opts: { from?: string; name?: string; as?: string; title?: string; json?: boolean }) => {
       const presets = loadPresets();
-      const preset = findPreset(presets, query);
+      const presetQuery = opts.from ?? query;
+      const preset = findPreset(presets, presetQuery);
       if (!preset) {
-        console.error(`프리셋 «${query}» 을 찾지 못했습니다. 있는 것: ${presets.map((p) => p.personaId).join(', ')}`);
+        console.error(`프리셋 «${presetQuery}» 을 찾지 못했습니다. 있는 것: ${presets.map((p) => p.personaId).join(', ')}`);
         process.exitCode = 1;
         return;
       }
-      if (opts.as !== undefined) {
+      if (opts.as !== undefined || opts.from !== undefined) {
         try {
-          if (opts.name !== undefined || opts.title !== undefined) throw new Error('--as cannot be combined with --name or --title');
-          const result = clonePreset(preset, opts.as);
+          if (opts.from !== undefined && (opts.as !== undefined || opts.name !== undefined || opts.title !== undefined)) throw new Error('--from cannot be combined with --as, --name or --title');
+          if (opts.as !== undefined && (opts.name !== undefined || opts.title !== undefined)) throw new Error('--as cannot be combined with --name or --title');
+          const result = clonePreset(preset, opts.from !== undefined ? query : opts.as!);
           debug.log('persona.cli', 'cloned', { preset: preset.personaId, personaId: result.personaId });
           if (opts.json) console.log(JSON.stringify({ personaId: result.personaId, displayName: result.displayName, preset: preset.personaId, path: result.path }, null, 2));
           else {
@@ -170,8 +173,8 @@ export function registerPersonaCommands(program: Command): void {
           console.log(`  파일: ${result.path}`);
         }
       } catch (err) {
-        console.error(err instanceof Error ? err.message : String(err));
-        process.exitCode = 1;
+        console.error(err instanceof Error ? err.message.replace(/\s+/g, ' ').trim() : String(err));
+        process.exitCode = err instanceof UnknownPersonaSchemaKeyError ? 2 : 1;
       }
     });
 

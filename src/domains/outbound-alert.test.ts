@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { debug } from '../debug/log.js';
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import {
@@ -85,6 +86,45 @@ function isoAgo(min: number): string {
   return new Date(Date.now() - min * 60_000).toISOString();
 }
 
+test('standalone CLI send is visible through elanous logs --category outbound.send --test; removing the sink loses the row', () => {
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const root = mkdtempSync(join(tmpdir(), 'outbound-log-cli-'));
+  const fakeBin = join(root, 'bin');
+  mkdirSync(fakeBin);
+  const fakeCurl = join(fakeBin, 'curl');
+  writeFileSync(fakeCurl, '#!/bin/sh\nprintf "{\\"ok\\":true}"\n', { mode: 0o755 });
+  const source = `cli-observation-${process.pid}-${Date.now()}`;
+  const control = `sink-removed-${process.pid}-${Date.now()}`;
+  const env = {
+    ...process.env, NODE_ENV: '', ELANOUS_STATE_DIR: join(repo, '.elanous-test'), ELANOUS_CONFIG_DIR: join(repo, '.elanous-test'),
+    ELANOUS_NEXUS_URL: '', OUTBOUND_PROBE_SOURCE: source,
+    PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+  };
+  const run = (args: string[], overrides: Record<string, string> = {}) => childProcess.spawnSync('bun', args, {
+    cwd: repo, env: { ...env, ...overrides }, encoding: 'utf8', timeout: 30_000,
+  });
+  try {
+    const send = run(['src/domains/outbound-log-probe.ts']);
+    expect(send.status).toBe(0);
+    const query = run(['bin/elanous.mjs', '--test', 'logs', '--category', 'outbound.send', '--event', 'sent', '--grep', source, '--json', '--json-data']);
+    expect(query.status).toBe(0);
+    const rows = query.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line));
+    const sent = rows.filter(row => row.event === 'sent');
+    expect(sent).toHaveLength(1);
+    expect(sent[0].data).toMatchObject({ bot: 'telegram:123456', kind: 'ops-alert', source, chars: 22, path: 'direct' });
+    expect(query.stdout).not.toContain('SECRET-BODY-DO-NOT-LOG');
+    expect(query.stdout).not.toContain('private-secret');
+    expect(query.stdout).not.toContain('98765');
+    expect(send.stdout).not.toContain('SECRET-BODY-DO-NOT-LOG');
+    const missing = run(['src/domains/outbound-log-probe.ts'], { OUTBOUND_PROBE_SOURCE: control, NODE_ENV: 'test' });
+    expect(missing.status).toBe(0);
+    expect(missing.stdout).not.toContain('SECRET-BODY-DO-NOT-LOG');
+    const withoutSink = run(['bin/elanous.mjs', '--test', 'logs', '--category', 'outbound.send', '--event', 'sent', '--grep', control, '--json', '--json-data']);
+    expect(withoutSink.stdout).not.toContain(control);
+    expect(withoutSink.status).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 90_000);
+
 describe('flushDeferred 관측 — 경로 · 밀림 경고 등급', () => {
   const dirs: string[] = [];
   const envSnap = snapshotEnv(TOUCHED_ENV);
@@ -110,6 +150,26 @@ describe('flushDeferred 관측 — 경로 · 밀림 경고 등급', () => {
     dirs.push(d);
     return d;
   }
+
+  it('보류분의 실제 재발송마다 봇·kind·source·결과를 본문 없이 관측한다', () => {
+    const path = writeQueue(tmp(), [{ ts: isoAgo(90), kind: 'ops-alert', text: 'SECRET-DEFERRED' }]);
+    const original = debug.log;
+    const rows: Array<{ event: string; data: Record<string, unknown> }> = [];
+    debug.log = ((category, event, data) => {
+      if (category === 'outbound.send' && (event === 'sent' || event === 'failed')) {
+        rows.push({ event, data: data as Record<string, unknown> });
+      }
+    }) as typeof debug.log;
+    try {
+      expect(flushDeferred(path)).toBe(0);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ event: 'failed', data: {
+        kind: 'ops-alert', source: 'deferred-flush', bot: 'unknown', path: 'undeliverable',
+      } });
+      expect(rows[0]!.data.chars).toBeGreaterThan('SECRET-DEFERRED'.length);
+      expect(JSON.stringify(rows)).not.toContain('SECRET-DEFERRED');
+    } finally { debug.log = original; }
+  });
 
   it('임계보다 오래된 항목이 든 큐는 경고 등급 관측을 낸다', () => {
     process.env[FLUSH_LAG_WARN_MIN_ENV] = '60';
@@ -176,6 +236,7 @@ const discordRequests: Array<{ url: string; body: string; headers: string[] }> =
 const telegramUrls: string[] = [];
 const telegramBodies: string[] = [];
 const outboundUrls: string[] = [];
+const outboundHeaders: string[][] = [];
 
 function daemonPathLogs(): Logged[] {
   return logged.filter((row) => row.category === 'outbound.send' && row.event === 'daemon-path');
@@ -189,7 +250,10 @@ function expectOutcome(event: 'sent' | 'deferred' | 'failed', text: string, kind
   const rows = outcomeLogs();
   expect(rows).toHaveLength(1);
   expect(rows[0]!.event).toBe(event);
-  expect(rows[0]!.data).toEqual({ kind, source: 'src/domains/outbound-alert.test.ts', chars: text.length });
+  expect(rows[0]!.data).toMatchObject({ kind, source: 'src/domains/outbound-alert.test.ts', chars: text.length, bot: expect.any(String) });
+  if (event === 'deferred') expect((rows[0]!.data as { path?: string }).path).toBe('deferred');
+  else if (event === 'failed') expect((rows[0]!.data as { path?: string }).path).toBe('undeliverable');
+  else expect(['daemon', 'direct', 'origin']).toContain((rows[0]!.data as { path?: string }).path ?? 'unknown');
   expect(JSON.stringify(rows[0]!.data)).not.toContain(text);
 }
 
@@ -227,6 +291,7 @@ beforeEach(() => {
   telegramUrls.length = 0;
   telegramBodies.length = 0;
   outboundUrls.length = 0;
+  outboundHeaders.length = 0;
   discordRequests.length = 0;
   discordBody = '{"id":"posted"}';
   daemonBody = '{"delivered":true}';
@@ -242,6 +307,7 @@ beforeEach(() => {
     const url = String(args?.[args.length - 1] ?? '');
     if (url.includes('/v1/outbound')) {
       outboundUrls.push(url);
+      outboundHeaders.push((args ?? []).flatMap((arg, i, all) => arg === '-H' ? [all[i + 1]!] : []));
       if (daemonBody === 'throw') throw new Error('econnrefused');
       if (daemonBody === null) throw new Error('non-json');
       return daemonBody;
@@ -284,10 +350,10 @@ describe('sendOutbound outcome ledger', () => {
     telegramUrls.length = 0;
   });
 
-  test('daemon success records one sent with source and length, never body', () => {
+  test('daemon acceptance does not record a second sent before the daemon reports delivery', () => {
     expect(sendOutbound(text, kind)).toBe(true);
     expect(outboundUrls).toHaveLength(1);
-    expectOutcome('sent', text, kind);
+    expect(outcomeLogs()).toHaveLength(0);
   });
 
   test('quiet hours record one deferred without transmitting', () => {
@@ -329,11 +395,11 @@ describe('sendOutbound outcome ledger', () => {
     expectOutcome('sent', text, kind);
   });
 
-  test('origin failure followed by daemon success still records one sent', () => {
+  test('origin failure followed by daemon success defers the outcome to the daemon', () => {
     delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
     expect(sendOutbound(text, kind, { channel: 'discord', channelId: '123' })).toBe(true);
     expect(outboundUrls).toHaveLength(1);
-    expectOutcome('sent', text, kind);
+    expect(outcomeLogs()).toHaveLength(0);
   });
 
   test('distinct origin surfaces in one host retain their sender names, not argv', () => {
@@ -342,10 +408,10 @@ describe('sendOutbound outcome ledger', () => {
     try {
       expect(sendOutbound(text, kind, { channel: 'cli', surface: 'codex-quota-alert' })).toBe(true);
       expect(sendOutbound(text, kind, { channel: 'cli', surface: 'ops-health-check' })).toBe(true);
-      expect(outcomeLogs().map(row => (row.data as { source: string }).source))
-        .toEqual(['codex-quota-alert', 'ops-health-check']);
-      expect(outcomeLogs().map(row => row.event)).toEqual(['sent', 'sent']);
-      expect(outcomeLogs().every(row => !JSON.stringify(row.data).includes(text))).toBe(true);
+      expect(outcomeLogs()).toHaveLength(0);
+      expect(outboundHeaders).toHaveLength(2);
+      expect(outboundHeaders.every(headers => headers.includes('X-Elanous-Client-Fallback: direct'))).toBe(true);
+      expect(JSON.stringify(outboundHeaders)).not.toContain(text);
     } finally { process.argv[1] = argv; }
   });
 
@@ -357,7 +423,7 @@ describe('sendOutbound outcome ledger', () => {
         errorSpy.mockImplementation((() => ({ stack: `Error\n    at sendOutbound (/repo/src/domains/outbound-alert.ts:258:18)\n    at producer (${path}:12:3)` })) as never);
         expect(sendOutbound(text, kind)).toBe(true);
       }
-      const sources = outcomeLogs().map(row => (row.data as { source: string }).source);
+      const sources = outboundHeaders.map(headers => headers.find(h => h.startsWith('X-Elanous-Outbound-Source: '))?.slice('X-Elanous-Outbound-Source: '.length));
       expect(sources).toHaveLength(2);
       expect(sources[0]).not.toBe(sources[1]);
       expect(sources[0]).toMatch(/src\/alpha\/index\.ts$/);
@@ -373,11 +439,11 @@ describe('sendOutbound outcome ledger', () => {
     const appendSpy = spyOn(fs, 'appendFileSync').mockImplementation(() => { throw new Error('queue unavailable'); });
     try {
       captureConsole(() => {
-        expect(sendOutbound(text, kind, { channel: 'cli', surface: 'codex-quota-alert' })).toBe(true);
+        expect(sendOutbound(text, kind, { channel: 'cli', surface: 'codex-quota-alert' })).toBe(false);
       });
       expect(outcomeLogs()).toHaveLength(1);
       expect(outcomeLogs()[0]!.event).toBe('failed');
-      expect(outcomeLogs()[0]!.data).toEqual({ kind, source: 'codex-quota-alert', chars: text.length });
+      expect(outcomeLogs()[0]!.data).toEqual({ kind, source: 'codex-quota-alert', chars: text.length, bot: 'unknown', path: 'queue-failed' });
       expect(JSON.stringify(outcomeLogs()[0]!.data)).not.toContain(text);
       expect(outboundUrls).toHaveLength(0);
       expect(telegramUrls).toHaveLength(0);
@@ -725,6 +791,21 @@ describe('OB8 — inside the daemon, deliver never curls its own /v1/outbound', 
     expect(daemonPathLogs().map((row) => row.data)).toEqual([{ classification: 'ok', kind: 'report', inProcess: true }]);
   });
 
+  it('in-process accepted send records only after asynchronous delivery succeeds', async () => {
+    let complete!: (ok: boolean) => void;
+    setInProcessOutbound((_text, _kind, source, deferFailure) => {
+      expect(source).toBe('src/domains/outbound-alert.test.ts');
+      expect(deferFailure).toBe(true);
+      return new Promise<boolean>(resolve => { complete = resolve; });
+    });
+    expect(sendOutbound('private pending', 'alert')).toBe(true);
+    expect(outcomeLogs()).toHaveLength(0);
+    complete(true);
+    await settle();
+    expect(outcomeLogs()).toHaveLength(0); // The actual daemon router owns the success record.
+    expect(telegramUrls).toHaveLength(0);
+  });
+
   it('an in-process failure falls back to Telegram directly, still without a self-call', async () => {
     setInProcessOutbound(async () => false);
     expect(deliver('rotation alert', 'alert')).toBe('daemon');
@@ -732,11 +813,18 @@ describe('OB8 — inside the daemon, deliver never curls its own /v1/outbound', 
     expect(outboundUrls).toEqual([]);
     expect(telegramUrls.length).toBe(1);
     expect(classifications()).toEqual(['rejected']);
+    expect(outcomeLogs()).toEqual([expect.objectContaining({ event: 'sent', data: expect.objectContaining({
+      source: 'daemon-fallback', kind: 'alert', path: 'direct', chars: 'rotation alert'.length,
+    }) })]);
+    logged.length = 0;
     setInProcessOutbound(async () => { throw new Error('router down'); });
     deliver('rotation alert 2', 'alert');
     await settle();
     expect(outboundUrls).toEqual([]);
     expect(telegramUrls.length).toBe(2);
+    expect(outcomeLogs()).toEqual([expect.objectContaining({ event: 'sent', data: expect.objectContaining({
+      source: 'daemon-fallback', kind: 'alert', path: 'direct', chars: 'rotation alert 2'.length,
+    }) })]);
   });
 
   it('outside the daemon (nothing registered) the HTTP path is unchanged', () => {

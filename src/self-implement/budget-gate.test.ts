@@ -1,6 +1,7 @@
 import { describe, expect, it, test } from 'bun:test';
 import {
   decideBudget,
+  decideLaunchBudget,
   formatCodexReason,
   formatGrokReason,
   readBudgetInputs,
@@ -141,6 +142,26 @@ describe('decideBudget', () => {
     expect(decision.action).toBe('proceed');
     expect(decision.provider).toBe('grok');
     expect(decision.model).toBe('grok-4.6');
+  });
+});
+
+describe('decideLaunchBudget only', () => {
+  it('unmeasured candidates proceed at launch while decideBudget still stops', () => {
+    const unknown = input({ codex: [{ name: 'default' }] });
+    expect(decideBudget(unknown).action).toBe('stop');
+    expect(decideLaunchBudget(unknown)).toEqual(expect.objectContaining({
+      decision: expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }),
+      unmeasuredProvider: 'openai-codex',
+    }));
+    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).unmeasuredProvider).toBe('grok');
+  });
+
+  it('reached and measured exhaustion do not become unmeasured', () => {
+    const exhausted = input({ codex: [{ name: 'default', reached: true }], grok: 48 });
+    expect(decideLaunchBudget(exhausted).decision.action).toBe('stop');
+    expect(decideLaunchBudget(exhausted).unmeasuredProvider).toBeUndefined();
+    const mixed = input({ codex: [{ name: 'default', reached: true }, { name: 'team' }], grok: 48 });
+    expect(decideLaunchBudget(mixed).unmeasuredProvider).toBe('openai-codex');
   });
 });
 

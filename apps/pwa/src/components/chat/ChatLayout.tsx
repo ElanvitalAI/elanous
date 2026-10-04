@@ -6,6 +6,7 @@ import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
+import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
@@ -1077,6 +1078,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         </div>
       )}
       <SeatsNowStrip />
+      <ChatApprovalsChip />
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}

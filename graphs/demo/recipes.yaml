@@ -1,0 +1,12 @@
+plan:
+  command: 'sleep 0.01; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+build:
+  command: 'sleep 0.01; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+review:
+  command: 'if [ -f "${ELANOUS_GRAPH_CONTEXT%/*}/review-seen" ]; then printf ''{"outcome":"ok"}\n''; else : > "${ELANOUS_GRAPH_CONTEXT%/*}/review-seen"; printf ''{"outcome":"rework"}\n''; fi'
+  timeout_ms: 30000
+publish:
+  command: 'sleep 0.01; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000

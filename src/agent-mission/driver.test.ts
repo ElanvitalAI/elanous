@@ -356,6 +356,7 @@ describe('agent-mission handoff commit and PR', () => {
     const repo = join(root, 'repo');
     const bare = join(root, 'origin.git');
     const events: string[] = [];
+    const contextEvents: import('../context-bus/session-events.js').SessionEventInput[] = [];
     const logs: unknown[][] = [];
     const originalLog = debug.log;
     let prCalls = 0;
@@ -392,6 +393,7 @@ describe('agent-mission handoff commit and PR', () => {
       }, {
         createWorktree: (() => ({ path: repo, branch: 'fixture', base: 'main' })) as never,
         recordWorktreeProvenance: () => {},
+        emitContextEvent: input => { contextEvents.push(input); },
         planMissionResources: async () => ({ needs: [], have: ['available'], backend: { name: 'codex', why: 'selected' }, gaps: [], decisions: [] } satisfies ResourcePlan),
         startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
           isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'done',
@@ -438,6 +440,10 @@ describe('agent-mission handoff commit and PR', () => {
         return;
       }
       const settled = await result;
+      expect(contextEvents.map(event => event.kind)).toEqual(['task-claimed', 'task-done']);
+      expect(contextEvents[0]?.ref).toMatch(/^runId=run-/);
+      expect(contextEvents[1]?.ref).toBe(origin === 'local' || origin === 'github-pushurl-local'
+        ? contextEvents[0]?.ref : `${contextEvents[0]?.ref} PR=#1`);
       expect(settled.ok).toBe(true);
       expect(settled.committed).toBe(true);
       expect(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')).not.toContain('.mission-prompt.md');

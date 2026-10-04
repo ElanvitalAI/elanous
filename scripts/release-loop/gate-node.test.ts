@@ -1193,7 +1193,7 @@ test('the Pod sweep never assigns an integration-only file and logs that it left
 });
 
 test('nightly audit files keep their fixture cases in Pod and local gate sweeps', async () => {
-  expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts']);
+  expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts', 'scripts/review-model-ab.test.ts']);
   expect(GATE_NIGHTLY_AUDITS).toEqual([
     'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/pwa-build-typecheck.test.ts',
   ]);
@@ -1259,6 +1259,60 @@ test('Pod accepts Ran 4 tests across 3 files out of four assigned without retryi
   expect(calls).toEqual([4, 4, 4]);
   expect(result.rc).toBe(0);
   expect(result.output).toContain('Ran 12 tests across 11 files.');
+});
+
+test('a no-output Pod shard retries once in a fresh Job and its measured result determines the gate', async () => {
+  for (const retryOutcome of ['pass', 'fail', 'stall'] as const) {
+    const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const files = ['src/a.test.ts', 'src/b.test.ts'];
+    const invoked: RunPodCommandOptions[] = [];
+    const retries: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'release-loop.gate' && event === 'pod-shard-retry') retries.push(data);
+    });
+    try {
+      const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+        if (cmd === 'rg') return { rc: 1, output: '' };
+        if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+        if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+        return fixtureRunner.command(cmd, args, cwd);
+      }, async (o) => {
+        invoked.push(o);
+        const artifactsDir = join(root, o.name!);
+        mkdirSync(artifactsDir);
+        const isB = o.command[2]!.includes("'./src/b.test.ts'");
+        const bAttempt = invoked.filter((call) => call.command[2]!.includes("'./src/b.test.ts'")).length;
+        if (isB && (bAttempt === 1 || retryOutcome === 'stall')) return { exitCode: 0, artifactsDir, job: 'fake' };
+        const failed = isB && retryOutcome === 'fail';
+        writeFileSync(join(artifactsDir, 'shard.log'), failed
+          ? 'src/b.test.ts:\n(fail) B [1.00ms]\n0 pass\n1 fail\nRan 1 test across 1 file.\n'
+          : '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+        writeFileSync(join(artifactsDir, 'shard.rc'), failed ? '1\n' : '0\n');
+        return { exitCode: 0, artifactsDir, job: 'fake' };
+      }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+      runner.add = fixtureRunner.add;
+      runner.remove = fixtureRunner.remove;
+      runner.snapshot = fixtureRunner.snapshot;
+      runner.removeSnapshot = fixtureRunner.removeSnapshot;
+      const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
+      expect(invoked).toHaveLength(3);
+      expect(invoked.map((call) => files.filter((file) => call.command[2]!.includes(`'./${file}'`)))).toEqual([[files[0]!], [files[1]!], [files[1]!]]);
+      expect(new Set(invoked.map((call) => call.name)).size).toBe(3);
+      expect(invoked[1]!.source).toEqual(invoked[2]!.source);
+      expect(retries).toEqual([{ shard: 1, files: [files[1]!], reason: 'no-output', outcome: retryOutcome === 'stall' ? 'no-output' : 'ok' }]);
+      if (retryOutcome === 'stall') {
+        expect(result).toMatchObject({ outcome: 'error', stalledShards: [{ shard: 1, files: [files[1]!], reason: 'no-output' }],
+          partialSummary: { pass: 1, fail: 0, ran: 1, files: 1 } });
+        expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
+      } else {
+        expect(result).toMatchObject({ outcome: retryOutcome === 'pass' ? 'ok' : 'regression', introduced: retryOutcome === 'pass' ? [] : [B] });
+        expect(result.stalledShards).toBeUndefined();
+        expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')).failures).toEqual(retryOutcome === 'pass' ? [] : [B]);
+      }
+    } finally { log.mockRestore(); }
+  }
 });
 
 test('Pod splits OOMKilled four-file shard into two two-file jobs without repeating original', async () => {
@@ -1489,7 +1543,8 @@ test('Pod isolates every file of a depth-two shard that ends with no output', as
     expect(result.stalledShards.flatMap((item) => item.files).sort()).toEqual([files[43]]);
     expect(result.stalledShards.every((item) => item.reason === 'no-output')).toBe(true);
   }
-  expect(calls.filter((assigned) => assigned.length === 1)).toHaveLength(44);
+  expect(calls.filter((assigned) => assigned.length === 1)).toHaveLength(45);
+  expect(calls.filter((assigned) => assigned[0] === files[43] && assigned.length === 1)).toHaveLength(2);
 });
 
 test('Pod records the mismatch at an unattributed leaf', async () => {
@@ -1616,7 +1671,7 @@ test('Pod splits only incomplete shards and reports stalled leaves instead of pu
     runner.snapshot = fixtureRunner.snapshot;
     runner.removeSnapshot = fixtureRunner.removeSnapshot;
     const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
-    expect(attempts).toEqual([1, alwaysStall ? 5 : 3, 1]);
+    expect(attempts).toEqual([1, alwaysStall ? (missingSummary ? 5 : 10) : (missingSummary ? 3 : 4), 1]);
     if (alwaysStall) {
       expect(result).toMatchObject({ outcome: 'error', stalledShards: [
         { shard: 1, files: [files[1]], reason: missingSummary ? 'incomplete' : 'no-output' },

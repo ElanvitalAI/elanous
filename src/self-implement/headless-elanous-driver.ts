@@ -1170,11 +1170,16 @@ export interface HeadlessGoalLoopPtyResult {
 
 export function pickImplementRoleForGoal(document: string): ReturnType<typeof resolveRoleLlm> | undefined {
   try {
-    const role = resolveRoleLlm('implement');
+    const config = getUserConfig();
+    const role = resolveRoleLlm('implement', { config });
+    if (config.harness?.difficultyPlacement !== true || role.source !== 'default') return role;
     const signals = goalDifficultySignals(document);
     const level = classifyGoalDifficulty(signals);
     const picked = resolveImplementDifficulty(role, level);
-    try { debug.log('llm.difficulty', 'pick', { level, tier: picked.tier ?? null, signals }); } catch { /* observation is fail-soft */ }
+    try {
+      debug.log('llm.difficulty', 'pick', { level, tier: picked.tier ?? null, signals });
+      debug.log('harness.role-llm', 'difficulty-placement', { difficulty: level, tier: picked.tier, source: role.source });
+    } catch { /* observation is fail-soft */ }
     return picked;
   } catch { return undefined; }
 }

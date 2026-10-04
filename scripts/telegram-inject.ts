@@ -16,6 +16,7 @@
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { createInterface } from 'node:readline/promises';
+import { parseInjectArgs } from './lib/telegram-inject-args.js';
 
 const args = process.argv.slice(2);
 const has = (f: string): boolean => args.includes(f);
@@ -201,15 +202,22 @@ if (has('--buttons') || has('--click') || has('--react')) {
 
 // 무인 주입: SESSION STRING 으로 로그인 → 봇에게 메시지.
 const sessionStr = process.env.TELEGRAM_USER_SESSION ?? val('--session');
-const to = val('--to') ?? process.env.TELEGRAM_TEST_BOT ?? configBot;
-const text = val('--text');
 if (!sessionStr) { console.error('❌ TELEGRAM_USER_SESSION 필요 — 먼저 `--login` 으로 발급.'); process.exit(2); }
-if (!to || !text) { console.error('사용: telegram-inject.ts --to @monad_test_bot --text "<objective>"'); process.exit(2); }
-
+let inject: ReturnType<typeof parseInjectArgs>;
+try {
+  inject = parseInjectArgs(args, { TELEGRAM_TEST_BOT: process.env.TELEGRAM_TEST_BOT ?? configBot });
+} catch (error) {
+  console.error((error as Error).message);
+  process.exit(2);
+}
+const { to, text, photos, caption } = inject;
 const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, { connectionRetries: 5 });
 await client.connect();
-const msg = await client.sendMessage(to, { message: text });
-console.log(`✅ 주입 완료 → ${to} (msgId=${(msg as { id?: number }).id ?? '?'}). 이 계정의 텔레그램 앱에도 대화가 보입니다.`);
+const msg = photos.length > 0
+  ? await client.sendFile(to, { file: photos.length === 1 ? photos[0]! : photos, caption })
+  : await client.sendMessage(to, { message: text! });
+const sent = Array.isArray(msg) ? msg[0] : msg;
+console.log(`✅ 주입 완료 → ${to} (msgId=${(sent as { id?: number } | undefined)?.id ?? '?'}). 이 계정의 텔레그램 앱에도 대화가 보입니다.`);
 console.log('   → 데몬 처리 후 watchdog 검증: log/watchdog-stall.log (stall 없으면 A subprocess 격리 정상).');
 await client.disconnect();
 process.exit(0);

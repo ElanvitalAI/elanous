@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { describe, expect, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
-import { LogStore } from '../mss/logging/log-store.js';
+import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
 import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
@@ -458,7 +458,7 @@ describe('harness CLI command', () => {
   test('GitHub adapters page the full draft and merged inventory and pass label/close arguments without deleting branches', async () => {
     const requests: string[][] = [];
     const pr = (number: number, draft: boolean, merged = false) => ({
-      number, draft, title: `goal ${number}`, head: { ref: `self-impl/${number}` },
+      number, draft, title: `goal ${number}`, head: { ref: `self-impl/${number}` }, base: { ref: 'main' },
       labels: [{ name: 'elanous:running' }], created_at: '2026-09-01T00:00:00Z',
       merged_at: merged ? '2026-09-02T00:00:00Z' : null,
     });
@@ -466,6 +466,7 @@ describe('harness CLI command', () => {
       requests.push(args);
       if (args[0] !== 'api') return '';
       const endpoint = args[1]!;
+      if (endpoint.includes('/files?') || endpoint.includes('/comments?')) return '[]';
       if (endpoint.includes('state=open')) return JSON.stringify(endpoint.endsWith('&page=1')
         ? Array.from({ length: 100 }, (_, i) => pr(i + 1, true)) : [pr(101, true), pr(102, false)]);
       return JSON.stringify(endpoint.endsWith('&page=1')
@@ -475,7 +476,7 @@ describe('harness CLI command', () => {
     expect((await adapters.listDrafts(2, 100, 'my/repo')).map((entry) => entry.number)).toEqual([101]);
     expect((await adapters.listMerged(1, 100, 'my/repo'))).toHaveLength(100);
     expect((await adapters.listMerged(2, 100, 'my/repo')).map((entry) => entry.number)).toEqual([301]);
-    expect(requests.filter((args) => args[0] === 'api')).toEqual([
+    expect(requests.filter((args) => args[0] === 'api' && args[1]?.includes('state='))).toEqual([
       ['api', 'repos/my/repo/pulls?state=open&per_page=100&page=1'],
       ['api', 'repos/my/repo/pulls?state=open&per_page=100&page=2'],
       ['api', 'repos/my/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1'],
@@ -487,6 +488,138 @@ describe('harness CLI command', () => {
       ['pr', 'edit', '3', '--repo', 'my/repo', '--add-label', 'elanous:stalled', '--remove-label', 'elanous:running'],
       ['pr', 'close', '3', '--repo', 'my/repo', '--comment', 'Branch preserved.'],
     ]);
+  });
+
+  test('GitHub sweep adapter supplies file coverage and harvest evidence from the merged PR', async () => {
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1]!;
+      if (endpoint.includes('state=open')) return JSON.stringify([{
+        number: 1, draft: true, title: 'draft', head: { ref: 'self-impl/d' }, labels: [],
+        created_at: '2026-09-01T00:00:00Z', merged_at: null, body: '칸: UX 10-03',
+      }]);
+      if (endpoint.includes('state=closed')) return JSON.stringify([{
+        number: 2, draft: false, title: 'new title', head: { ref: 'other' }, base: { ref: 'main' }, labels: [],
+        created_at: '2026-09-01T00:00:00Z', merged_at: '2026-09-02T00:00:00Z',
+        body: '칸: UX 10-03', merge_commit_sha: 'sha',
+      }, {
+        number: 4, draft: false, title: 'unlanded', head: { ref: 'other-branch' }, base: { ref: 'feature' }, labels: [],
+        created_at: '2026-09-01T00:00:00Z', merged_at: '2026-09-03T00:00:00Z', body: '칸: UX 10-03',
+      }]);
+      if (endpoint.includes('/files?')) return JSON.stringify([{ filename: 'src/a.ts' }]);
+      if (endpoint.includes('/pulls/1/commits?')) return JSON.stringify([
+        { sha: 'draft-commit', commit: { committer: { date: '2026-09-01T12:00:00Z' } } },
+      ]);
+      if (endpoint.includes('/commits/draft-commit?')) return JSON.stringify({ files: [{ filename: 'src/a.ts' }] });
+      if (endpoint.includes('/comments?')) return JSON.stringify([{ body: 'landing-verified: superseded #1' }]);
+      if (endpoint.endsWith('/commits/sha')) return JSON.stringify({ commit: { message: 'Shipped (수확 #1)' } });
+      throw new Error(`Unexpected GitHub request: ${endpoint}`);
+    });
+    expect(await adapters.listDrafts(1, 100, 'my/repo')).toMatchObject([
+      { number: 1, body: '칸: UX 10-03', changedFiles: ['src/a.ts'] },
+    ]);
+    expect(await adapters.listMerged(1, 100, 'my/repo')).toMatchObject([
+      { number: 2, body: '칸: UX 10-03', mergedAt: '2026-09-02T00:00:00Z', changedFiles: ['src/a.ts'],
+        mergeCommitMessage: 'Shipped (수확 #1)', landingVerifiedComments: ['landing-verified: superseded #1'] },
+    ]);
+    const { decideDraft } = await import('../self-dev/draft-triage-rules.js');
+    const [harvested] = await adapters.listDrafts(1, 100, 'my/repo');
+    const latestFileChanges = await adapters.getLatestFileChanges?.(harvested!, 'my/repo');
+    expect(latestFileChanges).toEqual({ 'src/a.ts': '2026-09-01T12:00:00Z' });
+    const merged = await adapters.listMerged(1, 100, 'my/repo');
+    expect(decideDraft({ draft: harvested!, mergedTwins: merged, runStatus: 'completed', ageHours: 1,
+      liveBranches: new Set() })).toMatchObject({ action: 'close', reason: 'superseded-by #2 (harvest #1)' });
+    expect(decideDraft({ draft: { ...harvested!, number: 3, latestFileChanges }, mergedTwins: merged, runStatus: 'completed',
+      ageHours: 1, liveBranches: new Set() })).toMatchObject({ action: 'close', reason: 'superseded-by #2 (all-files-landed)' });
+  });
+
+  test('a draft whose file list reaches the GitHub cap has no provable file list and never closes as all-files-landed', async () => {
+    const fullPage = (page: number) => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ filename: `src/f${page}-${i}.ts` })));
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1]!;
+      if (endpoint.includes('state=open')) return JSON.stringify([{
+        number: 1, draft: true, title: 'huge draft', head: { ref: 'self-impl/huge' }, labels: [],
+        created_at: '2026-09-01T00:00:00Z', merged_at: null, body: '칸: UX 10-03',
+      }]);
+      if (endpoint.includes('state=closed')) return JSON.stringify([{
+        number: 2, draft: false, title: 'later', head: { ref: 'self-impl/huge' }, base: { ref: 'main' }, labels: [],
+        created_at: '2026-09-01T00:00:00Z', merged_at: '2026-09-02T00:00:00Z', body: '칸: UX 10-03',
+      }]);
+      // GitHub returns 30 full pages (3,000 files) and then an empty page: the cut looks like a normal end.
+      const files = /\/pulls\/(\d+)\/files\?per_page=100&page=(\d+)/.exec(endpoint);
+      if (files) return Number(files[2]) <= 30 ? fullPage(Number(files[2])) : '[]';
+      if (endpoint.includes('/comments?')) return '[]';
+      throw new Error(`Unexpected GitHub request: ${endpoint}`);
+    });
+    const [draft] = await adapters.listDrafts(1, 100, 'my/repo');
+    expect(draft!.changedFiles).toBeUndefined();
+    const { decideDraft } = await import('../self-dev/draft-triage-rules.js');
+    const merged = await adapters.listMerged(1, 100, 'my/repo');
+    const decision = decideDraft({ draft: { ...draft!, title: 'different title', branch: 'self-impl/other' }, mergedTwins: merged,
+      runStatus: 'completed', ageHours: 1, liveBranches: new Set() });
+    expect(decision.reason).not.toContain('all-files-landed');
+  });
+
+  test('GitHub sweep adapter recognizes final results only for the same PR and owned run', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'draft-final-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = stateDir;
+    try {
+      const logPath = logsDbPath();
+      mkdirSync(join(stateDir, 'run-ledger'), { recursive: true });
+      writeFileSync(join(stateDir, 'run-ledger', 'run-owned.jsonl'), `${JSON.stringify({ runId: 'run-owned', event: 'pr-opened',
+        timestamp: '2026-09-01T00:00:00Z', data: { number: 43, repository: 'my/repo' } })}\n`);
+      mkdirSync(join(stateDir, 'logs'), { recursive: true });
+      const store = new LogStore(logPath);
+      try {
+        store.insertBatch([
+          { surface: 'harness', rec: { ts: new Date().toISOString(), category: 'self-implement.result', event: 'final',
+            data: { runId: 'unowned-run', prNumber: 43 } } },
+        ]);
+      } finally { store.close(); }
+      const adapters = githubDraftSweepAdapters(() => '[]');
+      const target = { number: 43, branch: 'self-impl/goal', title: 'draft', labels: [],
+        createdAt: '2026-09-01T00:00:00Z' };
+      expect(await adapters.hasFinalRunResult?.(target, 'my/repo')).toBe(false);
+      const owned = new LogStore(logPath);
+      try {
+        owned.insertBatch([{ surface: 'harness', rec: { ts: new Date().toISOString(), category: 'self-implement.result',
+          event: 'final', data: { runId: 'run-owned', prNumber: 43 } } }]);
+      } finally { owned.close(); }
+      expect(await adapters.hasFinalRunResult?.(target, 'my/repo')).toBe(true);
+      writeFileSync(join(stateDir, 'run-ledger', 'run-current.jsonl'), `${JSON.stringify({ runId: 'run-current', event: 'pr-opened',
+        timestamp: '2026-09-02T00:00:00Z', data: { number: 43, repository: 'my/repo' } })}\n`);
+      const open = { number: 43, draft: true, title: 'draft', head: { ref: target.branch }, labels: [],
+        created_at: target.createdAt, merged_at: null };
+      const rerunAdapters = githubDraftSweepAdapters((args) => args[1]?.includes('state=open')
+        ? JSON.stringify([open]) : '[]');
+      const [current] = await rerunAdapters.listDrafts(1, 100, 'my/repo');
+      expect(current?.runId).toBe('run-current');
+      expect(await rerunAdapters.getRunStatus(current!, 'my/repo')).toBeUndefined();
+      expect(await rerunAdapters.hasFinalRunResult?.(current!, 'my/repo')).toBe(false);
+      const { runDraftSweep } = await import('../self-dev/draft-sweep.js');
+      const sweepAdapters = githubDraftSweepAdapters((args) => args[1]?.includes('state=open')
+        ? JSON.stringify([{ ...open, labels: [{ name: 'elanous:stalled' }] }]) : '[]', (_cwd, args) => ({
+        status: 0, stderr: '', stdout: args[0] === 'config'
+          ? 'https://github.com/my/repo.git' : `worktree /tmp/retained\nbranch refs/heads/${target.branch}\n`,
+      }));
+      const inspect = () => runDraftSweep({ repository: 'my/repo', adapters: sweepAdapters,
+        now: new Date('2026-09-30T00:00:00Z') });
+      expect((await inspect()).entries[0]).toMatchObject({ action: 'keep', reason: 'live' });
+      expect(await rerunAdapters.hasFinalRunResult?.({ ...target, runId: 'run-owned' }, 'my/repo')).toBe(true);
+      const currentStore = new LogStore(logPath);
+      try {
+        currentStore.insertBatch([{ surface: 'harness', rec: { ts: new Date().toISOString(), category: 'self-implement.result',
+          event: 'final', data: { runId: 'run-current', prNumber: 43 } } }]);
+      } finally { currentStore.close(); }
+      expect(await rerunAdapters.hasFinalRunResult?.(current!, 'my/repo')).toBe(true);
+      expect((await inspect()).entries[0]).toMatchObject({ action: 'close',
+        reason: 'stale-ended-run (self-implement.result final; worktree is not live)' });
+      expect(await rerunAdapters.hasFinalRunResult?.({ ...target, number: 44, branch: 'self-impl/other' }, 'my/repo')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   test('GitHub sweep adapter reads the latest claim owner for the expired-claim comment', async () => {
@@ -505,13 +638,14 @@ describe('harness CLI command', () => {
   test('draft sweep reads closed PRs only back to the oldest open draft — a large repository does not exhaust pagination', async () => {
     const requests: string[] = [];
     const closedPage = (page: number) => Array.from({ length: 100 }, (_, i) => ({
-      number: 10_000 - page * 100 - i, draft: false, title: `old ${page}-${i}`, head: { ref: `b-${page}-${i}` }, labels: [],
+      number: 10_000 - page * 100 - i, draft: false, title: `old ${page}-${i}`, head: { ref: `b-${page}-${i}` }, base: { ref: 'main' }, labels: [],
       created_at: '2026-01-01T00:00:00Z', merged_at: '2026-01-02T00:00:00Z',
       // page 1 is newer than the oldest draft; page 2 ends before it
       updated_at: page === 1 ? '2026-09-20T00:00:00Z' : '2026-09-05T00:00:00Z',
     }));
     const adapters = githubDraftSweepAdapters((args) => {
       requests.push(args[1]!);
+      if (args[1]!.includes('/files?') || args[1]!.includes('/comments?')) return '[]';
       if (args[1]!.includes('state=open')) return JSON.stringify([{ number: 1, draft: true, title: 'd', head: { ref: 'self-impl/d' },
         labels: [], created_at: '2026-09-10T00:00:00Z', merged_at: null }]);
       const page = Number(/&page=(\d+)/.exec(args[1]!)![1]);
@@ -551,6 +685,7 @@ describe('harness CLI command', () => {
       return runDraftSweep({ repository, apply: true, now: new Date('2026-10-01T00:00:00Z'), adapters: {
         ...adapters,
         getRunStatus: async () => 'failed',
+        hasFinalRunResult: async () => false,
         setLabels: async () => {},
         closeDraft: async (_repository, number) => { closed.push(number); },
       } });
@@ -595,7 +730,11 @@ describe('harness CLI command', () => {
       number: 43, repo: 'my/repo', url: 'https://github.com/other/repo/pull/43',
     }, 'failed')], live, 'my/repo', 43)).toBeUndefined();
     expect(draftSweepRunStatus([owned, ledger('run-conflict', { number: 43, repo: 'my/repo' }, 'failed')],
-      live, 'my/repo', 43)).toBeUndefined();
+      live, 'my/repo', 43)).toBe('running');
+    expect(draftSweepRunStatus([
+      ledger('run-old', { number: 43, repository: 'my/repo' }, 'completed'),
+      ledger('run-new', { number: 43, repository: 'my/repo' }, 'failed'),
+    ], new Map([['run-new', 'running']]), 'my/repo', 43)).toBe('running');
     expect(draftSweepRunStatus([{
       ...owned, entries: [...owned.entries, { runId: owned.runId, event: 'pr-opened', data: { number: 43 } }],
     }], live, 'my/repo', 43)).toBeUndefined();

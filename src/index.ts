@@ -3035,15 +3035,39 @@ contextCmd.command('hooks').description('Claude Code 맥락 훅 설정').command
     const { claudeHooksSettings } = await import('./context-bus/claude-hooks-install.js');
     console.log(claudeHooksSettings(REPOSITORY_ROOT));
   });
-contextCmd.command('emit')
-  .requiredOption('--kind <kind>', 'claimed|done|asked|guide-changed')
-  .requiredOption('--summary <line>', '한 줄 요약')
-  .requiredOption('--source <link>', '출처 링크')
-  .action(async (opts: { kind: string; summary: string; source: string }) => {
-    if (!['claimed', 'done', 'asked', 'guide-changed'].includes(opts.kind)) throw new Error('context emit --kind must be claimed|done|asked|guide-changed');
-    const { recordExternalEvent } = await import('./context-bus/external-events.js');
-    recordExternalEvent({ origin: 'claude-code', kind: opts.kind as import('./context-bus/external-events.js').ContextHookKind,
-      summary: opts.summary, source: opts.source });
+contextCmd.command('emit [sessionKind]')
+  .description('외부 에이전트 세션 이벤트: emit <kind> --seat <자리> --text <한 줄> [--ref <PR|칸>]')
+  .option('--seat <seat>', 'OP|TC|MK|UX')
+  .option('--text <line>', '한 줄 이벤트')
+  .option('--ref <PR|cell>', '연결 PR 또는 칸')
+  .option('--kind <kind>', '기존 Claude Code 훅 이벤트 종류')
+  .option('--summary <line>', '기존 훅 한 줄 요약')
+  .option('--source <link>', '기존 훅 출처 링크')
+  .action(async (sessionKind: string | undefined, opts: { seat?: string; text?: string; ref?: string; kind?: string; summary?: string; source?: string }) => {
+    try {
+      if (sessionKind !== undefined) {
+        if (opts.seat === undefined || opts.text === undefined || opts.kind !== undefined || opts.summary !== undefined || opts.source !== undefined) {
+          throw new Error('context emit <kind> requires --seat and --text (not hook options)');
+        }
+        const { emitSessionEvent, SESSION_EVENT_KINDS } = await import('./context-bus/session-events.js');
+        if (!SESSION_EVENT_KINDS.includes(sessionKind as import('./context-bus/session-events.js').SessionEventKind)) {
+          throw new Error(`unknown context session kind: ${sessionKind}`);
+        }
+        emitSessionEvent({ kind: sessionKind as import('./context-bus/session-events.js').SessionEventKind,
+          seat: opts.seat, text: opts.text, ...(opts.ref === undefined ? {} : { ref: opts.ref }) });
+      } else {
+        if (opts.seat !== undefined || opts.text !== undefined || opts.ref !== undefined || !opts.kind || opts.summary === undefined || opts.source === undefined) {
+          throw new Error('context emit hook requires --kind, --summary and --source');
+        }
+        if (!['claimed', 'done', 'asked', 'guide-changed'].includes(opts.kind)) throw new Error(`unknown context hook kind: ${opts.kind}`);
+        const { recordExternalEvent } = await import('./context-bus/external-events.js');
+        recordExternalEvent({ origin: 'claude-code', kind: opts.kind as import('./context-bus/external-events.js').ContextHookKind,
+          summary: opts.summary, source: opts.source });
+      }
+    } catch (error) {
+      console.error(`context emit: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
   });
 
 const coordCmd = program.command('coord').description('조율 채널 맥락 원장');

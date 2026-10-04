@@ -52,20 +52,29 @@ export function deliveryDedupKey(kind: string, text: string): string {
   return createHash('sha1').update(`${kind}\n${norm}`).digest('hex').slice(0, 16);
 }
 
-/** ① 중복 발사 제어 — 같은 dedupKey가 windowSec 내에 이미 발송됐나(재팬아웃 억제).
- *  보수적 짧은 창(기본 120s) — 크론 재시도·이중호출 같은 즉시 중복만 잡고,
- *  시간 지난 정당한 재발송은 통과. (의미 중복은 상류 signal-dedup 6h 담당.) */
-export function recentlyDelivered(
+/** ① 중복 발사 제어 — windowSec 내 동일 메시지가 한 채널 이상 성공했으면 그 messageId.
+ *  실패 기록은 재시도를 막지 않는다. 짧은 창(기본 120s) 밖의 재발송은 통과. */
+export function successfulDeliveryId(
   db: Database, dedupKey: string, windowSec = 120, nowMs: number = Date.now(),
-): boolean {
+): string | null {
   // ⚠️ 축 ②(JS 임계 · db-window 참조) — 같은 파일의 `recentDeliveryCount` 와 동형이다.
   //    SQL 안의 `datetime('now')` 를 쓰면 **시계를 주입할 수 없어** 테스트가 실제 시각에
   //    매달린다. 실제로 이 함수의 테스트가 고정 날짜로 seed 한 채 시간이 흘러 어느 날 빨개진
   //    시한폭탄이었다. `deliveries.ts` 는 ISO 로만 쓰므로 raw 비교가 옳고 인덱스도 산다.
   const row = db.prepare(
-    `SELECT 1 FROM deliveries WHERE dedup_key = ? AND ts >= ? LIMIT 1`,
-  ).get(dedupKey, sinceTs(SECONDS(windowSec), nowMs));
-  return !!row;
+    `SELECT message_id FROM deliveries
+     WHERE dedup_key = ? AND ts >= ?
+       AND EXISTS (SELECT 1 FROM json_each(deliveries.channels) WHERE json_extract(value, '$.ok') = 1)
+     ORDER BY ts DESC LIMIT 1`,
+  ).get(dedupKey, sinceTs(SECONDS(windowSec), nowMs)) as { message_id: string } | null;
+  return row?.message_id ?? null;
+}
+
+/** 기존 boolean 호출부 호환 — 성공 배송 기록만 중복으로 센다. */
+export function recentlyDelivered(
+  db: Database, dedupKey: string, windowSec = 120, nowMs: number = Date.now(),
+): boolean {
+  return successfulDeliveryId(db, dedupKey, windowSec, nowMs) !== null;
 }
 
 /** 최근 창(windowSec) 내 총 발송 수 — 버스트(밀림) 판정용. 전 kind 합산.

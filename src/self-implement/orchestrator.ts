@@ -63,6 +63,7 @@ import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-ru
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
+import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
@@ -874,6 +875,8 @@ export type ImplementTerminalStatus = {
 export interface SelfImplementSeams {
   /** Run-observer ledger sink. Tests inject an in-memory sink to avoid touching user state. */
   writeRunLedger?: RunLedgerWriter;
+  /** Optional context-journal sink for isolated runs. */
+  emitContextEvent?: (input: SessionEventInput) => void;
   /** Registers this run as an ephemeral loop-agent asset; failures are observed but never affect execution. */
   registerLoopAgent?: (input: LoopAgentInput) => void;
   /** Wraps implementation and gate promises with their effective wall-clock timeout; tests observe the actual stage budgets. */
@@ -3384,6 +3387,16 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       detail: 'observe-only: SelfImplement execution skipped before child boot',
     };
   }
+  const emitContext = (kind: 'task-claimed' | 'task-done', text: string, pr?: number): void => {
+    try {
+      (opts.seams.emitContextEvent ?? emitSessionEvent)({ kind, seat: 'TC', text,
+        ref: `runId=${runId}${pr === undefined ? '' : ` PR=#${pr}`}` });
+    } catch (error) {
+      try { logRunAwareFailSoft(runId, 'context-event-failed', { kind, error: safeErrorDescription(error) }); }
+      catch { /* context publication never changes the run result */ }
+    }
+  };
+  emitContext('task-claimed', `Self-implement claimed: ${opts.feature.split(/\r?\n/, 1)[0]}`);
   const parentHarnessSpaceId = getHarnessSpace()?.id || undefined;
   const configRoot = getElanousConfigDir() || undefined;
   const stateRoot = elanousStateRoot() || undefined;
@@ -4091,6 +4104,8 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         }, { level: 'warn' });
       } catch { /* fail-soft — 종결 기록 실패가 원래 예외를 덮으면 안 된다 */ }
     }
+    emitContext('task-done', `Self-implement ${terminalResult?.stage ?? 'crashed'}: ${opts.feature.split(/\r?\n/, 1)[0]}`,
+      terminalResult?.prNumber ?? capturedPrNumber);
     finalizeTraversal();
     try { unregisterProviderErrorSink(); } catch { /* fail-soft — cleanup must not change the terminal result */ }
   }

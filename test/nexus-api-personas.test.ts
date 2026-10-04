@@ -4,7 +4,7 @@
 // init via `setGlobalPersonaRegistryDir` test seam.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,10 +15,14 @@ import {
   reloadGlobalPersonaRegistry,
   setGlobalPersonaRegistryDir,
 } from '../src/persona/global-registry.js';
+import { routeRequest, type NexusHttpServerOpts } from '../src/nexus/api/http-server.js';
+import { createDevProxyRuntimeRef } from '../src/nexus/api/admin-dev-proxy.js';
 import {
   dispatchPersonaRoute,
+  handlePersonaCreate,
   handlePersonaGet,
   handlePersonaPatch,
+  handlePersonaPresets,
   handlePersonasEvents,
   handlePersonasList,
 } from '../src/nexus/api/personas.js';
@@ -203,13 +207,12 @@ systemPrompt: hi
     expect(res!.status).toBe(200);
   });
 
-  test('POST /v1/personas → 405 method not allowed', async () => {
+  test('POST /v1/personas → 400 when the request has no preset and name', async () => {
     const res = await dispatchPersonaRoute(
-      new Request('http://localhost/v1/personas', { method: 'POST' }),
+      new Request('http://localhost/v1/personas', { method: 'POST', body: '{}' }),
       '/v1/personas',
     );
-    expect(res).not.toBeNull();
-    expect(res!.status).toBe(405);
+    expect(res?.status).toBe(400);
   });
 
   test('non-personas pathname → null (caller chains)', async () => {
@@ -315,6 +318,65 @@ displayName: Gamma
   });
 });
 
+describe('preset catalog and persona creation', () => {
+  test('GET serves the shipped catalog and rejects unauthenticated requests', async () => {
+    const req = new Request('http://localhost/v1/persona-presets');
+    expect(handlePersonaPresets(req, { checkAuth: () => false }).status).toBe(401);
+    const res = await dispatchPersonaRoute(req, '/v1/persona-presets');
+    expect(res?.status).toBe(200);
+    const body = await res!.json() as { presets: Array<{ personaId: string; displayName: string }> };
+    expect(body.presets.length).toBeGreaterThan(0);
+    expect(body.presets[0]?.personaId).toBeTruthy();
+    expect(body.presets[0]?.displayName).toBeTruthy();
+  });
+
+  test('HTTP routing requires owner auth and reaches GET catalog, POST create and PATCH edit', async () => {
+    const opts = { metaApi: { bearerToken: 'owner-secret' } } as unknown as NexusHttpServerOpts;
+    const server = { requestIP: () => ({ address: '203.0.113.10' }) };
+    const route = (method: string, path: string, body?: object, authorized = true) => routeRequest(
+      new Request(`http://localhost${path}`, {
+        method,
+        headers: authorized ? { authorization: 'Bearer owner-secret' } : {},
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }), opts, server as unknown as Parameters<typeof routeRequest>[2], null, createDevProxyRuntimeRef(),
+    );
+    expect((await route('GET', '/v1/persona-presets', undefined, false))?.status).toBe(401);
+    expect((await route('POST', '/v1/personas', { preset: 'x', name: 'N' }, false))?.status).toBe(401);
+    expect((await route('PATCH', '/v1/personas/alpha', { description: 'x' }, false))?.status).toBe(401);
+    const catalog = await route('GET', '/v1/persona-presets');
+    expect(catalog?.status).toBe(200);
+    const { presets } = await catalog!.json() as { presets: Array<{ personaId: string }> };
+    const created = await route('POST', '/v1/personas', { preset: presets[0]!.personaId, name: 'API Friend' });
+    expect(created?.status).toBe(201);
+    const patched = await route('PATCH', '/v1/personas/api-friend', { displayName: 'API Renamed', systemPrompt: 'one\ntwo' });
+    expect(patched?.status).toBe(200);
+    expect((await patched!.json() as { persona: { systemPrompt: string } }).persona.systemPrompt).toBe('one\ntwo');
+  });
+
+  test('POST clones a preset, reloads the registry, rejects duplicate names and missing presets', async () => {
+    const presetRes = handlePersonaPresets(new Request('http://localhost/v1/persona-presets'));
+    const { presets } = await presetRes.json() as { presets: Array<{ personaId: string }> };
+    const preset = presets[0]!.personaId;
+    const request = () => new Request('http://localhost/v1/personas', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ preset, name: 'Custom Friend' }),
+    });
+    expect((await handlePersonaCreate(request(), { checkAuth: () => false })).status).toBe(401);
+    const res = await dispatchPersonaRoute(request(), '/v1/personas');
+    expect(res?.status).toBe(201);
+    const body = await res!.json() as { persona: { personaId: string; displayName: string } };
+    expect(body.persona.personaId).toBe('custom-friend');
+    expect(body.persona.displayName).toContain('Custom Friend');
+    expect(getGlobalPersonaRegistry().get(body.persona.personaId)?.displayName).toBe(body.persona.displayName);
+    expect(readFileSync(join(dir, 'custom-friend.yaml'), 'utf8')).toContain('personaId: custom-friend');
+    expect((await handlePersonaCreate(request())).status).toBe(409);
+    const missing = new Request('http://localhost/v1/personas', {
+      method: 'POST', body: JSON.stringify({ preset: 'does-not-exist', name: 'Somebody' }),
+    });
+    expect((await handlePersonaCreate(missing)).status).toBe(404);
+  });
+});
+
 describe('§Phase 3 · PATCH /v1/personas/:id (description edit)', () => {
   test('updates description + reloads registry', async () => {
     writePersona('alpha', `personaId: alpha
@@ -333,6 +395,35 @@ description: old desc
     const body = await res.json() as { persona: { personaId: string; description?: string } };
     expect(body.persona.personaId).toBe('alpha');
     expect(body.persona.description).toBe('new description text');
+  });
+
+  test('edits displayName, description and multiline systemPrompt without losing identity', async () => {
+    writePersona('alpha', 'personaId: alpha\ndisplayName: Alpha\ndescription: Before\nsystemPrompt: Before\n');
+    const prompt = 'First line\nSecond line';
+    const req = new Request('http://localhost/v1/personas/alpha', {
+      method: 'PATCH', body: JSON.stringify({ displayName: 'Renamed', description: 'After', systemPrompt: prompt }),
+    });
+    const res = await dispatchPersonaRoute(req, '/v1/personas/alpha');
+    expect(res?.status).toBe(200);
+    const { persona } = await res!.json() as { persona: { personaId: string; displayName: string; description: string; systemPrompt: string } };
+    expect(persona).toMatchObject({ personaId: 'alpha', displayName: 'Renamed', description: 'After', systemPrompt: prompt });
+    expect(readFileSync(join(dir, 'alpha.yaml'), 'utf8')).toContain('Second line');
+    expect((await handlePersonaPatch(new Request('http://localhost/v1/personas/alpha', {
+      method: 'PATCH', body: JSON.stringify({ personaId: 'other', displayName: 'Unsafe' }),
+    }), 'alpha')).status).toBe(400);
+    expect(getGlobalPersonaRegistry().get('alpha')?.displayName).toBe('Renamed');
+  });
+
+  test('description-only edit preserves YAML comments and unrelated keys', async () => {
+    writePersona('alpha', '# Keep me\npersonaId: alpha\ndisplayName: Alpha\ndescription: before\ncustomKey: custom value\n');
+    const res = await handlePersonaPatch(new Request('http://localhost/v1/personas/alpha', {
+      method: 'PATCH', body: JSON.stringify({ description: 'after' }),
+    }), 'alpha');
+    expect(res.status).toBe(200);
+    const yaml = readFileSync(join(dir, 'alpha.yaml'), 'utf8');
+    expect(yaml).toContain('# Keep me');
+    expect(yaml).toContain('customKey: custom value');
+    expect(yaml).toContain('description: "after"');
   });
 
   test('404 on unknown personaId', async () => {

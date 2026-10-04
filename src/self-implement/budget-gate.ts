@@ -101,21 +101,27 @@ function codexCandidateUsable(candidate: BudgetCodexCandidate, cap: number | und
 function slotUsable(
   provider: string,
   input: DecideBudgetInput,
-): { usable: boolean; reason: string } {
+  allowUnmeasured = false,
+): { usable: boolean; reason: string; unmeasured?: boolean } {
   if (provider === CODEX_PROVIDER) {
     const cap = capFor(input.maxUsedPercent, CODEX_PROVIDER);
-    const usable = input.codexCandidates.some((candidate) => codexCandidateUsable(candidate, cap));
-    return { usable, reason: formatCodexReason(input.codexCandidates, cap) };
+    const measuredUsable = input.codexCandidates.some((candidate) => codexCandidateUsable(candidate, cap));
+    const unmeasured = allowUnmeasured && !measuredUsable && (input.codexCandidates.length === 0
+      || input.codexCandidates.some((candidate) => candidate.reached !== true
+        && (typeof candidate.usedPercent !== 'number' || !Number.isFinite(candidate.usedPercent))));
+    return { usable: measuredUsable || unmeasured, reason: formatCodexReason(input.codexCandidates, cap), ...(unmeasured ? { unmeasured: true } : {}) };
   }
   if (provider === GROK_PROVIDER) {
     const cap = capFor(input.maxUsedPercent, GROK_PROVIDER);
     const known = typeof input.grokUsedPercent === 'number' && Number.isFinite(input.grokUsedPercent);
-    const usable = cap === undefined
+    const unmeasured = allowUnmeasured && !known;
+    const usable = unmeasured || (cap === undefined
       ? known
-      : known && (input.grokUsedPercent as number) < cap;
+      : known && (input.grokUsedPercent as number) < cap);
     return {
       usable,
       reason: formatGrokReason(input.grokUsedPercent, cap),
+      ...(unmeasured ? { unmeasured: true } : {}),
     };
   }
   return { usable: false, reason: `${provider}: 예산 판정 없음` };
@@ -127,6 +133,15 @@ function slotUsable(
  * 아무것도 못 쓰면 onShortfall 이 wait-reset 일 때만 wait-reset, 아니면 stop.
  */
 export function decideBudget(input: DecideBudgetInput): BudgetDecision {
+  return decideBudgetWithPolicy(input, false).decision;
+}
+
+/** Only the harness launch gate treats an unmeasured provider as launchable. */
+export function decideLaunchBudget(input: DecideBudgetInput): { decision: BudgetDecision; unmeasuredProvider?: string } {
+  return decideBudgetWithPolicy(input, true);
+}
+
+function decideBudgetWithPolicy(input: DecideBudgetInput, allowUnmeasured: boolean): { decision: BudgetDecision; unmeasuredProvider?: string } {
   const reasons: string[] = [];
   if (input.preference.chain.length === 0) {
     reasons.push('chain: 비었음 — tools.selfImplement.childLlm.chain 도 llm.fallbackChain 도 없다');
@@ -134,7 +149,7 @@ export function decideBudget(input: DecideBudgetInput): BudgetDecision {
   let firstUnusable = false;
   for (let index = 0; index < input.preference.chain.length; index++) {
     const slot = input.preference.chain[index]!;
-    const judged = slotUsable(slot.provider, input);
+    const judged = slotUsable(slot.provider, input, allowUnmeasured);
     reasons.push(judged.reason);
     if (!judged.usable) {
       if (index === 0) firstUnusable = true;
@@ -142,16 +157,18 @@ export function decideBudget(input: DecideBudgetInput): BudgetDecision {
     }
     const action: BudgetAction = index === 0 || !firstUnusable ? 'proceed' : 'next-provider';
     return {
-      action,
-      provider: slot.provider,
-      ...(slot.model !== undefined ? { model: slot.model } : {}),
-      reasons,
+      decision: {
+        action,
+        provider: slot.provider,
+        ...(slot.model !== undefined ? { model: slot.model } : {}),
+        reasons,
+      },
+      ...(judged.unmeasured ? { unmeasuredProvider: slot.provider } : {}),
     };
   }
   const onShortfall = input.preference.budgetGate.onShortfall;
   return {
-    action: onShortfall === 'wait-reset' ? 'wait-reset' : 'stop',
-    reasons,
+    decision: { action: onShortfall === 'wait-reset' ? 'wait-reset' : 'stop', reasons },
   };
 }
 

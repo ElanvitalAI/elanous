@@ -2,6 +2,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { WARNING_ONLY } from './auto-approve-node.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
 
 export function publicNotes(markdown: string, pages: { pages: Array<{ id: string; slug?: string; source?: string }> }): string {
@@ -40,7 +41,9 @@ export function runPublish(run: CommandRunner = runCommand) {
   const auto = context.outputs['auto-approve'];
   if (context.outputs['approve-publish']?.outcome !== 'approved' &&
     !(auto?.outcome === 'ok' && auto.decidedBy === 'release-loop metrics'
-      && Array.isArray(auto.metrics) && auto.metrics.length === 8
+      // The 8 blocking metrics; warning-only rows (tui-regress · mac-smoke) are shown but never counted (V1g · MAC1).
+      && Array.isArray(auto.metrics)
+      && auto.metrics.filter((metric: unknown) => !(metric && typeof metric === 'object' && 'name' in metric && WARNING_ONLY.has(String(metric.name)))).length === 8
       && auto.metrics.every((metric: unknown) => metric && typeof metric === 'object' && 'verdict' in metric && metric.verdict === 'pass'))) {
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }

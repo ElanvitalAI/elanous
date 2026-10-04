@@ -436,6 +436,12 @@ export function goalTouchesPwa(feature: string): boolean {
   return PWA_PATH.test(feature);
 }
 
+/** A launch-time warning, not a memory-tier override or a test-command parser. */
+export function broadPodTestWarning(goal: string): string | null {
+  const broad = /(?:전체\s*(?:시험|테스트)|(?:full|whole|entire|all)\s+(?:test|suite)|(?:전체|모든)\s*(?:test|suite)|\bbun\s+test\s+(?:[\w./-]+\/|[\w./-]+(?<!\.[cm]?[jt]sx?))(?:\s|$)|\bbun\s+test\s*(?:$|[;&|]))/imu.test(goal);
+  return broad ? '[pod] 넓은 시험 골 경고: 10-04 W10b 32Gi OOM — 넓은 bun test 한 프로세스가 16GB+ 사용; 바꾼 시험 파일만 지정해 실행하세요.' : null;
+}
+
 export function parsePodMemoryTier(v: string | undefined): PodMemoryTier | null {
   const t = v?.trim().toLowerCase();
   return t && (POD_MEMORY_TIERS as readonly string[]).includes(t) ? (t as PodMemoryTier) : null;
@@ -660,6 +666,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         debug.log('self-implement.pod', 'memory-directive-ignored', { spaceId: input.spaceId, where, reason }, { level: 'warn' });
       }
     }
+    const broadTestWarning = broadPodTestWarning(`${input.feature}\n${parentGoal ?? ''}`);
+    if (broadTestWarning) console.warn(broadTestWarning);
     let memoryLimit = selectedMemoryLimit;
     const after = input.after ?? podPredecessorFor(input.feature, env, parentGoal);
     if (after !== undefined) debug.log('self-implement.pod', 'predecessor', { spaceId: input.spaceId, after, source: input.after !== undefined ? 'input' : 'goal-or-option' });

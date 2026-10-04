@@ -335,7 +335,7 @@ import {
   handleTasksList,
   handleTaskDetail,
 } from './tasks-scheduler.js';
-import { handleTaskCardsGet } from './task-cards-api.js';
+import { handleTaskCardsGet, handleTaskCardsWishPost } from './task-cards-api.js';
 import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
 import { matchIngestAuthorization } from './ingest-token.js';
 import {
@@ -344,6 +344,8 @@ import {
   handleWorkflowApprovalsPending,
   handleWorkflowDelete,
   handleWorkflowGet,
+  handleWorkflowHistoryList,
+  handleWorkflowHistoryVersionGet,
   handleWorkflowPut,
   handleWorkflowRunGet,
   handleWorkflowRunsList,
@@ -1360,6 +1362,11 @@ export async function routeRequest(
     return handleSkillProblems(req, opts.metaApi);
   }
 
+  if (method === 'GET' && pathname === '/v1/persona-presets') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return dispatchPersonaRoute(req, pathname) as Promise<Response>;
+  }
+
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
@@ -1388,6 +1395,10 @@ export async function routeRequest(
       if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const mutated = await handleGraphsMutation(pathname, req);
       if (mutated) return mutated;
+    }
+    if (method === 'POST' && pathname === '/v1/task-cards/wish') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleTaskCardsWishPost(req);
     }
     if (method === 'POST' && pathname === '/v1/tasks') {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
@@ -1645,10 +1656,10 @@ export async function routeRequest(
       if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return pathname === '/v1/setup/child-llm' ? handleChildLlmSet(req) : handleAnswerPrioritySet(req);
     }
-    // PWA `/settings` Phase 3 (2026-05-19) — persona description PATCH.
-    // dispatchPersonaRoute 가 PATCH 분기를 자체 처리. GET sibling 은
-    // 아래 GET-only 블록의 기존 /v1/personas 핸들러.
-    if (pathname.startsWith('/v1/personas/') && method === 'PATCH') {
+    // Persona creation and editing require owner auth before parsing a write body.
+    if ((method === 'POST' && pathname === '/v1/personas')
+      || (method === 'PATCH' && pathname.startsWith('/v1/personas/'))) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const result = await dispatchPersonaRoute(req, pathname);
       if (result) return result;
     }
@@ -2645,7 +2656,7 @@ export async function routeRequest(
     catch { return jsonResponse({ error: 'bad_request' }, 400); }
     return handleScheduleDetail(req, id, opts.metaApi);
   }
-  if (pathname === '/v1/task-cards' || /^\/v1\/task-cards\/[^/]+$/.test(pathname)) {
+  if (method === 'GET' && (pathname === '/v1/task-cards' || /^\/v1\/task-cards\/[^/]+$/.test(pathname))) {
     return handleTaskCardsGet(pathname);
   }
   if (pathname === '/v1/tasks') {
@@ -2738,11 +2749,23 @@ export async function routeRequest(
   }
   if (pathname.startsWith('/v1/workflows/')) {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const wfName = decodeURIComponent(pathname.slice('/v1/workflows/'.length));
+    const segments = pathname.slice('/v1/workflows/'.length).split('/');
+    let wfName: string;
+    try { wfName = decodeURIComponent(segments[0] ?? ''); }
+    catch { return jsonResponse({ error: 'bad_request', reason: 'invalid workflow name' }, 400); }
     if (!wfName || wfName.includes('/') || wfName.includes('\\') || wfName.includes('..')) {
       return jsonResponse({ error: 'bad_request', reason: 'invalid workflow name' }, 400);
     }
-    return handleWorkflowGet(req, wfName, opts.metaApi);
+    if (segments.length === 2 && segments[1] === 'history') {
+      return handleWorkflowHistoryList(req, wfName, opts.metaApi);
+    }
+    if (segments.length === 3 && segments[1] === 'history') {
+      let id: string;
+      try { id = decodeURIComponent(segments[2] ?? ''); }
+      catch { return jsonResponse({ error: 'bad_request', reason: 'invalid workflow history version id' }, 400); }
+      return handleWorkflowHistoryVersionGet(req, wfName, id, opts.metaApi);
+    }
+    if (segments.length === 1) return handleWorkflowGet(req, wfName, opts.metaApi);
   }
   if (pathname.startsWith('/v1/nexus/templates/')) {
     const name = pathname.slice('/v1/nexus/templates/'.length);

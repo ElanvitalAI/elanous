@@ -64,10 +64,50 @@ test('configured key signs the exact official index bytes; no key material is bu
   expect(readFileSync(join(output, 'marketplace.json'), 'utf8')).not.toContain(key.privateKeyPem);
 });
 
+test('run state inside the installed plugin is excluded from the archive and market index', () => {
+  const { plugin, output, root } = fixture();
+  writeFileSync(join(root, 'private.tsv'), 'owner-private-9087\t[redacted]\n');
+  const runDir = join(plugin, '.elanous-local', 'graph-runs', 'demo-plugin');
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, 'run-1.json'), 'owner-private-9087\n');
+  const nestedState = join(plugin, 'graphs', '.elanous-local');
+  mkdirSync(nestedState, { recursive: true });
+  writeFileSync(join(nestedState, 'output.json'), 'private source/' + 'pilot/ output\n');
+  const directRuns = join(plugin, 'graph-runs');
+  mkdirSync(directRuns);
+  writeFileSync(join(directRuns, 'run-2.json'), 'private source/' + 'pilot/ input\n');
+  const testState = join(plugin, '.elanous-test');
+  mkdirSync(testState);
+  writeFileSync(join(testState, 'session.json'), 'private source/' + 'pilot/ test\n');
+  writeFileSync(join(plugin, 'graphs', 'demo.yaml'), 'graph_id: demo-plugin\n');
+
+  const result = bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json'));
+  const archive = Bun.spawnSync(['tar', '-tzf', result.artifact]);
+  expect(archive.exitCode).toBe(0);
+  const entries = archive.stdout.toString().trim().split('\n');
+  expect(entries).toContain('README.md');
+  expect(entries).toContain('graphs/demo.yaml');
+  for (const runtimeDir of ['.elanous-local', '.elanous-test', 'graph-runs']) {
+    expect(entries.some(entry => entry.split('/').includes(runtimeDir))).toBe(false);
+    expect(readFileSync(join(output, 'marketplace.json'), 'utf8')).not.toContain(runtimeDir);
+  }
+});
+
 test('public-export leak markers refuse a private-looking string before creating any bundle', () => {
   const { plugin, output, root } = fixture();
   writeFileSync(join(plugin, 'README.md'), 'private source/' + 'pilot/ note\n');
   expect(() => bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json'))).toThrow('pilot-tree');
+  expect(existsSync(output)).toBe(false);
+});
+
+test('private identifier in an authored file still fails the leak gate when run state is excluded', () => {
+  const { plugin, output, root } = fixture();
+  writeFileSync(join(root, 'private.tsv'), 'owner-private-9087\t[redacted]\n');
+  const runDir = join(plugin, '.elanous-local', 'graph-runs', 'demo-plugin');
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, 'run-1.json'), 'owner-private-9087\n');
+  writeFileSync(join(plugin, 'README.md'), 'owner-private-9087\n');
+  expect(() => bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json'))).toThrow('market bundle leak: README.md:1 private-identifier');
   expect(existsSync(output)).toBe(false);
 });
 

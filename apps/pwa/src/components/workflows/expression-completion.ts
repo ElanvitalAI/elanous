@@ -4,6 +4,14 @@ import type { WorkflowDefinitionLike } from './workflow-graph-layout';
 const NODE_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+export function variableLabel(candidate: string): string {
+  if (candidate === '$ARGUMENTS') return '실행할 때 받은 인자';
+  if (candidate === '$ARTIFACTS_DIR') return '산출물 폴더';
+  const match = /^\$([a-z0-9]+(?:-[a-z0-9]+)*)\.output(?:\.([A-Za-z_][A-Za-z0-9_]*))?$/.exec(candidate);
+  if (!match) return candidate;
+  return match[2] ? `${match[1]} 노드 결과의 ${match[2]}` : `${match[1]} 노드 결과`;
+}
+
 export function getExpressionCandidates(def: WorkflowDefinitionLike, nodeId: string, typed: string): string[] {
   if (!/^\$[A-Za-z0-9_.-]*$/.test(typed)) return [];
 

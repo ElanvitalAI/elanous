@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProjectStore } from '../../project/project-store.js';
+import { CardStore } from '../../task-cards/card-store.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveSurfaceUx } from '../../agent/surface-ux/build.js';
@@ -169,6 +170,58 @@ function createContext(
     },
   } as unknown as DashboardSlashContext;
 }
+
+test('/wish follows /now in the visible catalog and registers on the human dashboard', () => {
+  const names = SLASH_COMMANDS.map(({ name }) => name);
+  expect(names[names.indexOf('now') + 1]).toBe('wish');
+  expect(buildDashboardSlashRegistry().has('wish')).toBe(true);
+});
+
+test('/wish shows usage without writing a card when arguments are empty', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-wish-slash-empty-'));
+  const store = new CardStore(root);
+  try {
+    const lines: string[] = [];
+    const ctx = createContext(lines);
+    ctx.wishCardStore = store;
+    const registry = buildDashboardSlashRegistry();
+    await registry.dispatch('wish', [], ctx);
+    await registry.dispatch('wish', ['   '], ctx);
+    expect(lines).toEqual(['  usage: /wish <소원 한 줄>', '  usage: /wish <소원 한 줄>']);
+    expect(store.listCards()).toHaveLength(0);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/wish creates distinct TUI cards for separate submissions, including identical text', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-wish-slash-create-'));
+  const store = new CardStore(root);
+  try {
+    const lines: string[] = [];
+    const ctx = createContext(lines);
+    ctx.wishCardStore = store;
+    const registry = buildDashboardSlashRegistry();
+    await registry.dispatch('wish', ['새', '소원'], ctx);
+    await registry.dispatch('wish', ['새', '소원'], ctx);
+    expect(lines).toEqual([
+      '  소원 카드로 남겼습니다 — 새 소원',
+      '  소원 카드로 남겼습니다 — 새 소원',
+    ]);
+    const cards = store.listCards();
+    expect(cards).toHaveLength(2);
+    expect(cards.every(card => card.goalId.startsWith('wish:tui:'))).toBe(true);
+    expect(new Set(cards.map(card => card.goalId)).size).toBe(2);
+    for (const card of cards) {
+      expect(card.sections).toHaveLength(1);
+      expect(JSON.parse(card.sections[0]!.content)).toMatchObject({ source: 'tui', text: '새 소원' });
+    }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('/session new suggests a matching project once without assigning it to a session', async () => {
   const root = mkdtempSync(join(tmpdir(), 'elanous-tui-project-suggestion-'));

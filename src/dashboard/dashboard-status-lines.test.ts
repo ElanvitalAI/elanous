@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { buildDashboardStatusLines, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
 
 const input: DashboardStatusLinesInput = {
@@ -18,6 +19,19 @@ const input: DashboardStatusLinesInput = {
   acp: 'idle',
 };
 
+test('dashboard /status reads current seats and fails closed when the read throws', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('const getDashboardStatusLines = () => {');
+  const end = source.indexOf('bootDashboardSlashExecutor({', start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const status = source.slice(start, end);
+  expect(status).toContain('let seatsNow: string | null = null;');
+  expect(status).toContain('seatsNowLine(readSlashContextNow([]), Date.now())');
+  expect(status).toMatch(/try\s*\{[\s\S]*readSlashContextNow\(\[\]\)[\s\S]*\}\s*catch\s*\(error\)\s*\{[\s\S]*debug\.log\('dashboard\.status', 'seats-unreadable'/);
+  expect(status).toContain('return buildDashboardStatusLines({\n      seatsNow,');
+});
+
 describe('buildDashboardStatusLines', () => {
   test('puts model, daemon attachment and account first, preserving all detailed lines', () => {
     expect(buildDashboardStatusLines(input)).toEqual([
@@ -36,6 +50,15 @@ describe('buildDashboardStatusLines', () => {
       '  chatOnly: off',
       '  acp: idle',
     ]);
+  });
+
+  test('inserts the current seats immediately after account and preserves the remaining lines', () => {
+    const baseline = buildDashboardStatusLines(input);
+    const seatsNow = '지금 자리들: CTO Context door · 3분 전';
+    expect(buildDashboardStatusLines({ ...input, seatsNow })).toEqual([
+      ...baseline.slice(0, 3), seatsNow, ...baseline.slice(3),
+    ]);
+    expect(buildDashboardStatusLines({ ...input, seatsNow: null })).toEqual(baseline);
   });
 
   test('unknown model, address and unverified account are explicit', () => {

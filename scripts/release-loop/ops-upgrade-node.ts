@@ -1,12 +1,43 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandResult, type CommandRunner } from './node-verdict.js';
 
 interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
-interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null }
+/** Where the internal feed is packed from: a checkout of the release tag, never the run's working tree. */
+export interface FeedSource { checkout: string; commit: string; cleanup: () => void }
+interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null; feedSource?: (version: string) => FeedSource }
+
+/** Detached worktree at refs/tags/v<version> with the PWA built — the feed ships what was released (10-04 0.2.11:
+ *  packing process.cwd() shipped main HEAD ee689ad2 as «0.2.11» to node-b·cloud-vm instead of the cut 31129c91). */
+export function tagFeedSource(run: CommandRunner, repo: string = process.cwd()): (version: string) => FeedSource {
+  return (version) => {
+    const tag = run('git', ['rev-parse', '--verify', `refs/tags/v${version}^{commit}`], repo);
+    const commit = tag.stdout.trim();
+    if (tag.status !== 0 || !/^[0-9a-f]{40,64}$/.test(commit)) throw new Error(`태그 없음: v${version}`);
+    const dir = mkdtempSync(join(tmpdir(), 'ops-feed-'));
+    const tree = join(dir, 'tree');
+    const cleanup = () => {
+      run('git', ['worktree', 'remove', '--force', tree], repo);
+      rmSync(dir, { recursive: true, force: true });
+    };
+    try {
+      const added = run('git', ['worktree', 'add', '--detach', tree, commit], repo);
+      if (added.status !== 0) throw new Error(`태그 체크아웃 실패: ${reason(added)}`);
+      symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'));
+      if (existsSync(join(repo, 'apps/pwa/node_modules'))) symlinkSync(join(repo, 'apps/pwa/node_modules'), join(tree, 'apps/pwa/node_modules'));
+      // The feed carries the PWA build (apps/pwa/out is ignored, so a fresh tag checkout has none until built).
+      const built = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], tree, 900_000);
+      if (built.status !== 0) throw new Error(`태그 PWA 빌드 실패: ${reason(built)}`);
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+    return { checkout: tree, commit, cleanup };
+  };
+}
 
 function localInstallSource(): string | null {
   try {
@@ -54,11 +85,21 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
     : (deps.exists ?? existsSync)(defaultFeed) ? defaultFeed : undefined;
   let feedError = '';
   if (feedPath !== undefined) {
+    let source: FeedSource | undefined;
     try {
-      const feed = run('bun', ['scripts/publish-internal-dist.ts', '--checkout', process.cwd(), '--out', feedPath]);
-      const data = lastResult(feed);
-      if (feed.status !== 0 || data?.ok !== true || data.version !== version) feedError = `내부 피드 발행 실패: ${feed.status === 0 && data?.ok === true ? `판 불일치 (${String(data.version)})` : reason(feed)}`;
+      source = (deps.feedSource ?? tagFeedSource(run))(version);
+      const released = context.outputs['version-release']?.commit;
+      if (typeof released === 'string' && released && released !== source.commit) {
+        feedError = `내부 피드 발행 실패: 태그 v${version}(${source.commit.slice(0, 12)})가 컷(${released.slice(0, 12)})과 다르다`;
+      } else {
+        const feed = run('bun', ['scripts/publish-internal-dist.ts', '--checkout', source.checkout, '--out', feedPath]);
+        const data = lastResult(feed);
+        if (feed.status !== 0 || data?.ok !== true || data.version !== version) feedError = `내부 피드 발행 실패: ${feed.status === 0 && data?.ok === true ? `판 불일치 (${String(data.version)})` : reason(feed)}`;
+        else if (data.commit !== source.commit) feedError = `내부 피드 발행 실패: 묶은 커밋 ${String(data.commit).slice(0, 12)} ≠ 태그 ${source.commit.slice(0, 12)}`;
+        debug.log('release-loop.ops-upgrade', 'feed-source', { version, commit: source.commit, source: `refs/tags/v${version}`, packed: data?.commit, pwaBuild: data?.pwaBuild });
+      }
     } catch (error) { feedError = `내부 피드 발행 실패: ${firstLine(String(error))}`; }
+    finally { source?.cleanup(); }
   }
   const results: HostResult[] = [];
   for (const host of hosts as string[]) {

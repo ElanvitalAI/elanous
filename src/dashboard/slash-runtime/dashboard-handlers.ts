@@ -273,6 +273,8 @@
 // of circular dependency on dashboard/index.ts.
 
 import { tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
+import { createWishCard } from '../../intake-plane/wish-card.js';
+import { CardStore } from '../../task-cards/card-store.js';
 import type { ContextNowDeps } from '../../context-bus/context-now.js';
 import { runRebindCommand } from '../../input-core/index.js';
 // B4 (TUI half) — /design reuses the CLI's own resolution so the three
@@ -422,6 +424,8 @@ export interface DashboardSlashContext {
   /** Existing TUI structured-question capability. Absent means /ask keeps
    * the self-dev noninteractive deferred-clarification contract. */
   surfaceUx?: Pick<SurfaceUx, 'question'>;
+  /** Optional wish-card store for isolated slash dispatch tests. */
+  wishCardStore?: CardStore;
   attachmentRowMap: { clear(): void };
   pushDebugLine(line: string): void;
   pushChatLine(line: string): void;
@@ -1365,6 +1369,26 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
 
   registry.register(['now'], (args, ctx) => {
     for (const line of tuiNowSlash(args, nowDeps)) ctx.pushChatLine(line);
+  });
+
+  registry.register('wish', (args, ctx) => {
+    const text = args.join(' ').trim();
+    if (!text) {
+      ctx.pushChatLine(ctx.warning('  usage: /wish <소원 한 줄>'));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    let store: CardStore | undefined;
+    try {
+      store = ctx.wishCardStore ?? new CardStore();
+      const card = createWishCard({ text, source: 'tui', ref: crypto.randomUUID() }, store);
+      ctx.pushChatLine(ctx.success(`  소원 카드로 남겼습니다 — ${card.title}`));
+    } catch (err) {
+      ctx.pushChatLine(ctx.error(`  소원 카드 등록 실패 — ${err instanceof Error ? err.message : String(err)}`));
+    } finally {
+      if (!ctx.wishCardStore) store?.close();
+    }
+    ctx.setChatScrollOffset(-1);
   });
 
   // ── B-1.a pilot ────────────────────────────────────────────────────

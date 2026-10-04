@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { interpolate } from '../../../../../src/workflow-runtime/variables';
 import type { WorkflowDefinitionLike } from './workflow-graph-layout';
-import { getExpressionCandidates } from './expression-completion';
+import { getExpressionCandidates, variableLabel } from './expression-completion';
 
 const def: WorkflowDefinitionLike = {
   name: 'completion',
@@ -15,9 +15,20 @@ const def: WorkflowDefinitionLike = {
   ],
 };
 
+it('labels both built-in variables, node output and an output field', () => {
+  expect(variableLabel('$ARGUMENTS')).toBe('실행할 때 받은 인자');
+  expect(variableLabel('$ARTIFACTS_DIR')).toBe('산출물 폴더');
+  expect(variableLabel('$fetch.output')).toBe('fetch 노드 결과');
+  expect(variableLabel('$fetch.output.status')).toBe('fetch 노드 결과의 status');
+});
+
 describe('getExpressionCandidates', () => {
   it('walks only transitive dependencies and emits runtime-supported output and field references', () => {
     const candidates = getExpressionCandidates(def, 'current', '$');
+    expect(candidates).toEqual([
+      '$ARGUMENTS', '$ARTIFACTS_DIR', '$fetch.output',
+      '$fetch.output.status', '$fetch.output._count', '$step-2.output',
+    ]);
     expect(candidates).toContain('$fetch.output');
     expect(candidates).toContain('$fetch.output.status');
     expect(candidates).toContain('$fetch.output._count');

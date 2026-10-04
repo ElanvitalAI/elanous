@@ -22,7 +22,7 @@ test('NEXUS routes authenticated GET task-cards list and detail without capturin
   process.env.ELANOUS_STATE_DIR = root;
   const store = new CardStore(root);
   const card = store.createCard({ goalId: 'http-goal', title: 'HTTP card' });
-  store.appendSection(card.id, { key: 'outcome', owner: 'agent', content: 'Delivered' });
+  store.appendSection(card.id, { key: 'outcome', owner: 'steward', content: 'Delivered' });
   const expected = store.getCard(card.id);
   store.close();
 

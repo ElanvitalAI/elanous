@@ -1,0 +1,12 @@
+collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" collect'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" collect'
+condense:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" condense'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" condense'
+record:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" record'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" record'
+conflict-candidates:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" conflict-candidates'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/context-bus/nightly-condense.ts" conflict-candidates'

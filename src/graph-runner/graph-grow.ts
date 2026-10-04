@@ -25,8 +25,11 @@ export async function proposeGrowth(input: Parameters<GrowthProposer>[0],
   catch (error) { return { ok: false, reason: `proposer failed: ${String(error)}` }; }
   if (!proposal) return { ok: false, reason: 'no proposal' };
   if (!proposal.node || typeof proposal.reason !== 'string' || !proposal.reason.trim()) return { ok: false, reason: 'proposal requires a node and reason' };
-  const result = createGraphVariant({ template: input.graph, goal: `g_${input.runId.replace(/[^a-z0-9_-]/gi, '_')}`,
-    plan: { growth: { node: proposal.node, from: input.nodeId, outcome: input.outcome, returnTo: proposal.returnTo } } });
+  let result: ReturnType<typeof createGraphVariant>;
+  try {
+    result = createGraphVariant({ template: input.graph, goal: `g_${input.runId.replace(/[^a-z0-9_-]/gi, '_')}`,
+      plan: { growth: { node: proposal.node, from: input.nodeId, outcome: input.outcome, returnTo: proposal.returnTo } } });
+  } catch (error) { return { ok: false, reason: `growth rejected: ${String(error)}` }; }
   if (!result.ok) return { ok: false, reason: `growth rejected: ${JSON.stringify(result.rejections)}` };
   // Neither a recipe id nor its declared tools certify arbitrary executable code.
   // Only a trusted classification of the resolved recipe may authorize execution.

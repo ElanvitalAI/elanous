@@ -88,7 +88,7 @@ export type ControlDecision =
   | { readonly action: 'handoff'; readonly to: 'codex' | 'claude' | 'elanous'; readonly mission: string; readonly carry?: 'diff' | 'summary' }
   | { readonly action: 'ask-human'; readonly reason: string; readonly url?: string; readonly code?: string }
   /** `no-progress` reports observed lack of progress without claiming completion. */
-  | { readonly action: 'no-progress'; readonly reason: string };
+  | { readonly action: 'no-progress'; readonly reason: string; readonly terminal?: boolean };
 
 export interface RunSupervisor {
   /** run supervisor의 관측 → 다음 행동. 동기/비동기 모두 허용(LLM 은 async). `signal` 이 abort 되면(사람 takeover
@@ -664,6 +664,9 @@ export async function runPtyControlLoop(
           previousIntervention = { ...intervention, sameScreenCount: 1 };
         }
       } else if (decision.action === 'wait' || decision.action === 'no-progress') {
+        if (decision.action === 'no-progress' && decision.terminal) {
+          return finish({ kind: 'stuck', iteration: step, reason: decision.reason }, step, intervention, true);
+        }
         // wait/no-progress — 종료된 자식은 새 출력을 낼 수 없으므로 대기 없이 즉시 수렴한다.
         if (deps.isAlive?.() === false) {
           debug.log('autopilot.control', 'child-exited', { step });

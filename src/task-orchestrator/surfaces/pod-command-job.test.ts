@@ -14,7 +14,7 @@ import {
   runPodCommand,
 } from './pod-command-job.js';
 import type { Kubectl } from './self-implement-pod.js';
-import { PodPoolScheduler, type PodPoolMember } from './pod-pool.js';
+import { PodPoolScheduler, syncPoolImages, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 import { podSourceScript } from './pod-source-receive.js';
 
 const base = {
@@ -225,6 +225,46 @@ describe('runPodCommand', () => {
     expect(result.image).toBe(imageRef);
     expect(applied!.spec.template.spec.initContainers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
     expect(applied!.spec.template.spec.containers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
+  });
+
+  test('pool registry tag uses IfNotPresent for both the isolation gate and child', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5050' };
+    const ref = 'k3d-elanous-registry:5050/elanous-harness:abcdef123456';
+    const run: RemoteRun = (_host, cmd) => ({ status: 0, stdout: cmd.includes('/tags/list') ? '{"tags":["abcdef123456"]}' : 'abcdef1234567890', stderr: '' });
+    let job: Record<string, any> | undefined;
+    const result = await runPodCommand({ command: ['true'], imageCommit: 'abcdef1234567890',
+      checkPool: (members) => { expect(members).toEqual([member]); return { ok: true, ready: [...members], dropped: [] }; },
+      syncImages: (members, image, commit, deps) => syncPoolImages(members, image, commit, { ...deps, run, buildScript: null }),
+      kubectl: (args, input) => {
+        if (input) { const body = JSON.parse(input); if (body.kind === 'Job') job = body; }
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, env: { ELANOUS_POD_POOL: 'pool-node-b@node-b:1#k3d-elanous-registry:5050' }, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-registry-test',
+    });
+    expect(result.image).toBe(ref);
+    expect(job!.spec.template.spec.initContainers[0]).toMatchObject({ image: ref, imagePullPolicy: 'IfNotPresent' });
+    expect(job!.spec.template.spec.containers[0]).toMatchObject({ image: ref, imagePullPolicy: 'IfNotPresent' });
+  });
+
+  test('an unavailable registry tag falls back to the local image with one observable reason', async () => {
+    let job: Record<string, any> | undefined;
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const result = await runPodCommand({ command: ['true'], pool: 'pool-node-b@node-b:1', imageCommit: 'abcdef1234567890',
+      checkPool: (members) => ({ ok: true, ready: [...members], dropped: [] }),
+      syncImages: async (members) => new Map([[members[0]!.context, { ok: true, action: 'shipped' as const, detail: 'local image imported', ms: 1 }]]),
+      kubectl: (args, input) => {
+        if (input) { const body = JSON.parse(input); if (body.kind === 'Job') job = body; }
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, log: (category, event, data) => { events.push({ category, event, data }); },
+      env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-registry-test',
+    });
+    expect(result.image).toBe('elanous-harness:local');
+    expect(job!.spec.template.spec.initContainers[0]).toMatchObject({ image: 'elanous-harness:local', imagePullPolicy: 'Never' });
+    expect(job!.spec.template.spec.containers[0]).toMatchObject({ image: 'elanous-harness:local', imagePullPolicy: 'Never' });
+    expect(events.filter(({ event }) => event === 'image-fallback-local')).toEqual([
+      { category: 'pod.command-job', event: 'image-fallback-local', data: { reason: 'registry-tag-unavailable' } },
+    ]);
   });
 
   test('clone command passes the commit source through to the Job script', async () => {

@@ -3,13 +3,35 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseDecision, reduceDecisions, EMPTY_DECISIONS } from '../../apps/pwa/src/components/inside/pty-decisions.js';
-import { runAgentMission, claudeBackend, codexBackend } from './driver.js';
+import { runAgentMission, claudeBackend, codexBackend, createMissionControlBrain } from './driver.js';
 import { emitPtyDecision, PTY_DECISION_TEXT_MAX } from './pty-decision.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { runPtyControlLoop, type PtyControlDeps, type RunSupervisor } from '../autopilot/pty-control-loop.js';
 import { decideInterventionStep } from '../self-implement/intervention-step.js';
 
-test('a fake mission emits judge, input, published-frame read, answer and done without changing decisions', async () => {
+test('repeated choice prompts emit recover decisions in action order', async () => {
+  const rows: unknown[] = [];
+  const actions: string[] = [];
+  const ident = { missionId: 'choice-recover-test', sessionId: 'session', terminalId: 'terminal', agent: 'codex' };
+  const brain = createMissionControlBrain({ mission: 'Build', evidenceReady: () => false, search: () => {},
+    stream: async () => '{"action":"wait"}', initialCommand: 'Build',
+    onRecover: (blocked, action) => {
+      actions.push(action);
+      emitPtyDecision({ ...ident, step: 'recover', text: action, detail: { blocked, action } }, (_category, _event, row) => { rows.push(row); });
+    },
+  });
+  for (let step = 0; step < 7; step++) {
+    const decision = await brain.decide({ screen: 'Proceed? [y/N]', state: 'blocked', step,
+      changed: false, sameScreenMs: 0, intervention: {} as Parameters<typeof brain.decide>[0]['intervention'] });
+    if (decision.action === 'input') brain.onInputResult(decision.text, true);
+  }
+  expect(actions).toEqual(['Enter', 'Esc', 'Ctrl-C and replay previous command', 'Human needed']);
+  const decisions = rows.map(parseDecision);
+  expect(decisions.map((row) => row?.step)).toEqual(['recover', 'recover', 'recover', 'recover']);
+  expect(decisions.map((row) => row?.seq)).toEqual([0, 1, 2, 3]);
+});
+
+test('a fake mission emits read, judge, input, answer and done without changing decisions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pty-decision-'));
   const rows: unknown[] = [];
   const writes: string[] = [];
@@ -64,14 +86,14 @@ test('a fake mission emits judge, input, published-frame read, answer and done w
     const events = parsed.filter((row): row is NonNullable<typeof row> => row !== null);
     expect(events.map(({ step }) => step)).toContain('answer');
     expect(events.find((row) => row.step === 'recover')?.detail).toMatchObject({ blocked: expect.stringContaining('Output missing'), action: 'Retry after fixing evidence' });
-    const judge = events.findIndex((row) => row.step === 'judge');
+    const read = events.findIndex((row) => row.step === 'read');
+    const judge = events.findIndex((row, i) => i > read && row.step === 'judge');
     const input = events.findIndex((row, i) => i > judge && row.step === 'input');
-    const read = events.findIndex((row, i) => i > input && row.step === 'read');
-    const key = events.findIndex((row, i) => i > read && row.step === 'input' && row.detail?.keys === 'Down');
+    const key = events.findIndex((row, i) => i > input && row.step === 'input' && row.detail?.keys === 'Down');
     const answer = events.findIndex((row, i) => i > key && row.step === 'answer');
     const done = events.findIndex((row, i) => i > answer && row.step === 'done');
-    expect([judge, input, read, key, answer, done].every((n) => n >= 0)).toBe(true);
-    expect(events.filter((row) => row.step === 'read')).toHaveLength(1);
+    expect([read, judge, input, key, answer, done].every((n) => n >= 0)).toBe(true);
+    expect(events.filter((row) => row.step === 'read')).toHaveLength(2);
     expect(events[read]?.text).toBe('step 0 (idle): ready to proceed');
     expect(events[key]?.text).toBe('Pressed Down ×2');
     // seq is per mission id (the process run id), so another mission in the same process may have advanced it — require no gaps.
@@ -326,4 +348,32 @@ test('moving the trust selection is only input; the answer comes when the choice
     expect(answers[0]!.detail?.answer).toBe('Confirm selected choice');
     expect(rows.map((row) => parseDecision(row)).every(Boolean)).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a rejected recovery input neither emits a recover decision nor advances the stage', async () => {
+  const actions: string[] = [];
+  const brain = createMissionControlBrain({ mission: 'Build', evidenceReady: () => false, search: () => {},
+    stream: async () => '{"action":"wait"}', initialCommand: 'Build',
+    onRecover: (_blocked, action) => { actions.push(action); },
+  });
+  const obs = (step: number) => ({ screen: 'Proceed? [y/N]', state: 'blocked' as const, step,
+    changed: false, sameScreenMs: 0, intervention: {} as Parameters<typeof brain.decide>[0]['intervention'] });
+  for (let step = 0; step < 2; step++) await brain.decide(obs(step));
+  const first = await brain.decide(obs(2));
+  expect(first).toEqual({ action: 'input', text: '\r' });
+  brain.onInputResult('\r', false);
+  expect(actions).toEqual([]);
+  // The same stage is retried; once accepted it is recorded and the next stage is Esc.
+  const retry = await brain.decide(obs(3));
+  expect(retry).toEqual({ action: 'input', text: '\r' });
+  brain.onInputResult('\r', true);
+  expect(actions).toEqual(['Enter']);
+  const next = await brain.decide(obs(4));
+  expect(next).toEqual({ action: 'input', text: '\x1b' });
+  // A rejected Ctrl-C does not schedule the command replay.
+  brain.onInputResult('\x1b', true);
+  const interrupt = await brain.decide(obs(5));
+  expect(interrupt).toEqual({ action: 'input', text: '\x03' });
+  brain.onInputResult('\x03', false);
+  expect(await brain.decide(obs(6))).toEqual({ action: 'input', text: '\x03' });
 });

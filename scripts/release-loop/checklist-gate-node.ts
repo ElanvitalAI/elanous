@@ -11,10 +11,11 @@ export function runChecklistGate(context: GraphContext = readGraphContext()) {
   if (gate.ok && gate.moved.length) {
     const [major, minor, patch] = version.split('.').map(Number);
     const next = `${major}.${minor}.${patch! + 1}`;
+    // 이월은 «같은 칸»을 다음 판으로 옮기는 것 — 다른 판 id 충돌 검사(CKID #23407)의 대상이 아니다.
     for (const id of gate.moved) {
       const item = data.items.find((candidate) => candidate.id === id)!;
       if (listChecklist(next).items.some((candidate) => candidate.id === id)) continue;
-      try { addItem(next, { id, title: item.title, ...(item.owner !== undefined ? { owner: item.owner } : {}), ...(item.kind !== undefined ? { kind: item.kind } : {}) }); }
+      try { addItem(next, { id, title: item.title, ...(item.owner !== undefined ? { owner: item.owner } : {}), ...(item.kind !== undefined ? { kind: item.kind } : {}) }, { allowDuplicateId: true }); }
       catch (error) {
         if (!listChecklist(next).items.some((candidate) => candidate.id === id)) throw error;
       }

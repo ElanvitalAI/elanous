@@ -69,7 +69,7 @@ function safeSegment(value: string): string {
   return value;
 }
 
-type CommandRecipe = { command: string; timeout_ms?: number };
+type CommandRecipe = { command: string; dry_run_command?: string; timeout_ms?: number };
 type Recipe = CommandRecipe | { approval: string };
 
 /** 접두 없는 recipe 가 카탈로그 역할이고, 그래프 옆 recipes.yaml 에 같은 키의 `{ command }` 가 있을 때만 cmd 처럼 실행한다. */
@@ -117,10 +117,13 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
       recipes[id] = { approval: item.approval };
     } else {
       if (typeof item.command !== 'string' || !item.command.trim() ||
-        (item.timeout_ms !== undefined && (!Number.isSafeInteger(item.timeout_ms) || (item.timeout_ms as number) <= 0))) {
+        (item.timeout_ms !== undefined && (!Number.isSafeInteger(item.timeout_ms) || (item.timeout_ms as number) <= 0)) ||
+        (item.dry_run_command !== undefined && (typeof item.dry_run_command !== 'string' || !item.dry_run_command.trim()))) {
         throw new Error(`invalid recipe: ${id}`);
       }
-      recipes[id] = { command: item.command, ...(item.timeout_ms === undefined ? {} : { timeout_ms: item.timeout_ms as number }) };
+      recipes[id] = { command: item.command,
+        ...(item.dry_run_command === undefined ? {} : { dry_run_command: item.dry_run_command as string }),
+        ...(item.timeout_ms === undefined ? {} : { timeout_ms: item.timeout_ms as number }) };
     }
   }
   return recipes;
@@ -590,7 +593,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let exit: number | null = null;
     let error: string | undefined;
     let output: unknown;
-    if (command && !state.dryRun && !resumingCompleted) {
+    if (command && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
       const outputs: Record<string, unknown> = Object.create(null);
       // 구조 산출(마지막 JSON 줄)이 있으면 그것을, 없으면 원문을 준다 — 다음 노드가 판단을 «값»으로 받는다.
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
@@ -635,9 +638,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: env.ELANOUS_CONFIG_DIR, stateDir: env.ELANOUS_STATE_DIR });
       }
       env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      env.ELANOUS_GRAPH_DRY_RUN = state.dryRun ? '1' : '0';
       env.ELANOUS_GRAPH_DIR = dirname(resolve(path));
       const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env } as NodeExecContext;
-      const result = await executeBashNode({ id: current, type: 'bash', bash: command.command, ...(command.timeout_ms ? { idle_timeout: command.timeout_ms } : {}) } as BashNode, ctx, { runBash } as WorkflowDeps);
+      const result = await executeBashNode({ id: current, type: 'bash', bash: state.dryRun ? command.dry_run_command! : command.command, ...(command.timeout_ms ? { idle_timeout: command.timeout_ms } : {}) } as BashNode, ctx, { runBash } as WorkflowDeps);
       output = result.output;
       ok = result.ok;
       exit = code;
@@ -654,14 +658,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (approval && !state.dryRun && !command) {
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !!command && !state.dryRun, ...((command || approval) && !state.dryRun && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !!command && (!state.dryRun || !!command.dry_run_command), ...((command || approval) && (!state.dryRun || !!command?.dry_run_command) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}) });
     }
     if (approval) {
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported = command && !state.dryRun ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reported = command && (!state.dryRun || command.dry_run_command) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
     const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
@@ -709,7 +713,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       }
       persist();
     }
-    current = nextNode(graph.edges, current, state.dryRun ? 'ok' : ok ? 'ok' : 'fail', state.dryRun ? undefined : namedOutcome);
+    current = nextNode(graph.edges, current, state.dryRun && !command?.dry_run_command ? 'ok' : ok ? 'ok' : 'fail', namedOutcome);
     if (current !== undefined) publishInsideEvent({ kind: 'edge', graphId, runId, from: fromNodeId, to: current });
     if (current === undefined) {
       state.status = 'failed';

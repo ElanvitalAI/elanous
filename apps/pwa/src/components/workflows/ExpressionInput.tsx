@@ -1,8 +1,8 @@
 'use client';
 
-import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react';
 import type { WorkflowDefinitionLike } from './workflow-graph-layout';
-import { getExpressionCandidates } from './expression-completion';
+import { getExpressionCandidates, variableLabel } from './expression-completion';
 
 type ExpressionInputProps = {
   definition: WorkflowDefinitionLike;
@@ -35,16 +35,49 @@ export function insertCandidate(
   return { value: value.slice(0, part.start) + candidate + value.slice(selectionEnd), cursor: part.start + candidate.length };
 }
 
+export function insertAtSelection(
+  value: string, start: number, end: number, text: string,
+): { value: string; cursor: number } {
+  return { value: value.slice(0, start) + text + value.slice(end), cursor: start + text.length };
+}
+
 export function ExpressionInput({
   definition, nodeId, value, onChange, className, spellCheck, placeholder, rows, multiline = false,
 }: ExpressionInputProps) {
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const rootRef = useRef<HTMLSpanElement>(null);
+  const selectionRef = useRef<{ start: number; end: number } | null>(null);
   const nextCursor = useRef<number | null>(null);
   const [cursor, setCursor] = useState<number | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [variableOpen, setVariableOpen] = useState(false);
   const fragment = dismissed ? null : cursorFragment(value, cursor);
-  const candidates = fragment ? getExpressionCandidates(definition, nodeId, fragment.typed) : [];
+  const candidates = fragment && !variableOpen ? getExpressionCandidates(definition, nodeId, fragment.typed) : [];
+  const variables = variableOpen ? getExpressionCandidates(definition, nodeId, '$') : [];
+
+  useEffect(() => {
+    if (!variableOpen || typeof document === 'undefined') return;
+    const outside = (event: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setVariableOpen(false);
+    };
+    const escape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setVariableOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', outside);
+    document.addEventListener('keydown', escape);
+    return () => {
+      document.removeEventListener('pointerdown', outside);
+      document.removeEventListener('keydown', escape);
+    };
+  }, [variableOpen]);
+
+  const rememberSelection = (el: HTMLInputElement | HTMLTextAreaElement) => {
+    selectionRef.current = { start: el.selectionStart ?? value.length, end: el.selectionEnd ?? value.length };
+  };
 
   useLayoutEffect(() => {
     if (nextCursor.current === null || !inputRef.current) return;
@@ -54,18 +87,16 @@ export function ExpressionInput({
   }, [value]);
 
   const handleChange = (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    rememberSelection(event.target);
     setCursor(event.target.selectionStart);
     setDismissed(false);
     setActiveIndex(0);
     onChange(event);
   };
 
-  const choose = (candidate: string) => {
+  const applyInsertion = (inserted: { value: string; cursor: number }) => {
     const el = inputRef.current;
-    const selection = el?.selectionStart ?? cursor;
-    if (!el || selection === null) return;
-    const inserted = insertCandidate(value, selection, el.selectionEnd ?? selection, candidate);
-    if (!inserted) return;
+    if (!el) return;
     const { value: updated, cursor: position } = inserted;
     const setter = Object.getOwnPropertyDescriptor(
       multiline ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value',
@@ -78,11 +109,29 @@ export function ExpressionInput({
     onChange({ target: el, currentTarget: el, type: 'change', nativeEvent: new Event('input'),
       preventDefault: () => {}, stopPropagation: () => {} } as unknown as ChangeEvent<HTMLInputElement | HTMLTextAreaElement>);
     setCursor(position);
+    selectionRef.current = { start: position, end: position };
     setDismissed(true);
   };
 
+  const choose = (candidate: string) => {
+    const el = inputRef.current;
+    const selection = el?.selectionStart ?? cursor;
+    if (!el || selection === null) return;
+    const inserted = insertCandidate(value, selection, el.selectionEnd ?? selection, candidate);
+    if (inserted) applyInsertion(inserted);
+  };
+
+  const chooseVariable = (candidate: string) => {
+    const selection = selectionRef.current ?? { start: value.length, end: value.length };
+    applyInsertion(insertAtSelection(value, selection.start, selection.end, candidate));
+    setVariableOpen(false);
+  };
+
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-    if (event.key === 'Escape' && candidates.length) {
+    if (event.key === 'Escape' && variableOpen) {
+      event.preventDefault();
+      setVariableOpen(false);
+    } else if (event.key === 'Escape' && candidates.length) {
       event.preventDefault();
       setDismissed(true);
     } else if (candidates.length && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
@@ -104,18 +153,45 @@ export function ExpressionInput({
   };
 
   return (
-    <span className="relative block w-full">
+    <span ref={rootRef} className="relative grid w-full grid-cols-[minmax(0,1fr)_auto] items-start gap-1">
       {multiline
         ? <textarea {...shared} rows={rows} placeholder={placeholder}
             onChange={handleChange} onKeyDown={handleKeyDown}
-            onFocus={(event) => setCursor(event.target.selectionStart)}
-            onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
+            onFocus={(event) => { rememberSelection(event.target); setCursor(event.target.selectionStart); }}
+            onSelect={(event) => { rememberSelection(event.currentTarget); setCursor(event.currentTarget.selectionStart); }}
             onBlur={() => setCursor(null)} onClick={() => setDismissed(false)} />
         : <input {...shared} type="text" placeholder={placeholder}
             onChange={handleChange} onKeyDown={handleKeyDown}
-            onFocus={(event) => setCursor(event.target.selectionStart)}
-            onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
+            onFocus={(event) => { rememberSelection(event.target); setCursor(event.target.selectionStart); }}
+            onSelect={(event) => { rememberSelection(event.currentTarget); setCursor(event.currentTarget.selectionStart); }}
             onBlur={() => setCursor(null)} onClick={() => setDismissed(false)} />}
+      <button
+        type="button"
+        aria-label="변수 넣기"
+        aria-haspopup="listbox"
+        aria-expanded={variableOpen}
+        className="rounded px-1.5 py-0.5 text-xs whitespace-nowrap bg-surface-elevated text-foreground border border-border hover:bg-surface"
+        onMouseDown={(event) => { if (!variableOpen && inputRef.current) rememberSelection(inputRef.current); event.preventDefault(); }}
+        onClick={() => {
+          if (!variableOpen && inputRef.current && !selectionRef.current) rememberSelection(inputRef.current);
+          setVariableOpen((open) => !open);
+        }}
+      >변수 넣기</button>
+      {variableOpen && (
+        <span role="listbox" aria-label="사용 가능한 변수" className="absolute left-0 top-full z-30 max-h-48 w-full overflow-y-auto rounded-md border border-border bg-surface-elevated shadow-lg">
+          {variables.length === 0 ? <span className="block px-2 py-1 text-xs">쓸 수 있는 변수가 없습니다</span> : variables.map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              role="option"
+              aria-selected={false}
+              className="block w-full px-2 py-1 text-left text-xs hover:bg-surface"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => chooseVariable(candidate)}
+            ><span className="font-mono">{candidate}</span> · {variableLabel(candidate)}</button>
+          ))}
+        </span>
+      )}
       {candidates.length > 0 && (
         <span role="listbox" aria-label="Expression suggestions" className="absolute left-0 top-full z-20 max-h-48 w-full overflow-y-auto rounded-md border border-border bg-surface-elevated shadow-lg">
           {candidates.map((candidate, index) => (

@@ -1,0 +1,21 @@
+graph_id: nightly-condense
+version: 1
+loop:
+  title: Nightly context condensation
+  description: Condense yesterday's context into project/seat memory and OP conflict-card candidates; never publish cards.
+  trigger:
+    cron: '30 3 * * *'
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }
+  - { node_id: condense, kind: agent, recipe: 'cmd:condense', max_visits: 1 }
+  - { node_id: record, kind: agent, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: conflict-candidates, kind: agent, recipe: 'cmd:conflict-candidates', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: collect, on: outcome, map: { ok: condense, fail: failed } }
+  - { from: condense, on: outcome, map: { ok: record, fail: failed } }
+  - { from: record, on: outcome, map: { ok: conflict-candidates, fail: failed } }
+  - { from: conflict-candidates, on: outcome, map: { ok: done, fail: failed } }

@@ -274,7 +274,7 @@ test('한 트랜잭션 이동은 상태·제목·근거를 보존하고 이벤�
   features.importJson('0.2.9'); features.importJson('0.2.10');
   const beforeFrom = listChecklist('0.2.9'), beforeTo = listChecklist('0.2.10');
   const before = features.history('L13e');
-  expect(() => features.move('L13e', '0.2.9', '0.2.10', 'OP', '', '')).toThrow('이미 있는 칸');
+  expect(() => features.move('L13e', '0.2.9', '0.2.10', 'OP', '', '')).toThrow('이미 있는 칸: L13e — 0.2.10 · 담당 OP · 같은 제목');
   expect(listChecklist('0.2.9').items).toEqual(beforeFrom.items);
   expect(listChecklist('0.2.10').items).toEqual(beforeTo.items);
   expect(features.history('L13e')).toEqual(before);

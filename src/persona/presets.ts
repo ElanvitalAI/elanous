@@ -111,11 +111,18 @@ function mapping(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export class UnknownPersonaSchemaKeyError extends Error {
+  constructor(key: string) {
+    super(`unknown persona schema key: ${key}`);
+    this.name = 'UnknownPersonaSchemaKeyError';
+  }
+}
+
 function assertSchemaKeys(value: Record<string, unknown>, parent = ''): void {
   const allowed: ReadonlySet<string> = parent ? new Set(NESTED_KEYS[parent] ?? []) : PROFILE_KEYS;
   for (const [key, child] of Object.entries(value)) {
     if (!allowed.has(key)) {
-      throw new Error(`unknown persona schema key: ${parent ? `${parent}.` : ''}${key}`);
+      throw new UnknownPersonaSchemaKeyError(`${parent ? `${parent}.` : ''}${key}`);
     }
     const path = parent ? `${parent}.${key}` : key;
     if (NESTED_KEYS[path] && mapping(child)) assertSchemaKeys(child, path);

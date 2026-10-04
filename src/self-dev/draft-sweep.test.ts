@@ -31,6 +31,36 @@ const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
 const sweep = (adapters: DraftSweepAdapters, apply = false) => runDraftSweep({ repository: 'owner/repo', adapters, apply, now });
 
 describe('runDraftSweep', () => {
+  it('reuses paged open drafts to supersede an older matching attempt and logs the existing reason', async () => {
+    const rows = Array.from({ length: 100 }, (_, i) => draft(i + 100, { labels: [stalled], createdAt: '2026-09-29T23:00:00Z' }));
+    const older = draft(1, { labels: [stalled], title: 'T', branch: 'self-impl/x-aaaaaaaa-r1', createdAt: '2026-09-29T22:00:00Z' });
+    const newer = draft(2, { labels: [stalled], title: 'T', branch: 'self-impl/x-bbbbbbbb-r2', createdAt: '2026-09-29T23:00:00Z' });
+    const fixture = make([older, ...rows, newer]);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await sweep(fixture.adapters, true);
+      expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2', statusLabel: superseded, applied: true });
+      expect(result.entries.at(-1)).toMatchObject({ number: 2, action: 'keep', reason: 'recent' });
+      expect(fixture.calls).toContain('drafts:2');
+      expect(fixture.calls.filter((call) => call.startsWith('drafts:'))).toEqual(['drafts:1', 'drafts:2']);
+      expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
+        `label:1:${stalled}=>${superseded}`, 'close:1:Draft sweep: duplicate-of-open #2. Branch preserved.',
+      ]);
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'decided', { number: 1, action: 'close', reason: 'duplicate-of-open #2' });
+    } finally { log.mockRestore(); }
+  });
+
+  it('allows a newer open attempt to supersede a fresh running claim without an update timestamp', async () => {
+    const older = draft(1, { title: 'T', branch: 'self-impl/x-aaaaaaaa-r1', createdAt: '2026-09-29T22:00:00Z', updatedAt: undefined });
+    const newer = draft(2, { labels: [stalled], title: 'T', branch: 'self-impl/x-bbbbbbbb-r2', createdAt: '2026-09-29T23:00:00Z' });
+    const fixture = make([older, newer]);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toMatchObject({ action: 'close', reason: 'duplicate-of-open #2', statusLabel: superseded, applied: true });
+    expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([
+      `label:1:${running}=>${superseded}`, 'close:1:Draft sweep: duplicate-of-open #2. Branch preserved.',
+    ]);
+  });
+
   it('paginates both drafts and merged PRs and recognizes a twin on a later page', async () => {
     const drafts = Array.from({ length: 101 }, (_, i) => draft(i + 1, { labels: [stalled], createdAt: '2026-09-29T23:00:00Z' }));
     const merged = Array.from({ length: 100 }, (_, i) => ({ number: i + 500, title: `unrelated ${i}`, branch: `elsewhere/${i}` }));
@@ -50,11 +80,79 @@ describe('runDraftSweep', () => {
     const fixture = make([one, draft(2)], [{ number: 77, title: one.title, branch: 'elsewhere' }]);
     fixture.statuses.set(1, 'running');
     fixture.setLive(new Set([draft(2).branch]));
+    fixture.adapters.hasFinalRunResult = async () => false;
     const result = await sweep(fixture.adapters, true);
     expect(result.entries.map((entry) => [entry.action, entry.reason])).toEqual([
       ['keep', 'claim-expired-but-live'], ['keep', 'claim-expired-but-live'],
     ]);
     expect(fixture.calls.some((call) => call.startsWith('close:') || call.startsWith('label:'))).toBe(false);
+  });
+
+  it('cards the three DRAFT3 close reasons and keeps protected drafts', async () => {
+    const first = draft(1, { labels: [stalled], createdAt: '2026-09-29T23:00:00Z' });
+    const second = draft(2, { labels: [stalled], createdAt: '2026-09-29T23:00:00Z', body: '칸: UX 10-03', changedFiles: ['a.ts', 'b.ts'] });
+    const third = draft(3, { labels: [stalled] });
+    const protectedDraft = draft(4, { labels: [keep], createdAt: '2026-09-29T23:00:00Z' });
+    const fixture = make([first, second, third, protectedDraft], [
+      { number: 9, title: 'Other title', branch: 'other', body: 'Implemented (수확 #1) and (수확 #4)' },
+      { number: 10, title: 'Another title', branch: 'elsewhere', body: '칸: UX 10-03',
+        mergedAt: '2026-09-30T01:00:00Z', changedFiles: ['a.ts', 'b.ts'] },
+    ]);
+    fixture.setLive(new Set([third.branch]));
+    fixture.adapters.getLatestFileChanges = async (pr) => pr.number === 2 ? {
+      'a.ts': '2026-09-29T23:30:00Z', 'b.ts': '2026-09-29T23:30:00Z',
+    } : undefined;
+    fixture.adapters.hasFinalRunResult = async (pr) => pr.number === 3;
+    const result = await sweep(fixture.adapters);
+    expect(result.entries.map(({ action, reason, statusLabel }) => [action, reason, statusLabel])).toEqual([
+      ['close', 'superseded-by #9 (harvest #1)', superseded],
+      ['close', 'superseded-by #10 (all-files-landed)', superseded],
+      ['close', 'stale-ended-run (self-implement.result final; worktree is not live)', stalled],
+      ['keep', `label:${keep}`, undefined],
+    ]);
+  });
+
+  it('keeps branch finality unknown when an adapter omits the final-result lookup', async () => {
+    const pr = draft(15, { labels: [stalled] });
+    const fixture = make([pr]);
+    fixture.setLive(new Set([pr.branch]));
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toEqual({ number: 15, action: 'keep', reason: 'branch-finality-unobserved', applied: false });
+    expect(fixture.calls.some((call) => call.startsWith('close:') || call.startsWith('label:'))).toBe(false);
+    fixture.adapters.hasFinalRunResult = async () => false;
+    expect((await sweep(fixture.adapters)).entries[0]).toMatchObject({ action: 'keep', reason: 'live' });
+  });
+
+  it('retains a merged replacement for an unknown-finality branch without claiming it is live', async () => {
+    const pr = draft(16, { labels: [stalled] });
+    const fixture = make([pr], [{ number: 116, title: pr.title, branch: 'merged/16' }]);
+    fixture.setLive(new Set([pr.branch]));
+    expect((await sweep(fixture.adapters, true)).entries[0]).toMatchObject({
+      action: 'keep', reason: 'branch-finality-unobserved', applied: false,
+    });
+    expect(fixture.calls.some((call) => call.startsWith('close:') || call.startsWith('label:'))).toBe(false);
+  });
+
+  it('keeps an active rerun of a previously final draft even if the old run has a final result', async () => {
+    const rerun = draft(13, { createdAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([rerun]);
+    fixture.setLive(new Set([rerun.branch]));
+    fixture.adapters.getRunStatus = async () => 'running';
+    fixture.adapters.hasFinalRunResult = async () => true;
+    expect((await sweep(fixture.adapters, true)).entries[0]).toMatchObject({
+      action: 'keep', reason: 'claim-expired-but-live',
+    });
+    expect(fixture.calls.some((call) => call.startsWith('close:') || call.startsWith('label:'))).toBe(false);
+  });
+
+  it('does not let a retained branch override an observed final result when a claim expires', async () => {
+    const stale = draft(12, { createdAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([stale]);
+    fixture.setLive(new Set([stale.branch]));
+    fixture.adapters.hasFinalRunResult = async () => true;
+    expect((await sweep(fixture.adapters)).entries[0]).toMatchObject({
+      action: 'close', reason: 'claim-expired (self-implement.result final; worktree is not live)', statusLabel: stalled,
+    });
   });
 
   it('recognizes merged goal lineage when titles differ, including recent ended drafts', async () => {
@@ -162,6 +260,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     ]);
     for (const n of [1, 2, 3]) fixture.statuses.set(n, undefined);
     fixture.setLive(new Set([draft(3).branch]));
+    fixture.adapters.hasFinalRunResult = async () => false;
     const result = await sweep(fixture.adapters, true);
     expect(result.entries.map((entry) => [entry.number, entry.action, entry.reason])).toEqual([
       [1, 'close', 'stale-unobserved'], [2, 'keep', 'unobserved'], [3, 'keep', 'live'],
@@ -181,6 +280,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     ]);
     for (const n of [11, 12, 13, 14]) fixture.statuses.set(n, undefined);
     fixture.setLive(new Set([draft(13).branch]));
+    fixture.adapters.hasFinalRunResult = async () => false;
     fixture.adapters.getClaimOwner = async () => 'T';
     const result = await sweep(fixture.adapters, true);
     expect(CLAIM_IDLE_HOURS).toBe(6);
@@ -204,6 +304,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     for (const pr of twins) fixture.statuses.set(pr.number, undefined);
     fixture.statuses.set(43, 'running');
     fixture.setLive(new Set([twins[4]!.branch]));
+    fixture.adapters.hasFinalRunResult = async () => false;
     const result = await sweep(fixture.adapters, true);
     expect(result.entries.map(({ action, reason, statusLabel }) => [action, reason, statusLabel])).toEqual([
       ['close', 'superseded-by #141', superseded], ['close', 'superseded-by #142', superseded],
@@ -248,6 +349,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     ]);
     for (const row of rows) fixture.statuses.set(row.number, undefined);
     fixture.setLive(new Set([rows[5]!.branch]));
+    fixture.adapters.hasFinalRunResult = async () => false;
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       const result = await sweep(fixture.adapters);

@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { setSecretAsync } from '../nexus/config/secrets/index.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { gatherSeatInputs } from '../seat-loop/seat-loop.js';
 import { dispatchHook } from './dispatch.js';
@@ -9,6 +11,7 @@ import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hooksPrimaryUrl, startHookReceiver } from './receiver.js';
+import { ConsultQueue } from './consult-intake.js';
 
 const now = 1_700_000_000_000;
 const signature = (raw: string, secret: string) => createHmac('sha256', secret).update(raw).digest('hex');
@@ -415,8 +418,82 @@ test('an expired wake claim is reclaimed atomically without reposting and stale 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('consult endpoint CORS, validation, rate limit and queued delivery preserve the Primary payload without leaking identity', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hooks-consult-'));
+  const queue = new ConsultQueue(root);
+  const received: unknown[] = [];
+  const logs: unknown[] = [];
+  const off = debug.registerSink({ name: 'hook-consult-test', emit: record => { logs.push(record); } });
+  let accepting = false;
+  const primary = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    if (!accepting) return new Response(null, { status: 503 });
+    received.push({ path: new URL(request.url).pathname, authorization: request.headers.get('authorization'), body: await request.json() });
+    return new Response(null, { status: 202 });
+  } });
+  setElanousConfigDir(root);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ hooks: { primaryUrl: primary.url.toString(), primaryTokenRef: 'consult-test-token' } }));
+  await setSecretAsync('consult-test-token', 'fake-primary-token');
+  const server = startHookReceiver({ port: 0, root, secrets: {}, retryBaseMs: 10_000, consultEnabled: true });
+  try {
+    const form = { name: 'Sensitive Visitor', org: 'Private Company', kind: 'company', interest: 'B', contact: 'unique-555-0199', consent: true, extra: 'discard' };
+    const post = (body: unknown, origin = 'https://elanous.ai') => fetch(new URL('/v1/consult', server.url), {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const preflight = await fetch(new URL('/v1/consult', server.url), { method: 'OPTIONS', headers: { Origin: 'https://preview-42.vercel.app', 'Access-Control-Request-Method': 'POST' } });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://preview-42.vercel.app');
+    expect((await fetch(new URL('/v1/consult', server.url), { method: 'OPTIONS', headers: { Origin: 'https://evil.example' } })).status).toBe(403);
+    const first = await post(form);
+    expect(first.status).toBe(202);
+    expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://elanous.ai');
+    expect(JSON.stringify(await first.json())).not.toContain(form.name);
+    expect(queue.count()).toBe(1);
+    expect((await post({ ...form, consent: false })).status).toBe(400);
+    expect((await post(form, 'https://elanous.ai.evil.example')).status).toBe(403);
+    expect((await post(form, 'https://www.elanous.ai')).status).toBe(202);
+    expect((await post(form, 'https://preview.vercel.app')).status).toBe(202);
+    const limited = await post(form);
+    expect(limited.status).toBe(429);
+    const spoofed = await fetch(new URL('/v1/consult', server.url), { method: 'POST', headers: {
+      Origin: 'https://elanous.ai', 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.8' }, body: JSON.stringify(form) });
+    expect(spoofed.status).toBe(429);
+    expect(Number(limited.headers.get('Retry-After'))).toBeGreaterThan(0);
+    expect(queue.count()).toBe(3);
+    accepting = true;
+    server.stop();
+    const resumed = startHookReceiver({ port: 0, root, secrets: {}, retryBaseMs: 10, consultEnabled: true });
+    try { await waitFor(() => received.length === 3 && queue.count() === 0); } finally { resumed.stop(); }
+    expect(received).toHaveLength(3);
+    expect(received[0]).toEqual({ path: '/v1/consult-requests', authorization: 'Bearer fake-primary-token',
+      body: { name: form.name, org: form.org, kind: form.kind, interest: form.interest, contact: form.contact, consent: true } });
+    const recorded = JSON.stringify(logs);
+    for (const secret of [form.name, form.org, form.contact]) expect(recorded).not.toContain(secret);
+    expect(recorded).toContain('forwarded');
+    expect(recorded).toContain('forward-failed');
+  } finally { server.stop(); primary.stop(); off(); resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test('forwarding goes to hooks.primaryUrl (the nexus API), and a missing or non-http address is refused', () => {
   expect(hooksPrimaryUrl({ hooks: { primaryUrl: 'https://mbp.example.ts.net' } }).origin).toBe('https://mbp.example.ts.net');
   expect(() => hooksPrimaryUrl({})).toThrow('hooks.primaryUrl missing');
   expect(() => hooksPrimaryUrl({ hooks: { primaryUrl: 'file:///etc/passwd' } })).toThrow('http(s)');
+});
+
+test('the public consult route stays closed (404) unless hooks.consult.enabled is true in user config', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hooks-consult-switch-'));
+  const form = { name: 'A', kind: 'personal', interest: 'A', contact: 'a@example.com', consent: true };
+  const post = (url: string) => fetch(new URL('/v1/consult', url), {
+    method: 'POST', headers: { 'content-type': 'application/json', Origin: 'https://elanous.ai' }, body: JSON.stringify(form) });
+  setElanousConfigDir(root);
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ hooks: { consult: { enabled: 'yes' } } }));
+    const closed = startHookReceiver({ port: 0, root, secrets: {}, retryBaseMs: 10_000 });
+    try { expect((await post(closed.url)).status).toBe(404); } finally { closed.stop(); }
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ hooks: { consult: { enabled: true } } }));
+    const open = startHookReceiver({ port: 0, root, secrets: {}, retryBaseMs: 10_000 });
+    try { expect((await post(open.url)).status).toBe(202); } finally { open.stop(); }
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

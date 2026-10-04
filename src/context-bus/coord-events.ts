@@ -22,7 +22,7 @@ export interface CoordEvent {
   text: string;
   summary: string;
   kind: string;
-  refs: Pick<CoordEventInput, 'seat' | 'recipients' | 'all' | 'kind' | 'slot' | 'deadline' | 'url'> & { origin?: string; source?: string };
+  refs: Pick<CoordEventInput, 'seat' | 'recipients' | 'all' | 'kind' | 'slot' | 'deadline' | 'url'> & { origin?: string; source?: string; ref?: string | null };
 }
 
 function seatIds(): Set<string> {
@@ -104,7 +104,7 @@ export function listCoordEvents(opts: { since: string; seat?: string }, deps: { 
   const db = deps.db ?? openSurfaceEventsDb();
   try {
     const rows = db.prepare(`SELECT id, ts, text, summary, kind, refs FROM events
-      WHERE surface IN ('coord:channel', 'context:external') AND direction='outbound' AND ts>=?
+      WHERE surface IN ('coord:channel', 'context:external', 'context:session') AND direction='outbound' AND ts>=?
       ${opts.seat ? "AND json_extract(refs,'$.seat')=?" : ''} ORDER BY ts ASC, rowid ASC`)
       .all(...(opts.seat ? [opts.since, opts.seat] : [opts.since])) as Array<{
         id: string; ts: string; text: string; summary: string; kind: string; refs: string;

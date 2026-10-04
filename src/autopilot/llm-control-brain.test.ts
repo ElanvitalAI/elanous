@@ -2,6 +2,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { createLlmControlBrain, parseControlDecision, extractFirstJsonObject, type StreamLLMFn } from './llm-control-brain.js';
+import { createMissionControlBrain } from '../agent-mission/driver.js';
 import { runPtyControlLoop, controlDepsForHandle, type ControlObservation, type RunSupervisor } from './pty-control-loop.js';
 import { decideInterventionStep } from '../self-implement/intervention-step.js';
 import { MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';
@@ -18,6 +19,19 @@ const obs = (over: Partial<ControlObservation> = {}): ControlObservation => {
     }),
   };
 };
+
+test('mission recovery does not interrupt an LLM wait on changing screens that retain a question', async () => {
+  let calls = 0;
+  const brain = createMissionControlBrain({ mission: 'Build', evidenceReady: () => false, search: () => {},
+    stream: async () => { calls++; return '{"action":"wait"}'; },
+    onRecover: () => { throw new Error('recovery must not interrupt progress'); },
+  });
+  for (let step = 0; step < 4; step++) {
+    const screen = `compiling ${step}\nProceed? [y/N]`;
+    expect(await brain.decide(obs({ screen, step, changed: step > 0, sameScreenMs: 0 }))).toEqual({ action: 'wait' });
+  }
+  expect(calls).toBe(4);
+});
 
 describe('parseControlDecision', () => {
   test('input — text 동반', () => {

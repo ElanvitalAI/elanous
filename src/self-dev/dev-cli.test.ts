@@ -854,7 +854,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       { url: pr(22), reason: '하니스 시작 트리아지: superseded-by #51' },
     ]);
     expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({
-      decisions: { live: 2, superseded: 2, staleEndedRun: 0, recent: 0, humanApproval: 1 },
+      // DRAFT3 ③(#23421): a finished run's draft on a still-live branch is not «live» — kept as recent, branch untouched.
+      decisions: { live: 1, superseded: 2, staleEndedRun: 0, recent: 1, humanApproval: 1 },
       statusesObserved: expect.objectContaining({ completed: 4, running: 1 }),
     }) }));
   });

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import sharp from 'sharp';
-import { isBlankFrame, parseArgs } from './demo-rehearsal.js';
+import { runInNewContext } from 'node:vm';
+import { EMPTY_STATE_PHRASES, isBlankFrame, parseArgs, sceneSnapshotScript } from './demo-rehearsal.js';
 import { judgeScene, type SceneObservation } from './lib/rehearsal-verdict.js';
 
 const required = ['--url', 'http://127.0.0.1:31415', '--out', '/tmp/rehearsal'];
@@ -11,6 +12,21 @@ test('import is inert and defaults to 20 seconds, 1920x1080 and demo mode', () =
 
 test('no-demo includes scene 5, size and seconds parse explicitly', () => {
   expect(parseArgs([...required, '--no-demo', '--size', '1280x720', '--secs', '2.5', '--token-stdin'])).toMatchObject({ secs: 2.5, width: 1280, height: 720, demo: false, tokenStdin: true });
+});
+
+test('visible scene snapshot carries observed empty text to the scene verdict, excluding hidden and chrome text', () => {
+  const phrase = EMPTY_STATE_PHRASES[0];
+  const visible = { hidden: false, getClientRects: () => [1], getAttribute: () => '3', innerText: `장면 콘텐츠 ${phrase} 본문이 충분히 길어집니다 데이터 확인 필요` };
+  const hidden = { hidden: true, getClientRects: () => [], getAttribute: () => '2', innerText: phrase };
+  const document = { querySelectorAll: () => [hidden, visible], body: { innerText: phrase } };
+  const snapshot = () => runInNewContext(sceneSnapshotScript(), { document }) as { sectionsInDom: number; visibleScene: number | null; textLength: number; emptyStates: string[] };
+  const state = snapshot();
+  expect(state.emptyStates).toEqual([phrase]);
+  const obs: SceneObservation = { scene: 3, title: '루프 에이전트', hiddenByDemo: false, secs: 1, frames: 1, exceptions: [], failedRequests: [], textLength: state.textLength, leaks: [], sectionsInDom: 6, visibleScene: state.visibleScene, emptyStates: state.emptyStates };
+  expect(judgeScene(obs)).toMatchObject({ verdict: 'no-data', reasons: [`실데이터 없음 — ${phrase}`] });
+  visible.innerText = '일반 장면 콘텐츠가 충분히 길고 실제 데이터가 존재합니다 모든 데이터가 확인됐습니다';
+  expect(snapshot().emptyStates).toEqual([]);
+  expect(judgeScene({ ...obs, emptyStates: snapshot().emptyStates }).verdict).toBe('ok');
 });
 
 test('whole captured frame distinguishes dark or grey blank from content at the top above empty space', async () => {

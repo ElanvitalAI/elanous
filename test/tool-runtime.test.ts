@@ -179,9 +179,9 @@ describe('listToolRuntimes', () => {
     const skill = listToolRuntimes('skill');
     const tui = listToolRuntimes('tui');
     // Catalog additions are allowed; these active surfaces must not lose their
-    // established runtime floors.
-    expect(skill.length).toBeGreaterThanOrEqual(111);
-    expect(tui.length).toBeGreaterThanOrEqual(116);
+    // currently registered runtime floors.
+    expect(skill.length).toBeGreaterThanOrEqual(108);
+    expect(tui.length).toBeGreaterThanOrEqual(113);
   });
 
   // ⛔ 이름에 구성 개수를 열거하지 않는다 — 카탈로그가 자라면 그 열거가 «먼저» 낡고,

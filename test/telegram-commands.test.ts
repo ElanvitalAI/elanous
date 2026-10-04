@@ -6,7 +6,20 @@
 // the dispatcher path — the menu publish is covered by the existing
 // telegram.test.ts "bot posts on start" suite via a stubbed fetch.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CardStore } from '../src/task-cards/card-store.js';
+import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
+
+const originalStateDir = process.env.ELANOUS_STATE_DIR;
+const wishRoots: string[] = [];
+afterEach(() => {
+  if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = originalStateDir;
+  for (const root of wishRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 import {
   dispatchTelegramSlash,
   parseTelegramSlash,
@@ -156,6 +169,33 @@ describe('dispatchTelegramSlash', () => {
       userConfig: baseConfig(), allCommands: defaultTelegramCommands(),
     });
     expect(out.handled).toBe(false);
+  });
+});
+
+describe('/wish', () => {
+  it('owner private chat creates one card, retry replies with same id; others and empty args do not write', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'telegram-wish-'));
+    wishRoots.push(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    const commands = defaultTelegramCommands();
+    expect(FEATURE_MATURITY.telegramCommand.wish).toBe('beta');
+    expect(commands.find(c => c.name === 'wish')?.description).toBe('소원을 카드로 남기기');
+    const opts = { userConfig: baseConfig(), allCommands: commands };
+    const send = (text: string, overrides: Partial<TgIncoming> = {}) =>
+      dispatchTelegramSlash(fakeCtx(text, overrides), opts);
+    const first = await send('/wish 저장할 소원', { messageId: 73 });
+    expect(first).toMatchObject({ handled: true, reply: expect.stringMatching(/^소원 카드로 남겼습니다 — 저장할 소원 \(카드 [a-f0-9]{8}\)$/) });
+    const second = await send('/wish 저장할 소원', { messageId: 73 });
+    expect(second).toEqual(first);
+    expect(await send('/wish')).toEqual({ handled: true, reply: '/wish <소원 한 줄>' });
+    expect(await send('/wish 안 됨', { userId: 19 })).toEqual({ handled: true, reply: '대표만 쓸 수 있습니다' });
+    expect(await send('/wish 안 됨', { chatId: -42, isDm: false, isGroup: true }))
+      .toEqual({ handled: true, reply: '대표만 쓸 수 있습니다' });
+    const store = new CardStore(root);
+    try {
+      expect(store.listCards()).toHaveLength(1);
+      expect(store.listCards()[0]).toMatchObject({ goalId: 'wish:telegram:42:73', title: '저장할 소원' });
+    } finally { store.close(); }
   });
 });
 

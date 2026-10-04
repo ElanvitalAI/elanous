@@ -79,7 +79,7 @@ test('move passes and copies once to next patch without replacing an existing it
   expect(listChecklist('0.2.7').items).toHaveLength(1);
   expect(listChecklist('0.2.7').history).toHaveLength(1);
   expect(node(root, '0.2.7').result).toMatchObject({ outcome: 'fail', undecided: ['K13'] });
-  addItem('0.2.8', { id: 'K13', title: 'Already present' });
+  addItem('0.2.8', { id: 'K13', title: 'Already present' }, { allowDuplicateId: true });
   setItem('0.2.7', 'K13', { disposition: 'move' }, 'TC');
   expect(node(root, '0.2.7').result.outcome).toBe('ok');
   expect(listChecklist('0.2.8').items).toMatchObject([{ id: 'K13', title: 'Already present' }]);

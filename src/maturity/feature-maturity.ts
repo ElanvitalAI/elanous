@@ -89,6 +89,7 @@ export const FEATURE_MATURITY = {
     clear: 'stable',
     status: 'stable',
     now: 'beta', // CTX2 «지금 무엇이 돌고 있나» (#23379)
+    wish: 'beta',
     remaining: 'stable',
     setup: 'stable',
     quit: 'stable',
@@ -152,7 +153,7 @@ export const FEATURE_MATURITY = {
     ping: 'stable', provider: 'stable', sessions: 'stable', fork: 'stable', resume: 'stable',
     decisions: 'stable', work: 'stable', cancel: 'stable',
     skills: 'beta', skill: 'beta', digest: 'beta', intake: 'beta', ad: 'beta',
-    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', project: 'beta',
+    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', project: 'beta', wish: 'beta',
     brain: 'tool', cc: 'tool', cdx: 'tool', gem: 'tool', local: 'tool',
     harness: 'ops',
     // Existing commands outside the CXO four-grade menu list are owner-only.

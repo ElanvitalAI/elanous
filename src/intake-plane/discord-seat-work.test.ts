@@ -3,10 +3,94 @@ import { debug } from '../debug/log.js';
 import { handleDiscordSeatWork } from './discord-seat-work.js';
 import { DiscordBot } from '../discord.js';
 import type { UserConfig } from '../user-config.js';
+import type { PersonaProfile } from '../persona/types.js';
+import type { PersonaSource } from '../persona/mention-parser.js';
 
 const MSG = { channelId: '123', messageId: '456' };
 const OWNER = { ...MSG, userId: '11111', isDm: true };
 const config = { raw: { decisions: { discordOwnerId: '11111' } }, discord: { allowedUsers: ['11111'] } } as unknown as UserConfig;
+const sage: PersonaProfile = { personaId: 'sage', displayName: 'Sage', systemPrompt: '차분히 답하라.', mentionPatterns: ['@mentor'] };
+const personaProfiles: PersonaProfile[] = [sage, { personaId: 'cmo', displayName: 'CMO Persona' }, { personaId: 'mira', displayName: 'Mira' }];
+const personaSource: PersonaSource = { list: () => personaProfiles, get: (id) => personaProfiles.find((p) => p.personaId === id) };
+
+describe('Discord persona address', () => {
+  test('owner private @sage and mentionPatterns answer in the persona voice, without seat work', async () => {
+    const prompts: string[] = [];
+    const deps = { config, personaSource,
+      personaAnswerDeps: { complete: async (prompt: string) => { prompts.push(prompt); return '조언입니다.'; } },
+      submit: async () => { throw Error('should not submit'); },
+      answer: async () => { throw Error('should not answer seat'); },
+      dispatch: async () => { throw Error('should not dispatch'); },
+    } as never;
+    expect(await handleDiscordSeatWork('@sage 오늘 할 일', OWNER, deps)).toBe('@Sage\n조언입니다.');
+    expect(prompts[0]?.startsWith('차분히 답하라.\n')).toBe(true);
+    expect(prompts[0]).toContain('오늘 할 일');
+    expect(await handleDiscordSeatWork('@mentor 조언', OWNER, deps)).toBe('@Sage\n조언입니다.');
+    expect(await handleDiscordSeatWork('@mIrA 조언', OWNER, deps)).toBe('@Mira\n조언입니다.');
+    expect(prompts).toHaveLength(3);
+  });
+
+  test('seat name and colliding personaId take seat answer path, not persona', async () => {
+    const seats: string[] = [];
+    let personaCalls = 0;
+    const deps = { config, personaSource,
+      personaAnswer: async () => { personaCalls++; return 'persona'; },
+      answer: async (seat: string) => { seats.push(seat); return { title: 'CMO', text: '자리 답' }; },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    expect(await handleDiscordSeatWork('@cmo 오늘 진행 상황?', OWNER, deps)).toBe('자리 답');
+    expect(await handleDiscordSeatWork('@MK 오늘 진행 상황?', OWNER, deps)).toBe('자리 답');
+    expect(seats).toEqual(['cmo', 'MK']);
+    expect(personaCalls).toBe(0);
+  });
+
+  test('mixed seat/persona and multiple personas reject without answering or intake', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address') events.push({ event, data });
+    }) as typeof debug.log);
+    const deps = { config, personaSource,
+      personaAnswer: async () => { throw Error('should not answer persona'); },
+      answer: async () => { throw Error('should not answer seat'); },
+      dispatch: async () => { throw Error('should not dispatch'); },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    try {
+      expect(await handleDiscordSeatWork('@sage,@cmo private-question', OWNER, deps)).toBe('페르소나는 한 번에 하나만 부를 수 있습니다');
+      expect(await handleDiscordSeatWork('@sage,@mira private-question', OWNER, deps)).toBe('페르소나는 한 번에 하나만 부를 수 있습니다');
+      expect(events).toEqual([
+        { event: 'rejected', data: { reason: 'mixed', via: 'discord' } },
+        { event: 'rejected', data: { reason: 'mixed', via: 'discord' } },
+      ]);
+      expect(JSON.stringify(events)).not.toContain('private-question');
+    } finally { log.mockRestore(); }
+  });
+
+  test('non-owner and unknown addresses retain seat clarification; owner persona events identify discord', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address') events.push({ event, data });
+    }) as typeof debug.log);
+    const calls: unknown[] = [];
+    const deps = { config, personaSource,
+      personaAnswer: async (persona: PersonaProfile, question: string) => { calls.push([persona.personaId, question]); return '@Sage\n답'; },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    const rejected = '어느 좌석을 말씀하시나요? @sage은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.';
+    try {
+      expect(await handleDiscordSeatWork('@sage 질문', { ...OWNER, userId: '22222' }, deps)).toBe(rejected);
+      expect(await handleDiscordSeatWork('@sage 질문', { ...OWNER, isDm: false }, deps)).toBe(rejected);
+      expect(await handleDiscordSeatWork('@nobody 질문', OWNER, deps)).toBe(rejected.replace('@sage', '@nobody'));
+      expect(calls).toHaveLength(0);
+      expect(await handleDiscordSeatWork('@sage 질문', OWNER, deps)).toBe('@Sage\n답');
+      expect(calls).toEqual([['sage', '질문']]);
+      expect(events).toEqual([
+        { event: 'resolved', data: { name: 'sage', personaId: 'sage', via: 'discord' } },
+        { event: 'answered', data: { personaId: 'sage', via: 'discord' } },
+      ]);
+    } finally { log.mockRestore(); }
+  });
+});
 
 describe('Discord owner intent', () => {
   test('one seat question answers; null answer falls back to intake', async () => {
@@ -152,6 +236,31 @@ describe('Discord addressed seat work', () => {
       submit: async () => ({ ok: false, track: 'graph', reason: 'no-acceptance-id\ninternal trace' }),
     });
     expect(reply).toBe('@CMO 접수 실패 — no-acceptance-id');
+  });
+
+  test('gateway returns the owner persona reply in the originating DM without chat or intake', async () => {
+    const sent: string[] = [];
+    let personaCalls = 0;
+    const bot = new DiscordBot({ token: 'tok', allowedUsers: ['11111'],
+      onMessage: async () => { throw Error('should not enter ordinary chat'); },
+      seatWorkDeps: { config, personaSource,
+        personaAnswer: async (persona, question) => {
+          personaCalls++;
+          expect([persona.personaId, question]).toEqual(['sage', '오늘 할 일']);
+          return '@Sage\n조언입니다.';
+        },
+        submit: async () => { throw Error('should not submit'); },
+      },
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        if (init.method === 'POST') sent.push((JSON.parse(String(init.body)) as { content: string }).content);
+        return { ok: true, status: 200, json: async () => ({ id: 'response' }), text: async () => '' };
+      }) as typeof fetch,
+    });
+    await (bot as unknown as { handleMessageCreate: (m: Record<string, unknown>) => Promise<void> }).handleMessageCreate({
+      author: { id: '11111' }, id: '1', channel_id: 'dm-1', content: '@sage 오늘 할 일',
+    });
+    expect(personaCalls).toBe(1);
+    expect(sent).toContain('@Sage\n조언입니다.');
   });
 
   test('gateway sends owner DM questions and default-seat tasks to seat paths, leaving other chat alone', async () => {

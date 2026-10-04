@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
+import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { runOpsUpgrade } from './ops-upgrade-node.js';
+import { join } from 'node:path';
+import { runOpsUpgrade, tagFeedSource, type FeedSource } from './ops-upgrade-node.js';
 import type { CommandRunner } from './node-verdict.js';
 
 function withContext(input: Record<string, unknown>, check: () => void) {
@@ -11,7 +13,10 @@ function withContext(input: Record<string, unknown>, check: () => void) {
 }
 
 const good = { status: 0, stdout: '{"exitCode":0,"installedVersion":"0.2.7"}\n', stderr: '' };
-const feedGood = { status: 0, stdout: '{"ok":true,"version":"0.2.7"}\n', stderr: '' };
+const TAG = 'c'.repeat(40);
+const feedGood = { status: 0, stdout: `{"ok":true,"version":"0.2.7","commit":"${TAG}"}\n`, stderr: '' };
+let cleaned = 0;
+const tagSource = (): FeedSource => ({ checkout: '/tmp/tag-tree', commit: TAG, cleanup: () => { cleaned++; } });
 
 test('checkout install fetches tag, detaches, then updates without release version', () => {
   withContext({ opsHosts: ['local'], opsRestart: true }, () => {
@@ -104,9 +109,9 @@ test('default feed is published if present; missing feed path is reported', () =
     const result = runOpsUpgrade((cmd, args) => {
       calls.push([cmd, args]);
       return cmd === 'bun' ? feedGood : args.join(' ').includes('update') ? good : { status: 0, stdout: '0.2.7 new\n', stderr: '' };
-    }, { exists: (path) => path === `${homedir()}/.local/share/elanous-ops/internal-dist` });
+    }, { exists: (path) => path === `${homedir()}/.local/share/elanous-ops/internal-dist`, feedSource: tagSource });
     expect(result.feed).toBe('published');
-    expect(calls[0]).toEqual(['bun', ['scripts/publish-internal-dist.ts', '--checkout', process.cwd(), '--out', `${homedir()}/.local/share/elanous-ops/internal-dist`]]);
+    expect(calls[0]).toEqual(['bun', ['scripts/publish-internal-dist.ts', '--checkout', '/tmp/tag-tree', '--out', `${homedir()}/.local/share/elanous-ops/internal-dist`]]);
     expect(result.outcome).toBe('ok');
   });
   withContext({ opsHosts: ['node-b'] }, () => {
@@ -168,7 +173,7 @@ test('internal feed expands a home-relative path before publishing', () => {
     expect(runOpsUpgrade((cmd, args) => {
       calls.push([cmd, args]);
       return cmd === 'bun' ? feedGood : args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' };
-    }, { installSource: () => null }).outcome).toBe('ok');
+    }, { installSource: () => null, feedSource: tagSource }).outcome).toBe('ok');
     expect(calls[0]?.[1].at(-1)).toBe(`${homedir()}/internal-dist`);
   });
 });
@@ -181,10 +186,10 @@ test('internal feed is published once before remote updates and restart is expli
       if (cmd === 'bun') return feedGood;
       return args.join(' ').includes('--version') && !args.join(' ').includes('update')
         ? { status: 0, stdout: '0.2.7 revised\n', stderr: '' } : good;
-    }, { installSource: () => null });
+    }, { installSource: () => null, feedSource: tagSource });
     expect(result.outcome).toBe('ok');
     expect(result.hosts.map((host) => host.ok)).toEqual([true, true]);
-    expect(calls[0]).toEqual(['bun', ['scripts/publish-internal-dist.ts', '--checkout', process.cwd(), '--out', '/tmp/internal dist']]);
+    expect(calls[0]).toEqual(['bun', ['scripts/publish-internal-dist.ts', '--checkout', '/tmp/tag-tree', '--out', '/tmp/internal dist']]);
     expect(calls.filter(([cmd]) => cmd === 'bun')).toHaveLength(1);
     expect(calls.filter(([cmd, args]) => cmd === 'ssh' && args[1]?.includes("'update'")).every(([, args]) => !args[1]?.includes("'--version'"))).toBe(true);
     expect(calls.filter(([, args]) => args.join(' ').includes('update')).every(([, args]) => args.join(' ').includes('--restart'))).toBe(true);
@@ -194,7 +199,7 @@ test('internal feed is published once before remote updates and restart is expli
 test('internal feed failure with only local target is still reported', () => {
   withContext({ opsHosts: ['local'], internalDist: '/tmp/dist' }, () => {
     const result = runOpsUpgrade((cmd, args) => cmd === 'bun' ? { status: 1, stdout: '', stderr: 'pack failed' }
-      : args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' }, { installSource: () => null });
+      : args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' }, { installSource: () => null, feedSource: tagSource });
     expect(result).toMatchObject({ outcome: 'fail', feed: 'failed', summary: expect.stringContaining('내부 피드 발행 실패'), hosts: [{ host: 'local', ok: true }] });
   });
 });
@@ -206,7 +211,7 @@ test('failed internal feed skips remotes, continues local and records the feed f
       calls.push([cmd, args]);
       if (cmd === 'bun') return { status: 1, stdout: '', stderr: 'pack failed\n' };
       return args[0] === 'update' ? good : { status: 0, stdout: '0.2.7 abc\n', stderr: '' };
-    }, { installSource: () => null });
+    }, { installSource: () => null, feedSource: tagSource });
     expect(calls.map(([cmd]) => cmd)).toEqual(['bun', 'elanous', 'elanous', 'elanous']);
     expect(result.outcome).toBe('fail');
     expect(result.feed).toBe('failed');
@@ -239,5 +244,50 @@ test('without opsRestart the hooks receiver is not touched', () => {
     const calls: string[] = [];
     runOpsUpgrade((cmd, args) => { calls.push(args.join(' ')); return args.join(' ').includes('--version') && !args.join(' ').includes('update') ? { status: 0, stdout: '0.2.7 revised\n', stderr: '' } : good; }, { exists: () => false, installSource: () => null });
     expect(calls.some((c) => c.includes('elanous-hooks.service'))).toBe(false);
+  });
+});
+
+test('feed is packed from the release tag checkout, not the working tree, and carries the tag commit (10-04 0.2.11)', () => {
+  withContext({ opsHosts: ['node-b'], internalDist: '/tmp/dist' }, () => {
+    const calls: Array<[string, string[], string | undefined]> = [];
+    const run: CommandRunner = (cmd, args, cwd) => {
+      calls.push([cmd, args, cwd]);
+      if (cmd === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: `${TAG}\n`, stderr: '' };
+      // A real tag checkout has apps/pwa — without it the feed's PWA node_modules link fails on hosts that have one (0.2.12 gate Pod).
+      if (cmd === 'git' && args[0] === 'worktree' && args[1] === 'add') { mkdirSync(join(args[3]!, 'apps/pwa'), { recursive: true }); return { status: 0, stdout: '', stderr: '' }; }
+      if (cmd === 'git') return { status: 0, stdout: '', stderr: '' };
+      if (cmd === 'bun' && args[0] === 'bin/elanous.mjs') return { status: 0, stdout: 'built\n', stderr: '' };
+      if (cmd === 'bun') return feedGood;
+      return args.join(' ').includes('update') ? good : { status: 0, stdout: '0.2.7 new\n', stderr: '' };
+    };
+    const result = runOpsUpgrade(run, { feedSource: tagFeedSource(run, process.cwd()) });
+    expect(result).toMatchObject({ outcome: 'ok', feed: 'published' });
+    expect(calls).toContainEqual(['git', ['rev-parse', '--verify', 'refs/tags/v0.2.7^{commit}'], process.cwd()]);
+    const pack = calls.find(([cmd, args]) => cmd === 'bun' && args[0] === 'scripts/publish-internal-dist.ts')!;
+    const tree = pack[1][2]!;
+    expect(tree).not.toBe(process.cwd());
+    expect(calls).toContainEqual(['git', ['worktree', 'add', '--detach', tree, TAG], process.cwd()]);
+    expect(calls.findIndex(([cmd, args]) => cmd === 'bun' && args.join(' ') === 'bin/elanous.mjs nexus build'))
+      .toBeLessThan(calls.indexOf(pack));
+    expect(calls).toContainEqual(['git', ['worktree', 'remove', '--force', tree], process.cwd()]);
+    expect(existsSync(tree)).toBe(false);
+  });
+});
+
+test('feed refuses a tag that is not the release cut, or a pack that is not the tag commit', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.7', previousVersion: '0.2.6', opsHosts: ['node-b'], internalDist: '/tmp/dist' },
+      outputs: { verify: { outcome: 'ok' }, publish: { outcome: 'ok', tag: 'v0.2.7' }, 'version-release': { outcome: 'ok', commit: 'd'.repeat(40) } } });
+    const before = cleaned;
+    const calls: string[] = [];
+    const result = runOpsUpgrade((cmd, args) => { calls.push(cmd); return cmd === 'bun' ? feedGood : good; }, { feedSource: tagSource });
+    expect(result).toMatchObject({ outcome: 'fail', feed: 'failed', summary: expect.stringContaining('컷') });
+    expect(calls).not.toContain('bun');
+    expect(cleaned).toBe(before + 1);
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+  withContext({ opsHosts: ['node-b'], internalDist: '/tmp/dist' }, () => {
+    const result = runOpsUpgrade((cmd) => cmd === 'bun' ? { status: 0, stdout: `{"ok":true,"version":"0.2.7","commit":"${'e'.repeat(40)}"}\n`, stderr: '' } : good, { feedSource: tagSource });
+    expect(result).toMatchObject({ outcome: 'fail', feed: 'failed', summary: expect.stringContaining('≠ 태그') });
   });
 });
