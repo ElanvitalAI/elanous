@@ -59,6 +59,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [Doctor](https://docs.elanous.ai/operations/doctor/): Find out what this machine still needs.
 - [Running on several machines](https://docs.elanous.ai/operations/multi-machine/): Join machines into one fleet — seats move by rank, duties describe what each machine is for.
+- [HQ failover](https://docs.elanous.ai/operations/hq-failover/): Keep the HQ service available across machines — prepare a standby, hand over deliberately, and recover after a failure.
 
 ## Reference
 
@@ -74,6 +75,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.13](https://docs.elanous.ai/releases/0-2-13/): Changes in 0.2.13.
 - [0.2.12](https://docs.elanous.ai/releases/0-2-12/): Changes in 0.2.12.
 - [0.2.11](https://docs.elanous.ai/releases/0-2-11/): Changes in 0.2.11.
 - [0.2.10](https://docs.elanous.ai/releases/0-2-10/): Changes in 0.2.10.
