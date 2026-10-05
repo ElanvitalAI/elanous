@@ -20,6 +20,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 - [Commands you will use](https://docs.elanous.ai/using-elanous/commands/): The handful of commands that cover daily use.
 - [The harness](https://docs.elanous.ai/using-elanous/harness/): say, ask and goal documents.
 - [Drive elanous from your coding agent](https://docs.elanous.ai/using-elanous/drive-from-a-coding-agent/): Connect over MCP, check what is running, launch a goal and answer a decision — from another coding agent.
+- [Attach a coding-agent session to an elanous seat](https://docs.elanous.ai/using-elanous/attach-a-coding-agent-session/): Mark a project, manually add Claude Code context hooks locally or record a Codex event, and check what reached elanous.
 - [Working backwards](https://docs.elanous.ai/using-elanous/working-backwards/): Write the finished result first, then turn it into a goal the harness can prove.
 - [PTY intelligence](https://docs.elanous.ai/using-elanous/pty-intelligence/): elanous drives terminals and coding agents from inside their own screens.
 - [Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake/): Anything you send becomes tasks — Telegram, the web app, links, YouTube, Linear — run by the harness or an agent.
@@ -75,6 +76,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.15](https://docs.elanous.ai/releases/0-2-15/): Changes in 0.2.15.
 - [0.2.14](https://docs.elanous.ai/releases/0-2-14/): Changes in 0.2.14.
 - [0.2.13](https://docs.elanous.ai/releases/0-2-13/): Changes in 0.2.13.
 - [0.2.12](https://docs.elanous.ai/releases/0-2-12/): Changes in 0.2.12.

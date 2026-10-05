@@ -839,6 +839,8 @@ Ask the agent again, in plain words:
 - "Is anything failing?" → `ops_status` with `action: health`
 - "What happened in the last 30 minutes?" → `logs_query` with `sinceMinutes`, `level` or `category`
 
+For the opposite direction — [attach your coding-agent session to an elanous seat →](/using-elanous/attach-a-coding-agent-session).
+
 ## The other direction: elanous drives the agent
 
 MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude Code, Codex or Grok as a child agent and drives it. `elanous acp list` shows the backends this build knows; `elanous acp test --backend <id>` sends one prompt as a smoke test.
@@ -850,6 +852,73 @@ MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude 
 | Codex says the elanous call "required approval" | Set `default_tools_approval_mode = "approve"` and `enabled_tools` for the elanous server |
 | `logs_query` returns nothing | The daemon has not written logs to this state directory yet; start it once (`elanous start`) |
 | `SelfImplement` returns `observed: true` but nothing happens | Observe-only is on: `elanous config set tools.selfImplement.observeOnly false` |
+
+---
+
+# Attach a coding-agent session to an elanous seat
+
+Source: https://docs.elanous.ai/using-elanous/attach-a-coding-agent-session/
+
+You may already be working in Claude Code or Codex and want that session's work to appear alongside your elanous context. This is the opposite of [driving elanous from your coding agent](/using-elanous/drive-from-a-coding-agent): you keep working in your own coding agent, while elanous receives bounded session events. Attaching a session does not give elanous control of that agent.
+
+## 1. Mark the project, not your whole machine
+
+A seat marker is a local text file at `<project-root>/.claude/seat`. Its content is **one seat identifier assigned to you for this project**, followed by a newline. Create the `.claude` directory if needed and write that identifier into the `seat` file before starting the session. Get the identifier from the person administering your elanous setup; do not guess it or copy one from another project. Put the file in the root of the project where you start your coding-agent session. If you work in multiple projects, mark each one separately. Do not commit the marker.
+
+Claude Code's hooks look for this marker from the session's working directory up toward the repository root. With no valid marker, they send **nothing**. A marker in a different repository does not attach this one. The marker identifies the seat, not a credential; it does not grant permissions.
+
+## 2. Preview, then install Claude Code's context hooks
+
+From the project you want to attach, first inspect the settings fragment:
+
+```bash
+elanous context hooks install --print
+```
+
+Despite the word `install`, **`--print` only prints JSON**. It does not edit your settings. Read the printed `hooks` entries before copying them. Then open this project's `.claude/settings.local.json` and merge the printed `hooks` into its `hooks` object. If the file is new, create it as a JSON object containing the printed `hooks`. If you already have hooks for the same event, keep those entries and add the printed hook entries; do not replace your other hooks or your other settings. Back up an existing settings file locally before editing (for example as `.claude/settings.local.json.bak`). The fragment is the source of the hook commands; do not substitute a guessed path.
+
+This is a **manual installation**: there is no write-mode `elanous context hooks install` command. Only change this project's `settings.local.json` hooks. In particular, leave any `permissions` entries exactly as they are; the context hooks do not need new permission rules. They do not forward your prompt or transcript: the Claude Code hooks send limited completion metadata when the marked project is active. Start a new Claude Code session in that project after saving the settings, then finish a tool action or stop the session to generate an event.
+
+**Codex:** Claude Code's `settings.local.json` is not a Codex hook configuration. For a Codex session, use the same project seat marker as your local opt-in and record a session event explicitly after finishing work, using the identifier from that marker. From the project root, this shell example reads the marker for this invocation only:
+
+```bash
+SEAT=$(cat .claude/seat)
+elanous context emit task-done --seat "$SEAT" --text "Codex session finished"
+```
+
+Inspect your own marker first; do not run the command with an empty or copied identifier. This explicit event is not automatic Codex hook capture. Do not claim Codex sessions are automatically recorded by installing Claude Code's hooks.
+
+## 3. Check the connection
+
+```bash
+elanous context day
+```
+
+Look for a recent event and timestamp within the displayed time window after you finish a Claude Code action, stop its session, or explicitly record a Codex event. A zero count only means no matching event **in that window**; it does not prove a hook was installed or absent. If your session occurred earlier, expand the window with `elanous context day --since 48h`. This command reads context; it does not install anything.
+
+## 4. Keep local files out of Git
+
+Add the following lines to the project's `.git/info/exclude` for a local-only exclusion (or to the project's `.gitignore` if your team deliberately shares the ignore rules):
+
+```gitignore
+/.claude/seat
+/.claude/settings.local.json
+/.claude/settings.local.json.bak
+```
+
+If you use a different backup filename, exclude that filename too. Ignore rules do not untrack files already committed; check that these files were never added to Git. Keep the backup locally so existing project hook settings can be recovered.
+
+## Why not use personal global settings?
+
+Do **not** put these hooks in your personal global Claude Code settings. Global hooks run in sessions opened from other repositories too; a marker left in an unrelated work folder could then attribute its actions to the wrong project. Project-local hooks plus a project-local marker keep the opt-in scoped to the work you meant to attach.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `elanous context day` shows no new event | Check that the marker is at this project's root, has your assigned identifier on one line, and the Claude Code session was started in that project. Run `elanous context hooks install --print` again and compare its entries with this project's saved hooks; then finish a tool action or stop a fresh session. For Codex, record the event explicitly. |
+| Your existing hooks or permissions changed | Restore your local settings backup; merge only the printed `hooks` entries into `.claude/settings.local.json` while keeping existing hooks and `permissions` unchanged. `--print` itself never edits the file. |
+| A session in another repository appears attached | Remove any copied marker from the unintended project and move hooks out of personal global settings into the intended project's `settings.local.json`. Verify the working directory and check the next event with `elanous context day`. |
 
 ---
 
@@ -1236,6 +1305,31 @@ elanous loop start steward               # preview the schedule (every 15 minute
 The steward needs a Linear connection and is off until you start it.
 
 The **landing-and-healing loop** (`landing-heal`) watches the harness's own pull requests for review findings that must be fixed and for checks that are due after a merge. It is off by default too — `elanous loop status landing-heal` shows its schedule.
+
+## For operators — the orchestrator
+
+When work crosses loops, these layers have different jobs:
+
+| Layer | Job |
+|---|---|
+| Seat loops | Pick up queued work for their area and report progress. |
+| Steward | Triage tasks, dependencies and decisions that need a person. |
+| Orchestrator | Turn requests into cards and release work, choose an order, hand off eligible work and reconcile the results. |
+
+A work request becomes a card, then a work cell, then a proposed release placement before handoff. The orchestrator graph names the path **intake → split → place → delegate → reconcile → report**: collect open request cards, propose cells, place eligible cells on a release, queue a request for the relevant seat loop, check progress, and report the outcome. Placement and handoff depend on eligible work and available integrations; a proposal is not a completed launch.
+
+Set `loops.orchestrator.mode` to `shadow` (the default) to record proposals and would-be handoffs without placing work or sending requests. Set it to `live` to place eligible work and actually queue requests for seat loops. A queued request is not itself a completed run.
+
+| The orchestrator can do on its own | It must leave to a person |
+|---|---|
+| Record proposals and outcomes; order work; in live mode, add a request to the seat loop's queue. | Spending money, making external commitments, irreversible publication or security decisions: raise a human decision card rather than acting alone. |
+
+Check the loop and recent activity without starting work:
+
+```bash
+elanous loop status orchestrator
+elanous loop activity
+```
 
 ## For developers — build your own
 
@@ -4817,6 +4911,80 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.15
+
+Source: https://docs.elanous.ai/releases/0-2-15/
+
+## Behavior changes
+
+- the harness no longer deletes files that were added to main after a run started when they are outside the run's target paths.
+- `elanous release auto-start` previews the scheduled release cut within a window and, with `--apply`, starts the guarded release run (freeze or readiness changes defer instead of failing).
+- `elanous hq fence-audit` lists cron jobs that write outside the HQ fence and proposes the wrapped line (no crontab changes).
+- the public-demo "now" view no longer crashes on installs without brand rules and never returns a developer error page.
+- when the last review round fails, the harness child opens a review-blocked draft PR with its work and must-fix list instead of exiting without a result.
+- every elanous-related cron line now shows up in the loop registry as a loop or an unregistered warning; none is silently dropped.
+- a recorded heal event now starts the heal loop once.
+- The author-depth shadow tick checks selected release-cell titles and text, holding missing-text cells with ledger receipts, without enqueueing harness work.
+- brand-dependent generators now report missing rules as unmeasured rather than passing an unchecked brand assessment.
+- decision cards are no longer re-sent every 20 seconds when no device is subscribed.
+- a seat loop that falls back to shadow now says why.
+- hq move-plan lists what a headquarters host owns before moving it.
+- Each traffic tick records author-depth shadow receipts and reports held and queued-for-author counts plus incomplete ledger writes in JSON without enqueueing harness work.
+- Lecture-note graph collection now OCRs photos into draft inputs, recording unreadable images with a reason.
+- Lesson handbook pages show hash-free dated IDs and readable, 200-character cause and remedy summaries.
+- a failed Pod run now reports why it failed instead of «no error diagnostic».
+- The scheduled harness queue tick now records author-depth shadow receipts at most once every 30 minutes without changing dispatch decisions.
+- Generate a capability map from maturity grades, green release cells, and the marketing feature map, with evidence gaps and patent-held concepts marked.
+- the Telegram intake digest now leads with what matters to us, at most three items in a short situation-reason-action form.
+- tests no longer start the real heal loop (and its paid external grounding) when they record a failure event.
+- Feature maps now use marketing-map maturity, publication status, and PR citations when a row has no release checklist cell.
+- seat requests can be listed and closed from the CLI.
+- a waiting harness-queue item now names which seat cap is holding it back.
+- seat launch caps follow each seat's remaining work and lend
+- at most two heal loops run at once; further failures wait in the inbox.
+- intake check now flags paid dependencies a new tool could replace, and asks for a hands-on trial first.
+- agent-env capture records a secret-free profile of the local Claude, Codex and Grok setup.
+- Rhythm daily dry runs preserve review files, deduplicate PR landings, and bound unlanded runs; weekly reviews use scheduled cuts and recent daily news.
+- Returned Pod child logs now populate the host logs database once per job, preserving event identity and source attribution.
+- A new public guide shows how to attach a Claude Code or Codex session to an elanous seat using a project-local marker and context checks.
+- links saved from Telegram are absorbed right away instead of waiting for the daily run.
+- the HQ arbiter asks the operations seat to promote the standby after the holder goes silent; automatic promotion stays opt-in and a failed runbook is never reported as a promotion.
+- the draft sweep no longer treats two drafts as the same goal just because they share a title; it needs a matching goal id, or the same title on the same harness branch stem, and never an auto-generated file-name title.
+- Idle seat checks now request the next evidence-free yellow release cell after 30 minutes, with shadow mode by default.
+- test processes no longer run the real author-depth shadow on every queue tick (it timed out the seat-loop tests).
+- doctor node-modules reports missing or mismatched installed packages in a working tree.
+- a finished run that stalls while catching up with main is kept as harvestable instead of being dropped.
+- The public loop agents guide now explains the orchestrator's handoff flow, shadow and live modes, human decision boundary, and status commands.
+- the changed-file type check fails instead of passing when it cannot see TypeScript changes that are in the diff.
+- a review that failed to run is no longer shown as PASS in PR comments or the PR body, and it is retried once with another provider.
+- AX briefs now include the measured, deduplicated self-implement merge count and report source read failures explicitly.
+- the child model provider chosen for a run is now used in Pods and local runs, or the launch is refused.
+- the release checklist gate fails on a carry-over ID collision instead of silently leaving the item behind.
+- several release checklist commands opening a fresh ledger at the same time no longer fail with "duplicate column name".
+- one seat at its cap no longer blocks other seats' goals in the harness queue.
+- draft sweeps record a daily count of old harness drafts and say why a sweep failed.
+- pod run always saves the job's log to the artifact folder it announces.
+- the run supervisor no longer stops a run as «no progress» when its children finished and committed on a non-main base.
+- the draft cleanup and steward loops no longer fail outside a git checkout, and a failing graph step keeps the real error line.
+- Pod launches now pick the pool member with the most real free capacity instead of always the first one.
+- Pods no longer receive a child effort flag that `self implement` rejects, which would stop the Pod at startup.
+- Pods launched at the same moment share one GitHub App token instead of each minting one, and a Pod whose GitHub login fails is retried once after a short backoff.
+- every harness run records which door it came through and whether it went via the queue; eln harness doors shows the daily table.
+
+## Security
+
+- agent-env capture redacts key-shaped values (sk-, ghp_, AKIA… and long digit-heavy strings) even in plain identifier fields.
+
+Plus 103 internal changes.
+
+## Known issues
+
+The following issues are known in this release.
+
+- Known issues have been reported for this release.
 
 ---
 
