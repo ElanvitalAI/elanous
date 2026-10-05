@@ -99,10 +99,10 @@ test('independent harness ask/say and self CLI dispatch run real kubectl apply o
     return child;
   };
   try {
-    // The fixture HOME has no measured usage; a provider outside the budget gate keeps the L6 launch gate from blocking.
-    run(['harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'fake:3', '--child-llm-provider', 'anthropic']);
+    // No named child provider: since PODPROVIDER (#24183) a Pod honours only openai-codex/grok, so the old `anthropic` dodge exits 2.
+    run(['harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'fake:3']);
     await wait(() => applied().length === 1);
-    run(['harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3', '--child-llm-provider', 'anthropic']);
+    run(['harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
     await wait(() => applied().length === 2);
     const measurementsBeforeThird = snapshot().measured.length;
     run(['self', 'orchestrate', 'Third distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3', '--pod-account', 'team', '--no-supervise']);

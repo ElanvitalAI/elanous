@@ -35,6 +35,8 @@ type GoalClarificationAnsweredBy = 'human' | 'agent' | 'none' | 'mixed';
 
 export interface GoalClarificationEscalationInput {
   goalFile: string;
+  /** Explicit provenance for isolated test fixtures; never inferred from goalFile. */
+  testOrigin?: true;
   delivery?: GoalClarificationDelivery;
   resolvedDelivery?: GoalClarificationObservedDelivery;
   dispatch?: (
@@ -577,6 +579,9 @@ export async function escalateGoalDocumentClarifications(
                   }],
                 },
                 input.dispatchContext?.sessionId,
+                {},
+                undefined,
+                { testOrigin: input.testOrigin },
               );
               pendingQuestionPersistence.write(pending);
               pendingWritten += 1;

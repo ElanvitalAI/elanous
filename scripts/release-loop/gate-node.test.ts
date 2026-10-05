@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, type GateRunner } from './gate-node';
+import { createGateRunner, GATE_ISOLATED_TIMEOUT_MS, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -1273,7 +1273,8 @@ test('Pod accepts Ran 4 tests across 3 files out of four assigned without retryi
 });
 
 test('a no-output Pod shard retries once in a fresh Job and its measured result determines the gate', async () => {
-  for (const retryOutcome of ['pass', 'fail', 'stall'] as const) {
+  for (const retryOutcome of ['pass', 'fail', 'stall', 'hang'] as const) {
+    const stalls = retryOutcome === 'stall' || retryOutcome === 'hang';
     const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
     const repo = join(root, 'repo');
     mkdirSync(repo);
@@ -1295,7 +1296,7 @@ test('a no-output Pod shard retries once in a fresh Job and its measured result 
         mkdirSync(artifactsDir);
         const isB = o.command[2]!.includes("'./src/b.test.ts'");
         const bAttempt = invoked.filter((call) => call.command[2]!.includes("'./src/b.test.ts'")).length;
-        if (isB && (bAttempt === 1 || retryOutcome === 'stall')) return { exitCode: 0, artifactsDir, job: 'fake' };
+        if (isB && (bAttempt === 1 || stalls)) return { exitCode: 0, artifactsDir, job: 'fake' };
         const failed = isB && retryOutcome === 'fail';
         writeFileSync(join(artifactsDir, 'shard.log'), failed
           ? 'src/b.test.ts:\n(fail) B [1.00ms]\n0 pass\n1 fail\nRan 1 test across 1 file.\n'
@@ -1307,15 +1308,17 @@ test('a no-output Pod shard retries once in a fresh Job and its measured result 
       runner.remove = fixtureRunner.remove;
       runner.snapshot = fixtureRunner.snapshot;
       runner.removeSnapshot = fixtureRunner.removeSnapshot;
-      runner.localCommand = async () => ({ rc: 0, output: runOutput([]) });
+      runner.localCommand = async () => (retryOutcome === 'hang'
+        ? { rc: 2, output: '\nSystemError: spawnSync bun ETIMEDOUT', timedOut: true }
+        : { rc: 0, output: runOutput([]) });
       const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 2 } }, runner);
       expect(invoked).toHaveLength(3);
       expect(invoked.map((call) => files.filter((file) => call.command[2]!.includes(`'./${file}'`)))).toEqual([[files[0]!], [files[1]!], [files[1]!]]);
       expect(new Set(invoked.map((call) => call.name)).size).toBe(3);
       expect(invoked[1]!.source).toEqual(invoked[2]!.source);
-      expect(retries).toEqual([{ shard: 1, files: [files[1]!], reason: 'no-output', outcome: retryOutcome === 'stall' ? 'no-output' : 'ok' }]);
-      if (retryOutcome === 'stall') {
-        expect(result).toMatchObject({ outcome: 'ok', stalledEnv: [{ file: files[1]!, reason: 'no-output', local: 'passed' }] });
+      expect(retries).toEqual([{ shard: 1, files: [files[1]!], reason: 'no-output', outcome: stalls ? 'no-output' : 'ok' }]);
+      if (stalls) {
+        expect(result).toMatchObject({ outcome: 'ok', introduced: [], stalledEnv: [{ file: files[1]!, reason: 'no-output', local: retryOutcome === 'hang' ? 'timeout' : 'passed' }] });
         expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
       } else {
         expect(result).toMatchObject({ outcome: retryOutcome === 'pass' ? 'ok' : 'regression', introduced: retryOutcome === 'pass' ? [] : [B] });
@@ -2262,4 +2265,63 @@ test('a failure the console counts but never names is attributed from the shard 
   const result = await runner.sweep(repo, join(root, 'logs'), { pool: 'pool-test', shards: 1 });
   expect(result.output).toContain('(fail) unknown slash command keeps "/x" text');
   expect(result.output).toContain('1 fail');
+});
+
+test('only a limited host command times out — the real runner kills it and reports timedOut', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-limit-'));
+  const runner = createGateRunner(dir);
+  const limited = await runner.localCommand('sleep', ['5'], dir, 200);
+  expect(limited.timedOut).toBe(true);
+  const unlimited = await runner.localCommand('sleep', ['0.3'], dir);
+  expect(unlimited.timedOut).toBeUndefined();
+  expect(unlimited.rc).toBe(0);
+});
+
+test('a timed-out limited command takes its grandchildren with it — no orphan outlives the gate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-group-'));
+  const started = Date.now();
+  const result = await limitedLocalCommand('sh', ['-c', 'sleep 30 & echo "grandchild=$!"; wait'], dir, 500);
+  // Killing only the leader leaves the grandchild holding the pipe, so the call would return only when it ends (≈30s).
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(result.timedOut).toBe(true);
+  const grandchild = Number(/grandchild=(\d+)/.exec(result.output)?.[1]);
+  expect(grandchild).toBeGreaterThan(0);
+  await new Promise((done) => setTimeout(done, 200));
+  expect(() => process.kill(grandchild, 0)).toThrow();
+});
+
+test('a timed-out limited command returns by its hard deadline even if a process in another group holds the pipe', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-foreign-'));
+  const started = Date.now();
+  // perl leaves our group (setpgrp) and keeps stdout open — the 0.2.15 shape: test-deterministic runs `bun test` as its own group leader.
+  const result = await limitedLocalCommand('sh', ['-c', 'perl -e "setpgrp(0,0); print qq(foreign=\\$\\$\\n); STDOUT->flush; sleep 30" & wait'], dir, 300, 300);
+  const foreign = Number(/foreign=(\d+)/.exec(result.output)?.[1]);
+  try {
+    expect(foreign).toBeGreaterThan(0);
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  } finally { try { if (foreign > 0) process.kill(foreign, 'SIGKILL'); } catch { /* already gone */ } }
+});
+
+test('a new-failure file whose cut or baseline re-check times out is an environment stall, not introduced', async () => {
+  for (const where of ['cut', 'baseline'] as const) {
+    const { instanceRoot, runner } = fake();
+    const limits: Array<number | undefined> = [];
+    const original = runner.command.bind(runner);
+    runner.command = async (cmd, args, cwd, limitMs) => {
+      if (cmd === 'bun' && args[0] === 'run') limits.push(limitMs);
+      if (cmd === 'bun' && args[0] === 'run' && args[2] === './src/b.test.ts' && cwd.endsWith(`/${where}`))
+        return { rc: 2, output: '\nSystemError: spawnSync bun ETIMEDOUT', timedOut: true };
+      return original(cmd, args, cwd);
+    };
+    const logs = spyOn(debug, 'log');
+    try {
+      const result = await judgeGate(options(instanceRoot), runner);
+      expect(result).toMatchObject({ outcome: 'ok', introduced: [] });
+      expect(result.stalledEnv).toContainEqual({ file: 'src/b.test.ts', reason: 'isolated-timeout', local: 'timeout' });
+      expect(limits.every((limit) => limit === GATE_ISOLATED_TIMEOUT_MS)).toBe(true);
+      expect(logs.mock.calls.some(([category, event, data]) => category === 'release-loop.gate' && event === 'isolated-timeout'
+        && (data as { label?: string }).label === `${where} isolated`)).toBe(true);
+    } finally { logs.mockRestore(); }
+  }
 });

@@ -53,6 +53,81 @@ test('renders ordered sections, status counts, unenforced count, disproof and la
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 
+test('imported lesson headings omit hashes and table and bold summaries stay readable within 200 characters', () => {
+  const stateDir = root();
+  const ledger = new LessonLedger({ stateDir });
+  const firstId = `first-lesson-2026-10-05-${'a'.repeat(64)}`;
+  const secondId = `second-lesson-2026-10-05-${'b'.repeat(64)}`;
+  try {
+    ledger.importDocument({
+      id: firstId, incident: '첫 사고',
+      cause: '공유 상태를 확인했다.\n| # | 원인 |\n| --- | --- |\n| 1 | **잘못된 공유** |\n| 2 | 다른 원인 |',
+      remedy: '재발 방지가 필요하다.\n# | 처방\n--- | ---\n1 | **상태 격리**\n2 | 다른 처방',
+      owner: 'MK', source: 'docs/first-lesson-2026-10-05.md',
+    });
+    ledger.importDocument({
+      id: secondId, incident: '둘째 사고', cause: `**재현** ${'나'.repeat(201)}`,
+      remedy: `**${'가'.repeat(201)}**`, owner: 'MK', source: 'docs/second-lesson-2026-10-05.md',
+    });
+    const result = run('--state-dir', stateDir, '--json');
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ total: 2 });
+    const page = readFileSync(join(stateDir, 'lessons', 'handbook-lessons.md'), 'utf8');
+    expect(page).toContain('### first-lesson-2026-10-05 — 첫 사고');
+    expect(page).toContain('### second-lesson-2026-10-05 — 둘째 사고');
+    expect(page).not.toContain('a'.repeat(64));
+    expect(page).not.toContain('b'.repeat(64));
+    expect(page).toContain('- 원인: 공유 상태를 확인했다. 1 · 잘못된 공유');
+    expect(page).toContain('- 처방: 재발 방지가 필요하다. 1 · 상태 격리');
+    expect(page).not.toContain('---');
+    expect(page).not.toContain('다른 원인');
+    expect(page).toContain(`- 원인: 재현 ${'나'.repeat(197)}…`);
+    expect(page).not.toContain('다른 처방');
+    expect(page).not.toContain('**');
+    expect(page).not.toContain('\\');
+    const longRemedy = page.match(/^- 처방: (가+…)$/m)?.[1];
+    expect(longRemedy).toBe(`${'가'.repeat(200)}…`);
+    expect(ledger.get(firstId).id).toBe(firstId);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('every markdown table in a cause or remedy is folded, not only the first', () => {
+  const stateDir = root();
+  const ledger = new LessonLedger({ stateDir });
+  try {
+    ledger.importDocument({
+      id: 'two-tables-2026-10-05', incident: '표 둘',
+      cause: '앞 설명.\n| # | 원인 |\n| --- | --- |\n| 1 | 첫 원인 |\n중간 설명.\n| 축 | 값 |\n| --- | --- |\n| A | 둘째 원인 |\n| B | 남는 줄 |',
+      remedy: '처방 설명.', owner: 'MK', source: 'docs/two-tables-2026-10-05.md',
+    });
+    const result = run('--state-dir', stateDir, '--json');
+    expect(result.status, result.stderr).toBe(0);
+    const page = readFileSync(join(stateDir, 'lessons', 'handbook-lessons.md'), 'utf8');
+    expect(page).toContain('- 원인: 앞 설명. 1 · 첫 원인 중간 설명. A · 둘째 원인');
+    expect(page).not.toContain('---');
+    expect(page).not.toContain('\\|');
+    expect(page).not.toContain('남는 줄');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('a table flattened onto one line by import is folded like a multi-line table', () => {
+  const stateDir = root();
+  const ledger = new LessonLedger({ stateDir });
+  try {
+    ledger.importDocument({
+      id: 'inline-table-2026-10-05', incident: '한 줄 표', cause: '원인 설명.',
+      remedy: '| # | 처방 | 성격 | | --- | --- | --- | | D1 | 부재 판정 금지 | 안전 | | D2 | 관측 | 관측 |',
+      owner: 'MK', source: 'docs/inline-table-2026-10-05.md',
+    });
+    const result = run('--state-dir', stateDir, '--json');
+    expect(result.status, result.stderr).toBe(0);
+    const page = readFileSync(join(stateDir, 'lessons', 'handbook-lessons.md'), 'utf8');
+    expect(page).toContain('- 처방: D1 · 부재 판정 금지 · 안전');
+    expect(page).not.toContain('---');
+    expect(page).not.toContain('D2');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
 test('ledger text cannot inject sections, links, or HTML into the handbook', () => {
   const stateDir = root();
   const ledger = new LessonLedger({ stateDir });

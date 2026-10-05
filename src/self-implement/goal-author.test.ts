@@ -626,19 +626,19 @@ console.log(result.authored.document);`;
       });
       const phases = log.mock.calls
         .filter(([category, event]) => category === 'goal-author' && (event === 'phase-start' || event === 'phase-end'))
-        .map(([, event, data]) => ({ event, ...(data as { phase: string; authorRunId?: string; elapsedMs?: number }) }))
+        .map(([, event, data]) => ({ event, ...(data as { phase: string; authorRunId?: string; elapsedMs?: number; inputTokens?: number | null; outputTokens?: number | null }) }))
         .filter(({ phase }) => ['ground', 'enhance', 'assemble', 'lint'].includes(phase));
 
       // ⭐ 2026-08-07 — 조인 키(authorRunId)가 «전 페이즈»에 실린다(T2). 순서·소요 계약은 그대로다.
       expect(phases).toEqual([
         { event: 'phase-start', phase: 'ground', authorRunId: expect.any(String) },
-        { event: 'phase-end', phase: 'ground', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+        { event: 'phase-end', phase: 'ground', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
         { event: 'phase-start', phase: 'enhance', authorRunId: expect.any(String) },
-        { event: 'phase-end', phase: 'enhance', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+        { event: 'phase-end', phase: 'enhance', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
         { event: 'phase-start', phase: 'assemble', authorRunId: expect.any(String) },
-        { event: 'phase-end', phase: 'assemble', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+        { event: 'phase-end', phase: 'assemble', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
         { event: 'phase-start', phase: 'lint', authorRunId: expect.any(String) },
-        { event: 'phase-end', phase: 'lint', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+        { event: 'phase-end', phase: 'lint', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
       ]);
       // ⛔ 그리고 여덟이 «같은» id 여야 한다 — 갈리면 곡선이 저작 하나를 여럿으로 센다.
       expect(new Set(phases.map((p) => (p as { authorRunId?: string }).authorRunId)).size).toBe(1);
@@ -659,6 +659,55 @@ console.log(result.authored.document);`;
       log.mockRestore();
       stderr.mockRestore();
       stdout.mockRestore();
+    }
+  });
+
+  test('attributes reported enhancement usage to its phase and reconciles summary characters with the unchanged document', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const authored = await authorGoal('What 😀\n## SCOPE BOUNDARY is quoted inside this ask', {
+        ...deps,
+        enhance: async (raw, opts) => {
+          opts?.onUsage?.({ inputTokens: 11, outputTokens: 7 });
+          opts?.onUsage?.({ inputTokens: 3, outputTokens: 2 });
+          return { original: raw, checklist: [], verbatimPreserved: true };
+        },
+      });
+      const events = log.mock.calls.filter(([category]) => category === 'goal-author');
+      const phaseEnds = events.filter(([, event]) => event === 'phase-end')
+        .map(([, , data]) => data as { phase: string; inputTokens: number | null; outputTokens: number | null });
+      expect(phaseEnds.find(({ phase }) => phase === 'enhance')).toMatchObject({ inputTokens: 14, outputTokens: 9 });
+      expect(phaseEnds.filter(({ phase }) => phase !== 'enhance').every(({ inputTokens, outputTokens }) => inputTokens === null && outputTokens === null)).toBe(true);
+      const summaries = events.filter(([, event]) => event === 'summary');
+      expect(summaries).toHaveLength(1);
+      const summary = summaries[0]![2] as {
+        authorRunId: string; elapsedMs: number; inputTokens: number; outputTokens: number; totalTokens: number;
+        goalChars: number; sectionChars: Record<string, number>;
+      };
+      expect(summary.authorRunId).toBe(authored.authorRunId);
+      expect(summary.elapsedMs).toBeGreaterThanOrEqual(0);
+      expect(summary).toMatchObject({ inputTokens: 14, outputTokens: 9, totalTokens: 23 });
+      expect(summary.goalChars).toBe([...authored.document].length);
+      expect(Object.values(summary.sectionChars).reduce((sum, chars) => sum + chars, 0)).toBe(summary.goalChars);
+      for (const section of ['PROBLEM', 'WHAT TO BUILD', 'ACCEPTANCE CRITERIA', 'TRACED PATHS', 'SCOPE BOUNDARY', 'STEPS', '답하지 못하는 것']) {
+        expect(summary.sectionChars).toHaveProperty(section);
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('keeps unavailable usage null in both phase-end and summary', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      await authorGoal(ask, deps);
+      const events = log.mock.calls.filter(([category]) => category === 'goal-author');
+      const enhanceEnd = events.find(([, event, data]) => event === 'phase-end' && (data as { phase?: string }).phase === 'enhance');
+      expect(enhanceEnd?.[2]).toMatchObject({ inputTokens: null, outputTokens: null });
+      const summary = events.find(([, event]) => event === 'summary');
+      expect(summary?.[2]).toMatchObject({ inputTokens: null, outputTokens: null, totalTokens: null });
+    } finally {
+      log.mockRestore();
     }
   });
 
@@ -962,8 +1011,8 @@ console.log(result.authored.document);`;
         log.mockRestore();
       }
     };
-    const first = await observeRun([0, 1, 2, 3, 4, 5, 15, 15, 50, 50, 70, 70, 71, 72]);
-    const second = await observeRun([100, 101, 102, 103, 104, 105, 115, 115, 170, 170, 190, 190, 191, 192]);
+    const first = await observeRun([0, 0, 1, 2, 3, 4, 5, 15, 15, 50, 50, 70, 70, 71, 72, 72]);
+    const second = await observeRun([100, 100, 101, 102, 103, 104, 105, 115, 115, 170, 170, 190, 190, 191, 192, 192]);
     const outer = first.filter(({ phase }) => ['ground', 'enhance', 'assemble', 'lint'].includes(phase));
     const assemble = first.filter(({ phase }) => phase.startsWith('assemble'));
     type AssembleDurations = Record<(typeof subphases)[number], number>;
@@ -1066,17 +1115,17 @@ console.log(result.authored.document);`;
       expect(stderr).not.toHaveBeenCalled();
       expect(log.mock.calls
         .filter(([category, event]) => category === 'goal-author' && (event === 'phase-start' || event === 'phase-end'))
-        .map(([, event, data]) => ({ event, ...(data as { phase: string; authorRunId?: string; elapsedMs?: number }) }))
+        .map(([, event, data]) => ({ event, ...(data as { phase: string; authorRunId?: string; elapsedMs?: number; inputTokens?: number | null; outputTokens?: number | null }) }))
         .filter(({ phase }) => ['ground', 'enhance', 'assemble', 'lint'].includes(phase)))
         .toEqual([
           { event: 'phase-start', phase: 'ground', authorRunId: expect.any(String) },
-          { event: 'phase-end', phase: 'ground', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+          { event: 'phase-end', phase: 'ground', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
           { event: 'phase-start', phase: 'enhance', authorRunId: expect.any(String) },
-          { event: 'phase-end', phase: 'enhance', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+          { event: 'phase-end', phase: 'enhance', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
           { event: 'phase-start', phase: 'assemble', authorRunId: expect.any(String) },
-          { event: 'phase-end', phase: 'assemble', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+          { event: 'phase-end', phase: 'assemble', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
           { event: 'phase-start', phase: 'lint', authorRunId: expect.any(String) },
-          { event: 'phase-end', phase: 'lint', authorRunId: expect.any(String), elapsedMs: expect.any(Number) },
+          { event: 'phase-end', phase: 'lint', authorRunId: expect.any(String), elapsedMs: expect.any(Number), inputTokens: null, outputTokens: null },
         ]);
     } finally {
       log.mockRestore();
@@ -6683,10 +6732,10 @@ ${report}`);
 
       // ⊕ `groundedFacts` 가 늘었다(2026-08-08) — 접지 사실을 인핸싱에 넘겨 SCQA 요약을 만든다.
       //   이 단정의 의도는 여전히 「`directoryMeasurement` 가 전달된다」이고, 그 키가 여기 있다.
-      expect(enhance).toHaveBeenCalledWith('모든 fixtures/count-target 를 관측한다.', {
-        directoryMeasurement: 'fixtures/count-target: top-level files 1, direct directories 1, symbolic links 1',
-        groundedFacts: facts.persistentEvidence,
-      });
+      const [enhancedAsk, enhancedOpts] = enhance.mock.calls[0]!;
+      expect(enhancedAsk).toBe('모든 fixtures/count-target 를 관측한다.');
+      expect(enhancedOpts?.directoryMeasurement).toBe('fixtures/count-target: top-level files 1, direct directories 1, symbolic links 1');
+      expect(enhancedOpts).toMatchObject({ groundedFacts: facts.persistentEvidence });
       expect(forwarded).toEqual([['goal-author', 'ask-directory-measurement-forwarded', { count: 1 }]]);
       expect(readFileSync(result.path, 'utf8')).not.toContain('top-level files 1, direct directories 1, symbolic links 1');
     } finally {
@@ -6712,7 +6761,10 @@ ${report}`);
       // ⛔ 종전 기대는 `undefined` 였다 — 그때는 저작기가 인핸싱에 아무것도 안 넘겼다.
       //   이제 접지 사실은 «항상» 넘어가므로, 이 단정의 의도(「수량어가 없으면 directoryMeasurement 를
       //   전달하지 않는다」)는 ***그 키가 «없다»는 것***으로 유지한다.
-      expect(enhance).toHaveBeenCalledWith('fixtures/count-target에는 파일이 있다.', { groundedFacts: facts.persistentEvidence });
+      const [enhancedAsk, enhancedOpts] = enhance.mock.calls[0]!;
+      expect(enhancedAsk).toBe('fixtures/count-target에는 파일이 있다.');
+      expect(enhancedOpts).toMatchObject({ groundedFacts: facts.persistentEvidence });
+      expect(enhancedOpts).not.toHaveProperty('directoryMeasurement');
       expect(forwarded).toEqual([['goal-author', 'ask-directory-measurement-forwarded', { count: 0 }]]);
     } finally {
       log.mockRestore();
@@ -9807,7 +9859,7 @@ describe('goal author — 수용 구별 관측', () => {
       },
     });
 
-    expect(seen).toEqual([{ groundedFacts: [observation('cold', '0'), observation('warm', '0')] }]);
+    expect(seen).toEqual([{ groundedFacts: [observation('cold', '0'), observation('warm', '0')], onUsage: expect.any(Function) }]);
     expect(authored.document).toContain('### 수용 구별 관측\n- Status: same-value');
     expect(authored.document).toContain('must not invent a discriminator or manual input absent from the producer observations.');
     expect(authored.document).toContain('## 판정 신호');

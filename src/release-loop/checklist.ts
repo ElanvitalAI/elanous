@@ -16,6 +16,8 @@ export interface ChecklistItem {
   priority?: 'P0' | 'P1' | 'P2';
   predecessors?: string[];
   deadlineVersion?: string;
+  ceoMinutes?: number;
+  ceoDate?: string;
   evidence?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
@@ -96,7 +98,12 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
   debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
 }
 
-export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string }, options: { allowDuplicateId?: boolean } = {}): Checklist {
+export function validateCeoLoad(input: { ceoMinutes?: number; ceoDate?: string }): void {
+  if (input.ceoMinutes !== undefined && (!Number.isSafeInteger(input.ceoMinutes) || input.ceoMinutes < 0)) throw new CliUserError('대표 손 분량은 0 이상의 정수 분이어야 한다');
+  if (input.ceoDate !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(input.ceoDate) || !Number.isFinite(Date.parse(`${input.ceoDate}T00:00:00Z`)) || new Date(`${input.ceoDate}T00:00:00Z`).toISOString().slice(0, 10) !== input.ceoDate)) throw new CliUserError('대표 손 날짜는 YYYY-MM-DD 이어야 한다');
+}
+
+export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
@@ -104,6 +111,7 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
   if (input.priority !== undefined && !['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
   if (input.predecessors !== undefined && (!Array.isArray(input.predecessors) || input.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === input.id))) throw new CliUserError('잘못된 선행 칸');
   if (input.deadlineVersion !== undefined) store.validateVersion(input.deadlineVersion);
+  validateCeoLoad(input);
   return mutate(v, (data, otherItems) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const collisions = otherItems(input.id);
@@ -114,14 +122,14 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
     }
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), updatedAt: at, updatedBy: by };
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), updatedAt: at, updatedBy: by };
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
@@ -131,13 +139,14 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
     if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
     if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
+    validateCeoLoad(patch);
     if (patch.owner !== undefined) {
       parseOwner(patch.owner);
       if (item.owner && patch.owner !== item.owner) {
         throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
       }
     }
-    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field]));
+    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field]));
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {

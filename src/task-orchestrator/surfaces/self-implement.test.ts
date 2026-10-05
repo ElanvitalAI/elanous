@@ -58,6 +58,11 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
 }
 
 describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
+  test('terminal JSON retains pushed harvestable branch for supervisor, but never infers a push from branch alone', () => {
+    expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"branch":"self-impl/finished","harvestable":true}')).toMatchObject({ stage: 'timed-out', branch: 'self-impl/finished', harvestable: true });
+    expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"branch":"self-impl/finished"}')?.harvestable).toBeUndefined();
+    expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"harvestable":true}')?.harvestable).toBeUndefined();
+  });
   test('exit 0 → completed', async () => {
     const spawn: SelfImplementJobSpawn = () => ({
       address: 'self-impl:x',

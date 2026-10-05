@@ -13,6 +13,7 @@ import { PTY_LEDGER_SCOPE_PROBE_MARKER } from '../__fixtures__/pty-ledger-scope-
 import { UNPRIVILEGED_DROP_HINT, resolveUnprivilegedLauncher } from '../lib/unprivileged-child.js';
 import { migratePtyManifestSchema } from '../../src/pty-shell/pty-manifest.js';
 import { measureRunLedgerGaps, type RunLedgerGapMeasurement, type RunLedgerGapRoot } from '../../src/self-implement/run-ledger.js';
+import { refuseProductionLedgerWriteInTest } from '../../src/harness/ledger-write-guard.js';
 import { ledgerIdsAt, resolvePtyLedgerScopeTargets, runPtyLedgerScope, scanPtyLedgerScope, type LedgerEvidenceSummary, type PtyLedgerScopeLegacySummary } from './pty-ledger-scope.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -138,6 +139,14 @@ function scanInUnprivilegedChild(dbPath: string): ProbeResult {
   expect(parsed.uid).not.toBe(0);
   return parsed;
 }
+
+it('read-only PTY ledger measurement does not grant writes through a missing nested production path', () => {
+  const production = makeStateRoot('production-boundary');
+  const dir = join(production, 'nested', 'run-ledger');
+  expect(refuseProductionLedgerWriteInTest(dir, 'run-ledger', { ELANOUS_TEST_HOME: '/test/home' }, production, production)).toBe(true);
+  expect(ledgerIdsAt(dir).status).toBe('missing');
+  expect(existsSync(join(production, 'nested'))).toBe(false);
+});
 
 describe('pty-ledger-scope filesystem collection', () => {
   it('collects live PTY rows and record-evidenced ledger IDs from a real state root', () => {

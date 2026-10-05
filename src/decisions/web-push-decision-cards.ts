@@ -28,7 +28,7 @@ export function webPushDecisionTransport(
       const recommendation = 'skipped' in entry.recommendation ? '추천안 없음' : `추천안: ${entry.recommendation.option.toUpperCase()}`;
       const body = `${recommendation}${entry.dueAt ? ` · 기한: ${new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(entry.dueAt))}` : ''}`;
       const result = await push({ title: title('대표 결정 · ', entry.title), body, url: url(id), tag: tag(id) });
-      debug.log('decisions.webpush', 'card-sent', { id, delivered: result.delivered });
+      if (result.attempted) debug.log('decisions.webpush', 'card-sent', { id, delivered: result.delivered });
       return result.delivered ? { chat: 'webpush', message: id } : null;
     },
     edit: async (ref, _view) => {

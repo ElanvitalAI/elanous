@@ -47,6 +47,90 @@ test('all inventory joins graph cron once and adds seat, shell and orchestrator 
   } finally { db.close(); }
 });
 
+test('four fenced seat loop CLI crons are owned by their seat and accounted once; unknown seat warns', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'registry-seat-cli-')));
+  roots.push(root);
+  const now = new Date('2026-10-04T12:02:00Z');
+  const log = join(root, 'seat.log');
+  writeFileSync(log, 'run');
+  utimesSync(log, new Date('2026-10-04T11:59:00Z'), new Date('2026-10-04T11:59:00Z'));
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      ...(['MK', 'TC', 'UX', 'OP'] as const).map((seat, index) =>
+        `*/${index + 5} * * * * hq-fence seat-loop 'cd ${root} && bun bin/elanous.mjs seat loop --seat ${seat} --once >> ${log} 2>&1'`),
+      `*/9 * * * * hq-fence seat-loop 'bun bin/elanous.mjs seat loop --seat ZZ --once >> ${log} 2>&1'`,
+    ].join('\n') + '\n' });
+    const schedules = listSchedules(db);
+    const opts = { root, stateRoot: root, now, schedules };
+    expect(listLoops(opts)).toEqual([]);
+    const all = listAllLoops(opts);
+    expect(listLoops(opts)).toEqual([]);
+    const seats = all.filter(entry => entry.kind === 'seat');
+    expect(seats).toHaveLength(4);
+    for (const [index, seat] of (['MK', 'TC', 'UX', 'OP'] as const).entries()) {
+      expect(seats.find(entry => entry.id === `elanous:seat-loop:${seat}`)).toMatchObject({
+        owner: seat, ownerSource: 'seat-arg', kind: 'seat', registered: true, enabled: true,
+        fenceRole: 'seat-loop', expectEveryMinutes: index + 5,
+        evidence: 'log-mtime', lastRunAt: '2026-10-04T11:59:00.000Z',
+        command: schedules.find(row => row.command?.includes(`--seat ${seat}`))?.command,
+      });
+    }
+    expect(all.filter(entry => entry.kind === 'unregistered').map(entry => entry.cron)).toEqual(['*/9 * * * *']);
+    expect(unregisteredCronLoops(all, opts).map(row => row.cron)).toEqual(['*/9 * * * *']);
+    expect(unregisteredCronLoops(seats, { ...opts, schedules: schedules.filter(row => row.command?.includes('--seat ZZ') === false) })).toEqual([]);
+    expect(checkLoops(seats, now).every(entry => entry.state === 'alive')).toBe(true);
+    const related = schedules.filter(row => row.command?.includes('hq-fence seat-loop'));
+    expect(related.length).toBe(seats.length + unregisteredCronLoops(all, opts).length);
+    const configPath = join(root, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ loops: { owners: { 'elanous:seat-loop:MK': 'UX' } } }));
+    expect(listAllLoops({ ...opts, config: buildUserConfig(configPath) }).find(entry => entry.id === 'elanous:seat-loop:MK'))
+      .toMatchObject({ owner: 'UX', ownerSource: 'config' });
+  } finally { db.close(); }
+});
+
+test('direct seat loop CLI recognizes a real seat argument, not quoted mentions or unknown values', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-seat-direct-'));
+  roots.push(root);
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      '*/5 * * * * bun bin/elanous.mjs seat loop --seat=TC --once',
+      '*/6 * * * * bun bin/elanous.mjs seat loop --seat ZZ --once',
+      '*/7 * * * * echo "elanous seat loop --seat MK --once"',
+      '*/8 * * * * bun bin/elanous.mjs seat loop --seat MK',
+    ].join('\n') + '\n' });
+    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
+    const all = listAllLoops(opts);
+    expect(all.filter(entry => entry.kind === 'seat')).toMatchObject([
+      { id: 'elanous:seat-loop:TC', owner: 'TC', ownerSource: 'seat-arg', cron: '*/5 * * * *' },
+    ]);
+    expect(all.filter(entry => entry.kind === 'unregistered').map(entry => entry.cron).sort())
+      .toEqual(['*/6 * * * *', '*/7 * * * *', '*/8 * * * *']);
+    expect(unregisteredCronLoops(all, opts).map(row => row.cron).sort()).toEqual(['*/6 * * * *', '*/7 * * * *', '*/8 * * * *']);
+  } finally { db.close(); }
+});
+
+test('a second installed CLI cron for one seat remains visible as an unregistered warning', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-seat-duplicate-'));
+  roots.push(root);
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      '*/5 * * * * bun bin/elanous.mjs seat loop --seat MK --once',
+      '*/10 * * * * bun bin/elanous.mjs seat loop --seat MK --once',
+    ].join('\n') + '\n' });
+    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
+    const all = listAllLoops(opts);
+    expect(all.map(entry => [entry.kind, entry.id])).toEqual([
+      ['seat', 'elanous:seat-loop:MK'],
+      ['unregistered', opts.schedules[1]!.id],
+    ]);
+    expect(unregisteredCronLoops(all, opts).map(row => row.id)).toEqual([opts.schedules[1]!.id]);
+    expect(opts.schedules).toHaveLength(all.length);
+  } finally { db.close(); }
+});
+
 test('37 owner lookup keys preserve graph id, seat hash, cron hash and elanous action slots', () => {
   const root = mkdtempSync(join(tmpdir(), 'registry-owner-keys-'));
   roots.push(root);
@@ -131,7 +215,7 @@ test('owner precedence and cron-shell log mtime flow through registry and checke
       { ownerSource: 'default', owner: 'OP', state: 'unknown' },
       { ownerSource: 'default', owner: 'OP', evidence: 'log-mtime', state: 'alive' },
     ]);
-    expect(events).toEqual([{ total: 7, bySource: { header: 1, config: 2, seat: 1, default: 3 } }]);
+    expect(events).toEqual([{ total: 7, bySource: { header: 1, config: 2, seat: 1, 'seat-arg': 0, default: 3 } }]);
     const custom = listAllLoops({ root, stateRoot: root, now, schedules: listSchedules(db), config: {
       ...config, loops: { ...config.loops, owners: { [fallback.id]: 'UX', [all.find(loop => loop.kind === 'seat')!.id]: 'TC' }, defaultOwner: 'MK' },
     } });
@@ -183,7 +267,9 @@ test('cron-shell falls back to a valid recorded run only when log mtime is unava
     expect(results.find(loop => loop.id === unreadable.id)).toMatchObject({ state: 'alive', lastRunAt: '2026-10-04T11:59:00Z' });
     expect(results.find(loop => loop.id === noRedirect.id)).toMatchObject({ state: 'late', lastRunAt: '2026-10-04T11:35:00Z' });
     expect(results.find(loop => loop.id === invalid.id)).toMatchObject({ state: 'unknown', reason: 'no valid run recorded' });
-    expect(all.filter(loop => loop.evidence !== undefined)).toEqual([]);
+    expect(all.filter(loop => loop.evidence === 'log-mtime')).toEqual([]);
+    expect(all.filter(loop => loop.evidence === 'registry').map(loop => loop.id).sort()).toEqual(
+      [missing.id, unreadable.id, noRedirect.id].sort());
     const log = join(root, 'present.log');
     writeFileSync(log, 'not inspected');
     utimesSync(log, new Date('2026-10-04T11:59:00Z'), new Date('2026-10-04T11:59:00Z'));
@@ -309,7 +395,10 @@ test('execution wrappers expose their inner launches and missing elanous cron li
     ].join('\n') + '\n' });
     const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
     const entries = listAllLoops(opts);
-    expect(entries.map(entry => entry.kind).sort()).toEqual(['cron-shell', 'cron-shell', 'cron-shell', 'graph', 'orchestrator', 'seat', 'seat', 'seat', 'seat', 'seat']);
+    expect(entries.filter(entry => entry.kind !== 'unregistered').map(entry => entry.kind).sort()).toEqual(['cron-shell', 'cron-shell', 'cron-shell', 'cron-shell', 'cron-shell', 'graph', 'orchestrator', 'seat', 'seat', 'seat', 'seat', 'seat']);
+    expect(entries.filter(entry => entry.kind === 'unregistered').map(entry => entry.cron).sort()).toEqual([
+      '*/8 * * * *', '*/22 * * * *', '*/23 * * * *', '*/24 * * * *', '*/9 * * * *', '*/11 * * * *',
+    ].sort());
     expect(entries.find(entry => entry.cron === '*/26 * * * *')).toMatchObject({ id: 'elanous:loop-list', title: 'loop list' });
     expect(entries.find(entry => entry.kind === 'seat' && entry.owner === 'UX')).toMatchObject({ registered: true, cron: '*/25 * * * *' });
     expect(entries.find(entry => entry.id === 'daily')).toMatchObject({ registered: true, enabled: true, fenceRole: 'cron' });
@@ -319,8 +408,7 @@ test('execution wrappers expose their inner launches and missing elanous cron li
     expect(entries.find(entry => entry.kind === 'seat' && entry.cron === '*/29 * * * *')?.fenceRole).toBeUndefined();
     expect(entries.every(entry => entry.fenceRole !== 'fake')).toBe(true);
     expect(unregisteredCronLoops(entries, opts).map(row => row.cron).sort()).toEqual([
-      '*/22 * * * *', '*/23 * * * *', '*/24 * * * *', '*/27 * * * *', '*/28 * * * *',
-      '*/9 * * * *', '*/11 * * * *', '*/8 * * * *',
+      '*/8 * * * *', '*/22 * * * *', '*/23 * * * *', '*/24 * * * *', '*/9 * * * *', '*/11 * * * *',
     ].sort());
   } finally { db.close(); }
 });
@@ -349,7 +437,8 @@ test('HQ role wrappers and periodic elanous launches keep graph and shell keys w
     const rows = listSchedules(db);
     const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: rows };
     const all = listAllLoops(opts);
-    expect(all).toHaveLength(10);
+    expect(all).toHaveLength(11);
+    expect(all.find(entry => entry.kind === 'unregistered')).toMatchObject({ cron: '*/14 * * * *', registered: false });
     expect(all.find(entry => entry.id === 'daily')).toMatchObject({ kind: 'graph', fenceRole: 'cron', registered: true });
     expect(listLoops(opts).find(entry => entry.id === 'daily')?.jobs.map(job => job.id)).toEqual(
       rows.filter(row => row.command?.includes('graphs/daily.yaml')).map(row => row.id));
@@ -399,20 +488,24 @@ test('operational bun and node elanous cron lines share named keys with CLI laun
     const gitRows = rows.filter(row => row.command?.includes('hq-fence git-push'));
     writeFileSync(configPath, JSON.stringify({ loops: { owners: Object.fromEntries(gitRows.map(row => [row.id, 'UX'])) } }));
     const all = listAllLoops({ ...opts, config: buildUserConfig(configPath) });
-    expect(all).toHaveLength(6);
+    expect(all).toHaveLength(8);
+    expect(all.find(entry => entry.kind === 'unregistered')).toMatchObject({ cron: '*/11 * * * *', registered: false });
+    expect(all.find(entry => entry.cron === '*/12 * * * *')).toMatchObject({ id: 'elanous:harness-queue-3', title: 'harness queue' });
     expect([all.find(entry => entry.cron === '*/5 * * * *')?.id, all.find(entry => entry.cron === '*/9 * * * *')?.id].sort())
       .toEqual(['elanous:hq-heartbeat', 'elanous:hq-heartbeat-2']);
     expect([all.find(entry => entry.cron === '*/6 * * * *')?.id, all.find(entry => entry.cron === '*/10 * * * *')?.id].sort())
       .toEqual(['elanous:harness-queue', 'elanous:harness-queue-2']);
     expect(all.find(entry => entry.cron === '*/6 * * * *')).toMatchObject({ title: 'harness queue (hq-fence cron)', fenceRole: 'cron' });
     expect(all.find(entry => entry.cron === '*/5 * * * *')).toMatchObject({ title: 'hq heartbeat' });
+    expect(all.filter(entry => entry.id.startsWith('elanous:harness-queue')).map(entry => entry.id).sort())
+      .toEqual(['elanous:harness-queue', 'elanous:harness-queue-2', 'elanous:harness-queue-3']);
     for (const row of gitRows) {
       expect(row.id).toBe(cronEntryId(row.cron!, row.command!));
       expect(all.find(entry => entry.id === row.id)).toMatchObject({
         kind: 'cron-shell', title: 'git push (hq-fence git-push)', owner: 'UX', ownerSource: 'config', fenceRole: 'git-push',
       });
     }
-    expect(unregisteredCronLoops(all, opts).map(row => row.cron).sort()).toEqual(['*/11 * * * *', '*/12 * * * *']);
+    expect(unregisteredCronLoops(all, opts).map(row => row.cron)).toEqual(['*/11 * * * *']);
     expect(unregisteredCronLoops([], opts).map(row => row.cron).sort()).toEqual([
       '*/5 * * * *', '*/6 * * * *', '*/7 * * * *', '*/8 * * * *', '*/9 * * * *', '*/10 * * * *', '*/11 * * * *', '*/12 * * * *',
     ].sort());
@@ -437,16 +530,69 @@ test('absolute-path eln loop checker and executable basenames register; unmatche
     const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
     const entries = listAllLoops(opts);
     expect(entries.filter(entry => entry.id.startsWith('elanous:')).map(entry => [entry.id, entry.title, entry.cron]).sort((a, b) => String(a[2]).localeCompare(String(b[2])))).toEqual([
+      ['elanous:config-get', 'config get', '*/11 * * * *'],
       ['elanous:loop-status-2', 'loop status (hq-fence cron)', '*/5 * * * *'],
       ['elanous:loop-list', 'loop list', '*/6 * * * *'],
       ['elanous:hq-heartbeat', 'hq heartbeat', '*/7 * * * *'],
       ['elanous:loop-status', 'loop status', '*/8 * * * *'],
     ]);
     expect(unregisteredCronLoops(entries, opts).map(row => row.cron).sort()).toEqual([
-      '*/9 * * * *', '*/10 * * * *', '*/11 * * * *',
+      '*/9 * * * *', '*/10 * * * *',
     ].sort());
     expect(unregisteredCronLoops(entries.filter(entry => entry.id !== 'elanous:loop-status-2'), opts).map(row => row.cron))
       .toContain('*/5 * * * *');
+  } finally { db.close(); }
+});
+
+test('every active elanous-related cron line is a loop, CLI action or unregistered warning', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-accounted-'));
+  roots.push(root);
+  mkdirSync(join(root, 'graphs'));
+  writeFileSync(join(root, 'graphs', 'daily.yaml'), "graph_id: daily\nloop:\n  trigger:\n    cron: '*/5 * * * *'\n");
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    const lines = [
+      `*/5 * * * * cd ${root} && bun bin/elanous.mjs graph run graphs/daily.yaml`,
+      "*/6 * * * * hq-fence cron '/home/ops/.bun/bin/eln --version > /tmp/eln-version'",
+      '*/7 * * * * eln where',
+      '*/8 * * * * elanous future-action --json',
+      '*/9 * * * * /home/ops/.elanous/bin/mystery --unknown',
+      '*/10 * * * * echo "eln where"',
+      '*/11 * * * * unrelated worker',
+      '# */12 * * * * eln --version',
+      '',
+    ];
+    inventoryCrontab(db, { crontab: lines.join('\n') + '\n' });
+    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
+    const entries = listAllLoops(opts);
+    expect(entries.find(entry => entry.id === 'daily')).toMatchObject({ kind: 'graph', registered: true });
+    expect(entries.find(entry => entry.cron === '*/6 * * * *')).toMatchObject({ id: 'elanous:--version', fenceRole: 'cron' });
+    expect(entries.find(entry => entry.cron === '*/7 * * * *')).toMatchObject({ id: 'elanous:where', title: 'where' });
+    expect(entries.find(entry => entry.cron === '*/8 * * * *')).toMatchObject({ kind: 'unregistered', registered: false, command: 'elanous future-action --json' });
+    const warnings = unregisteredCronLoops(entries, opts);
+    expect(warnings.map(row => row.cron).sort()).toEqual(['*/10 * * * *', '*/8 * * * *', '*/9 * * * *']);
+    expect(entries.filter(entry => entry.kind === 'unregistered').map(entry => entry.cron).sort())
+      .toEqual(['*/10 * * * *', '*/8 * * * *', '*/9 * * * *']);
+    expect(entries.filter(entry => entry.kind === 'unregistered').map(entry => entry.command).sort())
+      .toEqual(['/home/ops/.elanous/bin/mystery --unknown', 'echo "eln where"', 'elanous future-action --json'].sort());
+    const related = opts.schedules.filter(row => row.source === 'crontab' && row.run_via === 'crontab'
+      && row.disabled_reason !== 'vanished' && row.disabled_reason !== 'manual'
+      && /\b(?:eln|elanous|hq-fence)\b|\.elanous\//.test(row.command ?? ''));
+    expect(related).toHaveLength(6);
+    expect(related.length).toBe(entries.filter(entry => entry.kind === 'graph' && entry.registered).length
+      + entries.filter(entry => entry.id.startsWith('elanous:')).length + warnings.length);
+    expect(entries.filter(entry => entry.kind === 'unregistered').every(entry => !entry.registered && entry.enabled)).toBe(true);
+    expect(checkLoops(entries, opts.now).filter(entry => entry.state === 'unregistered').map(entry => entry.id).sort())
+      .toEqual(entries.filter(entry => entry.kind === 'unregistered').map(entry => entry.id).sort());
+    expect(opts.schedules.some(row => row.raw === lines[7] && row.enabled)).toBe(false);
+    const logs: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    debug.log = ((category, event, data) => { logs.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      const damaged = [...entries, entries.find(entry => entry.id === 'elanous:where')!];
+      expect(unregisteredCronLoops(damaged, opts).map(row => row.cron)).toContain('*/7 * * * *');
+    } finally { debug.log = original; }
+    expect(logs).toContainEqual({ category: 'loops.registry', event: 'unaccounted', data: { lines: ['*/7 * * * * eln where'] } });
   } finally { db.close(); }
 });
 
@@ -486,8 +632,11 @@ test('unclaimed elanous-related cron lines warn even when their command cannot b
     ].join('\n') + '\n' });
     const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
     const entries = listAllLoops(opts);
-    expect(entries.map(entry => entry.id)).toEqual(['elanous:hq-heartbeat', 'elanous:harness-queue']);
-    expect(unregisteredCronLoops(entries, opts).map(row => row.cron).sort()).toEqual(['*/5 * * * *', '*/6 * * * *', '*/7 * * * *', '*/8 * * * *'].sort());
+    expect(entries.filter(entry => entry.kind !== 'unregistered').map(entry => entry.id)).toEqual([
+      'elanous:card-list', 'elanous:hq-status', 'elanous:hq-heartbeat',
+      'elanous:harness-queue-2', 'elanous:harness-queue', 'elanous:logs-query',
+    ]);
+    expect(unregisteredCronLoops(entries, opts)).toEqual([]);
     expect(unregisteredCronLoops([], opts).map(row => row.cron).sort()).toEqual([
       '*/5 * * * *', '*/6 * * * *', '*/7 * * * *', '*/8 * * * *', '*/9 * * * *', '*/10 * * * *',
     ].sort());

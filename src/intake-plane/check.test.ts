@@ -2,7 +2,44 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { deriveRuler, runIntakeCheck } from './check.js';
+import { deriveRuler, intakeCheckReportJson, renderIntakeCheckReport, runIntakeCheck } from './check.js';
+
+test('replacement candidate requires the tool to replace the paid dependency, not the reverse', () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-replacement-'));
+  const ruler = { capabilities: [], surfaces: [], promises: [], failures: [] };
+  const trial = { installation: '미검증', sampleRun: '미검증', license: '미검증', maintenanceStatus: '미검증' } as const;
+  try {
+    const facts = [
+      '유료 `firecrawl` 을 `crawlerkit` 이 대체할 수 있다',
+      '`crawlerkit` 이 유료 `firecrawl` 을 대체할 수 있다',
+      '유료 `firecrawl` 이 `crawlerkit` 을 대체할 수 있다',
+      '`crawlerkit` can replace paid `firecrawl`',
+      'paid `firecrawl` can replace `crawlerkit`',
+      '유료 `firecrawl` 과 `crawlerkit` 을 비교한다',
+      '`crawlerkit`이 유료 `firecrawl`을 대체하지 않는다',
+      '`crawlerkit`이 유료 `firecrawl`을 대체하지는 않는다',
+      '`crawlerkit`이 유료 `firecrawl`을 대체할 수는 없다',
+    ];
+    const report = runIntakeCheck(facts.map((text) => ({ text })), {
+      root, readFile: (path) => readFileSync(path, 'utf8'), listFiles: () => [],
+      commit: () => 'test', draftDir: join(root, 'drafts'), log: () => {},
+    }, { ruler });
+    for (const index of [0, 1, 3]) {
+      const item = report.items[index]!;
+      expect(item.verdict).toBe('판단 필요');
+      expect(item.replacementCandidate).toEqual({ tool: 'crawlerkit', paidDependency: 'firecrawl', status: '현장 시험 필요', trial });
+      expect(item.goalDraftPath).toBeUndefined();
+      expect(renderIntakeCheckReport(report)).toContain('대체 후보: crawlerkit → 유료 의존성 firecrawl (현장 시험 필요)');
+      expect((intakeCheckReportJson(report).items as typeof report.items)[index]!.replacementCandidate).toEqual(item.replacementCandidate);
+    }
+    for (const index of [2, 4, 5, 6, 7, 8]) {
+      expect(report.items[index]!.replacementCandidate).toBeUndefined();
+      expect(report.items[index]!.current).not.toContain('대체 후보');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('repository documentation alone cannot prove a capability', () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-doc-only-'));

@@ -5,6 +5,29 @@ import type { Project } from '@/lib/projects-api';
 
 export type ProjectSelection = 'all' | 'none' | string;
 export const PROJECT_SELECTION_KEY = 'elanous.chat.projectSelection';
+export const PROJECT_PENDING_CHANGED = 'elanous-chat-pending-projects-changed';
+export const PROJECTS_CHANGED = 'elanous-chat-projects-changed';
+
+export function notifyProjectsChanged(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(PROJECTS_CHANGED));
+}
+const PENDING_PROJECTS_KEY = 'elanous.chat.pendingProjects';
+
+export function readPendingProjects(): Record<string, string> {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(PENDING_PROJECTS_KEY) ?? '{}');
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+      return Object.fromEntries(Object.entries(stored).filter(([id, projectId]) => id && typeof projectId === 'string' && projectId));
+    }
+  } catch { /* Storage can be unavailable or malformed. */ }
+  return {};
+}
+
+export function writePendingProjects(pending: Record<string, string>): boolean {
+  try { localStorage.setItem(PENDING_PROJECTS_KEY, JSON.stringify(pending)); } catch { return false; }
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(PROJECT_PENDING_CHANGED));
+  return true;
+}
 
 export function ChatProjectSwitcher({ projects, selection, onChange, onCreate }: {
   projects: Project[];

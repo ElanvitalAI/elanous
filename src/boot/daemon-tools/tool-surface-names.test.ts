@@ -34,7 +34,7 @@ const CHAT_CORE = [
   'schedule_manage', 'session_manage', 'memory_recall', 'fact_check', 'self_recall', 'context_now',
   'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
   // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).
-  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'elanous_skills_list', 'skill_exec',
+  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec',
 ];
 const CHAT_PTY_EXTRA = ['ElanousHold', 'PtyControl'];
 // webterm 이 chat 위에 항상 더하는 것(pty 무관) — 자율tool 3종(nest-cap off 전제) + 웹터미널/카메라.

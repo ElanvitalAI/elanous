@@ -125,12 +125,24 @@ export async function scanStoppedPrs({ runGh }: { runGh: RunGh }): Promise<Scann
 }
 
 if (import.meta.main) {
-  if (process.argv.slice(2).some((arg) => arg !== '--json')) {
-    console.error('사용법: bun src/harness/helper-scan.ts [--json]');
+  const args = process.argv.slice(2);
+  const json = args.includes('--json');
+  const recordShadows = args.includes('--record-shadows');
+  if (args.some((arg) => arg !== '--json' && arg !== '--record-shadows') || (json && recordShadows) || args.length > 1) {
+    console.error('사용법: bun src/harness/helper-scan.ts [--json | --record-shadows]');
     process.exitCode = 1;
   } else {
-    const rows = await scanStoppedPrs({ runGh: (args) => execFileSync('gh', [...args], { encoding: 'utf8' }) });
-    if (process.argv.includes('--json')) console.log(JSON.stringify(rows, null, 2));
+    // 열린 PR 본문 전체는 기본 버퍼(1MB)를 넘는다(10-05 운영 ENOBUFS) — 넉넉히 준다.
+    const runGh = (args: readonly string[]) => execFileSync('gh', [...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+    const rows = await scanStoppedPrs({ runGh });
+    if (recordShadows) {
+      // 명시적 그림자 기록에서만 추가 PR 조회와 헬퍼 원장 쓰기를 수행한다(발사 0).
+      const { recordRepairShadows } = await import('./helper-repair.js');
+      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+      const shadows = await recordRepairShadows(rows, { runGh, root: effectiveInstanceRoot() });
+      if (shadows.length) console.log(`수리 골 그림자 ${shadows.length}건 → helper/repairs.jsonl`);
+    }
+    if (json) console.log(JSON.stringify(rows, null, 2));
     else for (const row of rows) {
       const gate = row.blockerCount ? ` · Gate 차단 ${row.blockerCount}(${row.hasPublicExportLeak ? row.blockers.find((line) => /public-export-leak/i.test(line))?.trim() ?? '✗ public-export-leak (6번째 이후)' : row.blockers[0]!.trim()})` : '';
       console.log(`#${row.pr} ${row.category}${gate} → ${row.firstAction}`);

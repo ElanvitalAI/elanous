@@ -59,6 +59,9 @@ verify:
 vault-note:
   command: 'bun scripts/release-loop/vault-note-node.ts'
   timeout_ms: 60000
+release-story:
+  command: 'bun scripts/release-story/draft.ts --graph'
+  timeout_ms: 600000
 ops-upgrade:
   command: 'bun scripts/release-loop/ops-upgrade-node.ts'
   timeout_ms: 1200000

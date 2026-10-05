@@ -16,6 +16,7 @@ import { clearChatQueue, dequeueChat, enqueueChat, removeChat, type ChatQueueEnt
 import { ChatDropOverlay } from './ChatDropOverlay';
 import { nextDropOverlay, type DropOverlayState } from '@/lib/drop-overlay';
 import { SessionPill } from './SessionPill';
+import { ChatCurrentProject } from './ChatCurrentProject';
 import { ChatHud } from './blocks/ChatHud';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
 import { restorableChatMessages } from '@/lib/session-restore';
@@ -1159,6 +1160,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
             />
           </div>
+          <div className="min-w-0 shrink-0"><ChatCurrentProject compact /></div>
           <NowSpeakButton />
           <div ref={moreRef} className="relative shrink-0">
             <button type="button" aria-label="채팅 더보기" aria-expanded={moreOpen} aria-controls="chat-header-more" onClick={() => setMoreOpen((open) => !open)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-muted">
@@ -1184,7 +1186,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
             <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
           </div>
-          <div className="flex items-center gap-2"><NowSpeakButton />{voiceButton}</div>
+          <div className="flex min-w-0 items-center gap-2"><ChatCurrentProject /><NowSpeakButton />{voiceButton}</div>
         </div>
       )}
       <SeatsNowStrip />

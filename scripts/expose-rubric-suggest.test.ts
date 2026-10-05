@@ -50,6 +50,51 @@ describe('expose rubric suggestions — measurement, not judgement', () => {
     expect(readFileSync(ledger)).toEqual(original);
   });
 
+  test('missing brand rules mark only brand unmeasured and keep independent passes in API, CLI and YAML patch', () => {
+    const missing = join(root, 'absent-rules.yaml');
+    const [row] = suggestExposeRubric(root, [path('one')], help, missing);
+    expect(row!.criteria).toEqual({
+      reproducible: { status: 'pass', reason: '명령 1개 모두 --help 에 있음' },
+      confidential: { status: 'pass', reason: '누출 표식 없음' },
+      brand: { status: 'n/a', reason: '규칙 없음 — 측정 불가' },
+    });
+    const lines: string[] = [];
+    const print = console.log;
+    const patch = join(root, 'missing-rules-patch.yaml');
+    try {
+      console.log = (...args) => { lines.push(args.join(' ')); };
+      expect(run(['--files', path('one'), '--rules', missing, '--yaml-patch', patch], root, help)).toBe(0);
+    } finally { console.log = print; }
+    expect(lines[0]).toContain('brand n/a(규칙 없음 — 측정 불가)');
+    expect(lines[1]).toContain('pass 2');
+    expect(parse(readFileSync(patch, 'utf8')).entries[0].criteria).toEqual(row!.criteria);
+    expect(readFileSync(ledger)).toEqual(original);
+    const [measured] = suggestExposeRubric(root, [path('one')], help);
+    expect(measured!.criteria.brand).toEqual({ status: 'pass', reason: '브랜드 규칙 위반 없음' });
+  });
+
+  test('missing brand rules do not hide a confidential leak or an independent failure', () => {
+    const missing = join(root, 'absent-rules.yaml');
+    const leak = path('leaking');
+    writeFileSync(join(root, leak), '# Example\n// Created by Example Author\n`elanous doctor missing`\n');
+    try {
+      const [row] = suggestExposeRubric(root, [leak], help, missing);
+      expect(row!.criteria.brand).toEqual({ status: 'n/a', reason: '규칙 없음 — 측정 불가' });
+      expect(row!.criteria.confidential).toEqual({ status: 'fail', reason: '누출 표식: xcode-author-header' });
+      expect(row!.criteria.reproducible).toEqual({ status: 'fail', reason: '없는 명령: elanous doctor missing' });
+      const [measured] = suggestExposeRubric(root, [leak], help);
+      expect(row!.criteria.confidential).toEqual(measured!.criteria.confidential);
+      const lines: string[] = [];
+      const print = console.log;
+      try {
+        console.log = (...args) => { lines.push(args.join(' ')); };
+        expect(run(['--json', '--files', leak, '--rules', missing], root, help)).toBe(0);
+      } finally { console.log = print; }
+      expect(JSON.parse(lines[0]!).at(0).criteria).toEqual(row!.criteria);
+      expect(readFileSync(ledger)).toEqual(original);
+    } finally { rmSync(join(root, leak)); }
+  });
+
   test('help 예외·실패는 없는 명령이라 추측하지 않고 n/a, 나머지 기준은 계속 측정', () => {
     for (const down of [(() => { throw new Error('help down\nraw details'); }) as HelpRunner, (() => ({ ok: false, out: '' })) as HelpRunner]) {
       const [item] = suggestExposeRubric(root, [path('one')], down);

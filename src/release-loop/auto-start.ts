@@ -15,10 +15,12 @@ export function selectScheduledCut(schedules: readonly ReleaseSchedule[], now: D
     .sort((a, b) => Date.parse(a.cutAt) - Date.parse(b.cutAt) || a.version.localeCompare(b.version))[0] ?? null;
 }
 
+export type AutoStartDeferral = { deferred: true; reason: Exclude<ReleaseReadiness, { ready: true }>['reason'] | 'frozen' };
+
 export type AutoStartResult =
   | { status: 'no-cut' }
   | { status: 'planned'; version: string; cutAt: string }
-  | { status: 'skipped'; version: string; reason: Exclude<ReleaseReadiness, { ready: true }>['reason'] }
+  | { status: 'skipped'; version: string; reason: AutoStartDeferral['reason'] }
   | { status: 'started'; version: string; cutAt: string };
 
 export interface AutoStartOptions {
@@ -28,7 +30,7 @@ export interface AutoStartOptions {
   ledgerRoot?: string;
   schedules?: (root: string) => ReleaseSchedule[];
   readiness?: (version: string, ledgerRoot: string, now: Date) => ReleaseReadiness;
-  launch?: (version: string) => void | Promise<void>;
+  launch?: (version: string) => void | AutoStartDeferral | Promise<void | AutoStartDeferral>;
 }
 
 /** Select from the release schedule; the existing `release run --if-ready` owns the launch-time lock and guards. */
@@ -43,6 +45,7 @@ export async function autoStartScheduledRelease(options: AutoStartOptions): Prom
   const readiness = (options.readiness ?? ((v, ledgerRoot, at) => releaseReadiness(v, { ledgerRoot, now: () => at })))(version, root, now);
   if (!readiness.ready) return { status: 'skipped', version, reason: readiness.reason };
   if (!options.launch) throw new Error('auto-start apply requires a launch callback');
-  await options.launch(version);
+  const launched = await options.launch(version);
+  if (launched?.deferred) return { status: 'skipped', version, reason: launched.reason };
   return { status: 'started', version, cutAt };
 }

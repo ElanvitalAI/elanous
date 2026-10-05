@@ -14,8 +14,8 @@ export type LoopScope = 'graph-only' | 'registry';
 export interface CheckEntry {
   id: string;
   owner?: string;
-  ownerSource?: 'header' | 'config' | 'seat' | 'default';
-  evidence?: 'log-mtime';
+  ownerSource?: 'header' | 'config' | 'seat' | 'seat-arg' | 'default';
+  evidence?: 'log-mtime' | 'registry';
   mode?: string;
   expectEveryMinutes?: number;
   /** The scheduled fire before the latest one (cron loops). A run older than this missed two scheduled fires. */

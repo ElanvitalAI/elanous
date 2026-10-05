@@ -4,10 +4,14 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import type { Command } from 'commander';
+import { writeStdoutJson } from '../cli/stdout-json.js';
 import { debug } from '../debug/log.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig, type HqConfig, type HqFenceRole } from '../user-config.js';
+import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';
+import type { HqOpRequestWriter, PromoteResult } from './promote.js';
 import {
   DEFAULT_TTL_SECONDS, decideAcquire, decideArbiterCheck, decideFence, decideRelease, decideRenew, defaultSshRunner,
   fileLeaseStore, leaseExpired, parseLease, probeReachable, recordView, serializeLease, sshLeaseStore, sshReachable, localShellRunner,
@@ -15,6 +19,21 @@ import {
 } from './lease.js';
 
 export const FENCE_ROLES: readonly HqFenceRole[] = ['telegram-poller', 'cron', 'seat-loop', 'release-run', 'conatus', 'git-push', 'ledger-cli'];
+
+/** Register only the read-only move inventory; keep it outside lease/fence mutation flows. */
+export function registerHqMovePlanCommand(hqCmd: Command): void {
+  hqCmd.command('move-plan').description('현재 호스트의 작업·launchd 및 대상 호스트 파일을 조회(읽기 전용)')
+    .requiredOption('--to <host>', '이동 대상 호스트')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { to: string; json?: boolean }) => {
+      try {
+        const { hqMovePlan, formatMovePlan } = await import('./move-plan.js');
+        const result = hqMovePlan(opts.to);
+        if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+        else console.log(formatMovePlan(result));
+      } catch (error) { console.error(`hq move-plan: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
+}
 
 export interface HqDeps {
   config?: HqConfig;
@@ -29,6 +48,9 @@ export interface HqDeps {
   seenPath?: string;
   now?: () => number;
   log?: typeof debug.log;
+  /** Injection points for the OP seat request and the promotion runbook; production uses durable defaults. */
+  opRequest?: HqOpRequestWriter;
+  promote?: (host: string, apply: boolean) => PromoteResult;
 }
 
 interface Resolved { me: string; arbiter: string; standby: string; ttl: number; failOpen: Set<HqFenceRole>; store: LeaseStore; ssh: SshRunner; probe: HostProbe; localPath: string; seenPath: string; now: () => number; log: typeof debug.log }
@@ -247,19 +269,55 @@ export function hqHeartbeat(deps: HqDeps = {}) {
 
 /**
  * Arbiter check (cron on cloud-vm every 10 min, next to the file): probe the holder over the tailnet
- * (`tailscale ping` ⊕ nexus health · no ssh into home machines) and promote per rule ②.
+ * (`tailscale ping` ⊕ nexus health · no ssh into home machines); propose to OP by default.
  */
 export function hqArbiterCheck(deps: HqDeps & { leasePath?: string } = {}) {
   const r0 = resolve(deps);
   const r = deps.store ? r0 : { ...r0, store: fileLeaseStore(deps.leasePath ?? join(process.env.HOME ?? '', '.elanous-hq', 'lease.json')) };
-  let outcome: { promoted: boolean; streak: number; holder?: string; generation?: number; ping?: boolean; health?: boolean } = { promoted: false, streak: 0 };
+  let outcome: { promoted: boolean; streak: number; holder?: string; generation?: number; ping?: boolean; health?: boolean; runbookFailed?: string } = { promoted: false, streak: 0 };
+  let proposal: { holder: string; generation: number; streak: number } | undefined;
+  const config = deps.config ?? getUserConfig().hq ?? {};
+  const threshold = config.autoPromote?.streak ?? 3;
+  const autoPromote = config.autoPromote?.enabled === true;
+  let leaseMoved: { from: string; to: string; generation: number } | undefined;
   const result = mutate(r, (record, now) => {
     if (!record) return { ok: false, reason: 'no lease' };
     const seen = probeReachable(record.holder, r.probe);
-    const checked = decideArbiterCheck(record, { arbiter: r.me, standby: r.standby, arbiterReachesHolder: seen.reachable, now });
-    outcome = { promoted: checked.promoted, streak: checked.streak, holder: checked.next.holder, generation: checked.next.generation, ping: seen.ping, health: seen.health };
+    const checked = decideArbiterCheck(record, { arbiter: r.me, standby: r.standby, arbiterReachesHolder: seen.reachable, now,
+      promote: autoPromote, promoteAfterChecks: threshold });
+    proposal = !autoPromote && !seen.reachable && record.holder !== r.standby && checked.streak >= threshold
+      ? { holder: record.holder, generation: record.generation, streak: checked.streak } : undefined;
+    // promoteHq's own precondition is «lease holder = target», so the lease moves first and the runbook follows.
+    if (checked.promoted) leaseMoved = { from: record.holder, to: checked.next.holder, generation: checked.next.generation };
+    outcome = { promoted: false, streak: checked.streak, holder: checked.next.holder, generation: checked.next.generation, ping: seen.ping, health: seen.health };
     return { ok: true, next: checked.next };
   });
+  const moved = leaseMoved as { from: string; to: string; generation: number } | undefined; // assigned inside the mutate callback
+  if (result.ok && moved) {
+    let promotion: PromoteResult | undefined;
+    let failure: string | undefined;
+    try {
+      promotion = (deps.promote ?? ((host: string, apply: boolean) => promoteHq(host, apply)))(moved.to, true);
+      if (!promotion.ok) failure = promotion.lines.filter((line) => line.status === 'failed').map((line) => `${line.step}: ${line.measurement}`).join(' · ') || 'runbook returned ok=false';
+    } catch (error) { failure = String(error); }
+    if (failure === undefined) outcome = { ...outcome, promoted: true };
+    else {
+      // The lease already names the standby but the services did not move — never report this as a promotion.
+      outcome = { ...outcome, promoted: false, runbookFailed: failure };
+      try { r.log('hq.arbiter', 'promote-runbook-failed', { ...moved, error: failure }); } catch { /* observation is fail-soft */ }
+      try {
+        (deps.opRequest ?? ((request) => writeOpSeatRequest(request)))({
+          key: `hq:promote-failed:${moved.to}:${moved.generation}`,
+          text: `자동 승격 런북 실패 — 임대는 ${moved.to}(세대 ${moved.generation})로 옮겨졌지만 서비스 이전이 끝나지 않았다: ${failure}. OP 가 \`eln hq promote --to ${moved.to}\` 로 확인한다.`,
+        });
+      } catch (error) { try { r.log('hq.arbiter', 'promote-request-failed', { ...moved, error: String(error) }); } catch { /* fail-soft */ } }
+    }
+  }
+  const proposed = proposal as { holder: string; generation: number; streak: number } | undefined;
+  if (result.ok && proposed) {
+    try { proposeHqPromotion({ ...proposed, standby: r.standby }, { request: deps.opRequest, log: r.log }); }
+    catch (error) { try { r.log('hq.arbiter', 'promote-proposal-failed', { ...proposed, error: String(error) }); } catch { /* observation is fail-soft */ } }
+  }
   observe(r, 'hq.lease', outcome.promoted ? 'promoted' : 'arbiter-check', { ...outcome, ok: result.ok });
   return { ok: result.ok, ...outcome };
 }

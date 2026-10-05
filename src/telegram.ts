@@ -66,7 +66,9 @@ import { detectUrlRoute, type UrlRouteDecision } from './skills/url-router.js';
 import { observeDevRequestRouteFailSoft } from './skills/dev-request-router.js';
 import { runUrlRoute } from './skills/url-route-exec.js';
 import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
-import { classifyFrontInput } from './intake-plane/front-classifier.js';
+import { classifyFrontInput, telegramAbsorbUrls } from './intake-plane/front-classifier.js';
+import { scheduleIntakeEvent } from './intake-plane/route.js';
+import { dispatchTaskCreate } from './task-orchestrator/runtimes/create.js';
 import { handleTelegramSeatWork, type TelegramSeatWorkDeps } from './intake-plane/telegram-seat-work.js';
 import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
@@ -1919,11 +1921,30 @@ export class TelegramBot {
         ? getActiveDelegation(delegationChatKey(this.botId, ctx.chatId, ctx.threadId))
         : null;
       if (!activeDeleg) {
-        try {
-          classifyFrontInput({ text: ctx.text, surface: 'telegram' }, { urlRouting: getUserConfig().skills.urlRouting });
-        } catch { /* observation must not interrupt URL routing */ }
         const urlDec = detectUrlRoute(ctx.text, getUserConfig().skills.urlRouting);
         if (urlDec) {
+          try {
+            const frontInput = { text: ctx.text, surface: 'telegram' as const };
+            const decision = classifyFrontInput(frontInput, { urlRouting: getUserConfig().skills.urlRouting });
+            const absorbUrls = telegramAbsorbUrls(frontInput, decision);
+            for (const url of absorbUrls) {
+              const result = await scheduleIntakeEvent(effectiveInstanceRoot(), url, {
+                eventMax: getUserConfig().intake.eventMax,
+                post: async ({ url: link }) => {
+                  const posted = await dispatchTaskCreate({
+                    title: `흡수: ${link}`.slice(0, 80),
+                    surface: { kind: 'llm-direct', prompt: `이 링크를 흡수하고 노트로 저장하세요: ${link}` },
+                  });
+                  if (!posted.taskId) throw new Error('intake event task not created');
+                  return { taskId: posted.taskId };
+                },
+              });
+              if (result.reply) await this.sendMessage(ctx.chatId, result.reply, { threadId: ctx.threadId, markdown: true });
+            }
+            if (absorbUrls.length) return;
+          } catch (error) {
+            debug.log('intake.event', 'failed', { reason: error instanceof Error ? error.name : 'unknown' });
+          }
           const handled = await this.runUrlRouteReply(ctx, urlDec);
           if (handled) return;
         }

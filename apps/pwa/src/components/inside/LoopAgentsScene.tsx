@@ -5,6 +5,9 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getSeats, type OpsSeats } from '@/lib/ops-api';
 import { createNexusClient, type HarnessRunsResponse } from '@/nexus/client';
 import { loopAgentsView, type LoopAgentsView } from './loop-agents-view';
+import { loadLoopRows, type LoopRow } from '@/components/loops/loop-status';
+import { LoopActivityMap } from './LoopActivityMap';
+import { activityEdges, applyLoopOwners, newlySeenEdges, ACTIVITY_WINDOW_MS, type ActivityEdge, type LoopOwner } from './loop-activity-map';
 
 const EMPTY = loopAgentsView(null, null);
 
@@ -38,8 +41,13 @@ export function LoopAgentsViewContent({ view, runsUnreadable, refreshedAt }: {
 export function LoopAgentsScene() {
   const { client, config } = useDaemon();
   const [snapshot, setSnapshot] = useState<{ source: string; seats: OpsSeats | null; runs: HarnessRunsResponse | null; runsUnreadable: boolean; refreshedAt: string | null } | null>(null);
+  const [mode, setMode] = useState<'activity' | 'map'>('activity');
+  const [map, setMap] = useState<{ source: string; rows: LoopRow[]; edges: ActivityEdge[]; seenAt: Record<string, number>; state: 'ready' | 'error' } | null>(null);
+  const [now, setNow] = useState(0);
   const source = `${config.baseUrl}\u0000${config.token}`;
+  const mapSource = `${source}\u0000${mode}`;
   const current = snapshot?.source === source ? snapshot : null;
+  const subSeatIds = current?.seats?.seats.flatMap(seat => seat.subSeats?.map(sub => sub.id) ?? []) ?? [];
 
   useEffect(() => {
     let active = true;
@@ -64,6 +72,50 @@ export function LoopAgentsScene() {
     return () => { active = false; window.clearInterval(interval); document.removeEventListener('visibilitychange', visible); };
   }, [client, config.baseUrl, config.token, source]);
 
-  return <LoopAgentsViewContent view={current ? loopAgentsView(current.seats, current.runs) : EMPTY}
-    runsUnreadable={current?.runsUnreadable ?? true} refreshedAt={current?.refreshedAt ?? null} />;
+  useEffect(() => {
+    if (mode !== 'map') return;
+    let active = true;
+    let busy = false;
+    setMap(null);
+    setNow(Date.now());
+    const refresh = async () => {
+      if (!active || busy || document.hidden) return;
+      busy = true;
+      const receivedAt = Date.now();
+      try {
+        const [rows, owners, response] = await Promise.all([
+          loadLoopRows(path => client.fetchJson<unknown>(path), receivedAt),
+          client.fetchJson<{ owners: LoopOwner[] | null }>('/v1/schedules?includeOff=1&includeOwners=1'),
+          client.fetchJson<unknown>(`/v1/loops/edges?since=${encodeURIComponent(new Date(receivedAt - ACTIVITY_WINDOW_MS).toISOString())}&limit=200`),
+        ]);
+        const loopOwners = owners.owners;
+        if (!Array.isArray(loopOwners)) throw new Error('루프 주인 조회 실패');
+        const edges = activityEdges(response, receivedAt);
+        if (active) setMap(previous => ({ source: mapSource, rows: applyLoopOwners(rows, loopOwners, receivedAt), edges,
+          seenAt: newlySeenEdges(previous?.source === mapSource ? previous.seenAt : null, edges, receivedAt), state: 'ready' }));
+      } catch {
+        if (active) setMap(previous => ({ source: mapSource, rows: previous?.source === mapSource ? previous.rows : [],
+          edges: previous?.source === mapSource ? previous.edges : [],
+          seenAt: previous?.source === mapSource ? previous.seenAt : {}, state: 'error' }));
+      } finally { busy = false; }
+    };
+    void refresh();
+    const interval = window.setInterval(() => { void refresh(); }, 5_000);
+    const clock = window.setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 250);
+    const visible = () => { if (!document.hidden) void refresh(); };
+    document.addEventListener('visibilitychange', visible);
+    return () => { active = false; window.clearInterval(interval); window.clearInterval(clock); document.removeEventListener('visibilitychange', visible); };
+  }, [client, mode, mapSource]);
+
+  const currentMap = map?.source === mapSource ? map : null;
+  return <div className="min-w-0">
+    <div role="group" aria-label="루프 에이전트 보기" className="flex gap-2 px-4 pt-4">
+      <button type="button" aria-pressed={mode === 'activity'} onClick={() => setMode('activity')} className="min-h-11 rounded-lg border border-slate-500 px-4 py-2 aria-pressed:bg-sky-800">현황</button>
+      <button type="button" aria-pressed={mode === 'map'} onClick={() => setMode('map')} className="min-h-11 rounded-lg border border-slate-500 px-4 py-2 aria-pressed:bg-sky-800">지도</button>
+    </div>
+    {mode === 'activity' ? <LoopAgentsViewContent view={current ? loopAgentsView(current.seats, current.runs) : EMPTY}
+      runsUnreadable={current?.runsUnreadable ?? true} refreshedAt={current?.refreshedAt ?? null} />
+      : <div className="min-w-0 p-4"><LoopActivityMap rows={currentMap?.rows ?? []} edges={currentMap?.edges ?? []} seatIds={['OP', 'MK', 'TC', 'UX', ...subSeatIds]}
+          seenAt={currentMap?.seenAt ?? {}} now={now} state={currentMap?.state ?? 'loading'} /></div>}
+  </div>;
 }

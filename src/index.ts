@@ -31,6 +31,7 @@ import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entr
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
 import { registerPrivateLedgerCommands } from './cli/private-ledger-commands.js';
+import { registerSeatRequestsCommands } from './cli/seat-requests-cli.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
 import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
@@ -46,6 +47,7 @@ import { registerPublishCommands } from './cli/publish-cli.js';
 import { registerAutopilotCommands } from './cli/autopilot-cli.js';
 import { registerRoleCommands } from './cli/role-cli.js';
 import { registerMachineCommands } from './cli/machine-cli.js';
+import { registerAgentEnvCommands } from './cli/agent-env-cli.js';
 import { registerScheduleCommands } from './cli/schedule-cli.js';
 export { runSchedule, scheduleCreatePlan } from './cli/schedule-cli.js';
 export type { ScheduleDispatch } from './cli/schedule-cli.js';
@@ -80,6 +82,7 @@ import { registerStartCommand } from './cli/start-cli.js';
 import { registerGroundingSourcesCli } from './grounding/sources-cli.js';
 import { registerGraphCommands } from './graph-runner/graph-cli.js';
 import { registerLoopCommands } from './loops/loop-cli.js';
+import { registerHqMovePlanCommand } from './hq/hq.js';
 import { registerCardCommand } from './task-cards/card-cli.js';
 import { registerLaunchHeadCommands } from './launch-head/launch-head-cli.js';
 import { acpServerHelpText } from './boot/acp-server-help.js';
@@ -856,6 +859,7 @@ registerPrCommands(program);
 registerRepoCommands(program);
 registerRoleCommands(program);
 registerMachineCommands(program);
+registerAgentEnvCommands(program);
 // CLI entry: where action → resolveCurrentInstance → resolveInstance (instance universe).
 registerWhereCommand(program);
 registerShadowCommand(program);
@@ -937,6 +941,18 @@ hqCmd.command('seen').description('이 호스트가 본 가장 높은 임대 세
     else console.log(result.seen ? `hq seen: generation ${result.generation}` : 'hq seen: never');
     process.exitCode = result.seen ? 0 : 3;
   });
+registerHqMovePlanCommand(hqCmd);
+hqCmd.command('fence-audit').description('운영 crontab 의 HQ 울타리 밖 쓰기 잡 목록과 감싼 줄 제안(읽기 전용)')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      await hqSink();
+      const rows = (await import('./hq/fence-audit.js')).hqFenceAudit();
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(rows)}\n`);
+      else if (!rows.length) console.log('hq fence-audit: unfenced 0');
+      else for (const row of rows) console.log(`${row.raw}\n  role: ${row.recommendedRole}\n  suggested: ${row.suggestedLine}`);
+    } catch (error) { console.error(`hq fence-audit: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 명령 실행(아니면 건너뜀 · exit 0)')
   .requiredOption('--role <role>', 'telegram-poller|cron|seat-loop|release-run|conatus|git-push')
   .argument('<command...>', '-- 뒤의 명령')
@@ -947,6 +963,7 @@ hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 
     process.exitCode = hqFenceRun(opts.role as 'cron', command);
   });
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
+registerSeatRequestsCommands(seatCmd);
 seatCmd.command('answer <askId> <answer>').description('자리 질문에 답을 남기고 원래 표면으로 회신 예약')
   .action(async (askId: string, answer: string) => {
     try {
@@ -962,10 +979,10 @@ seatCmd.command('loop').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
     try {
       // V3 F5: without the sink, the seat loop's judgment lines (seat.loop) never reach the log store when cron runs it.
       await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('seat-loop');
-      const { runSeatLoopTurn } = await import('./seat-loop/seat-loop.js');
+      const { runSeatLoopTurn, seatLoopTickLine } = await import('./seat-loop/seat-loop.js');
       const result = await runSeatLoopTurn(opts.seat);
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
-      else console.log(`seat loop ${opts.seat}: ${result.status}${'runId' in result && result.runId ? ` ${result.runId}` : ''}`);
+      else console.log(seatLoopTickLine(result));
     } catch (error) { console.error(`seat loop: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 seatCmd.command('report').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
@@ -3458,6 +3475,22 @@ selfCmd
   });
 
 selfCmd
+  .command('speed-claims')
+  .description('런 원장 발사→종결 시간의 자리별·결과별 분포를 읽기 전용으로 출력한다')
+  .option('--json', '구조화된 JSON으로 출력한다')
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      const { measureSpeedClaims, renderSpeedClaims } = await import('./self-implement/speed-claims.js');
+      const result = measureSpeedClaims();
+      if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
+      else console.log(renderSpeedClaims(result));
+    } catch (error) {
+      console.error(`speed-claims measurement failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
+
+selfCmd
   .command('goal-source-distribution')
   .description('self-implement 런 원장의 start goalSource 분포를 읽기 전용으로 출력한다')
   .option('--json', '구조화된 JSON으로 출력한다')
@@ -4379,6 +4412,9 @@ const selfOrchestrateCmd = selfCmd
   .option('--no-pod-rebuild', 'pod: 이미지 판(elanous.commit)이 HEAD 와 달라도 다시 굽지 않는다 — 측정은 «이미지 판»을 잰다')
   .option('--pod-pass-env <keys>', 'pod: 호스트 env 에서 Pod 로 넘길 키(쉼표) — 예 OPENROUTER_API_KEY,ANTHROPIC_API_KEY(벤치마크 과금 경로)')
   .option('--bench-arms <spec>', 'pod 벤치마크: 골 1개를 팔마다 «라벨 한 줄만 다르게» 복제해 동시에 — "id=provider[:model][@KEY+KEY];…" (예 codex=openai-codex;or-kimi=openrouter:openrouter/moonshotai/kimi-k3@OPENROUTER_API_KEY) · --auto-merge 거부 · RFC fleet 슈퍼바이저 §A3')
+  .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
+  .addOption(new Option('--child-llm-model <id>', 'pod: 구현 자식 LLM model(--child-llm-provider 와 함께)').hideHelp())
+  .addOption(new Option('--child-llm-effort <level>', 'pod: 구현 자식 추론 노력(--child-llm-provider 와 함께)').hideHelp())
   .option('--help-all', '모든 orchestrate 옵션 표시')
   .action(function (this: Command, parts: string[], opts: { goalFile?: string[]; concurrency?: string; autoMerge?: boolean; autoReview?: boolean; openPr?: boolean; base?: string; teardown?: boolean; resume?: string; board?: boolean; decompose?: boolean; fabricDecompose?: boolean; maxTasks?: string; supervise?: boolean; superviseRounds?: string; json?: boolean }) {
     return (async () => {
@@ -4613,6 +4649,19 @@ const selfOrchestrateCmd = selfCmd
         let rotationAccounts: readonly string[] | undefined;
         let podProvider: 'openai-codex' | 'grok' = 'openai-codex';
         let grokApiKeyOptIn = false;
+        {
+          // 10-05 PODPROVIDER: refuse child choices this Pod launch cannot honour instead of dropping them.
+          const child = opts as { childLlmProvider?: string; childLlmModel?: string; childLlmEffort?: string };
+          const named = child.childLlmProvider?.trim();
+          const refuse = !named && (child.childLlmModel?.trim() || child.childLlmEffort?.trim())
+            ? 'pod: --child-llm-model/--child-llm-effort 는 --child-llm-provider 와 함께'
+            : named && benchArms
+              ? 'pod: --child-llm-provider 는 --bench-arms 와 함께 못 쓴다(팔마다 모델이 하나다)'
+              : named === 'grok' && explicitPodAccount
+                ? 'pod: --child-llm-provider grok 은 --pod-account 와 함께 못 쓴다(그것은 codex 계정을 고정한다)'
+                : undefined;
+          if (refuse) { ui.error(refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: named ?? null, reason: refuse }); process.exit(2); }
+        }
         if (!explicitPodAccount && !benchArms) {
           const { inspectCodexRotation } = await import('./oauth/codex-account-store.js');
           const { planPodProvider, makePodAccountBroker } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
@@ -4651,17 +4700,31 @@ const selfOrchestrateCmd = selfCmd
               if (!opts.json) ui.warn(podGrokSkippedLine(grokCheck));
             }
           }
-          const plan = planPodProvider({
+          // 10-05 PODPROVIDER: a launch that named the child provider gets it, or is refused — never a silent codex.
+          const namedChild = (opts as { childLlmProvider?: string }).childLlmProvider?.trim();
+          const { podNamedChildProvider, podFallbackCredentials, podGrokSubscriptionUsable: namedGrokUsable } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
+          const namedChildDecision = podNamedChildProvider(namedChild, {
+            grokSubscription: namedChild === 'grok' && credential?.kind === 'subscription' && (grokSubscriptionUsable || namedGrokUsable().usable),
+            grokApiKey: credential?.kind === 'api_key' && grokApiKeyOptIn,
+          });
+          if (namedChildDecision.refuse) { ui.error(namedChildDecision.refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: namedChild, reason: namedChildDecision.refuse }); process.exit(2); }
+          // A named codex child must stay codex — the plan may not fall back to grok (post-review must-fix).
+          const namedCodex = namedChildDecision.provider === 'openai-codex';
+          const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan = namedChildDecision.provider === 'grok'
+            ? { provider: 'grok', excluded: [], grokSubscriptionEligible: credential?.kind === 'subscription' }
+            : planPodProvider({
             codexCandidates: inspectCodexRotation().candidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
             thresholdPercentByAccount: getUserConfig().llm?.codexAccountRotationThresholdPercentByAccount,
             // 대표 한도 정책 한 값(`llm.codexQuotaPolicy`) — 크레딧·폴백을 같이 정한다.
             creditsAllowed: codexPolicyAllowsCredits(quotaPolicy),
-            grokSubscription: codexPolicyAllowsFallback(quotaPolicy) && grokSubscriptionUsable,
-            grokApiKey: codexPolicyAllowsFallback(quotaPolicy) && credential?.kind === 'api_key',
+            ...podFallbackCredentials(namedChildDecision.provider, {
+              grokSubscription: codexPolicyAllowsFallback(quotaPolicy) && grokSubscriptionUsable,
+              grokApiKey: codexPolicyAllowsFallback(quotaPolicy) && credential?.kind === 'api_key',
+            }),
             grokApiKeyOptIn,
           });
-          if (plan.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
+          if (plan.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')}${namedCodex ? ' · child provider 를 openai-codex 로 지정해 grok 으로 넘기지 않는다' : ''} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
           podProvider = plan.provider;
           if (plan.provider === 'openai-codex') {
             accountBroker = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
@@ -4670,6 +4733,10 @@ const selfOrchestrateCmd = selfCmd
             { const { emitDecision } = await import('./live/detail-switch.js');
               emitDecision({ kind: 'ROUTE', what: `Pod 계정 배분 ${plan.accounts.join(' → ')}`, reason: plan.excluded.length ? `뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : '모든 계정 여유', purpose: plan.creditAccounts ? '구독 잔량 0 — 정책상 크레딧으로 병렬 조각을 돌린다' : '병렬 조각이 한 계정에 몰리지 않게 잔량 순으로 돌려 준다', phase: 'dispatch', target: `Pod ${plan.accounts.length}계정`, paths: plan.accounts.length + plan.excluded.length }); }
             if (!opts.json) ui.info(`[pod] 계정 배분(잔량 순 · 돌려 가며): ${plan.accounts.join(' → ')}${plan.creditAccounts ? ' · 💳 크레딧(구독 잔량 0 · 허가됨)' : ''}${plan.excluded.length ? ` · 뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : ''}`);
+          } else if (namedChildDecision.provider === 'grok') {
+            const model = (opts as { childLlmModel?: string }).childLlmModel?.trim() || defaultGrokModel().id;
+            debug.log('self-implement.pod', 'provider-named', { provider: 'grok', model, credential: credential?.kind ?? null });
+            if (!opts.json) ui.info(`[pod] child provider = grok(모델 ${model}) — 발사 인자로 지정됨`);
           } else {
             const model = defaultGrokModel().id;
             debug.log('self-implement.pod', 'provider-fallback', { from: 'openai-codex', to: 'grok', excluded: plan.excluded, model });
@@ -4697,7 +4764,10 @@ const selfOrchestrateCmd = selfCmd
             ...(podSource.kind === 'bundle' ? { headCommit: podSource.headCommit, sizeBytes: podSource.sizeBytes } : {}),
           });
         }
-        const podBase = { hostSupervised: opts.supervise === true, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker, rotationAccounts } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
+        const childFlags = opts as { childLlmProvider?: string; childLlmModel?: string; childLlmEffort?: string };
+        const podChildLlm = childFlags.childLlmProvider?.trim() ? { childProviderExplicit: true, ...(childFlags.childLlmModel?.trim() ? { childModel: childFlags.childLlmModel.trim() } : {}), ...(childFlags.childLlmEffort?.trim() ? { childEffort: childFlags.childLlmEffort.trim() } : {}) } : {};
+        if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker, rotationAccounts } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);

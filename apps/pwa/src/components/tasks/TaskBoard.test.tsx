@@ -86,6 +86,22 @@ describe('TaskBoardView detail wiring', () => {
     expect(openIncidentCount(cardFromWire(wire))).toBe(0);
   });
 
+  test('projects the wish reply address from the read-only card journal without treating flow result as a sent reply', () => {
+    const wire: TaskCardWire = { id: 'wish-1', goalId: 'wish:pwa:ref', title: '소원', status: 'open',
+      createdAt: '2023-11-14T22:13:20.000Z', sections: [
+        { key: 'intake:wish:0', owner: 'steward', content: '{"text":"원문"}', createdAt: '2023-11-14T22:13:20.000Z' },
+        { key: 'intake:reply:0', owner: 'steward', content: '{"surface":"pwa","address":"session-1"}', createdAt: '2023-11-14T22:13:21.000Z' },
+        { key: 'flow:result:0', owner: 'flow', content: '{"text":"전송 전 결과"}', createdAt: '2023-11-14T22:13:22.000Z' },
+      ] };
+    const card = cardFromWire(wire);
+    expect(card.wishReply).toEqual({ surface: 'pwa', address: 'session-1' });
+    expect(card).not.toHaveProperty('wishReplyHistory');
+    const detail = renderToStaticMarkup(<TaskBoardView cards={[card]} selectedId={card.taskId} selectedCard={card} onSelect={() => {}} />);
+    expect(detail).toContain('PWA · session-1');
+    expect(detail).not.toContain('전송 전 결과');
+    expect(cardFromWire({ ...wire, sections: [] }).wishReply).toBeNull();
+  });
+
   test('loads the list and selected detail via the task-card API', async () => {
     const wire: TaskCardWire = {
       id: 'card-1', goalId: 'goal-1', title: 'Ship it', status: 'open', createdAt: '2023-11-14T22:13:20.000Z', sections: [],

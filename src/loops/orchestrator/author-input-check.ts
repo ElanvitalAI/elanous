@@ -8,7 +8,7 @@ export interface AuthorInput {
 }
 
 export interface AuthorInputSignal {
-  kind: 'path' | 'symbol' | 'command' | 'marker';
+  kind: 'path' | 'symbol' | 'command' | 'marker' | 'missing';
   match: string;
   field: 'title' | 'text';
   reason: string;
@@ -40,15 +40,19 @@ function sentences(value: string): string[] {
 }
 
 export function checkAuthorInput({ title, text, cellId, version }: AuthorInput): AuthorInputCheck {
-  const valid = [title, text, cellId, version].every(value => typeof value === 'string' && !!value.trim())
+  const validIdentity = [title, cellId, version].every(value => typeof value === 'string' && !!value.trim())
     && /^\d+\.\d+\.\d+$/.test(version);
+  const missingText = typeof text !== 'string' || !text.trim();
+  const valid = validIdentity && !missingText;
   const signals: AuthorInputSignal[] = [];
+  if (validIdentity && missingText) signals.push({ kind: 'missing', match: '', field: 'text', reason: 'missing cell text' });
   let checked = 0;
   let candidates = 0;
   let directed = false;
 
-  if (valid) {
+  if (validIdentity) {
     for (const field of ['title', 'text'] as const) {
+      if (field === 'text' && missingText) continue;
       for (const sentence of sentences(field === 'title' ? title : text)) {
         checked++;
         let found = false;
@@ -70,6 +74,7 @@ export function checkAuthorInput({ title, text, cellId, version }: AuthorInput):
   const verdict: AuthorInputCheck['verdict'] = !valid ? 'uncheckable'
     : signals.length === 0 ? 'approved' : directed ? 'resubmit' : 'confirm';
   const implementationRatio = valid ? candidates / checked : null;
+  if (!valid) { checked = 0; candidates = 0; }
   debug.log('author.par', 'input-checked', {
     cellId, version, verdict, signals: signals.length, ratio: implementationRatio,
   });

@@ -260,9 +260,56 @@ function skipOverlappingRun(root: string, open: FailureStreak['open'] & { pid?: 
   }
   debug.log('steward.stage', 'skipped-overlap', { openStage: open.stage, pid: open.pid });
   writeFileSync(skippedPath(root), JSON.stringify({ openStage: open.stage, pid: open.pid }));
+  logTickDecision(root, 'skipped', `overlapping ${open.stage} (pid ${open.pid ?? 'unknown'})`);
 }
 
 function reportPath(root: string): string { return join(root, 'steward', 'observe.json'); }
+
+type TickDecision = { verdict: 'launched' | 'failed'; reason: string; goalId?: string };
+
+function logTickDecision(root: string | undefined, verdict: 'launched' | 'skipped' | 'reported' | 'failed', reason: string, goalId?: string): void {
+  const runId = graphRunId();
+  const marker = root && runId && existsSync(join(root, 'steward')) ? join(root, 'steward', `decision-logged-${runId}.json`) : undefined;
+  const decision = { verdict, reason: redactSecretText(reason), ...(goalId ? { goalId } : {}), ...(runId ? { runId } : {}) };
+  if (marker) try {
+    const previous = JSON.parse(readFileSync(marker, 'utf8')) as { verdict?: string; reason?: string };
+    // A replay keeps the first success; a failure replaces a success; a success after a failure replaces the failure.
+    if (previous.verdict === decision.verdict && previous.reason === decision.reason) return;
+    if (previous.verdict !== 'failed' && verdict !== 'failed') return;
+  } catch { /* Missing or stale marker: retry the observation. */ }
+  try {
+    debug.log('loop.steward', 'decision', decision);
+    if (marker) writeFileSync(marker, JSON.stringify(decision));
+  } catch { /* Observation must not change the tick outcome. */ }
+}
+
+function tickDecisionPath(root: string, runId: string): string {
+  return join(root, 'steward', `decision-${runId}.json`);
+}
+function rememberLaunchDecision(root: string, entry: TickDecision): void {
+  const runId = graphRunId();
+  if (!runId) return;
+  const path = tickDecisionPath(root, runId);
+  try {
+    let current: TickDecision | undefined;
+    try { current = JSON.parse(readFileSync(path, 'utf8')) as TickDecision; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return; }
+    // Keep the first failure (and its goal/cause), even if a retried schedule later succeeds.
+    if (current?.verdict === 'failed' || current?.verdict === entry.verdict) return;
+    writeFileSync(path, JSON.stringify(entry));
+  } catch { /* An unavailable observation store must not block execution. */ }
+}
+function readLaunchDecision(root: string): TickDecision | undefined {
+  const runId = graphRunId();
+  if (!runId) return undefined;
+  try { return JSON.parse(readFileSync(tickDecisionPath(root, runId), 'utf8')) as TickDecision; }
+  catch { return undefined; }
+}
+function logStageFailure(root: string, stage: StewardStage, reason: string): void {
+  const runId = graphRunId();
+  if (runId) try { rmSync(tickDecisionPath(root, runId), { force: true }); } catch { /* Observation must not change the failure. */ }
+  logTickDecision(root, 'failed', `${stage}: ${reason}`);
+}
 function readState(path: string): { issues: Record<string, string>; digestDay?: string } {
   try { return JSON.parse(readFileSync(path, 'utf8')) as ReturnType<typeof readState>; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { issues: {} }; throw error; }
@@ -396,10 +443,18 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       const entry = raiseHitl(issue, row, launchDeps);
       recordHitlOnCard(issue, entry, cardDeps);
     }
+    let launchDecision: TickDecision | undefined;
     for (const item of plan.launches) {
       const entry = launch(item, launchDeps);
+      const decision: TickDecision | undefined = entry.status === 'launched'
+        ? { verdict: 'launched', reason: 'harness run spawned', goalId: `linear:${item.issue.identifier}` }
+        : entry.status === 'failed'
+          ? { verdict: 'failed', reason: entry.reason ?? 'launch failed', goalId: `linear:${item.issue.identifier}` }
+          : undefined;
+      if (decision && (!launchDecision || (decision.verdict === 'failed' && launchDecision.verdict !== 'failed'))) launchDecision = decision;
       recordLaunchOnCard(item.issue, entry, cardDeps);
     }
+    if (launchDecision) rememberLaunchDecision(root, launchDecision);
     if (settings.mode === 'shadow') {
       const { recordShadowTick } = await import('./readiness.js');
       const tick = recordShadowTick(root, rows, plan, (deps.now ?? (() => new Date()))());
@@ -459,12 +514,18 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       }
     }
     const day = at.slice(0, 10);
+    let digested = false;
     if (state.digestDay !== day) {
       const send = deps.sendDigest ?? sendStewardDigest;
       await send(`스튜어드 ${day}: ${rows.map(row => `${row.issue} ${row.disposition}`).join(' · ')}`);
       state.digestDay = day;
       writeFileSync(path, JSON.stringify(state));
+      digested = true;
     }
+    const launched = readLaunchDecision(root);
+    if (launched) logTickDecision(root, launched.verdict, launched.reason, launched.goalId);
+    else if (outcomes.length || digested) logTickDecision(root, 'reported', outcomes.length ? `${outcomes.length} outcome(s) reported` : 'daily digest sent');
+    else logTickDecision(root, 'skipped', 'no new outcome or digest');
   }
   outcome = 'ok';
   } finally {
@@ -513,10 +574,14 @@ async function withStageSlot<T>(root: string, run: () => Promise<T>, onBusy?: ()
 
 /** The command-node boundary records both normal exits and an unclosed stage from a killed process. */
 export async function runStewardStageCommand(stage: StewardStage, deps: StewardCommandDeps = {}): Promise<0 | 1> {
-  if (resolvedStewardSettings(deps.launchSettings).mode === 'off') return 0;
+  if (resolvedStewardSettings(deps.launchSettings).mode === 'off') {
+    if (stage === 'sync') logTickDecision(deps.root ?? effectiveInstanceRoot(), 'skipped', 'steward mode off');
+    return 0;
+  }
   const root = deps.root ?? effectiveInstanceRoot();
   if (stage !== 'sync' && existsSync(skippedPath(root))) return 0;
-  return withStageSlot(root, async () => {
+  try {
+    return await withStageSlot(root, async () => {
     const now = deps.now ?? (() => new Date());
     const threshold = stewardSettings().alertAfterFailures ?? 3;
     const alertIfNeeded = async (state: FailureStreak): Promise<void> => {
@@ -564,10 +629,16 @@ export async function runStewardStageCommand(stage: StewardStage, deps: StewardC
     if (!ok) {
       console.error(`steward ${stage}: stage failed — ${reason}`);
       debug.log('steward.stage', 'failed', { stage, reason });
+      if (stage === 'sync' || !existsSync(skippedPath(root))) logStageFailure(root, stage, reason);
       return 1;
     }
     return 0;
-  }, stage === 'sync' ? () => { skipOverlappingRun(root, currentOpen(root, stage)); return 0 as const; } : undefined);
+    }, stage === 'sync' ? () => { skipOverlappingRun(root, currentOpen(root, stage)); return 0 as const; } : undefined);
+  } catch (error) {
+    try { if (stage === 'sync' || !existsSync(skippedPath(root))) logStageFailure(root, stage, error instanceof Error ? error.message : String(error)); }
+    catch { /* Observation must not change the stage error. */ }
+    throw error;
+  }
 }
 
 export async function runStewardNodeCommand(

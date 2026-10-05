@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'no
 import { groundMissionInCodebase, isRepositoryImplementationCandidate, type CodebaseGrounding } from '../autopilot/mission-codebase-gate.js';
 import { extractSlugSource, generateMissionSlug, slugify } from '../autopilot/mission-registry.js';
 import { enhancePrompt, type EnhanceOpts, type EnhanceResult } from '../prompt-enhance/enhance.js';
+import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
 
 function observeGoalAuthor(
@@ -324,9 +325,12 @@ function startGoalAuthorPhase(phase: GoalAuthorTimedPhase, authorRunId: string, 
   return Date.now();
 }
 
-function endGoalAuthorPhase(phase: GoalAuthorTimedPhase, startedAt: number, authorRunId: string, onProgress?: GoalAuthorDeps['onProgress']): void {
+type GoalAuthorTokens = { inputTokens: number | null; outputTokens: number | null };
+const UNKNOWN_GOAL_AUTHOR_TOKENS: GoalAuthorTokens = { inputTokens: null, outputTokens: null };
+
+function endGoalAuthorPhase(phase: GoalAuthorTimedPhase, startedAt: number, authorRunId: string, onProgress?: GoalAuthorDeps['onProgress'], tokens: GoalAuthorTokens = UNKNOWN_GOAL_AUTHOR_TOKENS): void {
   const elapsedMs = Date.now() - startedAt;
-  observeGoalAuthor('goal-author', 'phase-end', { phase, authorRunId, elapsedMs });
+  observeGoalAuthor('goal-author', 'phase-end', { phase, authorRunId, elapsedMs, ...tokens });
   if (GOAL_AUTHOR_PHASES.includes(phase as GoalAuthorPhase)) {
     if (onProgress) onProgress(phase as GoalAuthorPhase, 'end');
     else process.stderr.write(`[goal-author] ${phase} ended in ${elapsedMs}ms\n`);
@@ -1154,6 +1158,21 @@ function observeAuthoredGroundingPathSections(document: string, paths: readonly 
   } catch {
     // Grounding-path measurement is observation only and must never stop authoring.
   }
+}
+
+function authoredGoalSectionChars(document: string): Record<string, number> {
+  const headings = linesOutsideFencedCode(document)
+    .filter(({ text }) => /^## (?:\S)/.test(text))
+    .map(({ text, start }) => ({ heading: text.slice(3).trim(), start }));
+  const sections: Record<string, number> = { preamble: [...document.slice(0, headings[0]?.start ?? document.length)].length };
+  for (let index = 0; index < headings.length; index += 1) {
+    const { heading, start } = headings[index];
+    sections[heading] = (sections[heading] ?? 0) + [...document.slice(start, headings[index + 1]?.start ?? document.length)].length;
+  }
+  for (const heading of ['PROBLEM', 'WHAT TO BUILD', 'ACCEPTANCE CRITERIA', 'TRACED PATHS', 'SCOPE BOUNDARY', 'STEPS', '답하지 못하는 것']) {
+    sections[heading] ??= 0;
+  }
+  return sections;
 }
 
 function canonicalBlocks(document: string): string[] {
@@ -4906,6 +4925,13 @@ async function authorGoalWithSupersededRootIntent(
   }
   // ⭐ 이 저작 «한 번»의 id. goalId 보다 «먼저» 있어야 ground·enhance 의 소요를 그 골에 붙일 수 있다.
   const authorRunId = generateGoalId();
+  const authorStartedAt = Date.now();
+  const enhanceTokens: GoalAuthorTokens = { inputTokens: null, outputTokens: null };
+  const onEnhanceUsage = (usage: LLMUsage): void => {
+    if (usage.inputTokens !== undefined) enhanceTokens.inputTokens = (enhanceTokens.inputTokens ?? 0) + usage.inputTokens;
+    if (usage.outputTokens !== undefined) enhanceTokens.outputTokens = (enhanceTokens.outputTokens ?? 0) + usage.outputTokens;
+    try { deps.enhanceOpts?.onUsage?.(usage); } catch { /* usage observation is fail-soft */ }
+  };
   let facts: CodebaseGrounding | null = null;
   let groundingError = false;
   const persistentGrounding = resolveGoalAuthorPersistentGrounding('persistentGrounding' in deps ? deps.persistentGrounding : undefined);
@@ -4937,8 +4963,8 @@ async function authorGoalWithSupersededRootIntent(
       ? await deps.enhance(
         enhanceAsk,
         persistentFacts.length > 0
-          ? { ...deps.enhanceOpts, groundedFacts: persistentFacts }
-          : deps.enhanceOpts,
+          ? { ...deps.enhanceOpts, groundedFacts: persistentFacts, onUsage: onEnhanceUsage }
+          : { ...deps.enhanceOpts, onUsage: onEnhanceUsage },
       )
       : { original: ask, checklist: [], verbatimPreserved: true };
     // ⭐ goal-context 규범이 «어디에도 안 실린다»는 것을 관측으로 남긴다.
@@ -4956,7 +4982,7 @@ async function authorGoalWithSupersededRootIntent(
       placement: 'omitted',
     });
   } finally {
-    endGoalAuthorPhase('enhance', enhanceStartedAt, authorRunId, deps.onProgress);
+    endGoalAuthorPhase('enhance', enhanceStartedAt, authorRunId, deps.onProgress, enhanceTokens);
   }
   if (!enhancement.verbatimPreserved || (enhanceAsk && enhancement.original !== enhanceAsk)) {
     throw new Error('goal author refused an enhancement that does not preserve its input verbatim');
@@ -5431,6 +5457,18 @@ async function authorGoalWithSupersededRootIntent(
     } finally {
       endGoalAuthorPhase('lint', lintStartedAt, authorRunId, deps.onProgress);
     }
+    try {
+      observeGoalAuthor('goal-author', 'summary', {
+        authorRunId,
+        elapsedMs: Date.now() - authorStartedAt,
+        inputTokens: enhanceTokens.inputTokens,
+        outputTokens: enhanceTokens.outputTokens,
+        totalTokens: enhanceTokens.inputTokens === null || enhanceTokens.outputTokens === null
+          ? null : enhanceTokens.inputTokens + enhanceTokens.outputTokens,
+        goalChars: [...document].length,
+        sectionChars: authoredGoalSectionChars(document),
+      });
+    } catch { /* observation is fail-soft */ }
     return { document, facts, grounded: !groundingError && hasEvidence, authorRunId };
   } finally {
     endAssembleSubphase();

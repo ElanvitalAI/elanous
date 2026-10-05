@@ -57,7 +57,7 @@ describe('draft-cleanup graph', () => {
       chmodSync(file, 0o755);
     };
     install('bun', `#!/bin/sh\nif [ "$1" = "-e" ]; then exec "${bun}" "$@"; fi\nprintf '%s\\n' "$*" >> "${cliInvocations}"\nentry=$1; shift\nexec "${bun}" "$entry" --test "$@"\n`);
-    install('gh', `#!/bin/sh\nprintf '%s\\n' "$*" >> "${invocations}"\ncase "$*" in\n  'repo view --json nameWithOwner --jq .nameWithOwner') echo 'test/repo' ;;\n  *'pulls?state=open'*) echo '[{"number":81,"title":"already landed","draft":true,"state":"open","head":{"ref":"self-impl/goalid-51-run"},"labels":[{"name":"elanous:stalled"}],"created_at":"2026-09-28T00:00:00Z","updated_at":"2026-09-28T00:00:00Z","merged_at":null},{"number":83,"title":"protected draft","draft":true,"state":"open","head":{"ref":"self-impl/goalid-53-run"},"labels":[{"name":"elanous:keep"}],"created_at":"2026-09-28T00:00:00Z","updated_at":"2026-09-28T00:00:00Z","merged_at":null}]' ;;\n  *'pulls?state=closed'*) echo '[{"number":82,"title":"already landed","draft":false,"state":"closed","head":{"ref":"merged/82"},"base":{"ref":"main"},"labels":[],"created_at":"2026-09-28T01:00:00Z","updated_at":"2026-09-29T00:00:00Z","merged_at":"2026-09-29T00:00:00Z"}]' ;;\n  'pr edit 81 --repo test/repo --add-label elanous:superseded --remove-label elanous:stalled') echo "$*" >> "${root}/mutations" ;;\n  pr\\ close\\ 81\\ --repo\\ test/repo*) echo "$*" >> "${root}/mutations" ;;\n  *'/files?'*) echo '[]' ;;\n  *'/commits?'*) echo '[]' ;;\n  *'/comments?'*) echo '[]' ;;\n  *'/commits/'*) echo '{"commit":{"message":""},"files":[]}' ;;\n  *) exit 91 ;;\nesac\n`);
+    install('gh', `#!/bin/sh\nprintf '%s\\n' "$*" >> "${invocations}"\ncase "$*" in\n  'repo view --json nameWithOwner --jq .nameWithOwner') echo 'test/repo' ;;\n  *'pulls?state=open'*) echo '[{"number":81,"title":"already landed","draft":true,"state":"open","head":{"ref":"self-impl/goalid-51-run"},"labels":[{"name":"elanous:stalled"}],"created_at":"2026-09-28T00:00:00Z","updated_at":"2026-09-28T00:00:00Z","merged_at":null},{"number":83,"title":"protected draft","draft":true,"state":"open","head":{"ref":"self-impl/goalid-53-run"},"labels":[{"name":"elanous:keep"}],"created_at":"2026-09-28T00:00:00Z","updated_at":"2026-09-28T00:00:00Z","merged_at":null}]' ;;\n  *'pulls?state=closed'*) echo '[{"number":82,"title":"already landed","draft":false,"state":"closed","head":{"ref":"self-impl/goalid-51-landed"},"base":{"ref":"main"},"labels":[],"created_at":"2026-09-28T01:00:00Z","updated_at":"2026-09-29T00:00:00Z","merged_at":"2026-09-29T00:00:00Z"}]' ;;\n  'pr edit 81 --repo test/repo --add-label elanous:superseded --remove-label elanous:stalled') echo "$*" >> "${root}/mutations" ;;\n  pr\\ close\\ 81\\ --repo\\ test/repo*) echo "$*" >> "${root}/mutations" ;;\n  *'/files?'*) echo '[]' ;;\n  *'/commits?'*) echo '[]' ;;\n  *'/comments?'*) echo '[]' ;;\n  *'/commits/'*'/status') echo '{"state":"success"}' ;;\n  *'/check-runs?'*) echo '{"check_runs":[]}' ;;\n  *'/commits/'*) echo '{"commit":{"message":""},"files":[]}' ;;\n  *'/reviews?'*) echo '[]' ;;\n  *'/pulls/'[0-9]*) echo '{"head":{"sha":"abc123"}}' ;;\n  *) exit 91 ;;\nesac\n`);
     install('git', `#!/bin/sh\ncase "$*" in\n  'config --get remote.origin.url') echo 'https://github.com/test/repo.git' ;;\n  'worktree list --porcelain') echo '' ;;\n  *) exec "${git}" "$@" ;;\nesac\n`);
     const previousPath = process.env.PATH;
     const previousState = process.env.ELANOUS_STATE_DIR;
@@ -89,14 +89,14 @@ describe('draft-cleanup graph', () => {
       const githubCalls = readFileSync(invocations, 'utf8').trim().split('\n');
       expect(githubCalls.filter((call) => call.includes('pulls?state=open'))).toHaveLength(mode === 'live' ? 2 : 1);
       expect(githubCalls.filter((call) => call.includes('pulls?state=closed'))).toHaveLength(mode === 'live' ? 2 : 1);
-      // Read-only GETs (PR files, commits, comments) feed the classifier; only edits/closes are mutations.
-      const readOnly = (call: string) => /^api repos\/[^ ]+\/(?:pulls\/\d+\/(?:files|commits)|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(call) && !/\s-X\s|--method/.test(call);
+      // Read-only GETs (PR detail, files, commits, reviews, comments, commit status) feed the classifier; only edits/closes are mutations.
+      const readOnly = (call: string) => /^api repos\/[^ ]+\/(?:pulls\/\d+(?:\/(?:files|commits|reviews))?|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(call) && !/\s-X\s|--method/.test(call);
       const mutations = githubCalls.filter((call) => !call.startsWith('repo view') && !call.includes('pulls?state=') && !readOnly(call));
       if (mode === 'shadow') expect(mutations).toEqual([]);
       else {
         expect(mutations).toEqual([
           'pr edit 81 --repo test/repo --add-label elanous:superseded --remove-label elanous:stalled',
-          expect.stringMatching(/^pr close 81 --repo test\/repo --comment Draft sweep: superseded-by #82\. Branch preserved\.$/),
+          'pr close 81 --repo test/repo --comment Draft sweep: superseded-by #82 (https://github.com/test/repo/pull/82). Branch preserved.',
         ]);
         expect(readFileSync(join(root, 'mutations'), 'utf8').trim().split('\n')).toEqual(mutations);
       }

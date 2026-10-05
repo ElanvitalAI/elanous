@@ -722,3 +722,16 @@ describe('reviewMaxPasses — 상한 계약', () => {
     }
   });
 });
+
+describe('renderReview — 리뷰가 안 돈 결과', () => {
+  it('reviewed=false 면 verdict 가 pass 여도 PASS·«지적 없음» 을 쓰지 않고 사유를 쓴다', () => {
+    const body = renderReview({ verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: 'Codex overloaded' });
+    expect(body).toBe('⚠️ 자율 PR 리뷰: 리뷰 안 돎 — 사유 Codex overloaded (통과 판정 아님)');
+    expect(body).not.toContain('PASS');
+    expect(body).not.toContain('지적 없음');
+  });
+  it('reviewed 가 없거나 true 면 지금 렌더 그대로', () => {
+    expect(renderReview({ verdict: 'pass', mustFix: [], shouldFix: [] })).toContain('자율 PR 리뷰: PASS');
+    expect(renderReview({ verdict: 'pass', mustFix: [], shouldFix: [], reviewed: true })).toContain('자율 PR 리뷰: PASS');
+  });
+});

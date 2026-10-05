@@ -13,6 +13,7 @@ import { ChatDropOverlay } from './ChatDropOverlay';
 import { BudgetPill } from './BudgetPill';
 import { VoiceCostPill } from './VoiceCostPill';
 import { SessionPill } from './SessionPill';
+import { ChatCurrentProject } from './ChatCurrentProject';
 import { HideInPublicCapture } from '@/lib/public-capture';
 import { SHARE_PREFILL_KEY } from '@/lib/share-prefill';
 import { MAX_CHAT_FILE_BYTES, MAX_CHAT_FILES } from '@/lib/chat-paste-drop';
@@ -267,6 +268,8 @@ test('compact header fits one 44px row with navigation, session, and expandable 
   expect(header.props.className).toContain('whitespace-nowrap');
   expect(header.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
   expect(header.findAllByType(SessionPill)).toHaveLength(1);
+  expect(header.findAllByType(ChatCurrentProject)).toHaveLength(1);
+  expect(header.findByProps({ 'aria-label': '현재 대화 프로젝트' }).props.className).toContain('max-w-[24vw]');
   expect(header.findAllByType(NowSpeakButton)).toHaveLength(1);
   expect(header.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
   expect(header.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(1);
@@ -279,6 +282,7 @@ test('compact header fits one 44px row with navigation, session, and expandable 
   const more = header.findByProps({ 'aria-label': '채팅 더보기' });
   await act(async () => more.props.onClick());
   const popup = root.findByProps({ id: 'chat-header-more' });
+  expect(popup.findAllByType(ChatCurrentProject)).toHaveLength(0);
   expect(popup.findAllByType(BudgetPill)).toHaveLength(1);
   expect(popup.findAllByType(VoiceCostPill)).toHaveLength(1);
   expect(popup.findAllByType(HideInPublicCapture)).toHaveLength(2);
@@ -309,6 +313,8 @@ test('wide header preserves the existing session, money pills, and voice button 
   expect(root.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
   expect(root.findAllByType(SessionPill)).toHaveLength(1);
+  expect(root.findAllByType(ChatCurrentProject)).toHaveLength(1);
+  expect(root.findAllByProps({ 'aria-label': '현재 대화 프로젝트' })).toHaveLength(1);
   expect(root.findAllByType(NowSpeakButton)).toHaveLength(1);
   expect(root.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
   expect(root.findAllByType(BudgetPill)).toHaveLength(1);

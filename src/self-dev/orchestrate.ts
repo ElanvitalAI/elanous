@@ -260,12 +260,23 @@ export interface SelfDevJobResult {
    *  (merged / pr-opened / gate-failed / review-blocked / pr-declined). */
   stage?: string;
   branch?: string;
+  /** Child confirmed the finished implementation was pushed for manual harvest. */
+  harvestable?: true;
   worktreePath?: string;
   prUrl?: string;
   prNumber?: number;
   merged?: boolean;
   /** Child commit SHA, when observed by the Pod/host. */
   checkedHeadCommit?: string;
+  /**
+   * This run's own `--base` (not main). A non-main completion mode
+   * (worktree-only, draft, `--base` other than main) lands commits here.
+   */
+  base?: string;
+  /** Child finished with GOAL-COMPLETE (`ok=true`). Distinct from a main merge. */
+  ok?: boolean;
+  /** Commits this child added against its own `--base`. 0 is not completion progress. */
+  commitsAheadOfBase?: number;
   /** A dependency is done but its result is not on main; no child was launched. */
   blockReason?: 'parent-unlanded';
   parentPrNumber?: number;
@@ -405,6 +416,7 @@ export type ResumeDisposition = 'skip' | 'rerun' | 'rerun-duplicate-risk';
  */
 export function classifyResumeDisposition(result: SelfDevJobResult): ResumeDisposition {
   if (hasDelivered(result)) return 'skip';
+  if (result.harvestable === true && result.branch) return 'skip';
   if (result.stage === 'pr-opened') return 'rerun-duplicate-risk';
   if (result.merged === false) return 'rerun';
   if (result.status !== 'done') return 'rerun';
@@ -621,6 +633,7 @@ export function classifyFailure(
   ) {
     return 'awaiting-human';
   }
+  if (result.harvestable === true && result.branch) return 'main-sync-blocked';
   if (result.status === 'done' && !hasDelivered(result)) return convergedFailureKind();
   // ⭐ 상류가 죽어 «취소»된 조각 — 종전엔 status 가 failed 도 done 도 아니라 null 로 사라졌다.
   //   ⛔ 이것을 못 보면 「무엇이 상류를 기다리는가」를 슈퍼바이저가 영영 모른다.
@@ -1479,6 +1492,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(resumeDisposition ? { resumeDisposition } : {}),
           ...(disp?.stage ? { stage: disp.stage } : {}),
           ...(disp?.branch ? { branch: disp.branch } : {}),
+          ...(disp?.harvestable === true && disp.branch ? { harvestable: true } : {}),
           ...(disp?.worktreePath ? { worktreePath: disp.worktreePath } : {}),
           ...(disp?.prUrl ? { prUrl: disp.prUrl } : {}),
           ...(disp?.prNumber !== undefined ? { prNumber: disp.prNumber } : {}),
@@ -1526,7 +1540,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         const rm = opts.removeWorktree ?? defaultRemoveWorktree;
         let removed = 0;
         for (const r of out) {
-          if (!r.worktreePath || r.prUrl) continue;
+          if (!r.worktreePath || r.prUrl || r.harvestable) continue;
           try { rm(r.worktreePath); removed++; } catch { /* fail-soft */ }
         }
         if (removed > 0) debug.log('self-dev.orchestrate', 'teardown', { removed });

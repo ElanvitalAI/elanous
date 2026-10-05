@@ -21,7 +21,7 @@ import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
-import { runDraftSweep, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr } from '../self-dev/draft-sweep.js';
+import { runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
@@ -30,8 +30,10 @@ import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, decideLaunchBudget, readBu
 import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
+import { resolveRepositoryName } from './repository-name.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
 import { addHarnessQueue, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps, type QueueSeat } from './harness-queue.js';
+import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
@@ -333,7 +335,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; seat?: QueueSeat };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: 'lite' | 'standard' | 'high'; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; seat?: QueueSeat };
 function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
   const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
   debug.log('harness.substrate', 'resolved', resolved);
@@ -552,9 +554,23 @@ function hasHarnessPodJobApplied(runId: string | undefined, output: string): boo
   } finally { store.close(); }
 }
 
+/** 10-05 PODPROVIDER — say which child provider a local run will use (an unnamed choice follows config). */
+function announceLocalChildProvider(opts: unknown): void {
+  const child = opts as HarnessAskSayChildLlmOptions;
+  if (!child.childLlmProvider?.trim()) return;
+  console.error(`child provider 요청 = ${child.childLlmProvider.trim()}${child.childLlmModel?.trim() ? `/${child.childLlmModel.trim()}` : ''} (local)`);
+}
+
+/** `harness.authorOnPod` — 명시 true 만 켠다. 읽기 실패는 끔(호스트 저작)으로 둔다. */
+function harnessAuthorOnPod(): boolean {
+  try { return getUserConfig().harness?.authorOnPod === true; }
+  catch { return false; }
+}
+
 /** ⭐ 런 계약의 실행 칸 = pod — 호스트는 그래프를 안 돌리고 Pod 로 보낸다(harness-pod-dispatch.ts). */
 async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string, pool: string,
-  recordDispatch: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask> = dispatchTask): Promise<void> {
+  recordDispatch: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask> = dispatchTask,
+  authorOnPod = false): Promise<void> {
   const o = opts as HarnessSubstrateOpts;
   if (o.target !== undefined) {
     debug.log('harness.pod', 'target-refused', { target: o.target });
@@ -588,7 +604,13 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
   let output = '';
   let runId: string | undefined;
-  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
+  const child = opts as HarnessAskSayChildLlmOptions;
+  // 10-05 PODPROVIDER: say which child provider the Pod will use when the launch named one.
+  if (child.childLlmProvider?.trim()) console.error(`child provider 요청 = ${child.childLlmProvider.trim()}${child.childLlmModel?.trim() ? `/${child.childLlmModel.trim()}` : ''} (pod · 자격 없으면 발사 전 거부)`);
+  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(authorOnPod && entrance === 'cli-harness-say' ? { authorOnPod: true } : {}),
+    ...(child.childLlmProvider?.trim() ? { childLlmProvider: child.childLlmProvider.trim() } : {}),
+    ...(child.childLlmModel?.trim() ? { childLlmModel: child.childLlmModel.trim() } : {}),
+    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
@@ -1631,6 +1653,12 @@ export async function runHarnessBudget(opts: { json?: boolean } = {}, io: {
 
 const DRAFT_SWEEP_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
+/** A review body still names a must-fix. «must-fix 0» and «must-fix: 0» are a cleared list, not a remaining one. */
+function mustFixRemains(text: string): boolean {
+  if (!/(?:^|\n)\s*(?:[-*]\s*)?(?:must-fix|must fix)\b/i.test(text)) return false;
+  return !/(?:^|\n)\s*(?:[-*]\s*)?(?:must-fix|must fix)\s*[:=]?\s*0\b/i.test(text);
+}
+
 type GithubPull = {
   number: number;
   title: string;
@@ -1814,6 +1842,36 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     }
     return undefined;
   };
+  const reviewGateForDraft = (draft: SweepDraft, repository: string): SweepReviewGate | undefined => {
+    const head = ghJson<{ head?: { sha?: string } }>(['api', `repos/${repository}/pulls/${draft.number}`], execute);
+    const sha = head?.head?.sha;
+    if (!sha) return undefined;
+    const comments: string[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const batch = ghJson<Array<{ body?: string }>>(['api', `repos/${repository}/issues/${draft.number}/comments?per_page=100&page=${page}`], execute);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete review comment inventory');
+      comments.push(...batch.map((comment) => comment.body ?? ''));
+      if (batch.length < 100) break;
+      if (page === 100) throw new Error('Review comment inventory exceeded pagination limit');
+    }
+    const reviews = ghJson<Array<{ state?: string; body?: string }>>(['api', `repos/${repository}/pulls/${draft.number}/reviews?per_page=100`], execute);
+    if (!Array.isArray(reviews) || reviews.length > 100) throw new Error('Incomplete review inventory');
+    const text = [...comments, ...reviews.map((review) => review.body ?? '')].join('\n');
+    const status = ghJson<{ state?: string }>(['api', `repos/${repository}/commits/${sha}/status`], execute);
+    const checkRuns = ghJson<{ check_runs?: Array<{ conclusion?: string | null }> }>(
+      ['api', `repos/${repository}/commits/${sha}/check-runs?per_page=100`], execute);
+    if (!checkRuns || !Array.isArray(checkRuns.check_runs)) throw new Error('Incomplete check-run inventory');
+    const conclusions = checkRuns.check_runs.map((run) => run.conclusion ?? null);
+    const gatePass = (status?.state === 'success' || status?.state === undefined)
+      && conclusions.length > 0 && conclusions.every((conclusion) => conclusion === 'success' || conclusion === 'skipped' || conclusion === 'neutral');
+    const gateFail = status?.state === 'failure' || status?.state === 'error'
+      || conclusions.some((conclusion) => conclusion === 'failure' || conclusion === 'cancelled' || conclusion === 'timed_out' || conclusion === 'action_required');
+    return {
+      ...(reviews.some((review) => review.state === 'APPROVED') || /(?:^|\n)\s*VERDICT:\s*PASS\b/i.test(text) ? { review: 'pass' as const } : {}),
+      ...(mustFixRemains(text) ? { mustFix: true } : {}),
+      ...(gatePass && !gateFail ? { gate: 'pass' as const } : gateFail ? { gate: 'fail' as const } : {}),
+    };
+  };
   const landingCommentsFor = (repository: string, number: number): string[] => {
     const comments: string[] = [];
     for (let page = 1; page <= 100; page++) {
@@ -1902,6 +1960,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       execute(['pr', 'close', String(number), '--repo', repository, '--comment', comment]);
     },
     getClaimOwner: async (repository, number) => claimCommentOwner(repository, number, execute),
+    getReviewGate: async (draft, repository) => reviewGateForDraft(draft, repository),
   };
 }
 
@@ -1936,7 +1995,10 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
     .action(async (number: string, opts: { owner?: string; note?: string; release?: boolean; repo?: string }) => {
       try {
         const execute = deps.execute ?? executeGh;
-        const repository = opts.repo ?? deps.repository?.() ?? execute(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).trim();
+        const repository = resolveRepositoryName({
+          repo: opts.repo ?? deps.repository?.(),
+          executeGh: (args) => execute(args),
+        });
         if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
         if (!/^[1-9]\d*$/.test(number) || !Number.isSafeInteger(Number(number))) throw new HarnessCliInputError(`invalid PR number: ${number}`);
         const owner = opts.owner?.trim();
@@ -1973,21 +2035,32 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
     .action(async (opts: { apply?: boolean; json?: boolean; repo?: string }) => {
       try {
         const write = deps.write ?? console.log;
-        const repository = opts.repo ?? deps.repository?.() ?? execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
-          { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], env: process.env }).trim();
+        const execute = deps.execute ?? executeGh;
+        const repository = resolveRepositoryName({
+          repo: opts.repo ?? deps.repository?.(),
+          executeGh: (args) => execute(args),
+        });
         if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) {
           throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
         }
         const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? githubDraftSweepAdapters(deps.execute) });
-        if (opts.json) write(JSON.stringify(result));
+        const reason = result.error ? sweepFailureReason(result.error) : undefined;
+        if (opts.json) write(JSON.stringify(reason ? { ...result, error: reason } : result));
         else {
-          write(`draft sweep ${result.repository}: ${result.complete ? 'complete' : `incomplete (${result.error})`} · ${result.apply ? 'apply' : 'dry-run'}`);
-          for (const entry of result.entries) write(`#${entry.number} ${entry.action}: ${entry.reason}${entry.statusLabel ? ` → ${entry.statusLabel}` : ''}${entry.error ? ` ERROR: ${entry.error}` : ''}`);
-          if (result.complete) write(`못 본 초안 ${result.unobserved ?? 0} · 이번에 닫음 ${result.closed ?? 0}${result.apply ? '' : '(dry-run)'} · 처리 중 ${result.claimed ?? 0} · 표식 만료 ${result.claimExpired ?? 0}`);
+          write(`draft sweep ${result.repository}: ${result.complete ? 'complete' : `incomplete (${reason})`} · ${result.apply ? 'apply' : 'dry-run'}`);
+          for (const entry of result.entries) write(`#${entry.number} ${entry.action}: ${entry.reason}${entry.statusLabel ? ` → ${entry.statusLabel}` : ''}${entry.error ? ` ERROR: ${sweepFailureReason(entry.error)}` : ''}`);
+          if (result.complete) {
+            const daily = result.daily
+              ? ` · 24h 넘음 ${result.daily.over24h} · 정리 대상 ${result.daily.closable} · 수확 대기 ${result.daily.harvestable} · 막힘 ${result.daily.blocked}`
+              : '';
+            write(`못 본 초안 ${result.unobserved ?? 0} · 이번에 닫음 ${result.closed ?? 0}${result.apply ? '' : '(dry-run)'} · 처리 중 ${result.claimed ?? 0} · 표식 만료 ${result.claimExpired ?? 0}${daily}`);
+          }
+          if (reason) write(reason);
         }
         if (!result.complete || result.entries.some((entry) => entry.error)) process.exitCode = 1;
       } catch (error) {
         console.error(humanErrorLine(error));
+        try { debug.log('drafts.cleanup', 'failed', { reason: sweepFailureReason(error) }); } catch { /* observation is fail-soft */ }
         process.exitCode = 1;
       }
     });
@@ -2248,6 +2321,27 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
     .command('harness')
     .description('dev-harness worktree 수명 — 워크트리 생성(worktree add)·조회(worktrees)·정리(clean)·프로세스 관찰(processes)');
   installHarnessCliSinkHook(harnessCmd, deps.registerSink, deps.resolveSurface);
+  harnessCmd.command('doors').description('기간 안 런을 입구×대기열 경유 표로 읽는다')
+    .option('--since <window>', '조회 창 (30m · 12h · 1d, 기본 1d)', '1d')
+    .option('--json', '구조화 출력')
+    .action((opts: { since?: string; json?: boolean }) => {
+      const parsed = parseDoorSince(opts.since);
+      if ('error' in parsed) {
+        console.error(`❌ ${parsed.error}`);
+        process.exitCode = 2;
+        return;
+      }
+      let table: DoorTable;
+      try {
+        table = queryLaunchDoors({ sinceMs: parsed.sinceMs });
+      } catch (error) {
+        console.error(`❌ doors: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.json) console.log(JSON.stringify(table));
+      else console.log(renderLaunchDoors(table));
+    });
   harnessCmd.command('incidents').description('최근 하니스 Pod 종료 사고 원장을 읽는다')
     .option('--since <minutes>', '최근 몇 분의 종료를 볼지 (기본 15분)', '15')
     .option('--json', '구조화 출력')
@@ -2294,7 +2388,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
       console.log(`${row.id} ${row.seat} ${row.kind} queued`);
     }));
   queue.command('list').description('대기·발사 원장 조회').action(() => queueAction(async () => {
-    for (const row of listHarnessQueue(queueDeps)) console.log(`${row.id} ${row.seat} ${row.status} ${row.kind} ${row.input}`);
+    for (const row of listHarnessQueue(queueDeps)) console.log(`${row.id} ${row.seat} ${row.status} ${row.kind} ${row.input}${row.waitingReason ? ` · ${row.waitingReason}` : ''}`);
   }));
   queue.command('remove <id>').description('대기 중 또는 종료 확인된 항목 제거').action((id: string) => queueAction(async () => {
     if (!await removeHarnessQueue(id, queueDeps)) throw new Error(`queue item active or not found: ${id}`);
@@ -2303,7 +2397,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   queue.command('reconcile <id>').description('불확정 발사를 확인하고 종료 또는 미발사 증거가 있으면 예약 해소').action((id: string) => queueAction(async () => {
     console.log(`${id} ${await reconcileHarnessQueue(id, queueDeps)}`);
   }));
-  queue.command('tick').description('맨 앞 한 건의 자리 몫과 Pod 풀 여유를 확인하고 발사').action(() => queueAction(async () => {
+  queue.command('tick').description('자리별 맨 앞 한 건을 라운드로빈으로 돌며 자리 몫·Pod 풀 여유·마무리 관문을 확인하고 한 건 발사').action(() => queueAction(async () => {
     const result = await tickHarnessQueue(queueDeps);
     console.log(`${result.outcome}${result.item ? ` ${result.item.id}` : ''}: ${result.reason}`);
   }));
@@ -2328,7 +2422,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts));
+            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : (announceLocalChildProvider(stampedOpts), ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts)));
           },
           deps.launchGate,
         );
@@ -2353,7 +2447,9 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask) : say(sentence, normalizeHarnessAskSayOptions(stampedOpts));
+            return resolved.substrate === 'pod'
+              ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, harnessAuthorOnPod())
+              : (announceLocalChildProvider(stampedOpts), say(sentence, normalizeHarnessAskSayOptions(stampedOpts)));
           },
           deps.launchGate,
         );

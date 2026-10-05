@@ -123,6 +123,7 @@ test('multi-item tab opens its visible items; more groups files and settings, op
   expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정', '운영🔒']);
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ops/release');
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/loops');
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ceo');
 });
 
 test('single visible item navigates directly without a sheet, and role/Labs hide forbidden items', () => {

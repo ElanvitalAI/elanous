@@ -29,14 +29,41 @@ function inlineText(value: string): string {
         www ? 'w\u200bww.' : `${scheme ?? at}\u200b${slashes ?? ''}`);
 }
 
+function displayId(id: string): string {
+  return id.replace(/(-(?:\d{4}-\d{2}-\d{2}|undated))-[a-f\d]{64}$/i, '$1');
+}
+
+function summaryText(value: string): string {
+  // 원장 적재 때 줄바꿈이 사라져 «| a | b | |---|---| | 1 | 2 |» 처럼 한 줄로 뭉개진 표는 행 경계 «| |»에서 다시 줄로 편다.
+  const lines = value.split(/\r?\n/)
+    .flatMap(line => /\|\s*:?-{3,}:?\s*\|/.test(line) && /\|\s+\|/.test(line) ? line.replace(/\|\s+\|/g, '|\n|').split('\n') : [line])
+    .map(line => line.trim()).filter(Boolean);
+  const cells = (line: string) => line.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
+  const findTable = () => lines.findIndex((line, index) => {
+    if (!line.includes('|') || !lines[index + 1]) return false;
+    const separator = cells(lines[index + 1]);
+    return separator.length > 1 && separator.every(cell => /^:?-{3,}:?$/.test(cell));
+  });
+  // 표가 여럿이면 모두 «첫 데이터 행 한 줄»로 접는다 — 뒤 표의 구분선·이스케이프가 남지 않게.
+  for (let tableAt = findTable(); tableAt >= 0; tableAt = findTable()) {
+    const row = lines[tableAt + 2]?.includes('|') ? lines[tableAt + 2] : lines[tableAt];
+    const summary = cells(row).join(' · ');
+    let after = tableAt + 2;
+    while (after < lines.length && lines[after].includes('|')) after++;
+    lines.splice(tableAt, after - tableAt, summary);
+  }
+  const text = lines.join(' ').replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim();
+  return inlineText(text.length > 200 ? `${text.slice(0, 200)}…` : text);
+}
+
 function section(title: string, rows: LessonRow[], ledger: LessonLedger, kind: LessonStatus): string[] {
   const lines = [`## ${title}`, ''];
   if (!rows.length) return [...lines, '없음', ''];
   for (const row of rows) {
     const last = ledger.get(row.id).occurrences.at(-1);
-    lines.push(`### ${inlineText(row.id)} — ${inlineText(row.incident)}`,
-      `- 원인: ${inlineText(row.cause)}`,
-      `- 처방: ${inlineText(row.remedy)}`,
+    lines.push(`### ${inlineText(displayId(row.id))} — ${inlineText(row.incident)}`,
+      `- 원인: ${summaryText(row.cause)}`,
+      `- 처방: ${summaryText(row.remedy)}`,
       `- 재발: ${row.occurrence_count}회`,
       `- 마지막 발생: ${inlineText(last?.at ?? '없음')} · 출처: ${inlineText(last?.source ?? '없음')}`);
     if (kind === 'candidate') lines.push(`- 반증: ${row.disproof?.trim() ? inlineText(row.disproof) : '반증 없음 — 승격 불가'}`);

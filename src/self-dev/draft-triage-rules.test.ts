@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { branchStem, decideDraft, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+import { branchStem, decideDraft, isAutoTitle, sameGoalPr, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
 
 const base: DraftTriageInput = {
   draft: { number: 1, title: 'same goal', branch: 'self-impl/x-goalid-a1b2c3-run' },
@@ -26,7 +26,7 @@ describe('decideDraft', () => {
     expect(decide(openDrafts[0]!, { runStatus: 'running' })).toEqual({ action: 'keep', reason: 'live' });
     expect(decide(openDrafts[0]!, { liveBranches: new Set([openDrafts[0]!.branch]) }))
       .toEqual({ action: 'keep', reason: 'branch-finality-unobserved' });
-    expect(decide(openDrafts[0]!, { mergedTwins: [{ number: 9, title: 'T', branch: 'other' }] }))
+    expect(decide(openDrafts[0]!, { mergedTwins: [{ number: 9, title: 'T', branch: 'self-impl/x-eeeeeeee-r9' }] }))
       .toEqual({ action: 'close', reason: 'superseded-by #9' });
   });
   it('selects the newest valid open attempt, without guessing missing title, time or branch stem', () => {
@@ -58,10 +58,30 @@ describe('decideDraft', () => {
       .toEqual({ action: 'keep', reason: 'branch-finality-unobserved' });
   });
   it('closes a same-title merged twin of a one-hour-old ended run', () => {
-    expect(decideDraft({ ...base, ageHours: 1, mergedTwins: [{ number: 2, title: 'same goal', branch: 'other' }] })).toEqual({ action: 'close', reason: 'superseded-by #2' });
+    const draft = { number: 1, title: 'same goal', branch: 'self-impl/sg-aaaaaaaa-r1' };
+    expect(decideDraft({ ...base, draft, ageHours: 1, mergedTwins: [{ number: 2, title: 'same goal', branch: 'self-impl/sg-bbbbbbbb-r2' }] })).toEqual({ action: 'close', reason: 'superseded-by #2' });
   });
   it('closes a merged goalid lineage without a matching title', () => {
     expect(decideDraft({ ...base, ageHours: 1, mergedTwins: [{ number: 3, title: 'different', branch: 'self-impl/y-goalid-a1b2c3-new' }] })).toEqual({ action: 'close', reason: 'superseded-by #3' });
+  });
+  it('requires verified file coverage and matching slot for a branch-prefix replacement', () => {
+    const row = { ...base.draft, title: 'old', branch: 'self-impl/shared-aaaaaaaa-r1', body: '칸: TC-17',
+      createdAt: '2026-09-01T00:00:00Z', changedFiles: ['src/a.ts'],
+      latestFileChanges: { 'src/a.ts': '2026-09-01T12:00:00Z' } };
+    const merged = { number: 42, title: 'new', branch: 'self-impl/shared-bbbbbbbb-r2', body: '칸: TC-17',
+      mergedAt: '2026-09-02T00:00:00Z', changedFiles: ['src/a.ts'] };
+    expect(decideDraft({ ...base, draft: row, ageHours: 1, mergedTwins: [merged] }))
+      .toEqual({ action: 'close', reason: 'superseded-by #42 (all-files-landed)' });
+    for (const variation of [
+      { body: '칸: TC-18' }, { mergedAt: '2026-08-31T00:00:00Z' },
+      { changedFiles: ['src/b.ts'] },
+    ]) expect(decideDraft({ ...base, draft: row, ageHours: 1, mergedTwins: [{ ...merged, ...variation }] }))
+      .toEqual({ action: 'keep', reason: 'recent' });
+    expect(decideDraft({ ...base, draft: { ...row, latestFileChanges: undefined }, ageHours: 1,
+      mergedTwins: [merged] })).toEqual({ action: 'keep', reason: 'recent' });
+    expect(decideDraft({ ...base, draft: { ...row, branch: 'self-impl/shared-goalid-cafe-aaaaaaaa-r1' },
+      ageHours: 1, mergedTwins: [{ ...merged, branch: 'self-impl/shared-goalid-beef-bbbbbbbb-r2' }] }))
+      .toEqual({ action: 'keep', reason: 'recent' });
   });
   it('closes a different-title harvest explicitly referencing the draft number, but not a neighboring number', () => {
     const harvested = { number: 7, title: 'unrelated heading', branch: 'work/different', body: 'Implemented (수확 #1)' };
@@ -123,8 +143,8 @@ describe('decideDraft', () => {
     expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3, mergedTwins: [
       { number: 20, title: 'other', branch: 'self-impl/y-goalid-a1b2c3-new' },
     ] })).toEqual({ action: 'close', reason: 'superseded-by #20' });
-    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3, mergedTwins: [
-      { number: 21, title: 'same goal', branch: 'other' },
+    expect(decideDraft({ ...base, draft: { number: 1, title: 'same goal', branch: 'self-impl/sg-aaaaaaaa-r1' }, runStatus: undefined, ageHours: 3, mergedTwins: [
+      { number: 21, title: 'same goal', branch: 'self-impl/sg-bbbbbbbb-r2' },
     ] })).toEqual({ action: 'close', reason: 'superseded-by #21' });
   });
   it('closes unobserved non-live drafts at the 24h idle boundary, not 3h', () => {
@@ -144,5 +164,27 @@ describe('decideDraft', () => {
       .toEqual({ action: 'keep', reason: 'label:elanous:keep' });
     // Origin labels carry no protection.
     expect(decideDraft({ ...base, draft: { ...base.draft, labels: ['elanous:from-harness'] }, ageHours: 100 }).action).toBe('close');
+  });
+});
+
+describe('sameGoalPr (TC 10-05 · identifier first, title only with harness stem)', () => {
+  it('compares goal identifiers when both carry one', () => {
+    expect(sameGoalPr({ number: 1, title: 'A', branch: 'self-impl/x-goalid-abc1-r1' }, { number: 2, title: 'B', branch: 'self-impl/y-goalid-abc1-r2' })).toBe(true);
+    expect(sameGoalPr({ number: 1, title: 'Same', branch: 'self-impl/x-goalid-abc1-r1' }, { number: 2, title: 'Same', branch: 'self-impl/x-goalid-def2-r2' })).toBe(false);
+    expect(sameGoalPr({ number: 1, title: 'Same', branch: 'a', body: '골: one' }, { number: 2, title: 'Same', branch: 'b', body: '골: two' })).toBe(false);
+  });
+  it('never treats an auto title shared by different goals as the same goal', () => {
+    const title = 'src/harness: harness-queue.ts';
+    expect(isAutoTitle(title)).toBe(true);
+    expect(isAutoTitle('src: hq.ts, fence-audit.ts, registry.ts')).toBe(true);
+    expect(isAutoTitle('fix seat loop downgrade')).toBe(false);
+    expect(sameGoalPr({ number: 1, title, branch: 'self-impl/x-aaaaaaaa-r1' }, { number: 2, title, branch: 'self-impl/x-bbbbbbbb-r2' })).toBe(false);
+  });
+  it('needs exact title, both harness branches and the same stem when an identifier is missing', () => {
+    const a = { number: 1, title: 'Same', branch: 'self-impl/x-aaaaaaaa-r1' };
+    expect(sameGoalPr(a, { number: 2, title: 'Same', branch: 'self-impl/x-bbbbbbbb-r2' })).toBe(true);
+    expect(sameGoalPr(a, { number: 2, title: 'Same', branch: 'feature/x' })).toBe(false);
+    expect(sameGoalPr(a, { number: 2, title: 'Same', branch: 'self-impl/y-bbbbbbbb-r2' })).toBe(false);
+    expect(sameGoalPr(a, { number: 2, title: 'Other', branch: 'self-impl/x-bbbbbbbb-r2' })).toBe(false);
   });
 });

@@ -28,7 +28,7 @@ export interface LoopEntry {
   title: string;
   description: string | null;
   owner?: string | null;
-  ownerSource?: 'header' | 'config' | 'seat' | 'default';
+  ownerSource?: 'header' | 'config' | 'seat' | 'seat-arg' | 'default';
   mode?: string | null;
   file: string;
   trigger: { cron: string | null; events: string[] };
@@ -46,6 +46,8 @@ export interface LoopRegistryOptions {
   /** An already-inventoried registry; keeps focused tests isolated. */
   schedules?: ScheduleRow[];
   scheduleAction?: (action: 'create' | 'enable' | 'disable', args: Record<string, unknown>) => Promise<unknown>;
+  /** Home used to expand `~`/`$HOME` in cron redirects; tests inject a temp dir instead of writing the real HOME. */
+  home?: string;
 }
 
 function graphFiles(dir: string): string[] {
@@ -136,29 +138,43 @@ function schedules(opts: LoopRegistryOptions): ScheduleRow[] {
 }
 
 type OwnerSource = NonNullable<LoopEntry['ownerSource']>;
-function resolveOwner(id: string, title: string, config: UserConfig, header?: unknown, seat?: string): { owner: string; ownerSource: OwnerSource } {
+function resolveOwner(id: string, title: string, config: UserConfig, header?: unknown, seat?: string, seatSource: OwnerSource = 'seat'): { owner: string; ownerSource: OwnerSource } {
   if (typeof header === 'string' && /^(OP|TC|MK|UX)$/.test(header)) return { owner: header, ownerSource: 'header' };
   const owners = config.loops?.owners;
   const configured = owners && (Object.hasOwn(owners, id) ? owners[id] : Object.hasOwn(owners, title) ? owners[title] : undefined);
   if (configured) return { owner: configured, ownerSource: 'config' };
-  if (seat) return { owner: seat, ownerSource: 'seat' };
+  if (seat) return { owner: seat, ownerSource: seatSource };
   return { owner: config.loops?.defaultOwner ?? 'OP', ownerSource: 'default' };
 }
 
-/** An append redirection on the installed command is a run estimate, not a success record. */
-function cronLogMtime(command: string): string | undefined {
-  const match = command.match(/(?:^|\s)>>\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))/);
-  if (!match) return undefined;
-  const path = (match[1] ?? match[2] ?? match[3]!).replace(/^~(?=\/)/, homedir()).replace(/^\$HOME(?=\/)/, homedir());
-  const cd = command.match(/^cd\s+(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))\s*&&/);
-  const cwd = (cd?.[1] ?? cd?.[2] ?? cd?.[3] ?? homedir()).replace(/^~(?=\/)/, homedir()).replace(/^\$HOME(?=\/)/, homedir());
-  try {
-    const stat = statSync(resolve(cwd, path));
-    return stat.isFile() ? stat.mtime.toISOString() : undefined;
-  } catch (error) {
-    debug.log('loops.registry', 'cron-log-unavailable', { path: resolve(cwd, path), error: String(error) });
-    return undefined;
+/** Output redirects in the installed cron line (including a quoted hq-fence payload) estimate runs, not success. */
+function cronLogMtime(command: string, home: string = homedir()): { at?: string; targets: number } {
+  const expandHome = (path: string) => path.replace(/^~(?=\/)/, home).replace(/^\$HOME(?=\/)/, home);
+  const operand = String.raw`(?:'([^']+)'|"([^"]+)"|([^\s;|&'"<>]+))`;
+  const cdPattern = new RegExp(String.raw`(?:^|[\s'"])cd\s+${operand}\s*&&`, 'g');
+  const redirectPattern = new RegExp(String.raw`(?:[12]|&)?>{1,2}\s*${operand}`, 'g');
+  const cds: Array<{ index: number; cwd: string }> = [];
+  for (const match of command.matchAll(cdPattern)) {
+    const path = expandHome(match[1] ?? match[2] ?? match[3]!);
+    cds.push({ index: match.index, cwd: resolve(cds.at(-1)?.cwd ?? home, path) });
   }
+  let latest: number | undefined;
+  let targets = 0;
+  for (const match of command.matchAll(redirectPattern)) {
+    const path = expandHome(match[1] ?? match[2] ?? match[3]!);
+    if (path === '/dev/null') continue;
+    const cwd = [...cds].reverse().find(cd => cd.index < match.index)?.cwd ?? home;
+    const target = resolve(cwd, path);
+    targets++;
+    try {
+      const stat = statSync(target);
+      if (stat.isFile()) latest = Math.max(latest ?? -Infinity, stat.mtimeMs);
+    } catch (error) {
+      debug.log('loops.registry', 'cron-log-unavailable', { path: target, error: String(error) });
+    }
+  }
+  if (latest === undefined) debug.log('loops.registry', 'cron-log-unavailable', { command, targets, reason: 'no-output-files' });
+  return { at: latest === undefined ? undefined : new Date(latest).toISOString(), targets };
 }
 
 /** Where loop graphs live and where their cron line `cd`s — the same rule as the other elanous crons:
@@ -213,7 +229,7 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
 }
 
 export interface AllLoopEntry extends CheckEntry {
-  kind: 'graph' | 'seat' | 'cron-shell' | 'orchestrator';
+  kind: 'graph' | 'seat' | 'cron-shell' | 'orchestrator' | 'unregistered';
   title: string;
   cron?: string;
   command?: string;
@@ -268,16 +284,22 @@ function elanousActionStart(args: LaunchWord[]): number {
 }
 
 /** Include every launched segment of a wrapper's quoted shell payload, in execution order. */
-function launchedCommands(command: string, onFence?: (role: string) => void): LaunchWord[][] {
-  const launches: LaunchWord[][] = [];
-  const last = launchedCommand(command, onFence, words => { if (words.length) launches.push(words); });
-  if (last.length) launches.push(last);
+function launchedCommandsWithFence(command: string): Array<{ words: LaunchWord[]; fenceRole?: string }> {
+  const launches: Array<{ words: LaunchWord[]; fenceRole?: string }> = [];
+  launchedCommand(command, undefined, (words, fenceRole) => { if (words.length) launches.push({ words, ...(fenceRole ? { fenceRole } : {}) }); });
   return launches;
 }
 
+function launchedCommands(command: string): LaunchWord[][] {
+  return launchedCommandsWithFence(command).map(({ words }) => words);
+}
+
 /** Only executable-prefix wrappers are stripped; a quoted argument mentioning a loop is not a launch. */
-function launchedCommand(command: string, onFence?: (role: string) => void, onLaunch?: (words: LaunchWord[]) => void): LaunchWord[] {
+function launchedCommand(command: string, onFence?: (role: string) => void,
+  onLaunch?: (words: LaunchWord[], fenceRole?: string) => void, inheritedFenceRole?: string): LaunchWord[] {
   const words = launchedWords(command);
+  let activeFenceRole = inheritedFenceRole;
+  const markFence = (role: string) => { activeFenceRole = role; onFence?.(role); };
   const wrappers: Record<string, { values: readonly string[]; positionals: number }> = {
     env: { values: ['-u', '--unset', '-C', '--chdir', '-S', '--split-string'], positionals: 0 },
     flock: { values: ['-w', '--wait', '-E', '--conflict-exit-code'], positionals: 1 },
@@ -303,7 +325,7 @@ function launchedCommand(command: string, onFence?: (role: string) => void, onLa
       for (let i = 2; i < separator; i++) {
         const role = args[i]?.text === '--role' && i + 1 < separator ? args[i + 1]?.text
           : args[i]?.text.startsWith('--role=') ? args[i]!.text.slice('--role='.length) : undefined;
-        if (role) { onFence?.(role); break; }
+        if (role) { markFence(role); break; }
       }
       offset = words.length - args.length + separator + 1;
       continue;
@@ -313,20 +335,19 @@ function launchedCommand(command: string, onFence?: (role: string) => void, onLa
       if (words[commandAt]?.text === '--role' && !words[commandAt]?.quoted) {
         const role = words[commandAt + 1]?.text;
         if (role && FENCE_ROLES.includes(role as typeof FENCE_ROLES[number])) {
-          onFence?.(role);
+          markFence(role);
           commandAt += words[commandAt + 2]?.text === '--' ? 3 : 2;
         }
       } else if (FENCE_ROLES.includes(words[commandAt]?.text as typeof FENCE_ROLES[number]) && !words[commandAt]?.quoted) {
-        onFence?.(words[commandAt]!.text);
+        markFence(words[commandAt]!.text);
         commandAt++;
       }
       if (words[commandAt]?.quoted && words[commandAt]!.text.includes(' ')) {
         const parts = shellSegments(words[commandAt]!.text);
         for (const part of parts.slice(0, -1)) {
-          const launch = launchedCommand(part, onFence, onLaunch);
-          if (launch.length) onLaunch?.(launch);
+          launchedCommand(part, onFence, onLaunch, activeFenceRole);
         }
-        return launchedCommand(parts.at(-1) ?? '', onFence, onLaunch);
+        return launchedCommand(parts.at(-1) ?? '', onFence, onLaunch, activeFenceRole);
       }
       offset = commandAt;
       continue;
@@ -348,15 +369,16 @@ function launchedCommand(command: string, onFence?: (role: string) => void, onLa
       // The payload is its own shell line: each segment may launch a loop.
       const parts = shellSegments(payload);
       for (const part of parts.slice(0, -1)) {
-        const launch = launchedCommand(part, onFence, onLaunch);
-        if (launch.length) onLaunch?.(launch);
+        launchedCommand(part, onFence, onLaunch, activeFenceRole);
       }
-      return launchedCommand(parts.at(-1) ?? '', onFence, onLaunch);
+      return launchedCommand(parts.at(-1) ?? '', onFence, onLaunch, activeFenceRole);
     }
     if (index >= words.length) break;
     offset = index;
   }
-  return words.slice(offset);
+  const launch = words.slice(offset);
+  if (launch.length) onLaunch?.(launch, activeFenceRole);
+  return launch;
 }
 
 /** Split a shell line at top-level `&&`, `||`, `;` and `|` only — separators inside quotes stay in their word. */
@@ -408,6 +430,15 @@ function launchedScript(words: LaunchWord[]): { script: string; args: LaunchWord
   return { script: words[offset]?.text ?? '', args: words.slice(offset + 1) };
 }
 
+/** Return each launched action with its own fence role; one fenced segment cannot cover a sibling. */
+export function cronLaunchedActionsWithFence(command: string): Array<{ script: string; args: string[]; fenceRole?: string }> {
+  return shellSegments(command).flatMap(segment => launchedCommandsWithFence(segment).map(({ words, fenceRole }) => {
+    const { script, args } = launchedScript(words);
+    return { script, args: args.slice(isElanousExecutable(script) ? elanousActionStart(args) : 0).map(word => word.text),
+      ...(fenceRole ? { fenceRole } : {}) };
+  }));
+}
+
 /** Recognize direct .sh execution or sh/bash/zsh with option flags and a script or -c payload. */
 function isCronShellCommand(command: string): boolean {
   return shellSegments(command).some(segment => launchedCommands(segment).some(words => {
@@ -444,13 +475,31 @@ function launchedSeat(command: string): string | undefined {
   return undefined;
 }
 
+function seatLoopCommand(command: string): { seat?: string; matched: boolean } {
+  for (const segment of shellSegments(command)) {
+    for (const words of launchedCommands(segment)) {
+      const { script, args } = launchedScript(words);
+      if (!isElanousExecutable(script)) continue;
+      const action = args.slice(elanousActionStart(args));
+      if (action[0]?.quoted || action[0]?.text !== 'seat' || action[1]?.quoted || action[1]?.text !== 'loop') continue;
+      if (!action.slice(2).some(word => !word.quoted && word.text === '--once')) continue;
+      const seatAt = action.findIndex((word, index) => index >= 2 && !word.quoted && word.text === '--seat');
+      const seat = seatAt >= 0 && !action[seatAt + 1]?.quoted ? action[seatAt + 1]?.text
+        : action.slice(2).find(word => !word.quoted && word.text.startsWith('--seat='))?.text.slice('--seat='.length);
+      return { matched: true, ...(seat && /^(OP|TC|MK|UX)$/.test(seat) ? { seat } : {}) };
+    }
+  }
+  return { matched: false };
+}
+
 function launchedOrchestrator(command: string): boolean {
   return shellSegments(command).some(segment => launchedCommands(segment).some(words =>
     /(?:^|\/)(?:\w+-)?orchestrator(?:\.[\w-]+)?$/i.test(launchedScript(words).script)));
 }
 
-/** A launched two-word elanous action, not a mention in an argument or a read-only CLI query. */
+/** Name only recognizable CLI entry points. Unknown actions remain visible via the unregistered cron warning. */
 function elanousCronName(command: string): string | undefined {
+  const known = new Set(['hq', 'harness', 'card', 'loop', 'graph', 'config', 'logs', 'where', '--version']);
   for (const segment of shellSegments(command)) {
     for (const words of launchedCommands(segment)) {
       const { script, args } = launchedScript(words);
@@ -458,15 +507,9 @@ function elanousCronName(command: string): string | undefined {
       const start = elanousActionStart(args);
       const first = args[start];
       const second = args[start + 1];
-      if (!first || !second || first.quoted || second.quoted || first.text.startsWith('-') || second.text.startsWith('-')) continue;
-      const actions: Record<string, readonly string[]> = {
-        hq: ['heartbeat', 'arbiter-check'],
-        harness: ['queue'],
-        card: ['intake-scan'],
-        loop: ['status', 'list'],
-      };
-      if (actions[first.text]?.includes(second.text)
-        && (first.text !== 'harness' || args[start + 2]?.text === 'tick')) return `${first.text} ${second.text}`;
+      if (!first || first.quoted || !first.text || !known.has(first.text)) continue;
+      return second && !second.quoted && !second.text.startsWith('-') && !/^(?:\d*>|\d*>>|<|<<|&>|\|)$/.test(second.text)
+        ? `${first.text} ${second.text}` : first.text;
     }
   }
   return undefined;
@@ -476,12 +519,20 @@ function elanousCronName(command: string): string | undefined {
 function namedCronIds(rows: ScheduleRow[], graphClaimed: Set<string>): Map<string, string> {
   const counts = new Map<string, number>();
   const ids = new Map<string, string>();
-  for (const row of rows) {
-    if (graphClaimed.has(row.id) || row.source !== 'crontab' || row.run_via !== 'crontab' || row.disabled_reason === 'vanished') continue;
-    const command = row.command ?? '';
-    if (launchedSeat(command) || launchedOrchestrator(command) || isCronShellCommand(command)) continue;
+  const candidates = rows.filter(row => !graphClaimed.has(row.id) && row.source === 'crontab'
+    && row.run_via === 'crontab' && row.disabled_reason !== 'vanished'
+    && !launchedSeat(row.command ?? '') && !seatLoopCommand(row.command ?? '').matched && !launchedOrchestrator(row.command ?? '')
+    && !isCronShellCommand(row.command ?? '') && !!elanousCronName(row.command ?? ''));
+  // Reserve the existing owner-key slots before assigning newly recognized commands.
+  const established = (command: string): boolean => {
     const name = elanousCronName(command);
-    if (!name) continue;
+    if (!name) return false;
+    if (name === 'harness queue') return /\bqueue\s+tick\b/.test(command);
+    return ['hq heartbeat', 'hq arbiter-check', 'card intake-scan', 'loop status', 'loop list'].includes(name);
+  };
+  for (const row of [...candidates.filter(row => established(row.command ?? '')),
+    ...candidates.filter(row => !established(row.command ?? ''))]) {
+    const name = elanousCronName(row.command ?? '')!;
     const base = `elanous:${name.replace(/\s+/g, '-')}`;
     const count = (counts.get(base) ?? 0) + 1;
     counts.set(base, count);
@@ -552,32 +603,47 @@ export function listAllLoops(opts: LoopRegistryOptions = {}): AllLoopEntry[] {
     if (claimed.has(row.id)) continue;
     const command = row.command ?? '';
     const seat = launchedSeat(command);
+    const seatArg = seatLoopCommand(command).seat;
     const orchestrator = launchedOrchestrator(command);
     const shell = isCronShellCommand(command);
     const namedId = namedIds.get(row.id);
     const fenceRole = cronFenceRole(command);
     const fencedGitPush = fenceRole === 'git-push' && fenceCommandTitle(command, fenceRole) === 'git push (hq-fence git-push)';
-    const kind: AllLoopEntry['kind'] = seat ? 'seat' : orchestrator ? 'orchestrator' : 'cron-shell';
+    const kind: AllLoopEntry['kind'] = seat || seatArg ? 'seat' : orchestrator ? 'orchestrator' : 'cron-shell';
     if (kind === 'cron-shell' && !shell && !namedId && !fencedGitPush) continue;
     const cron = row.cron;
     const period = cronPeriod(cron, now);
     const dueAt = cron ? dueBefore(cron, now) : null;
-    const id = seat ? `${seat.toLowerCase()}-seat:${row.id}` : namedId ?? row.id;
-    const title = seat ? `${seat} seat` : row.note || (fenceRole ? fenceCommandTitle(command, fenceRole) : undefined) || (namedId ? elanousCronName(command) : undefined) || row.name;
-    const logMtime = kind === 'cron-shell' && command ? cronLogMtime(command) : undefined;
+    const id = seatArg ? `elanous:seat-loop:${seatArg}` : seat ? `${seat.toLowerCase()}-seat:${row.id}` : namedId ?? row.id;
+    if (seatArg && all.some(entry => entry.id === id)) continue;
+    const title = seatArg ? `${seatArg} seat loop` : seat ? `${seat} seat` : row.note || (fenceRole ? fenceCommandTitle(command, fenceRole) : undefined) || (namedId ? elanousCronName(command) : undefined) || row.name;
+    const { at: logMtime, targets } = (kind === 'cron-shell' || seatArg) && command ? cronLogMtime(command, opts.home) : { at: undefined, targets: 0 };
+    const recorded = row.last_run && Number.isFinite(Date.parse(row.last_run)) ? row.last_run : undefined;
+    const picked = logMtime && (!recorded || Date.parse(logMtime) >= Date.parse(recorded)) ? 'log-mtime'
+      : recorded ? 'registry' : 'none';
+    debug.log('loops.registry', 'cron-last-run', { id, targets, picked });
     all.push({ kind, id, title,
-      ...resolveOwner(id, title, config, undefined, seat), ...(fenceRole ? { fenceRole } : {}),
+      ...resolveOwner(id, title, config, undefined, seatArg ?? seat, seatArg ? 'seat-arg' : 'seat'), ...(fenceRole ? { fenceRole } : {}),
       host: hostname(), observationCategory: row.category,
       enabled: !!row.enabled, registered: true,
       ...(cron ? { cron } : {}), ...(command ? { command } : {}),
       ...periodFields(period),
       ...(dueAt ? { dueAt } : {}),
-      ...(logMtime ? { lastRunAt: logMtime, evidence: 'log-mtime' as const }
-        : row.last_run && Number.isFinite(Date.parse(row.last_run)) ? { lastRunAt: row.last_run } : {}),
+      ...(picked === 'log-mtime' ? { lastRunAt: logMtime, evidence: picked }
+        : picked === 'registry' ? { lastRunAt: recorded, evidence: picked } : {}),
       ...(row.last_status ? { lastStatus: row.last_status } : {}),
       recentStatuses: row.last_status ? [row.last_status] : [] });
   }
-  const bySource: Record<OwnerSource, number> = { header: 0, config: 0, seat: 0, default: 0 };
+  const warnings = unregisteredCronLoops(all, graphOpts);
+  for (const row of warnings) {
+    const title = `미등록: ${row.command ?? row.id}`;
+    all.push({ kind: 'unregistered', id: row.id, title,
+      ...resolveOwner(row.id, title, config), host: hostname(), observationCategory: row.category,
+      enabled: !!row.enabled, registered: false,
+      ...(row.cron ? { cron: row.cron } : {}), ...(row.command ? { command: row.command } : {}),
+      ...periodFields(cronPeriod(row.cron, now)), recentStatuses: [] });
+  }
+  const bySource: Record<OwnerSource, number> = { header: 0, config: 0, seat: 0, 'seat-arg': 0, default: 0 };
   for (const loop of all) bySource[loop.ownerSource!]++;
   debug.log('loop.check', 'ownership', { total: all.length, bySource });
   debug.log('loops.registry', 'list-all', { count: all.length });
@@ -595,13 +661,28 @@ export function unregisteredCronLoops(entries: AllLoopEntry[], opts: LoopRegistr
   const rows = schedules(opts);
   const graphClaimed = new Set([...graphJobs.values()].flat());
   const namedRows = new Map([...namedCronIds(rows, graphClaimed)].map(([rowId, name]) => [name, rowId]));
-  const claimed = new Set(entries.flatMap(entry => entry.kind === 'graph'
+  const accounted = entries.flatMap(entry => entry.kind === 'graph'
     ? graphJobs.get(entry.id) ?? []
-    : [entry.kind === 'seat' ? entry.id.slice(entry.id.indexOf(':') + 1)
-      : namedRows.get(entry.id) ?? entry.id]));
-  return rows.filter(row => row.source === 'crontab' && row.run_via === 'crontab'
-    && row.disabled_reason !== 'vanished' && !claimed.has(row.id)
-    && looksElanousRelated(row.command ?? ''));
+    : entry.kind === 'unregistered' ? []
+      : [entry.kind === 'seat' && entry.id.startsWith('elanous:seat-loop:')
+        ? rows.find(row => row.command === entry.command && row.cron === entry.cron)?.id ?? entry.id
+        : entry.kind === 'seat' ? entry.id.slice(entry.id.indexOf(':') + 1)
+          : namedRows.get(entry.id) ?? entry.id]);
+  const claimed = new Set(accounted);
+  const related = rows.filter(row => row.source === 'crontab' && row.run_via === 'crontab'
+    && row.disabled_reason !== 'vanished' && row.disabled_reason !== 'manual'
+    && !!row.cron && looksElanousRelated(row.command ?? ''));
+  const warnings = related.filter(row => !claimed.has(row.id));
+  const relatedIds = new Set(related.map(row => row.id));
+  const registeredCount = accounted.filter(id => relatedIds.has(id)).length;
+  const counts = new Map<string, number>();
+  for (const id of accounted) counts.set(id, (counts.get(id) ?? 0) + 1);
+  const lines = related.filter(row => (counts.get(row.id) ?? 0) > 1);
+  if (related.length !== registeredCount + warnings.length || lines.length) {
+    debug.log('loops.registry', 'unaccounted', { lines: lines.map(row => row.raw ?? row.command ?? row.id) });
+    for (const row of lines) if (!warnings.includes(row)) warnings.push(row);
+  }
+  return warnings;
 }
 
 export function loopStatus(id: string, opts: LoopRegistryOptions = {}): LoopEntry & { recentRuns: LoopRun[] } {

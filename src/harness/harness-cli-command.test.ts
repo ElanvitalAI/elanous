@@ -412,7 +412,58 @@ describe('harness CLI command', () => {
     expect(closed[0]).toEqual(['default/repo', 43, expect.stringContaining('Branch preserved')]);
     expect(labels).toEqual([]);
     expect(lines.at(-2)).toContain('#43 close:');
-    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0');
+    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0 · 24h 넘음 1 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
+  });
+
+  test('draft sweep outside a git checkout uses harness.repo and never calls gh repo view', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'draft-sweep-outside-'));
+    const previous = process.cwd();
+    const gh = process.env.GH_REPO;
+    delete process.env.GH_REPO;
+    const calls: string[][] = [];
+    const lines: string[] = [];
+    const adapters = {
+      listDrafts: async (_page: number, _size: number, repository: string) => {
+        calls.push(['list', repository]);
+        return [];
+      },
+      listMerged: async () => [],
+      getRunStatus: async () => undefined,
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {},
+      closeDraft: async () => {},
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined, {
+      adapters,
+      execute: (args) => { calls.push(args); return 'gh/should-not-run'; },
+      write: (line) => lines.push(line),
+    });
+    setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, repo: 'config/repo' } }));
+    const previousExit = process.exitCode;
+    try {
+      process.chdir(outside);
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+      expect(calls.filter((args) => args[0] === 'repo' && args[1] === 'view')).toEqual([]);
+      expect(calls).toContainEqual(['list', 'config/repo']);
+      expect(JSON.parse(lines.at(-1)!).repository).toBe('config/repo');
+
+      calls.length = 0;
+      lines.length = 0;
+      setUserConfigOverlay(null);
+      process.exitCode = 0;
+      const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']));
+      expect(calls.filter((args) => args[0] === 'repo' && args[1] === 'view')).toEqual([]);
+      expect(errors.join('\n')).toContain('저장소 이름 없음 — --repo 또는 harness.repo 설정');
+      expect(errors.join('\n')).not.toContain('\n    at ');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.chdir(previous);
+      if (gh === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = gh;
+      setUserConfigOverlay(null);
+      process.exitCode = previousExit;
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   test('draft sweep reports fresh claims and expired claims in JSON and the human summary', async () => {
@@ -431,7 +482,7 @@ describe('harness CLI command', () => {
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
     expect(JSON.parse(lines.at(-1)!)).toMatchObject({ claimed: 1, claimExpired: 1, closed: 1 });
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep']);
-    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1(dry-run) · 처리 중 1 · 표식 만료 1');
+    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1(dry-run) · 처리 중 1 · 표식 만료 1 · 24h 넘음 2 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
   });
 
   test('draft sweep apply transitions stale running label before close and dry-run leaves both untouched', async () => {
@@ -574,25 +625,25 @@ describe('harness CLI command', () => {
       if (args[0] === 'api' && args[1]?.includes('state=closed')) throw new Error('must not list closed PRs');
       if (args[0] === 'api' && args[1]?.includes('/files?')) return '[]';
       if (args[0] === 'api' && args[1]?.includes('state=open')) return JSON.stringify([
-        { number: 1, draft: true, title: 'same goal', head: { ref: 'self-impl/old' }, labels: [{ name: 'elanous:stalled' }],
+        { number: 1, draft: true, title: 'same goal', head: { ref: 'self-impl/old-goalid-abcd-r1' }, labels: [{ name: 'elanous:stalled' }],
           created_at: '2026-09-01T00:00:00Z', merged_at: null },
-        { number: 2, draft: true, title: 'same goal', head: { ref: 'self-impl/release' }, labels: [{ name: 'elanous:stalled' }, { name: RELEASE_PATH_LABEL }],
+        { number: 2, draft: true, title: 'same goal', head: { ref: 'self-impl/release-goalid-abcd-r2' }, labels: [{ name: 'elanous:stalled' }, { name: RELEASE_PATH_LABEL }],
           created_at: '2026-09-01T00:00:00Z', merged_at: null },
         { number: 3, draft: true, title: 'another goal', head: { ref: 'self-impl/other' }, labels: [{ name: 'elanous:stalled' }],
           created_at: '2026-09-01T00:00:00Z', merged_at: null },
-        { number: 4, draft: true, title: 'same goal', head: { ref: 'self-impl/live' }, labels: [{ name: 'elanous:stalled' }],
+        { number: 4, draft: true, title: 'same goal', head: { ref: 'self-impl/live-goalid-abcd-r4' }, labels: [{ name: 'elanous:stalled' }],
           created_at: '2026-09-01T00:00:00Z', merged_at: null },
       ]);
       return '';
     };
     const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '', stdout: args[0] === 'config'
-      ? 'https://github.com/my/repo.git' : 'worktree /tmp/live\nbranch refs/heads/self-impl/live\n' });
+      ? 'https://github.com/my/repo.git' : 'worktree /tmp/live\nbranch refs/heads/self-impl/live-goalid-abcd-r4\n' });
     await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
     expect(requests[0]).toEqual(['api', 'repos/my/repo/pulls/90']);
     expect(requests.filter((args) => args[0] === 'api' && args[1]?.includes('/files?'))).toHaveLength(5);
     expect(requests.filter((args) => args[0] === 'pr')).toEqual([
       ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
-      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90. Branch preserved.'],
+      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90 (https://github.com/my/repo/pull/90). Branch preserved.'],
     ]);
     requests.length = 0;
     await expect(supersedeMergedGoalDrafts(90, '/tmp/launch-tree', () => { throw new Error('GitHub unavailable'); }, git))
@@ -607,7 +658,7 @@ describe('harness CLI command', () => {
   test('merge-time lookup uses edited GitHub goal metadata and refuses unmerged or incomplete PRs', async () => {
     const writes: string[][] = [];
     const merged = { number: 90, state: 'closed', draft: false, title: 'edited goal',
-      head: { ref: 'self-impl/edited' }, labels: [], body: '칸: UX 10-04',
+      head: { ref: 'self-impl/edited' }, labels: [], body: '칸: UX 10-04\n골: edited goal',
       created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z' };
     let observed: Record<string, unknown> = merged;
     const gh = (args: string[]) => {
@@ -616,7 +667,7 @@ describe('harness CLI command', () => {
       if (args[1]?.includes('state=open')) return JSON.stringify([
         { number: 1, draft: true, title: 'edited goal', head: { ref: 'self-impl/old' },
           labels: [{ name: 'elanous:stalled' }], created_at: '2026-09-01T00:00:00Z', merged_at: null,
-          body: '칸: UX 10-04' },
+          body: '칸: UX 10-04\n골: edited goal' },
       ]);
       if (args[1]?.includes('/files?')) return '[]';
       throw new Error(`unexpected lookup ${args.join(' ')}`);
@@ -626,7 +677,7 @@ describe('harness CLI command', () => {
     await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
     expect(writes).toEqual([
       ['pr', 'edit', '1', '--repo', 'my/repo', '--add-label', 'elanous:superseded', '--remove-label', 'elanous:stalled'],
-      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90. Branch preserved.'],
+      ['pr', 'close', '1', '--repo', 'my/repo', '--comment', 'Draft sweep: superseded-by #90 (https://github.com/my/repo/pull/90). Branch preserved.'],
     ]);
     for (const invalid of [{ ...merged, merged_at: null }, { ...merged, number: 91 },
       { ...merged, head: null }, { ...merged, created_at: 'invalid' },
@@ -947,9 +998,69 @@ describe('harness CLI command', () => {
       process.exitCode = 0;
       await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--apply']);
       expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'default/repo', apply: true,
-        complete: false, entries: [], error: expect.stringContaining('GitHub listing failed') });
+        complete: false, entries: [], error: 'GitHub listing failed' });
       expect(process.exitCode).toBe(1);
     } finally { process.exitCode = prior; }
+  });
+  test('draft sweep prints the first gh error as one line with no stack and exits non-zero', async () => {
+    const lines: string[] = [];
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'drafts.cleanup' && event === 'failed') events.push(data);
+    }) as typeof debug.log);
+    const adapters = {
+      listDrafts: async () => { throw new Error('gh: Command failed\n    at ChildProcess.exithandler (node:child_process:1:1)'); },
+      listMerged: async () => [],
+      getRunStatus: async () => undefined,
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {},
+      closeDraft: async () => {},
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'my/repo', write: (line) => lines.push(line) });
+    const prior = process.exitCode;
+    try {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+      const parsed = JSON.parse(lines.at(-1)!);
+      expect(parsed).toMatchObject({ complete: false, error: 'gh: Command failed' });
+      expect(parsed.error).not.toContain('\n');
+      expect(parsed.error).not.toContain('at ChildProcess');
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      lines.length = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep']);
+      expect(lines.some((line) => line === 'gh: Command failed')).toBe(true);
+      expect(lines.join('\n')).not.toContain('at ChildProcess');
+      expect(process.exitCode).toBe(1);
+      expect(events).toEqual([{ reason: 'gh: Command failed' }, { reason: 'gh: Command failed' }]);
+      process.exitCode = 0;
+      events.length = 0;
+      const checkout = mkdtempSync(join(tmpdir(), 'draft-sweep-gh-missing-'));
+      const { execFileSync: realExec } = await import('node:child_process');
+      realExec('git', ['init', '-q', checkout]);
+      const previousCwd = process.cwd();
+      const gh = spyOn(await import('node:child_process'), 'execFileSync').mockImplementation(((file: string, ...rest: unknown[]) => {
+        if (file === 'git') return realExec(file, ...(rest as [string[]]));
+        throw new Error('Executable not found: gh\n    at execFileSync (node:child_process:1:1)');
+      }) as typeof realExec);
+      try {
+        process.chdir(checkout);
+        const unnamed = install();
+        const errors = await captureError(() => unnamed.program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep']));
+        expect(errors).toEqual(['❌ Executable not found: gh']);
+        expect(errors.join('\n')).not.toContain('at execFileSync');
+        expect(process.exitCode).toBe(1);
+        expect(events).toEqual([{ reason: 'Executable not found: gh' }]);
+      } finally {
+        process.chdir(previousCwd);
+        gh.mockRestore();
+        rmSync(checkout, { recursive: true, force: true });
+      }
+    } finally {
+      process.exitCode = prior;
+      log.mockRestore();
+    }
   });
 
   test('launch gate blocks same-goal say and exhausted budget before either local or Pod dispatch; force bypasses only duplicate', async () => {
@@ -1236,6 +1347,19 @@ describe('harness CLI command', () => {
       process.exitCode = exit;
       rmSync(goal, { force: true });
     }
+  });
+
+  test('Pod say forwards --goal-type document without --pod-memory to the dispatcher', async () => {
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const previousExit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      const { program } = install(async () => {}, async () => {}, undefined, undefined, undefined, undefined, undefined,
+        async () => ({ cardId: 'card', mode: 'observe', decisions: {} as never }));
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write guide', '--goal-type', 'document', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      expect(dispatch.mock.calls[0]?.[0]).toMatchObject({ entrance: 'cli-harness-say', input: 'write guide', goalType: 'document' });
+      expect(dispatch.mock.calls[0]?.[0].podMemory).toBeUndefined();
+    } finally { dispatch.mockRestore(); process.exitCode = previousExit; }
   });
 
   test('real harness ask/say entrances forward the pool to self orchestration; N=2 holds a third kubectl Job apply', async () => {

@@ -10,6 +10,17 @@ import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
+test('pushed harvestable child crosses the disposition boundary and is not relaunched on resume', async () => {
+  const disposition = { stage: 'timed-out', branch: 'self-impl/finished', harvestable: true as const, ok: false };
+  const [result] = await orchestrateSelfDev({
+    goals: [{ feature: 'finished merge timeout' }],
+    spawn: (input) => ({ address: input.spaceId, done: Promise.resolve({ exitCode: 1, output: '', disposition }) }),
+  });
+  expect(result).toMatchObject({ branch: disposition.branch, harvestable: true, stage: 'timed-out' });
+  expect(classifyResumeDisposition(result!)).toBe('skip');
+  expect(decideNextRun({ results: [result!] })).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human' });
+});
+
 test('terminal results emit one metadata-only observation per merged, review-budget PR and failed run', async () => {
   const records: LogRecord[] = [];
   const off = debug.registerSink({ name: 'self-implement-result-test', emit: (record) => {

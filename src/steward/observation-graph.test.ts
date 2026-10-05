@@ -60,6 +60,12 @@ mock.module(${JSON.stringify(join(repo, 'src/domains/outbound-alert.ts'))}, () =
     expect(result.status).toBe('done');
     expect(result.path).toEqual(['sync', 'triage', 'schedule', 'report', 'done']);
     expect(existsSync(join(isolated, 'logs', 'logs.db')), run.stdout).toBe(true);
+    const tickLookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'loop.steward', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
+    expect(tickLookup.code, `${tickLookup.stderr}\n${tickLookup.stdout}`).toBe(0);
+    const tickRows = tickLookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; data?: { verdict: string; reason: string; goalId?: string } });
+    expect(tickRows.filter(row => row.category === 'loop.steward' && row.event === 'decision').map(row => [row.data?.verdict, row.data?.reason, row.data?.goalId])).toEqual([
+      ['reported', 'daily digest sent', undefined],
+    ]);
     const lookup = await command(['bun', cli, `--test=${isolated}`, 'logs', '--category', 'steward.', '--event', 'decision', '--json', '--json-data', '--limit', '20'], root);
     expect(lookup.code, `${lookup.stderr}\n${lookup.stdout}`).toBe(0);
     const records = lookup.stdout.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line) as { category?: string; event?: string; data?: { kind: string; target: string; wouldAct: boolean } });

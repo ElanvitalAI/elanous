@@ -8,7 +8,8 @@ import { decideArbiterCheck, decideFence, fileLeaseStore, parseLease, probeReach
 
 let dir = '';
 let clock = 1_000_000;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'hq-lease-')); clock = 1_000_000; });
+const opRequests: Array<{ key: string; text: string }> = [];
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'hq-lease-')); clock = 1_000_000; opRequests.length = 0; });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 /** In-memory arbiter store with a switch for «unreachable». */
@@ -36,7 +37,8 @@ const fakeProbe = (reachable: Set<string>): HostProbe => ({ ping: (h) => reachab
 const logs: Array<[string, string]> = [];
 const log = ((category: string, event: string) => { logs.push([category, event]); }) as never;
 function deps(me: string, store: LeaseStore, ssh: FakeSsh) {
-  return { config: { hostName: me, arbiter: 'cloud-vm', standby: 'node-b', ttlSeconds: 1500 }, store, ssh, probe: fakeProbe(ssh.reachable), hostPath: join(dir, 'host'), localPath: join(dir, `${me}.json`), now: () => clock, log };
+  return { config: { hostName: me, arbiter: 'cloud-vm', standby: 'node-b', ttlSeconds: 1500 }, store, ssh, probe: fakeProbe(ssh.reachable), hostPath: join(dir, 'host'), localPath: join(dir, `${me}.json`), now: () => clock, log,
+    opRequest: (request: { key: string; text: string }) => { const created = !opRequests.some((row) => row.key === request.key); if (created) opRequests.push(request); return { key: request.key, created }; } };
 }
 
 describe('HQ host-local identity', () => {
@@ -261,12 +263,68 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
   test('arbiter promotes node-b only after 2 consecutive dual-unreachable checks', () => {
     const store = memStore();
     hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
-    const arbiter = { ...deps('cloud-vm', store, fakeSsh(new Set(['node-b']))) }; // mbp unreachable from the arbiter
+    const base = deps('cloud-vm', store, fakeSsh(new Set(['node-b'])));
+    const arbiter = { ...base, config: { ...base.config, autoPromote: { enabled: true, streak: 2 } }, promote: () => ({ ok: true, apply: true, host: 'node-b', lines: [] }) };
     clock += 600; hqHeartbeat(deps('node-b', store, fakeSsh(new Set()))); // node-b cannot reach mbp
     expect(hqArbiterCheck(arbiter)).toMatchObject({ promoted: false, streak: 1, holder: 'mbp' });
     clock += 600; hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
     expect(hqArbiterCheck(arbiter)).toMatchObject({ promoted: true, holder: 'node-b', generation: 2 });
     expect(parseLease(store.raw)).toMatchObject({ holder: 'node-b', generation: 2, promotedFrom: 'mbp' });
+  });
+
+  test('arbiter default files one OP seat request (not a CEO card) at streak 3 without changing the lease', () => {
+    const store = memStore();
+    hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
+    const base = deps('cloud-vm', store, fakeSsh(new Set()));
+    const proposalLogs: Array<[string, string]> = [];
+    const arbiter = { ...base, promote: () => { throw new Error('default must not promote'); },
+      log: ((category: string, event: string) => { proposalLogs.push([category, event]); }) as typeof base.log };
+    for (let i = 1; i <= 4; i++) {
+      clock += 600;
+      hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
+      expect(hqArbiterCheck(arbiter)).toMatchObject({ ok: true, promoted: false, streak: i, holder: 'mbp', generation: 1 });
+      expect(opRequests).toHaveLength(i < 3 ? 0 : 1);
+      expect(parseLease(store.raw)).toMatchObject({ holder: 'mbp', generation: 1 });
+    }
+    expect(opRequests[0]).toMatchObject({ key: 'hq:promote:mbp:1' });
+    expect(proposalLogs.filter(([category, event]) => category === 'hq.arbiter' && event === 'promote-proposed')).toHaveLength(2);
+  });
+
+  test('arbiter opt-in calls promote on configured streak and retains the existing takeover behavior', () => {
+    const store = memStore();
+    hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
+    const base = deps('cloud-vm', store, fakeSsh(new Set()));
+    const calls: Array<[string, boolean]> = [];
+    const arbiter = { ...base, config: { ...base.config, autoPromote: { enabled: true, streak: 4 } },
+      promote: (host: string, apply: boolean) => { calls.push([host, apply]); return { ok: true, apply, host, lines: [] }; } };
+    for (let i = 1; i <= 4; i++) {
+      clock += 600;
+      hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
+      expect(hqArbiterCheck(arbiter)).toMatchObject({ promoted: i === 4, streak: i });
+      expect(calls).toHaveLength(i === 4 ? 1 : 0);
+    }
+    expect(calls).toEqual([['node-b', true]]);
+    expect(parseLease(store.raw)).toMatchObject({ holder: 'node-b', generation: 2 });
+  });
+
+  test('a failed promotion runbook is never reported as promoted and files an OP request', () => {
+    for (const promote of [() => { throw new Error('runbook failed'); }, () => ({ ok: false, apply: true, host: 'node-b', lines: [{ step: '② stop', status: 'failed' as const, measurement: 'ssh refused', command: 'x' }] })]) {
+      const store = memStore();
+      hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
+      const base = deps('cloud-vm', store, fakeSsh(new Set()));
+      const arbiter = { ...base, config: { ...base.config, autoPromote: { enabled: true, streak: 1 } }, promote };
+      clock += 600;
+      hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
+      logs.length = 0; opRequests.length = 0;
+      const outcome = hqArbiterCheck(arbiter);
+      expect(outcome).toMatchObject({ ok: true, promoted: false, streak: 1 });
+      expect(outcome.runbookFailed).toBeTruthy();
+      expect(parseLease(store.raw)).toMatchObject({ holder: 'node-b', generation: 2 });
+      expect(logs).toContainEqual(['hq.arbiter', 'promote-runbook-failed']);
+      expect(logs).not.toContainEqual(['hq.lease', 'promoted']);
+      expect(opRequests).toHaveLength(1);
+      expect(opRequests[0]!.key).toBe('hq:promote-failed:node-b:2');
+    }
   });
 
   test('one dual-unreachable check, then the standby sees mbp again → streak resets, no takeover', () => {
@@ -288,7 +346,8 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
   test('old-generation host is blocked after takeover — via the arbiter and via the standby', () => {
     const store = memStore();
     hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
-    const arbiter = deps('cloud-vm', store, fakeSsh(new Set(['node-b'])));
+    const base = deps('cloud-vm', store, fakeSsh(new Set(['node-b'])));
+    const arbiter = { ...base, config: { ...base.config, autoPromote: { enabled: true, streak: 2 } }, promote: () => ({ ok: true, apply: true, host: 'node-b', lines: [] }) };
     for (let i = 0; i < 2; i++) { clock += 600; hqHeartbeat(deps('node-b', store, fakeSsh(new Set()))); hqArbiterCheck(arbiter); }
     expect(hqHeartbeat(deps('node-b', store, fakeSsh(new Set()))).outcome).toBe('renewed');
     // mbp comes back with arbiter reachable: not the holder any more.
@@ -417,6 +476,8 @@ describe('hq config block is read from config.json (was silently dropped)', () =
     expect(parseHqConfig({ arbiter: 'gcpvm', hostName: ' mbp ', ttlSeconds: 900, failOpenRoles: ['cron', 'nope'], healthUrls: { mbp: 'https://x/v1/health', bad: 3 }, seenGenerationFile: '/tmp/s' }))
       .toEqual({ arbiter: 'gcpvm', hostName: 'mbp', ttlSeconds: 900, failOpenRoles: ['cron'], healthUrls: { mbp: 'https://x/v1/health' }, seenGenerationFile: '/tmp/s' });
     expect(parseHqConfig({ ttlSeconds: -1, arbiter: '' })).toBeUndefined();
+    expect(parseHqConfig({ autoPromote: { enabled: true, streak: 4 } })).toEqual({ autoPromote: { enabled: true, streak: 4 } });
+    expect(parseHqConfig({ autoPromote: { enabled: 'yes', streak: -2 } })).toBeUndefined();
   });
 });
 

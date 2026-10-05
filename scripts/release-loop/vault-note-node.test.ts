@@ -8,6 +8,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-co
 import { addItem, setItem } from '../../src/release-loop/checklist.js';
 import { debug } from '../../src/debug/log.js';
 import { publishRelease, type ReleaseManifest, type Runner } from '../../src/cli/release-cli.js';
+import { runGraph } from '../../src/graph-runner/runner.js';
 import { runVaultNote } from './vault-note-node.js';
 import type { GraphContext } from './node-verdict.js';
 
@@ -15,6 +16,21 @@ const version = '0.2.13';
 const directory = '40. Project/엘라누스 릴리스';
 const name = '엘라누스 v0.2.13 (2026-10-04).md';
 const previous = '| [[엘라누스 v0.2.12 (2026-10-03)|v0.2.12]] | 10-03 18:00 | 사람이 쓴 한 줄 |';
+const previousCommit = 'b'.repeat(40);
+
+function writePublishedPrevious(root: string): void {
+  const dir = join(root, 'release', '0.2.12');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'release.json'), JSON.stringify({ version: '0.2.12', tag: 'v0.2.12', sourceCommit: previousCommit, publishedAt: '2026-10-03T12:00:00Z' }));
+}
+
+function previousRun(runId: string, count: number, startedAt?: string, published = true) {
+  return { graphId: 'release-loop', runId, ...(startedAt ? { startedAt } : {}), input: { version: '0.2.12' }, nodes: [
+    { nodeId: 'version-release', ok: true, output: JSON.stringify({ commit: previousCommit }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count }) },
+    { nodeId: 'publish', ok: published, output: JSON.stringify({ tag: 'v0.2.12' }) },
+  ] };
+}
 
 async function fixture(fn: (f: { root: string; vault: string; context: GraphContext; note: string; index: string; run: () => ReturnType<typeof runVaultNote> }) => void | Promise<void>): Promise<void> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'vault-note-root-')));
@@ -195,14 +211,14 @@ test('real checklist ledger supplies only green cells to the note', () => fixtur
   } finally { resetElanousConfigDir(); }
 }));
 
-test('write failure is fail yet the vault-note graph edge leads to ops-upgrade', () => fixture(({ root, vault, context }) => {
+test('write failure is fail yet the vault-note graph edge leads through release-story to ops-upgrade', () => fixture(({ root, vault, context }) => {
   const fileVault = join(root, 'vault-file');
   writeFileSync(fileVault, 'not a directory');
   const result = runVaultNote(context, { instanceRoot: root, productionRoot: root, vaultRoot: fileVault, checklist: () => [] });
   expect(result.outcome).toBe('fail');
   expect(result.reason).toBeTruthy();
   const graph = parse(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
-  expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map).toEqual({ ok: 'ops-upgrade', fail: 'ops-upgrade', error: 'ops-upgrade' });
+  expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map).toEqual({ ok: 'release-story', fail: 'release-story', error: 'release-story' });
   expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'vault-note', fail: 'failed', error: 'failed' });
   const recipes = parse(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command: string; timeout_ms: number }>;
   expect(recipes['vault-note']).toEqual({ command: 'bun scripts/release-loop/vault-note-node.ts', timeout_ms: 60000 });
@@ -291,10 +307,378 @@ test('a prior failed run of the same version supplies the retry reason, not unre
   expect(content).not.toContain('다른 판 실패');
 }));
 
+test('stability line compares known-issues with the newest published version, skipping an unpublished folded one', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  // 0.2.11 was published; 0.2.12 was cut and folded into the next version without publishing (no release.json).
+  mkdirSync(join(root, 'release', '0.2.11'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.11', 'release.json'), JSON.stringify({ version: '0.2.11', tag: 'v0.2.11', sourceCommit: previousCommit, publishedAt: '2026-10-02T12:00:00Z' }));
+  mkdirSync(join(root, 'release', '0.2.12'), { recursive: true });
+  const published = previousRun('previous', 4);
+  writeFileSync(join(dir, 'previous.json'), JSON.stringify({ ...published, input: { version: '0.2.11' }, nodes: published.nodes.map((node) => node.nodeId === 'publish' ? { ...node, output: JSON.stringify({ tag: 'v0.2.11' }) } : node) }));
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'gate', ok: true, output: JSON.stringify({ introduced: [], preexisting: 0 }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 3 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  expect(context.input.previousVersion).toBe('0.2.12');
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('known-issues 직전 판 대비 -1');
+}));
+
+test('stability line reads same-run ledger values and previous version known-issues count', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writePublishedPrevious(root);
+  writeFileSync(join(dir, 'previous.json'), JSON.stringify(previousRun('previous', 2)));
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'gate', ok: true, output: JSON.stringify({ introduced: ['one'], preexisting: 3 }) },
+    { nodeId: 'cutoff', ok: true, output: JSON.stringify({ baseline: { sha: 'base' }, cutoff: { sha: 'cut' }, in: [] }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 5 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  const currentBefore = readFileSync(join(dir, 'current.json'), 'utf8');
+  const previousBefore = readFileSync(join(dir, 'previous.json'), 'utf8');
+  const logged = spyOn(debug, 'log');
+  try {
+    expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+    const content = readFileSync(note, 'utf8');
+    expect(content).toContain('안정: 게이트 introduced 1 · preexisting 3 · 재컷 ? · 호스트 판올림 성공 ? · known-issues 직전 판 대비 +3');
+    expect(content.match(/^안정: /gm)).toHaveLength(1);
+    expect(readFileSync(join(dir, 'current.json'), 'utf8')).toBe(currentBefore);
+    expect(readFileSync(join(dir, 'previous.json'), 'utf8')).toBe(previousBefore);
+    expect(logged).toHaveBeenCalledWith('release-loop.vault-note', 'stability-line', { fields: { introduced: 1, preexisting: 3, recut: '?', hosts: '?', knownIssuesDelta: '+3' }, unreadable: ['cutoff.pick count not recorded', 'ops-upgrade.hosts not yet available'] });
+  } finally { logged.mockRestore(); }
+}));
+
+test('known-issues delta uses the published previous run, not a later failed run', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writePublishedPrevious(root);
+  for (const [runId, startedAt, count, published] of [
+    ['early', '2026-10-03T07:00:00Z', 4, true], ['late', '2026-10-03T09:00:00Z', 9, false], ['future', '2026-10-05T09:00:00Z', 8, false],
+  ] as const) {
+    writeFileSync(join(dir, `${runId}.json`), JSON.stringify(previousRun(runId, count, startedAt, published)));
+  }
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', startedAt: '2026-10-04T09:00:00Z', input: { version }, nodes: [
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 5 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('known-issues 직전 판 대비 +1');
+}));
+
+test('ambiguous published previous runs with different counts leave delta unknown', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writePublishedPrevious(root);
+  writeFileSync(join(dir, 'first.json'), JSON.stringify(previousRun('first', 2, '2026-10-03T07:00:00Z')));
+  writeFileSync(join(dir, 'second.json'), JSON.stringify(previousRun('second', 9, '2026-10-03T08:00:00Z')));
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 5 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('known-issues 직전 판 대비 ?');
+}));
+
+test('unknown previous publication never substitutes a failed previous run count', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'previous.json'), JSON.stringify(previousRun('previous', 8, undefined, false)));
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'gate', ok: true, output: JSON.stringify({ introduced: [], preexisting: 0 }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 5 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] })).toMatchObject({ outcome: 'ok', verdict: 'pass' });
+  expect(readFileSync(note, 'utf8')).toContain('안정: 게이트 introduced 0 · preexisting 0 · 재컷 ? · 호스트 판올림 성공 ? · known-issues 직전 판 대비 ?');
+}));
+
+test('known-issues delta distinguishes a measured zero and a decrease', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writePublishedPrevious(root);
+  writeFileSync(join(dir, 'previous.json'), JSON.stringify(previousRun('previous', 0)));
+  const currentPath = join(dir, 'current.json');
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  writeFileSync(currentPath, JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 0 }) },
+  ] }));
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('known-issues 직전 판 대비 +0');
+  writeFileSync(join(dir, 'previous.json'), JSON.stringify(previousRun('previous', 2)));
+  rmSync(note);
+  expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('known-issues 직전 판 대비 -2');
+}));
+
+test('partial ledger preserves measured zeros and marks only missing fields unknown', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'gate', ok: true, output: JSON.stringify({ introduced: [], preexisting: 0 }) },
+    { nodeId: 'cutoff', ok: true, output: JSON.stringify({ baseline: { sha: 'base' }, cutoff: { sha: 'base' }, in: [] }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ count: 0 }) },
+  ] }));
+  const matched = { ...context, graphId: 'release-loop', runId: 'current' };
+  const logged = spyOn(debug, 'log');
+  try {
+    expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+    expect(readFileSync(note, 'utf8')).toContain('안정: 게이트 introduced 0 · preexisting 0 · 재컷 ? · 호스트 판올림 성공 ? · known-issues 직전 판 대비 ?');
+    expect(logged).toHaveBeenCalledWith('release-loop.vault-note', 'stability-line', { fields: { introduced: 0, preexisting: 0, recut: '?', hosts: '?', knownIssuesDelta: '?' }, unreadable: ['cutoff.pick count not recorded', 'ops-upgrade.hosts not yet available', 'known-issues.count(previous/current)'] });
+  } finally { logged.mockRestore(); }
+}));
+
+test('graph runner context supplies run identity even when readGraphContext strips it', () => fixture(({ root, vault, context, note }) => {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'current.json'), JSON.stringify({ graphId: 'release-loop', runId: 'current', input: { version }, nodes: [
+    { nodeId: 'gate', ok: true, output: JSON.stringify({ outcome: 'ok', introduced: [], preexisting: 0 }) },
+    { nodeId: 'cutoff', ok: true, output: JSON.stringify({ version, baseline: { sha: 'base' }, cutoff: { sha: 'cut' }, in: [] }) },
+    { nodeId: 'known-issues', ok: true, output: JSON.stringify({ outcome: 'ok', count: 0 }) },
+  ] }));
+  const saved = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ graphId: 'release-loop', runId: 'current', input: context.input, outputs: context.outputs });
+  try {
+    expect(runVaultNote(context, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] })).toMatchObject({ outcome: 'ok', verdict: 'pass' });
+    expect(readFileSync(note, 'utf8')).toContain('안정: 게이트 introduced 0 · preexisting 0 · 재컷 ? · 호스트 판올림 성공 ? · known-issues 직전 판 대비 ?');
+    const graph = parse(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
+    expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map.ok).toBe('release-story');
+  } finally {
+    if (saved === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = saved;
+  }
+}));
+
+test('release graph runner writes note before later ops-upgrade results in its run ledger', () => fixture(async ({ root, vault, context, note }) => {
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const runId = 'graph-order';
+  const nodes: Array<{ nodeId: string; ok: boolean; output: string }> = [];
+  const output = (nodeId: string, data: Record<string, unknown>) => {
+    const result = JSON.stringify(data);
+    nodes.push({ nodeId, ok: true, output: result });
+    return { stdout: `${result}\n`, stderr: '', exitCode: 0 };
+  };
+  const saved = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const state = await runGraph(graphPath, { runId, input: context.input, deps: { root, log: () => {}, runBash: async (_body, options) => {
+      const location = options.env!.ELANOUS_GRAPH_CONTEXT!;
+      const nodeId = JSON.parse(readFileSync(location, 'utf8')).nodeId as string;
+      if (nodeId === 'vault-note') {
+        process.env.ELANOUS_GRAPH_CONTEXT = location;
+        const result = runVaultNote(context, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] });
+        expect(result.outcome).toBe('ok');
+        const text = readFileSync(note, 'utf8');
+        expect(text).toContain('안정: 게이트 introduced 0 · preexisting 0 · 재컷 ? · 호스트 판올림 성공 ?');
+        expect(nodes.some((node) => node.nodeId === 'ops-upgrade')).toBe(false);
+        return output(nodeId, result);
+      }
+      if (nodeId === 'gate') return output(nodeId, { outcome: 'ok', introduced: [], preexisting: 0 });
+      if (nodeId === 'cutoff') return output(nodeId, { outcome: 'ok', baseline: { sha: 'base' }, cutoff: { sha: 'cut' }, in: [] });
+      if (nodeId === 'known-issues') return output(nodeId, { outcome: 'ok', count: 0 });
+      if (nodeId === 'ops-upgrade') return output(nodeId, { outcome: 'ok', hosts: [{ ok: true }, { ok: false }] });
+      return output(nodeId, { outcome: 'ok' });
+    } } });
+    expect(state.path.indexOf('vault-note')).toBeLessThan(state.path.indexOf('ops-upgrade'));
+    const ledger = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', `${runId}.json`), 'utf8')) as { nodes: Array<{ nodeId: string; output?: string }> };
+    expect(readFileSync(note, 'utf8')).toContain('안정: 게이트 introduced 0 · preexisting 0 · 재컷 ? · 호스트 판올림 성공 ?');
+    expect(JSON.parse(ledger.nodes.find((node) => node.nodeId === 'ops-upgrade')!.output!)).toMatchObject({ hosts: [{ ok: true }, { ok: false }] });
+  } finally {
+    if (saved === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = saved;
+  }
+}));
+
+test('unreadable graph identity cannot fail an otherwise publishable note', () => fixture(({ root, vault, context, note }) => {
+  const saved = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = '{malformed';
+  try {
+    expect(runVaultNote(context, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] })).toMatchObject({ outcome: 'ok', verdict: 'pass' });
+    expect(readFileSync(note, 'utf8')).toContain('안정: 측정 불가: 런 식별자 없음');
+  } finally {
+    if (saved === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = saved;
+  }
+}));
+
+test('missing run ledger writes one unavailable stability line and retains ok result', () => fixture(({ root, vault, context, note }) => {
+  const matched = { ...context, graphId: 'release-loop', runId: 'missing' };
+  const logged = spyOn(debug, 'log');
+  try {
+    expect(runVaultNote(matched, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] })).toMatchObject({ outcome: 'ok', verdict: 'pass' });
+    const text = readFileSync(note, 'utf8');
+    expect(text.match(/^안정: 측정 불가: 런 원장 없음\(missing\.json\)$/gm)).toHaveLength(1);
+    expect(logged).toHaveBeenCalledWith('release-loop.vault-note', 'stability-line', { fields: { introduced: '?', preexisting: '?', recut: '?', hosts: '?', knownIssuesDelta: '?' }, unreadable: [expect.stringContaining('missing.json')] });
+  } finally { logged.mockRestore(); }
+}));
+
 test('actual node CLI emits skipped isolated and never writes to vault in a test universe', () => fixture(({ root, vault, context, note }) => {
   const run = spawnSync('bun', [join(import.meta.dir, 'vault-note-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) } });
   expect(run.status).toBe(0);
   expect(JSON.parse(run.stdout.trim())).toMatchObject({ outcome: 'ok', skipped: 'isolated' });
   expect(() => readFileSync(note)).toThrow();
   expect(readFileSync(join(vault, directory, '_색인 — 엘라누스 릴리스.md'), 'utf8')).toContain(previous);
+}));
+
+test('30 cut landings including next.md lines appear in four counted topics; three leading topic clauses skip broken punctuation', () => fixture(({ root, run, note, index }) => {
+  const entries = [
+    ...Array.from({ length: 9 }, (_, i) => ({ sha: `${i + 1}`.padStart(40, 'a'), title: `조직 루프 개선 ${i}`, line: `조직 루프 개선 ${i}`, prNumber: i + 1 })),
+    ...Array.from({ length: 8 }, (_, i) => ({ sha: `${i + 10}`.padStart(40, 'b'), title: `하니스 검증 ${i}`, line: i === 0 ? '하니스 «잘린 제목' : `하니스 검증 ${i}` })),
+    ...Array.from({ length: 7 }, (_, i) => ({ sha: `${i + 18}`.padStart(40, 'c'), title: `텔레그램 발송 ${i}`, line: `텔레그램 발송 ${i}` })),
+    ...Array.from({ length: 6 }, (_, i) => ({ sha: '', title: `지식 교훈 ${i}`, line: `지식 교훈 ${i}` })),
+  ];
+  mkdirSync(join(root, 'release', version), { recursive: true });
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const content = readFileSync(note, 'utf8');
+  const landings = content.split('## 이번 판 착지 (직전 판 컷 ~ 이번 판 컷)\n\n')[1]!.split('## 이제 할 수 있는 것')[0]!;
+  expect([...landings.matchAll(/^### (.+) \((\d+)건\)$/gm)].map((match) => [match[1], Number(match[2])])).toEqual([
+    ['조직·루프', 9], ['하니스', 8], ['채널·PWA', 7], ['지식·교훈', 6],
+  ]);
+  expect([...landings.matchAll(/^### .+ \((\d+)건\)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0)).toBe(30);
+  expect(landings.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(30);
+  expect(landings).toContain('- 하니스 «잘린 제목');
+  expect(landings).toContain('- 지식 교훈 5');
+  expect(content).toContain('title: "엘라누스 v0.2.13 — 조직 루프 개선 0 · 하니스 검증 1 · 텔레그램 발송 0"');
+  expect(readFileSync(index, 'utf8')).toContain('조직 루프 개선 0 · 하니스 검증 1 · 텔레그램 발송 0');
+}));
+
+test('representative skips an invalid third topic and takes a valid fourth topic', () => fixture(({ root, run, note, index }) => {
+  const cut = '8cd885efe701bf47c1df020c32ccd17e31cd4a25';
+  const entries = [
+    ...Array.from({ length: 4 }, (_, i) => ({ sha: 'a'.repeat(40), title: `조직 루프 ${i}`, line: `조직 루프 ${i}` })),
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: 'b'.repeat(40), title: `하니스 검증 ${i}`, line: `하니스 검증 ${i}` })),
+    ...Array.from({ length: 2 }, (_, i) => ({ sha: 'c'.repeat(40), title: `텔레그램 «잘림 ${i}`, line: `텔레그램 «잘림 ${i}` })),
+    { sha: 'd'.repeat(40), title: '지식 교훈 축적', line: '지식 교훈 축적' },
+  ];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) }, cutoff: { sha: cut }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const content = readFileSync(note, 'utf8');
+  expect(content).toContain('### 채널·PWA (2건)');
+  expect(content).toContain('### 지식·교훈 (1건)');
+  expect(parse(content.split('---\n')[1]!)).toMatchObject({ title: `엘라누스 v${version} — 조직 루프 0 · 하니스 검증 0 · 지식 교훈 축적` });
+  expect(readFileSync(index, 'utf8')).toContain('조직 루프 0 · 하니스 검증 0 · 지식 교훈 축적');
+  expect(content).not.toContain('title: "엘라누스 v0.2.13 — 조직 루프 0 · 하니스 검증 0 · 텔레그램');
+}));
+
+test('balanced quotes and backslashes in a landing title round-trip through parsed YAML frontmatter', () => fixture(({ root, run, note }) => {
+  const title = '하니스 "검증" 개선 \\ 경로';
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({
+    version, baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' },
+    in: [{ sha: 'c'.repeat(40), title, line: title, prNumber: 42 }],
+  }));
+  expect(run().outcome).toBe('ok');
+  const content = readFileSync(note, 'utf8');
+  const frontmatter = content.split('---\n')[1]!;
+  expect(parse(frontmatter)).toMatchObject({ title: `엘라누스 v${version} — ${title}` });
+  expect(content).toContain(`- ${title} (#42)`);
+}));
+
+test('unreadable or mismatched cut manifest marks the landing section with a reason instead of silently omitting it', () => fixture(({ root, run, note }) => {
+  const path = join(root, 'release', version, 'manifest.json');
+  expect(run().outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('## 이번 판 착지 (직전 판 컷 ~ 이번 판 컷)\n\n- 못 읽음 · manifest.json:');
+  expect(readFileSync(note, 'utf8')).toContain('ENOENT');
+  rmSync(note);
+  writeFileSync(path, JSON.stringify({ version, baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: 'f'.repeat(40) }, in: [] }));
+  expect(run().outcome).toBe('ok');
+  expect(readFileSync(note, 'utf8')).toContain('- 못 읽음 · manifest.json: 판·직전 컷·이번 컷 또는 착지 줄 불일치');
+}));
+
+test('title keeps guillemets paired when a cell title opens « without closing it (0.2.14)', () => fixture(({ root, vault, context, note }) => {
+  const checklist = () => [
+    { id: 'OUT1', title: '/v1/outbound 가 «delivered:true · 착지 동결 장치', owner: 'TC', status: 'green' as const },
+    { id: 'OUT2', title: '발송이 «보냄 · 받음» 을 가른다 — 세부', owner: 'TC', status: 'green' as const },
+  ];
+  expect(runVaultNote(context, { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist })).toMatchObject({ outcome: 'ok' });
+  const title = readFileSync(note, 'utf8').match(/^title: "(.*)"$/m)![1]!;
+  expect(title).toBe('엘라누스 v0.2.13 — 발송이 «보냄 · 받음» 을 가른다');
+  expect(title.split('«').length).toBe(title.split('»').length);
+}));
+
+test("representative skips a topic whose title leaves an ASCII ' unclosed, but keeps a word-internal apostrophe (ACP must-fix)", () => fixture(({ root, run, note }) => {
+  const cut = '8cd885efe701bf47c1df020c32ccd17e31cd4a25';
+  const entries = [
+    ...Array.from({ length: 4 }, (_, i) => ({ sha: 'a'.repeat(40), title: `조직 루프 ${i}`, line: `조직 루프 ${i}` })),
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: 'b'.repeat(40), title: `하니스 검증 ${i}`, line: `하니스 검증 ${i}` })),
+    ...Array.from({ length: 2 }, (_, i) => ({ sha: 'c'.repeat(40), title: `텔레그램 'open ${i}`, line: `텔레그램 'open ${i}` })),
+    { sha: 'd'.repeat(40), title: "지식 교훈 doesn't break", line: "지식 교훈 doesn't break" },
+  ];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) }, cutoff: { sha: cut }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const content = readFileSync(note, 'utf8');
+  expect(parse(content.split('---\n')[1]!)).toMatchObject({ title: `엘라누스 v${version} — 조직 루프 0 · 하니스 검증 0 · 지식 교훈 doesn't break` });
+}));
+
+test('real release/next.md lines lead with their kind; the headline keeps the change, not «feat» (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  const cut = '8cd885efe701bf47c1df020c32ccd17e31cd4a25';
+  const entries = [
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: 'a'.repeat(40), title: `조직 루프 ${i}`, line: `feat — seat requests can be listed and closed from the CLI ${i}.` })),
+    ...Array.from({ length: 2 }, (_, i) => ({ sha: 'b'.repeat(40), title: `하니스 검증 ${i}`, line: `internal — clarification tests no longer write into the card bridge ${i}.` })),
+    { sha: 'd'.repeat(40), title: '지식 교훈 축적', line: 'fix — lessons handbook folds every table' },
+  ];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) }, cutoff: { sha: cut }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const title = (parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title;
+  expect(title).toContain('seat requests can be listed and closed from the CLI 0.');
+  expect(title).toContain('lessons handbook folds every table');
+  expect(title).not.toMatch(/— feat( ·|$)/);
+}));
+
+test('a separator inside a balanced quoted or parenthesized span does not cut the headline clause (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  const cut = '8cd885efe701bf47c1df020c32ccd17e31cd4a25';
+  const entries = [
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: 'a'.repeat(40), title: `조직 루프 ${i}`, line: `조직 루프 "기능 · 개선" ${i}` })),
+    ...Array.from({ length: 2 }, (_, i) => ({ sha: 'b'.repeat(40), title: `하니스 검증 ${i}`, line: `하니스 검증 (재시도 · 회수) ${i}` })),
+  ];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) }, cutoff: { sha: cut }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const title = (parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title;
+  expect(title).toContain('조직 루프 "기능 · 개선" 0');
+  expect(title).toContain('하니스 검증 (재시도 · 회수) 0');
+}));
+
+test('a manifest whose baseline is not the previous published cut marks the landing section instead of publishing wrong landings (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  const cut = '8cd885efe701bf47c1df020c32ccd17e31cd4a25';
+  const previous = '0.2.12';
+  mkdirSync(join(root, 'release', previous), { recursive: true });
+  writeFileSync(join(root, 'release', previous, 'release.json'), JSON.stringify({ version: previous, tag: `v${previous}`, sourceCommit: 'f'.repeat(40), publishedAt: '2026-10-01T00:00:00Z' }));
+  const entries = [{ sha: 'a'.repeat(40), title: '조직 루프', line: '조직 루프' }];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) }, cutoff: { sha: cut }, in: entries }));
+  run();
+  expect(readFileSync(note, 'utf8')).toContain('직전 판 컷 불일치');
+}));
+
+test('a manifest whose baseline equals the previous published cut keeps its landings', () => fixture(({ root, run, note }) => {
+  const previous = '0.2.12';
+  mkdirSync(join(root, 'release', previous), { recursive: true });
+  writeFileSync(join(root, 'release', previous, 'release.json'), JSON.stringify({ version: previous, tag: `v${previous}`, sourceCommit: 'f'.repeat(40), publishedAt: '2026-10-01T00:00:00Z' }));
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'f'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: [{ sha: 'a'.repeat(40), title: '조직 루프', line: '조직 루프' }] }));
+  expect(run().outcome).toBe('ok');
+  const content = readFileSync(note, 'utf8');
+  expect(content).not.toContain('직전 판 컷 불일치');
+  expect(content).toContain('조직 루프');
+}));
+
+test("single quotes ('…' and ‘…’) keep their inner separator in the headline clause (ACP must-fix)", () => fixture(({ root, run, note }) => {
+  const entries = [
+    ...Array.from({ length: 3 }, (_, i) => ({ sha: 'a'.repeat(40), title: `조직 루프 ${i}`, line: `조직 루프 '검증 · 회수' ${i}` })),
+    ...Array.from({ length: 2 }, (_, i) => ({ sha: 'b'.repeat(40), title: `하니스 검증 ${i}`, line: `하니스 검증 ‘재시도 · 회수’ ${i}` })),
+  ];
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const title = (parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title;
+  expect(title).toContain("조직 루프 '검증 · 회수' 0");
+  expect(title).toContain('하니스 검증 ‘재시도 · 회수’ 0');
+}));
+
+test('an earlier unpublished version with no published one marks the landing section unverified (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  mkdirSync(join(root, 'release', '0.2.12'), { recursive: true });
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: [{ sha: 'a'.repeat(40), title: '조직 루프', line: '조직 루프' }] }));
+  run();
+  expect(readFileSync(note, 'utf8')).toContain('못 읽음 · manifest.json: 직전 판 컷 확인 못 함');
 }));

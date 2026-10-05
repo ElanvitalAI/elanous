@@ -38,6 +38,21 @@ const PROTECTED_LABELS: ReadonlySet<string> = new Set<string>([...PR_LABELS
 const goalId = (branch: string): string | undefined => /(?:^|[-/])goalid-([a-f0-9]+)(?=-|\/|$)/i.exec(branch)?.[1]?.toLowerCase();
 export const branchStem = (branch: string): string | undefined => /^self-impl\/(.+)-[a-f0-9]{8}-r[a-f0-9]+$/i.exec(branch)?.[1];
 const slot = (body?: string): string | undefined => /^칸:\s*(.+?)\s*$/m.exec(body ?? '')?.[1];
+const goalText = (body?: string): string | undefined => /^골:\s*(\S.*?)\s*$/m.exec(body ?? '')?.[1];
+// Auto titles name only files («src/harness: harness-queue.ts») — different goals share them, so they never identify a goal.
+export const isAutoTitle = (title: string): boolean =>
+  /^[\w./-]+:\s*[^\s,]+\.[a-z0-9]+(?:\s*,\s*[^\s,]+\.[a-z0-9]+)*$/i.test(title.trim());
+
+/** Same goal (TC 10-05): ① both carry a goal identifier → compare it ② otherwise exact title ⊕ both harness drafts ⊕ same branch stem, never an auto title ③ else false. */
+export function sameGoalPr(a: DraftTriagePr, b: DraftTriagePr): boolean {
+  const idA = goalId(a.branch), idB = goalId(b.branch);
+  if (idA && idB) return idA === idB;
+  const textA = goalText(a.body), textB = goalText(b.body);
+  if (textA && textB) return textA === textB;
+  if (!a.title || a.title !== b.title || isAutoTitle(a.title)) return false;
+  const stemA = branchStem(a.branch);
+  return Boolean(stemA && a.branch.startsWith('self-impl/') && b.branch.startsWith('self-impl/') && stemA === branchStem(b.branch));
+}
 const referencesDraft = (text: string, number: number): boolean =>
   new RegExp(`(?:\\(수확\\s*#${number}\\s*\\)|\\bsuperseded\\s*#${number}(?!\\d))`, 'i').test(text);
 const landingCommentReferencesDraft = (text: string, number: number): boolean =>
@@ -55,28 +70,30 @@ export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHour
     return { action: 'keep', reason: 'live' };
   }
   const lineage = goalId(draft.branch);
-  const twin = mergedTwins.find((pr) => pr.number !== draft.number && (
-    (draft.title && pr.title === draft.title) || (lineage && goalId(pr.branch) === lineage)
-  ));
-  if (twin) return { action: 'close', reason: `superseded-by #${twin.number}` };
+  const draftSlot = slot(draft.body);
   const stem = branchStem(draft.branch);
+  const compatible = (pr: DraftTriagePr): boolean =>
+    !(lineage && goalId(pr.branch) && goalId(pr.branch) !== lineage)
+    && !(draftSlot && slot(pr.body) && slot(pr.body) !== draftSlot);
+  const twin = mergedTwins.find((pr) => pr.number !== draft.number && compatible(pr) && sameGoalPr(draft, pr));
+  if (twin) return { action: 'close', reason: `superseded-by #${twin.number}` };
   const createdAt = Date.parse(draft.createdAt ?? '');
   const newer = stem && draft.title && Number.isFinite(createdAt) ? openDrafts
-    ?.filter((pr) => pr.number !== draft.number && pr.title === draft.title && branchStem(pr.branch) === stem
+    ?.filter((pr) => pr.number !== draft.number && pr.title === draft.title && branchStem(pr.branch) === stem && sameGoalPr(draft, pr)
       && Number.isFinite(Date.parse(pr.createdAt ?? '')) && Date.parse(pr.createdAt!) > createdAt)
     .sort((a, b) => Date.parse(b.createdAt!) - Date.parse(a.createdAt!) || b.number - a.number)[0] : undefined;
   if (newer) return { action: 'close', reason: `duplicate-of-open #${newer.number}` };
-  const harvest = mergedTwins.find((pr) => pr.number !== draft.number && (
+  const harvest = mergedTwins.find((pr) => pr.number !== draft.number && compatible(pr) && (
     [pr.mergeCommitMessage, pr.body].some((text) => text && referencesDraft(text, draft.number))
     || pr.landingVerifiedComments?.some((text) => landingCommentReferencesDraft(text, draft.number))
   ));
   if (harvest) return { action: 'close', reason: `superseded-by #${harvest.number} (harvest #${draft.number})` };
   const created = Date.parse(draft.createdAt ?? '');
   const files = draft.changedFiles;
-  const draftSlot = slot(draft.body);
   const later = mergedTwins.filter((pr) => pr.number !== draft.number && Number.isFinite(created)
     && Number.isFinite(Date.parse(pr.mergedAt ?? '')) && Date.parse(pr.mergedAt!) > created
-    && ((lineage && goalId(pr.branch) === lineage) || (draftSlot && slot(pr.body) === draftSlot)));
+    && compatible(pr) && ((lineage && goalId(pr.branch) === lineage)
+      || (draftSlot && slot(pr.body) === draftSlot) || (stem && branchStem(pr.branch) === stem)));
   if (files?.length && files.every((file) => {
     const changed = Date.parse(draft.latestFileChanges?.[file] ?? '');
     return Number.isFinite(changed) && changed >= created && later.some((pr) =>

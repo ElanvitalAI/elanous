@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { ChatLayout } from './ChatLayout';
+import { ChatCurrentProject } from './ChatCurrentProject';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
@@ -121,6 +122,7 @@ test('compact and wide layout place exactly one strip immediately after the head
   const children = layout.children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
   const header = children.findIndex((child) => child.props['data-elanous-chat-compact-header'] === '');
   expect(header).toBeGreaterThanOrEqual(0);
+  expect(children[header]!.findAllByType(ChatCurrentProject)).toHaveLength(1);
   expect(children[header + 1]!.type).toBe(SeatsNowStrip);
   expect(children.filter((child) => child.type === SeatsNowStrip)).toHaveLength(1);
   await act(async () => { tree!.unmount(); });
@@ -128,6 +130,7 @@ test('compact and wide layout place exactly one strip immediately after the head
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
   await probe.mount(true);
   const wide = tree!.root.findByType(ChatLayout).findByType('div').children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
+  expect(wide[0]!.findAllByType(ChatCurrentProject)).toHaveLength(1);
   expect(wide[1]!.type).toBe(SeatsNowStrip);
   expect(wide.filter((child) => child.type === SeatsNowStrip)).toHaveLength(1);
 });

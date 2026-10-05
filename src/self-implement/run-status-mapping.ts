@@ -16,6 +16,7 @@ export type SelfImplementStage =
   | 'worktree-completed'
   | 'gate-failed'
   | 'review-blocked'
+  | 'no-changes'
   | 'merge-conflict'
   | 'aborted'
   | 'timed-out'
@@ -30,6 +31,7 @@ const STAGE_OUTCOMES = {
   'worktree-completed': { runStatus: 'completed' },
   'gate-failed': { runStatus: 'failed', failureKind: 'gate' },
   'review-blocked': { runStatus: 'failed', failureKind: 'review' },
+  'no-changes': { runStatus: 'failed', failureKind: 'review' },
   'merge-conflict': { runStatus: 'failed', failureKind: 'merge-conflict' },
   aborted: { runStatus: 'failed', failureKind: 'aborted' },
   'timed-out': { runStatus: 'failed', failureKind: 'timed-out' },

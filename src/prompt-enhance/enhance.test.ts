@@ -141,6 +141,21 @@ describe('enhance — LLM usage 관측', () => {
     } finally { log.mockRestore(); stream.mockRestore(); }
   });
 
+  it('forwards raw usage to an optional caller observer without changing the enhanced result', async () => {
+    const usage = [{ inputTokens: 2, outputTokens: 3 }, { outputTokens: 0 }];
+    const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, _onChunk, opts) => {
+      for (const event of usage) opts?.onUsage?.(event);
+      return '{"goal":"g","constraints":[],"checklist":["item"]}';
+    });
+    const received: unknown[] = [];
+    try {
+      const result = await enhancePrompt('raw', { onUsage: (event) => received.push(event) });
+      expect(received).toEqual(usage);
+      expect(result.original).toBe('raw');
+      expect(result.checklist).toEqual(['item']);
+    } finally { stream.mockRestore(); }
+  });
+
   it('catalog-priced models emit a known cost field, including cache tokens', async () => {
     let call = 0;
     const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, _onChunk, opts) => {

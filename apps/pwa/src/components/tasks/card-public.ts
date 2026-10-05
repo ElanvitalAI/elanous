@@ -4,5 +4,7 @@ import { maskValueForPublic } from '@/lib/live-public';
 import type { TaskCard } from '@/lib/task-card-model';
 
 export function maskCardsForPublic(cards: readonly TaskCard[]): TaskCard[] {
-  return cards.map((card) => ({ ...maskValueForPublic(card, []), taskId: card.taskId }));
+  // 회신 주소(텔레그램 대화·PWA 세션 id)는 가면 패턴에 안 걸리는 숫자일 수 있어 공개 캡처에선 표면만 남긴다.
+  return cards.map((card) => ({ ...maskValueForPublic(card, []), taskId: card.taskId,
+    ...(card.wishReply ? { wishReply: { surface: card.wishReply.surface, address: null } } : {}) }));
 }

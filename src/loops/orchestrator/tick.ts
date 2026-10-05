@@ -16,7 +16,7 @@ const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cm
 export interface Cell { id: string; title: string; seat?: string; host?: string; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2'; predecessors?: string[] }
 export interface TickState {
   runId: string; window: Window; mode: Mode; day: string;
-  cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number;
+  cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number; rebalanceBlocked?: Array<{ id: string; reason: string }>;
   reconciled: { reached: number; progressing: number; blocked: number; unknown: number };
   runSummaries?: string[];
   nodes: Partial<Record<Node, 'ok' | 'skipped'>>;
@@ -27,7 +27,7 @@ export type SplitAdapter = (card: TaskCard, opts?: { shadow?: boolean }) => Prom
 /** RELPLAN1 `placeCell(input: PlacementCell)` — owner·priority·predecessors are required; the result carries no seat. */
 export type PlacementInput = { id: string; title: string; owner: string; priority: 'P0' | 'P1' | 'P2'; predecessors: string[] };
 export type PlaceAdapter = (cell: PlacementInput) => Promise<{ version?: string } | null> | { version?: string } | null;
-export type RebalanceAdapter = (version: string) => Promise<unknown[]> | unknown[];
+export type RebalanceAdapter = (version: string) => Promise<{ decisions: unknown[]; blocked: Array<{ id: string; reason: string }> }> | { decisions: unknown[]; blocked: Array<{ id: string; reason: string }> };
 export interface TickDeps {
   root?: string; now?: Date; mode?: Mode; runId?: string; window?: Window;
   cards?: () => TaskCard[]; split?: SplitAdapter; placeCell?: PlaceAdapter;
@@ -72,7 +72,8 @@ export function reconciliation(cells: readonly Cell[], requests: readonly { key:
 export function reportLine(state: TickState): string {
   const r = state.reconciled;
   const line = `orchestrator ${state.window} cards=${state.cards.length} cells=${state.cells.length} placed=${state.missing.includes('relplan1-absent') ? 'missing' : state.placed} delegated=${state.mode === 'shadow' ? `would ${state.wouldDelegate}` : state.delegated} reconciled=${r.reached}/${r.progressing}/${r.blocked}/${r.unknown} mode=${state.mode}`;
-  return state.runSummaries?.length ? `${line}\n${state.runSummaries.join('\n')}` : line;
+  const details = [...(state.rebalanceBlocked ?? []).map(row => `⛔ 이월 거부 ${row.id}: ${row.reason}`), ...(state.runSummaries ?? [])];
+  return details.length ? `${line}\n${details.join('\n')}` : line;
 }
 function readCardSnapshot(root: string): { cards: TaskCard[]; skippedCards: TickState['skippedCards'] } {
   const dir = taskCardsDir(root);
@@ -268,7 +269,13 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           if (mode === 'shadow') observe('exchange', 'rebalance-shadow-not-invoked', versions.length);
           else {
             state.rebalanced = 0;
-            for (const version of versions) state.rebalanced += (await rebalance(version)).length;
+            state.rebalanceBlocked = [];
+            for (const version of versions) {
+              const result = await rebalance(version);
+              state.rebalanced += result.decisions.length;
+              state.rebalanceBlocked.push(...result.blocked);
+              for (const blocked of result.blocked) observe('exchange', `rebalance-blocked: ${blocked.id} ${blocked.reason}`, 1);
+            }
           }
         }
       }

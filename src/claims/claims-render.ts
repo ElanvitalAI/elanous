@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite';
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { checkBrand } from '../../scripts/brand/check.js';
+import { BRAND_RULES_UNMEASURED, checkBrand } from '../../scripts/brand/check.js';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { ClaimsLedger, ClaimEvidence } from './claims-ledger.js';
@@ -11,7 +11,8 @@ export type ClaimSurface = 'deck' | 'site' | 'notice';
 export interface RenderedClaims {
   markdown: string;
   included: string[];
-  excluded: Array<{ id: string; reason: 'stale' | 'not-public' | 'retracted' | 'expired' | 'brand' | 'ambiguous-value' }>;
+  excluded: Array<{ id: string; reason: 'stale' | 'not-public' | 'retracted' | 'expired' | 'brand' | 'ambiguous-value' | 'rules-missing' }>;
+  unmeasured?: string;
 }
 
 const headings: Record<ClaimSurface, string> = {
@@ -48,7 +49,7 @@ export function representativeNumber(value: string): string | undefined {
   return matches[0];
 }
 
-export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurface; audience?: string }): RenderedClaims {
+export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurface; audience?: string; rulesPath?: string }): RenderedClaims {
   const { surface, audience } = options;
   if (!(surface in headings)) throw new Error(`invalid claims surface: ${surface}`);
   const excluded: RenderedClaims['excluded'] = [];
@@ -82,13 +83,21 @@ export function renderClaims(ledger: ClaimsLedger, options: { surface: ClaimSurf
     candidates.push({ id: row.id, line: `- ${claim} — ${number} <!-- claim:${row.id} measured:${evidence.measured_at} cmd:${commentValue(evidence.command)}${evidence.source ? ` source:${commentValue(evidence.source)}` : ''} --> <!-- src:${commentValue(evidence.source ?? evidence.command)} -->` });
   }
 
+  const rulesMissing = checkBrand(scopes[surface], [], options.rulesPath).missing;
+  if (rulesMissing) {
+    excluded.push(...candidates.map(({ id }) => ({ id, reason: 'rules-missing' as const })));
+    const result: RenderedClaims = { markdown: `${headings[surface]}\n\n> ⚠ ${BRAND_RULES_UNMEASURED}\n`, included: [], excluded, unmeasured: BRAND_RULES_UNMEASURED };
+    debug.log('claims.render', 'rendered', { surface, included: result.included, excluded, unmeasured: result.unmeasured });
+    return result;
+  }
+
   const temp = mkdtempSync(join(tmpdir(), 'claims-render-'));
   const file = join(temp, 'claims.md');
   try {
     const probe = (items: typeof candidates): Set<string> => {
       writeFileSync(file, [headings[surface], '', ...items.map(item => item.line)].join('\n').trimEnd() + '\n');
-      const result = checkBrand(scopes[surface], [file]);
-      if (result.missing) throw new Error('brand rules missing');
+      const result = checkBrand(scopes[surface], [file], options.rulesPath);
+      if (result.missing) throw new Error(BRAND_RULES_UNMEASURED);
       const bad = new Set<string>();
       for (const finding of result.findings) {
         const owner = items[finding.line - 3];

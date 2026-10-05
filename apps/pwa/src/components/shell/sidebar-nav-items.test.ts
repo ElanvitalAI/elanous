@@ -28,6 +28,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/board',
   '/botlab',
   '/bots',
+  '/ceo',
   '/chat',
   '/consult',
   '/control',
@@ -140,7 +141,7 @@ const expectedGroups = [
   ['make', '만들기', true, ['/term', '/editor', '/design-check', '/workspace']],
   ['files', '자료', false, ['/vault', '/field', '/market']],
   ['settings', '설정', false, ['/settings']],
-  ['ops', '운영🔒', false, ['/loops', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
+  ['ops', '운영🔒', false, ['/ceo', '/loops', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
 ] as const;
 
 describe('NAV1a menu', () => {
@@ -156,7 +157,7 @@ describe('NAV1a menu', () => {
       '/autopilot': '미션', '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
       '/term': '터미널', '/editor': '편집기', '/design-check': '디자인', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
-      '/loops': '루프 현황', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
+      '/ceo': '대표 조망판', '/loops': '루프 현황', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
       '/observatory': '관측', '/worktrees': '작업 트리', '/control': '제어',
     });
     for (const item of SIDEBAR_NAV_ITEMS) {

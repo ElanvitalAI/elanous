@@ -56,6 +56,78 @@ describe('Pod 메모리 등급 — standard | high', () => {
   });
 });
 
+describe('POD7 goal-type automatic selection', () => {
+  const document = '# Write a guide\n- GoalType: document\n\n## PROBLEM\nWrite a guide';
+  const research = '# Investigate\n- GoalType: research\n\n## PROBLEM\nInvestigate';
+  const implement = '# Implement\n- GoalType: implement\n\n## PROBLEM\nImplement';
+
+  test('declared research/document and CLI goal type select lite; explicit tiers and implement keep precedence', () => {
+    expect(podMemoryLimitFor(document, {})).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor(research, {})).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor('write guide', { ELANOUS_POD_GOAL_TYPE: 'document' })).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor('shard', {}, document)).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor(document, { ELANOUS_POD_MEMORY_TIER: 'standard' })).toEqual({ limit: '16Gi', tier: 'standard', source: 'option' });
+    expect(podMemoryLimitFor(`${document}\nPod 메모리: high`, {})).toEqual({ limit: '32Gi', tier: 'high', source: 'goal-line' });
+    expect(podMemoryLimitFor('apps/pwa/page.tsx', {}, document).tier).toBe('high');
+    expect(podMemoryLimitFor(implement, {})).toEqual({ limit: '16Gi', tier: 'standard', source: 'default' });
+    expect(podMemoryLimitFor('write guide', { ELANOUS_POD_GOAL_TYPE: 'implement' })).toEqual({ limit: '16Gi', tier: 'standard', source: 'default' });
+  });
+
+  test('measured high advice for a document wins over automatic lite, while a document without matching advice stays lite', () => {
+    const now = Date.now();
+    const rows = [
+      { ts_ms: now - 2000, category: 'self-implement.pod', event: 'memory-limit', data: JSON.stringify({ spaceId: 'docs-1', goalType: 'docs', memoryLimit: '16Gi' }) },
+      { ts_ms: now - 1000, category: 'self-implement.pod', event: 'job-applied', data: JSON.stringify({ spaceId: 'docs-1', job: 'docs-job' }) },
+      { ts_ms: now, category: 'self-implement.pod', event: 'oom-evidence', data: JSON.stringify({ job: 'docs-job', samples: [{ cgroupBytes: 16 * 1024 ** 3 }] }) },
+    ];
+    const advice = advisePodMemory(measurePodMemoryByGoal(rows, now, 'fixture.db'));
+    expect(podMemoryLimitFor(document, {}, undefined, advice)).toEqual({ limit: '32Gi', tier: 'high', source: 'advise' });
+    expect(podMemoryLimitFor(document, {})).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor(research, {}, undefined, advice)).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-type-auto' });
+    expect(podMemoryLimitFor(document, { ELANOUS_POD_MEMORY_TIER: 'lite' }, undefined, advice)).toEqual({ limit: '2Gi', tier: 'lite', source: 'option' });
+  });
+
+  test('dispatch carries the declared document type and selected lite tier', () => {
+    let seen: NodeJS.ProcessEnv | undefined;
+    expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'write guide', goalType: 'document' }, { run: (_c, _a, env) => { seen = env; return 0; } })).toBe(0);
+    expect(seen?.ELANOUS_POD_GOAL_TYPE).toBe('document');
+    expect(seen?.ELANOUS_POD_MEMORY_TIER).toBe('lite');
+    expect(seen?.ELANOUS_POD_MEMORY_REASON).toBe('goal-type-default');
+  });
+
+  test('document Pod launches at 2Gi, completes and records the tier and reason; implement remains 16Gi', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-goal-type-'));
+    const jobs: any[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-goal-type-memory-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'memory-limit') events.push(record.data as Record<string, unknown>);
+    } });
+    const kubectl = (args: readonly string[], input?: string) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.includes('apply') && input) { const manifest = JSON.parse(input); if (manifest.kind === 'Job') jobs.push(manifest); }
+      if (args.includes('get') && args.includes('job') && args.join(' ').includes('status.conditions[*].type')) return { status: 0, stdout: 'Complete', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: '{"stage":"pr-opened","ok":true}\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const spawn = podSelfImplementSpawn({ kubectl, env: { ELANOUS_STATE_DIR: root }, memoryAdvice: () => { throw new Error('no advice'); }, credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }) });
+      expect((await spawn({ spaceId: 'doc-lite', feature: document }).done).exitCode).toBe(0);
+      expect((await spawn({ spaceId: 'impl-default', feature: implement }).done).exitCode).toBe(0);
+      expect(jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['2Gi', '16Gi']);
+      expect(jobs[0].spec.template.spec.containers[0].resources.requests.memory).toBe('2Gi');
+      expect(events.map(({ tier, source, reason }) => ({ tier, source, reason }))).toEqual([
+        { tier: 'lite', source: 'goal-type-auto', reason: 'declared goal type document' },
+        { tier: 'standard', source: 'default', reason: 'default' },
+      ]);
+      const { readdirSync, readFileSync } = await import('node:fs');
+      const ledgers = readdirSync(join(root, 'run-ledger')).map((file) => readFileSync(join(root, 'run-ledger', file), 'utf8')).join('\n');
+      expect(ledgers).toContain('"event":"pod-memory-selected"');
+      expect(ledgers).toContain('"reason":"declared goal type document"');
+      expect(ledgers).toContain('"tier":"standard"');
+    } finally { off(); rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('POD7 measured per-kind requests', () => {
   const now = Date.now();
   const rows = ([['code', 5], ['test', 2], ['docs', 0.5], ['pwa-build', 10]] as const).flatMap(([kind, gib]) => [1, 2, 3].flatMap((n) => [
@@ -124,6 +196,30 @@ describe('POD7 measured per-kind requests', () => {
       });
       expect(defaults).toEqual([{ kind: 'code', reason: 'no-advice' }]);
     } finally { off(); }
+  });
+
+  test('non-document lite retains a measured request below 2Gi, and explicit lite remains distinct from the document default', async () => {
+    const jobs: any[] = [];
+    const smallAdvice = { ...advice, byGoalType: advice.byGoalType.map((entry) => entry.goalType === 'code' || entry.goalType === 'docs'
+      ? { ...entry, evidence: { ...entry.evidence, peakMiB: { ...entry.evidence.peakMiB, p95: 512 } } } : entry) };
+    const kubectl = (args: readonly string[], input?: string) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.includes('apply') && input) { const manifest = JSON.parse(input); if (manifest.kind === 'Job') jobs.push(manifest); }
+      if (args.includes('get') && args.includes('job') && args.join(' ').includes('status.conditions[*].type')) return { status: 0, stdout: 'Complete', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: '{"stage":"pr-opened","ok":true}\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ kubectl, env: {}, memoryAdvice: () => smallAdvice,
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }) });
+    expect(podMemoryRequestFor('docs', smallAdvice)).toBe('1Gi');
+    expect((await spawn({ spaceId: 'explicit-code-lite', feature: '코드 구현\nPod 메모리: lite' }).done).exitCode).toBe(0);
+    expect((await spawn({ spaceId: 'auto-document-lite', feature: '# Guide\n- GoalType: document' }).done).exitCode).toBe(0);
+    expect((await spawn({ spaceId: 'explicit-document-lite', feature: '# Guide\n- GoalType: document\nPod 메모리: lite' }).done).exitCode).toBe(0);
+    expect(jobs.map((job) => job.spec.template.spec.containers[0].resources)).toEqual([
+      { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+      { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+      { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+    ]);
   });
 
   test('spawn writes only the Job request; standard limit stays 16Gi and PWA shard limit stays high 32Gi', async () => {

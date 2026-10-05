@@ -1,26 +1,31 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
-import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
-import { decideSpawn } from '../loops/budget.js';
+import { effectiveInstanceRoot, prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
+import { listChecklist, type ChecklistItem } from '../release-loop/checklist.js';
+import { listSchedules } from '../release-loop/release-schedule.js';
+import { withFileLockSync } from '../storage/file-lock.js';
+import { trafficTick, TRAFFIC_SEATS, type TrafficCell } from '../loops/orchestrator/traffic.js';
+import { decideSpawn, seatCapDetails, seatCapReason } from '../loops/budget.js';
 import { listSelfDevRuns, processBirthId, selfDevRunsDir } from '../self-dev/run-store.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, userConfigPath, type OrchestratorLoopConfig } from '../user-config.js';
 import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
 import { leaseKubectl, measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
+import { finishAdvice, measureFinish, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
 
 export type QueueSeat = 'OP' | 'TC' | 'MK' | 'UX';
 export type QueueItem = {
   id: string; seat: QueueSeat; kind: 'say' | 'ask'; input: string; hold: boolean; heavy: boolean;
-  at: string; status: 'queued' | 'launching' | 'launched' | 'finished'; pid?: number; launchId?: string; idempotencyKey?: string;
+  at: string; status: 'queued' | 'launching' | 'launched' | 'finished'; pid?: number; launchId?: string; idempotencyKey?: string; waitingReason?: string;
 };
 export type QueuePool = { running: number; pending: number; reserved: number; limit: number };
 export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string };
-export type QueueProcess = { pid: number; seat?: QueueSeat; launchId?: string };
+export type QueueProcess = { pid: number; seat?: QueueSeat; launchId?: string; runId?: string; rootPid?: number };
 type ProcessProbe = {
   run?: typeof spawnSync; platform?: NodeJS.Platform;
   cwd?: (pid: number) => string;
@@ -51,7 +56,71 @@ export interface HarnessQueueDeps {
   alive?: (pid: number) => boolean;
   processes?: () => readonly QueueProcess[];
   receipt?: (root: string, launchId: string) => 'started' | 'finished' | 'not-started' | null;
+  now?: () => Date;
+  authorShadow?: (root: string, now: Date) => void | Promise<void>;
+  idleRequest?: (root: string, now: Date, items: readonly QueueItem[], deps: HarnessQueueDeps) => void | Promise<void>;
+  idleCells?: (now: Date) => { current: readonly Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status' | 'evidence'>[];
+    next: readonly Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status' | 'evidence'>[] };
+  idleLog?: (category: string, event: string, data: Record<string, unknown>) => void;
   log?: (event: 'enqueued' | 'launched' | 'waiting' | 'skipped', data: Record<string, unknown>) => void;
+  /** FINISH-RATE metrics source; a test process without it skips the real measurement. */
+  finishMetrics?: (now: Date) => FinishMetrics | Promise<FinishMetrics>;
+}
+
+const FINISH_CACHE_MS = 10 * 60 * 1_000;
+const FINISH_KEYS = ['launched', 'landed', 'landingRate', 'staleDrafts', 'conflictRatio', 'unknownMergeable'] as const;
+
+/** A cache row missing any metric or its reasons map is re-measured, never fed to finishAdvice. */
+function validFinishMetrics(value: unknown): value is FinishMetrics {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return FINISH_KEYS.every((key) => row[key] === null || (typeof row[key] === 'number' && Number.isFinite(row[key])))
+    && !!row.reasons && typeof row.reasons === 'object' && !Array.isArray(row.reasons);
+}
+
+/** Reads finish metrics at most once per 10 minutes per root; unreadable or missing → null (never a hold). */
+async function cachedFinishMetrics(root: string, now: Date, deps: HarnessQueueDeps): Promise<FinishMetrics | null> {
+  // Checked before the cache: a cached real measurement must not reach an uninjected test tick either.
+  if (!deps.finishMetrics && (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME)) {
+    debug.log('loop.orchestrator', 'finish-skipped-test', {});
+    return null;
+  }
+  const path = join(root, 'harness', 'finish-metrics.json');
+  try {
+    if (existsSync(path)) {
+      const cached = JSON.parse(readFileSync(path, 'utf8')) as { at?: unknown; metrics?: unknown };
+      const at = typeof cached.at === 'string' ? Date.parse(cached.at) : NaN;
+      if (Number.isFinite(at) && now.getTime() - at >= 0 && now.getTime() - at < FINISH_CACHE_MS
+        && validFinishMetrics(cached.metrics)) return cached.metrics;
+    }
+  } catch { /* A broken cache is re-measured. */ }
+  const measure = deps.finishMetrics ?? (() => measureFinish());
+  const metrics = await measure(now);
+  try {
+    mkdirSync(join(root, 'harness'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ at: now.toISOString(), metrics }));
+  } catch (error) { debug.log('loop.orchestrator', 'finish-cache-write-failed', { reason: String(error) }); }
+  return metrics;
+}
+
+/** FINISH-RATE: a backlogged board holds this launch when the pool already fills the launch share. */
+async function finishGateReason(root: string, now: Date, mode: 'off' | 'shadow' | 'on', running: number, totalSlots: number,
+  deps: HarnessQueueDeps): Promise<string | null> {
+  if (mode === 'off') return null;
+  let metrics: FinishMetrics | null;
+  try { metrics = await cachedFinishMetrics(root, now, deps); }
+  catch (error) {
+    debug.log('loop.orchestrator', 'finish-measure-failed', { reason: String(error) });
+    return null;
+  }
+  if (!metrics) return null;
+  const advice = finishAdvice(metrics, totalSlots);
+  if (advice.state !== 'backlogged' || running < advice.launchSlots) return null;
+  debug.log('loop.orchestrator', 'finish-rebalanced', {
+    finishSlots: advice.finishSlots, launchSlots: advice.launchSlots, running, reasons: advice.reasons, mode,
+  });
+  if (mode === 'shadow') return null;
+  return `마무리 우선 — finish=${advice.finishSlots}/${totalSlots} · 사유 ${advice.reasons.join(', ')}`;
 }
 
 export function harnessQueuePath(root = effectiveInstanceRoot()): string {
@@ -73,7 +142,8 @@ function read(path: string): QueueItem[] {
     && ['queued', 'launching', 'launched', 'finished'].includes(row.status)
     && (row.pid === undefined || Number.isSafeInteger(row.pid))
     && (row.launchId === undefined || typeof row.launchId === 'string')
-    && (row.idempotencyKey === undefined || typeof row.idempotencyKey === 'string'))) {
+    && (row.idempotencyKey === undefined || typeof row.idempotencyKey === 'string')
+    && (row.waitingReason === undefined || typeof row.waitingReason === 'string'))) {
     throw new Error('harness queue: invalid queue file (no launch)');
   }
   return value as QueueItem[];
@@ -84,6 +154,29 @@ function save(path: string, items: QueueItem[]): void {
   try {
     writeFileSync(temporary, `${JSON.stringify(items, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     renameSync(temporary, path);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* write did not finish */ }
+    throw error;
+  }
+}
+
+function lastLaunchedSeat(path: string): QueueSeat | undefined {
+  const marker = `${path}.round-robin.json`;
+  if (!existsSync(marker)) return undefined;
+  const value: unknown = JSON.parse(readFileSync(marker, 'utf8'));
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !queueSeatNames.some((name) => name === (value as { lastSeat?: unknown }).lastSeat)) {
+    throw new Error('harness queue: invalid round-robin state (no launch)');
+  }
+  return (value as { lastSeat: QueueSeat }).lastSeat;
+}
+
+function saveLastLaunchedSeat(path: string, lastSeat: QueueSeat): void {
+  const marker = `${path}.round-robin.json`;
+  const temporary = `${marker}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify({ lastSeat }), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, marker);
   } catch (error) {
     try { unlinkSync(temporary); } catch { /* write did not finish */ }
     throw error;
@@ -309,6 +402,7 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
     const attributed: { seat: QueueSeat; depth: number; source: 'env' | 'flag' | 'ledger' | 'cwd'; priority: number }[] = [];
     const worktrees: { seat: QueueSeat; depth: number }[] = [];
     let launchId: string | undefined;
+    let runId: string | undefined;
     for (const { process: { pid, command }, depth } of members) {
       let envSeat: string | undefined;
       if (platform === 'linux') {
@@ -316,6 +410,7 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
           const env = (probe.environ ?? ((id: number) => readFileSync(`/proc/${id}/environ`, 'utf8')))(pid).split('\0');
           envSeat = env.find((entry) => entry.startsWith('ELANOUS_HARNESS_SEAT='))?.slice('ELANOUS_HARNESS_SEAT='.length);
           launchId ??= env.find((entry) => entry.startsWith('ELANOUS_HARNESS_QUEUE_LAUNCH='))?.slice('ELANOUS_HARNESS_QUEUE_LAUNCH='.length);
+          runId ??= env.find((entry) => entry.startsWith('ELANOUS_RUN_ID='))?.slice('ELANOUS_RUN_ID='.length);
         } catch { /* Unknown attribution is charged to all seats. */ }
       }
       const flag = /--seat[=\s]+(OP|TC|MK|UX)(?:\s|$)/.exec(command)?.[1] as QueueSeat | undefined;
@@ -352,7 +447,8 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
     const assigned = seats.size === 1 ? top[0] : undefined;
     try { debug.log('harness.queue', 'attributed', { pid: root.pid, seat: assigned?.seat ?? null, source: assigned?.source ?? 'all' }); }
     catch { /* Observation does not block inventory. */ }
-    rows.push({ pid: root.pid, ...(assigned ? { seat: assigned.seat } : {}), ...(launchId ? { launchId } : {}) });
+    rows.push({ pid: root.pid, ...(assigned ? { seat: assigned.seat } : {}), ...(launchId ? { launchId } : {}),
+      ...(runId ? { runId } : {}) });
   }
   return rows;
 }
@@ -421,34 +517,241 @@ export async function reconcileHarnessQueue(id: string, deps: HarnessQueueDeps =
   });
 }
 
+const warnedLegacySeatCapPaths = new Set<string>();
+
+function warnLegacySeatCap(path: string): void {
+  if (warnedLegacySeatCapPaths.has(path)) return;
+  try {
+    const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+    const harness = (raw as Record<string, unknown>).harness;
+    if (!harness || typeof harness !== 'object' || Array.isArray(harness)) return;
+    const queue = (harness as Record<string, unknown>).queue;
+    if (!queue || typeof queue !== 'object' || Array.isArray(queue)
+      || !Object.hasOwn(queue, 'seatCap')) return;
+    warnedLegacySeatCapPaths.add(path);
+    debug.log('harness.queue', 'legacy-seat-cap-ignored', {
+      key: 'harness.queue.seatCap', replacement: 'loops.orchestrator.seatCaps', path,
+    }, { level: 'warn' });
+  } catch { /* An unreadable config cannot affect dispatch or observation. */ }
+}
+
+function groupQueueRuns(processes: readonly QueueProcess[]): { seat?: QueueSeat; launchIds: Set<string> }[] {
+  const groups: { seats: Set<QueueSeat>; unknown: boolean; launchIds: Set<string>; keys: Set<string> }[] = [];
+  for (const row of processes) {
+    const keys = [row.runId && `run:${row.runId}`, `root:${row.rootPid ?? row.pid}`,
+      row.launchId && `launch:${row.launchId}`, `pid:${row.pid}`].filter((key): key is string => Boolean(key));
+    const matching = groups.filter((group) => keys.some((key) => group.keys.has(key)));
+    const group = matching[0] ?? { seats: new Set<QueueSeat>(), unknown: false,
+      launchIds: new Set<string>(), keys: new Set<string>() };
+    for (const other of matching.slice(1)) {
+      for (const key of other.keys) group.keys.add(key);
+      for (const seat of other.seats) group.seats.add(seat);
+      for (const id of other.launchIds) group.launchIds.add(id);
+      group.unknown ||= other.unknown;
+      groups.splice(groups.indexOf(other), 1);
+    }
+    for (const key of keys) group.keys.add(key);
+    if (row.seat) group.seats.add(row.seat);
+    else group.unknown = true;
+    if (row.launchId) group.launchIds.add(row.launchId);
+    if (!matching.length) groups.push(group);
+  }
+  return groups.map((group) => ({
+    ...(group.unknown || group.seats.size !== 1 ? {} : { seat: [...group.seats][0] }),
+    launchIds: group.launchIds,
+  }));
+}
+
+const IDLE_REQUEST_INTERVAL_MS = 15 * 60_000;
+const IDLE_REQUEST_MINUTES = 30;
+type IdleRequestState = { checkedAt: string; idleSince: Partial<Record<QueueSeat, string>>; notified?: string[] };
+
+function idleRequestCells(now: Date, root: string): ReturnType<NonNullable<HarnessQueueDeps['idleCells']>> {
+  const ledger = root === effectiveInstanceRoot() ? releaseLedgerRoot() : root;
+  if (!existsSync(join(ledger, 'release', 'features.sqlite'))) throw new Error('release checklist ledger unavailable');
+  const upcoming = listSchedules(ledger).filter(row => Date.parse(row.cutAt) > now.getTime())
+    .sort((a, b) => Date.parse(a.cutAt) - Date.parse(b.cutAt));
+  if (!upcoming[0]) throw new Error('current release schedule unavailable');
+  return { current: listChecklist(upcoming[0].version, ledger).items,
+    next: upcoming[1] ? listChecklist(upcoming[1].version, ledger).items : [] };
+}
+
+function hasRunEvidence(cell: Pick<ChecklistItem, 'evidence'>): boolean {
+  return /(?:\brun[-_][a-z0-9-]+\b|\b(?:런|run)(?:\s*(?:근거|id|ID))?\s*[:：#]\s*\S+)/i.test(cell.evidence ?? '');
+}
+
+/** The queue lock serializes the observation marker; request journal lock also covers external traffic writers. */
+export function requestIdleSeats(root: string, now: Date, items: readonly QueueItem[], deps: HarnessQueueDeps = {}): void {
+  const config: OrchestratorLoopConfig | undefined = (deps.configPath ? getUserConfig(deps.configPath) : getUserConfig()).loops?.orchestrator;
+  const mode = config?.idleRequest ?? 'shadow';
+  if (mode === 'off') return;
+  if (!Number.isFinite(now.getTime())) throw new Error('invalid idle request clock');
+  const marker = join(root, 'orchestrator', 'idle-request.json');
+  const previous: IdleRequestState = existsSync(marker) ? JSON.parse(readFileSync(marker, 'utf8')) as IdleRequestState
+    : { checkedAt: new Date(now.getTime() - IDLE_REQUEST_INTERVAL_MS).toISOString(), idleSince: {} };
+  if (!previous || typeof previous !== 'object' || !previous.idleSince || typeof previous.idleSince !== 'object'
+    || !Number.isFinite(Date.parse(previous.checkedAt)) || (previous.notified !== undefined
+      && (!Array.isArray(previous.notified) || previous.notified.some(key => typeof key !== 'string')))
+    || Object.entries(previous.idleSince).some(([seat, value]) =>
+      !TRAFFIC_SEATS.some(name => name === seat) || typeof value !== 'string' || !Number.isFinite(Date.parse(value)))) {
+    throw new Error('invalid idle request marker');
+  }
+  const processes = (deps.processes ?? readHarnessQueueProcesses)();
+  const groups = groupQueueRuns(processes);
+  const reservations = items.filter(item => item.status === 'launching' || item.status === 'launched').filter(item => {
+    if (item.launchId && groups.some(group => group.launchIds.has(item.launchId!))) return false;
+    const state = item.launchId ? (deps.receipt ?? receipt)(root, item.launchId) : null;
+    return state !== 'finished' && state !== 'not-started';
+  });
+  const counts = Object.fromEntries(TRAFFIC_SEATS.map(seat => [seat,
+    groups.filter(group => !group.seat || group.seat === seat).length
+      + reservations.filter(item => item.seat === seat).length])) as Record<QueueSeat, number>;
+  const idleSince = { ...previous.idleSince };
+  for (const seat of TRAFFIC_SEATS) {
+    if (counts[seat] > 0) delete idleSince[seat];
+    else if (!idleSince[seat]) idleSince[seat] = now.toISOString();
+  }
+  const due = now.getTime() - Date.parse(previous.checkedAt) >= IDLE_REQUEST_INTERVAL_MS;
+  if (!due && Object.keys(idleSince).length === Object.keys(previous.idleSince).length) return;
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+  const state: IdleRequestState = { checkedAt: due ? now.toISOString() : previous.checkedAt, idleSince,
+    notified: (previous.notified ?? []).filter(key => key.startsWith('orch-idle:') && key.split(':')[2] === day) };
+  mkdirSync(join(root, 'orchestrator'), { recursive: true });
+  const temporary = `${marker}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(state), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, marker);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* no temporary file */ }
+    throw error;
+  }
+  if (!due) return;
+  const cells = (deps.idleCells ?? ((clock: Date) => idleRequestCells(clock, root)))(now);
+  const eligible = (rows: typeof cells.current, seat: QueueSeat) => rows.filter(cell =>
+    cell.owner?.split('/')[0] === seat && cell.status === 'yellow' && !hasRunEvidence(cell));
+  const candidates: TrafficCell[] = TRAFFIC_SEATS.flatMap(seat => {
+    const current = eligible(cells.current, seat);
+    return (current.length ? current : eligible(cells.next, seat)).slice(0, 1);
+  });
+  const measured = trafficTick({ now, processes: TRAFFIC_SEATS.flatMap(seat => Array.from({ length: counts[seat] }, () =>
+    ({ seat, command: 'bun bin/elanous.mjs harness say observed', elapsedSeconds: 0 }))),
+    caps: config?.seatCaps ?? { OP: 4, TC: 8, MK: 6, UX: 6 }, idleSince: Object.fromEntries(TRAFFIC_SEATS.map(seat =>
+      [seat, idleSince[seat] ? new Date(idleSince[seat]) : null])), openCells: candidates, idleMinutes: IDLE_REQUEST_MINUTES });
+  const log = deps.idleLog ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data));
+  for (const row of measured.seats) {
+    if (!row.idle || row.running !== 0) continue;
+    const cell = row.nextCell ? `${row.nextCell.id} ${row.nextCell.title.replace(/\s+/g, ' ').trim()}` : '칸 없음';
+    let outcome: 'shadow' | 'queued' | 'duplicate' | 'no-cell' = mode === 'live' ? 'no-cell' : 'shadow';
+    const key = `orch-idle:${row.seat}:${day}:${row.nextCell?.id ?? 'no-cell'}`;
+    if (state.notified!.includes(key)) continue;
+    if (mode === 'live' && row.nextCell) {
+      const path = join(root, 'seat-requests', 'requests.jsonl');
+      mkdirSync(join(root, 'seat-requests'), { recursive: true });
+      outcome = withFileLockSync(`${path}.lock`, () => {
+        if (existsSync(path) && readFileSync(path, 'utf8').split('\n').some(line => {
+          if (!line) return false;
+          try { return (JSON.parse(line) as { key?: string }).key === key; }
+          catch { throw new Error('invalid seat request journal'); }
+        })) return 'duplicate';
+        appendFileSync(path, JSON.stringify({ key, receiptId: key, seat: row.seat,
+          text: `다음 칸: ${cell} — 30분 놀았다`, status: 'queued', queuedAt: now.toISOString(), source: 'orchestrator-idle' }) + '\n');
+        return 'queued';
+      });
+    }
+    if (outcome !== 'duplicate') {
+      state.notified!.push(key);
+      try { log('loop.orchestrator', 'idle-requested', {
+        seat: row.seat, idleMinutes: IDLE_REQUEST_MINUTES, cell, mode, outcome }); }
+      catch { /* Observation cannot change the request or queue decision. */ }
+    }
+  }
+  try {
+    writeFileSync(temporary, JSON.stringify(state), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, marker);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* no temporary file */ }
+    throw error;
+  }
+}
+
 export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<QueueTick> {
   const root = deps.root ?? effectiveInstanceRoot();
   return locked(root, async (path) => {
+    try {
+      const now = (deps.now ?? (() => new Date()))();
+      // A test process must not run the real author shadow — it reads operational ledgers and blew the 5s test budget (10-05 P0).
+      if (!deps.authorShadow && process.env.ELANOUS_AUTHOR_SHADOW_LIVE !== '1' && (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME)) {
+        debug.log('loops.author-depth', 'shadow-skipped-test', {});
+      } else {
+        const shadow = deps.authorShadow ?? (await import('../loops/orchestrator/author-depth.js')).runAuthorDepthShadow;
+        await shadow(root, now);
+      }
+    } catch (error) {
+      try { debug.log('loops.author-depth', 'shadow-failed', { reason: String(error) }); }
+      catch { /* Shadow observation cannot affect queue dispatch. */ }
+    }
     const items = read(path);
-    const item = items.find((row) => row.status === 'queued');
-    if (!item) { observe('skipped', { reason: 'empty' }, deps); return { outcome: 'skipped', reason: 'empty' }; }
+    try { await (deps.idleRequest ?? requestIdleSeats)(root, (deps.now ?? (() => new Date()))(), items, deps); }
+    catch (error) {
+      try { debug.log('loop.orchestrator', 'idle-request-failed', { reason: String(error) }); }
+      catch { /* Idle observation cannot affect queue dispatch. */ }
+    }
+    const heads = new Map<QueueSeat, QueueItem>();
+    for (const row of items) if (row.status === 'queued' && !heads.has(row.seat)) heads.set(row.seat, row);
+    if (!heads.size) { observe('skipped', { reason: 'empty' }, deps); return { outcome: 'skipped', reason: 'empty' }; }
+    const lastSeat = lastLaunchedSeat(path);
+    const first = lastSeat ? (queueSeatNames.indexOf(lastSeat) + 1) % queueSeatNames.length
+      : queueSeatNames.indexOf(items.find((row) => row.status === 'queued')!.seat);
+    const candidates = [...queueSeatNames.slice(first), ...queueSeatNames.slice(0, first)]
+      .flatMap((name) => heads.get(name) ? [heads.get(name)!] : []);
     const config = deps.configPath === undefined ? getUserConfig() : getUserConfig(deps.configPath);
-    const cap = (deps.cap ?? ((s: QueueSeat) => config.harness?.queue?.seatCap?.[s] ?? 8))(item.seat);
-    if (!Number.isSafeInteger(cap) || cap < 1) throw new Error(`harness queue: invalid seat cap for ${item.seat}`);
+    warnLegacySeatCap(deps.configPath ?? userConfigPath());
     const caps = config.loops?.orchestrator?.seatCaps;
     const gate = config.loops?.orchestrator?.releaseGate;
     const attributed: Record<QueueSeat, number> = { OP: 0, TC: 0, MK: 0, UX: 0 };
     let unattributed = 0;
-    const wait = (reason: string, active: number): QueueTick => {
-      observe('waiting', { id: item.id, seat: item.seat, reason, active, cap, attributed, unattributed }, deps);
-      return { outcome: 'waiting', item, reason };
+    const blocked = new Map<QueueSeat, { reason: string; active: number }>();
+    const waiting = (): QueueTick => {
+      const reason = candidates.map((item) => blocked.get(item.seat)!.reason).join('\n');
+      const updated = current.map((row) => {
+        const block = blocked.get(row.seat);
+        return heads.get(row.seat)?.id === row.id && block && row.waitingReason !== block.reason
+          ? { ...row, waitingReason: block.reason } : row;
+      });
+      if (updated.some((row, index) => row !== current[index])) save(path, updated);
+      for (const item of candidates) {
+        const { reason: seatReason, active } = blocked.get(item.seat)!;
+        const injectedCap = deps.cap?.(item.seat);
+        const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
+        observe('waiting', { id: item.id, seat: item.seat, reason: seatReason, active, cap: details.cap,
+          seatCaps: details.seatCaps, releaseGate: details.releaseGate,
+          ...(details.injectedCap === undefined ? {} : { injectedCap: details.injectedCap }), capKeys: details.winners,
+          attributed, unattributed }, deps);
+      }
+      return { outcome: 'waiting', item: { ...candidates[0]!, waitingReason: blocked.get(candidates[0]!.seat)!.reason }, reason };
     };
+    for (const item of candidates) {
+      const injectedCap = deps.cap?.(item.seat);
+      if (injectedCap !== undefined && (!Number.isSafeInteger(injectedCap) || injectedCap < 0)) throw new Error(`harness queue: invalid seat cap for ${item.seat}`);
+    }
+    let current = items;
     let processes: readonly QueueProcess[];
     try { processes = (deps.processes ?? readHarnessQueueProcesses)(); }
     catch (error) {
-      const budget = decideSpawn({ seat: item.seat, running: null, caps, gate });
-      return wait(`${budget.reason}: harness process inventory unavailable: ${String(error)}`, 0);
+      for (const item of candidates) {
+        const injectedCap = deps.cap?.(item.seat);
+        const budget = decideSpawn({ seat: item.seat, running: null, caps, gate, injectedCap });
+        blocked.set(item.seat, { reason: `${budget.reason}: harness process inventory unavailable: ${String(error)}`, active: 0 });
+      }
+      return waiting();
     }
-    for (const row of processes) {
-      if (row.seat) attributed[row.seat]++;
+    const runs = groupQueueRuns(processes);
+    for (const run of runs) {
+      if (run.seat) attributed[run.seat]++;
       else unattributed++;
     }
-    const current = items.flatMap((row) => {
+    current = items.flatMap((row) => {
       if ((row.status !== 'launched' && row.status !== 'launching') || !row.launchId) return [row];
       const state = (deps.receipt ?? receipt)(root, row.launchId);
       if (state !== 'finished' && state !== 'not-started'
@@ -459,36 +762,63 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<Que
       return [];
     });
     if (current.length !== items.length || current.some((row, index) => row !== items[index])) save(path, current);
-    const charged = processes.filter((row) => !row.seat || row.seat === item.seat);
-    const launchIds = new Set(charged.map((row) => row.launchId));
-    const active = new Set(charged.map((row) => row.launchId ?? `pid:${row.pid}`)).size + current.filter((row) => row.seat === item.seat &&
-      (row.status === 'launching' || row.status === 'launched')
-      && (!row.launchId || !launchIds.has(row.launchId))).length;
-    if (active >= cap) return wait(`seat ${item.seat}: ${active}/${cap}`, active);
-    let pool: QueuePool;
-    try { pool = (deps.pool ?? readHarnessQueuePool)(); }
-    catch (error) { return wait(`pod lease status unavailable: ${String(error)}`, active); }
-    if (![pool.running, pool.pending, pool.reserved, pool.limit].every((n) => Number.isSafeInteger(n) && n >= 0) || pool.limit < 1) {
-      return wait('pod lease status incomplete', active);
+    let pool: QueuePool | undefined;
+    let poolReason: string | undefined;
+    let finishHeld: string | null | undefined;
+    for (const item of candidates) {
+      const injectedCap = deps.cap?.(item.seat);
+      const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
+      const charged = runs.filter((run) => !run.seat || run.seat === item.seat);
+      const launchIds = new Set(charged.flatMap((run) => [...run.launchIds]));
+      const active = charged.length + current.filter((row) => row.seat === item.seat &&
+        (row.status === 'launching' || row.status === 'launched')
+        && (!row.launchId || !launchIds.has(row.launchId))).length;
+      if (active >= details.cap) { blocked.set(item.seat, { reason: seatCapReason(item.seat, active, details), active }); continue; }
+      if (!pool && !poolReason) {
+        try { pool = (deps.pool ?? readHarnessQueuePool)(); }
+        catch (error) { poolReason = `pod lease status unavailable: ${String(error)}`; }
+        if (pool && (![pool.running, pool.pending, pool.reserved, pool.limit].every((n) => Number.isSafeInteger(n) && n >= 0) || pool.limit < 1)) {
+          poolReason = 'pod lease status incomplete';
+        }
+        if (pool && !poolReason) {
+          const queueLaunching = current.filter((row) => row.status === 'launching' || row.status === 'launched').length;
+          if (pool.running + pool.pending + pool.reserved + queueLaunching >= pool.limit) {
+            poolReason = `pool: ${pool.running}+${pool.pending}+${pool.reserved}+${queueLaunching}/${pool.limit}`;
+          }
+        }
+      }
+      if (poolReason) { blocked.set(item.seat, { reason: poolReason, active }); continue; }
+      const budget = decideSpawn({ seat: item.seat, running: active, caps, gate, injectedCap });
+      if (!budget.allow) {
+        blocked.set(item.seat, { reason: `${budget.reason}: ${seatCapReason(item.seat, active, details)}`, active });
+        continue;
+      }
+      if (finishHeld === undefined) {
+        finishHeld = await finishGateReason(root, (deps.now ?? (() => new Date()))(), config.loops?.orchestrator?.finishGate ?? 'shadow',
+          pool!.running + pool!.pending + pool!.reserved
+          + current.filter((row) => row.status === 'launching' || row.status === 'launched').length, pool!.limit, deps);
+      }
+      if (finishHeld) { blocked.set(item.seat, { reason: finishHeld, active }); continue; }
+      const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${randomUUID()}` };
+      delete launching.waitingReason;
+      save(path, current.map((row) => row.id === item.id ? launching : row));
+      try {
+        const pid = await (deps.launch ?? launch)(launching, queueLaunchArgs(launching), root);
+        if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('launcher returned no pid');
+        const launched: QueueItem = { ...launching, pid, status: 'launched' };
+        save(path, current.map((row) => row.id === item.id ? launched : row));
+        try { saveLastLaunchedSeat(path, item.seat); }
+        catch (error) {
+          try { debug.log('harness.queue', 'round-robin-save-failed', { id: item.id, seat: item.seat, reason: String(error) }, { level: 'warn' }); }
+          catch { /* Observation cannot change an already persisted launch. */ }
+        }
+        observe('launched', { id: item.id, seat: item.seat, pid, kind: item.kind, launchId: launched.launchId }, deps);
+        return { outcome: 'launched', item: launched, reason: 'spawned' };
+      } catch (error) {
+        observe('skipped', { id: item.id, seat: item.seat, reason: `launch uncertain: ${String(error)}`, launchId: launching.launchId }, deps);
+        throw error;
+      }
     }
-    const queueLaunching = current.filter((row) => row.status === 'launching' || row.status === 'launched').length;
-    if (pool.running + pool.pending + pool.reserved + queueLaunching >= pool.limit) {
-      return wait(`pool: ${pool.running}+${pool.pending}+${pool.reserved}+${queueLaunching}/${pool.limit}`, active);
-    }
-    const budget = decideSpawn({ seat: item.seat, running: active, caps, gate });
-    if (!budget.allow) return wait(`${budget.reason}: seat ${item.seat}: ${active}/${budget.cap}`, active);
-    const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${randomUUID()}` };
-    save(path, current.map((row) => row.id === item.id ? launching : row));
-    try {
-      const pid = await (deps.launch ?? launch)(launching, queueLaunchArgs(launching), root);
-      if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('launcher returned no pid');
-      const launched: QueueItem = { ...launching, pid, status: 'launched' };
-      save(path, current.map((row) => row.id === item.id ? launched : row));
-      observe('launched', { id: item.id, seat: item.seat, pid, kind: item.kind, launchId: launched.launchId }, deps);
-      return { outcome: 'launched', item: launched, reason: 'spawned' };
-    } catch (error) {
-      observe('skipped', { id: item.id, seat: item.seat, reason: `launch uncertain: ${String(error)}`, launchId: launching.launchId }, deps);
-      throw error;
-    }
+    return waiting();
   });
 }

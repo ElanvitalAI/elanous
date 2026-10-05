@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { checkBrand } from '../brand/check.js';
+import { dirname, join, resolve } from 'node:path';
+import { BRAND_RULES_UNMEASURED, checkBrand } from '../brand/check.js';
 import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { listChecklist, type ChecklistItem } from '../../src/release-loop/checklist.js';
+import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../../src/seat-dispatch/seat-request-ledger.js';
+import { finishNode, readGraphContext, type GraphContext } from '../release-loop/node-verdict.js';
 
 const repoRoot = resolve(import.meta.dir, '../..');
 
@@ -16,6 +18,7 @@ type DraftOptions = {
   checklistRoot?: string;
   stateDir?: string;
   manualRoot?: string;
+  rulesPath?: string;
 };
 
 type DraftResult = {
@@ -27,6 +30,7 @@ type DraftResult = {
   claims: number;
   manualCandidates: number;
   brandFindings: number;
+  brandUnmeasured?: string;
   files: string[];
 };
 
@@ -126,6 +130,7 @@ export function draftReleaseStory(options: DraftOptions): DraftResult {
   const outDir = options.outDir ?? join(effectiveInstanceRoot(), 'release', version, 'story');
   mkdirSync(outDir, { recursive: true });
   let brandFindings = 0;
+  let brandUnmeasured: string | undefined;
   const files: string[] = [];
   for (const [name, body, scope] of [
     ['announcement.md', announcement, 'release-notes'],
@@ -134,20 +139,63 @@ export function draftReleaseStory(options: DraftOptions): DraftResult {
   ] as const) {
     const file = join(outDir, name);
     writeFileSync(file, body);
-    const findings = checkBrand(scope, [file]).findings;
-    brandFindings += findings.length;
-    if (findings.length) writeFileSync(file, findings.map(({ id, match }) => `> ⚠ 브랜드 규칙: ${id} «${match}»`).join('\n') + '\n\n' + body);
+    const checked = checkBrand(scope, [file], options.rulesPath);
+    if (checked.missing) {
+      brandUnmeasured = checked.message ?? BRAND_RULES_UNMEASURED;
+      writeFileSync(file, `> ⚠ ${brandUnmeasured}\n\n${body}`);
+    } else {
+      brandFindings += checked.findings.length;
+      if (checked.findings.length) writeFileSync(file, checked.findings.map(({ id, match }) => `> ⚠ 브랜드 규칙: ${id} «${match}»`).join('\n') + '\n\n' + body);
+    }
     files.push(file);
   }
   const result: DraftResult = { version, status: 'drafted', userLines: userLines.length, internalDropped, greenCells: green.length,
-    claims: evidence.sentences.length, manualCandidates: candidates.length, brandFindings, files };
+    claims: evidence.sentences.length, manualCandidates: candidates.length, brandFindings, ...(brandUnmeasured ? { brandUnmeasured } : {}), files };
   debug.log('release.story', 'drafted', { version, userLines: result.userLines, internalDropped, greenCells: result.greenCells,
-    claims: result.claims, manualCandidates: result.manualCandidates, brandFindings });
+    claims: result.claims, manualCandidates: result.manualCandidates, brandFindings, ...(brandUnmeasured ? { brandUnmeasured } : {}) });
   return result;
 }
 
-if (import.meta.main) {
+export function runReleaseStory(context: GraphContext = readGraphContext(), draft: typeof draftReleaseStory = draftReleaseStory) {
+  const version = context.input.version;
   try {
+    if (context.outputs.publish?.outcome !== 'ok' || context.outputs.verify?.outcome !== 'ok')
+      throw new Error('published release and verification required');
+    const result = draft({ version });
+    if (result.status === 'drafted') {
+      const root = effectiveInstanceRoot();
+      const requestsPath = join(root, 'seat-requests', 'requests.jsonl');
+      const key = `release-story:${version}`;
+      const storyDir = dirname(result.files[0]!);
+      withSeatRequestLedgerLock(requestsPath, () => {
+        if (listSeatRequests(root).some((row) => row.key === key)) return;
+        appendSeatRequestRows(requestsPath, [{ key, seat: 'MK', source: 'release-story', version, status: 'pending',
+          text: `${version} 공지 초안 준비됨: ${storyDir}`, queuedAt: new Date().toISOString() }]);
+      });
+    }
+    return { outcome: 'ok' as const, verdict: 'pass' as const, summary: result.status,
+      files: result.files, status: result.status };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    debug.log('release.story', 'draft-failed', { version, reason });
+    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `release story failed: ${reason}`, reason };
+  }
+}
+
+if (import.meta.main) {
+  if (process.argv.includes('--graph')) {
+    let version = '';
+    try {
+      if (process.argv.length !== 3) throw new Error('usage: bun scripts/release-story/draft.ts --graph');
+      const context = readGraphContext();
+      version = context.input.version;
+      process.exitCode = finishNode('release-story', version, runReleaseStory(context));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      debug.log('release.story', 'draft-failed', { version, reason });
+      process.exitCode = finishNode('release-story', version, { outcome: 'fail', verdict: 'fail', summary: `release story failed: ${reason}`, reason });
+    }
+  } else try {
     const args = process.argv.slice(2);
     let version: string | undefined;
     let nextPath: string | undefined;
@@ -164,7 +212,7 @@ if (import.meta.main) {
     if (!version || (args.includes('--next') && !nextPath) || (args.includes('--out') && !outDir))
       throw new Error('usage: bun scripts/release-story/draft.ts --version <v> [--next <path>] [--out <dir>] [--json]');
     const result = draftReleaseStory({ version, ...(nextPath ? { nextPath } : {}), ...(outDir ? { outDir } : {}) });
-    console.log(json ? JSON.stringify(result) : result.status === 'drafted' ? `drafted: ${result.files.join(', ')}` : result.status);
+    console.log(json ? JSON.stringify(result) : result.status === 'drafted' ? `drafted: ${result.files.join(', ')}${result.brandUnmeasured ? ` · ${result.brandUnmeasured}` : ''}` : result.status);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

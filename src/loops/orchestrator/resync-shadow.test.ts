@@ -6,6 +6,11 @@ import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { junitCounts, runResyncShadow } from './resync-shadow.js';
 
+// The default runner isolates PR tests in `unshare --user --net` (Linux user namespaces); macOS has no unshare, so the
+// production path fails closed there ('test sandbox unavailable' → error, outside the ratio) and these tests cannot run.
+const hasSandbox = spawnSync('unshare', ['--user', '--map-root-user', '--net', 'true'], { encoding: 'utf8' }).status === 0;
+const sandboxTest = test.skipIf(!hasSandbox);
+
 const roots: string[] = [];
 afterEach(() => { while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true }); });
 
@@ -74,7 +79,7 @@ for (const scenario of [
   { name: 'marker left by resolver stays unresolved', resolved: false, failingTest: false, verdict: 'unresolved', status: 'conflict-unresolved' },
   { name: 'failing changed test blocks saving', resolved: true, failingTest: true, verdict: 'merge-ok-tests-failed', status: 'llm-resolved' },
 ] as const) {
-  test(scenario.name, async () => {
+  (scenario.resolved ? sandboxTest : test)(scenario.name, async () => {
     const f = fixture(scenario.failingTest);
     let resolves = 0;
     const logs: Array<{ event: string; data: unknown }> = [];
@@ -105,7 +110,7 @@ for (const scenario of [
   }, 30_000);
 }
 
-test('a changed test beginning with a dash is executed instead of counted as no-tests', async () => {
+sandboxTest('a changed test beginning with a dash is executed instead of counted as no-tests', async () => {
   const f = fixture(false, '-foo.test.ts');
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });
@@ -115,7 +120,7 @@ test('a changed test beginning with a dash is executed instead of counted as no-
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 });
 
-test('each changed test file must execute tests before the PR can be saved', async () => {
+sandboxTest('each changed test file must execute tests before the PR can be saved', async () => {
   const f = fixture(false, 'value.test.ts', false, 'empty.test.ts');
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });
@@ -127,7 +132,7 @@ test('each changed test file must execute tests before the PR can be saved', asy
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 }, 30_000);
 
-test('all changed test files run before a successful save', async () => {
+sandboxTest('all changed test files run before a successful save', async () => {
   const f = fixture(false, 'value.test.ts', false, 'second.test.ts');
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });
@@ -138,7 +143,7 @@ test('all changed test files run before a successful save', async () => {
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 }, 30_000);
 
-test('a PR test cannot push to its remote even with the local bare origin configured', async () => {
+sandboxTest('a PR test cannot push to its remote even with the local bare origin configured', async () => {
   const f = fixture(false, 'value.test.ts', true);
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });
@@ -170,7 +175,7 @@ test('successful merge without changed test files is not counted as saved', asyn
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 });
 
-test('candidates are tried in ascending PR number and --max limits attempts', async () => {
+sandboxTest('candidates are tried in ascending PR number and --max limits attempts', async () => {
   const f = fixture();
   const runGh = (args: string[]) => args[1] === 'list'
     ? JSON.stringify([12, 10].map(number => ({ number, headRefName: 'self-impl/conflicted', mergeable: 'CONFLICTING', isDraft: true, labels: [] })))
@@ -224,7 +229,7 @@ test('test sandbox failure is recorded but excluded from the savings ratio', asy
   expect(f.worktrees()).toBe(`worktree ${f.work}\nHEAD ${git(f.work, 'rev-parse', 'HEAD')}\nbranch refs/heads/main`);
 });
 
-test('measurement errors do not dilute a completed save', async () => {
+sandboxTest('measurement errors do not dilute a completed save', async () => {
   const f = fixture();
   const runGh = (args: string[]) => args[1] === 'list'
     ? JSON.stringify([11, 12].map(number => ({ number, headRefName: number === 11 ? 'self-impl/missing' : 'self-impl/conflicted',
@@ -252,7 +257,7 @@ test('zero candidates never invokes the resolver and reports null ratio', async 
   expect(f.remoteHead()).toBe(f.headBefore);
 });
 
-test('a changed test that prints the success text and exits cannot be counted as saved (review round 3 ①)', async () => {
+sandboxTest('a changed test that prints the success text and exits cannot be counted as saved (review round 3 ①)', async () => {
   const f = fixture(false, 'value.test.ts', false, 'spoof.test.ts');
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });
@@ -262,7 +267,7 @@ test('a changed test that prints the success text and exits cannot be counted as
   expect(f.remoteHead()).toBe(f.headBefore);
 }, 30_000);
 
-test('a test file the PR deleted is skipped, and only-deleted tests count as no-tests (review round 3 ②)', async () => {
+sandboxTest('a test file the PR deleted is skipped, and only-deleted tests count as no-tests (review round 3 ②)', async () => {
   const f = fixture(false, 'value.test.ts', false, 'deleted.test.ts');
   const summary = await runResyncShadow(3, { repoRoot: f.work, instanceRoot: f.state, runGh: f.runGh,
     resolve: async () => "export const value = 'combined';\n" });

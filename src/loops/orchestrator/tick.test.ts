@@ -361,7 +361,7 @@ describe('ORCH1b tick isolation and adapter exports', () => {
     writeFileSync(path, JSON.stringify(seed));
     let calls = 0;
     const counts: number[] = [];
-    const loadAdapter: TickDeps['loadAdapter'] = async (_path, name) => name === 'rebalance' ? () => { calls++; return []; } : undefined;
+    const loadAdapter: TickDeps['loadAdapter'] = async (_path, name) => name === 'rebalance' ? () => { calls++; return { decisions: [], blocked: [] }; } : undefined;
     const state = await invoke(root, 'rebalance18', '18', { mode: 'shadow', loadAdapter,
       observe: (event, data) => { logged.push({ event, reason: data.reason }); if (data.reason === 'rebalance-shadow-not-invoked') counts.push(data.count); },
     }, logged);
@@ -373,13 +373,31 @@ describe('ORCH1b tick isolation and adapter exports', () => {
     expect(state.rebalanced).toBeUndefined();
   }));
 
+  test('18 live reports rejected CEO-load rebalance adjustments as well as moved count', async () => fixture(async (root, _id, logged) => {
+    await invoke(root, 'ceo-rebalance-seed', '08', {
+      mode: 'live', split: () => [{ id: 'sns', title: 'SNS', seat: 'MK' }], placeCell: () => ({ version: '0.2.14' }),
+    }, logged);
+    const seedPath = join(root, 'loop', 'orchestrator', 'ceo-rebalance-seed.json');
+    const seed = JSON.parse(readFileSync(seedPath, 'utf8'));
+    let printed = '';
+    const evening = await invoke(root, 'ceo-rebalance-evening', '18', {
+      mode: 'live', print: line => { printed = line; },
+      loadAdapter: async (_path, name) => name === 'rebalance' ? () => ({ decisions: [], blocked: [{ id: 'sns', reason: '대표 손 과부하 — 늦추기 · 자리 대행 · 묶기' }] }) : undefined,
+    }, logged);
+    expect(seed.cells[0]?.version).toBe('0.2.14');
+    expect(evening.rebalanced).toBe(0);
+    expect(evening.rebalanceBlocked).toEqual([{ id: 'sns', reason: '대표 손 과부하 — 늦추기 · 자리 대행 · 묶기' }]);
+    expect(printed).toContain('⛔ 이월 거부 sns: 대표 손 과부하 — 늦추기 · 자리 대행 · 묶기');
+    expect(logged).toContainEqual({ event: 'exchange', reason: 'rebalance-blocked: sns 대표 손 과부하 — 늦추기 · 자리 대행 · 묶기' });
+  }));
+
   test('18 live invokes rebalance once per placed version and counts decisions', async () => fixture(async (root, id, logged) => {
     const state = await invoke(root, 'rebalance-seed', '08', {
       mode: 'live', split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.14' }),
     }, logged);
     const called: string[] = [];
     const evening = await invoke(root, 'rebalance-live', '18', {
-      mode: 'live', loadAdapter: async (_path, name) => name === 'rebalance' ? (version: string) => { called.push(version); return [{ id: 'C1' }, { id: 'C2' }]; } : undefined,
+      mode: 'live', loadAdapter: async (_path, name) => name === 'rebalance' ? (version: string) => { called.push(version); return { decisions: [{ id: 'C1' }, { id: 'C2' }], blocked: [] }; } : undefined,
     }, logged);
     expect(state.cells[0]?.version).toBe('0.2.14');
     expect(evening.cells.map(cell => cell.cardId)).toEqual([id]);

@@ -825,6 +825,8 @@ export async function reviewPullRequest(
 
 /** 리뷰 결과를 PR 코멘트/알림/CLI 용 markdown 으로 렌더. */
 export function renderReview(r: ReviewResult): string {
+  // A review that never ran must not read as PASS anywhere it is rendered (PR body, comments, CLI) — 10-05 #23942·#24151.
+  if (r.reviewed === false) return `⚠️ 자율 PR 리뷰: 리뷰 안 돎 — 사유 ${r.failureReason?.trim() || '미상'} (통과 판정 아님)`;
   const icon = r.verdict === 'pass' ? '✅' : r.verdict === 'warn' ? '⚠️' : '⛔';
   const head = `${icon} 자율 PR 리뷰: ${r.verdict.toUpperCase()}`;
   const parts = [head];

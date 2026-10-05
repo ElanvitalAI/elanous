@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -19,10 +19,10 @@ import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from 
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
-interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }> }
+interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean }
 export interface GateRunner {
-  command(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
-  localCommand(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
+  command(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<CommandResult>;
+  localCommand(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<CommandResult>;
   sweep(tree: string, logDir?: string, pod?: GateOptions['pod']): Promise<CommandResult>;
   add(tree: string, commit: string): Promise<void>;
   remove(tree: string): Promise<void>;
@@ -52,7 +52,7 @@ export interface GateResult {
   fixed: number;
   knownEnv: number;
   knownEnvCleared: string[];
-  stalledEnv: Array<{ file: string; reason: 'no-output'; local: 'passed' | 'failed' }>;
+  stalledEnv: Array<{ file: string; reason: 'no-output' | 'isolated-timeout'; local: 'passed' | 'failed' | 'timeout' }>;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
   durationMs: number;
   error?: string;
@@ -189,17 +189,63 @@ class StalledPodShards extends Error {
   }
 }
 
+/** Isolated re-runs (host stall re-run · cut and baseline re-checks) are time-limited; sweeps and installs keep their full time. */
+export const GATE_ISOLATED_TIMEOUT_MS = 300_000;
+
+/**
+ * Runs a limited local command in its own process group. On timeout: SIGTERM the group (test-deterministic forwards it to its own
+ * `bun test` group — Chrome included), SIGKILL after a grace, and return after a hard deadline even if a foreign-group process still holds the pipe.
+ */
+export function limitedLocalCommand(cmd: string, args: string[], cwd: string, limitMs: number, graceMs = 10_000): Promise<CommandResult> {
+  return new Promise((resolveRun) => {
+    const chunks: string[] = [];
+    let timedOut = false;
+    let done = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const child = spawn(cmd, args, { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let kept = 0;
+    // Same ceiling as the unlimited spawnSync path (maxBuffer 128MB): drop the oldest output beyond it, keep the tail.
+    const keep = (d: string) => { chunks.push(d); kept += d.length; while (kept > 128 * 1024 * 1024 && chunks.length > 1) kept -= chunks.shift()!.length; };
+    child.stdout?.setEncoding('utf8').on('data', keep);
+    child.stderr?.setEncoding('utf8').on('data', keep);
+    const signalGroup = (signal: NodeJS.Signals) => { try { if (child.pid) process.kill(-child.pid, signal); } catch { /* group already gone */ } };
+    const finish = (code: number | null, error?: Error) => {
+      if (done) return;
+      done = true;
+      for (const timer of timers) clearTimeout(timer);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      const tail = error ? `\n${error}` : timedOut ? `\nkilled after ${limitMs}ms (process group)` : '';
+      resolveRun({ rc: code ?? 2, output: `${chunks.join('')}${tail}`, ...(timedOut ? { timedOut } : {}) });
+    };
+    timers.push(setTimeout(() => {
+      timedOut = true;
+      signalGroup('SIGTERM');
+      timers.push(setTimeout(() => signalGroup('SIGKILL'), graceMs));
+      timers.push(setTimeout(() => finish(null), graceMs + 5_000));
+    }, limitMs));
+    child.on('error', (error) => finish(null, error));
+    child.on('close', (code) => finish(code));
+  });
+}
+
 export function createGateRunner(repo: string, remote?: string, commandOverride?: GateRunner['command'], podCommand: (options: RunPodCommandOptions) => Promise<PodCommandResult> = runPodCommand, poolOverride?: PodPoolScheduler, podLogTail?: (job: PodCommandResult) => string): GateRunner {
   let remoteMirror: string | undefined;
-  const localCommand: GateRunner['command'] = async (cmd, args, cwd) => {
+  const localCommand: GateRunner['localCommand'] = async (cmd, args, cwd, limitMs) => {
+    if (limitMs) return limitedLocalCommand(cmd, args, cwd, limitMs);
     const run = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
     return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}` };
   };
   const command: GateRunner['command'] = commandOverride ?? (remote
-    ? async (cmd, args, cwd) => {
-      const run = spawnSync('ssh', [remote, `PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd ${quote(cwd)} && ${[cmd, ...args].map(quote).join(' ')}`],
-        { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
-      return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}` };
+    ? async (cmd, args, cwd, limitMs) => {
+      // A limited remote run is killed on the remote host; the local ssh deadline is a backstop.
+      // GNU timeout signals its own process group: -s KILL would kill timeout too (ssh 255), so TERM first then KILL after 10s (124 / 137).
+      // No coreutils timeout on the remote → run unlimited there and rely on the local ssh deadline.
+      const limitPrefix = limitMs ? `$(command -v timeout >/dev/null 2>&1 && echo 'timeout -k 10 ${Math.ceil(limitMs / 1000)}') ` : '';
+      const run = spawnSync('ssh', [remote, `PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd ${quote(cwd)} && ${limitPrefix}${[cmd, ...args].map(quote).join(' ')}`],
+        { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024, ...(limitMs ? { timeout: limitMs + 60_000, killSignal: 'SIGKILL' as const } : {}) });
+      const timedOut = !!limitMs && (run.status === 124 || run.status === 137 || (run.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT');
+      return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}`, ...(timedOut ? { timedOut } : {}) };
     }
     : localCommand);
   const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>): Promise<CommandResult> => {
@@ -630,7 +676,15 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         }
         for (const { file, reason } of stalled) {
           if (!/^(?:[\w.-]+\/)+[\w.-]+\.test\.tsx?$/.test(file) || file.split('/').includes('..')) throw new Error(`unsafe test path: ${file}`);
-          const isolated = await runner.localCommand('bun', ['run', 'test:deterministic', asPath(file)], hostTree);
+          // 0.2.15: InsidePage.test.tsx gave no Pod output and then hung on the host with headless Chrome — the run could only fail.
+          const isolated = await runner.localCommand('bun', ['run', 'test:deterministic', asPath(file)], hostTree, GATE_ISOLATED_TIMEOUT_MS);
+          // A file that stalls in its Pod shard and again on the host is an environment stall: record it, measure nothing from it.
+          if (isolated.timedOut) {
+            // Grandchildren (e.g. headless Chrome) can outlive the kill — the event lets the next release see a repeat.
+            debug.log('release-loop.gate', 'isolated-timeout', { file, label, limitMs: GATE_ISOLATED_TIMEOUT_MS });
+            local.push({ file, reason, local: 'timeout' });
+            continue;
+          }
           const parsed = failuresOf(isolated, `${label} host isolated ${file}`);
           if ([...parsed.failures, ...parsed.errors].some((id) => fileOf(id) !== file)) throw new Error(`host isolated run attributed to another file: ${file}`);
           measured.failures.push(...parsed.failures);
@@ -688,14 +742,26 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     result.fixed = diff.fixed.length;
     result.preexisting = diff.common.length;
     for (const file of new Set(diff.newFailures.map(fileOf))) {
-      const isolatedCut = cutHostFailed.has(file)
+      // 0.2.15: the cut re-check of a new-failure file (InsidePage.test.tsx · headless Chrome) hung for good — limit it like the host re-run.
+      const cutCheck = cutHostFailed.has(file) ? undefined : await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree, GATE_ISOLATED_TIMEOUT_MS);
+      if (cutCheck?.timedOut) {
+        debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'cut isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
+        result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
+        continue;
+      }
+      const isolatedCut = cutCheck === undefined
         ? { failures: cut.failures.filter((id) => fileOf(id) === file), errors: cut.errors.filter((id) => fileOf(id) === file) }
-        : failuresOf(await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree), `cut isolated ${file}`);
+        : failuresOf(cutCheck, `cut isolated ${file}`);
       const reproduced = new Set([...isolatedCut.failures, ...isolatedCut.errors]);
       const candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
       if (candidates.length === 0) continue;
       const baselineTree = await getBaseTree();
-      const previous = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], baselineTree);
+      const previous = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], baselineTree, GATE_ISOLATED_TIMEOUT_MS);
+      if (previous.timedOut) {
+        debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'baseline isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
+        result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
+        continue;
+      }
       let oldFailures: Set<string>;
       if (/No tests found|had no matches/i.test(previous.output) && previous.rc === 1) {
         const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], opts.remote ? baselineTree : repo);

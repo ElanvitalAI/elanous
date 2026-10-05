@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyStoppedPr, scanStoppedPrs } from './helper-scan.js';
@@ -283,6 +283,42 @@ test('CLI text and --json read a fake gh without writing to any PR', () => {
       ['pr', 'view', '23753', '--json', 'comments'],
       ['pr', 'view', '23754', '--json', 'comments'],
     ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('default --json neither writes the repair ledger nor makes repair-only gh lookups; explicit shadow path does both', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'helper-scan-json-'));
+  const root = join(dir, 'state');
+  const ledger = join(root, 'helper', 'repairs.jsonl');
+  const calls = join(dir, 'calls');
+  const fakeGh = join(dir, 'gh');
+  const stopped = `## 요청\nOriginal request\n\n## 중단 사유\n- verdict: needs-human\n- reason: review-budget\n\n## 중단 원인 분류\n- classification: implementation-deficit\n- classificationBasis: must-fix-reported\n\n## 마지막 리뷰 must-fix\n- Fix the regression`;
+  const prs = JSON.stringify([{ number: 23753, headRefName: 'self-impl/repair', isDraft: true, body: stopped }]);
+  const comments = JSON.stringify({ comments: [review(3, 1)] });
+  writeFileSync(fakeGh, `#!/usr/bin/env bun\nimport { appendFileSync } from 'node:fs';\nappendFileSync(process.env.HELPER_SCAN_GH_CALLS!, JSON.stringify(process.argv.slice(2)) + '\\n');\nif (process.argv[2] === 'pr' && process.argv[3] === 'list') console.log(${JSON.stringify(prs)});\nelse if (process.argv[2] === 'pr' && process.argv[3] === 'view' && process.argv.includes('comments')) console.log(${JSON.stringify(comments)});\nelse if (process.argv[2] === 'pr' && process.argv[3] === 'view' && process.argv.includes('body')) console.log(${JSON.stringify(JSON.stringify({ body: stopped }))});\nelse process.exit(1);\n`);
+  chmodSync(fakeGh, 0o755);
+  const run = (args: string[]) => spawnSync('bun', ['src/harness/helper-scan.ts', ...args], {
+    encoding: 'utf8', cwd: process.cwd(),
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: root, HELPER_SCAN_GH_CALLS: calls },
+  });
+  const scanCalls = [
+    ['pr', 'list', '--state', 'open', '--limit', '100000', '--json', 'number,headRefName,isDraft,body'],
+    ['pr', 'view', '23753', '--json', 'comments'],
+  ];
+  const readCalls = () => readFileSync(calls, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  try {
+    const json = run(['--json']);
+    expect(json.status).toBe(0);
+    expect(JSON.parse(json.stdout)).toMatchObject([{ pr: 23753, category: 'review-budget' }]);
+    expect({ calls: readCalls(), ledgerExists: existsSync(ledger) }).toEqual({ calls: scanCalls, ledgerExists: false });
+
+    writeFileSync(calls, '');
+    const explicit = run(['--record-shadows']);
+    expect(explicit.status).toBe(0);
+    expect(readCalls()).toEqual([...scanCalls, ['pr', 'view', '23753', '--json', 'body']]);
+    expect(JSON.parse(readFileSync(ledger, 'utf8').trim())).toMatchObject({ pr: 23753, mode: 'shadow' });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

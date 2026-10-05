@@ -16,7 +16,7 @@ export const TERMINAL_STAGES_BY_NODE = {
   implement: ['aborted', 'timed-out', 'soft-stopped', 'parked'],
   gate: [],
   review: ['review-blocked'],
-  rework: ['gate-failed', 'review-blocked'],
+  rework: ['gate-failed', 'review-blocked', 'no-changes'],
   'main-sync': ['merge-conflict'],
   regate: ['gate-failed'],
   'open-pr': ['pr-declined', 'pr-opened', 'worktree-completed'],

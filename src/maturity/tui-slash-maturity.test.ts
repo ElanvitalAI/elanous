@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { SLASH_COMMANDS } from '../chat/index';
 import { FEATURE_MATURITY } from './feature-maturity';
+import { deriveTuiSlashAvailability } from './tui-slash-availability';
 import { readTuiSlashAudience, slashVisibleFor } from './tui-slash-maturity';
 
 describe('MAT1c TUI slash audience', () => {
@@ -23,6 +24,21 @@ describe('MAT1b TUI slash maturity', () => {
     const names = SLASH_COMMANDS.map(({ name }) => name);
     expect(new Set(names).size).toBe(names.length);
     expect(Object.keys(FEATURE_MATURITY.tuiSlash).sort()).toEqual([...names].sort());
+    expect(deriveTuiSlashAvailability().map(({ name }) => name)).toEqual(names);
+  });
+
+  test('a temporary registered command needs no expectation-list update but cannot be missing its grade', () => {
+    const name = 'temporary-fake-command';
+    const commands = [...SLASH_COMMANDS, { name }];
+    const grades = {
+      ...FEATURE_MATURITY,
+      tuiSlash: { ...FEATURE_MATURITY.tuiSlash, [name]: 'beta' as const },
+    };
+    expect(deriveTuiSlashAvailability(commands, grades).at(-1)).toEqual({
+      name, maturity: 'beta', telegram: false, discord: false,
+    });
+    expect(() => deriveTuiSlashAvailability(commands, FEATURE_MATURITY))
+      .toThrow(`TUI slash command /${name} has no maturity grade`);
   });
 
   test('wish is beta in the canonical TUI maturity map', () => {
@@ -45,9 +61,13 @@ describe('MAT1b TUI slash maturity', () => {
     }
   });
 
-  test('operator commands are ops, so a general palette never lists them', () => {
-    for (const name of ['directive', 'harness', 'control', 'inject', 'relay', 'lane', 'capture', 'reply', 'handoff', 'agent-room', 'showroom', 'surface', 'telegram', 'tablet', 'qc', 'default'])
-      expect(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]).toBe('ops');
+  test('operator commands from the registry are excluded from the general palette', () => {
+    const operators = deriveTuiSlashAvailability().filter(({ maturity }) => maturity === 'ops');
+    expect(operators.length).toBeGreaterThan(0);
+    for (const { name } of operators) {
+      expect(slashVisibleFor(name, 'general', { showBeta: true })).toBe(false);
+      expect(slashVisibleFor(name, 'owner', { showBeta: false })).toBe(true);
+    }
   });
 
   test('contributor sees stable, beta and tool without showBeta; owner sees everything', () => {

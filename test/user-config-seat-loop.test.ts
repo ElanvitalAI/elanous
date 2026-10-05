@@ -8,7 +8,7 @@ const root = mkdtempSync(join(tmpdir(), 'user-config-seat-loop-'));
 const path = join(root, 'config.json');
 const base = { mode: 'shadow' as const, seats: ['MK'], podPool: 'pool-node-b@node-b:8', questions: 'shadow' as const };
 // ORCH2 (#23660) parses the orchestrator loop block with defaults even when it is absent · ORCH1 adds mode (default shadow).
-const orchestrator = { mode: 'shadow' as const, seatCaps: { MK: 6, OP: 4, TC: 8, UX: 6 }, seatTrees: {}, trafficMode: 'shadow' as const };
+const orchestrator = { mode: 'shadow' as const, seatCaps: { MK: 6, OP: 4, TC: 8, UX: 6 }, seatTrees: {}, trafficMode: 'shadow' as const, idleRequest: 'shadow' as const, finishGate: 'shadow' as const };
 const ownership = { owners: {}, defaultOwner: 'OP' as const };
 function parse(loops: unknown) {
   writeFileSync(path, JSON.stringify({ loops }));

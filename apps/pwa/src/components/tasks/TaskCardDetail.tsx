@@ -47,6 +47,20 @@ export function TaskCardDetail({ card, placements }: { card: TaskCard; placement
         <h2 className="text-lg font-semibold">{cardTitle(card)}</h2>
         <p className="break-all text-xs text-muted-foreground">{card.taskId}</p>
       </header>
+      {card.wishReply !== undefined && (
+        <section aria-label="Wish reply destination" className="rounded-xl border border-border p-3 text-sm">
+          <h3 className="mb-1 font-semibold">어디로 회신하나</h3>
+          <p className="break-all">{card.wishReply
+            ? `${{ telegram: '텔레그램 대화', pwa: 'PWA', tui: 'TUI', linear: 'Linear' }[card.wishReply.surface as 'telegram' | 'pwa' | 'tui' | 'linear'] ?? card.wishReply.surface}${card.wishReply.address ? ` · ${card.wishReply.address}` : ''}`
+            : '회신 주소 없음'}</p>
+        </section>
+      )}
+      {card.wishReply !== undefined && (
+        <section aria-label="Wish reply history" className="rounded-xl border border-border p-3 text-sm">
+          <h3 className="mb-1 font-semibold">회신 이력</h3>
+          <p className="text-muted-foreground">카드 원장에는 회신 발송 이력이 기록되지 않습니다</p>
+        </section>
+      )}
       {placements && (
         <p className="overflow-x-auto whitespace-nowrap text-sm" aria-label="Wish placement and progress">
           배치 · {placements.length ? placements.map(({ cellId, cellTitle, version, status }) =>

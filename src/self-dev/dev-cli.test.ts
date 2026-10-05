@@ -841,8 +841,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       nowMs: () => now,
       queryAbandonedDraftPrs: () => drafts as never,
       queryDraftPrInventory: () => ({ open: drafts, merged: [
-        { number: 50, title: 'a', branch: 'self-impl/other-goalid-1234' },
-        { number: 51, title: 'different', branch: 'self-impl/new-goalid-bbcd1234-next' },
+        { number: 50, title: 'a', branch: 'self-impl/a-goalid-aabc1234-new' },
+        { number: 51, title: 'different', branch: 'self-impl/b-goalid-bbcd1234-next' },
       ], complete: true }),
       queryRunningRuns: () => ({ entries: [{ runId: 'finished', status: 'unknown' }, { runId: 'running', status: 'running' }] }) as never,
       queryTerminalRunStatuses: () => ({ finished: 'completed' }),

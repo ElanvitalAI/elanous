@@ -1,4 +1,4 @@
-import type { Database } from 'bun:sqlite';
+import { Database } from 'bun:sqlite';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
@@ -99,12 +99,14 @@ export function recordCoordEvent(input: CoordEventInput, deps: { db?: Database }
 }
 
 /** Read-only chronological list; a missing store is an empty ledger, not a newly created one. */
-export function listCoordEvents(opts: { since: string; seat?: string }, deps: { db?: Database } = {}): CoordEvent[] {
+export function listCoordEvents(opts: { since: string; seat?: string; channelOnly?: boolean }, deps: { db?: Database } = {}): CoordEvent[] {
   if (!deps.db && !existsSync(surfaceEventsDbPath())) return [];
-  const db = deps.db ?? openSurfaceEventsDb();
+  const db = deps.db ?? (opts.channelOnly
+    ? new Database(surfaceEventsDbPath(), { readonly: true, strict: true })
+    : openSurfaceEventsDb());
   try {
     const rows = db.prepare(`SELECT id, ts, text, summary, kind, refs FROM events
-      WHERE surface IN ('coord:channel', 'context:external', 'context:session') AND direction='outbound' AND ts>=?
+      WHERE surface ${opts.channelOnly ? "= 'coord:channel'" : "IN ('coord:channel', 'context:external', 'context:session')"} AND direction='outbound' AND ts>=?
       ${opts.seat ? "AND json_extract(refs,'$.seat')=?" : ''} ORDER BY ts ASC, rowid ASC`)
       .all(...(opts.seat ? [opts.since, opts.seat] : [opts.since])) as Array<{
         id: string; ts: string; text: string; summary: string; kind: string; refs: string;

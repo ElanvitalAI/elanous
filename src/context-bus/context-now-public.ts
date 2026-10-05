@@ -2,21 +2,30 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkBrand } from '../../scripts/brand/check.js';
+import { debug } from '../debug/log.js';
 import type { ContextFact, ContextNowAnswer } from './context-now.js';
 
 const internalItem = (count: number) => `내부 항목 ${count}개`;
 const seatNames: Record<string, string> = { OP: '운영', TC: '기술', MK: '마케팅', UX: '사용자 경험' };
 
 /** Public copy only: no raw ledger identifiers or private sources in the rendered answer. */
-export function filterPublicDemoContext(answer: ContextNowAnswer): ContextNowAnswer {
+export function filterPublicDemoContext(answer: ContextNowAnswer, brandCheck: typeof checkBrand = checkBrand): ContextNowAnswer {
   const dir = mkdtempSync(join(tmpdir(), 'context-now-public-'));
   const file = join(dir, 'text.txt');
   try {
+    let rulesMissing = brandCheck('public-docs', []).missing;
+    const logMissing = () => debug.log('context.now', 'brand-rules-missing', { audience: 'public-demo' });
+    if (rulesMissing) logMissing();
     const flagged = (texts: string[]): Set<number> => {
+      if (rulesMissing) return new Set(texts.map((_, index) => index));
       if (!texts.length) return new Set();
       writeFileSync(file, texts.map(text => text.replace(/[\r\n]+/g, ' ')).join('\n') + '\n');
-      const result = checkBrand('public-docs', [file]);
-      if (result.missing) throw new Error('brand rules missing');
+      const result = brandCheck('public-docs', [file]);
+      if (result.missing) {
+        rulesMissing = true;
+        logMissing();
+        return new Set(texts.map((_, index) => index));
+      }
       return new Set(result.findings.map(finding => finding.line - 1));
     };
     const publicText = (value: string): string => value
@@ -60,8 +69,9 @@ export function filterPublicDemoContext(answer: ContextNowAnswer): ContextNowAns
             status: safe(fact.status, '진행 중'), source: source(fact.source) });
       } else if (fact.kind === 'seat') {
         facts.push({ ...fact, seat: safe(fact.seat, '공개 담당'), status: safe(fact.status, '진행 중'),
-          id: fact.id ? (privateIds.has(fact.id) ? '내부 항목' : safe(fact.id, '공개 항목')) : null,
-          title: fact.title ? (privateIds.has(fact.id ?? '') ? '내부 항목' : safe(fact.title, '공개 항목')) : null, source: source(fact.source) });
+          id: fact.id ? (rulesMissing || privateIds.has(fact.id) ? '내부 항목' : safe(fact.id, '공개 항목')) : null,
+          title: fact.title === null ? null : rulesMissing ? internalItem(1) : privateIds.has(fact.id ?? '') ? '내부 항목' : safe(fact.title, '공개 항목'),
+          source: source(fact.source) });
       } else facts.push({ ...fact, version: safe(fact.version, '공개 판'), source: source(fact.source) });
     }
     for (const kind of ['cell', 'decision'] as const) {
@@ -78,7 +88,7 @@ export function filterPublicDemoContext(answer: ContextNowAnswer): ContextNowAns
       events: answer.events.map(event => ({ ...event, kind: safe(event.kind, '소식'),
         summary: publicField(event.summary, '공개 소식'), source: source(event.source) })),
       guide: answer.guide.map(text => publicField(text, '공개 안내')),
-      hiddenCount: collapsed.cell + collapsed.decision,
+      hiddenCount: collapsed.cell + collapsed.decision + (rulesMissing ? answer.facts.filter(fact => fact.kind === 'seat' && fact.title !== null).length : 0),
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -5,6 +5,7 @@ import { defaultTelegramCommands, parseTelegramSlash } from '../telegram-command
 import { TelegramBot } from '../telegram.js';
 import { ELANOUS_SLASH_COMMANDS, buildDiscordSlashWire } from '../discord-slash-wire.js';
 import { SLASH_COMMANDS } from '../chat/index.js';
+import { deriveTuiSlashAvailability } from './tui-slash-availability.js';
 import { botCommands } from '../discord/slash-commands/bots.js';
 import { personaCommand } from '../discord/slash-commands/persona.js';
 import { pollCommand } from '../discord/slash-commands/poll.js';
@@ -28,10 +29,14 @@ const expectedDiscordNames = (handled: readonly { name: string }[]) => {
     .map(({ name }) => name)];
 };
 const sprintHandled = [showroomCommand, personaCommand, relayCommand, statusCommand, pollCommand, ...botCommands].map((command) => command.schema);
-const stableTg = 'help status new clear reset ping provider sessions fork resume decisions work cancel'.split(' ');
-const betaTg = 'skills skill digest intake ad taste missions attach detach now loops project wish'.split(' ');
-const stableDc = 'status sessions new fork'.split(' ');
-const betaDc = 'persona poll attach now'.split(' ');
+const byGrade = (surface: 'telegram' | 'discord', list: readonly { name: string }[], grades: readonly string[]) => {
+  const maturity: Readonly<Record<string, string>> = FEATURE_MATURITY[`${surface}Command`];
+  return list.filter(({ name }) => grades.includes(maturity[name] ?? '')).map(({ name }) => name);
+};
+const stableTg = byGrade('telegram', tg, ['stable']);
+const betaTg = byGrade('telegram', tg, ['beta']);
+const stableDc = byGrade('discord', dc, ['stable']);
+const betaDc = byGrade('discord', dc, ['beta']);
 
 function audienceConfig(surface: 'telegram' | 'discord', role: 'owner' | 'contributor' | 'general', showBeta = false) {
   const cfg = getUserConfig();
@@ -48,19 +53,20 @@ describe('MAT1d bot menu grades', () => {
     expect(new Set(names(dc)).size).toBe(dc.length);
     expect(names(tg).filter((name) => !Object.hasOwn(FEATURE_MATURITY.telegramCommand, name))).toEqual([]);
     expect(Object.keys(FEATURE_MATURITY.telegramCommand).sort()).toEqual(names(tg).sort());
-    for (const name of 'cc_clear coo cto cmo cxo mission_del bots bot screen chart routines botsay'.split(' '))
-      expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('system');
     expect(Object.keys(FEATURE_MATURITY.discordCommand).sort()).toEqual(names(dc).sort());
-    expect(stableTg).toHaveLength(13);
-    for (const name of stableTg) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('stable');
-    for (const name of betaTg) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('beta');
-    for (const name of 'brain cc cdx gem local'.split(' ')) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('tool');
+    // Safety pins stay by hand: owner-only commands must never drift into a general menu by a grade-table edit.
+    for (const name of 'cc_clear mission_del botsay'.split(' ')) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('system');
     expect(FEATURE_MATURITY.telegramCommand.harness).toBe('ops');
-    for (const name of stableDc) expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('stable');
-    for (const name of betaDc) expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('beta');
-    for (const name of 'brain cc cdx gem'.split(' ')) expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('tool');
-    for (const name of 'relay showroom bots bot screen chart routines botsay voice-join voice-leave voice-status'.split(' '))
-      expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('ops');
+    for (const name of 'relay botsay voice-join'.split(' ')) expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('ops');
+    for (const surface of ['telegram', 'discord'] as const) {
+      const list = surface === 'telegram' ? tg : dc;
+      const grades: Readonly<Record<string, string>> = FEATURE_MATURITY[`${surface}Command`];
+      expect(byGrade(surface, list, ['stable', 'beta', 'tool', 'ops', 'system']).sort()).toEqual(names(list).sort());
+      for (const name of names(list)) expect(grades[name]).toBeDefined();
+      for (const entry of deriveTuiSlashAvailability()) {
+        expect(entry[surface]).toBe(Object.hasOwn(FEATURE_MATURITY[`${surface}Command`], entry.name));
+      }
+    }
   });
 
   test('invalid config defaults owner, and visibility changes only the menu', () => {
@@ -76,8 +82,8 @@ describe('MAT1d bot menu grades', () => {
       const list: readonly { name: string }[] = surface === 'telegram' ? tg : dc;
       const contributor = filterBotCommands(surface, list, { role: 'contributor', showBeta: false });
       const expected = surface === 'telegram'
-        ? [...stableTg, ...betaTg, ...'brain cc cdx gem local'.split(' ')]
-        : [...stableDc, ...betaDc, ...'brain cc cdx gem'.split(' ')];
+        ? byGrade('telegram', tg, ['stable', 'beta', 'tool'])
+        : byGrade('discord', dc, ['stable', 'beta', 'tool']);
       expect(names(contributor).sort()).toEqual(expected.sort());
       expect(names(filterBotCommands(surface, list, readBotAudience(undefined)))).toEqual(names(list));
       expect(botCommandVisible(surface, 'new-command', 'owner', { showBeta: false })).toBe(true);
@@ -101,7 +107,9 @@ describe('MAT1d bot menu grades', () => {
     try {
       await bot.start();
       expect(calls.find((c) => c.method === 'setMyCommands')?.body.commands.map((c: { command: string }) => c.command)).toEqual(stableTg);
-      expect(observed).toContainEqual({ category: 'telegram.command', event: 'menu-filtered', data: { total: tg.length, shown: 13, role: 'general', showBeta: false } });
+      // The general menu itself never shows an owner-only command (not just «equals the derived list»).
+      for (const name of 'cc_clear mission_del botsay harness'.split(' ')) expect(calls.find((c) => c.method === 'setMyCommands')?.body.commands.map((c: { command: string }) => c.command)).not.toContain(name);
+      expect(observed).toContainEqual({ category: 'telegram.command', event: 'menu-filtered', data: { total: tg.length, shown: stableTg.length, role: 'general', showBeta: false } });
       expect(parseTelegramSlash('/harness task', tg)).toMatchObject({ kind: 'match', cmd: { name: 'harness' } });
       expect(names(filterBotCommands('telegram', [...tg, { name: 'future-command', description: 'new', handler: async () => '' }], { role: 'owner', showBeta: false }))).toHaveLength(tg.length + 1);
     } finally { spy.mockRestore(); bot.stop(); }
@@ -127,9 +135,10 @@ describe('MAT1d bot menu grades', () => {
       const expectedNames = expectedDiscordNames(ELANOUS_SLASH_COMMANDS);
       expect(body.map((c) => c.name)).toEqual(expectedNames);
       expect(new Set(expectedNames).size).toBe(expectedNames.length);
-      expect(body.filter((c) => c.default_member_permissions === undefined).map((c) => c.name).sort()).toEqual(['sessions', 'new', 'fork', 'attach', 'now', 'status', 'persona'].sort());
+      expect(body.filter((c) => c.default_member_permissions === undefined).map((c) => c.name).sort())
+        .toEqual(byGrade('discord', body, ['stable', 'beta']).sort());
       expect(body.find((c) => c.name === 'cc')?.default_member_permissions).toBe('0');
-      expect(observed).toContainEqual({ category: 'discord.command', event: 'menu-filtered', data: { total: expectedNames.length, shown: 7, role: 'general', showBeta: true } });
+      expect(observed).toContainEqual({ category: 'discord.command', event: 'menu-filtered', data: { total: expectedNames.length, shown: byGrade('discord', body, ['stable', 'beta']).length, role: 'general', showBeta: true } });
     } finally { spy.mockRestore(); }
   });
 
@@ -156,7 +165,8 @@ describe('MAT1d bot menu grades', () => {
         const expectedNames = expectedDiscordNames(sprintHandled);
         expect(body.map((c) => c.name)).toEqual(expectedNames);
         expect(new Set(expectedNames).size).toBe(expectedNames.length);
-        expect(body.filter((c) => c.default_member_permissions === undefined).map((c) => c.name).sort()).toEqual(['status', 'persona', 'poll', 'fork', 'now'].sort());
+        expect(body.filter((c) => c.default_member_permissions === undefined).map((c) => c.name).sort())
+          .toEqual(byGrade('discord', body, ['stable', 'beta']).sort());
         const interaction = (commandName: string, options: ReadonlyMap<string, string | number | boolean> = new Map()) =>
           ({ id: 'i', token: 't', applicationId: 'app', commandName, channelId: 'guild', userId: 'u', options });
         const status = await runtime.router.dispatchToBody(interaction('status'));
@@ -171,7 +181,7 @@ describe('MAT1d bot menu grades', () => {
         expect(fallbackContent).toContain('/fork은(는) 디스코드에서 아직 지원되지 않습니다.');
         expect(fallbackContent.includes('\n')).toBe(false);
         expect(body.find((c) => c.name === 'relay')?.default_member_permissions).toBe('0');
-        expect(observed).toContainEqual({ category: 'discord.command', event: 'menu-filtered', data: { total: expectedNames.length, shown: 5, role: 'general', showBeta: true } });
+        expect(observed).toContainEqual({ category: 'discord.command', event: 'menu-filtered', data: { total: expectedNames.length, shown: byGrade('discord', body, ['stable', 'beta']).length, role: 'general', showBeta: true } });
         expect(runtime.router.schemas().some((schema) => schema.name === 'relay')).toBe(true);
         calls.length = 0;
         setUserConfigOverlay((cfg) => ({ ...cfg, raw: { ...cfg.raw, discord: { commandAudience: { role: 'owner', showBeta: false } } } }));

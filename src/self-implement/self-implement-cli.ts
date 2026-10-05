@@ -108,6 +108,7 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     stage: r.stage,
     ...(!r.ok && r.detail ? { error: { message: r.detail } } : {}),
     ...(r.branch ? { branch: r.branch } : {}),
+    ...(r.harvestable === true && r.branch ? { harvestable: true } : {}),
     ...(r.worktreePath ? { worktreePath: r.worktreePath } : {}),
     ...(r.prUrl ? { prUrl: r.prUrl } : {}),
     ...(r.merged !== undefined ? { merged: r.merged } : {}),

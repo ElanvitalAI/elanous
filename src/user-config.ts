@@ -3097,6 +3097,8 @@ export interface IntakeSurfaceConfig {
 }
 
 export interface IntakeConfig {
+  /** Maximum immediately scheduled Telegram absorption links per KST day. */
+  eventMax?: number;
   telegram: IntakeSurfaceConfig;
   discord: IntakeSurfaceConfig;
   approvals?: { repo?: string };
@@ -3484,10 +3486,13 @@ export interface OrchestratorLoopConfig {
   /** Per-seat release gate; absent seats retain the spawn-budget default. */
   releaseGate?: Partial<Record<OrchestratorSeat, number>>;
   trafficMode: 'shadow' | 'live';
+  idleRequest?: 'off' | 'shadow' | 'live';
+  /** FINISH-RATE — the queue tick reads finish metrics before launching; shadow logs the hold only, on holds (default shadow). */
+  finishGate?: 'off' | 'shadow' | 'on';
 }
 
 export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
-  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow',
+  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, trafficMode: 'shadow', idleRequest: 'shadow', finishGate: 'shadow',
 };
 
 export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfig {
@@ -3510,7 +3515,9 @@ export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfi
   }
   const mode = value.mode === 'off' || value.mode === 'live' ? value.mode : 'shadow';
   return { mode, seatTrees, seatCaps, ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
-    trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow' };
+    trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow',
+    idleRequest: value.idleRequest === 'off' || value.idleRequest === 'live' ? value.idleRequest : 'shadow',
+    finishGate: value.finishGate === 'off' || value.finishGate === 'on' ? value.finishGate : 'shadow' };
 }
 
 export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
@@ -3566,6 +3573,8 @@ export interface HqConfig {
   standby?: string;
   /** Lease TTL in seconds (default 1500 = 25 min). */
   ttlSeconds?: number;
+  /** Arbiter silence threshold (default 3); applying promotion requires explicit opt-in. */
+  autoPromote?: { enabled?: boolean; streak?: number };
   /** Roles that may still run when this host is fenced only for lack of quorum (never when a newer generation exists). Absent = none. */
   failOpenRoles?: HqFenceRole[];
   /** Per-host nexus health URL over the tailnet (default https://<host>.<tailnetDomain>:31415/v1/health). */
@@ -3601,9 +3610,9 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> } };
+  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean } };
+  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -3962,7 +3971,7 @@ function defaultConfig(): UserConfig {
       },
     },
     voice: { stt: {}, tts: {}, vad: {}, chat: {}, discord: {}, telegram: {}, pwa: {} },
-    intake: { telegram: {}, discord: {} },
+    intake: { eventMax: 10, telegram: {}, discord: {} },
     dashboard: {
       promptBank: { ...DASHBOARD_PROMPT_BANK_DEFAULTS },
       foldMode: 'task-unit',
@@ -4564,6 +4573,13 @@ export function parseHqConfig(raw: unknown): HqConfig | undefined {
   }
   if (typeof r.ttlSeconds === 'number' && Number.isFinite(r.ttlSeconds) && r.ttlSeconds > 0) out.ttlSeconds = r.ttlSeconds;
   if (typeof r.probeTimeoutSeconds === 'number' && Number.isFinite(r.probeTimeoutSeconds) && r.probeTimeoutSeconds > 0) out.probeTimeoutSeconds = r.probeTimeoutSeconds;
+  if (r.autoPromote && typeof r.autoPromote === 'object' && !Array.isArray(r.autoPromote)) {
+    const auto = r.autoPromote as Record<string, unknown>;
+    const setting: NonNullable<HqConfig['autoPromote']> = {};
+    if (typeof auto.enabled === 'boolean') setting.enabled = auto.enabled;
+    if (typeof auto.streak === 'number' && Number.isSafeInteger(auto.streak) && auto.streak > 0) setting.streak = auto.streak;
+    if (Object.keys(setting).length) out.autoPromote = setting;
+  }
   if (Array.isArray(r.failOpenRoles)) out.failOpenRoles = r.failOpenRoles.filter((v): v is HqFenceRole => HQ_FENCE_ROLES.includes(v as HqFenceRole));
   if (r.healthUrls && typeof r.healthUrls === 'object' && !Array.isArray(r.healthUrls)) {
     out.healthUrls = Object.fromEntries(Object.entries(r.healthUrls as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string'));
@@ -4698,6 +4714,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
       ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
+      ...(typeof legacyPod.childLogMaxBytes === 'number' && Number.isSafeInteger(legacyPod.childLogMaxBytes) && legacyPod.childLogMaxBytes > 0 ? { childLogMaxBytes: legacyPod.childLogMaxBytes } : {}),
       ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),
       memory: { adviseDefaults: Boolean(legacyPod.memory && typeof legacyPod.memory === 'object' && !Array.isArray(legacyPod.memory)
         && (legacyPod.memory as Record<string, unknown>).adviseDefaults === true) },
@@ -4730,6 +4747,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         ? { worktreeAddTimeoutSec: harness.worktreeAddTimeoutSec } : {}),
       ...(typeof harness.defaultRepo === 'string' && isAbsolute(harness.defaultRepo)
         ? { defaultRepo: harness.defaultRepo } : {}),
+      ...(typeof harness.repo === 'string' && harness.repo.trim()
+        ? { repo: harness.repo.trim() } : {}),
+      ...(harness.authorOnPod === true ? { authorOnPod: true } : {}),
       budgetGate: parseHarnessBudgetGate(
         rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness)
           ? (rawObj.harness as Record<string, unknown>).budgetGate
@@ -5266,6 +5286,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       },
     },
     intake: {
+      eventMax: typeof intake.eventMax === 'number' && Number.isSafeInteger(intake.eventMax) && intake.eventMax >= 0 ? intake.eventMax : 10,
       telegram: {
         ...(normalizeIntakeAmbientCaptureMode(intakeTelegram.ambientCapture) !== undefined
           ? { ambientCapture: normalizeIntakeAmbientCaptureMode(intakeTelegram.ambientCapture)! }
@@ -5972,8 +5993,10 @@ export function saveUserConfig(
       revertGuard: cfg.harness?.revertGuard ?? rawHarness.revertGuard,
       difficultyPlacement: cfg.harness?.difficultyPlacement ?? rawHarness.difficultyPlacement,
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
+      repo: cfg.harness?.repo,
       substrate: cfg.harness?.substrate,
       podPool: cfg.harness?.podPool,
+      authorOnPod: cfg.harness?.authorOnPod === true ? true : undefined,
       queue: cfg.harness?.queue ?? rawHarness.queue,
     }),
     ...rawRest,
@@ -6208,6 +6231,7 @@ export function saveUserConfig(
         }),
       }),
     }),
+    intake: { ...(rawRest.intake && typeof rawRest.intake === 'object' ? rawRest.intake as Record<string, unknown> : {}), ...cfg.intake },
     dashboard: stripUndef({
       views: cfg.dashboard.views,
       theme: cfg.dashboard.theme,

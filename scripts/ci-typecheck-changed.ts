@@ -53,6 +53,9 @@ export type ChangedTsFiles = {
   files: Set<string>;
   base: string;
   baseSource: string;
+  head?: string;
+  diffFiles?: Set<string>;
+  warnings?: string[];
   failures?: { command: string; why: string }[];
 };
 
@@ -78,23 +81,41 @@ export function changedTsFiles(run = sh, env: NodeJS.ProcessEnv = process.env): 
     }
   }
 
-  const files = new Set<string>();
-  const add = (out: string) => {
-    for (const line of out.split('\n')) {
-      const file = line.trim().replace(/^\.\//, '');
-      if (/\.tsx?$/.test(file) && existsSync(file)) files.add(file);
-    }
-  };
   const failures: { command: string; why: string }[] = [];
-  const addCommand = (command: string) => {
-    try { add(run(command)); } catch (cause) {
+  // Revision reads are observational: an unreadable HEAD/base must not turn into a collection failure.
+  const quietRevision = (command: string): string => { try { return run(command).trim(); } catch { return ''; } };
+  const head = quietRevision('git rev-parse HEAD') || undefined;
+  const warnings: string[] = [];
+  if (head && quietRevision(`git rev-parse ${base}`) === head) {
+    const main = quietRevision('git rev-parse origin/main');
+    const merged = main && main !== head ? quietRevision('git merge-base HEAD origin/main') : '';
+    if (merged && merged !== head) {
+      warnings.push(`base=${base} 가 HEAD 와 같은 커밋 — origin/main (${main})과 달라 merge-base 로 재계산`);
+      base = merged;
+      baseSource = 'recomputed merge-base(origin/main)';
+    } else if (main && main !== head) {
+      failures.push({ command: `git rev-parse ${base}`, why: `base 가 HEAD(${head}) 와 같아 변경을 셀 수 없다 — TSC_BASE_REF 로 base 를 주라 (못 셌음 ≠ 0)` });
+    }
+  }
+
+  const files = new Set<string>();
+  const diffFiles = new Set<string>();
+  const commands = [`git diff --name-only ${base}...HEAD`, 'git diff --name-only HEAD', 'git ls-files --others --exclude-standard'];
+  for (const command of commands) {
+    try {
+      for (const line of run(command).split('\n')) {
+        const file = line.trim().replace(/^\.\//, '');
+        if (!file) continue;
+        const ts = /\.tsx?$/.test(file);
+        // A deleted .ts is not a compile candidate, so it must not count as «should have been collected».
+        if (!ts || existsSync(file)) diffFiles.add(file);
+        if (ts && existsSync(file)) files.add(file);
+      }
+    } catch (cause) {
       failures.push({ command, why: cause instanceof Error ? cause.message : String(cause) });
     }
-  };
-  addCommand(`git diff --name-only ${base}...HEAD`);
-  addCommand('git diff --name-only HEAD');
-  addCommand('git ls-files --others --exclude-standard');
-  return { files, base, baseSource, failures };
+  }
+  return { files, base, baseSource, head, diffFiles, warnings, failures };
 }
 
 type RequiredExportField = { typeName: string; fieldName: string };
@@ -850,10 +871,13 @@ export function runGate(io: Partial<GateIo> = {}): void {
     ? { additions: [] }
     : exportedLiteralUnionMembersInChanges(changed, base));
   const changedResult = getChanged();
-  const { files: changed, base, baseSource, failures = [] } = changedResult instanceof Set
-    ? { files: changedResult, base: 'injected test seam', baseSource: 'injected test seam', failures: [] }
+  const { files: changed, base, baseSource, head, diffFiles, warnings = [], failures = [] } = changedResult instanceof Set
+    ? { files: changedResult, base: 'injected test seam', baseSource: 'injected test seam', head: 'injected test seam', diffFiles: new Set<string>(), warnings: [], failures: [] }
     : changedResult;
-  log(`[tsc-gate] base=${base} (${baseSource}); 변경 .ts ${changed.size}개 관측.`);
+  for (const message of warnings) warn(`[tsc-gate] ⚠ ${message}`);
+  const diffCount = diffFiles?.size;
+  const diffTsCount = diffFiles && [...diffFiles].filter((file) => /\.tsx?$/.test(file)).length;
+  log(`[tsc-gate] base=${base} (${baseSource}); 변경 .ts ${changed.size}개 관측. (head=${head ?? 'unknown'} · 전체 diff 파일 ${diffCount ?? 'unknown'}개 · diff .ts ${diffTsCount ?? 'unknown'}개)`);
   if (failures.length > 0) {
     error('[tsc-gate] ⛔ 변경 파일 수집 실패:');
     for (const { command, why } of failures) error(`  ${command}: ${why}`);
@@ -861,7 +885,15 @@ export function runGate(io: Partial<GateIo> = {}): void {
     exit(1);
     return;
   }
-  if (changed.size === 0) { log('[tsc-gate] 변경된 .ts 파일 없음 — 위 base 기준 0개이며 tsc 실행 없이 통과.'); return; }
+  if (changed.size === 0) {
+    if (!(changedResult instanceof Set) && (!head || diffCount === undefined || diffTsCount === undefined || diffTsCount > 0)) {
+      error(`[tsc-gate] FAIL — 변경 파일 수집 불일치: 전체 diff 파일 ${diffCount ?? 'unknown'}개 · diff .ts ${diffTsCount ?? 'unknown'}개 · 수집 .ts 0개 (못 셌음 ≠ 0).`);
+      exit(1);
+      return;
+    }
+    log(`[tsc-gate] PASS — 변경된 .ts 파일 없음 · base=${base} · head=${head} · 전체 diff 파일 ${diffCount}개 · diff .ts ${diffTsCount}개 · 수집 .ts 0개; tsc 실행 없이 통과.`);
+    return;
+  }
   const fieldCheck = requiredExportFields(changed, base);
   const requiredFields = Array.isArray(fieldCheck) ? fieldCheck : fieldCheck.fields;
   if (!Array.isArray(fieldCheck) && fieldCheck.failure) {

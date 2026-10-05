@@ -39,6 +39,11 @@ describe('FABRIC_STAGES', () => {
     for (const s of FABRIC_STAGES) expect(navHrefs.has(s.href)).toBe(true);
   });
 
+  it('대표 조망판은 운영 메뉴에서 열리고 파이프라인 단계는 늘리지 않는다', () => {
+    expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/ceo')).toMatchObject({ group: 'ops', label: '대표 조망판' });
+    expect(FABRIC_STAGES.map((stage) => stage.href)).not.toContain('/ceo');
+  });
+
   it('label·sub·num 이 모두 채워짐', () => {
     for (const s of FABRIC_STAGES) {
       expect(s.label.length).toBeGreaterThan(0);

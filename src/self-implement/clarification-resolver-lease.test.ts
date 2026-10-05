@@ -4,6 +4,13 @@
 //    cancelled 로 돌려 「설치된 리졸버가 실제로 불리는」 경로를 한 번도 안 탔다
 //    (무인 리뷰가 Goodhart 로 지적). 여기서는 «진짜 리졸버»를 만들어 부른다.
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir, userInfo } from 'node:os';
+import { join } from 'node:path';
+import { readPendingQuestions } from '../ask-user-question/pending-questions.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import {
   getAskUserQuestionResolver,
   setAskUserQuestionResolver,
@@ -17,8 +24,21 @@ const noopResolver: AskUserQuestionResolver = async () => ({ answers: {}, cancel
 
 // ⛔ 무조건 null 로 만들면 «남의» 전역 리졸버를 훼손한다(무인 리뷰 R6) — 원래 값을 되돌린다.
 let priorResolver: AskUserQuestionResolver | null = null;
-beforeEach(() => { priorResolver = getAskUserQuestionResolver(); });
-afterEach(() => { setAskUserQuestionResolver(priorResolver); });
+let priorStateDir: string | undefined;
+let isolatedStateDir: string;
+beforeEach(() => {
+  priorResolver = getAskUserQuestionResolver();
+  priorStateDir = process.env.ELANOUS_STATE_DIR;
+  expect(getElanousConfigDirOverride()).toBeUndefined();
+  isolatedStateDir = mkdtempSync(join(tmpdir(), 'clarification-lease-state-'));
+  process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+});
+afterEach(() => {
+  setAskUserQuestionResolver(priorResolver);
+  if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = priorStateDir;
+  rmSync(isolatedStateDir, { recursive: true, force: true });
+});
 
 describe('acquireClarificationResolverLease', () => {
   test('disabled 면 아무것도 설치하지 않는다', () => {
@@ -130,9 +150,6 @@ describe('전역 설치 → 기본 dispatch → escalation (seam 주입 없음)'
   ].join('\n');
 
   test('아무도 답하지 않아도 «폴백 문면 없이» 끝나고 호출자가 계속 갈 수 있다', async () => {
-    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
     const { escalateGoalDocumentClarifications } = await import('./goal-clarification-escalation.js');
 
     const root = mkdtempSync(join(tmpdir(), 'clarification-lease-e2e-'));
@@ -169,13 +186,27 @@ describe('전역 설치 → 기본 dispatch → escalation (seam 주입 없음)'
   // ⭐⭐⭐ 이 골의 핵심 요구 — 「물어볼 데가 없었다」와 「물었는데 무응답」이 «다른 값»이다.
   //    위 테스트와 «같은 골·같은 호출»인데 리졸버만 없앤다(대조군).
   test('리졸버가 없으면 «다른 값»으로 끝난다 — 폴백 문면이 나온다', async () => {
-    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
     const { escalateGoalDocumentClarifications } = await import('./goal-clarification-escalation.js');
 
     const root = mkdtempSync(join(tmpdir(), 'clarification-lease-e2e-none-'));
     const goalPath = join(root, 'GOAL.txt');
+    // Resolve the OS account independently of the deterministic runner's redirected HOME.
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error('Unable to resolve the real OS account UID');
+    const systemHome = process.platform === 'darwin'
+      ? execFileSync('dscl', ['.', '-read', `/Users/${userInfo().username}`, 'NFSHomeDirectory'], { encoding: 'utf8' }).trim().split(/\s+/).at(-1)
+      : readFileSync('/etc/passwd', 'utf8').split('\n')
+        .find((line) => Number(line.split(':')[2]) === uid)?.split(':')[5];
+    if (!systemHome) throw new Error('Unable to resolve the real OS account home');
+    const operationalRoot = join(systemHome, '.elanous');
+    expect(operationalRoot).not.toContain('elanous-deterministic-test-');
+    const questionId = `goal-clarification:${goalPath}:delivery_scope`;
+    const questionFile = (stateRoot: string) => join(stateRoot, 'ask-user-question', 'pending', `${encodeURIComponent(questionId)}.json`);
+    const operationalLedger = join(operationalRoot, 'decisions', 'decisions.jsonl');
+    const operationalQuestion = questionFile(operationalRoot);
+    const ledgerBefore = existsSync(operationalLedger) ? readFileSync(operationalLedger) : null;
+    const questionBefore = existsSync(operationalQuestion) ? readFileSync(operationalQuestion) : null;
+    expect(operationalRoot).not.toBe(isolatedStateDir);
     writeFileSync(goalPath, unresolvedGoal);
 
     setAskUserQuestionResolver(null); // ⛔ 아무도 없다
@@ -184,6 +215,7 @@ describe('전역 설치 → 기본 dispatch → escalation (seam 주입 없음)'
       const result = await escalateGoalDocumentClarifications({
         goalFile: goalPath,
         delivery: 'telegram',
+        testOrigin: true,
         fallback: (message) => { fallbackMessages.push(message); },
       });
 
@@ -192,6 +224,15 @@ describe('전역 설치 → 기본 dispatch → escalation (seam 주입 없음)'
       expect(fallbackMessages[0]).toContain('no resolver in this surface');
       expect(result.outcome).not.toBe('no-response');           // ⭐⭐⭐ 위와 «다른 값»
       expect(result.answeredBy).toBe('none');
+      expect(elanousStateRoot()).toBe(isolatedStateDir);
+      const pending = readPendingQuestions();
+      expect(pending.ok).toBe(true);
+      if (!pending.ok) throw new Error(pending.error);
+      expect(pending.questions.map(({ id }) => id)).toEqual([questionId]);
+      expect(pending.questions[0]!.testOrigin).toBe(true);
+      expect(existsSync(questionFile(isolatedStateDir))).toBe(true);
+      expect(existsSync(operationalQuestion) ? readFileSync(operationalQuestion) : null).toEqual(questionBefore);
+      expect(existsSync(operationalLedger) ? readFileSync(operationalLedger) : null).toEqual(ledgerBefore);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -200,9 +241,6 @@ describe('전역 설치 → 기본 dispatch → escalation (seam 주입 없음)'
   // ⛔ 무인 리뷰 R5 — 「설치했다」와 「그것이 답한다」는 다른 사실이다.
   //    dispatch 를 주입하면 전역 리졸버는 «불리지 않으므로» 표면을 terminal 로 적으면 거짓이다.
   test('dispatch 가 주입되면 전역 리졸버는 «불리지 않는다» — 그 사실이 관측에 남아야 한다', async () => {
-    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
     const { escalateGoalDocumentClarifications } = await import('./goal-clarification-escalation.js');
 
     const root = mkdtempSync(join(tmpdir(), 'clarification-lease-seam-'));

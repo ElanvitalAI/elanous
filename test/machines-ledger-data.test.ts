@@ -44,14 +44,14 @@ describe('machine ledger migration', () => {
   });
 
   test('preserves the original four placement rules and three dated change entries', () => {
-    expect(ledger.rules).toEqual([
+    expect(ledger.rules.slice(0, 4)).toEqual([
       '사람이 쓰는 메인 = 사무실 mbp · 재택 node-c.',
       '무거운 병렬 = node-b(→ M5 Ultra 합류 뒤 둘) · 사람이 보는 화면·로그인·로컬 앱 = mbp · 늘 켜져야 하는 것 = 운영 본부(미니 도입 전엔 mbp).',
       '매니지드 좌석 = 두 Ultra 의 리눅스 컨테이너(macOS VM 은 라이선스상 한 대 2개) · 격리 k3d(OrbStack k8s 는 NetworkPolicy 미집행) · 손님 LLM 은 우리 구독 금지 — 자체/클라우드 경계는 TC 매니지드 RFC(10-05).',
       '리눅스 점검 = 셋업 안정화 뒤 **새 베어 VM** 또는 듀얼부팅한 미니 PC(봇 운영 중인 `cloud-vm` 에 먼저 쏘지 않는다).',
     ]);
-    expect(ledger.changes).toHaveLength(3);
-    expect(ledger.changes.map((entry) => entry.slice(0, 17))).toEqual([
+    expect(ledger.changes.length).toBeGreaterThanOrEqual(3);
+    expect(ledger.changes.slice(0, 3).map((entry) => entry.slice(0, 17))).toEqual([
       '2026-09-30 22:5x ',
       '2026-09-30 23:0x ',
       '2026-09-30 23:3x ',

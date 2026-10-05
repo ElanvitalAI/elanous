@@ -20,7 +20,7 @@ import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
 import { HostPoolLease, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
-import { measurePoolLease, recommendConcurrency, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
+import { measurePoolLease, recommendConcurrency, type PodLeaseMember, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
 
 export interface PodPoolMember {
   readonly context: string;
@@ -142,7 +142,34 @@ export function genericConfigPodPool(config: { pod?: { pool?: string }; harness?
   return config.pod?.pool;
 }
 
-/** 노드 자리 배분 — 우선순위 순서로 첫 빈 자리. 순수(시각·대기는 호출자가). */
+/**
+ * Cluster occupancy of one pool member: Running + Pending harness goal Pods.
+ * `null` means the read failed — callers must not treat that as zero.
+ */
+export type MemberOccupancy = { occupied: number } | { occupied: null; reason: string };
+
+/** Read each member's cluster occupancy (Running + Pending harness goal Pods). A failed member is `occupied: null`, never 0. */
+export function measureMemberOccupancy(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; measure?: (members: readonly PodPoolMember[]) => { members: PodLeaseMember[] } } = {}): Record<string, MemberOccupancy> {
+  let measured: { members: PodLeaseMember[] };
+  try {
+    measured = deps.measure
+      ? deps.measure(members)
+      : measurePoolLease(members, { ...(deps.kubectl ? { kubectl: deps.kubectl } : {}), ...(deps.dns ? { dns: deps.dns } : {}) });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return Object.fromEntries(members.map((m) => [m.context, { occupied: null, reason }]));
+  }
+  const byContext = new Map(measured.members.map((m) => [m.context, m]));
+  return Object.fromEntries(members.map((member) => {
+    const row = byContext.get(member.context);
+    if (!row || row.running === null || row.pending === null) {
+      return [member.context, { occupied: null, reason: row?.reason ?? '측정 불가' }];
+    }
+    return [member.context, { occupied: row.running + row.pending }];
+  }));
+}
+
+/** 노드 자리 배분 — 클러스터 실측 점유가 있으면 남은 칸이 가장 큰 멤버. 측정이 없으면 우선순위 순 첫 빈 자리. */
 export function podPoolHostLease(members: readonly PodPoolMember[]): HostPoolLease {
   return new HostPoolLease([...members.map((m) => `${m.context}@${m.sshHost ?? ''}`)].sort().join(','));
 }
@@ -158,7 +185,8 @@ export class PodPoolScheduler {
   private lastRaw: PoolLeaseRecommendation | null = null;
   private readonly hostLease: HostPoolLease;
   private readonly pollMs: number;
-  constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
+  private readonly occupancy: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>;
+  constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
     this.hostLease = options.hostLease ?? podPoolHostLease(members);
@@ -167,6 +195,7 @@ export class PodPoolScheduler {
       return recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
     });
     this.measure = async () => measureStatus();
+    this.occupancy = options.occupancy ?? (() => measureMemberOccupancy(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }));
     this.admission = new PodLeaseAdmission({ status: async () => {
       const measured = await measureStatus();
       this.lastRaw = measured;
@@ -241,13 +270,36 @@ export class PodPoolScheduler {
   admissionSnapshot(): ReturnType<PodLeaseAdmission['snapshot']> {
     return this.admission.snapshot();
   }
-  /** 자리가 있으면 그 노드를 잡고 돌려준다. 없으면 null. */
-  tryAcquire(): PodPoolMember | null {
-    for (const m of this.members) {
-      const n = this.inflight.get(m.context) ?? 0;
-      if (n < m.capacity) { this.inflight.set(m.context, n + 1); return m; }
+  /**
+   * Pick the member with the most free slots: capacity − measured cluster occupancy − this process's inflight.
+   * A member whose occupancy could not be read falls back to inflight-only (never treated as zero occupied).
+   * Ties keep the configured member order. Returns null when every readable member is full.
+   */
+  async tryAcquire(): Promise<PodPoolMember | null> {
+    let reading: Record<string, MemberOccupancy>;
+    try { reading = await this.occupancy(); }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: null, reason }]));
     }
-    return null;
+    const free: Record<string, number> = {};
+    const measured: Record<string, boolean> = {};
+    let best: { member: PodPoolMember; slots: number } | null = null;
+    for (const m of this.members) {
+      const inflight = this.inflight.get(m.context) ?? 0;
+      const row = reading[m.context];
+      const ok = !!row && row.occupied !== null;
+      measured[m.context] = ok;
+      const occupied = ok ? row.occupied! : 0;
+      const slots = m.capacity - occupied - inflight;
+      free[m.context] = slots;
+      if (slots <= 0) continue;
+      if (!best || slots > best.slots) best = { member: m, slots };
+    }
+    if (!best) return null;
+    this.inflight.set(best.member.context, (this.inflight.get(best.member.context) ?? 0) + 1);
+    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured });
+    return best.member;
   }
   release(member: PodPoolMember): void {
     this.inflight.set(member.context, Math.max(0, (this.inflight.get(member.context) ?? 0) - 1));

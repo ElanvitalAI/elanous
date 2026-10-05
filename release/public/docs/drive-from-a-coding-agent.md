@@ -103,6 +103,8 @@ Ask the agent again, in plain words:
 - "Is anything failing?" → `ops_status` with `action: health`
 - "What happened in the last 30 minutes?" → `logs_query` with `sinceMinutes`, `level` or `category`
 
+For the opposite direction — [attach your coding-agent session to an elanous seat →](attach-a-coding-agent-session.md).
+
 ## The other direction: elanous drives the agent
 
 MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude Code, Codex or Grok as a child agent and drives it. `elanous acp list` shows the backends this build knows; `elanous acp test --backend <id>` sends one prompt as a smoke test.

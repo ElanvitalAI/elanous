@@ -20,7 +20,7 @@ export function needsPwaBuild(files: readonly string[]): boolean {
   return files.some((file) => file.startsWith('apps/pwa/') || (file.startsWith('src/') && !/\.test\.tsx?$/.test(file)));
 }
 
-export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; verifyOnly?: boolean; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
+export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
 export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
@@ -31,6 +31,7 @@ export type HostRegateDeps = {
   log?: (event: 'passed' | 'failed' | 'unmeasured' | 'base-raced', data: Record<string, unknown>) => void;
   freezeRoot?: string;
   runExposeGate?: typeof runExposeGate;
+  syncMergedChecklist?: typeof import('../release-loop/merged-pr-checklist.js').syncMergedPrChecklist;
 };
 
 const SPAWN_MAX_BUFFER = 256 * 1024 * 1024;
@@ -240,7 +241,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just
     // above; the seconds between that read and the merge are checked after the fact below.
     if (input.verifyOnly) return result('passed');
-    const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit });
+    const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot, ...(input.goalFile ? { goalFile: input.goalFile } : {}) }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit });
     if (landing.kind !== 'merge') {
       debug.log('harness.merge', 'frozen', { pr: input.prNumber, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
       return { passed: true, failures: [], os: process.platform, status: 'frozen' };
@@ -255,6 +256,12 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     catch (e) { return result('unmeasured', 'merge-confirm', String(e)); }
     if (merged.state !== 'MERGED') return result('unmeasured', 'merge-confirm', `PR state after merge is ${merged.state ?? 'unknown'}`);
     landed = true;
+    try {
+      const sync = deps.syncMergedChecklist ?? (await import('../release-loop/merged-pr-checklist.js')).syncMergedPrChecklist;
+      sync(input.prNumber, input.repoRoot, input.goalFile);
+    } catch (error) {
+      debug.log('release.checklist', 'merged-pr-sync-failed', { pr: input.prNumber, error: String(error) });
+    }
     const mergeCommit = merged.mergeCommit?.oid ?? '';
     let mergedOnto = '';
     try {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, spyOn } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -41,6 +41,71 @@ describe('pre-commit stale-revert guard', () => {
       expect(commitWorktree(repo, 'harness run').ok).toBe(true);
       expect(git('show', '--format=', '--name-only', 'HEAD')).toBe('other.ts');
       expect(readFileSync(join(repo, 'outside.ts'), 'utf8')).toBe('landed A');
+    } finally { log.mockRestore(); }
+  });
+
+  test('base 이후 main에 추가된 대상 밖 삭제는 복원하고 커밋의 D에서 제외한다', () => {
+    const base = git('rev-parse', 'HEAD~2');
+    rmSync(join(repo, 'other.ts'));
+    writeFileSync(join(repo, 'inside.ts'), 'feature change');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = dropStaleReverts(repo, ['inside.ts'], 'run-delete', 50, base);
+      expect(result).toMatchObject({ staleDeleted: ['other.ts'], reverted: ['other.ts'], protected: [] });
+      expect(log).toHaveBeenCalledWith('self-implement.revert-guard', 'reverted-stale-delete', { runId: 'run-delete', files: ['other.ts'] });
+      expect(readFileSync(join(repo, 'other.ts'), 'utf8')).toBe('extra');
+      expect(commitWorktree(repo, 'harness change').ok).toBe(true);
+      expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('M\tinside.ts');
+    } finally { log.mockRestore(); }
+  });
+
+  test('staged D라도 작업 트리에 파일이 다시 있으면 삭제로 취급하지 않는다', () => {
+    const base = git('rev-parse', 'HEAD~2');
+    rmSync(join(repo, 'other.ts'));
+    git('add', '-A');
+    writeFileSync(join(repo, 'other.ts'), 'updated content');
+    const result = dropStaleReverts(repo, ['inside.ts'], 'run-restored-worktree', 50, base);
+    expect(result).toEqual({ reverted: [], protected: [] });
+    expect(commitWorktree(repo, 'updated worktree').ok).toBe(true);
+    expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('M\tother.ts');
+  });
+
+  test('staged D 뒤 대상 밖 경로에 끊어진 symlink를 만들면 링크를 덮어쓰거나 삭제로 집계하지 않는다', () => {
+    const base = git('rev-parse', 'HEAD~2');
+    rmSync(join(repo, 'other.ts'));
+    git('add', '-A');
+    symlinkSync('nonexistent-target', join(repo, 'other.ts'));
+    expect(git('diff', '--cached', '--name-status', 'HEAD', '--', 'other.ts')).toBe('D\tother.ts');
+    expect(lstatSync(join(repo, 'other.ts')).isSymbolicLink()).toBe(true);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(dropStaleReverts(repo, ['inside.ts'], 'run-symlink', 50, base)).toEqual({ reverted: [], protected: [] });
+      expect(log.mock.calls.filter(([category, event]) => category === 'self-implement.revert-guard' && event === 'reverted-stale-delete')).toEqual([]);
+      expect(lstatSync(join(repo, 'other.ts')).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, 'other.ts'))).toBe('nonexistent-target');
+      expect(commitWorktree(repo, 'replace with symlink').ok).toBe(true);
+      expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('T\tother.ts');
+      expect(git('ls-tree', 'HEAD', '--', 'other.ts')).toMatch(/^120000 blob /);
+    } finally { log.mockRestore(); }
+  });
+
+  test('대상 안 삭제는 복원하지 않고 커밋의 D에 남는다', () => {
+    rmSync(join(repo, 'inside.ts'));
+    const outcome = dropStaleReverts(repo, ['inside.ts'], 'run-inside-delete', 50, git('rev-parse', 'HEAD~2'));
+    expect(outcome).toEqual({ reverted: [], protected: [] });
+    expect(commitWorktree(repo, 'intentional delete').ok).toBe(true);
+    expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('D\tinside.ts');
+  });
+
+  test('base에 있던 대상 밖 삭제는 경고만 하고 커밋의 D에 남는다', () => {
+    rmSync(join(repo, 'outside.ts'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const outcome = dropStaleReverts(repo, ['inside.ts'], 'run-old-delete', 50, git('rev-parse', 'HEAD~2'));
+      expect(outcome).toMatchObject({ reverted: [], protected: [], outsideDeleted: ['outside.ts'] });
+      expect(log).toHaveBeenCalledWith('self-implement.revert-guard', 'outside-delete', { runId: 'run-old-delete', files: ['outside.ts'] }, { level: 'warn' });
+      expect(commitWorktree(repo, 'intentional outside delete').ok).toBe(true);
+      expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('D\toutside.ts');
     } finally { log.mockRestore(); }
   });
 
@@ -108,6 +173,32 @@ describe('pre-commit stale-revert guard', () => {
     expect(git('show', '--format=', '--name-only', 'HEAD')).toBe('inside.ts');
     expect(body).toContain('## Gate\n');
     expect(body).toContain('- 되돌림 방지: 1파일 제외');
+  });
+
+  test('orchestrator의 commit 직전 stale-delete 복원과 PR Gate 삭제 제외·경고가 이어진다', async () => {
+    const base = git('rev-parse', 'HEAD~2');
+    let body = '';
+    const s = seams({
+      createWorktree: async () => ({ path: repo, branch: 'se/stale-delete', resolvedBase: base, invokedHead: base }),
+      implement: async () => {
+        rmSync(join(repo, 'other.ts'));
+        rmSync(join(repo, 'outside.ts'));
+        writeFileSync(join(repo, 'inside.ts'), 'new implementation');
+        return { ok: true, summary: 'implemented' };
+      },
+      commitWork: (cwd, message) => {
+        expect(readFileSync(join(repo, 'other.ts'), 'utf8')).toBe('extra');
+        commitWorktree(cwd, message);
+      },
+      mergeMain: async () => ({ status: 'up-to-date' }),
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'ok', reviewed: true }),
+      openPr: async (input) => { body = input.body; return { url: 'https://pr/stale-delete', number: 11 }; },
+    });
+    expect((await runSelfImplement({ feature: '대상 경로: inside.ts\nChange inside.ts only.', seams: s, runId: 'run-stale-delete' })).stage).toBe('pr-opened');
+    expect(git('show', '--format=', '--name-status', 'HEAD')).toBe('M\tinside.ts\nD\toutside.ts');
+    expect(body).toContain('## Gate');
+    expect(body).toContain('- 되돌림 방지: 삭제 1파일 제외');
+    expect(body).toContain('- 삭제 경고: 대상 밖 1파일 유지 (outside.ts)');
   });
 
   test('orchestrator does not protect stale files merely mentioned in piece prose as out of scope', async () => {

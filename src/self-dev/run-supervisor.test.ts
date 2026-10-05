@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, madeProgress, countLanded, appendRound, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
+import { decideNextRun, superviseRun, madeProgress, countLanded, countBaseCompleted, appendRound, SUPERVISOR_STOP_REASONS, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -36,6 +36,14 @@ const falseFailure = (id: string) => ({
 }) as never;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('finished merge timeout waits for human harvest instead of no-actionable-work', () => {
+    const result = { taskId: 'finished', feature: 'finished', status: 'failed' as const, stage: 'timed-out', branch: 'self-impl/finished', harvestable: true as const };
+    const decision = decideNextRun({ results: [result] });
+    expect(decision).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human' });
+    expect(decision.why).toContain(result.branch);
+    expect(SUPERVISOR_STOP_REASONS).toContain('harvestable-awaiting-human');
+    expect(decideNextRun({ results: [{ ...result, harvestable: undefined }] }).stopReason).not.toBe('harvestable-awaiting-human');
+  });
   test('each supervision sweep resumes deferred merges without rerunning an implemented job', async () => {
     let sweeps = 0;
     let reruns = 0;
@@ -248,7 +256,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     const d = decideNextRun({ results: [lockRace('p'), lockRace('q')], history, limits: { maxRounds: 9, stallRounds: 2 } });
     expect(d.action).toBe('stop');
     expect(d.stopReason).toBe('no-progress');
-    expect(d.why).toBe('2라운드 연속 제자리 — 착지도 안 늘고 남은 조각도 안 줄었다(2). 골·불변식을 의심할 자리 · 골 개정 관측 불가 — 결과에 관측이 없다');
+    expect(d.why).toBe('2라운드 연속 제자리 — base=main 기준 완료 0 · 착지 0 · 남은 조각도 안 줄었다(2). 골·불변식을 의심할 자리 · 골 개정 관측 불가 — 결과에 관측이 없다');
   });
 
   test('리뷰 must-fix improving 추이는 이력에 실려 제자리 정지를 막지만 stable·worsening·unmeasured는 막지 않는다', () => {
@@ -410,6 +418,64 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(second.why).toContain('decision-signal-red');
     expect(second.classifications.map((c) => `${c.kind}:${c.action}`)).toEqual(['awaiting-human:needs-human']);
   });
+  test('ok=true 이고 자기 base 대비 커밋이 있으면 착지 0 이어도 제자리가 아니다', () => {
+    const finished = (id: string) => ({
+      taskId: id, feature: id, status: 'done', stage: 'committed', merged: false,
+      ok: true, base: 'bench/x', commitsAheadOfBase: 2,
+    }) as never;
+    const stillOpen = {
+      taskId: 'open', feature: 'open', status: 'done', stage: 'pr-opened', merged: false,
+      ok: false, base: 'bench/x', commitsAheadOfBase: 0,
+    } as never;
+    const history: SupervisorRound[] = [
+      { round: 0, landed: 0, baseCompleted: 1, base: 'bench/x', actionable: 2 },
+      { round: 1, landed: 0, baseCompleted: 1, base: 'bench/x', actionable: 2 },
+    ];
+    const results = [finished('a'), finished('b'), stillOpen];
+    const next = appendRound(history, results)[2]!;
+    expect(countLanded(results)).toBe(0);
+    expect(countBaseCompleted(results)).toBe(2);
+    expect(next).toEqual({ round: 2, landed: 0, baseCompleted: 2, base: 'bench/x', actionable: 3 });
+    expect(madeProgress(history[1], next)).toBe(true);
+    const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
+    expect(decision.stopReason).not.toBe('no-progress');
+    expect(decision.action).toBe('relaunch');
+  });
+
+  test('ok=true 여도 base 대비 커밋이 0 이면 지금처럼 제자리다', () => {
+    const empty = (id: string) => ({
+      taskId: id, feature: id, status: 'done', stage: 'committed', merged: false,
+      ok: true, base: 'bench/x', commitsAheadOfBase: 0,
+    }) as never;
+    const history: SupervisorRound[] = [
+      { round: 0, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1 },
+      { round: 1, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1 },
+    ];
+    const results = [empty('a'), lockRace('stuck')];
+    const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
+    expect(countBaseCompleted(results)).toBe(0);
+    expect(decision.stopReason).toBe('no-progress');
+    expect(decision.why).toContain('base=bench/x 기준 완료 0 · 착지 0');
+    expect(madeProgress(history[1], appendRound(history, results)[2]!)).toBe(false);
+  });
+
+  test('커밋이 있어도 ok 가 아니면 완료로 세지 않는다', () => {
+    const unfinished = (id: string) => ({
+      taskId: id, feature: id, status: 'failed', stage: 'gate-failed',
+      ok: false, base: 'bench/x', commitsAheadOfBase: 2,
+    }) as never;
+    const history: SupervisorRound[] = [
+      { round: 0, landed: 0, actionable: 1 },
+      { round: 1, landed: 0, actionable: 1 },
+    ];
+    const results = [unfinished('a')];
+    expect(countBaseCompleted(results)).toBe(0);
+    expect(appendRound(history, results)[2]).toEqual({ round: 2, landed: 0, baseCompleted: 0, base: 'bench/x', actionable: 1 });
+    const decision = decideNextRun({ results, history, limits: { maxRounds: 9, stallRounds: 2 } });
+    expect(decision.stopReason).toBe('no-progress');
+    expect(decision.why).toContain('base=bench/x 기준 완료 0 · 착지 0');
+  });
+
   test('worktree-only 완료는 병합 없이 라운드 진전이며 남은 실패는 다시 건다', () => {
     const first = [lockRace('a'), lockRace('b')];
     const second = [worktreeCompleted('a'), lockRace('b')];
@@ -477,10 +543,10 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     });
 
     expect(noObservation.stopReason).toBe('no-progress');
-    expect(noObservation.why).toBe('2라운드 연속 제자리 — 착지도 안 늘고 남은 조각도 안 줄었다(1). 골·불변식을 의심할 자리 · 골 개정 관측 불가 — 결과에 관측이 없다');
+    expect(noObservation.why).toBe('2라운드 연속 제자리 — base=main 기준 완료 0 · 착지 0 · 남은 조각도 안 줄었다(1). 골·불변식을 의심할 자리 · 골 개정 관측 불가 — 결과에 관측이 없다');
     expect(noObservation.why).not.toContain('골 개정 시도 없음 — 원장을 읽었으나 시도 0 · 적용 0');
     expect(noObservation.why).not.toBe(noAttempts.why);
-    expect(noAttempts.why).toBe('2라운드 연속 제자리 — 착지도 안 늘고 남은 조각도 안 줄었다(1). 골·불변식을 의심할 자리 · 골 개정 시도 없음 — 원장을 읽었으나 시도 0 · 적용 0');
+    expect(noAttempts.why).toBe('2라운드 연속 제자리 — base=main 기준 완료 0 · 착지 0 · 남은 조각도 안 줄었다(1). 골·불변식을 의심할 자리 · 골 개정 시도 없음 — 원장을 읽었으나 시도 0 · 적용 0');
   });
 
   test('골 개정 관측을 아직 읽지 않았음을 정지 문면에 구별해 낸다', () => {

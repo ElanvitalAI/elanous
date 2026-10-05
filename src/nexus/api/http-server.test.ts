@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import type { ContextNowDeps } from '../../context-bus/context-now.js';
+import { checkBrand } from '../../../scripts/brand/check.js';
 import { resetUserConfig } from '../../user-config.js';
 import { useBackend } from '../config/secrets/index.js';
 
@@ -190,6 +191,66 @@ describe('GET /v1/context/now audience boundary', () => {
       const repeated = await fetch(`${server.url}/v1/context/now?audience=public-demo&audience=operator`, { headers });
       expect(repeated.status).toBe(400);
     } finally {
+      server.stop();
+      resetUserConfig();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('installed public-demo without brand rules returns 200 and collapses all fact titles', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'context-now-missing-http-'));
+    setElanousConfigDir(dir);
+    resetUserConfig();
+    const missingRules: typeof checkBrand = (scope, paths) => checkBrand(scope, paths, join(dir, 'absent-brand-rules.yaml'));
+    const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+      metaApi: { bearerToken: 'auth', noAuth: false }, contextNowDeps: { ...deps, brandCheck: missingRules } });
+    try {
+      const operator = await fetch(`${server.url}/v1/context/now?audience=operator`, {
+        headers: { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' },
+      });
+      expect(operator.status).toBe(200);
+      expect((await operator.json() as { hiddenCount: number }).hiddenCount).toBe(0);
+      const res = await fetch(`${server.url}/v1/context/now?audience=public-demo`, {
+        headers: { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' },
+      });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      const body = JSON.parse(text) as { hiddenCount: number; facts: Array<{ kind: string; title?: string }> };
+      expect(body.hiddenCount).toBe(3);
+      expect(body.facts.filter(fact => fact.title).map(fact => fact.title)).toEqual(['내부 항목 1개', '내부 항목 2개']);
+      expect(text).not.toMatch(/\/Users\/|\/home\/|\bstack\b/i);
+    } finally {
+      server.stop();
+      resetUserConfig();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('handler exceptions always return a single JSON line without error details, regardless of NODE_ENV', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'context-now-failed-http-'));
+    setElanousConfigDir(dir);
+    resetUserConfig();
+    const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+      metaApi: { bearerToken: 'auth', noAuth: false }, contextNowDeps: {
+        ...deps, checklist: () => { throw new Error('private /Users/alice /home/alice stack'); },
+      } });
+    const previousEnv = process.env.NODE_ENV;
+    try {
+      for (const env of ['development', 'production']) {
+        process.env.NODE_ENV = env;
+        const res = await fetch(`${server.url}/v1/context/now?audience=public-demo`, {
+          headers: { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' },
+        });
+        expect(res.status).toBe(500);
+        expect(res.headers.get('content-type')).toContain('application/json');
+        const text = await res.text();
+        expect(text).toBe('{"error":"context-now-failed"}');
+        expect(text).not.toMatch(/\/Users\/|\/home\/|\bstack\b|<html/i);
+      }
+    } finally {
+      if (previousEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previousEnv;
       server.stop();
       resetUserConfig();
       resetElanousConfigDir();

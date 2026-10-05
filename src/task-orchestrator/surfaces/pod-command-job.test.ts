@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import {
   commandJobSecret,
   podCommandJobManifest,
@@ -12,6 +13,7 @@ import {
   podCommandSecretKeys,
   podCommandTargetCommit,
   runPodCommand,
+  tailBytes,
 } from './pod-command-job.js';
 import type { Kubectl } from './self-implement-pod.js';
 import { PodPoolScheduler, syncPoolImages, type PodPoolMember, type RemoteRun } from './pod-pool.js';
@@ -31,6 +33,16 @@ function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {
 }
 
 describe('pod command job manifest', () => {
+  test('a limit below the default request (lite 2Gi) lowers the memory request to the limit so the Job is valid', () => {
+    const lite = manifest({ clone: false, memoryLimit: '2Gi' });
+    const raised = manifest({ clone: true, memoryLimit: '32Gi' });
+    const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
+    expect(res(lite).limits.memory).toBe('2Gi');
+    expect(res(lite).requests.memory).toBe('2Gi');
+    expect(res(raised).requests.memory).toBe('4Gi');
+    expect(res(manifest({ clone: true })).requests.memory).toBe('4Gi');
+  });
+
   test('memoryLimit raises only the container memory limit; omitted keeps 16Gi and the pre-change bytes', () => {
     const original = manifest({ clone: true });
     const raised = manifest({ clone: true, memoryLimit: '32Gi' });
@@ -388,13 +400,110 @@ describe('runPodCommand', () => {
     const finished = events.find((e) => e.event === 'job-finished');
     expect(finished).toMatchObject({ job: 'cmdjob1', exitCode: 3, skills: ['yt-vault'], llm: 'grok' });
     expect(String(finished?.command).length).toBeLessThanOrEqual(80);
+    expect(result.artifacts).toEqual({ files: 0, names: [], error: null });
+    expect(existsSync(join(result.artifactsDir, 'child.log'))).toBe(true);
+    expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe('ran\n');
+    expect(finished).toMatchObject({ artifactsDir: result.artifactsDir, artifacts: { files: 0, names: [], error: null } });
     expect(inputs.some((body) => body.includes('skillenv-yt-vault') && body.includes('"kind":"Secret"'))).toBe(true);
     expect(inputs.some((body) => body.includes('"kind":"Job"') && body.includes('\\"$@\\"'))).toBe(true);
     expect(inputs.filter((body) => body.includes('"kind":"Job"')).every((body) => !body.includes('host-mirror'))).toBe(true);
+    rmSync('/tmp/pod-artifacts-test', { recursive: true, force: true });
   });
 });
 
 // 🐞 2026-09-27(🅞 실측): 로컬 이미지가 옛 판이면 원격 노드도 그 옛 판 태그로 돌았다 — 원격이면 발사 트리의 HEAD 를 목표로.
+function artifactLine(path: string, body: string): string {
+  const token = Buffer.from(path).toString('base64url');
+  return `ELANOUS_POD_ARTIFACT ${token} 1/1 ${gzipSync(Buffer.from(body)).toString('base64')}`;
+}
+
+describe('명령 Job 산출 회수 — 표지가 없어도 알린 경로에 child.log 가 있다', () => {
+  function kubectlOf(logs: { status: number; stdout: string; stderr: string }): Kubectl {
+    return (args) => {
+      const joined = args.join(' ');
+      if (joined.includes('jsonpath={.status.conditions')) return { status: 0, stdout: 'Complete', stderr: '' };
+      if (joined.includes('containerStatuses')) return { status: 0, stdout: '0', stderr: '' };
+      if (joined.includes('logs')) return logs;
+      return { status: 0, stdout: '', stderr: '' };
+    };
+  }
+
+  test('표지 없는 로그 → 디렉터리와 child.log 하나, 회수 파일 0', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-nobeacon-'));
+    try {
+      const events: Array<Record<string, unknown>> = [];
+      const result = await runPodCommand({
+        command: ['echo', 'hi'], name: 'nobeacon', imageCommit: null, artifactsRoot: root,
+        kubectl: kubectlOf({ status: 0, stdout: 'plain child output\n', stderr: '' }),
+        log: (_c, event, data) => { events.push({ event, ...data }); },
+      });
+      expect(result.artifactsDir).toBe(join(root, 'nobeacon'));
+      expect(existsSync(result.artifactsDir)).toBe(true);
+      expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe('plain child output\n');
+      expect(result.artifacts).toEqual({ files: 0, names: [], error: null });
+      expect(events.find((e) => e.event === 'job-finished')).toMatchObject({
+        artifactsDir: result.artifactsDir, artifacts: { files: 0, names: [], error: null },
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('표지 2 → 파일 2와 child.log, 회수 수·이름이 반환값과 job-finished 에 있다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-two-'));
+    const logs = ['ran\n', artifactLine('a.txt', 'alpha'), artifactLine('nested/b.txt', 'beta')].join('\n');
+    try {
+      const events: Array<Record<string, unknown>> = [];
+      const result = await runPodCommand({
+        command: ['echo', 'hi'], name: 'twobeacon', imageCommit: null, artifactsRoot: root,
+        kubectl: kubectlOf({ status: 0, stdout: logs, stderr: '' }),
+        log: (_c, event, data) => { events.push({ event, ...data }); },
+      });
+      expect(readFileSync(join(result.artifactsDir, 'a.txt'), 'utf8')).toBe('alpha');
+      expect(readFileSync(join(result.artifactsDir, 'nested', 'b.txt'), 'utf8')).toBe('beta');
+      expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe(logs);
+      expect(result.artifacts).toEqual({ files: 2, names: ['a.txt', 'nested/b.txt'], error: null });
+      expect(events.find((e) => e.event === 'job-finished')).toMatchObject({
+        artifactsDir: result.artifactsDir, artifacts: result.artifacts,
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('로그 조회 실패 → «산출 회수 못 함: <사유>» 를 child.log·반환값·job-finished 에 싣고 빈 경로만 알리지 않는다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-logfail-'));
+    try {
+      const events: Array<Record<string, unknown>> = [];
+      const result = await runPodCommand({
+        command: ['echo', 'hi'], name: 'logfail', imageCommit: null, artifactsRoot: root,
+        kubectl: kubectlOf({ status: 1, stdout: '', stderr: 'connection refused' }),
+        log: (_c, event, data) => { events.push({ event, ...data }); },
+      });
+      expect(existsSync(result.artifactsDir)).toBe(true);
+      expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe('산출 회수 못 함: connection refused');
+      expect(result.artifacts).toEqual({ files: null, names: [], error: 'connection refused' });
+      expect(events.find((e) => e.event === 'job-finished')).toMatchObject({
+        artifactsDir: result.artifactsDir, artifactError: '산출 회수 못 함: connection refused',
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('출력 경로 = 실제 쓴 경로 — artifactsRoot 를 주면 effectiveInstanceRoot 가 아니라 그 경로다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-effective-'));
+    try {
+      const result = await runPodCommand({
+        command: ['echo', 'hi'], name: 'effective1', imageCommit: null, artifactsRoot: root,
+        kubectl: kubectlOf({ status: 0, stdout: 'body\n', stderr: '' }),
+      });
+      expect(result.artifactsDir).toBe(join(root, 'effective1'));
+      expect(result.artifactsDir.startsWith(root)).toBe(true);
+      expect(existsSync(join(result.artifactsDir, 'child.log'))).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('자식 로그가 상한을 넘으면 끝부분을 남긴다', () => {
+    expect(tailBytes('abcdef', 3)).toBe('…[앞 3바이트 생략]\ndef');
+    expect(tailBytes('short', 100)).toBe('short');
+  });
+});
+
 describe('podCommandTargetCommit', () => {
   test('원격 노드는 HEAD 를 목표로 삼는다(로컬 이미지 판을 따르지 않는다)', () => {
     expect(podCommandTargetCommit({ remote: true, gitHead: () => 'head123', localImageCommit: () => 'old30f' })).toBe('head123');

@@ -53,7 +53,10 @@ export async function recordWorkingBackwardsOnCards(
     }
     const card = store.createCard({ goalId: `linear:${issue.identifier}`, title: redactSecrets(issue.title) });
     if (card.sections.some(section => section.key.startsWith('prfaq:')) && card.sections.some(section => section.key.startsWith('manual:'))) continue;
-    if (card.sections.some(section => section.key.startsWith('launch:'))) throw new Error(`Working-backwards draft follows launch: ${issue.identifier}`);
+    if (card.sections.some(section => section.key.startsWith('launch:'))) {
+      debug.log('steward.working-backwards', 'skipped-launched-before-draft', { issueId: issue.identifier });
+      continue;
+    }
     const draft = await draftWorkingBackwards(issue, ask);
     for (const [section, content] of [['prfaq', draft.prfaq], ['manual', draft.manual]] as const) {
       const key = `${section}:${createHash('sha256').update(content).digest('hex')}`;

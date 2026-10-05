@@ -1,4 +1,6 @@
 import { expect, test } from 'bun:test';
+import { checkBrand } from '../../scripts/brand/check.js';
+import { debug } from '../debug/log.js';
 import { contextNow, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
 import { filterPublicDemoContext } from './context-now-public.js';
 import { renderCardNow, renderTelegramNow, renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
@@ -17,6 +19,40 @@ const answer: ContextNowAnswer = {
   events: [{ at: '2026-10-04T03:00:00.000Z', kind: 'report', summary: 'PR #1234 on run-abcdef12 at node-b.tailnet /home/alice/private', source: 'https://github.com/org/repo/pull/1234' }],
   guide: ['OP 확인: PR #5678 — /Users/alice/notes'],
 };
+
+test('missing rules collapse every cell and decision, redact linked seats and free text, and log the fallback', () => {
+  const originalLog = debug.log;
+  const missingLogs: unknown[] = [];
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    if (category === 'context.now' && event === 'brand-rules-missing') missingLogs.push(data);
+  }) as typeof debug.log;
+  try {
+    const missingRules: typeof checkBrand = (scope, paths) => checkBrand(scope, paths, '/nonexistent/brand-rules.yaml');
+    const before = structuredClone(answer);
+    const filtered = filterPublicDemoContext(answer, missingRules);
+    expect(filtered.hiddenCount).toBe(6);
+    expect(filtered.facts.filter(fact => fact.kind === 'cell')).toMatchObject([
+      { kind: 'cell', id: '내부 항목', title: '내부 항목 3개' },
+    ]);
+    expect(filtered.facts.filter(fact => fact.kind === 'decision')).toMatchObject([
+      { kind: 'decision', id: '내부 항목', title: '내부 항목 2개', status: 'open' },
+    ]);
+    expect(filtered.facts.find(fact => fact.kind === 'seat')).toMatchObject({ id: '내부 항목', title: '내부 항목 1개' });
+    const unlinked = filterPublicDemoContext({ ...answer, facts: [{ kind: 'seat', seat: 'UX', at: answer.at,
+      id: 'K99', title: '비공개 별도 작업', status: 'doing', source: 'elanous://seat-loop/UX/1' }] }, missingRules);
+    expect(unlinked.facts[0]).toMatchObject({ id: '내부 항목', title: '내부 항목 1개' });
+    expect(unlinked.hiddenCount).toBe(1);
+    expect(filtered.events[0]?.summary).toBe('공개 소식');
+    expect(filtered.guide).toEqual(['공개 안내']);
+    expect(answer).toEqual(before);
+    expect(missingLogs).toEqual([{ audience: 'public-demo' }, { audience: 'public-demo' }]);
+    for (const sensitive of [/\/Users\//, /\/home\//, /\bstack\b/i, /fully autonomous/, /공개 기능/]) {
+      expect(JSON.stringify(filtered)).not.toMatch(sensitive);
+    }
+  } finally {
+    (debug as { log: typeof debug.log }).log = originalLog;
+  }
+});
 
 test('brand-flagged cell and decision titles collapse by kind and count while clear facts remain', () => {
   const before = structuredClone(answer);

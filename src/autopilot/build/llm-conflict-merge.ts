@@ -67,6 +67,9 @@ export interface LlmMergeOutcome {
   testDeclarationUnmeasured?: string[];
   /** 해결기 응답이 LLM 공급자 오류 문구였다 — 파일 내용이 아니다(🅢 2026-09-27 #21086: 세 파일이 통째로 그 문구가 됐다). */
   providerFailure?: string[];
+  /** LLM 입력 상한 초과: 사람 수확으로 넘긴다. 원래 브랜치는 abort 후 보존된다. */
+  reason?: 'conflict-input-too-large' | 'conflict-resolver-interrupted';
+  inputChars?: number;
   /** 병합 결과가 양쪽 판 중 작은 쪽의 절반 아래로 줄었다 — 통째로 날린 것으로 보고 해결 실패로 친다. */
   sizeCollapse?: Array<{ file: string; ours: number; theirs: number; merged: number }>;
   /** `status: 'error'` 일 때 어느 단계인지. 선택 — 옛 호출자는 이 칸 없이 돌아도 된다. */
@@ -79,6 +82,13 @@ export interface LlmMergeOutcome {
 export const PROVIDER_FAILURE_TEXT = /^\s*\[LLM PROVIDER (?:BLOCKED|STOPPED)\]/;
 /** 이 줄 수 미만 파일은 크기 붕괴 판정에서 뺀다(작은 파일은 정당하게 크게 줄 수 있다). */
 export const SIZE_COLLAPSE_MIN_LINES = 50;
+export const DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS = 60_000;
+
+export class MergeConflictInputTooLarge extends Error {
+  constructor(readonly inputChars: number) {
+    super(`충돌 큼 — 사람 수확 (LLM 입력 ${inputChars}자)`);
+  }
+}
 
 function lineCount(s: string): number {
   if (s.length === 0) return 0;
@@ -207,12 +217,21 @@ export async function mergeMainWithLlmResolve(
     let merged: string;
     try {
       conflicted = git.readFile(abs);
+    } catch {
+      git.abort(worktreePath);
+      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
+    }
+    try {
       // release/next.md: concurrent landings each append a line — keep both without asking the LLM (REL7c).
       const deterministic = f === NEXT_MD_PATH ? deterministicNextMd(git, worktreePath, f) : null;
       merged = deterministic ?? await resolve(f, conflicted);
-    } catch {
+    } catch (error) {
       git.abort(worktreePath); // LLM 예외 → base 유지
-      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
+      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles,
+        ...(error instanceof MergeConflictInputTooLarge
+          ? { reason: 'conflict-input-too-large' as const, inputChars: error.inputChars }
+          : { reason: 'conflict-resolver-interrupted' as const }),
+      });
     }
     if (PROVIDER_FAILURE_TEXT.test(merged)) {
       git.abort(worktreePath); // 해결기가 공급자 오류 문구를 «내용»으로 돌려줬다 → base 유지
@@ -335,15 +354,22 @@ export async function defaultLlmResolve(
   filePath: string, conflicted: string, mergeTarget: string,
   options: { worktreePath?: string; mode?: 'off' | 'shadow' | 'on'; git?: IntentGit; stream?: typeof import('../../llm.js')['streamLLM'] } = {},
 ): Promise<string> {
+  let rawConfig: { mergeConflictInputMaxChars?: unknown; mergeIntent?: unknown } | undefined;
+  try { rawConfig = getUserConfig().raw.selfImplement as typeof rawConfig; }
+  catch { /* unreadable config keeps the old resolver and default input limit */ }
+  const configuredMax = rawConfig?.mergeConflictInputMaxChars;
+  const maxChars = typeof configuredMax === 'number' && Number.isSafeInteger(configuredMax) && configuredMax > 0
+    ? configuredMax : DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS;
   let rawMode: unknown = options.mode;
   if (rawMode === undefined) {
-    try { rawMode = (getUserConfig().raw.selfImplement as { mergeIntent?: unknown } | undefined)?.mergeIntent; }
-    catch { /* unreadable config keeps the old resolver */ }
+    rawMode = rawConfig?.mergeIntent;
   }
   const mode = rawMode === 'shadow' || rawMode === 'on' ? rawMode : 'off';
-  const streamLLM = options.stream ?? (await import('../../llm.js')).streamLLM;
   const resolve = async (intent?: { ours: string | null; theirs: string[] }): Promise<string> => {
-    const out = await streamLLM([{ role: 'user', content: conflictResolvePrompt(filePath, conflicted, mergeTarget, intent) }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
+    const prompt = conflictResolvePrompt(filePath, conflicted, mergeTarget, intent);
+    if (prompt.length > maxChars) throw new MergeConflictInputTooLarge(prompt.length);
+    const streamLLM = options.stream ?? (await import('../../llm.js')).streamLLM;
+    const out = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
     // ⛔ 라우터는 공급자가 전부 막히면 던지지 않고 오류 문구를 돌려준다 — 그것은 파일 내용이 아니다.
     if (PROVIDER_FAILURE_TEXT.test(out)) throw new Error(`conflict resolve: LLM provider failure for ${filePath}`);
     return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;

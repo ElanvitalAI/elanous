@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { join, relative, resolve, sep } from 'node:path';
 import { stringify } from 'yaml';
 import { debug } from '../src/debug/log.js';
-import { checkBrand } from './brand/check.js';
+import { BRAND_RULES_UNMEASURED, checkBrand } from './brand/check.js';
 import { checkCommands, extractElanousCommands, type HelpRunner } from './docs-cli-check.js';
 import { scanLeaks } from './public-export.js';
 
@@ -25,7 +25,7 @@ function measure(run: () => Criterion): Criterion {
 }
 
 /** Files are repository-relative paths (or absolute paths within root); the ledger is never read or written. */
-export function suggestExposeRubric(root: string, files?: readonly string[], help?: HelpRunner): Suggestion[] {
+export function suggestExposeRubric(root: string, files?: readonly string[], help?: HelpRunner, rulesPath?: string): Suggestion[] {
   const names = files ?? readdirSync(join(root, DOCS)).filter((name) => name.endsWith('.md')).map((name) => `${DOCS}/${name}`);
   const paths = [...new Set(names.map((name) => relative(root, resolve(root, name)).split(sep).join('/')))];
   if (paths.some((path) => !/^release\/public\/docs\/[^/]+\.md$/.test(path))) throw new Error('문서 경로는 release/public/docs/*.md 이어야 합니다');
@@ -77,6 +77,15 @@ export function suggestExposeRubric(root: string, files?: readonly string[], hel
       const failed = unmeasured(error);
       return { path, criteria: { reproducible: failed, confidential: failed, brand: failed } };
     }
+    const brand = measure(() => {
+      const result = checkBrand('public-docs', [absolute], rulesPath);
+      if (result.missing) return { status: 'n/a', reason: result.message ?? BRAND_RULES_UNMEASURED };
+      if (result.files !== 1 || result.rules === 0) return unmeasured('브랜드 규칙 없음 또는 파일 검사 실패');
+      const ids = [...new Set(result.findings.map((finding) => finding.id))].slice(0, 3);
+      return ids.length
+        ? { status: 'fail', reason: `브랜드 규칙: ${ids.join(', ')}` }
+        : { status: 'pass', reason: '브랜드 규칙 위반 없음' };
+    });
     const reproducible = measure(() => {
       const refs = extractElanousCommands(path, text);
       if (!refs.length) return { status: 'n/a', reason: '문서에 elanous 명령 없음' };
@@ -95,14 +104,7 @@ export function suggestExposeRubric(root: string, files?: readonly string[], hel
         ? { status: 'fail', reason: `누출 표식: ${markers.join(', ')}` }
         : { status: 'pass', reason: '누출 표식 없음' };
     });
-    const brand = measure(() => {
-      const result = checkBrand('public-docs', [absolute]);
-      if (result.missing || result.files !== 1 || result.rules === 0) return unmeasured('브랜드 규칙 없음 또는 파일 검사 실패');
-      const ids = [...new Set(result.findings.map((finding) => finding.id))].slice(0, 3);
-      return ids.length
-        ? { status: 'fail', reason: `브랜드 규칙: ${ids.join(', ')}` }
-        : { status: 'pass', reason: '브랜드 규칙 위반 없음' };
-    });
+    // 브랜드 규칙이 없으면 브랜드만 «측정 불가» — 따로 잰 재현성·누출 결과는 덮어쓰지 않는다.
     return { path, criteria: { reproducible, confidential, brand } };
   });
   const statuses = results.flatMap((item) => KEYS.map((key) => item.criteria[key].status));
@@ -119,19 +121,23 @@ export function run(argv: readonly string[], root = process.cwd(), help?: HelpRu
   const json = argv.includes('--json');
   let files: string[] | undefined;
   let out: string | undefined;
+  let rulesPath: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--json') continue;
     if (arg === '--yaml-patch') {
       out = argv[++i];
       if (!out || out.startsWith('--')) throw new Error('--yaml-patch 에 출력 경로가 필요합니다');
+    } else if (arg === '--rules') {
+      rulesPath = argv[++i];
+      if (!rulesPath || rulesPath.startsWith('--')) throw new Error('--rules 에 규칙 경로가 필요합니다');
     } else if (arg === '--files') {
       files = [];
       while (argv[i + 1] && !argv[i + 1]!.startsWith('--')) files.push(argv[++i]!);
       if (!files.length) throw new Error('--files 에 문서 경로가 필요합니다');
     } else throw new Error(`알 수 없는 옵션: ${arg}`);
   }
-  const results = suggestExposeRubric(root, files, help);
+  const results = suggestExposeRubric(root, files, help, rulesPath);
   if (out) {
     const target = resolve(root, out);
     const ledger = resolve(root, LEDGER);
@@ -140,7 +146,7 @@ export function run(argv: readonly string[], root = process.cwd(), help?: HelpRu
   }
   if (json) console.log(JSON.stringify(results));
   else {
-    for (const { path, criteria } of results) console.log(`${path} · ${KEYS.map((key) => `${key} ${criteria[key].status}${criteria[key].status === 'fail' ? `(${criteria[key].reason.split(': ').slice(1).join(': ') || criteria[key].reason})` : ''}`).join(' · ')}`);
+    for (const { path, criteria } of results) console.log(`${path} · ${KEYS.map((key) => `${key} ${criteria[key].status}${criteria[key].status === 'fail' ? `(${criteria[key].reason.split(': ').slice(1).join(': ') || criteria[key].reason})` : criteria[key].reason === BRAND_RULES_UNMEASURED ? `(${criteria[key].reason})` : ''}`).join(' · ')}`);
     const statuses = results.flatMap((item) => KEYS.map((key) => item.criteria[key].status));
     console.log(`합계 문서 ${results.length} · pass ${statuses.filter((status) => status === 'pass').length} · fail ${statuses.filter((status) => status === 'fail').length} · n/a ${statuses.filter((status) => status === 'n/a').length} · maturity/value/evidence/support 사람 판정 (MK)`);
   }

@@ -6,6 +6,7 @@ import { resolveAttachmentPath } from '../../boot/attachment-store.js';
 import { runGh } from '../../decisions/decision-cards.js';
 import { openMsgStore, canonicalSeatId } from '../../msg/msg-store.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
+import { appendSeatRequestRows, withSeatRequestLedgerLock } from '../../seat-dispatch/seat-request-ledger.js';
 import { acknowledgeSeatAnswers, askSeat, deliverSeatAnswers, parseSeatAsk, type SeatAskDeps } from '../../seat-dispatch/seat-ask.js';
 import { getUserConfig } from '../../user-config.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
@@ -36,10 +37,12 @@ interface PendingRequest {
   queuedAt: string;
   ref: string;
   attachments?: string[];
+  reason?: string;
+  closedAt?: string;
 }
 
 interface RejectedRequest extends Omit<PendingRequest, 'status'> {
-  status: 'rejected';
+  status: 'rejected' | 'done';
 }
 
 type RecordEntry = (SeatRequestItem & { key: string }) | PendingRequest | RejectedRequest;
@@ -73,19 +76,7 @@ function file(root: string): string {
 }
 
 function append(path: string, entry: RecordEntry): void {
-  mkdirSync(dirname(path), { recursive: true });
-  // Atomically replace the journal so a failed write cannot leave a truncated JSON line.
-  const previous = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  const temp = `${path}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temp, `${previous}${JSON.stringify(entry)}\n`);
-    const fd = openSync(temp, 'r');
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(temp, path);
-  } catch (error) {
-    try { unlinkSync(temp); } catch { /* no temp file to remove */ }
-    throw error;
-  }
+  appendSeatRequestRows(path, [entry]);
 }
 
 function records(path: string): Map<string, RecordEntry> {
@@ -100,7 +91,7 @@ function records(path: string): Map<string, RecordEntry> {
     if (!line) continue;
     const entry = JSON.parse(line) as RecordEntry;
     if (typeof entry.key !== 'string' || typeof entry.seat !== 'string' || typeof entry.text !== 'string'
-      || typeof entry.queuedAt !== 'string' || !['pending', 'queued', 'rejected'].includes(entry.status)
+      || typeof entry.queuedAt !== 'string' || !['pending', 'queued', 'rejected', 'done'].includes(entry.status)
       || (entry.status === 'queued' && typeof entry.receiptId !== 'string')
       || (entry.status !== 'queued' && typeof entry.ref !== 'string')) {
       throw new Error('invalid seat request journal');
@@ -121,7 +112,7 @@ function records(path: string): Map<string, RecordEntry> {
       throw new Error('invalid seat request outcome');
     }
     const current = entries.get(item.key);
-    if (current?.status === 'queued') continue;
+    if (current?.status === 'queued' || current?.status === 'done' || current?.closedAt) continue;
     if (current?.status === 'pending') {
       if (item.status === 'rejected' && current.ref !== item.ref) continue;
       if (item.status === 'queued' && current.queuedAt !== item.queuedAt) continue;
@@ -135,27 +126,32 @@ function outcomeFile(path: string, key: string): string {
   return join(dirname(path), 'outcomes', `${key}.json`);
 }
 
-function persistOutcome(path: string, entry: RecordEntry, write: typeof append): void {
-  try {
-    write(path, entry);
-    const sidecar = outcomeFile(path, entry.key);
-    if (existsSync(sidecar)) unlinkSync(sidecar);
-  } catch {
-    // The primary journal may be unavailable while the outcome is already committed
-    // to the intake queue. Keep a durable sidecar rather than a process-local receipt.
-    const target = outcomeFile(path, entry.key);
-    mkdirSync(dirname(target), { recursive: true });
-    const temp = `${target}.${randomUUID()}.tmp`;
+function persistOutcome(path: string, entry: RecordEntry, write: typeof append): RecordEntry {
+  return withSeatRequestLedgerLock(path, () => {
+    const current = records(path).get(entry.key);
+    if (current && ('closedAt' in current || current.status === 'done')) return current;
+    if (current?.status === 'queued') return current;
     try {
-      writeFileSync(temp, JSON.stringify(entry));
-      const fd = openSync(temp, 'r');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      renameSync(temp, target);
-    } catch (error) {
-      try { unlinkSync(temp); } catch { /* no temp file */ }
-      throw error;
+      write(path, entry);
+      const sidecar = outcomeFile(path, entry.key);
+      if (existsSync(sidecar)) unlinkSync(sidecar);
+    } catch {
+      // A committed external delivery still needs a durable outcome if the journal write failed.
+      const target = outcomeFile(path, entry.key);
+      mkdirSync(dirname(target), { recursive: true });
+      const temp = `${target}.${randomUUID()}.tmp`;
+      try {
+        writeFileSync(temp, JSON.stringify(entry));
+        const fd = openSync(temp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(temp, target);
+      } catch (error) {
+        try { unlinkSync(temp); } catch { /* no temp file */ }
+        throw error;
+      }
     }
-  }
+    return entry;
+  });
 }
 
 function receipt(item: SeatRequestItem): Response {
@@ -298,13 +294,18 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   const gate = new Promise<void>((resolve) => { start = resolve; });
   const task = (async (): Promise<Response> => {
     await gate;
-    let existing: RecordEntry | undefined;
-    try { existing = records(path).get(key); }
+    // A settled request answers from the journal before attachments are resolved — a retry
+    // must return its receipt even when the uploaded file is gone. The locked re-check below still guards races.
+    let settled: RecordEntry | undefined;
+    try { settled = records(path).get(key); }
     catch { return unavailable(); }
-    if (existing) {
-      if (existing.seat !== seat.id || existing.text !== text
-        || JSON.stringify(existing.attachments ?? []) !== JSON.stringify(attachmentIds)) return jsonResponse({ error: 'idempotency-conflict' }, 409);
-      if (existing.status === 'queued') return receipt(existing);
+    if (settled) {
+      if (settled.seat !== seat.id || settled.text !== text
+        || JSON.stringify(settled.attachments ?? []) !== JSON.stringify(attachmentIds)) return jsonResponse({ error: 'idempotency-conflict' }, 409);
+      if ('closedAt' in settled || settled.status === 'done') {
+        return jsonResponse({ error: 'request-closed', status: settled.status, reason: 'reason' in settled ? settled.reason : undefined }, 409);
+      }
+      if (settled.status === 'queued') return receipt(settled);
     }
     const attachments: Array<{ name: string; path: string }> = [];
     for (const id of attachmentIds) {
@@ -316,18 +317,36 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
       const metadata = (input.attachments as Array<{ name?: unknown }>)[attachments.length];
       attachments.push({ name: typeof metadata?.name === 'string' && metadata.name.trim() ? metadata.name : basename(resolved), path: resolved });
     }
-    const intent: PendingRequest = existing?.status === 'pending'
-      ? existing : { key, seat: seat.id, text, queuedAt: now, status: 'pending', ref: `pwa:${randomUUID()}`,
-        ...(attachmentIds.length ? { attachments: attachmentIds } : {}) };
-    if (existing?.status !== 'pending') {
-      try {
-        (deps.append ?? append)(path, intent);
-        if (existing?.status === 'rejected') {
-          const sidecar = outcomeFile(path, key);
-          if (existsSync(sidecar)) unlinkSync(sidecar);
+    let initial: { intent?: PendingRequest; response?: Response };
+    try {
+      initial = withSeatRequestLedgerLock(path, () => {
+        const existing = records(path).get(key);
+        if (existing) {
+          if (existing.seat !== seat.id || existing.text !== text
+            || JSON.stringify(existing.attachments ?? []) !== JSON.stringify(attachmentIds)) {
+            return { response: jsonResponse({ error: 'idempotency-conflict' }, 409) };
+          }
+          if ('closedAt' in existing || existing.status === 'done') {
+            return { response: jsonResponse({ error: 'request-closed', status: existing.status,
+              reason: 'reason' in existing ? existing.reason : undefined }, 409) };
+          }
+          if (existing.status === 'queued') return { response: receipt(existing) };
         }
-      } catch { return unavailable(); }
-    }
+        const intent: PendingRequest = existing?.status === 'pending'
+          ? existing : { key, seat: seat.id, text, queuedAt: now, status: 'pending', ref: `pwa:${randomUUID()}`,
+            ...(attachmentIds.length ? { attachments: attachmentIds } : {}) };
+        if (existing?.status !== 'pending') {
+          (deps.append ?? append)(path, intent);
+          if (existing?.status === 'rejected') {
+            const sidecar = outcomeFile(path, key);
+            if (existsSync(sidecar)) unlinkSync(sidecar);
+          }
+        }
+        return { intent };
+      });
+    } catch { return unavailable(); }
+    if (initial.response) return initial.response;
+    const intent = initial.intent!;
     const ceoSeat = canonicalSeatId(seat.id);
     if (['OP', 'TC', 'MK', 'UX'].includes(ceoSeat)) {
       let result: Awaited<ReturnType<typeof dispatchCeoTask>>;
@@ -342,10 +361,12 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
         ...(attachmentIds.length ? { attachments: attachmentIds } : {}), channel: result.channel,
         ...(result.channelError ? { channelError: result.channelError } : {}),
       };
-      try { persistOutcome(path, item, deps.append ?? append); }
+      let persisted: RecordEntry;
+      try { persisted = persistOutcome(path, item, deps.append ?? append); }
       catch { return unavailable(); }
+      if (persisted.status !== 'queued') return jsonResponse({ error: 'request-closed', status: persisted.status, reason: persisted.reason }, 409);
       publishInsideEvent({ kind: 'seat', seat: item.seat, receiptId: item.receiptId, status: item.status, ts: item.queuedAt });
-      return receipt(item);
+      return receipt(persisted);
     }
     let result: Awaited<ReturnType<typeof submitIntakeWork>>;
     try {
@@ -363,11 +384,13 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
     }
     const item: RecordEntry & SeatRequestItem = { key, receiptId: result.acceptanceId, seat: seat.id, text, queuedAt: intent.queuedAt,
       status: 'queued', ...(attachmentIds.length ? { attachments: attachmentIds } : {}) };
-    try { persistOutcome(path, item, deps.append ?? append); }
+    let persisted: RecordEntry;
+    try { persisted = persistOutcome(path, item, deps.append ?? append); }
     catch { return unavailable(); }
+    if (persisted.status !== 'queued') return jsonResponse({ error: 'request-closed', status: persisted.status, reason: persisted.reason }, 409);
     debug.log('seat-address.pwa', 'enqueued', { seat: seat.id, receiptId: item.receiptId });
     publishInsideEvent({ kind: 'seat', seat: item.seat, receiptId: item.receiptId, status: item.status, ts: item.queuedAt });
-    return receipt(item);
+    return receipt(persisted);
   })();
   inFlight.set(lock, { payload, task });
   start();

@@ -162,6 +162,7 @@ import {
 } from './vault-api.js';
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
+import { handleLoopEdgesGet } from './loop-edges.js';
 import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
 import { handleMe } from './operator.js';
@@ -1293,6 +1294,15 @@ export async function routeRequest(
   if (isDevicesPath(pathname)) {
     if (!opts.devices) return jsonResponse({ error: 'devices-not-wired' }, 503);
     return handleDevices(req, opts.devices);
+  }
+
+  if (pathname === '/v1/loops/edges' && method === 'GET') {
+    if (!opts.metaApi?.bearerToken) return jsonResponse({ error: 'unauthorized' }, 401);
+    const offered = req.headers.get('authorization');
+    if (!offered?.startsWith('Bearer ') || !compareTokenConstTime(offered.slice('Bearer '.length).trim(), opts.metaApi.bearerToken)) {
+      return jsonResponse({ error: 'unauthorized' }, 401);
+    }
+    return handleLoopEdgesGet(req);
   }
 
   if (pathname === '/v1/harness/runs' && method === 'GET') {
@@ -2882,20 +2892,24 @@ export async function routeRequest(
     if (result) return result;
   }
   if (pathname === '/v1/context/now') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    const audiences = url.searchParams.getAll('audience');
-    if (audiences.length > 1) return jsonResponse({ error: 'invalid_audience' }, 400);
-    const requested = audiences[0];
-    if (requested !== undefined && requested !== 'operator' && requested !== 'user' && requested !== 'public-demo') {
-      return jsonResponse({ error: 'invalid_audience' }, 400);
+    try {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      const audiences = url.searchParams.getAll('audience');
+      if (audiences.length > 1) return jsonResponse({ error: 'invalid_audience' }, 400);
+      const requested = audiences[0];
+      if (requested !== undefined && requested !== 'operator' && requested !== 'user' && requested !== 'public-demo') {
+        return jsonResponse({ error: 'invalid_audience' }, 400);
+      }
+      const forced = getUserConfig().nexus?.demoMode === true;
+      const audience: ContextNowAudience = forced ? 'public-demo' : requested ?? 'operator';
+      const answer = contextNow({ audience, ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }, opts.contextNowDeps);
+      debug.log('context.now', 'served', { audience, hidden: answer.hiddenCount ?? 0, forced });
+      return jsonResponse(url.searchParams.get('format') === 'voice'
+        ? { text: renderVoiceNow(answer, audience), audience, hiddenCount: answer.hiddenCount ?? 0 }
+        : { ...answer, audience, hiddenCount: answer.hiddenCount ?? 0 });
+    } catch {
+      return jsonResponse({ error: 'context-now-failed' }, 500);
     }
-    const forced = getUserConfig().nexus?.demoMode === true;
-    const audience: ContextNowAudience = forced ? 'public-demo' : requested ?? 'operator';
-    const answer = contextNow({ audience, ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }, opts.contextNowDeps);
-    debug.log('context.now', 'served', { audience, hidden: answer.hiddenCount ?? 0, forced });
-    return jsonResponse(url.searchParams.get('format') === 'voice'
-      ? { text: renderVoiceNow(answer, audience), audience, hiddenCount: answer.hiddenCount ?? 0 }
-      : { ...answer, audience, hiddenCount: answer.hiddenCount ?? 0 });
   }
   // §6.3 (2026-05-09) — context URL fetch (showroom).
   // POST /v1/context/fetch-url

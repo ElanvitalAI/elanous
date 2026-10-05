@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireL8MergeQueue, runL8MergeQueue, type L8MergeQueueDeps } from './l8-merge-queue.js';
+import { acquireL8MergeQueue, evaluateL8Integration, runL8MergeQueue, type L8MergeQueueDeps } from './l8-merge-queue.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -252,6 +252,51 @@ test('a push to the PR branch after the atomic merge is a new change and does no
   expect(result.merged).toBe(true);
   expect(git(remote, 'rev-parse', 'main')).toBe(result.mergeCommit!);
   expect(spawnSync('git', ['merge-base', '--is-ancestor', head, 'main'], { cwd: remote }).status).toBe(0);
+});
+
+test('non-landing evaluation reports next.md-only feasibility and changed-test results without pushing', async () => {
+  const { cwd, remote, head } = fixture();
+  const mainBefore = git(remote, 'rev-parse', 'main');
+  const featureBefore = git(remote, 'rev-parse', 'feature');
+  const { injected, calls, pushes } = deps(remote);
+  const report = await evaluateL8Integration({ number: 7, cwd, matchHeadCommit: head }, injected);
+  expect(report.feasible).toBe(true);
+  expect(report.conflictingFiles).toEqual(['release/next.md']);
+  expect(report.conflictsLimitedToNextMd).toBe(true);
+  expect(report.changedTests).toEqual([{ file: 'src.test.ts', passed: true, pass: 1, fail: 0 }]);
+  expect(calls).toEqual([['install', '--frozen-lockfile'], ['test', 'src.test.ts']]);
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'main')).toBe(mainBefore);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(featureBefore);
+  expect(readFileSync(join(cwd, 'release/next.md'), 'utf8')).not.toContain('- feature');
+});
+
+test('non-landing evaluation reports non-next.md conflicts and does not run tests or push', async () => {
+  const { cwd, remote, head } = fixture(true);
+  const { injected, calls, pushes } = deps(remote);
+  const report = await evaluateL8Integration({ number: 7, cwd, matchHeadCommit: head }, injected);
+  expect(report.feasible).toBe(false);
+  expect(report.conflictingFiles).toEqual(['other.ts', 'release/next.md']);
+  expect(report.conflictsLimitedToNextMd).toBe(false);
+  expect(report.changedTests).toEqual([]);
+  expect(report.detail).toContain('other.ts');
+  expect(calls).toEqual([]);
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(head);
+});
+
+test('non-landing evaluation records a failed changed test and leaves both refs unmoved', async () => {
+  const { cwd, remote, head } = fixture();
+  const mainBefore = git(remote, 'rev-parse', 'main');
+  const { injected, pushes } = deps(remote, { failTest: true });
+  const report = await evaluateL8Integration({ number: 7, cwd, matchHeadCommit: head }, injected);
+  expect(report.feasible).toBe(false);
+  expect(report.conflictsLimitedToNextMd).toBe(true);
+  expect(report.changedTests).toEqual([{ file: 'src.test.ts', passed: false, pass: 0, fail: 1, detail: '0 pass\n1 fail\nRan 1 test across 1 file\n' }]);
+  expect(report.detail).toBe('changed tests failed');
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'main')).toBe(mainBefore);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(head);
 });
 
 test('main advancing during changed tests prevents the stale candidate from being pushed', async () => {

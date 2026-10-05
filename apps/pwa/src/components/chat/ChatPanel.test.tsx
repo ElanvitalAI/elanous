@@ -6,12 +6,14 @@ import ChatPage from '@/app/chat/page';
 import { ChatPanel } from './ChatPanel';
 import { ChatLayout } from './ChatLayout';
 import { ChatConversationList } from './ChatConversationList';
+import { ChatCurrentProject } from './ChatCurrentProject';
 import { _resetSessionsServiceSingletonForTest } from '@/lib/sessions-service';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let tree: ReactTestRenderer | undefined;
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
 afterEach(async () => {
   if (tree) await act(async () => tree!.unmount());
   tree = undefined;
@@ -20,12 +22,28 @@ afterEach(async () => {
   else delete (globalThis as { window?: Window }).window;
   if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
   else delete (globalThis as { document?: Document }).document;
+  if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
+  else delete (globalThis as { localStorage?: Storage }).localStorage;
 });
 
 async function mount(show: boolean, entries: Array<{ id: string; title: string; preview: string; updatedAt: string; messageCount: number; source: string; active: boolean; createdAt: string }> = [], width = 412) {
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: width, location: { search: '' }, sessionStorage: { getItem: () => null } }) });
+  const saved = new Map<string, string>();
+  const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => saved.set(key, value) };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: width, location: { search: '' }, sessionStorage: { getItem: () => null }, localStorage: storage }) });
   Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
-  const client = { fetchJson: async () => ({ sessions: entries, messages: [] }), sessionStoreEventsUrl: () => '', voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } };
+  let projectId: string | null = 'p';
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
+    if (path === '/v1/projects') return { projects: [{ id: 'p', name: '일', createdAt: '' }, { id: 'q', name: '개인', createdAt: '' }] };
+    if (init?.method === 'PATCH') {
+      projectId = (JSON.parse(init.body as string) as { projectId: string | null }).projectId;
+      return { ok: true };
+    }
+    if (path.includes('?ifExists=1')) return { meta: { projectId }, messages: [] };
+    return { sessions: entries, messages: [] };
+  }, sessionStoreEventsUrl: () => '', voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } };
   let selected = 'one';
   function Host() {
     const [sessionId, setSessionId] = useState('one');
@@ -34,7 +52,7 @@ async function mount(show: boolean, entries: Array<{ id: string; title: string; 
     return <DaemonContext.Provider value={daemon}>{show ? <ChatPage /> : <ChatPanel />}</DaemonContext.Provider>;
   }
   await act(async () => { tree = create(<Host />); });
-  return { root: tree!.root, getSelected: () => selected };
+  return { root: tree!.root, getSelected: () => selected, calls, getProject: () => projectId };
 }
 
 test('/chat has a fixed desktop column and a mobile button opening a dismissible drawer without replacing chat', async () => {
@@ -80,6 +98,49 @@ test('wide standalone chat preserves its fixed left list and original header', a
   expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-controls': 'chat-conversation-drawer' })).toHaveLength(1);
   expect(root.findByType(ChatLayout).props.leading).toBeUndefined();
+});
+
+test('standalone chat header displays the stored project and switches it through the session PATCH endpoint', async () => {
+  const { root, calls, getProject } = await mount(true, [], 1200);
+  const select = root.findByProps({ 'aria-label': '현재 대화 프로젝트' });
+  expect(select.props.value).toBe('p');
+  expect(select.findAllByType('option').find((option) => option.props.value === 'p')?.props.children).toBe('일');
+  await act(async () => select.props.onChange({ target: { value: 'q' } }));
+  expect(getProject()).toBe('q');
+  expect(calls.findLast(({ init }) => init?.method === 'PATCH')?.path).toBe('/v1/sessions/store/one');
+  expect(select.props.value).toBe('q');
+});
+
+test('changing conversations during a project PATCH shows the new conversation’s stored project', async () => {
+  const saved = new Map<string, string>();
+  const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => saved.set(key, value) };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: 1200, location: { search: '' }, sessionStorage: { getItem: () => null }, localStorage: storage }) });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
+  let finishPatch: (() => void) | undefined;
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    if (path === '/v1/projects') return { projects: [{ id: 'p', name: '일', createdAt: '' }, { id: 'q', name: '개인', createdAt: '' }] };
+    if (init?.method === 'PATCH') return await new Promise((resolve) => { finishPatch = () => resolve({ ok: true }); });
+    if (path.includes('?ifExists=1')) return { meta: { projectId: path.includes('/two?') ? 'q' : 'p' }, messages: [] };
+    return { sessions: [], messages: [] };
+  }, sessionStoreEventsUrl: () => '', voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } };
+  let switchTo: ((id: string) => void) | undefined;
+  function Host() {
+    const [sessionId, setSessionId] = useState('one');
+    switchTo = setSessionId;
+    const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId, setSessionId, setConfig: () => {} };
+    return <DaemonContext.Provider value={daemon}><ChatCurrentProject /></DaemonContext.Provider>;
+  }
+  await act(async () => { tree = create(<Host />); });
+  const header = () => tree!.root.findByProps({ 'aria-label': '현재 대화 프로젝트' });
+  expect(header().props.value).toBe('p');
+  await act(async () => { header().props.onChange({ target: { value: '' } }); });
+  expect(finishPatch).toBeDefined();
+  await act(async () => { switchTo!('two'); });
+  expect(header().props.value).toBe('q');
+  expect(header().props.disabled).toBe(false);
+  await act(async () => { finishPatch!(); });
+  expect(header().props.value).toBe('q');
 });
 
 test('workspace-style ChatPanel keeps the original chat without conversation navigation', async () => {

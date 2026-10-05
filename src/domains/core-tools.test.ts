@@ -15,7 +15,7 @@ describe('buildCoreTools — L2 코어 앱 도구', () => {
     // (main 에서 이미 fail). 현행 전체 코어 세트로 갱신 + logs_query 합류.
     expect(names).toEqual([
       'autopilot_missions', 'context_now', 'coo_admin', 'decisions_pending', 'fact_check', 'logs_query', 'memory_recall', 'mission_decide',
-      'ops_seats', 'ops_status', 'release_change', 'release_status', 'schedule_manage', 'se_build', 'self_recall', 'session_manage',
+      'ops_seats', 'ops_status', 'proact_meter', 'release_change', 'release_status', 'schedule_manage', 'se_build', 'self_recall', 'session_manage',
     ]);
     expect(core.specs.length).toBe(CORE_TOOL_SPECS.length);
     for (const s of core.specs) {

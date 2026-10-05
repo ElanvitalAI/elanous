@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { defaultCmdRunner } from '../autopilot/pr-manager.js';
-import { githubAutomationToken, githubInstallationCredential } from './github-app-token.js';
+import { coalescedInstallationCredential, githubAutomationToken, githubInstallationCredential } from './github-app-token.js';
 
 const originalGhToken = process.env.GH_TOKEN;
 const originalPath = process.env.PATH;
@@ -287,5 +287,101 @@ describe('test runs never reach the machine App key', () => {
       const minted = githubInstallationCredential({ scope: { repository: 'repo-env' }, fetch: () => ({ token: 'ghs_env', expires_at: new Date(Date.now() + 3600_000).toISOString() }) });
       expect(minted?.token).toBe('ghs_env');
     } finally { process.env.ELANOUS_GITHUB_APP_CONFIG_PATH = before; }
+  });
+});
+
+describe('PODCRED1 coalesced scoped issuance', () => {
+  const T0 = Date.parse('2026-10-05T12:49:34Z');
+  const fresh = (n: number, now = T0) => ({ token: `ghs_coalesced_${n}`, expires_at: new Date(now + 60 * 60_000).toISOString() });
+
+  test('repeated issuers in one process within the window mint once and share the result (cross-process concurrency: next test)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-'));
+    try {
+      let mints = 0;
+      const results = await Promise.all(Array.from({ length: 6 }, () => Promise.resolve().then(() =>
+        coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => T0, mint: () => fresh(++mints) }))));
+      expect(mints).toBe(1);
+      expect(new Set(results.map((r) => r?.token))).toEqual(new Set(['ghs_coalesced_1']));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('separate processes coalesce through the shared lock and cache', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-proc-'));
+    const counter = join(dir, 'mints.log');
+    const script = `const { coalescedInstallationCredential } = await import(${JSON.stringify(join(import.meta.dir, 'github-app-token.ts'))});
+const fs = await import('node:fs');
+const r = coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: ${JSON.stringify(dir)}, mint: () => {
+  fs.appendFileSync(${JSON.stringify(counter)}, 'm\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+  return { token: 'ghs_proc_' + process.pid, expires_at: new Date(Date.now() + 3600_000).toISOString() }; } });
+process.stdout.write(r ? 'ok' : 'null');`;
+    try {
+      const children = Array.from({ length: 4 }, () => Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' }));
+      const texts = await Promise.all(children.map(async (c) => { await c.exited; return new Response(c.stdout).text(); }));
+      expect(texts).toEqual(['ok', 'ok', 'ok', 'ok']);
+      expect(readFileSync(counter, 'utf8').trim().split('\n')).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('an old or short-lived cached token is not reused — a new one is minted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-old-'));
+    try {
+      let mints = 0;
+      let t = T0;
+      const call = () => coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => t, mint: () => fresh(++mints, t) });
+      expect(call()?.token).toBe('ghs_coalesced_1');
+      t = T0 + 121_000;
+      expect(call()?.token).toBe('ghs_coalesced_2');
+      expect(mints).toBe(2);
+      // A recent entry whose remaining life is below the floor is not reused either.
+      expect(coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => t + 15 * 60_000, windowMs: 3600_000, mint: () => fresh(++mints, t) })?.token).toBe('ghs_coalesced_3');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a stale lock left by a dead issuer does not block issuance', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-stale-'));
+    try {
+      mkdirSync(dir, { recursive: true });
+      const key = new Bun.CryptoHasher('sha256').update('injected\0elanous-agent').digest('hex').slice(0, 32);
+      mkdirSync(join(dir, `${key}.lock`));
+      let mints = 0;
+      const r = coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => Date.now() + 60_000, sleepSync: () => {}, mint: () => fresh(++mints) });
+      expect(r?.token).toBe('ghs_coalesced_1');
+      expect(existsSync(join(dir, `${key}.lock`))).toBe(false);
+      expect(spawnSync('ls', ['-a', dir], { encoding: 'utf8' }).stdout.split('\n').filter((name) => name.endsWith('.lock'))).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('the cache file is private and observations never carry the token', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-private-'));
+    const logged: string[] = [];
+    const off = debug.registerSink({ name: 'gh-coalesce-private', emit: (record) => { if (record.category === 'auth.github-app') logged.push(JSON.stringify(record)); } });
+    try {
+      coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => T0, mint: () => fresh(1) });
+      coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, now: () => T0, mint: () => fresh(2) });
+      const file = spawnSync('ls', ['-l', dir], { encoding: 'utf8' }).stdout.split('\n').find((l) => l.endsWith('.json'));
+      expect(file?.startsWith('-rw-------')).toBe(true);
+      expect(logged.some((l) => l.includes('token-coalesced'))).toBe(true);
+      expect(logged.join('\n')).not.toContain('ghs_coalesced');
+    } finally { off(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a test process without an explicit cache dir never coalesces through the operational root', () => {
+    expect(process.env.NODE_ENV === 'test' || Boolean(process.env.ELANOUS_TEST_HOME)).toBe(true);
+    let mints = 0;
+    coalescedInstallationCredential({ repository: 'elanous-agent' }, { now: () => T0, mint: () => fresh(++mints) });
+    coalescedInstallationCredential({ repository: 'elanous-agent' }, { now: () => T0, mint: () => fresh(++mints) });
+    expect(mints).toBe(2);
+  });
+
+  test('fresh skips reuse but publishes the new token for later issuers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-coalesce-fresh-'));
+    try {
+      let mints = 0;
+      const call = (f?: boolean) => coalescedInstallationCredential({ repository: 'elanous-agent' }, { cacheDir: dir, fresh: f, now: () => T0, mint: () => fresh(++mints) })?.token;
+      expect(call()).toBe('ghs_coalesced_1');
+      expect(call(true)).toBe('ghs_coalesced_2');
+      expect(call()).toBe('ghs_coalesced_2');
+      expect(mints).toBe(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

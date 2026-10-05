@@ -35,6 +35,7 @@ import type { DocumentReferenceStatus } from '../self-implement/self-implement-r
 import type { SelfDevGoal, OrchestrateSelfDevOptions, SelfDevJobResult } from './orchestrate.js';
 import { launchCapabilityObservation, resolveLaunchCapabilities } from './launch-capabilities.js';
 import { lookupEntrance, type EntranceId } from './entrance-registry.js';
+import { resolveLaunchStamp } from '../harness/launch-stamp.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
 import type { ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { resolveRunIdentity, type RunIdSource } from '../harness/harness-space.js';
@@ -42,7 +43,7 @@ import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-
 import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
-import { buildReviewProviderAttempts, runReviewWithFallback, reviewFallbackModelsFromConfig } from './review-provider-fallback.js';
+import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig } from './review-provider-fallback.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
 import { provisionRepository, type RepoProvisionResult } from '../self-implement/repo-provision.js';
@@ -609,6 +610,7 @@ export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seam
     ...(s.correlationId !== undefined ? { correlationId: s.correlationId } : {}),
     ...(s.branchName ? { branchName: s.branchName } : {}),
     ...(s.maxReworkRounds !== undefined ? { maxReworkRounds: s.maxReworkRounds } : {}),
+    launch: resolveLaunchStamp({ entrance: plan.entrance, queueId: process.env.ELANOUS_HARNESS_QUEUE_LAUNCH }),
   };
 }
 
@@ -1093,10 +1095,12 @@ export async function buildDefaultSelfImplementSeams(
     provider: inferProviderFromModel(model) ? getProvider(model) : undefined,
     label,
   });
+  const primaryReviewAttempt = reviewAttemptForModel(reviewModel, 'primary');
   const reviewAttempts = buildReviewProviderAttempts(
-    reviewAttemptForModel(reviewModel, 'primary'),
-    reviewFallbackModels.map((model) => reviewAttemptForModel(model, model)),
-  );
+    primaryReviewAttempt,
+    [...reviewFallbackModels, defaultReviewFallbackModel(primaryReviewAttempt.provider?.name)]
+      .map((model) => reviewAttemptForModel(model, model)),
+  ).slice(0, 2);
   const defaultApiReview = async (prompt: string): Promise<string> => {
     const r = await runReviewWithFallback(
       reviewAttempts,

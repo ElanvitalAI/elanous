@@ -99,6 +99,8 @@ export interface EnhanceOpts {
   reasoningEffort?: 'low' | 'medium' | 'high';
   /** 산출물 유형 힌트(선택) — 예: 'PPT 발표덱', 'PLAN 문서'. 제약 문구 조정. */
   deliverableHint?: string;
+  /** Optional usage observer for the caller's authoring phase; missing usage stays unknown. */
+  onUsage?: (usage: LLMUsage) => void;
   /** 인핸싱 끄기(순수 verbatim). true 면 원문만 fenced 로 감싸 반환. */
   disabled?: boolean;
   /** Ask 원문 밖 스캐폴드에만 렌더할, 저작기가 관측한 디렉터리 실물 수. */
@@ -368,7 +370,10 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
     const rawOut = await streamLLM(messages, () => {}, {
       model,
       reasoningEffort: opts.reasoningEffort ?? 'high',
-      onUsage: (usage) => logLlmUsage(model, usage),
+      onUsage: (usage) => {
+        logLlmUsage(model, usage);
+        try { opts.onUsage?.(usage); } catch { /* usage observation must not change enhancement */ }
+      },
     });
     const parsed = parseEnhanceJson(rawOut);
     if (parsed) {

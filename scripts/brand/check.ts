@@ -12,6 +12,7 @@ type GlossaryEntry = { internal: string; public: string; publicForbidden: boolea
 const scopes: Scope[] = ['public-docs', 'release-notes', 'site', 'deck', 'skill', 'any'];
 const kinds: Kind[] = ['forbid', 'require-form', 'korean-in-english', 'number-needs-source'];
 const defaultRules = join(import.meta.dir, '../../docs/brand/brand-rules.yaml');
+export const BRAND_RULES_UNMEASURED = '규칙 없음 — 측정 불가';
 
 function loadRules(path: string): Rule[] {
   const document = parseYaml(readFileSync(path, 'utf8')) as unknown;
@@ -143,10 +144,10 @@ function findInFile(file: string, rules: Rule[], scope: Scope): Finding[] {
   return findings;
 }
 
-export function checkBrand(scope: Scope, paths: string[], rulesPath = defaultRules): { files: number; findings: Finding[]; rules: number; missing: boolean } {
+export function checkBrand(scope: Scope, paths: string[], rulesPath = defaultRules): { files: number; findings: Finding[]; rules: number; missing: boolean; message?: string } {
   if (!existsSync(rulesPath)) {
-    debug.log('brand.check', 'run', { scope, files: 0, findings: 0, rules: 0 });
-    return { files: 0, findings: [], rules: 0, missing: true };
+    debug.log('brand.check', 'run', { scope, files: 0, findings: 0, rules: 0, missing: true, message: BRAND_RULES_UNMEASURED });
+    return { files: 0, findings: [], rules: 0, missing: true, message: BRAND_RULES_UNMEASURED };
   }
   const applicable = loadRules(rulesPath).filter((rule) => scope === 'any' || rule.scope.includes('any') || rule.scope.includes(scope));
   const files = filesAt(paths);
@@ -172,13 +173,14 @@ if (import.meta.main) {
     }
     if (!scope || !scopes.includes(scope) || !paths.length || !rulesPath) throw new Error('usage: bun scripts/brand/check.ts --scope <scope> <file|folder...> [--rules <path>] [--json]');
     const result = checkBrand(scope, paths, rulesPath);
-    if (result.missing) console.log(json ? JSON.stringify({ ...result, message: '규칙 없음' }) : '규칙 없음');
+    if (result.missing) console.log(json ? JSON.stringify(result) : result.message);
     else if (json) console.log(JSON.stringify({ scope, ...result }));
     else {
       for (const finding of result.findings) console.log(`${finding.file}:${finding.line}:${finding.id}:${finding.match}`);
       console.log(`brand-check ${scope} files=${result.files} findings=${result.findings.length} rules=${result.rules}`);
     }
-    if (result.findings.length) process.exitCode = 1;
+    if (result.missing) process.exitCode = 2;
+    else if (result.findings.length) process.exitCode = 1;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 2;

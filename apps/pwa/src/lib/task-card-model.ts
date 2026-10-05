@@ -19,6 +19,7 @@ export interface TaskCard {
   updatedAt: number;
   runId?: string;
   apiTitle?: string;
+  wishReply?: { surface: string; address: string | null } | null;
 }
 
 export type BoardColumn = 'steward' | 'execution' | 'landing' | 'release' | 'done';

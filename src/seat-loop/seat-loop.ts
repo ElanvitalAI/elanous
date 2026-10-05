@@ -21,6 +21,7 @@ import { loadLayeredPersonaDirs, resolveRepositoryPersonaDir, resolveStatePerson
 import { orderedPersonaTodos, personaTodoPath, readPersonaTodos, type PersonaTodo } from '../persona/persona-todo.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { recordSeatAskShadow } from '../seat-dispatch/seat-ask.js';
+import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../seat-dispatch/seat-request-ledger.js';
 import { answerCrossCheck, answerSeat, askCrossCheck, askSeat, crossCheckAnswer, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatCrossChecks, seatQuestions, type CrossCheckJudgment, type SeatId } from '../seat-dispatch/seat-questions.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
@@ -42,8 +43,14 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
-export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off' };
+export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
+export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off'; modeDowngradeReason?: string };
+
+export function seatLoopTickLine(result: SeatLoopResult): string {
+  const suffix = (result.status === 'shadow' || result.status === 'skipped-off') && result.modeDowngradeReason
+    ? ` (live-safe 요청 · 이유: ${result.modeDowngradeReason})` : '';
+  return `seat loop ${result.seat}: ${result.status}${'runId' in result && result.runId ? ` ${result.runId}` : ''}${suffix}`;
+}
 export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null; action?: 'decision' | 'harness' | 'wait'; what?: string };
 export type SeatDeps = {
   personaConfig?: PersonaLoopConfig;
@@ -77,6 +84,8 @@ export type SeatDeps = {
   stallDelivery?: (message: MessageEnvelope, key: string, root: string) => boolean;
   /** Open cards from the decision ledger; injected only for isolated ledger tests. */
   pendingDecisions?: () => Array<Pick<DecisionEntry, 'id' | 'title' | 'category' | 'dueAt'>>;
+  /** Running-run observation for OP cutoff; incomplete observations cannot establish that a run is absent. */
+  cutoffRuns?: (runIds: readonly string[]) => Pick<ReturnType<typeof queryRunningRuns>, 'completeness' | 'entries' | 'pty'>;
   /** Read-only PR snapshot for TC judgment; defaults to GitHub CLI reads. */
   pullRequests?: () => Promise<TcPullRequest[]>;
   ledgerFiles?: (directory: string) => string[];
@@ -200,6 +209,10 @@ async function pickPersonaShadows(deps: SeatDeps, name?: string): Promise<Person
 
 export async function runSeatLoopTurn(seat: string, deps: SeatDeps = {}): Promise<SeatLoopResult> {
   const result = await runSeatLoopOnce(seat, deps);
+  if ((result.status === 'shadow' || result.status === 'skipped-off') && result.modeDowngradeReason) {
+    try { debug.log('seat-loop', 'mode-downgraded', { seat, requested: 'live-safe', effective: result.status, reason: result.modeDowngradeReason }); }
+    catch { /* logging cannot change execution */ }
+  }
   try { await runPersonaShadowOnce(deps); }
   catch (error) { observe('persona-shadow-error', { error: String(error).slice(0, 200) }); }
   try {
@@ -301,8 +314,18 @@ function decisionRef(seat: string, item: SeatItem): string {
   return `seat-loop:${seat}:${encodeURIComponent(itemKey(item))}`;
 }
 
+// The decision ledger counts Unicode characters and sentence boundaries before it stores a card.
+function decisionSummary(text: string): string {
+  const sentences = text.replace(/\s+/g, ' ').trim().split(/(?<=[.!?。！？])\s+/u).slice(0, 2).join(' ');
+  return Array.from(sentences).slice(0, 240).join('').trim();
+}
+
+function decisionSourceRef(seat: string, item: SeatItem): string {
+  return item.source === 'request' && item.id.startsWith('coord:') ? item.id : decisionRef(seat, item);
+}
+
 function decisionReceipt(root: string, seat: string, item: SeatItem): DecisionEntry | undefined {
-  const ref = decisionRef(seat, item);
+  const ref = decisionSourceRef(seat, item);
   return new DecisionLedger({ stateDir: root }).list({ status: 'all' }).find((card) => card.refs?.includes(ref));
 }
 
@@ -454,6 +477,62 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     if (request.source === 'seat-question' && ownedEvidence) request.evidence = ownedEvidence;
   }
   return { requests: pending, checklist, role: read(join(deps.repo ?? repoRoot, 'docs', 'roles', `${seat}.md`)).slice(0, 4_000) };
+}
+
+const OP_CUTOFF_WINDOW_MS = 2 * 60 * 60_000;
+const RUN_REFERENCE = /\brun-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
+function checkOpLandingCutoff(deps: SeatDeps, now: Date, path: string, stateRoot: string): SeatEntry | undefined {
+  const releaseRoot = deps.root ?? releaseLedgerRoot();
+  const shipped = releasedVersion(releaseRoot);
+  const schedule = (deps.schedules ?? (() => readSchedules(releaseRoot)))()
+    .filter((row) => /^\d+\.\d+\.\d+$/.test(row.version) && (!shipped || versionOrder(row.version, shipped) > 0))
+    .sort((a, b) => versionOrder(a.version, b.version))[0];
+  if (!schedule?.landBy) return;
+  const untilLanding = Date.parse(schedule.landBy) - now.getTime();
+  if (!Number.isFinite(untilLanding) || untilLanding < 0 || untilLanding > OP_CUTOFF_WINDOW_MS) return;
+  const append = deps.append ?? defaultAppend;
+  let items: ReturnType<NonNullable<SeatDeps['checklistItems']>>;
+  try { items = (deps.checklistItems ?? ((version: string) => listChecklist(version, releaseRoot).items))(schedule.version); }
+  catch (error) {
+    const entry: SeatEntry = { seat: 'OP', ts: now.toISOString(), at: now.toISOString(), status: 'shadow',
+      reason: `체크리스트 못 읽음: ${schedule.version} (${String(error).slice(0, 200)})`,
+      modeDowngradeReason: 'OP 판정은 shadow 기록만 구현' };
+    append(path, entry);
+    return entry;
+  }
+  const yellow = items.filter((item) => item.status === 'yellow');
+  const runIds = [...new Set(yellow.flatMap((item) => [...(item.evidence ?? '').matchAll(RUN_REFERENCE)].map(([id]) => id.toLowerCase())))];
+  let running = new Set<string>();
+  if (runIds.length) {
+    try {
+      const observed = (deps.cutoffRuns ?? ((ids: readonly string[]) => queryRunningRuns({ runIds: ids, caller: 'seat-loop.op-cutoff' })))(runIds);
+      if (observed.completeness !== 'complete' || observed.pty.unreadable.length) {
+        observe('op-cutoff-runs-unreadable', { version: schedule.version });
+        return;
+      }
+      running = new Set(observed.entries.filter((row) => row.status === 'running' || row.status === 'probable-running' || row.status === 'unknown')
+        .map((row) => row.runId.toLowerCase()));
+    } catch (error) {
+      observe('op-cutoff-runs-unreadable', { version: schedule.version, error: String(error).slice(0, 200) });
+      return;
+    }
+  }
+  const candidates = yellow.filter((item) => ![...(item.evidence ?? '').matchAll(RUN_REFERENCE)]
+    .some(([id]) => running.has(id.toLowerCase())))
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(({ id, title, owner }) => ({ id, title, owner: owner ?? '미배정' }));
+  try { debug.log('seat-loop', 'op-cutoff-check', { version: schedule.version, landBy: schedule.landBy, candidates }); }
+  catch { /* Observation cannot change a request. */ }
+  if (!candidates.length) return;
+  const key = `seat-loop:op-cutoff:${schedule.version}:${seatDay(now)}`;
+  const requestPath = join(stateRoot, 'seat-requests', 'requests.jsonl');
+  withSeatRequestLedgerLock(requestPath, () => {
+    if (listSeatRequests(stateRoot).some((row) => row.key === key)) return;
+    appendSeatRequestRows(requestPath, [{ key, seat: 'OP', status: 'pending' as const, queuedAt: now.toISOString(),
+      text: `${schedule.version} 착지 마감 ${schedule.landBy} 전 노랑 칸 점검 — 다음 판으로 옮길지 OP 판단:\n${candidates.map((item) => `${item.id} · ${item.title} · 주인 ${item.owner}`).join('\n')}`,
+      version: schedule.version, landBy: schedule.landBy, candidates }]);
+  });
 }
 
 function opCandidates(deps: SeatDeps, now: Date): OpCandidate[] {
@@ -827,9 +906,15 @@ function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps
 export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promise<SeatLoopResult> {
   if (!/^(?:MK|OP|TC|UX)$/.test(seat)) throw new Error(`unknown seat: ${seat}`);
   const config = deps.config ?? getUserConfig().loops?.seat ?? { mode: 'shadow' };
-  if (config.mode === 'off' || !(config.seats ?? ['MK']).includes(seat)) {
+  if (config.mode === 'off') {
     observe('skipped-off', { seat });
     return { seat, status: 'skipped-off' };
+  }
+  if (!(config.seats ?? ['MK']).includes(seat)) {
+    // An excluded seat does not read inputs or run the shadow loop; never report it as shadow.
+    observe('skipped-off', { seat });
+    return { seat, status: 'skipped-off',
+      ...(config.mode === 'live-safe' ? { modeDowngradeReason: '자리 목록에 없음 (loops.seat.seats)' } : {}) };
   }
   const now = (deps.now ?? (() => new Date()))();
   const path = seatLedgerPath(seat, deps.root ?? effectiveInstanceRoot(), now);
@@ -928,6 +1013,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       return entry;
     }
   }
+  let tcDowngrade: SeatEntry | undefined;
   if (seat === 'TC') {
     const candidates = await tcCandidates(deps, now);
     for (const candidate of candidates) {
@@ -938,18 +1024,26 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
           && row.candidate.version === candidate.version && row.candidate.id === candidate.id && row.candidate.to === candidate.to);
         if (!inLedger) {
           const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate,
+            ...(config.mode === 'live-safe' ? { modeDowngradeReason: 'TC 타 자리 결함 질문은 shadow 기록만 구현' } : {}),
             item: { source: 'checklist', kind: 'cell', id: candidate.id, title: candidate.title, text: candidate.title, version: candidate.version, seat: candidate.to },
             action: 'seat-question', inquiry: { to: candidate.to, question } };
           (deps.append ?? defaultAppend)(path, entry);
+          tcDowngrade ??= entry;
         }
         if (!inLedger || recorded) observe('ask-shadow', { from: seat, to: candidate.to, itemId: candidate.id });
         continue;
       }
       if (ledger.some((row) => row.status === 'shadow' && JSON.stringify(row.candidate) === JSON.stringify(candidate))) continue;
-      const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate };
+      const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate,
+        ...(config.mode === 'live-safe' ? { modeDowngradeReason: 'TC PR 판정은 shadow 기록만 구현' } : {}) };
       (deps.append ?? defaultAppend)(path, entry);
+      tcDowngrade ??= entry;
       observe('tc-shadow-candidate', { seat, candidate });
     }
+  }
+  if (seat === 'OP' && config.mode === 'live-safe') {
+    const unreadable = checkOpLandingCutoff(deps, now, path, stateRoot);
+    if (unreadable) return unreadable;
   }
   if (seat === 'OP' && !seatQuestions(stateRoot, 'OP').some((question) =>
     !hasSeatAnswer(stateRoot, question)
@@ -987,7 +1081,8 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
         if (id !== currentDecision.id) candidates.push({ kind: 'decision-delegation', id, verdict: 'none' });
       }
     }
-    const entries = candidates.map((candidate): SeatEntry => ({ seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate }));
+    const entries = candidates.map((candidate): SeatEntry => ({ seat, ts: now.toISOString(), at: now.toISOString(), status: 'shadow', candidate,
+      ...(config.mode === 'live-safe' ? { modeDowngradeReason: 'OP 판정은 shadow 기록만 구현' } : {}) }));
     for (const entry of entries) {
       const candidate = entry.candidate!;
       const previous = [...ledger].reverse().find((row) => row.candidate?.kind === candidate.kind &&
@@ -1003,7 +1098,12 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     }
     return entries[0]!;
   }
+  const failedDecisions = new Set<string>();
+  let lastDecisionFailure: SeatEntry | undefined;
+  while (true) {
   const inputs = await gatherSeatInputs(seat, deps, ledger);
+  inputs.requests = inputs.requests.filter((candidate) => !failedDecisions.has(itemKey(candidate)));
+  inputs.checklist = inputs.checklist.filter((candidate) => !failedDecisions.has(itemKey(candidate)));
   const questionsMode = config.mode === 'on' ? config.questions ?? 'shadow' : 'shadow';
   const questionHandled = handledKeys(ledger, questionsMode !== 'on', stateRoot);
   const pendingQuestion = inputs.requests.find((candidate) => candidate.source === 'seat-question'
@@ -1085,6 +1185,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
         entry.action = 'decision';
       }
       if (questionsMode !== 'on') {
+        if (config.mode === 'live-safe') entry.modeDowngradeReason = '질문 전달 선행 조건 미충족 (questions shadow)';
         if (config.mode === 'live-safe' && !isRescueAllowedAction('seat-question')) {
           observe('refused', { seat, item: item.id, action: 'seat-question', reason: 'question delivery is shadow-only' });
         }
@@ -1192,9 +1293,11 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   if (item && config.mode === 'live-safe' && deps.inquire && !isRescueAllowedAction('seat-question')) {
     observe('refused', { seat, item: item.id, action: 'seat-question', reason: 'outbound inquiry not in rescue policy' });
   }
+  if (!item && config.mode === 'live-safe' && tcDowngrade) return tcDowngrade;
   const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: item ? 'shadow' : 'skipped-empty',
     ...(item ? { item, action: planned!.kind, ...(planned!.reason ? { reason: planned!.reason } : {}) } : { action: 'skipped-empty' as const }) };
   if (config.mode === 'shadow' || !item) {
+    if (!item && lastDecisionFailure) return lastDecisionFailure;
     append(path, entry);
     if (config.mode === 'shadow') observe('shadow', { seat, item, status: entry.status });
     return entry;
@@ -1282,11 +1385,14 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   append(path, { ...entry, status: 'attempting' });
   try {
     if (action.kind === 'decision') {
-      const title = `${seat}: ${action.text.replace(/[\r\n]+/g, ' ')}`;
+      const title = `${seat}: ${decisionSummary(action.text)}`;
+      const source = decisionSourceRef(seat, item);
       const raised = await run(['decisions', 'raise', '--title', title, '--category', 'other',
-        '--s', `${seat} 배정 항목: ${action.text.replace(/[\r\n]+/g, ' ')}\n역할: ${inputs.role}`, '--c', '자동 실행 금지 문면에 해당하여 사람 결정이 필요하다',
+        '--s', decisionSummary(`${seat} 배정 항목: ${action.text.replace(/[\r\n]+/g, ' ')} 역할: ${inputs.role}`),
+        '--c', '자동 실행 금지 문면에 해당하여 사람 결정이 필요하다',
         '--option', 'a=사람 승인:승인 후 별도로 집행', '--option', 'b=보류:집행하지 않음',
-        '--skip-recommend', '금지 문면은 자동으로 권고하지 않는다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②', '--agent', 'seat-loop', '--json']);
+        '--skip-recommend', '금지 문면은 자동으로 권고하지 않는다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②',
+        '--agent', 'seat-loop', '--ref', source, '--json']);
       const decision: unknown = JSON.parse(raised.trim());
       if (!decision || typeof decision !== 'object' || typeof (decision as { id?: unknown }).id !== 'string') {
         throw new Error('decisions raise returned no decision id');
@@ -1332,8 +1438,18 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     observe('launched', { seat, item, runId });
     return entry;
   } catch (error) {
-    append(path, { ...entry, status: 'outcome-unknown' });
+    const failure: SeatEntry = { ...entry, status: 'outcome-unknown' };
+    append(path, failure);
+    if (action.kind === 'decision') {
+      lastDecisionFailure = failure;
+      const source = decisionSourceRef(seat, item);
+      try { debug.log('seat-loop', 'decision-raise-failed', { source, error: String(error) }); }
+      catch { /* A failed observation cannot interrupt the remaining items. */ }
+      failedDecisions.add(itemKey(item));
+      continue;
+    }
     throw error;
+  }
   }
   } catch (error) {
     turnError = error;

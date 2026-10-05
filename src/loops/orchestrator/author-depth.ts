@@ -1,5 +1,7 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { debug } from '../../debug/log.js';
 import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
 import { listHarnessQueue, type QueueItem } from '../../harness/harness-queue.js';
@@ -7,15 +9,19 @@ import { releaseLedgerRoot } from '../../instance/resolve.js';
 import { listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { listSchedules } from '../../release-loop/release-schedule.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorSeat } from '../../user-config.js';
+import { checkAuthorInput } from './author-input-check.js';
+import { AuthorLedger } from './author-ledger.js';
 import { collectWork, findOverlaps, type WorkItem } from './overlap.js';
 import { seatOfTree, trafficTick, TRAFFIC_SEATS } from './traffic.js';
 
-export type AuthorCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status'> & { version: string };
+export type AuthorCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status' | 'evidence'> & { version: string };
 export type AuthorQueueRow = Pick<QueueItem, 'seat' | 'status'> & Partial<Pick<QueueItem, 'input' | 'kind'>>;
 export type AuthorDepthResult = {
   seats: Array<{ seat: OrchestratorSeat; cap: number | null; running: number | null; queued: number | null;
     target: number | null; short: number | null; wouldAuthor: Array<{ cellId: string; version: string; title: string }> }>;
   unreadable: Array<{ source: string; reason: string }>;
+  receiptCounts?: { held: number; queuedForAuthor: number };
+  receiptFailures?: number;
 };
 export type AuthorDepthInput = {
   seats: readonly OrchestratorSeat[];
@@ -84,6 +90,7 @@ export function authorDepth({ seats, caps, running, queued, cells, overlaps, now
 }
 
 export interface CollectAuthorDepthDeps {
+  root?: string;
   seats?: readonly OrchestratorSeat[];
   now?: Date;
   caps?: () => Partial<Record<OrchestratorSeat, number>>;
@@ -92,12 +99,13 @@ export interface CollectAuthorDepthDeps {
   cells?: (version: string) => readonly AuthorCell[];
   overlaps?: () => readonly WorkItem[];
   versions?: () => readonly [string, string];
+  ledger?: Pick<AuthorLedger, 'request'>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
 }
 
-function defaultVersions(now: Date): readonly [string, string] {
-  if (!existsSync(join(releaseLedgerRoot(), 'release', 'features.sqlite'))) throw new Error('release schedule ledger unavailable');
-  const upcoming = listSchedules().filter(row => row.cutAt && Date.parse(row.cutAt) > now.getTime())
+function defaultVersions(now: Date, root = releaseLedgerRoot()): readonly [string, string] {
+  if (!existsSync(join(root, 'release', 'features.sqlite'))) throw new Error('release schedule ledger unavailable');
+  const upcoming = listSchedules(root).filter(row => row.cutAt && Date.parse(row.cutAt) > now.getTime())
     .sort((a, b) => Date.parse(a.cutAt) - Date.parse(b.cutAt));
   if (upcoming.length < 2) throw new Error('current and next release schedules unavailable');
   return [upcoming[0]!.version, upcoming[1]!.version];
@@ -123,12 +131,13 @@ export function collectAuthorDepth(deps: CollectAuthorDepthDeps = {}): AuthorDep
     if (measured.unassigned) throw new Error(`${measured.unassigned} unassigned harness launch process(es)`);
     return Object.fromEntries(measured.seats.map(row => [row.seat, row.running]));
   });
-  const queued = observe('queue', deps.queued ?? (() => listHarnessQueue()));
-  const versions = observe('versions', deps.versions ?? (() => defaultVersions(now)));
+  const queued = observe('queue', deps.queued ?? (() => listHarnessQueue({ root: deps.root })));
+  const releaseRoot = deps.root ?? releaseLedgerRoot();
+  const versions = observe('versions', deps.versions ?? (() => defaultVersions(now, releaseRoot)));
   const cells = versions === null ? null : observe('checklist', () => versions.flatMap(version => {
-    if (!deps.cells && !existsSync(join(releaseLedgerRoot(), 'release', 'features.sqlite')))
+    if (!deps.cells && !existsSync(join(releaseRoot, 'release', 'features.sqlite')))
       throw new Error('checklist ledger unavailable');
-    return deps.cells?.(version) ?? listChecklist(version).items.map(item => ({ ...item, version }));
+    return deps.cells?.(version) ?? listChecklist(version, deps.root).items.map(item => ({ ...item, version }));
   }));
   const overlaps = observe('overlap', deps.overlaps ?? (() => {
     const observed = collectWork();
@@ -141,7 +150,54 @@ export function collectAuthorDepth(deps: CollectAuthorDepthDeps = {}): AuthorDep
   for (const row of result.seats) log('loop.orchestrator', 'would-author', {
     seat: row.seat, target: row.target, have: row.queued, short: row.short, cells: row.wouldAuthor,
   });
+  const ledger = deps.ledger ?? new AuthorLedger(deps.root === undefined ? {} : { path: join(deps.root, 'orchestrator', 'author-ledger.sqlite') });
+  const receiptCounts = { held: 0, queuedForAuthor: 0 };
+  let receiptFailures = 0;
+  for (const row of result.seats) for (const candidate of row.wouldAuthor) {
+    const cell = cells?.find(item => item.id === candidate.cellId && item.version === candidate.version);
+    try {
+      if (!cell) throw new Error('selected cell unavailable');
+      const text = cell.evidence ?? '';
+      const check = checkAuthorInput({ title: cell.title, text, cellId: cell.id, version: cell.version });
+      const receipt = ledger.request({ seat: row.seat, cellId: cell.id, version: cell.version, title: cell.title,
+        text, check: { verdict: check.verdict, signals: check.signals, ratio: check.implementationRatio } });
+      if (receipt.status === 'held') receiptCounts.held++;
+      if (receipt.status === 'queued-for-author') receiptCounts.queuedForAuthor++;
+    } catch (error) {
+      receiptFailures++;
+      result.unreadable.push({ source: 'author-ledger', reason: `${candidate.version} ${candidate.cellId}: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+  result.receiptCounts = receiptCounts;
+  result.receiptFailures = receiptFailures;
   return result;
+}
+
+const SHADOW_INTERVAL_MS = 30 * 60_000;
+
+/** The queue tick serializes callers; stamp before collection so even a failing shadow cannot run every two minutes. */
+export function runAuthorDepthShadow(root = effectiveInstanceRoot(), now = new Date(), collect = collectAuthorDepth): void {
+  const path = join(root, 'orchestrator', 'author-depth-shadow-at');
+  const time = now.getTime();
+  if (!Number.isFinite(time)) throw new Error('invalid author-depth shadow clock');
+  if (existsSync(path)) {
+    const last = Date.parse(readFileSync(path, 'utf8').trim());
+    if (!Number.isFinite(last)) throw new Error('invalid author-depth shadow marker');
+    if (time - last < SHADOW_INTERVAL_MS) return;
+  }
+  mkdirSync(join(root, 'orchestrator'), { recursive: true });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, now.toISOString(), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, path);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* No temporary file to remove. */ }
+    throw error;
+  }
+  const result = collect({ root, now });
+  if (result.unreadable.length || result.receiptFailures || !result.receiptCounts) {
+    throw new Error(`author-depth shadow incomplete: ${JSON.stringify({ unreadable: result.unreadable, receiptFailures: result.receiptFailures })}`);
+  }
 }
 
 export function authorDepthLines(result: AuthorDepthResult): string[] {

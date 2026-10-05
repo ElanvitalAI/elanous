@@ -270,23 +270,54 @@ export class LogStore {
     this.db.run('CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, ts_ms)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_logs_surface ON logs(surface, ts_ms)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category, ts_ms)');
+    this.db.run(`CREATE TABLE IF NOT EXISTS pod_log_imports (
+      job TEXT NOT NULL,
+      line INTEGER NOT NULL,
+      PRIMARY KEY (job, line)
+    )`);
+  }
+
+  /** Insert each returned Pod line at most once per job, atomically with its receipt. */
+  insertPodBatch(job: string, rows: Array<{ rec: LogRecord; surface: string; line: number }>): number {
+    if (rows.length === 0) return 0;
+    const receipt = this.db.prepare('INSERT OR IGNORE INTO pod_log_imports (job, line) VALUES (?, ?)');
+    return this.db.transaction(() => {
+      const unseen = rows.filter(({ line }) => receipt.run(job, line).changes > 0);
+      this.insertBatch(unseen, { preserveRows: true });
+      return unseen.length;
+    })();
   }
 
   /** 배치 insert(단일 트랜잭션). 실패는 throw — fail-soft 는 호출측(StoreSink)
    *  책임(ops-log 의 recordOpsEvent/Safe 분업 동형). */
-  insertBatch(rows: Array<{ rec: LogRecord; surface: string }>): void {
+  insertBatch(rows: Array<{ rec: LogRecord; surface: string }>, opts: { preserveRows?: boolean } = {}): void {
     if (rows.length === 0) return;
     const stmt = this.db.prepare(
       `INSERT INTO logs (ts, ts_ms, level, instance, host_id, surface, category, event, session_id, trace_id, data)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
+    const decisionRow = this.db.prepare(`SELECT id FROM logs WHERE instance = ? AND category = 'loop.steward' AND event = 'decision'
+      AND json_valid(data) AND json_extract(data, '$.runId') = ? ORDER BY id DESC LIMIT 1`);
+    const updateDecision = this.db.prepare(`UPDATE logs SET ts = ?, ts_ms = ?, level = ?, surface = ?, data = ? WHERE id = ?`);
     const insertAll = this.db.transaction((batch: Array<{ rec: LogRecord; surface: string }>) => {
       for (const { rec, surface } of batch) {
         const tsMs = Date.parse(rec.ts);
+        const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
+        const level = deriveLogLevel(rec);
+        const data = rec.data !== undefined ? JSON.stringify(rec.data) : null;
+        const runId = rec.category === 'loop.steward' && rec.event === 'decision' &&
+          rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
+          ? (rec.data as Record<string, unknown>).runId : undefined;
+        const existing = !opts.preserveRows && typeof runId === 'string' && runId
+          ? decisionRow.get(this.instance, runId) as { id: number } | undefined : undefined;
+        if (existing) {
+          updateDecision.run(rec.ts, timestamp, level, surface, data, existing.id);
+          continue;
+        }
         stmt.run(
           rec.ts,
-          Number.isFinite(tsMs) ? tsMs : Date.now(),
-          deriveLogLevel(rec),
+          timestamp,
+          level,
           this.instance,
           rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
             && typeof (rec.data as Record<string, unknown>).hostId === 'string'
@@ -297,7 +328,7 @@ export class LogStore {
           rec.event,
           (rec as { session_id?: string }).session_id ?? null,
           rec.trace_id ?? null,
-          rec.data !== undefined ? JSON.stringify(rec.data) : null,
+          data,
         );
       }
     });

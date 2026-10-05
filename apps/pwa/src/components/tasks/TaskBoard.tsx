@@ -32,6 +32,17 @@ export function cardsFromEntries(entries: readonly TaskCardEntry[]): TaskCard[] 
 export function cardFromWire(wire: TaskCardWire): TaskCard {
   const entries: TaskCardEntry[] = [];
   const createdAt = Date.parse(wire.createdAt);
+  const replySection = wire.sections.find(section => section.key === 'intake:reply:0');
+  let wishReply: TaskCard['wishReply'] = null;
+  if (replySection) {
+    try {
+      const value: unknown = JSON.parse(replySection.content);
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const { surface, address } = value as Record<string, unknown>;
+        if (typeof surface === 'string' && (typeof address === 'string' || address === null)) wishReply = { surface, address };
+      }
+    } catch { /* An unreadable address is not a usable reply destination. */ }
+  }
   for (const section of wire.sections) {
     if (!SECTIONS.has(section.key as TaskCardSection)) continue;
     let data: Record<string, unknown>;
@@ -60,7 +71,8 @@ export function cardFromWire(wire: TaskCardWire): TaskCard {
       ts: Math.max(createdAt, ...entries.map((entry) => entry.ts)),
       data: { ...lastRelease?.data, status: 'done' } });
   }
-  return { ...foldCard(entries)!, apiTitle: wire.title };
+  return { ...foldCard(entries)!, apiTitle: wire.title,
+    ...(wire.goalId.startsWith('wish:') ? { wishReply } : {}) };
 }
 
 export function openIncidentCount(card: TaskCard): number {

@@ -13,6 +13,7 @@ import { runUpgrade } from './upgrade-node.js';
 import { runDocsLand } from './docs-land-node.js';
 import { runVerify } from './verify-node.js';
 import { runAutoApprove } from './auto-approve-node.js';
+import { runVaultNote } from './vault-note-node.js';
 import type { GraphContext } from './node-verdict.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -27,7 +28,7 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.status).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -40,7 +41,7 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -96,7 +97,7 @@ test('mac-smoke fail and error are warning-only: the graph continues to export-c
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -137,8 +138,38 @@ test('npm publish follows GitHub publication and failure continues to docs land'
       stdout: JSON.stringify(body.includes('npm-publish-node.ts') ? { outcome: 'fail', verdict: 'fail', summary: 'E401' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('done');
-    expect(state.path.slice(-7)).toEqual(['npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path.slice(-8)).toEqual(['npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'npm-publish')?.output))).toMatchObject({ outcome: 'fail', summary: 'E401' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('published graph vault-note recipe renders the cutoff manifest and keeps the route to ops-upgrade', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-vault-graph-'));
+  const vault = join(root, 'vault');
+  const version = '0.2.14';
+  const cut = 'a'.repeat(40);
+  try {
+    const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: Array<{ node_id: string; recipe?: string }>; edges: Array<{ from: string; map: Record<string, string> }> };
+    const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string }>;
+    expect(graph.nodes.find((node) => node.node_id === 'vault-note')?.recipe).toBe('cmd:vault-note');
+    expect(recipes['vault-note']?.command).toBe('bun scripts/release-loop/vault-note-node.ts');
+    // The vault note always continues to the release story, which then always continues to ops-upgrade (#24052).
+    expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map).toEqual({ ok: 'release-story', fail: 'release-story', error: 'release-story' });
+    expect(graph.edges.find((edge) => edge.from === 'release-story')?.map).toEqual({ ok: 'ops-upgrade', fail: 'ops-upgrade', error: 'ops-upgrade' });
+    const dir = join(root, 'release', version);
+    mkdirSync(join(dir, 'prepared'), { recursive: true });
+    writeFileSync(join(dir, 'release.json'), JSON.stringify({ version, tag: `v${version}`, sourceCommit: cut, publishedAt: '2026-10-05T09:00:00Z', publicRepo: 'ElanvitalAI/elanous' }));
+    writeFileSync(join(dir, 'prepared', 'notes-draft.md'), '# Release\n- Change\n');
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: cut }, in: [
+      { sha: 'c'.repeat(40), title: '하니스 "검증" 개선', prNumber: 1, line: '하니스 "검증" 개선' },
+      { sha: '', title: '지식 교훈 축적', line: '지식 교훈 축적' },
+    ] }));
+    expect(runVaultNote({ input: { version, previousVersion: '0.2.13' }, outputs: { verify: { outcome: 'ok' } } },
+      { instanceRoot: root, productionRoot: root, vaultRoot: vault, checklist: () => [] }).outcome).toBe('ok');
+    const content = readFileSync(join(vault, '40. Project/엘라누스 릴리스/0.x/0.2/엘라누스 v0.2.14 (2026-10-05).md'), 'utf8');
+    expect(content).toContain('### 하니스 (1건)\n\n- 하니스 "검증" 개선 (#1)');
+    expect(content).toContain('### 지식·교훈 (1건)\n\n- 지식 교훈 축적');
+    expect(yaml(content.split('---\n')[1]!)).toMatchObject({ title: '엘라누스 v0.2.14 — 하니스 "검증" 개선 · 지식 교훈 축적' });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -159,8 +190,64 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
         : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('done');
-    expect(state.path.slice(-8)).toEqual(['publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path.slice(-9)).toEqual(['publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'ops-upgrade')?.output))).toMatchObject({ outcome: 'fail', hosts: [{ host: 'node-b', ok: false }] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release story follows vault note and every outcome continues to ops upgrade', async () => {
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const graph = yaml(readFileSync(graphPath, 'utf8')) as {
+    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>;
+    edges: Array<{ from: string; map: Record<string, string> }>;
+  };
+  const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
+  expect(graph.nodes.find((node) => node.node_id === 'release-story')).toMatchObject({ kind: 'gate', recipe: 'cmd:release-story', max_visits: 1 });
+  expect(recipes['release-story']).toEqual({ command: 'bun scripts/release-story/draft.ts --graph', timeout_ms: 600000 });
+  expect(graph.edges.find((edge) => edge.from === 'vault-note')?.map).toEqual({ ok: 'release-story', fail: 'release-story', error: 'release-story' });
+  expect(graph.edges.find((edge) => edge.from === 'release-story')?.map).toEqual({ ok: 'ops-upgrade', fail: 'ops-upgrade', error: 'ops-upgrade' });
+  for (const outcome of ['ok', 'fail', 'error'] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'release-story-route-'));
+    try {
+      const state = await runGraph(graphPath, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({
+        exitCode: body.includes('release-story/draft.ts') ? outcome === 'ok' ? 0 : outcome === 'fail' ? 1 : 2 : 0,
+        stdout: JSON.stringify(body.includes('release-story/draft.ts') ? { outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: 'injected story result' } : { outcome: 'ok', verdict: 'pass' }) + '\n', stderr: '',
+      }) } });
+      expect(state.status).toBe('done');
+      expect(state.path.slice(-5)).toEqual(['vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('published graph executes the real story recipe into the isolated release directory and MK inbox once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-story-published-'));
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const version = '9.9.9';
+  const story = join(root, 'release', version, 'story');
+  const requests = join(root, 'seat-requests', 'requests.jsonl');
+  try {
+    const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      if (body.includes('release-story/draft.ts')) {
+        const child = spawnSync(process.execPath, [join(import.meta.dir, '../release-story/draft.ts'), '--graph'], {
+          cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, ELANOUS_STATE_DIR: root },
+        });
+        return { exitCode: child.status ?? 2, stdout: child.stdout, stderr: child.stderr };
+      }
+      return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+    };
+    for (let i = 0; i < 2; i++) {
+      const state = await runGraph(graphPath, { input: { version, previousVersion: '9.9.8' }, deps: { root, runBash } });
+      expect(state.status).toBe('done');
+      expect(state.path.slice(-5)).toEqual(['vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+      expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'release-story')?.output))).toMatchObject({ outcome: 'ok', status: 'drafted' });
+    }
+    expect(readFileSync(join(story, 'announcement.md'), 'utf8')).toContain(version);
+    expect(readFileSync(join(story, 'site-news.md'), 'utf8')).toContain(version);
+    expect(readFileSync(join(story, 'manual-candidates.md'), 'utf8')).toContain(version);
+    const rows = readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, string>);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ key: `release-story:${version}`, seat: 'MK', source: 'release-story', version,
+      status: 'pending', text: `${version} 공지 초안 준비됨: ${story}` });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -359,10 +446,10 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
-    expect(resumed.path.slice(-9)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'ops-upgrade', 'version-dev-bump', 'done']);
-    expect(commands).toHaveLength(21); // + vault-note (RELNOTE-VAULT)
-    expect(commands.at(-7)).toContain('publish-node.ts');
-    expect(commands.at(-6)).toContain('npm-publish-node.ts');
+    expect(resumed.path.slice(-10)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(commands).toHaveLength(22); // + vault-note and release-story
+    expect(commands.at(-8)).toContain('publish-node.ts');
+    expect(commands.at(-7)).toContain('npm-publish-node.ts');
     expect(commands.at(-1)).toContain('version-node.ts dev-bump');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

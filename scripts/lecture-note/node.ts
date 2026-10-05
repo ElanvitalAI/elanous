@@ -5,6 +5,7 @@ import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { debug } from '../../src/debug/log.js';
+import { runOcr } from '../../skills/omni-digest/src/ocr.js';
 import { streamLLM } from '../../src/llm.js';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
@@ -19,6 +20,7 @@ export interface Counts { inputs: number; diagrams: number; rendered: number; ht
 export interface StageResult extends Counts { outcome: 'ok' | 'skipped' }
 export interface StageOptions {
   llm?: (prompt: string) => Promise<string>;
+  ocr?: (filePath: string) => Promise<string>;
   toolsPath?: string;
   referenceRoot?: string;
 }
@@ -62,9 +64,9 @@ function binary(name: string, path = process.env.PATH ?? ''): string | undefined
   return undefined;
 }
 
-function run(bin: string, args: string[], dir: string, timeout: number): ReturnType<typeof spawnSync> {
+function run(bin: string, args: string[], dir: string, timeout: number, cacheDir = dir): ReturnType<typeof spawnSync> {
   return spawnSync(bin, args, { cwd: dir, encoding: 'utf8', timeout, maxBuffer: 20 * 1024 * 1024,
-    env: { ...process.env, HOME: dir, XDG_CACHE_HOME: dir, XDG_CONFIG_HOME: dir, UV_CACHE_DIR: dir, PYTHONDONTWRITEBYTECODE: '1' } });
+    env: { ...process.env, HOME: dir, XDG_CACHE_HOME: dir, XDG_CONFIG_HOME: dir, UV_CACHE_DIR: cacheDir, PYTHONDONTWRITEBYTECODE: '1' } });
 }
 
 function readInputs(dir: string): Input[] {
@@ -83,7 +85,7 @@ function counts(dir: string): Counts {
   return { inputs, diagrams, rendered, html: existsSync(join(dir, 'notes.html')) ? 'yes' : 'no', pdf: existsSync(join(dir, 'notes.pdf')) ? 'yes' : 'skipped' };
 }
 
-export function collect(folder: string, options: StageOptions = {}): StageResult {
+export async function collect(folder: string, options: StageOptions = {}): Promise<StageResult> {
   const dir = outputDir(folder);
   const files: Input[] = [];
   const pdfText = binary('pdftotext', options.toolsPath);
@@ -94,11 +96,22 @@ export function collect(folder: string, options: StageOptions = {}): StageResult
     const kind = kinds[extname(entry.name).toLowerCase()];
     if (!entry.isFile() || !kind) continue;
     const at = join(base, entry.name);
-    const text = kind === 'markdown' ? readFileSync(at, 'utf8') : kind === 'image' ? '이미지 — 시각 자료 (텍스트 추출 없음)' :
-      pdfText ? (() => {
-        const result = run(pdfText, ['-layout', at, '-'], dir, 60000);
-        return result.status === 0 ? String(result.stdout) : 'PDF 텍스트 없음 — pdftotext 추출 실패';
-      })() : 'PDF 텍스트 없음 — pdftotext 없음';
+    let text: string;
+    if (kind === 'markdown') text = readFileSync(at, 'utf8');
+    else if (kind === 'image') {
+      try {
+        const extracted = await (options.ocr ?? runOcr)(at);
+        if (!extracted.trim()) throw new Error('Upstage/OCR.space 폴백 결과가 비었다');
+        text = extracted;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        text = `이미지 텍스트 못 읽음 · ${reason}`;
+        debug.log('lecture-note.collect', 'ocr-failed', { name: prefix + entry.name, reason });
+      }
+    } else if (pdfText) {
+      const result = run(pdfText, ['-layout', at, '-'], dir, 60000);
+      text = result.status === 0 ? String(result.stdout) : 'PDF 텍스트 없음 — pdftotext 추출 실패';
+    } else text = 'PDF 텍스트 없음 — pdftotext 없음';
     files.push({ name: prefix + entry.name, kind, text });
   }
   writeFileSync(artifact(dir, 'inputs.json'), JSON.stringify(files, null, 2) + '\n');
@@ -131,19 +144,26 @@ export function render(folder: string, options: StageOptions = {}): StageResult 
   const renderer = join(options.referenceRoot ?? ownRoot, 'diagram-master/references/engines/mermaid/render_mermaid.py');
   const uv = binary('uv', options.toolsPath);
   let unavailable = 0;
+  let failed = 0;
   for (const [i, match] of [...notes.matchAll(mermaid)].entries()) {
     const png = artifact(dir, `diagram-${i + 1}.png`);
     if (existsSync(png)) rmSync(png);
     if (!uv || !existsSync(renderer)) { unavailable++; continue; }
     const mmd = artifact(dir, `diagram-${i + 1}.mmd`);
     writeFileSync(mmd, match[1]!);
-    const result = run(uv, ['run', 'python', renderer, mmd, '--output', png], dir, 120000);
+    const cacheDir = join(process.env.ELANOUS_STATE_DIR ?? join(homedir(), '.elanous'), 'lecture-note', 'uv-cache');
+    const result = run(uv, ['run', 'python', renderer, mmd, '--output', png], dir, 120000, cacheDir);
     if (result.status !== 0 || !existsSync(png)) {
       if (existsSync(png)) rmSync(png);
-      throw new Error(`Mermaid 렌더 실패 (diagram-${i + 1}, exit=${result.status}): ${result.error?.message ?? result.stderr ?? result.stdout ?? 'PNG 없음'}`);
+      failed++;
+      const detail = String(result.stderr ?? '').split(/\r?\n/)[0]?.trim() || result.error?.message ||
+        String(result.stdout ?? '').split(/\r?\n/)[0]?.trim() || 'PNG 없음';
+      const reason = `Mermaid 렌더 실패 (diagram-${i + 1}, exit=${result.status}): ${detail}`;
+      debug.log('lecture-note.render', 'diagram-failed', { name: `diagram-${i + 1}`, reason });
     }
   }
   if (unavailable) console.log(`렌더러 없음: ${unavailable}`);
+  if (failed) console.log(`못 그림: ${failed}`);
   return { ...counts(dir), outcome: 'ok' };
 }
 
@@ -216,7 +236,7 @@ export function pdf(folder: string, options: StageOptions = {}): StageResult {
 }
 
 export async function runStage(stage: Stage, folder: string, options: StageOptions = {}): Promise<StageResult> {
-  const result = stage === 'collect' ? collect(folder, options) : stage === 'draft' ? await draft(folder, options) :
+  const result = stage === 'collect' ? await collect(folder, options) : stage === 'draft' ? await draft(folder, options) :
     stage === 'render' ? render(folder, options) : stage === 'html' ? html(folder, options) : pdf(folder, options);
   debug.log('lecture.note', stage, { inputs: result.inputs, diagrams: result.diagrams, rendered: result.rendered, pdf: result.pdf });
   return result;

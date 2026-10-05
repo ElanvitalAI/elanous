@@ -7,6 +7,9 @@ import { acquireSlot, runHostRegate, type HostRegateDeps } from './host-regate.j
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { sweepFrozenMerges } from './frozen-merges.js';
+import { syncMergedPrChecklist } from '../release-loop/merged-pr-checklist.js';
+import { addItem, listChecklist } from '../release-loop/checklist.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'c'.repeat(40);
@@ -85,9 +88,12 @@ describe('host regate: never merge without a measured host pass', () => {
       writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '{"state":"%s","headRefOid":"${HEAD}"}\\n' "$(cat '${join(root, 'gh-state')}')"\n`);
       execFileSync('chmod', ['+x', join(bin, 'gh')]);
       process.env.PATH = `${bin}:${path ?? ''}`;
-      const held = { ...input, repoRoot: root };
+      const held = { ...input, repoRoot: root, goalFile: join(root, 'goal.md') };
       enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
       const { deps, calls } = mock({ freezeRoot: root });
+      // CL-AUTO: the resumed merge must still see the goal document to apply «이 칸 완료».
+      const synced: Array<string | undefined> = [];
+      deps.syncMergedChecklist = (_pr, _root, goalFile) => { synced.push(goalFile); };
       const command = deps.command!;
       deps.command = (bin, args, cwd, env) => {
         if (bin === 'gh' && args[0] === 'pr' && args[1] === 'merge') writeFileSync(join(root, 'gh-state'), 'MERGED');
@@ -99,6 +105,7 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(calls.filter((call) => call.startsWith('gh pr view 42 --json headRefOid'))).toHaveLength(2);
       const pending = () => JSON.parse(readFileSync(join(root, 'landing-freeze-pending.json'), 'utf8')) as unknown[];
       expect(pending()).toHaveLength(1);
+      expect(pending()[0]).toMatchObject({ goalFile: join(root, 'goal.md') });
       disableLandingFreeze(root);
       // A merge that reports success but GitHub still shows OPEN stays queued.
       const notYet = await sweepFrozenMerges(async () => ({ passed: true }), root);
@@ -106,6 +113,7 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(pending()).toHaveLength(1);
       const sweep = await sweepFrozenMerges((item) => runHostRegate(item, deps), root);
       expect(sweep).toEqual({ pending: 0, merged: 1 });
+      expect(synced).toEqual([join(root, 'goal.md')]);
       expect(pending()).toEqual([]);
       expect(calls.filter((call) => call.startsWith('gh pr merge'))).toEqual([`gh pr merge 42 --squash --match-head-commit ${HEAD}`]);
     } finally {
@@ -130,6 +138,38 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(inFlightLandingMerges(root)).toBe(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  test('confirmed main merge invokes checklist sync after confirmation; verifyOnly never does', async () => {
+    const synced: string[] = [];
+    const { deps, calls } = mock({ syncMergedChecklist: (number, cwd, goalFile) => { synced.push(`${number} ${cwd} ${goalFile}`); } });
+    const measured = await runHostRegate({ ...input, goalFile: '/repo/goal.txt', verifyOnly: true }, deps);
+    expect(measured.passed).toBe(true);
+    expect(synced).toEqual([]);
+    expect(calls).not.toContain(`gh pr merge 42 --squash --match-head-commit ${HEAD}`);
+    const landed = await runHostRegate({ ...input, goalFile: '/repo/goal.txt' }, deps);
+    expect(landed.passed).toBe(true);
+    expect(synced).toEqual(['42 /repo /repo/goal.txt']);
+    expect(calls.indexOf('gh pr view 42 --json state,mergeCommit')).toBeLessThan(calls.indexOf(`git fetch origin ${SQUASH}`));
+  });
+
+  test('confirmed main merge with a line-head 칸: X label writes one #42 history row and preserves yellow without declaration', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-checklist-'));
+    setElanousConfigDir(root);
+    try {
+      addItem('0.2.12', { id: 'X', title: 'X' });
+      const events: string[] = [];
+      const { deps } = mock({ syncMergedChecklist: (number, cwd, goalFile) => syncMergedPrChecklist(number, cwd, goalFile, {
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: 'misc', body: 'Implements release automation\n칸: X — release automation', mergedAt: '2026-10-02T00:00:00Z' }),
+        versions: () => ['0.2.12'], log: (_category, event) => { events.push(event); },
+      }) });
+      expect((await runHostRegate(input, deps)).passed).toBe(true);
+      const snapshot = listChecklist('0.2.12');
+      expect(snapshot.items.find(({ id }) => id === 'X')).toMatchObject({ id: 'X', evidence: '#42', status: 'yellow' });
+      expect(snapshot.history.filter(({ field }) => field === 'evidence.add')).toHaveLength(1);
+      expect(snapshot.history.filter(({ field }) => field === 'status')).toHaveLength(0);
+      expect(events).toEqual(['merged-pr-evidence-added']);
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('all gates pass: one head-pinned squash merge after the base re-read, confirmed MERGED, cleanup', async () => {
     const { deps, calls, events } = mock();
     const result = await runHostRegate(input, deps);

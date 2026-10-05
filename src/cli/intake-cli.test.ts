@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { intakeToTasksMessages, registerIntakeCommands, renderIntakeToTasksResult, runIntakeToTasksCli } from './intake-cli.js';
+import { intakeToTasksMessages, registerIntakeCommands, renderIntakeToTasksResult, runIntakeDigestCli, runIntakeToTasksCli } from './intake-cli.js';
 
 test('registers the complete intake command tree on a fresh Command with its help and options', () => {
   const program = new Command().name('elanous');
@@ -150,4 +150,16 @@ test('to-tasks CLI refuses an unavailable Nexus without consuming the goal line'
     expect(result.items).toMatchObject([{ status: 'failed', reason: 'intake-to-tasks request failed' }]);
     expect(result.items[0]!.id).toStartWith('goal:');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('intake digest --telegram annotates the lens before building the digest, and a lens failure still sends', async () => {
+  const order: string[] = [];
+  const sent = await runIntakeDigestCli({ telegram: true, day: '2026-10-05' }, {
+    root: '/tmp/intake-digest-lens-unused',
+    annotateLens: async () => { order.push('lens'); throw new Error('lens down'); },
+    buildDigest: () => { order.push('digest'); return { day: '2026-10-05', absorbed: [{ id: 'a', sources: [], axis: '그 밖' }], goals: [], grounding: 0, release: 0, manual: 0 }; },
+    sendTelegram: async () => { order.push('telegram'); return true; },
+  });
+  expect(order).toEqual(['lens', 'digest', 'telegram']);
+  expect(sent).toEqual({ sent: true });
 });

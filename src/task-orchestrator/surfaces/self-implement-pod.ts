@@ -15,10 +15,10 @@ import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skil
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import { GROUNDING_TOKEN_ENV, GROUNDING_URL_ENV, mintGroundingToken, revokeGroundingRun, type GroundingTokenScope } from '../../grounding/token.js';
 import { POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH, POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV, installationRepositories } from '../../nexus/api/pod-credential-api.js';
-import { githubInstallationCredential } from '../../auth/github-app-token.js';
+import { coalescedInstallationCredential } from '../../auth/github-app-token.js';
 import { POD_CREDENTIAL_TOKEN_ENV, POD_CREDENTIAL_URL_ENV } from '../../grok/credential.js';
 import { collectPodLedgers, createPodLedgerFollower } from './pod-ledger-collect.js';
-import { collectPodArtifacts } from './pod-artifact-return.js';
+import { collectPodArtifacts, podNoResultDiagnostic } from './pod-artifact-return.js';
 import { isValidAccountName, resolveCodexAccount } from '../../oauth/codex-account.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { controlInboxEnv } from '../../harness/control-inbox.js';
@@ -59,8 +59,10 @@ import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } fro
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
 import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
 import { goalTypeOf, type GoalType } from '../../../scripts/measure-pod-memory-by-goal.js';
+import { declaredGoalType, type GoalType as DeclaredGoalType } from '../../self-implement/goal-author.js';
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
 import { getUserConfig } from '../../user-config.js';
+import { extractPodFailureReason } from './pod-failure-reason.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
@@ -83,6 +85,11 @@ export interface PodSpawnOptions {
   rotationAccounts?: readonly string[];
   /** 미지정이면 종전 Codex Job. */
   provider?: 'openai-codex' | 'grok';
+  /** Child model/effort chosen at launch (`--child-llm-model/--child-llm-effort`) — carried into the Pod child. */
+  childModel?: string;
+  childEffort?: string;
+  /** True when the child provider was named at launch — the child gets explicit flags even for codex. */
+  childProviderExplicit?: boolean;
   /** 🔐 API 키 과금 허용은 명시 true 뿐. */
   grokApiKeyOptIn?: boolean;
   namespace?: string;
@@ -108,7 +115,7 @@ export interface PodSpawnOptions {
   pollMs?: number;
   kubectl?: Kubectl;
   /** Host-side regate (injected for Pod tests). */
-  hostRegate?: (input: { prNumber: number; headCommit: string; repoRoot: string }) => Promise<HostRegateResult>;
+  hostRegate?: (input: { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string }) => Promise<HostRegateResult>;
   /** PR comment for host-regate failures that never reached runHostRegate (injectable for tests). */
   ghComment?: (prNumber: number, body: string) => void;
   /** 🔑 Pod 필수 스킬의 키(.env)를 이 런의 Secret 으로 넘긴다 — 명시 opt-in(유료 크레딧을 쓴다). */
@@ -123,7 +130,8 @@ export interface PodSpawnOptions {
   mintGrounding?: (claims: { runId: string; job: string; ttlMs: number; scope?: GroundingTokenScope; repository?: string }) => Promise<{ token: string; exp: number }>;
   revokeGrounding?: (runId: string) => void;
   /** Test seam for the host's repository-scoped GitHub App installation token. */
-  githubInstallation?: (repository: string) => { token: string; expires_at?: string; expiresAt?: string | number } | null;
+  /** `fresh` = do not reuse a coalesced token (the exit-7 retry must not get the token that just failed back). */
+  githubInstallation?: (repository: string, opts?: { fresh?: boolean }) => { token: string; expires_at?: string; expiresAt?: string | number } | null;
   /** GitHub installation repository lookup; required to prove the scoped token matches owner/name. */
   githubRepositories?: (token: string) => Promise<readonly string[] | null>;
   now?: () => number;
@@ -184,6 +192,17 @@ export function hostCredentials(account: string, storePath: string = authStorePa
 
 /** A Pod gets a refresh-less access copy, so the copy must outlive the Job: same rule as the Codex path (3 h). */
 export const POD_GROK_MIN_VALIDITY_MS = 3 * 3600_000;
+/** PODCRED1 (10-05): an App installation token lives ~60 min and the host renews it in the Pod at the ten-minute
+ *  boundary; below this remaining life at launch the token is observed (`github-app-short-lived`). */
+export const POD_APP_TOKEN_MIN_START_MS = 20 * 60_000;
+/** Exit 7 (in-Pod GitHub login failed) is retried once after this spread backoff — bursts were simultaneous launches. */
+export const POD_GH_LOGIN_RETRY_BACKOFF_MS = 60_000;
+/** Base backoff plus a 0-59 s spread derived from the job name, so jobs that failed together retry apart. */
+export function podGhLoginRetryBackoffMs(job: string): number {
+  let spread = 0;
+  for (const ch of job) spread = (spread * 31 + ch.charCodeAt(0)) % 60;
+  return POD_GH_LOGIN_RETRY_BACKOFF_MS + spread * 1000;
+}
 
 /** resolveGrokCredential 과 동일한 출처를 읽되 Pod 로는 refresh 없는 access 사본만 보낸다.
  *  POD4 (10-01): the copy used to ship whatever the host had — an AUTH1 shard copied a token that had expired
@@ -453,11 +472,11 @@ export function podRunLabels(o: { runId?: string; parentRunId?: string }): Recor
 
 /** Pod 메모리 «등급» — 대표 09-27: PWA Pod 골이 16Gi 에서 OOM 으로 죽는다 ⇒ «high» 등급을 옵션으로 고른다.
  *  등급 = `standard`(`ELANOUS_POD_MEMORY` 또는 16Gi) · `high`(`ELANOUS_POD_MEMORY_HIGH` 또는 32Gi · standard 보다 작아지지 않는다).
- *  고르는 순서(앞이 이긴다): ① 발사 옵션 `--pod-memory <등급>`(→ `ELANOUS_POD_MEMORY_TIER`) ② 조각 문면 한 줄 `Pod 메모리: high|standard` ③ 조각의 `apps/pwa/` ④ 부모 골 본문의 같은 두 규칙 ⑤ standard.
+ *  고르는 순서(앞이 이긴다): ① 발사 옵션 `--pod-memory <등급>`(→ `ELANOUS_POD_MEMORY_TIER`) ② 조각 문면 `Pod 메모리: lite|standard|high` ③ 조각의 `apps/pwa/` ④ 부모의 명시 메모리 줄·PWA 경로 ⑤ 실측 권고 ⑥ 권고 없는 research/document 는 lite ⑦ standard.
  *  node-b 노드 할당 가능 약 251Gi. */
 export const POD_MEMORY_DEFAULT = '16Gi';
 export const POD_MEMORY_HIGH_DEFAULT = '32Gi';
-/** POD7 — `lite`(`ELANOUS_POD_MEMORY_LITE` 또는 2Gi): 명시할 때만(인자·문면 줄) · 자동 판정은 없다(성공 런 피크 기록 0 — 설계 §②). OOM 이면 POD9 가 high 로 한 번 다시 띄운다. */
+/** POD7 — `lite`(`ELANOUS_POD_MEMORY_LITE` 또는 2Gi): research/document 기본값; OOM 시 standard 로 한 단계 승급한다. */
 export const POD_MEMORY_LITE_DEFAULT = '2Gi';
 
 /** Reserve from measured per-run peaks, never from the advisory limit tier. Sparse or missing measurements keep the old reservation. */
@@ -475,7 +494,7 @@ export function podMemoryRequestFor(kind: GoalType | null, advice?: PodMemoryAdv
 }
 export const POD_MEMORY_TIERS = ['lite', 'standard', 'high'] as const;
 export type PodMemoryTier = (typeof POD_MEMORY_TIERS)[number];
-export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto' | 'advise';
+export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto' | 'advise' | 'goal-type-auto';
 const PWA_PATH = /(?:^|[\s`'"(,·])apps\/pwa\//m;
 const GOAL_LINE = /^[ \t]*(?:Pod 메모리|pod-memory)[ \t]*:[ \t]*(lite|standard|high)[ \t]*\r?$/im;
 
@@ -511,6 +530,10 @@ export function parsePodMemoryTier(v: string | undefined): PodMemoryTier | null 
   return t && (POD_MEMORY_TIERS as readonly string[]).includes(t) ? (t as PodMemoryTier) : null;
 }
 
+function parsePodGoalType(value: string | undefined): DeclaredGoalType | null {
+  return value === 'implement' || value === 'research' || value === 'document' || value === 'operate' ? value : null;
+}
+
 function memoryGi(v: string): number | null {
   const m = /^(\d+(?:\.\d+)?)(Gi|Mi)$/.exec(v);
   if (!m) return null;
@@ -521,9 +544,13 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
   const option = parsePodMemoryTier(env.ELANOUS_POD_MEMORY_TIER);
   const line = parsePodMemoryTier(GOAL_LINE.exec(feature)?.[1]);
   const parentLine = !option && !line ? parsePodMemoryTier(GOAL_LINE.exec(parentGoal ?? '')?.[1]) : null;
+  const declared = parsePodGoalType(env.ELANOUS_POD_GOAL_TYPE)
+    ?? declaredGoalType(feature) ?? declaredGoalType(parentGoal ?? '');
+  // 선언 «document» 는 실측 분류의 «docs» 다 — 낱말 판정(goalTypeOf)이 «document» 를 못 읽어 권고가 안 이어지던 구멍
   const goalType = advice && !option && !line && !parentLine
     ? (broadPodTestWarning(feature) ? 'test' : goalTypeOf(feature))
       ?? (parentGoal ? (broadPodTestWarning(parentGoal) ? 'test' : goalTypeOf(parentGoal)) : null)
+      ?? (declared === 'document' ? 'docs' : null)
     : null;
   const recommendation = advice?.byGoalType.find((entry) => entry.goalType === goalType && entry.evidence.runs > 0)?.recommended;
   const [tier, source]: [PodMemoryTier, PodMemorySource] = option ? [option, 'option']
@@ -531,8 +558,11 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
     // 조각 자신의 PWA 경로가 부모 줄·실측 권고보다 먼저다 — 부모 «standard» 가 PWA 조각을 16Gi 로 내리면 OOM(POD7 · #23569 순서 회귀)
     : goalTouchesPwa(feature) ? ['high', 'pwa-auto']
     : parentLine ? [parentLine, 'parent-goal-line']
-    : recommendation ? [recommendation, 'advise']
     : parentGoal && goalTouchesPwa(parentGoal) ? ['high', 'parent-pwa-auto']
+    // 실측이 high(OOM 증거)를 권하면 선언 종류의 자동 lite 보다 먼저다 — 문서 골도 OOM 이 났으면 다시 2Gi 로 띄우지 않는다
+    : recommendation === 'high' ? ['high', 'advise']
+    : declared === 'research' || declared === 'document' ? ['lite', 'goal-type-auto']
+    : recommendation ? [recommendation, 'advise']
     : ['standard', 'default'];
   if (tier === 'lite') return { limit: env.ELANOUS_POD_MEMORY_LITE?.trim() || POD_MEMORY_LITE_DEFAULT, tier, source };
   const base = env.ELANOUS_POD_MEMORY?.trim() || POD_MEMORY_DEFAULT;
@@ -540,6 +570,28 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
   const high = env.ELANOUS_POD_MEMORY_HIGH?.trim() || POD_MEMORY_HIGH_DEFAULT;
   const a = memoryGi(base), b = memoryGi(high);
   return { limit: a !== null && b !== null && a > b ? base : high, tier, source };
+}
+
+/** A named child provider decides the Pod provider (10-05 PODPROVIDER) — grok needs a usable credential, other names are refused. */
+export function podNamedChildProvider(named: string | undefined, credential: { grokSubscription: boolean; grokApiKey: boolean }): { provider?: 'openai-codex' | 'grok'; refuse?: string } {
+  if (!named) return {};
+  if (named === 'openai-codex' || named === 'codex') return { provider: 'openai-codex' };
+  if (named === 'grok') return credential.grokSubscription || credential.grokApiKey ? { provider: 'grok' } : { refuse: 'pod: Pod 에 grok 자격 없음 — 구독 자격이 쓸 수 없거나(만료 임박·갱신 불가) API 키 과금 동의(harness.pod.grokApiKeyOptIn)가 없다 · codex 로 조용히 돌리지 않는다' };
+  return { refuse: `pod: Pod 자식 provider 는 openai-codex|grok 만 — 받음 ${named}` };
+}
+
+/** Fallback credentials for the codex plan — a launch that named openai-codex never falls back to grok (post-review must-fix). */
+export function podFallbackCredentials(named: 'openai-codex' | 'grok' | undefined, fallback: { grokSubscription: boolean; grokApiKey: boolean }): { grokSubscription: boolean; grokApiKey: boolean } {
+  return named === 'openai-codex' ? { grokSubscription: false, grokApiKey: false } : fallback;
+}
+
+/** Child LLM flags for the Pod child — grok always names its model; codex only when the launch named it (10-05 PODPROVIDER). */
+export function podChildLlmArgs(options: Pick<PodSpawnOptions, 'provider' | 'childModel' | 'childEffort' | 'childProviderExplicit'>): string[] {
+  const provider = options.provider === 'grok' ? 'grok' : options.childProviderExplicit ? 'openai-codex' : undefined;
+  if (!provider) return [];
+  const model = options.childModel?.trim() || (provider === 'grok' ? defaultGrokModel().id : undefined);
+  // `self implement` registers no --child-llm-effort — passing it kills the Pod at argument parsing, so effort stays host-only.
+  return ['--child-llm-provider', provider, ...(model ? ['--child-llm-model', model] : [])];
 }
 
 export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean }): Record<string, unknown> {
@@ -735,7 +787,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     catch (error) { debug.log('self-implement.pod', 'memory-advice-unavailable', { spaceId: input.spaceId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
     const { limit: selectedMemoryLimit, tier: memoryTier, source: memorySource } = podMemoryLimitFor(input.feature, env, parentGoal, useAdvice && !explicitMemory ? advice : undefined);
     const requestKind = broadPodTestWarning(input.feature) ? 'test' : goalTypeOf(input.feature)
-      ?? (parentGoal ? (broadPodTestWarning(parentGoal) ? 'test' : goalTypeOf(parentGoal)) : null);
+      ?? (parentGoal ? (broadPodTestWarning(parentGoal) ? 'test' : goalTypeOf(parentGoal)) : null)
+      ?? ((parsePodGoalType(env.ELANOUS_POD_GOAL_TYPE) ?? declaredGoalType(input.feature) ?? declaredGoalType(parentGoal ?? '')) === 'document' ? 'docs' : null);
     for (const [where, text] of [['feature', input.feature], ['parent-goal', parentGoal]] as const) {
       if (text && text.split(/\r?\n/u).some((line) => /Pod 메모리/u.test(line) && !GOAL_LINE.test(line))) {
         const reason = '한 줄 단독 `Pod 메모리: high|standard` 형식이 아님';
@@ -749,9 +802,14 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     const after = input.after ?? podPredecessorFor(input.feature, env, parentGoal);
     if (after !== undefined) debug.log('self-implement.pod', 'predecessor', { spaceId: input.spaceId, after, source: input.after !== undefined ? 'input' : 'goal-or-option' });
     let oomRetried = false;
+    let retryTier: PodMemoryTier = memoryTier === 'lite' ? 'standard' : 'high';
     let retryFromChildRunId: string | undefined;
     let retryFromMemoryLimit: string | undefined;
-    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, goalType: requestKind, memoryLimit, tier: memoryTier, source: memorySource,
+    const selectedGoalType = parsePodGoalType(env.ELANOUS_POD_GOAL_TYPE) ?? declaredGoalType(input.feature) ?? declaredGoalType(parentGoal ?? '');
+    const memoryReason = memorySource === 'option' && ['explicit-option', 'goal-type-default', 'existing-tier'].includes(env.ELANOUS_POD_MEMORY_REASON ?? '')
+      ? env.ELANOUS_POD_MEMORY_REASON!
+      : memorySource === 'goal-type-auto' ? `declared goal type ${selectedGoalType}` : memorySource;
+    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, goalType: requestKind, declaredGoalType: selectedGoalType, memoryLimit, tier: memoryTier, source: memorySource, reason: memoryReason,
       ...(memorySource.startsWith('parent-') ? { inheritedFrom } : {}), ...(parentGoalUnreadable ? { parentGoal: 'unreadable' } : {}) });
     const childRunId = mintRunId();
     const executionKey = createHash('sha256').update(JSON.stringify({ spaceId: input.spaceId, feature: input.feature, base: input.base, autoMerge: input.autoMerge, autoReview: input.autoReview, openPr: input.openPr, draft: input.draft })).digest('hex');
@@ -769,6 +827,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (typeof intent.data.to !== 'string' || memoryGi(intent.data.to) === null) throw new Error('invalid OOM retry memory limit');
         oomRetried = true;
         memoryLimit = intent.data.to;
+        retryTier = parsePodMemoryTier(typeof intent.data.tier === 'string' ? intent.data.tier : undefined)
+          ?? ((memoryGi(intent.data.to) ?? 0) >= (memoryGi(podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit) ?? Infinity) ? 'high' : 'standard');
         retryFromChildRunId = typeof intent.data.fromChildRunId === 'string' ? intent.data.fromChildRunId : undefined;
         retryFromMemoryLimit = typeof intent.data.from === 'string' ? intent.data.from : undefined;
       }
@@ -783,7 +843,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       ...(input.draft === false ? ['--no-draft'] : []),
       ...(hostSupervised ? ['--no-supervise'] : []),
       ...(options.extraArgs ?? []),
-      ...(options.provider === 'grok' ? ['--child-llm-provider', 'grok', '--child-llm-model', defaultGrokModel().id] : []),
+      ...podChildLlmArgs(options),
     ];
     debug.log('pod.self-implement', 'child-supervise', { hostSupervised, childSupervise: !hostSupervised });
     const done = (async (): Promise<SelfImplementJobDone> => {
@@ -800,7 +860,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (!options.pool) return null;
         for (;;) {
           if (input.signal?.aborted) return null;
-          const acquired = options.pool.tryAcquire();
+          const acquired = await options.pool.tryAcquire();
           if (acquired) {
             debug.log('self-implement.pod', 'pool-slot', { spaceId: input.spaceId, context: acquired.context, inflight: options.pool.snapshot() });
             return acquired;
@@ -868,6 +928,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       let retrySamples: ReturnType<typeof parseMemSamples> = [];
       let failedAccount: string | undefined;
       let usageLimitRetried = false;
+      let ghLoginRetried = false;
       for (;;) {
       try {
         const grok = options.provider === 'grok';
@@ -930,10 +991,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           debug.log('self-implement.pod', 'credential-relay-skipped', { reason: 'no-host-url' });
         }
         const now = options.now ?? Date.now;
-        const issueVerifiedAppCredential = async (): Promise<{ token: string; expiresAt: number } | null> => {
+        const issueVerifiedAppCredential = async (fresh = false): Promise<{ token: string; expiresAt: number } | null> => {
           if (!repository) return null;
           // This is the same repository-scoped, contents+pull_requests installation request on launch and refresh.
-          const candidate = (options.githubInstallation ?? ((repo) => githubInstallationCredential({ scope: { repository: repo.split('/')[1]! } })))(repository);
+          const candidate = (options.githubInstallation ?? ((repo, o) => coalescedInstallationCredential({ repository: repo.split('/')[1]! }, { fresh: o?.fresh })))(repository, { fresh });
           if (!candidate?.token) return null;
           const expiry = candidate.expires_at ?? ('expiresAt' in candidate ? candidate.expiresAt : undefined);
           const expiresAt = typeof expiry === 'number' ? expiry : Date.parse(expiry ?? '');
@@ -943,8 +1004,13 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             ? { token: candidate.token, expiresAt } : null;
         };
         let appCredential: Awaited<ReturnType<typeof issueVerifiedAppCredential>> = null;
-        try { appCredential = await issueVerifiedAppCredential(); }
+        try { appCredential = await issueVerifiedAppCredential(ghLoginRetried); }
         catch { debug.log('self-implement.pod', 'github-app-unavailable', { job: name, reason: 'mint-or-verification-failed' }); }
+        // PODCRED1: a short token is still shipped — the host renews it in the Pod on the first live poll — but it is
+        // observed, so an exit-7 burst can be checked against the remaining life the Pods actually started with.
+        if (appCredential && appCredential.expiresAt - now() < POD_APP_TOKEN_MIN_START_MS) {
+          debug.log('self-implement.pod', 'github-app-short-lived', { job: name, expiresAt: new Date(appCredential.expiresAt).toISOString(), requiredSeconds: POD_APP_TOKEN_MIN_START_MS / 1000 });
+        }
         const githubRelay = appCredential && groundingUrl && repository
           ? await mint({ runId: groundingRunId, job: name, ttlMs: groundingTtlMs, scope: 'gh-credential', repository })
           : null;
@@ -1042,7 +1108,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         //   🩸 종전엔 여기서 delete 부터 해서, 재개가 원격에서 멀쩡히 돌던 Job 을 죽였다. 실패로 끝난 Job 만 지우고 다시 만든다.
         // ☸️ 노드 레지스트리에 이 판이 있으면 그것을 pull 한다(델타 · 대표 2026-09-26) — 라벨 판정은 로컬 이미지 이름으로 한다.
         const jobImage = member?.imageRef ?? image;
-        const launchRunId = retryAccount || oomRetried ? mintRunId() : childRunId;
+        const launchRunId = retryAccount || oomRetried || ghLoginRetried ? mintRunId() : childRunId;
         let liveChildRunId = launchRunId;
         let reattachedMemoryLimit: string | undefined;
         let existingExecutionKey: string | undefined;
@@ -1083,7 +1149,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         if (failedExisting) {
           const pods = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'jsonpath={range .items[*]}{.metadata.creationTimestamp}{"\\t"}{range .status.containerStatuses[?(@.name=="child")]}{.state.terminated.reason}{"\\t"}{.state.terminated.exitCode}{end}{"\\n"}{end}']);
-          const failedOom = pods.status === 0 && pods.stdout.split('\n').some((line) => { const fields = line.split('\t'); return fields[1] === 'OOMKilled' && fields[2]?.trim() === '137'; });
+          const latestPod = pods.status === 0 ? pods.stdout.trimEnd().split('\n').map((line) => line.split('\t'))
+            .filter(([created]) => created && !Number.isNaN(Date.parse(created)))
+            .sort((a, b) => Date.parse(b[0]!) - Date.parse(a[0]!))[0] : undefined;
+          const failedOom = latestPod?.[1]?.trim() === 'OOMKilled' && latestPod[2]?.trim() === '137';
           // Once attempt 2 exists, consume its terminal result even if it failed for a non-OOM reason.
           // Only the old, lower-memory attempt may be removed to make room for high.
           if (failedOom || oomRetried) reattach = !oomRetried || (memoryGi(reattachedMemoryLimit ?? '') ?? 0) >= (memoryGi(memoryLimit) ?? Infinity);
@@ -1096,21 +1165,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           debug.log('self-implement.pod', 'job-reattach', { job: name, conditions: existingConditions.join(' ') || 'running', spaceId: input.spaceId });
         }
         if (!hostRefresh && ghTokenExpiresAt === null && !githubRelay) debug.log('self-implement.pod', 'gh-token-app-skipped', { job: name, reason: 'no-verified-app-or-refresh-path' });
+        let appliedMemoryRequest: string | undefined;
         if (!reattach) {
         if (oomRetried && hasExistingJob && !failedExisting && memoryGi(reattachedMemoryLimit ?? '') === null) {
           return { exitCode: 1, output: '', error: { code: 'pod-memory-unavailable', message: `Job ${name} 실제 메모리 한도를 확인할 수 없다` } };
         }
         if (oomRetried && !retryAccount) {
-          const high = podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit;
-          if ((memoryGi(memoryLimit) ?? 0) < (memoryGi(high) ?? Infinity)) throw new Error(`pod: OOM 재시도 한도가 high 와 다름: ${memoryLimit}`);
+          const retryLimit = podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: retryTier }).limit;
+          if ((memoryGi(memoryLimit) ?? 0) < (memoryGi(retryLimit) ?? Infinity)) throw new Error(`pod: OOM 재시도 한도가 ${retryTier} 와 다름: ${memoryLimit}`);
           const leaseMembers = member ? [member] : [{ context, capacity: 1, k3dCluster: '' }];
           const lease = recommendConcurrency(measurePoolLease(leaseMembers, { kubectl: (args) => baseKubectl(args) }), {
-            capacity: leaseMembers.reduce((sum, item) => sum + item.capacity, 0), perGoalMemory: high, accounts: 0, perAccount: 0,
+            capacity: leaseMembers.reduce((sum, item) => sum + item.capacity, 0), perGoalMemory: retryLimit, accounts: 0, perAccount: 0,
           });
           if (lease.recommended === null || lease.placeableSlots === null || lease.placeableSlots < 1 || lease.memorySlots === null || lease.memorySlots < 1) {
-            return { exitCode: 1, output: '', error: { code: 'pod-lease', message: `OOM 재시도 high 자리 판정 실패: ${lease.reason ?? lease.limitedBy ?? 'no capacity'}\n${formatLastMemSample(retrySamples.at(-1))}` } };
+            return { exitCode: 1, output: '', error: { code: 'pod-lease', message: `OOM 재시도 ${retryTier} 자리 판정 실패: ${lease.reason ?? lease.limitedBy ?? 'no capacity'}\n${formatLastMemSample(retrySamples.at(-1))}` } };
           }
-          debug.log('self-implement.pod', 'oom-retry-lease', { job: name, context, memoryLimit: high, recommended: lease.recommended });
+          debug.log('self-implement.pod', 'oom-retry-lease', { job: name, context, memoryLimit: retryLimit, tier: retryTier, recommended: lease.recommended });
         }
         if (failedExisting && !reattach && !oomRetried && collectFullLogs('failed-job-logs-unavailable').status === 'incomplete') {
           return { exitCode: 1, output: '', error: { code: 'pod-collection-incomplete', message: `Job ${name} recovery incomplete — old Job retained` } };
@@ -1146,7 +1216,14 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const measuredRequest = podMemoryRequestFor(requestKind, advice);
         const requestGi = memoryGi(measuredRequest);
         const limitGi = memoryGi(memoryLimit);
-        const memoryRequest = requestGi !== null && limitGi !== null && requestGi > limitGi ? memoryLimit : measuredRequest;
+        const documentDefaultLite = !oomRetried && selectedGoalType === 'document' && memoryTier === 'lite'
+          && (memorySource === 'goal-type-auto' || memoryReason === 'goal-type-default');
+        const memoryRequest = documentDefaultLite ? memoryLimit
+          : requestGi !== null && limitGi !== null && requestGi > limitGi ? memoryLimit : measuredRequest;
+        appliedMemoryRequest = memoryRequest;
+        debug.log('self-implement.pod', 'memory-request', { spaceId: input.spaceId, job: name,
+          tier: oomRetried ? retryTier : memoryTier, reason: oomRetried ? 'OOMKilled' : memoryReason,
+          memoryLimit, memoryRequest });
         const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
@@ -1183,7 +1260,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         try {
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, attempt: oomRetried ? 2 : 1, ...(goalFile ? { goalFile } : {}) } }, ledgerDir);
-          if (oomRetried && retryFromChildRunId) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry', data: { attempt: 2, from: retryFromMemoryLimit ?? selectedMemoryLimit, to: memoryLimit, job: name, childRunId: liveChildRunId, fromChildRunId: retryFromChildRunId } }, ledgerDir);
+          appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-memory-selected', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, limit: memoryLimit, ...(appliedMemoryRequest ? { request: appliedMemoryRequest } : {}), tier: oomRetried ? retryTier : memoryTier, source: oomRetried ? 'oom-retry' : memorySource, reason: oomRetried ? 'OOMKilled' : memoryReason, declaredGoalType: selectedGoalType } }, ledgerDir);
+          if (oomRetried && retryFromChildRunId) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry', data: { attempt: 2, from: retryFromMemoryLimit ?? selectedMemoryLimit, to: memoryLimit, tier: retryTier, reason: 'OOMKilled', job: name, childRunId: liveChildRunId, fromChildRunId: retryFromChildRunId } }, ledgerDir);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           debug.log('self-implement.pod', 'parent-ledger-unavailable', { job: name, reason, attempt: oomRetried ? 2 : 1 });
@@ -1293,6 +1371,21 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const parsed = parseSelfImplementJson(logs);
         const terminal = parseSelfImplementJson(logs.trimEnd().split('\n').at(-1) ?? '');
         const nextAccount = codexAccounts?.find((candidate) => candidate !== account);
+        if (state === 'failed' && containerExitCode === 7 && !input.signal?.aborted) {
+          debug.log('self-implement.pod', 'gh-login-failed', { job: name, attempt: ghLoginRetried ? 2 : 1, tokenExpiresInSec: ghTokenExpiresAt === null ? null : Math.floor((ghTokenExpiresAt - now()) / 1000) });
+          if (!ghLoginRetried) {
+            const deleted = kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=true']);
+            if (deleted.status !== 0) throw new Error(`pod: GitHub 로그인 실패 Job 삭제 실패: ${deleted.stderr.trim()}`);
+            // Bursts came from simultaneous launches (10-05 12:49Z · 5 deaths in 2 s) — wait, spread by job name, then
+            // retry once with a newly issued token so the retries do not collide again.
+            const backoffMs = podGhLoginRetryBackoffMs(name);
+            debug.log('self-implement.pod', 'gh-login-retry-backoff', { job: name, backoffMs });
+            await sleep(backoffMs);
+            if (input.signal?.aborted) return { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before GitHub login retry' } };
+            ghLoginRetried = true;
+            continue;
+          }
+        }
         if (!usageLimitRetried && !input.signal?.aborted && state !== 'aborted' && terminal?.ok === false
           && /\b429\b/.test(terminal.error ?? '') && /\busage_limit_reached\b/.test(terminal.error ?? '') && nextAccount) {
           debug.log('self-implement.pod', 'usage-limit-retry', { job: name, spaceId: input.spaceId, from: account, to: nextAccount });
@@ -1316,7 +1409,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             try {
               const hostRoot = findGitDir(process.cwd())?.root;
               if (!hostRoot) throw new Error('host repository unavailable');
-              regate = await (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: hostRoot });
+              regate = await (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: hostRoot, ...(goalFile ? { goalFile } : {}) });
             } catch (error) {
               debug.log('harness.host-regate', 'unmeasured', { pr: prNumber, files: [], os: process.platform, failedStep: 'host-regate' });
               regate = { passed: false, failures: [{ step: 'host-regate', detail: error instanceof Error ? error.message : String(error) }], os: process.platform };
@@ -1335,7 +1428,16 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         const childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
           ? lastPodChildFailure(logs) : null;
+        let noResultDiagnostic: string | null = null;
+        if (state === 'failed' && containerExitCode !== null && containerExitCode !== 0 && !disposition && !oomKilled && failedReason !== 'DeadlineExceeded' && failedReason !== 'BackoffLimitExceeded') {
+          try { noResultDiagnostic = podNoResultDiagnostic(readFileSync(runLedgerPath(liveChildRunId, ledgerDir), 'utf8')); }
+          catch { /* ledger not returned: do not invent a stage */ }
+          noResultDiagnostic ??= 'child terminal result missing; last ledger stage=unknown; round=unknown; mustFix=unknown';
+        }
         if (childFailure) debug.log('self-implement.pod', 'child-error', { job: name, stage: childFailure.stage, error: childFailure.error }, { compact: { stringMax: 500 } });
+        if (noResultDiagnostic && !noResultDiagnostic.includes('stage=unknown')) {
+          debug.log('self-implement.pod', 'no-result-ledger-diagnostic', { job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic }, { compact: { stringMax: 500 } });
+        }
         debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness,
           ...(state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
             ? { ...(childFailure ? { childStage: childFailure.stage } : {}), childError: childFailure?.error ?? 'no-result-line' } : {}) },
@@ -1344,22 +1446,25 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           return { exitCode: 1, output: '', error: { code: 'pod-memory-unavailable', message: `Job ${name} 실제 메모리 한도를 확인할 수 없다` } };
         }
         if (oomKilled && failedReason !== 'DeadlineExceeded' && !input.signal?.aborted && !oomRetried) {
-          const high = podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit;
           const actual = memoryGi(reattachedMemoryLimit ?? memoryLimit);
+          const standardLimit = podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'standard' }).limit;
+          const nextTier: PodMemoryTier = actual !== null && actual < (memoryGi(standardLimit) ?? 0) ? 'standard' : 'high';
+          const nextLimit = podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: nextTier }).limit;
           if (actual === null) {
             return { exitCode: 1, output: '', error: { code: 'pod-memory-unavailable', message: `Job ${name} 실제 메모리 한도를 판정할 수 없다: ${memoryLimit}` } };
           }
-          if (actual < (memoryGi(high) ?? actual)) {
+          if (actual < (memoryGi(nextLimit) ?? actual)) {
             const from = reattachedMemoryLimit ?? memoryLimit;
-            appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry-intent', data: { attempt: 2, from, to: high, job: name, executionKey, fromChildRunId: liveChildRunId } }, ledgerDir);
-            debug.log('self-implement.pod', 'oom-retry', { from, to: high, job: name });
+            appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry-intent', data: { attempt: 2, from, to: nextLimit, tier: nextTier, reason: 'OOMKilled', job: name, executionKey, fromChildRunId: liveChildRunId } }, ledgerDir);
+            debug.log('self-implement.pod', 'oom-retry', { from, to: nextLimit, tier: nextTier, reason: 'OOMKilled', job: name });
             const deleted = kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=true']);
             if (deleted.status !== 0) throw new Error(`pod: OOM Job 삭제 실패: ${deleted.stderr.trim()}`);
             oomRetried = true;
             retryFromChildRunId = liveChildRunId;
             retryFromMemoryLimit = from;
             retrySamples = samples;
-            memoryLimit = high;
+            memoryLimit = nextLimit;
+            retryTier = nextTier;
             if (member) { options.pool!.release(member); member = null; }
             releaseAdmission?.();
             releaseAdmission = undefined;
@@ -1378,7 +1483,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           const record: GoalExecutionRecord = {
             runId: liveChildRunId,
             stage: (state === 'aborted' || !disposition ? 'aborted' : disposition.stage) as GoalExecutionRecord['stage'],
-            outcome: (!disposition ? 'pod-no-result' : state === 'complete' && disposition.merged ? 'merged' : state === 'complete' && disposition.ok ? 'completed' : 'abandoned') as GoalExecutionRecord['outcome'],
+            outcome: (!disposition ? noResultDiagnostic ? 'abandoned' : 'pod-no-result' : state === 'complete' && disposition.merged ? 'merged' : state === 'complete' && disposition.ok ? 'completed' : 'abandoned') as GoalExecutionRecord['outcome'],
             ok: state === 'complete' && (disposition?.ok ?? false),
             ...(disposition?.prNumber !== undefined ? { prNumber: disposition.prNumber } : {}),
             completedAt: new Date().toISOString(),
@@ -1402,16 +1507,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const finishedDisposition = deadlineExceeded && disposition
           ? { ...disposition, failureClassification: 'run-deadline-exceeded' as const }
           : disposition;
+        const podExitCode = state === 'complete' && disposition?.stage !== 'host-regate-failed' && disposition?.ok !== false ? 0 : 1;
+        // SCHED-CONTRACT: a failed child must say why outside the Pod, not «no error diagnostic».
+        const podReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds }) : undefined;
+        if (podReason) debug.log('self-implement.pod', 'failure-reason', { job: name, reason: podReason });
         return {
-          exitCode: state === 'complete' && disposition?.stage !== 'host-regate-failed' && disposition?.ok !== false ? 0 : 1,
+          exitCode: podExitCode,
           output: tail,
           ...(deadlineExceeded
             ? { error: { code: 'pod-deadline-exceeded', message: `Job ${name} 이 수명 상한 ${deadlineSeconds}초에 닿았다` } }
             : state === 'failed'
-              ? oomKilled
-                ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})${oomRetried || (memoryGi(reattachedMemoryLimit ?? memoryLimit) ?? 0) >= (memoryGi(podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit) ?? Infinity) ? ' — OOM · high 에서도' : ''}\n${formatLastMemSample(samples.at(-1))}` } }
-                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}${childFailure ? ` — childStage=${childFailure.stage} · childError=${childFailure.error}` : ' — childError=no-result-line'}` } }
-              : {}),
+              ? containerExitCode === 7
+                ? { error: { code: 'pod-gh-login-failed', message: `Job ${name} GitHub 앱 로그인 실패 (container=${containerReason ?? 'unknown'}/7, attempt=${ghLoginRetried ? 2 : 1}) — 새 토큰으로 ${ghLoginRetried ? '1회 재시도했으나 다시 실패' : '재시도 불가'}` } }
+              : oomKilled
+                ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})${oomRetried || (memoryGi(reattachedMemoryLimit ?? memoryLimit) ?? 0) >= (memoryGi(podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit) ?? Infinity) ? ` — OOM · ${oomRetried ? retryTier : 'high'} 에서도` : ''}\n${formatLastMemSample(samples.at(-1))}` } }
+                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}${childFailure ? ` — childStage=${childFailure.stage} · childError=${childFailure.error}` : ` — childError=no-result-line · reason=${podReason}`}${noResultDiagnostic ? ` · ${noResultDiagnostic}` : ''}` } }
+              : podReason && !childFailure?.error ? { error: { code: 'pod-child-failed', message: podReason } } : {}),
           ...(finishedDisposition ? { disposition: finishedDisposition } : {}),
         };
       } catch (err) {

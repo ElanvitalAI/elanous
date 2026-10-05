@@ -28,6 +28,7 @@ export interface CardTransport {
 const IRREVERSIBLE = new Set(['money', 'publish', 'security', 'irreversible', 'secret']);
 export const DECISION_DATA_PREFIX = 'dec:';
 const REMIND_BEFORE_MS = 2 * 3600_000;
+const WEBPUSH_MAX_SEND_ATTEMPTS = 3;
 
 export function isIrreversible(entry: Pick<DecisionEntry, 'category'>): boolean {
   return IRREVERSIBLE.has(entry.category);
@@ -99,7 +100,8 @@ interface CardState {
   /** First start of this platform's service — decisions raised before it are not pushed (no burst of old items at
    *  deploy); they stay reachable through `/decisions`. */
   since?: string;
-  cards: Record<string, { refs: CardRef[]; closed?: boolean; remindedAt?: string; note?: string }>;
+  cards: Record<string, { refs: CardRef[]; closed?: boolean; remindedAt?: string; note?: string; attempts?: number; noSubscribers?: boolean }>;
+  testOriginQuestions?: Record<string, true>;
 }
 
 export interface DecisionCardServiceOptions {
@@ -165,16 +167,27 @@ export class DecisionCardService {
       for (const record of pending.questions) {
         for (const question of record.questions) {
           const data = { questionId: record.id, runId: record.runId };
+          const logSkip = (reason: string): void => debug.log('hitl.card-bridge', 'skipped', { ...data, reason });
+          // Path is not provenance: operational goals can live under the OS temporary directory too.
+          if (record.testOrigin === true) {
+            state.testOriginQuestions ??= {};
+            if (!state.testOriginQuestions[record.id]) {
+              state.testOriginQuestions[record.id] = true;
+              dirty = true;
+              debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'test-origin' });
+            }
+            continue;
+          }
           if (record.expiresAt && record.expiresAt <= this.now().toISOString()) {
-            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'expired' });
+            logSkip('expired');
             continue;
           }
           if (question.impact !== 'high' && question.impact !== 'critical') {
-            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'impact' });
+            logSkip('impact');
             continue;
           }
           if (record.questions.length !== 1 || question.options.length < 2 || question.options.length > 4) {
-            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'options' });
+            logSkip('options');
             continue;
           }
           if (seen.has(record.id)) {
@@ -200,7 +213,7 @@ export class DecisionCardService {
             all.unshift(entry);
             debug.log('hitl.card-bridge', 'raised', { ...data, decisionId: entry.id });
           } catch (error) {
-            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: error instanceof Error ? error.name : 'unknown' });
+            logSkip(error instanceof Error ? error.name : 'unknown');
           }
         }
       }
@@ -208,13 +221,26 @@ export class DecisionCardService {
     const chats = await this.opts.transport.ownerChats().catch(() => [] as string[]);
     for (const e of all) {
       const card = state.cards[e.id];
-      if (e.status === 'open' && !card && e.options.length >= 2 && e.raisedAt !== undefined && e.raisedAt >= state.since) {
+      if (e.status === 'open' && (!card || (platform === 'webpush' && !card.refs.length && (card.attempts ?? 0) < WEBPUSH_MAX_SEND_ATTEMPTS))
+        && e.options.length >= 2 && e.raisedAt !== undefined && e.raisedAt >= state.since) {
+        if (platform === 'webpush' && !chats.length) {
+          if (!card?.noSubscribers) {
+            state.cards[e.id] = { ...(card ?? { refs: [] }), noSubscribers: true };
+            dirty = true;
+            debug.log('decisions.webpush', 'no-subscribers', { id: e.id });
+          }
+          continue;
+        }
         const refs: CardRef[] = [];
         for (const chat of chats) {
           const ref = await this.opts.transport.send(chat, renderCard(e)).catch(() => null);
           if (ref) refs.push(ref);
         }
-        if (refs.length) { state.cards[e.id] = { refs }; sent++; }
+        if (platform === 'webpush') {
+          state.cards[e.id] = { ...(card ?? { refs: [] }), refs, attempts: (card?.attempts ?? 0) + 1 };
+          dirty = true;
+        } else if (refs.length) state.cards[e.id] = { refs };
+        if (refs.length) sent++;
         debug.log('decisions.telegram', 'card-sent', { platform, id: e.id, category: e.category, chats: chats.length, delivered: refs.length });
         continue;
       }

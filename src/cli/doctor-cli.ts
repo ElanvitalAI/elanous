@@ -39,6 +39,7 @@ import { formatDoctorLocalLlm, probeDoctorLocalLlm, type DoctorLocalLlm } from '
 import type { LlmInventory } from '../llm/local-manager/types.js';
 import { buildDoctorBundle } from './doctor-bundle.js';
 import { uploadDoctorBundle } from './doctor-bundle-upload.js';
+import { checkNodeModules, formatNodeModulesCheck, nodeModulesTrees } from './doctor-node-modules.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -1216,9 +1217,30 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
   const out = deps.out ?? { log: (value: string) => console.log(value) };
   const err = deps.err ?? { error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
-  program.command('doctor')
+  const doctor = program.command('doctor')
     .description('Reports whether credentials resolve and where each resolution comes from')
+    .option('--json', 'structured output');
+  doctor.command('node-modules')
+    .description('Check installed top-level packages against bun.lock (read-only)')
+    .option('--dir <tree>', 'tree to check', process.cwd())
+    .option('--all', 'also check nested package.json trees')
     .option('--json', 'structured output')
+    .action((opts: { dir: string; all?: boolean; json?: boolean }, command: Command) => {
+      const json = opts.json || command.parent?.opts().json === true;
+      let dirs: string[];
+      try { dirs = opts.all ? nodeModulesTrees(opts.dir) : [resolve(opts.dir)]; }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (json) out.log(JSON.stringify({ status: 'unreadable', reason }));
+        else out.log(`unreadable: ${reason}`);
+        setExitCode(1);
+        return;
+      }
+      const checks = dirs.map(checkNodeModules);
+      out.log(json ? JSON.stringify(opts.all ? checks : checks[0], null, 2) : checks.map(formatNodeModulesCheck).join('\n'));
+      if (checks.some((check) => check.status !== 'ok')) setExitCode(1);
+    });
+  doctor
     .option('--credentials', 'show per-credential details in human-readable output')
     .option('--bundle', 'write a redacted diagnostics archive for support')
     .option('--upload', 'send the bundle to diagnostics.uploadUrl after consent (requires --bundle)')

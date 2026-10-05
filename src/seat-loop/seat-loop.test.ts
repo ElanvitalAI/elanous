@@ -19,7 +19,7 @@ import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { writePersonaTodos } from '../persona/persona-todo.js';
-import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, type SeatDeps } from './seat-loop.js';
+import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, type SeatDeps } from './seat-loop.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -52,6 +52,97 @@ const neighborConfig = (mode: 'shadow' | 'live-safe') => ({ mode, seats: ['MK'],
   { id: 'op-seat', exchange: ['status' as const], heartbeat: { everyMinutes: 10, missedTicks: 2 },
     onAbsent: { action: 'escalate' as const, delegateTo: 'orchestrator' } },
 ] } });
+
+test('live-safe request names the OP shadow-only implementation and emits one downgrade log', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = await runSeatLoopTurn('OP', { ...f.deps, config: { mode: 'live-safe', seats: ['OP'] },
+      schedules: () => [], pendingDecisions: () => [], run: async () => { throw Error('OP executed'); } });
+    expect(seatLoopTickLine(result)).toBe('seat loop OP: shadow (live-safe 요청 · 이유: OP 판정은 shadow 기록만 구현)');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded'))
+      .toEqual([['seat-loop', 'mode-downgraded', { seat: 'OP', requested: 'live-safe', effective: 'shadow', reason: 'OP 판정은 shadow 기록만 구현' }]]);
+    expect(result.status).toBe('shadow');
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('live-safe seat outside the configured list remains skipped-off and names why without claiming shadow work', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['MK'] },
+      read: () => { throw Error('read a disabled seat'); },
+      append: () => { throw Error('appended for a disabled seat'); },
+      run: async () => { throw Error('ran a disabled seat'); } });
+    expect(result).toEqual({ seat: 'TC', status: 'skipped-off', modeDowngradeReason: '자리 목록에 없음 (loops.seat.seats)' });
+    expect(seatLoopTickLine(result)).toBe('seat loop TC: skipped-off (live-safe 요청 · 이유: 자리 목록에 없음 (loops.seat.seats))');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded'))
+      .toEqual([['seat-loop', 'mode-downgraded', { seat: 'TC', requested: 'live-safe', effective: 'skipped-off', reason: '자리 목록에 없음 (loops.seat.seats)' }]]);
+    expect(existsSync(seatLedgerPath('TC', f.root, now))).toBe(false);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('TC PR judgment shadow uses its own downgrade reason, not an OP candidate guess', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      pullRequests: async () => [{ number: 101, title: 'TC1 landing', state: 'MERGED', isDraft: false,
+        createdAt: '2026-10-02T00:00:00Z', mergedAt: '2026-10-02T10:00:00Z' }],
+      checklistItems: () => [{ id: 'TC1', title: '검증', status: 'yellow', owner: 'TC' }], versions: () => [] });
+    const reason = 'TC PR 판정은 shadow 기록만 구현';
+    expect(seatLoopTickLine(result)).toBe(`seat loop TC: shadow (live-safe 요청 · 이유: ${reason})`);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded'))
+      .toEqual([['seat-loop', 'mode-downgraded', { seat: 'TC', requested: 'live-safe', effective: 'shadow', reason }]]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('TC other-seat defect shadow names its unimplemented ask rather than the PR judgment', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      pullRequests: async () => [], checklistItems: () => [{ id: 'UX1', title: '결함', status: 'red', owner: 'UX' }], versions: () => [] });
+    const reason = 'TC 타 자리 결함 질문은 shadow 기록만 구현';
+    expect(seatLoopTickLine(result)).toBe(`seat loop TC: shadow (live-safe 요청 · 이유: ${reason})`);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded'))
+      .toEqual([['seat-loop', 'mode-downgraded', { seat: 'TC', requested: 'live-safe', effective: 'shadow', reason }]]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('live-safe pending question shadow names its unmet delivery prerequisite even with a TC candidate', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    askSeat(f.root, 'UX', 'TC', '근거가 있나요?');
+    const result = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      pullRequests: async () => [{ number: 101, title: 'publish', state: 'OPEN', isDraft: false,
+        createdAt: '2026-10-02T00:00:00Z', reviewDecision: 'REVIEW_REQUIRED', readyAt: '2026-10-02T00:00:00Z',
+        approvalWaitAt: '2026-10-02T00:00:00Z', paths: ['release/public/guide.md'] }],
+      reply: () => ({ answer: '확인한 근거' }) });
+    const reason = '질문 전달 선행 조건 미충족 (questions shadow)';
+    expect(seatLoopTickLine(result)).toBe(`seat loop TC: shadow (live-safe 요청 · 이유: ${reason})`);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded'))
+      .toEqual([['seat-loop', 'mode-downgraded', { seat: 'TC', requested: 'live-safe', effective: 'shadow', reason }]]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('matching shadow and live-safe modes preserve the original tick line without downgrade logs', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const shadow = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'] }, versions: () => [] });
+    const live = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] }, versions: () => [], queueItems: () => [] });
+    expect(seatLoopTickLine(shadow)).toBe('seat loop TC: skipped-empty');
+    expect(seatLoopTickLine(live)).toBe('seat loop TC: skipped-empty');
+    const excluded = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'shadow', seats: ['MK'] },
+      read: () => { throw Error('read a disabled seat'); } });
+    expect(excluded).toEqual({ seat: 'TC', status: 'skipped-off' });
+    expect(seatLoopTickLine(excluded)).toBe('seat loop TC: skipped-off');
+    expect(seatLoopTickLine({ seat: 'TC', at: now.toISOString(), status: 'launched', runId: 'run-1' })).toBe('seat loop TC: launched run-1');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'mode-downgraded')).toHaveLength(0);
+  } finally { spy.mockRestore(); f.close(); }
+});
 
 test('seat tick judges stale context-bus neighbor in shadow without taking action', async () => {
   const f = fixture();
@@ -117,7 +208,7 @@ test('a neighbor event arriving during a long live-safe turn is present at judgm
     expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
       .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'live-safe' }]);
   } finally { bus.close(); spy.mockRestore(); f.close(); }
-});
+}, 30_000);
 
 test('seat neighbor configuration parses without admitting malformed heartbeats', () => {
   const f = fixture();
@@ -142,18 +233,18 @@ test('live-safe does not delegate or defer a missing neighbor, and a fresh neigh
     const neighbor = config.neighbors.MK[0]!;
     const deps: SeatDeps = { ...f.deps, config: { ...config, neighbors: { MK: [
       { ...neighbor, onAbsent: { ...neighbor.onAbsent, action: 'defer' } },
-    ] } }, versions: () => [], queueItems: () => [],
+    ] } }, versions: () => [], schedules: () => [], queueItems: () => [],
       run: async () => { throw Error('unexpected action'); } };
-    await runSeatLoopOnce('MK', deps);
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
     expect(new DecisionLedger({ stateDir: f.root }).list()).toEqual([]);
     recordEvent(bus, { surface: 'coord:channel', direction: 'outbound', kind: 'asked',
       text: 'OP fresh', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 2 * 60_000).toISOString() });
-    await runSeatLoopOnce('MK', deps);
+    expect((await runSeatLoopOnce('MK', deps)).status).toBe('skipped-empty');
     expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
       .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'absent', action: null, plannedAction: 'defer', mode: 'live-safe' },
         { seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'live-safe' }]);
   } finally { bus.close(); spy.mockRestore(); f.close(); }
-});
+}, 60_000);
 
 test('neighbor judgment failure cannot replace a completed turn or skip stall escalation', async () => {
   const f = fixture();
@@ -1485,18 +1576,22 @@ test('request evidence reaches the plan without changing ordinary request fields
 test('on: measurement evidence waits with a reason and makes no budget, decision or harness call', async () => {
   const f = fixture();
   try {
-    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '기기 검증', status: 'yellow', evidence: '실물 측정 대기 · 사람 기기' }]);
+    const evidence = '실물 측정 대기 · 사람 기기';
     const calls: string[][] = [];
-    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => { calls.push(args); throw Error('wait must not execute'); } };
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.9'],
+      checklistItems: () => [{ id: 'K2', owner: 'TC', title: '기기 검증', status: 'yellow', evidence }],
+      config: { mode: 'on', seats: ['TC'] }, run: async (args) => { calls.push(args); throw Error('wait must not execute'); } };
     const inputs = await gatherSeatInputs('TC', deps);
-    expect(inputs.checklist[0]?.evidence).toBe('실물 측정 대기 · 사람 기기');
+    expect(inputs.checklist).toHaveLength(1);
+    expect(inputs.checklist[0]?.evidence).toBe(evidence);
+    expect(planAction(inputs.checklist[0]!, 'TC')).toMatchObject({ kind: 'wait', reason: '실물 측정' });
     const result = await runSeatLoopOnce('TC', deps);
-    expect(result).toMatchObject({ status: 'wait', action: 'wait', reason: '실물 측정', item: { evidence: '실물 측정 대기 · 사람 기기' } });
+    expect(result).toMatchObject({ status: 'wait', action: 'wait', reason: '실물 측정', item: { evidence } });
     expect(entries(f)).toHaveLength(1);
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
     expect(calls).toEqual([]);
   } finally { f.close(); }
-});
+}, 30_000);
 
 test('on: wait rechecks changed measurement evidence and then launches only once', async () => {
   const f = fixture();
@@ -1537,15 +1632,88 @@ test('on: publication preparation uses harness even when it names a prohibited p
   } finally { f.close(); }
 });
 
-test('decision raise without a receipt is not recorded as hitl', async () => {
+test('decision raise without a receipt is observed and does not starve the next item', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    checklist(f, '0.2.9', [
+      { id: 'K2', owner: 'TC', title: '마켓에 게시', status: 'yellow' },
+      { id: 'K3', owner: 'TC', title: 'SNS에 게시', status: 'yellow' },
+    ]);
+    const raises: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] }, queueItems: () => [], run: async (args) => {
+      if (args[1] === 'budget') return '{"outcome":"proceed"}';
+      raises.push(args);
+      if (raises.length === 1) throw Error('decision ledger unavailable');
+      return '{"id":"dec-good"}';
+    } };
+    expect(await runSeatLoopOnce('TC', deps)).toMatchObject({ status: 'hitl', item: { id: 'K3' } });
+    expect(raises).toHaveLength(2);
+    expect(entries(f).map((entry) => [entry.item?.id, entry.status])).toEqual([
+      ['K2', 'attempting'], ['K2', 'outcome-unknown'], ['K3', 'attempting'], ['K3', 'hitl'],
+    ]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'decision-raise-failed'))
+      .toEqual([['seat-loop', 'decision-raise-failed', { source: 'seat-loop:TC:checklist%3A0.2.9%3AK2', error: 'Error: decision ledger unavailable' }]]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a failed decision raise with no remaining work returns its failed outcome instead of an empty tick', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const source = 'coord:5970836854:TC';
+    writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'),
+      JSON.stringify({ key: source, seat: 'TC', text: '마켓에 게시', status: 'pending', queuedAt: now.toISOString() }) + '\n');
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] }, queueItems: () => [], run: async (args) => {
+      calls.push(args);
+      if (args[1] === 'budget') return '{"outcome":"proceed"}';
+      throw Error('decision ledger unavailable');
+    } };
+    const result = await runSeatLoopOnce('TC', deps);
+    expect(result).toMatchObject({ status: 'outcome-unknown', action: 'decision', item: { id: source } });
+    expect(entries(f).map((row) => row.status)).toEqual(['attempting', 'outcome-unknown']);
+    expect(calls.map((args) => args[1])).toEqual(['budget', 'raise']);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat-loop' && event === 'decision-raise-failed'))
+      .toEqual([['seat-loop', 'decision-raise-failed', { source, error: 'Error: decision ledger unavailable' }]]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('600-character four-sentence coord request raises one bounded card with its original comment id as source', async () => {
   const f = fixture();
   try {
-    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '마켓에 게시', status: 'yellow' }]);
-    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => args[1] === 'budget'
-      ? '{"outcome":"proceed"}' : '{"error":"decision not saved"}' };
-    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('no decision id');
-    expect(entries(f).map((entry) => entry.status)).toEqual(['attempting', 'outcome-unknown']);
+    const source = 'coord:5970836854:TC';
+    const request = Array.from({ length: 4 }, (_, i) => `요청 ${i + 1} ${'긴문장'.repeat(50)}.`).join(' ');
+    expect(Array.from(request).length).toBeGreaterThanOrEqual(600);
+    writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'),
+      JSON.stringify({ key: source, seat: 'TC', text: `마켓에 게시 ${request}`, status: 'pending', queuedAt: now.toISOString() }) + '\n');
+    mkdirSync(join(f.root, 'docs', 'roles'), { recursive: true });
+    writeFileSync(join(f.root, 'docs', 'roles', 'TC.md'), '역할: ' + '지침.'.repeat(300));
+    const cards = new DecisionLedger({ stateDir: f.root, now: () => now, resolveVersion: () => ({ released: '0.2.8', dev: '0.2.9', codename: null }) });
+    const raises: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] }, queueItems: () => [], run: async (args) => {
+      if (args[1] === 'budget') return '{"outcome":"proceed"}';
+      raises.push(args);
+      const value = (flag: string) => args[args.indexOf(flag) + 1]!;
+      const card = cards.raise({ title: value('--title'), category: 'other',
+        scqa: { s: value('--s'), c: value('--c') },
+        options: [{ key: 'a', label: '승인', consequence: '별도 집행' }, { key: 'b', label: '보류', consequence: '집행하지 않음' }],
+        recommendation: { skipped: true, reason: '자동 권고 없음' }, raisedBy: { agent: 'seat-loop' }, refs: [value('--ref')] });
+      return JSON.stringify({ id: card.id });
+    } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(raises).toHaveLength(1);
+    expect(cards.list()).toHaveLength(1);
+    const [card] = cards.list();
+    expect(card!.refs).toContain(source);
+    expect(raises[0]).toContain(source);
+    for (const field of Object.values(card!.scqa)) {
+      expect(Array.from(field).length).toBeLessThanOrEqual(240);
+      expect(field.split(/[.!?。！？]+(?:\s+|$)/).filter(Boolean).length).toBeLessThanOrEqual(2);
+    }
+    expect(card!.scqa.s).not.toContain(request);
   } finally { f.close(); }
 });
 

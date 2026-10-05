@@ -8,7 +8,7 @@ import { useSessions } from '@/lib/use-sessions';
 import type { SessionSummary } from '@/lib/sessions-service';
 import { SessionsStoreApi, type SessionStoreCard } from '@/lib/sessions-store-api';
 import { ProjectsApi, type Project } from '@/lib/projects-api';
-import { ChatProjectSwitcher, PROJECT_SELECTION_KEY } from './ChatProjectSwitcher';
+import { ChatProjectSwitcher, PROJECT_SELECTION_KEY, PROJECT_PENDING_CHANGED, PROJECTS_CHANGED, notifyProjectsChanged, readPendingProjects, writePendingProjects } from './ChatProjectSwitcher';
 
 export function conversationTitle(s: SessionSummary, title?: string): string {
   return title?.trim() || s.lastMsgPreview?.trim().split(/\r?\n/)[0]?.trim() || '대화';
@@ -27,8 +27,6 @@ export function conversationTime(iso: string, now = Date.now()): string {
   return new Date(time).toLocaleDateString();
 }
 
-const PENDING_PROJECTS_KEY = 'elanous.chat.pendingProjects';
-
 // Device state is optional: storage may be missing (server render, tests) or throw (private mode).
 function readStore(key: string): string | null {
   try { return typeof localStorage === 'undefined' ? null : localStorage.getItem(key); } catch { return null; }
@@ -45,29 +43,39 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selection, setSelection] = useState('all');
   const [cards, setCards] = useState<SessionStoreCard[]>([]);
-  const [pending, setPending] = useState<Record<string, string>>(() => {
-    try {
-      const stored: unknown = JSON.parse(readStore(PENDING_PROJECTS_KEY) ?? '{}');
-      if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
-        return Object.fromEntries(Object.entries(stored).filter(([id, projectId]) => id && typeof projectId === 'string' && projectId));
-      }
-    } catch { /* Ignore malformed device state. */ }
-    return {};
-  });
+  const [pending, setPending] = useState<Record<string, string>>(readPendingProjects);
+  useEffect(() => {
+    const refresh = () => {
+      setPending(readPendingProjects());
+      setFailedAssignment({});
+    };
+    window.addEventListener(PROJECT_PENDING_CHANGED, refresh);
+    return () => window.removeEventListener(PROJECT_PENDING_CHANGED, refresh);
+  }, []);
   const [assigned, setAssigned] = useState<Record<string, string>>({});
+  const [failedAssignment, setFailedAssignment] = useState<Record<string, string>>({});
   const assigning = useRef<Set<string>>(new Set());
+  const updatePending = (update: (current: Record<string, string>) => Record<string, string>) => {
+    const next = update(readPendingProjects());
+    writePendingProjects(next);
+    setPending(next);
+  };
   useEffect(() => {
     if (typeof window === 'undefined') return;
     setSelection(readStore(PROJECT_SELECTION_KEY) ?? 'all');
     let alive = true;
-    void new ProjectsApi(daemon.client).list().then((body) => {
-      if (alive) setProjects(body.projects ?? []);
-    }).catch(() => {});
-    return () => { alive = false; };
+    let request = 0;
+    const refresh = () => {
+      const current = ++request;
+      void new ProjectsApi(daemon.client).list().then((body) => {
+        if (alive && current === request) setProjects(body.projects ?? []);
+      }).catch(() => {});
+    };
+    refresh();
+    window.addEventListener(PROJECTS_CHANGED, refresh);
+    return () => { alive = false; window.removeEventListener(PROJECTS_CHANGED, refresh); };
   }, [daemon.client]);
-  useEffect(() => {
-    writeStore(PENDING_PROJECTS_KEY, JSON.stringify(pending));
-  }, [pending]);
+
   useEffect(() => {
     if (typeof window === 'undefined') return;
     let alive = true;
@@ -93,21 +101,28 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
   }, [cards, daemon.client, pending, sessions]);
   useEffect(() => {
     for (const [id, projectId] of Object.entries(pending)) {
-      if (!sessions.some((s) => s.id === id) || assigning.current.has(id)) continue;
+      if (id === daemon.sessionId || failedAssignment[id] === projectId || !sessions.some((s) => s.id === id) || assigning.current.has(id)) continue;
       const card = cards.find((item) => item.id === id);
-      if (!card) continue;
+      if (!card || readPendingProjects()[id] !== projectId) continue;
       if (card.projectId === projectId || assigned[id] === projectId) {
-        setPending((current) => { const next = { ...current }; delete next[id]; return next; });
+        updatePending((current) => { const next = { ...current }; delete next[id]; return next; });
         continue;
       }
       assigning.current.add(id);
       void new ProjectsApi(daemon.client).assign(id, projectId).then(() => {
         setAssigned((previous) => ({ ...previous, [id]: projectId }));
         setCards((previous) => previous.map((item) => item.id === id ? { ...item, projectId } : item));
-        setPending((current) => { const next = { ...current }; delete next[id]; return next; });
-      }).catch(() => { assigning.current.delete(id); });
+        if (readPendingProjects()[id] === projectId) {
+          updatePending((current) => { const next = { ...current }; delete next[id]; return next; });
+        }
+      }).catch(() => {
+        setFailedAssignment((previous) => ({ ...previous, [id]: projectId }));
+        if (readPendingProjects()[id] === projectId) {
+          updatePending((current) => { const next = { ...current }; delete next[id]; return next; });
+        }
+      }).finally(() => { assigning.current.delete(id); });
     }
-  }, [assigned, cards, daemon.client, pending, sessions]);
+  }, [assigned, failedAssignment, cards, daemon.client, daemon.sessionId, pending, sessions]);
   const activeSelection = projects.some((project) => project.id === selection) || selection === 'none' ? selection : 'all';
   const visible = projects.length === 0 || activeSelection === 'all' ? sessions
     : sessions.filter((s) => {
@@ -122,7 +137,7 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
   const start = () => {
     const id = forkSession();
     if (projects.length > 0 && activeSelection !== 'all' && activeSelection !== 'none') {
-      setPending((previous) => ({ ...previous, [id]: activeSelection }));
+      updatePending((previous) => ({ ...previous, [id]: activeSelection }));
     }
     daemon.setSessionId(id);
     onSelect?.();
@@ -139,6 +154,7 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
           setProjects((previous) => [...previous, project]);
           setSelection(project.id);
           writeStore(PROJECT_SELECTION_KEY, project.id);
+          notifyProjectsChanged();
         }} />
         <button type="button" onClick={start} className="flex w-full items-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
           <Plus className="h-4 w-4" aria-hidden="true" /> 새 대화
@@ -160,7 +176,7 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
           <ul className="space-y-1">
             {filtered.map((s) => (
               <li key={s.id}>
-                <button type="button" aria-current={daemon.sessionId === s.id ? 'page' : undefined} onClick={() => { daemon.setSessionId(s.id); onSelect?.(); }} className={`w-full rounded-lg px-3 py-2.5 text-left transition-colors ${daemon.sessionId === s.id ? 'bg-primary/10 text-primary ring-1 ring-inset ring-primary/25' : 'text-foreground hover:bg-muted'}`}>
+                <button type="button" aria-current={daemon.sessionId === s.id ? 'page' : undefined} onClick={() => { notifyProjectsChanged(); daemon.setSessionId(s.id); onSelect?.(); }} className={`w-full rounded-lg px-3 py-2.5 text-left transition-colors ${daemon.sessionId === s.id ? 'bg-primary/10 text-primary ring-1 ring-inset ring-primary/25' : 'text-foreground hover:bg-muted'}`}>
                   <span className="block truncate text-sm font-medium">{conversationTitle(s, titles[s.id])}</span>
                   <span className="mt-1 block truncate text-xs text-muted-foreground">{conversationTime(s.lastTurnAt)} · {s.msgCount}개 메시지</span>
                 </button>

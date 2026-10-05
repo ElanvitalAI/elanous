@@ -55,6 +55,15 @@ test('numeric version in human text is not a file path', () => {
   expect(result.signals).toEqual([]);
 });
 
+test('missing text remains uncheckable while the selected title is checked for directives', () => {
+  const result = checkAuthorInput({ ...base, title: 'src/foo.ts를 수정하세요', text: '' });
+  expect(result).toMatchObject({ verdict: 'uncheckable', implementationRatio: null, units: { checked: 0, candidates: 0 } });
+  expect(result.signals).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: 'path', field: 'title', match: 'src/foo.ts' }),
+    expect.objectContaining({ kind: 'missing', field: 'text', reason: 'missing cell text' }),
+  ]));
+});
+
 test('invalid version and missing required inputs are uncheckable, not zero ratio', () => {
   for (const input of [{ ...base, version: '0.2' }, { ...base, title: '  ' }, { ...base, text: '' }, { ...base, cellId: '' }]) {
     const result = checkAuthorInput(input);

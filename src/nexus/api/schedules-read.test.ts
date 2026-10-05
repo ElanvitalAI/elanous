@@ -63,6 +63,22 @@ describe('schedule run history API (S2)', () => {
 });
 
 describe('schedule read API', () => {
+  test('opt-in owner projection joins graph jobs without changing the ordinary response or leaking private fields', async () => {
+    const withOwners = { ...deps, loopOwners: () => [
+      { id: 'morning', title: '아침', owner: 'OP', enabled: true, lastRun: { at: '2026-10-05T09:00:00Z', status: 'success' }, jobs: [{ id: 'abc' }], file: '/home/alice/private' },
+    ] };
+    const plain = await handleSchedulesList(request('/v1/schedules?includeOff=1'), meta, withOwners).json() as { schedules: unknown[]; owners?: unknown[] };
+    expect(plain).not.toHaveProperty('owners');
+    const response = handleSchedulesList(request('/v1/schedules?includeOff=1&includeOwners=1'), meta, withOwners);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { owners: unknown[]; schedules: unknown[] };
+    expect(body.owners).toEqual([{ id: 'morning', title: '아침', owner: 'OP', enabled: true, lastRun: { at: '2026-10-05T09:00:00Z', status: 'success' }, jobs: ['abc'] }]);
+    expect(body.schedules).toEqual(plain.schedules);
+    expect(JSON.stringify(body)).not.toContain('/home/alice/private');
+    expect(handleSchedulesList(request('/v1/schedules?includeOwners=1', false), meta, withOwners).status).toBe(401);
+    expect((await handleSchedulesList(request('/v1/schedules?includeOwners=1'), meta,
+      { ...deps, loopOwners: () => { throw Error('offline'); } }).json() as { owners: unknown[] | null }).owners).toBeNull();
+  });
   test('owner-only inventory is based on actual crontab and launchd; off excluded by default', async () => {
     expect(handleSchedulesList(request('/v1/schedules', false), meta, deps).status).toBe(401);
     const res = handleSchedulesList(request('/v1/schedules'), meta, deps);

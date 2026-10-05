@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildSelfImplementDevSpec } from '../../self-dev/dev-pipeline.js';
+import { podChildLlmArgs } from './self-implement-pod.js';
 
 const src = (rel: string) => readFileSync(join(import.meta.dir, '..', '..', rel), 'utf8');
 
@@ -20,6 +21,11 @@ describe('Pod → self implement flag contract', () => {
     expect(argsStart).toBeGreaterThan(0);
     const argsBlock = pod.slice(argsStart, pod.indexOf('\n    ];', argsStart));
     const sent = new Set([...argsBlock.matchAll(/'(--[a-z][a-z-]+)'/g)].map((m) => m[1]!));
+    // Child LLM flags come from podChildLlmArgs since PODPROVIDER (10-05) — take them from the real helper.
+    for (const flag of [
+      ...podChildLlmArgs({ provider: 'grok' }),
+      ...podChildLlmArgs({ provider: 'openai-codex', childProviderExplicit: true, childModel: 'm', childEffort: 'high' }),
+    ]) if (flag.startsWith('--')) sent.add(flag);
     expect([...sent]).toContain('--child-llm-provider');
     const missing = [...sent].filter((flag) => !block.includes(`.option('${flag}`));
     expect(missing).toEqual([]);
@@ -27,7 +33,9 @@ describe('Pod → self implement flag contract', () => {
 
   test('the Pod account plan receives the per-account caps from config', () => {
     const index = src('index.ts');
-    const call = index.slice(index.indexOf('const plan = planPodProvider({'), index.indexOf('const plan = planPodProvider({') + 600);
+    const at = index.indexOf('planPodProvider({');
+    expect(at).toBeGreaterThan(0);
+    const call = index.slice(at, at + 600);
     expect(call).toContain('thresholdPercentByAccount: getUserConfig().llm?.codexAccountRotationThresholdPercentByAccount');
   });
 

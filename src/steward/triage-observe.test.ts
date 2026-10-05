@@ -28,7 +28,9 @@ test('one steward loop tick closes each stage with graph run, outcome, source an
       judge: async () => ({ rung: 0, dependsOn: [], priority: 1, why: 'wait' }), decide: () => true,
       sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
     for (const stage of ['sync', 'triage', 'schedule', 'report'] as const) await runStewardStage(stage, deps);
-    const ticks = records.filter(record => record.category === 'loop.steward');
+    const ticks = records.filter(record => record.category === 'loop.steward' && record.event === 'tick');
+    // ST0: the tick also leaves exactly one loop.steward decision (STEWOBS2).
+    expect(records.filter(record => record.category === 'loop.steward' && record.event === 'decision')).toHaveLength(1);
     expect(ticks.map(record => record.event)).toEqual(['tick', 'tick', 'tick', 'tick']);
     expect(ticks.map(record => record.data.stage)).toEqual(['sync', 'triage', 'schedule', 'report']);
     for (const tick of ticks) expect(tick.data).toMatchObject({ loopId: 'steward', runId: 'steward-graph-1', outcome: 'ok',

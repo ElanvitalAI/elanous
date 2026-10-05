@@ -418,4 +418,22 @@ exit 0
     expect(cap.lines).toEqual(['/artifacts/job']);
     expect(cap.code()).toBe(0);
   });
+
+  test('로그 조회 실패면 알린 경로와 함께 «산출 회수 못 함: <사유>» 를 출력한다', async () => {
+    const cap = capture();
+    const program = new Command();
+    program.exitOverride();
+    const prev = process.argv;
+    process.argv = ['bun', 'elanous', 'pod', 'run', '--', 'echo', 'hi'];
+    try {
+      registerPodCommands(program, {
+        io: cap.io,
+        run: async () => ({ exitCode: 1, artifactsDir: '/artifacts/job', job: 'job', artifacts: { files: null, names: [], error: 'connection refused' } }),
+      });
+      await program.parseAsync(['pod', 'run', '--', 'echo', 'hi'], { from: 'user' });
+    } finally { process.argv = prev; }
+    expect(cap.lines).toEqual(['/artifacts/job']);
+    expect(cap.errors).toContain('산출 회수 못 함: connection refused');
+    expect(cap.code()).toBe(1);
+  });
 });

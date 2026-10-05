@@ -232,14 +232,57 @@ test('rebalance checks cumulative PR/seat capacity and does not move a predecess
   const near = new Date('2026-10-05T01:00:00Z');
   addItem('0.2.14', { ...cell('first') });
   addItem('0.2.14', { ...cell('second') });
-  expect(rebalance('0.2.14', { now: near, merged24h: 4, seatCap: { TC: 1 } }).map((row) => row.id)).toEqual(['first']);
+  expect(rebalance('0.2.14', { now: near, merged24h: 4, seatCap: { TC: 1 } }).decisions.map((row) => row.id)).toEqual(['first']);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['second']);
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['first']);
   addItem('0.2.14', { ...cell('base') });
   addItem('0.2.15', { ...cell('dependent'), owner: 'MK', predecessors: ['base'] });
-  expect(rebalance('0.2.14', { now: near, merged24h: 20 }).map((row) => row.id)).toEqual(['second']);
+  expect(rebalance('0.2.14', { now: near, merged24h: 20 }).decisions.map((row) => row.id)).toEqual(['second']);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['base']);
   expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
+});
+
+test('CEO load blocks rebalance with named adjustments and CLI never calls the blocked cell absent', async () => {
+  setup();
+  const current = new Date(Date.now() + 3_600_000).toISOString();
+  const destination = new Date(Date.now() + 86_400_000).toISOString();
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(destination));
+  setSchedule('0.2.14', { cutAt: current, landBy: current }, 'OP');
+  setSchedule('0.2.15', { cutAt: destination, landBy: destination }, 'OP');
+  addItem('0.2.14', { ...cell('sns'), owner: 'MK', ceoMinutes: 20, ceoDate: day });
+  addItem('0.2.15', { ...cell('youtube'), owner: 'MK', ceoMinutes: 20, ceoDate: day });
+  const preview = rebalance('0.2.14', { merged24h: 40, dryRun: true });
+  expect(preview.decisions).toEqual([]);
+  const blocked = preview.blocked[0]!;
+  expect([blocked.id, blocked.from, blocked.to]).toEqual(['sns', '0.2.14', '0.2.15']);
+  expect(blocked.reason.includes('대표 손 과부하')).toBe(true);
+  expect(blocked.reason.includes('40분 > 하루 상한 30분')).toBe(true);
+  for (const alternative of ['늦추기', '자리 대행', '묶기']) expect(blocked.reason.includes(alternative)).toBe(true);
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  const recent = new Date().toISOString();
+  writeFileSync(join(bin, 'pr.json'), JSON.stringify(Array.from({ length: 40 }, (_, number) => ({ number, mergedAt: recent }))));
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\ncat '${join(bin, 'pr.json')}'\n`);
+  chmodSync(join(bin, 'gh'), 0o700);
+  const path = process.env.PATH;
+  const track = process.env.ELANOUS_TRACK;
+  const lines: string[] = [];
+  const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+  try {
+    process.env.PATH = `${bin}:${path ?? ''}`;
+    process.env.ELANOUS_TRACK = 'OP';
+    const cmd = new Command(); registerReleaseCommands(cmd);
+    await cmd.parseAsync(['release', 'rebalance', '--version', '0.2.14'], { from: 'user' });
+    expect(lines.join('\n')).toContain('⛔ sns 0.2.14 → 0.2.15 이월 거부');
+    for (const alternative of ['늦추기', '자리 대행', '묶기']) expect(lines.join('\n')).toContain(alternative);
+    expect(lines.join('\n')).not.toContain('이월할 미시작 칸 없음');
+    expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['sns']);
+    expect(checklistHistory('sns').filter((row) => row.field === 'move')).toHaveLength(0);
+  } finally {
+    output.mockRestore();
+    if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+    if (track === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = track;
+  }
 });
 
 test('rebalance enforces cumulative destination PR capacity across seats', () => {
@@ -247,9 +290,9 @@ test('rebalance enforces cumulative destination PR capacity across seats', () =>
   const near = new Date('2026-10-05T01:00:00Z');
   addItem('0.2.14', { ...cell('tc') });
   addItem('0.2.14', { ...cell('mk'), owner: 'MK' });
-  expect(rebalance('0.2.14', { now: near, merged24h: 4, dryRun: true }).map((row) => row.id)).toEqual(['tc']);
+  expect(rebalance('0.2.14', { now: near, merged24h: 4, dryRun: true }).decisions.map((row) => row.id)).toEqual(['tc']);
   expect(listChecklist('0.2.15').items).toHaveLength(0);
-  expect(rebalance('0.2.14', { now: near, merged24h: 4 }).map((row) => row.id)).toEqual(['tc']);
+  expect(rebalance('0.2.14', { now: near, merged24h: 4 }).decisions.map((row) => row.id)).toEqual(['tc']);
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['mk']);
 });
 
@@ -274,15 +317,15 @@ test('rebalance moves only unstarted yellow cells in two-hour pre-deadline windo
   addItem('0.2.14', { id: 'started', title: 'started', owner: 'MK' });
   setItem('0.2.14', 'started', { evidence: 'started' }, 'MK');
   const near = new Date('2026-10-05T01:00:00Z');
-  expect(rebalance('0.2.14', { now, dryRun: true })).toEqual([]);
-  expect(rebalance('0.2.14', { now: near, merged24h: 10, dryRun: true }).map((row) => row.id)).toEqual(['new']);
+  expect(rebalance('0.2.14', { now, dryRun: true })).toEqual({ decisions: [], blocked: [] });
+  expect(rebalance('0.2.14', { now: near, merged24h: 10, dryRun: true }).decisions.map((row) => row.id)).toEqual(['new']);
   expect(listChecklist('0.2.14').items).toHaveLength(2);
   rebalance('0.2.14', { now: near, merged24h: 10 });
   expect(checklistHistory('new').at(-1)).toMatchObject({ field: 'move', reason: expect.stringContaining('2시간 전') });
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['started']);
   addItem('0.2.15', { id: 'late', title: 'late', owner: 'MK', deadlineVersion: '0.2.15' });
   const before = listChecklist('0.2.15').items.map((item) => item.id);
-  expect(rebalance('0.2.15', { now: new Date('2026-10-05T11:00:00Z'), merged24h: 10 }).map((row) => row.id)).toEqual(['new']);
+  expect(rebalance('0.2.15', { now: new Date('2026-10-05T11:00:00Z'), merged24h: 10 }).decisions.map((row) => row.id)).toEqual(['new']);
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['late']);
   expect(before).toEqual(['new', 'late']);
 });

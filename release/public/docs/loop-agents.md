@@ -44,6 +44,31 @@ The steward needs a Linear connection and is off until you start it.
 
 The **landing-and-healing loop** (`landing-heal`) watches the harness's own pull requests for review findings that must be fixed and for checks that are due after a merge. It is off by default too — `elanous loop status landing-heal` shows its schedule.
 
+## For operators — the orchestrator
+
+When work crosses loops, these layers have different jobs:
+
+| Layer | Job |
+|---|---|
+| Seat loops | Pick up queued work for their area and report progress. |
+| Steward | Triage tasks, dependencies and decisions that need a person. |
+| Orchestrator | Turn requests into cards and release work, choose an order, hand off eligible work and reconcile the results. |
+
+A work request becomes a card, then a work cell, then a proposed release placement before handoff. The orchestrator graph names the path **intake → split → place → delegate → reconcile → report**: collect open request cards, propose cells, place eligible cells on a release, queue a request for the relevant seat loop, check progress, and report the outcome. Placement and handoff depend on eligible work and available integrations; a proposal is not a completed launch.
+
+Set `loops.orchestrator.mode` to `shadow` (the default) to record proposals and would-be handoffs without placing work or sending requests. Set it to `live` to place eligible work and actually queue requests for seat loops. A queued request is not itself a completed run.
+
+| The orchestrator can do on its own | It must leave to a person |
+|---|---|
+| Record proposals and outcomes; order work; in live mode, add a request to the seat loop's queue. | Spending money, making external commitments, irreversible publication or security decisions: raise a human decision card rather than acting alone. |
+
+Check the loop and recent activity without starting work:
+
+```bash
+elanous loop status orchestrator
+elanous loop activity
+```
+
 ## For developers — build your own
 
 See [Build a loop agent](build-a-loop-agent.md).

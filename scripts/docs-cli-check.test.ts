@@ -130,6 +130,29 @@ describe('docs-cli-check — 문서의 elanous 호출을 실제 CLI 에 대조',
     };
     expect(checkCommands(refs, realHelp)).toEqual([]);
   });
+  test('public loop agents guide names the graph stages and safe orchestrator modes; its commands exist', () => {
+    const repo = resolve(import.meta.dir, '..');
+    const file = 'release/public/docs/loop-agents.md';
+    const doc = readFileSync(resolve(repo, file), 'utf8');
+    const graph = readFileSync(resolve(repo, 'graphs/orchestrator/orchestrator.yaml'), 'utf8');
+    const stages = ['intake', 'split', 'place', 'delegate', 'reconcile', 'report'];
+    for (const stage of stages) expect(graph).toContain(`node_id: ${stage}`);
+    expect(doc).toContain(`**${stages.join(' → ')}**`);
+    expect(doc).toContain('## For operators — the orchestrator');
+    expect(doc).toMatch(/`loops\.orchestrator\.mode` to `shadow` \(the default\)/);
+    expect(doc).toContain('`live` to place eligible work and actually queue requests');
+    expect(doc).toContain('raise a human decision card rather than acting alone');
+    for (const heading of ['## For everyone — see and run loops', '## For owners — the steward', '## For developers — build your own']) expect(doc).toContain(heading);
+    const refs = extractElanousCommands(file, doc).filter((r) => r.cmd === 'loop' && ['status', 'activity'].includes(r.sub ?? '') && (r.text.includes('orchestrator') || r.sub === 'activity'));
+    expect(refs.map((r) => r.text)).toEqual(['elanous loop status orchestrator', 'elanous loop activity']);
+    const realHelp: HelpRunner = (args) => {
+      const r = spawnSync('bun', ['bin/elanous.mjs', '--test', ...args, '--help'], {
+        cwd: repo, encoding: 'utf8', timeout: 60_000, env: { ...process.env, NO_COLOR: '1' },
+      });
+      return { ok: r.status === 0, out: `${r.stdout ?? ''}\n${r.stderr ?? ''}` };
+    };
+    expect(checkCommands(refs, realHelp)).toEqual([]);
+  });
 });
 
 // 09-26: 도움말은 별칭을 `self-update|update [options]` 로 찍는다 — 문서의 `elanous update` 를 «없는 명령»으로 잡았다.

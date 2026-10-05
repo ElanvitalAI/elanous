@@ -10,6 +10,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
+import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
 function date(raw?: string): string | undefined {
@@ -136,6 +137,14 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .action((o: { since: string; seat?: Seat; json?: boolean }) => fail(() => {
       const rows = new DecisionLedger(config).seatReport({ since: date(o.since), seat: o.seat });
       emit(rows, o.json, rows.length ? rows.map(formatSeatDecisionRow).join('\n') : '자리 결정 0건');
+    }));
+  root.command('proact').description('선제성 기준선 — 지난 7일, 먼저 낸 수·채택 수·물어서야 드러난 수')
+    .option('--days <n>', 'KST 일수 (기본 7)', '7').option('--json')
+    .action((o: { days: string; json?: boolean }) => fail(() => {
+      const days = Number(o.days);
+      if (!Number.isInteger(days) || days < 1) throw new Error('invalid days');
+      const meter = readProactMeter({ ...(config.stateDir ? { stateDir: config.stateDir, instanceRoot: config.stateDir } : {}), ...(config.now ? { now: config.now() } : {}), days });
+      emit(meter, o.json, formatProactMeter(meter));
     }));
   root.command('list').description('결정 목록 (기본 열린 것)')
     .option('--status <open|decided|all>', '기본 open', 'open').option('--since <date>').option('--version <version>')

@@ -73,11 +73,16 @@ export function buildReviewProviderAttempts(
   const out: ReviewProviderAttempt[] = [primary];
   const seen = new Set([primary.model]);
   for (const f of fallbacks) {
-    if (!f.model.trim() || seen.has(f.model)) continue;
+    if (!f.model.trim() || seen.has(f.model) || (primary.provider && f.provider?.name === primary.provider.name)) continue;
     seen.add(f.model);
     out.push(f);
   }
   return out;
+}
+
+/** A distinct provider is available even when the optional config list is empty. */
+export function defaultReviewFallbackModel(primaryProvider?: string): string {
+  return resolveModelAlias(primaryProvider === 'grok' ? 'claude' : 'grok')!;
 }
 
 export interface ReviewFallbackObservation {

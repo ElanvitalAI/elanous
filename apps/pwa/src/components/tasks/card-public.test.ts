@@ -17,4 +17,8 @@ describe('board public capture (teaser S02 · host names in card titles)', () =>
     const [masked] = maskCardsForPublic([card('[elanous-lab] 오늘 착지한 PR 수를 한 줄로')]);
     expect(cardTitle(masked!)).toBe('[elanous-lab] 오늘 착지한 PR 수를 한 줄로');
   });
+  it('keeps the reply surface but drops the reply address (chat or session id)', () => {
+    const [masked] = maskCardsForPublic([{ ...card('소원'), wishReply: { surface: 'telegram', address: '42:7' } }]);
+    expect(masked!.wishReply).toEqual({ surface: 'telegram', address: null });
+  });
 });

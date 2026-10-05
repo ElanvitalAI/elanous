@@ -61,6 +61,29 @@ describe('TaskCardDetail', () => {
     expect(renderToStaticMarkup(<TaskCardDetail card={card} />)).not.toContain('Wish placement and progress');
   });
 
+  test('renders stored Telegram conversation, PWA session and TUI destination; old cards have no address', () => {
+    const base = foldCard([entry('intake', 'wish', 1700000000000, 'steward', { title: '소원' })]);
+    if (!base) throw new Error('expected a card');
+    const telegram = renderToStaticMarkup(<TaskCardDetail card={{ ...base, wishReply: { surface: 'telegram', address: '42:7' } }} />);
+    expect(telegram).toContain('텔레그램 대화 · 42:7');
+    expect(telegram).toContain('회신 이력');
+    expect(telegram).toContain('카드 원장에는 회신 발송 이력이 기록되지 않습니다');
+    expect(renderToStaticMarkup(<TaskCardDetail card={{ ...base, wishReply: { surface: 'pwa', address: 'session-1' } }} />))
+      .toContain('PWA · session-1');
+    expect(renderToStaticMarkup(<TaskCardDetail card={{ ...base, wishReply: { surface: 'tui', address: null } }} />))
+      .toContain('TUI');
+    expect(renderToStaticMarkup(<TaskCardDetail card={{ ...base, wishReply: null }} />))
+      .toContain('회신 주소 없음');
+  });
+
+  test('a non-wish card shows neither reply section', () => {
+    const base = foldCard([entry('intake', 'wish', 1700000000000, 'steward', { title: '일반 카드' })]);
+    if (!base) throw new Error('expected a card');
+    const html = renderToStaticMarkup(<TaskCardDetail card={base} />);
+    expect(html).not.toContain('어디로 회신하나');
+    expect(html).not.toContain('회신 이력');
+  });
+
   test('does not invent a gate decision or incident when neither exists', () => {
     const html = render([entry('triage', 'triage-1', 1700000000000, 'steward', { title: 'Ready' })]);
     expect(html).not.toContain('Gate decisions');

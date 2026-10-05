@@ -1,6 +1,6 @@
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
-import { decideDraft, type DraftTriagePr } from './draft-triage-rules.js';
+import { decideDraft, sameGoalPr, type DraftTriagePr } from './draft-triage-rules.js';
 
 export interface SweepDraft extends DraftTriagePr {
   readonly title: string;
@@ -33,6 +33,18 @@ export interface DraftSweepAdapters {
   getLatestFileChanges?(draft: SweepDraft, repository: string): Promise<Readonly<Record<string, string>> | undefined>;
   /** Optional merge-time file inventory for the existing all-files-landed decision. */
   getPrFiles?(repository: string, number: number): Promise<readonly string[] | undefined>;
+  /**
+   * Review and gate posture for the daily count. Omitted means unknown — not harvestable and not blocked.
+   * `review: 'pass'` is a review PASS; `mustFix` means must-fix remains; `gate: 'pass'` is a green gate.
+   */
+  getReviewGate?(draft: SweepDraft, repository: string): Promise<SweepReviewGate | undefined>;
+}
+
+/** Review PASS and gate posture used only by the daily old-draft count. */
+export interface SweepReviewGate {
+  readonly review?: 'pass' | 'fail';
+  readonly mustFix?: boolean;
+  readonly gate?: 'pass' | 'fail';
 }
 
 export interface DraftSweepOptions {
@@ -67,7 +79,21 @@ export interface DraftSweepResult {
   claimed?: number;
   /** Running claims older than the idle window, including those kept by liveness. */
   claimExpired?: number;
+  /**
+   * One line per sweep: harness drafts older than 24h, split into closable (a same-goal landing exists),
+   * harvestable (review PASS and gate pass), and blocked (must-fix remains).
+   */
+  daily?: DraftSweepDaily;
   error?: string;
+}
+
+/** Daily old-draft census. `date` is the sweep clock's UTC calendar day. */
+export interface DraftSweepDaily {
+  readonly date: string;
+  readonly over24h: number;
+  readonly closable: number;
+  readonly harvestable: number;
+  readonly blocked: number;
 }
 
 const stateLabels = PR_LABELS.filter((label) => label.axis === 'state');
@@ -115,7 +141,7 @@ export async function supersedeDraftsOnMerge(input: {
     const mergedFiles = await adapters.getPrFiles?.(repository, merged.number);
     const landed = { ...merged, changedFiles: mergedFiles };
     for (const draft of drafts) {
-      if (draft.number !== merged.number && !liveBranches.has(draft.branch)
+      if (draft.number !== merged.number && draft.branch.startsWith('self-impl/') && !liveBranches.has(draft.branch)
         && Date.parse(draft.createdAt) < Date.parse(merged.mergedAt)) {
         statuses.set(draft.number, await adapters.getRunStatus(draft, repository));
         if (draft.changedFiles?.length && adapters.getLatestFileChanges) {
@@ -125,7 +151,7 @@ export async function supersedeDraftsOnMerge(input: {
     }
     for (const listedDraft of drafts) {
       const draft = { ...listedDraft, latestFileChanges: latestChanges.get(listedDraft.number) };
-      if (draft.number === merged.number || liveBranches.has(draft.branch)
+      if (draft.number === merged.number || !draft.branch.startsWith('self-impl/') || liveBranches.has(draft.branch)
         || Date.parse(draft.createdAt) >= Date.parse(merged.mergedAt)) {
         kept.push(draft.number);
         continue;
@@ -134,7 +160,6 @@ export async function supersedeDraftsOnMerge(input: {
         mergedTwins: [landed], liveBranches, ageHours: NaN });
       if (decision.action !== 'close' || !decision.reason.startsWith(`superseded-by #${merged.number}`)
         || PR_LABELS.filter((entry) => entry.axis === 'state' && draft.labels.includes(entry.name)).length > 1
-        || (draft.labels.length === 0 && !draft.branch.startsWith('self-impl/'))
         || closeAttempts >= DRAFT_SWEEP_CLOSE_CAP) {
         kept.push(draft.number);
         continue;
@@ -144,7 +169,8 @@ export async function supersedeDraftsOnMerge(input: {
       try {
         // Label first: a failed label write must never strand a closed, unlabelled PR outside open-draft sweeps.
         if (!draft.labels.includes(supersededLabel)) await adapters.setLabels(repository, draft.number, { add: supersededLabel, remove });
-        await adapters.closeDraft(repository, draft.number, `Draft sweep: superseded-by #${merged.number}. Branch preserved.`);
+        await adapters.closeDraft(repository, draft.number,
+          `Draft sweep: superseded-by #${merged.number} (https://github.com/${repository}/pull/${merged.number}). Branch preserved.`);
         closed.push(draft.number);
       } catch (failure) {
         kept.push(draft.number);
@@ -171,6 +197,46 @@ async function collectPages<T>(fetch: (page: number, perPage: number) => Promise
   throw new Error('PR listing exceeded pagination limit');
 }
 
+/** First line of a failure, with no stack — the draft-cleanup loop log shows this line as-is. */
+export function sweepFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const line = message.split(/\r?\n/).map((part) => part.trim()).find((part) => part.length > 0 && !/^\s*at\s/.test(part));
+  return line && line.length > 0 ? line : 'sweep failed';
+}
+
+function harnessDraft(draft: SweepDraft): boolean {
+  return draft.branch.startsWith('self-impl/') || draft.labels.some((name) => name.startsWith('elanous:'));
+}
+
+/**
+ * Census of harness drafts older than 24h. Same-goal landing uses `sameGoalPr` unchanged.
+ * A draft counts as closable when a same-goal merged PR exists, harvestable when review PASS and the gate passed,
+ * and blocked when must-fix remains. Unknown review/gate is neither harvestable nor blocked.
+ */
+export function draftSweepDaily(
+  drafts: readonly SweepDraft[],
+  merged: readonly SweepMergedPr[],
+  now: Date,
+  reviewGate: ReadonlyMap<number, SweepReviewGate | undefined>,
+): DraftSweepDaily {
+  const cutoff = now.getTime() - STALLED_DRAFT_HOURS * 3_600_000;
+  let over24h = 0;
+  let closable = 0;
+  let harvestable = 0;
+  let blocked = 0;
+  for (const draft of drafts) {
+    if (!harnessDraft(draft)) continue;
+    const created = Date.parse(draft.createdAt);
+    if (!Number.isFinite(created) || created > cutoff) continue;
+    over24h += 1;
+    if (merged.some((pr) => pr.number !== draft.number && sameGoalPr(draft, pr))) closable += 1;
+    const posture = reviewGate.get(draft.number);
+    if (posture?.mustFix === true) blocked += 1;
+    else if (posture?.review === 'pass' && posture.gate === 'pass') harvestable += 1;
+  }
+  return { date: now.toISOString().slice(0, 10), over24h, closable, harvestable, blocked };
+}
+
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
 export async function runDraftSweep({ repository, adapters, apply = false, now = new Date() }: DraftSweepOptions): Promise<DraftSweepResult> {
   const result: DraftSweepResult = { repository, apply, complete: false, entries: [], counts: {} };
@@ -181,10 +247,12 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   };
   const finish = (): DraftSweepResult => {
     debug.log('drafts.cleanup', 'summary', result.counts);
+    if (result.daily) debug.log('harness.drafts', 'daily', result.daily);
+    if (!result.complete && result.error) debug.log('drafts.cleanup', 'failed', { reason: sweepFailureReason(result.error) });
     return result;
   };
-  let drafts: SweepDraft[];
-  let merged: SweepMergedPr[];
+  let drafts: SweepDraft[] = [];
+  let merged: SweepMergedPr[] = [];
   let liveBranches: ReadonlySet<string> | undefined;
   try {
     [drafts, merged, liveBranches] = await Promise.all([
@@ -196,7 +264,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     if (drafts.some((pr) => !Number.isInteger(pr.number) || !pr.branch || !Array.isArray(pr.labels) || !Number.isFinite(Date.parse(pr.createdAt)))
       || merged.some((pr) => !Number.isInteger(pr.number) || !pr.branch)) throw new Error('Invalid PR inventory');
   } catch (error) {
-    result.error = String(error);
+    result.error = sweepFailureReason(error);
+    if (drafts.length > 0) result.daily = draftSweepDaily(drafts, merged, now, new Map());
     return finish();
   }
   let statuses: Map<number, string | undefined>;
@@ -218,9 +287,19 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       }
     }
   } catch (error) {
-    result.error = String(error);
+    result.error = sweepFailureReason(error);
     return finish();
   }
+  let reviewGate = new Map<number, SweepReviewGate | undefined>();
+  if (adapters.getReviewGate) {
+    try {
+      for (const draft of drafts) reviewGate.set(draft.number, await adapters.getReviewGate(draft, repository));
+    } catch (error) {
+      result.error = sweepFailureReason(error);
+      return finish();
+    }
+  }
+  result.daily = draftSweepDaily(drafts, merged, now, reviewGate);
   result.complete = true;
   let closes = 0;
   let unobserved = 0;
@@ -330,7 +409,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       if (action === 'close') {
         await adapters.closeDraft(repository, draft.number, decision.reason === 'stale-unobserved'
           ? `Draft sweep: run unobserved — no run record reachable here, no host worktree for this branch, idle ≥${STALLED_DRAFT_HOURS}h. Closed as stalled. Branch preserved; reopen to restore.`
-          : `Draft sweep: ${decision.reason}. Branch preserved.`);
+          : `Draft sweep: ${decision.reason}${decision.reason.startsWith('superseded-by #')
+            ? ` (https://github.com/${repository}/pull/${decision.reason.slice('superseded-by #'.length).match(/^\d+/)![0]})` : ''}. Branch preserved.`);
       }
       entry.applied = labelsChanged || action === 'close';
     } catch (error) {

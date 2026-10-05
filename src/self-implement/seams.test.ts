@@ -13,6 +13,7 @@ import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import { runIntegrityGate, type GateResult, type GateStepName } from '../autopilot/build/integrity-gate.js';
 import { stageFile } from './shadow-stage.js';
+import { dropStaleReverts } from './revert-guard.js';
 import { createSelfImplementControlBrain, launchDevGoalFileDetached, SELF_IMPLEMENT_COMPLETION_REPORT_HINT } from './seams.js';
 import { assertBaseBranchOnOrigin } from './seams.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
@@ -615,6 +616,51 @@ describe('gateWorktreeBehindMain — 실제 Git rev-list 통합 경로', () => {
 
     expect(gateWorktreeBehindMain(noOrigin)).toBeUndefined();
     expect(gateWorktreeBehindMain(nonRepository)).toBeUndefined();
+  });
+});
+
+describe('pre-commit deletion guard — real git staging', () => {
+  let repo: string;
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), 'seam-stale-delete-'));
+    git(repo, 'init', '-b', 'main');
+    git(repo, 'config', 'user.email', 't@t.co');
+    git(repo, 'config', 'user.name', 'T');
+    writeFileSync(join(repo, 'outside-old.md'), 'old\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'base');
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  test('새 main 파일의 대상 밖 staged 삭제도 복원해 D를 커밋하지 않는다', () => {
+    const base = git(repo, 'rev-parse', 'HEAD').stdout.trim();
+    writeFileSync(join(repo, 'outside-new.md'), 'landed\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'main landing');
+    rmSync(join(repo, 'outside-new.md'));
+    git(repo, 'add', '-A');
+    writeFileSync(join(repo, 'feature.md'), 'feature\n');
+    expect(dropStaleReverts(repo, ['feature.md'], 'run-seams-new', 50, base).staleDeleted).toEqual(['outside-new.md']);
+    expect(commitWorktree(repo, 'feature').ok).toBe(true);
+    expect(git(repo, 'show', '--format=', '--name-status', 'HEAD').stdout.trim()).toBe('A\tfeature.md');
+    expect(readFileSync(join(repo, 'outside-new.md'), 'utf8')).toBe('landed\n');
+  });
+
+  test('대상 안 삭제는 D, base에 있던 대상 밖 삭제는 경고 및 D로 보존한다', () => {
+    const base = git(repo, 'rev-parse', 'HEAD').stdout.trim();
+    writeFileSync(join(repo, 'inside.md'), 'inside\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'inside landing');
+    rmSync(join(repo, 'inside.md'));
+    rmSync(join(repo, 'outside-old.md'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = dropStaleReverts(repo, ['inside.md'], 'run-seams-old', 50, base);
+      expect(result).toMatchObject({ reverted: [], outsideDeleted: ['outside-old.md'] });
+      expect(log).toHaveBeenCalledWith('self-implement.revert-guard', 'outside-delete', { runId: 'run-seams-old', files: ['outside-old.md'] }, { level: 'warn' });
+      expect(commitWorktree(repo, 'intentional deletion').ok).toBe(true);
+      expect(git(repo, 'show', '--format=', '--name-status', 'HEAD').stdout.trim()).toBe('D\tinside.md\nD\toutside-old.md');
+    } finally { log.mockRestore(); }
   });
 });
 

@@ -1,12 +1,15 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerLoopCommands } from './loop-cli.js';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildUserConfig } from '../user-config.js';
+import { debug } from '../debug/log.js';
+import { checkLoops } from './checker.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
-import { listLoops, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
+import { listAllLoops, listLoops, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -30,6 +33,123 @@ function fixture() {
   const opts: LoopRegistryOptions = { root, stateRoot, now: new Date('2026-09-28T06:30:00.000Z'), schedules: rows };
   return { root, stateRoot, cronFile, line, opts };
 }
+
+test('cron shell chooses the newest redirect from outer and inner fence commands, or the newer DB record', () => {
+  const f = fixture();
+  const now = new Date('2026-10-05T07:30:00Z');
+  const at = (name: string, time: string) => {
+    const file = join(f.root, name);
+    writeFileSync(file, name);
+    utimesSync(file, new Date(time), new Date(time));
+    return file;
+  };
+  at('A.json', '2026-10-05T07:29:00Z');
+  at('A.err', '2026-10-05T07:24:00Z');
+  at('F.log', '2026-10-05T07:20:00Z');
+  const lone = at('only.err', '2026-10-05T07:28:00Z');
+  const older = at('older.log', '2026-10-05T07:10:00Z');
+  const lines = [
+    `*/5 * * * * cd ${f.root} && hq-fence cron 'eln loop status --json > A.json 2>> A.err' >> F.log`,
+    `*/5 * * * * eln loop status --json 2>>'${lone}'`,
+    '*/5 * * * * eln loop status --json > /dev/null 2>&1',
+    `*/5 * * * * eln loop status --json 1>> "${older}"`,
+    '*/5 * * * * eln loop list --all',
+  ];
+  const db = openSchedulesDb(join(f.root, 'redirects.db'));
+  const observations: Array<{ id: string; targets: number; picked: string }> = [];
+  const original = debug.log;
+  try {
+    inventoryCrontab(db, { crontab: lines.join('\n') + '\n' });
+    const rows = listSchedules(db);
+    db.run('UPDATE schedule_registry SET last_run = ? WHERE id = ?',
+      ['2026-10-05T07:15:00Z', rows.find(row => row.command?.includes('/dev/null'))!.id]);
+    db.run('UPDATE schedule_registry SET last_run = ? WHERE id = ?',
+      ['2026-10-05T07:25:00Z', rows.find(row => row.command?.includes('older.log'))!.id]);
+    debug.log = ((category, event, data) => {
+      if (category === 'loops.registry' && event === 'cron-last-run') observations.push(data as typeof observations[number]);
+    }) as typeof debug.log;
+    const all = listAllLoops({ ...f.opts, now, schedules: listSchedules(db) }).filter(loop => loop.kind === 'cron-shell');
+    const get = (needle: string) => all.find(loop => loop.command?.includes(needle))!;
+    const inner = get('A.json');
+    const only = get('only.err');
+    const nullOnly = get('/dev/null');
+    const dbNewer = get('older.log');
+    const none = get('loop list');
+    expect(inner).toMatchObject({ lastRunAt: '2026-10-05T07:29:00.000Z', evidence: 'log-mtime' });
+    expect(only).toMatchObject({ lastRunAt: '2026-10-05T07:28:00.000Z', evidence: 'log-mtime' });
+    expect(nullOnly).toMatchObject({ lastRunAt: '2026-10-05T07:15:00Z', evidence: 'registry' });
+    expect(dbNewer).toMatchObject({ lastRunAt: '2026-10-05T07:25:00Z', evidence: 'registry' });
+    expect(none.lastRunAt).toBeUndefined();
+    expect(none.evidence).toBeUndefined();
+    expect(observations).toHaveLength(5);
+    expect(observations).toEqual(expect.arrayContaining([
+      { id: inner.id, targets: 3, picked: 'log-mtime' },
+      { id: only.id, targets: 1, picked: 'log-mtime' },
+      { id: nullOnly.id, targets: 0, picked: 'registry' },
+      { id: dbNewer.id, targets: 1, picked: 'registry' },
+      { id: none.id, targets: 0, picked: 'none' },
+    ]));
+    expect(checkLoops([inner], now)[0]?.state).toBe('alive');
+  } finally { debug.log = original; db.close(); }
+});
+
+test('operational hq-fence loop checker run within five minutes is not late', () => {
+  const f = fixture();
+  const now = new Date('2026-10-05T07:30:00Z');
+  const output = join(f.root, 'loop-check.json');
+  const error = join(f.root, 'loop-check.err');
+  writeFileSync(output, '{}');
+  writeFileSync(error, '');
+  utimesSync(output, new Date('2026-10-05T07:28:00Z'), new Date('2026-10-05T07:28:00Z'));
+  utimesSync(error, new Date('2026-10-05T07:18:00Z'), new Date('2026-10-05T07:18:00Z'));
+  const db = openSchedulesDb(join(f.root, 'operational.db'));
+  try {
+    inventoryCrontab(db, { crontab: `*/5 * * * * /home/ops/.elanous/bin/hq-fence cron '/home/ops/.bun/bin/eln loop status --all --notify --json > ${output} 2>> ${error}' # LOOP-CHECK1 5분 점검기\n` });
+    const row = listSchedules(db)[0]!;
+    db.run('UPDATE schedule_registry SET last_run = ? WHERE id = ?', ['2026-10-04T03:12:00Z', row.id]);
+    const configPath = join(f.root, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ loops: { owners: { 'elanous:loop-status': 'MK' } } }));
+    const entry = listAllLoops({ ...f.opts, now, schedules: listSchedules(db), config: buildUserConfig(configPath) })
+      .find(loop => loop.id === 'elanous:loop-status')!;
+    expect(entry).toMatchObject({ id: 'elanous:loop-status', owner: 'MK', lastRunAt: '2026-10-05T07:28:00.000Z', evidence: 'log-mtime' });
+    expect(checkLoops([entry], now)[0]?.state).toBe('alive');
+  } finally { db.close(); }
+});
+
+test('redirect variants and home expansion use the newest existing file, never /dev/null', () => {
+  const f = fixture();
+  const now = new Date('2026-10-05T07:30:00Z');
+  const file = join(f.root, 'space name.log');
+  const newer = join(f.root, 'newer.log');
+  writeFileSync(file, 'file');
+  writeFileSync(newer, 'newer');
+  for (const [path, time] of [[file, '07:20'], [newer, '07:29']] as const) {
+    utimesSync(path, new Date(`2026-10-05T${time}:00Z`), new Date(`2026-10-05T${time}:00Z`));
+  }
+  const db = openSchedulesDb(join(f.root, 'variants.db'));
+  const homeName = `.loop-check-registry-${process.pid}-${Date.now()}.log`;
+  const home = join(f.root, 'home');
+  mkdirSync(home, { recursive: true });
+  const actualHomeFile = join(home, homeName);
+  writeFileSync(actualHomeFile, 'home');
+  utimesSync(actualHomeFile, new Date('2026-10-05T07:10:00Z'), new Date('2026-10-05T07:10:00Z'));
+  try {
+    inventoryCrontab(db, { crontab: `*/5 * * * * cd '${f.root}' && sh -c 'echo ok' > /dev/null 1> "space name.log" 1>> ~/${homeName} 2> missing.err 2>> $HOME/${homeName} &> /dev/null &>> '${newer}'\n` });
+    const entry = listAllLoops({ ...f.opts, now, home, schedules: listSchedules(db) })
+      .find(loop => loop.kind === 'cron-shell')!;
+    expect(entry).toMatchObject({ lastRunAt: '2026-10-05T07:29:00.000Z', evidence: 'log-mtime' });
+    const redirects = ['>', '>>', '1>', '1>>', '2>', '2>>', '&>', '&>>'];
+    inventoryCrontab(db, { crontab: redirects.map((redirect, i) =>
+      `*/5 * * * * zsh scripts/variant-${i}.sh ${redirect}'${newer}'`).join('\n') + '\n' });
+    const variants = listAllLoops({ ...f.opts, now, schedules: listSchedules(db) }).filter(loop => loop.kind === 'cron-shell');
+    expect(variants).toHaveLength(redirects.length);
+    for (let i = 0; i < redirects.length; i++) {
+      expect(variants.find(loop => loop.command?.includes(`variant-${i}.sh`))).toMatchObject({
+        lastRunAt: '2026-10-05T07:29:00.000Z', evidence: 'log-mtime',
+      });
+    }
+  } finally { db.close(); }
+});
 
 test('list joins graph and cron by path, excludes untriggered graph, exposes next and last run', () => {
   const f = fixture();

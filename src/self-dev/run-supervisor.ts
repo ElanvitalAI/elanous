@@ -10,6 +10,14 @@ import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 export interface SupervisorRound {
   round: number;
   landed: number;
+  /**
+   * Pieces that finished (`ok=true`) with at least one new commit against
+   * this run's own `--base` — not a main merge. Omitted on rounds that
+   * never measured it, so older history stays comparable.
+   */
+  baseCompleted?: number;
+  /** The run's own `--base` those completions were counted against. */
+  base?: string;
   actionable: number;
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'];
 }
@@ -22,6 +30,7 @@ export type SupervisorStopReason =
   | 'parent-signals-red'
   | 'needs-human'
   | 'no-actionable-work'
+  | 'harvestable-awaiting-human'
   | 'handed-off-to-salvage'
   | 'max-rounds'
   | 'no-progress'
@@ -39,6 +48,7 @@ export const SUPERVISOR_STOP_REASONS = [
   'parent-signals-red',
   'needs-human',
   'no-actionable-work',
+  'harvestable-awaiting-human',
   'handed-off-to-salvage',
   'max-rounds',
   'no-progress',
@@ -105,9 +115,25 @@ export function countLanded(results: readonly SelfDevJobResult[]): number {
   return results.filter(hasDelivered).length;
 }
 
+/** One base label for the round. Mixed or missing bases stay unnamed. */
+export function roundBase(results: readonly SelfDevJobResult[]): string | undefined {
+  const bases = [...new Set(results.flatMap((result) => result.base === undefined ? [] : [result.base]))];
+  return bases.length === 1 ? bases[0] : undefined;
+}
+
+/**
+ * Finished pieces (`ok=true`) that added at least one commit against this
+ * run's own `--base`. A main merge is not required, and a commit without
+ * `ok=true` is not completion.
+ */
+export function countBaseCompleted(results: readonly SelfDevJobResult[]): number {
+  return results.filter((result) => result.ok === true && (result.commitsAheadOfBase ?? 0) >= 1).length;
+}
+
 export function madeProgress(prev: SupervisorRound | undefined, next: SupervisorRound): boolean {
   if (!prev) return true;
   if (next.landed > 0) return true;
+  if ((next.baseCompleted ?? 0) > (prev.baseCompleted ?? 0)) return true;
   if (next.actionable < prev.actionable) return true;
   return next.reviewMustFixTrend === 'improving';
 }
@@ -191,8 +217,16 @@ export function decideNextRun(input: {
   const t = triageRun(activeResults, deployFindings, observation === 'failed');
   const round = history.length;
   const landed = countLanded(results);
+  const baseCompleted = countBaseCompleted(results);
+  const completionBase = roundBase(results);
   const actionable = countActionable(t);
-  const thisRound: SupervisorRound = { round, landed, actionable, reviewMustFixTrend };
+  const thisRound: SupervisorRound = {
+    round,
+    landed,
+    ...(baseCompleted > 0 || completionBase !== undefined ? { baseCompleted, ...(completionBase === undefined ? {} : { base: completionBase }) } : {}),
+    actionable,
+    reviewMustFixTrend,
+  };
   const goalPlanRevisionObservation = formatGoalPlanRevisionObservation(results);
   const withGoalPlanRevisionObservation = (why: string): string => goalPlanRevisionObservation
     && goalPlanRevisionObservation !== GOAL_PLAN_REVISION_OBSERVATION_UNAVAILABLE
@@ -223,6 +257,16 @@ export function decideNextRun(input: {
       action: 'stop',
       stopReason: 'needs-human',
       why: unlandedParents.map((result) => parentUnlandedProgressLine(result.feature.split('\n')[0]!, result.parentPrNumber, result.parentNoPr === true)).join(' · '),
+    };
+  }
+
+  const harvestable = results.filter((result) => result.harvestable === true && !!result.branch);
+  if (harvestable.length > 0) {
+    return {
+      ...base,
+      action: 'stop',
+      stopReason: 'harvestable-awaiting-human',
+      why: withGoalPlanRevisionObservation(`구현 완료 · 수확 대기 — ${harvestable.map((result) => result.branch).join(' · ')}`),
     };
   }
 
@@ -364,7 +408,7 @@ export function decideNextRun(input: {
         ...base,
         action: 'stop',
         stopReason: 'no-progress',
-        why: withNoProgressGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리 — 착지도 안 늘고 남은 조각도 안 줄었다(${actionable}). 골·불변식을 의심할 자리`),
+        why: withNoProgressGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리 — base=${completionBase ?? 'main'} 기준 완료 ${baseCompleted} · 착지 ${landed} · 남은 조각도 안 줄었다(${actionable}). 골·불변식을 의심할 자리`),
       };
     }
   }
@@ -390,9 +434,12 @@ export function appendRound(
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'],
 ): SupervisorRound[] {
   const t = triageRun(results.filter((result) => result.salvage !== 'launched'));
+  const baseCompleted = countBaseCompleted(results);
+  const base = roundBase(results);
   return [...history, {
     round: history.length,
     landed: countLanded(results),
+    ...(baseCompleted > 0 || base !== undefined ? { baseCompleted, ...(base === undefined ? {} : { base }) } : {}),
     actionable: countActionable(t),
     ...(reviewMustFixTrend === undefined ? {} : { reviewMustFixTrend }),
   }];

@@ -6,6 +6,7 @@ import { ChatLayout } from '../components/chat/ChatLayout';
 import { assertTuiSeatAskRestartContract } from '../../../../test/seat-ask-tui-restart-contract';
 import { ChatInput } from '../components/chat/ChatInput';
 import { ChatHistory } from '../components/chat/ChatHistory';
+import { ChatCurrentProject } from '../components/chat/ChatCurrentProject';
 import type { ChatMessage } from './chat-runtime';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -262,6 +263,7 @@ describe('PWA slash-command boundary', () => {
       await act(async () => {
         tree = create(createElement(DaemonContext.Provider, { value: daemon }, createElement(ChatLayout)));
       });
+      expect(tree!.root.findAllByType(ChatCurrentProject)).toHaveLength(1);
       const input = tree!.root.findByType(ChatInput);
       await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/model' } }); });
       await act(async () => { input.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault: () => {} }); });

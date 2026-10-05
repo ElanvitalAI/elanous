@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { redactSecretText } from '../debug/log.js';
+import { refuseProductionLedgerWriteInTest } from './ledger-write-guard.js';
 
 export interface RunExit {
   runId: string;
@@ -83,6 +84,7 @@ export function readRunExits(root: string): RunExit[] {
 
 /** SQLite's process-owned write lock serializes ledger checks and appends across processes. */
 export function recordRunExit(row: RunExit, root: string): void {
+  if (refuseProductionLedgerWriteInTest(root, 'incidents')) return;
   if (!row.runId?.trim()) return;
   const at = Date.parse(row.at);
   if (!Number.isFinite(at)) throw new Error('invalid incident exit time');

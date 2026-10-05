@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { findTrack } from '../autopilot/mission-phase-track.js';
+import { wasIntakeEventScheduled } from './route.js';
 
 export const INTAKE_SOURCES = ['x', 'youtube', 'github', 'telegram-saved', 'telegram-bot', 'memo', 'pwa'] as const;
 export type RegisteredIntakeSourceKind = 'rss' | 'command';
@@ -243,13 +244,13 @@ export function parseRawIntakeJsonl(text: string): { raws: RawIntakeItem[]; bad:
  */
 const STALE_QUEUED_MS = 24 * 3600_000;
 
-export function pickAbsorbQueue(instanceRoot: string, opts: { max: number; laneMax?: number; kind?: IntakeKind; dryRun?: boolean }, now = new Date().toISOString()): IntakeItem[] {
+export function pickAbsorbQueue(instanceRoot: string, opts: { max: number; laneMax?: number; kind?: IntakeKind; dryRun?: boolean }, now = new Date().toISOString(), taskStatus?: Parameters<typeof wasIntakeEventScheduled>[3]): IntakeItem[] {
   const userLeft = (i: IntakeItem) => i.sources.some((s) => s === 'telegram-saved' || s === 'memo');
   const score = (i: IntakeItem) => Math.max(0, ...Object.entries(i.signals).filter(([k]) => k.endsWith('.score')).map(([, v]) => v));
   const eligible = [...loadIntakeLedger(instanceRoot).items.values()]
     // queued 로 옮긴 뒤 흡수·표시가 없이 하루가 지난 것(흡수 도중 죽은 판)은 다시 고른다.
     .filter((i) => (i.status === 'new' || (i.status === 'queued' && Date.parse(now) - Date.parse(i.lastSeenAt) > STALE_QUEUED_MS))
-      && !!i.url && (!opts.kind || i.kind === opts.kind))
+      && !!i.url && !wasIntakeEventScheduled(instanceRoot, i.url, now, taskStatus) && (!opts.kind || i.kind === opts.kind))
     .sort((a, b) => Number(userLeft(b)) - Number(userLeft(a)) || b.sources.length - a.sources.length || score(b) - score(a) || b.lastSeenAt.localeCompare(a.lastSeenAt));
   const laneMax = opts.laneMax ?? 30;
   const lane = eligible.filter((i) => i.sources.includes('telegram-saved')).slice(0, Math.max(0, laneMax));

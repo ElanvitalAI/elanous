@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { checkPodPool, genericConfigPodPool, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type RemoteRun } from './pod-pool.js';
+import { debug } from '../../debug/log.js';
+import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -45,13 +46,70 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(resolvePodPoolSpec(undefined, { ELANOUS_POD_POOL: 'b:1' }, () => 'c:1')).toBe('b:1');
   });
 
-  test('fills the first node to capacity before spilling to the next; release reopens a slot', () => {
-    const pool = new PodPoolScheduler(parsePodPool('first:2,second:1'));
-    const got = [pool.tryAcquire(), pool.tryAcquire(), pool.tryAcquire(), pool.tryAcquire()].map((m) => m?.context ?? null);
+  test('fills the first node to capacity before spilling to the next; release reopens a slot', async () => {
+    const pool = new PodPoolScheduler(parsePodPool('first:2,second:1'), { occupancy: () => ({}) });
+    const got = [await pool.tryAcquire(), await pool.tryAcquire(), await pool.tryAcquire(), await pool.tryAcquire()].map((m) => m?.context ?? null);
     expect(got).toEqual(['first', 'first', 'second', null]);
     pool.release(pool.members[0]!);
-    expect(pool.tryAcquire()?.context).toBe('first');
+    expect((await pool.tryAcquire())?.context).toBe('first');
     expect(pool.snapshot()).toEqual({ first: 2, second: 1 });
+  });
+
+  test('picks the member with the most real free slots, not the first one', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const original = debug.log.bind(debug);
+    debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'pod.pool' && event === 'member-selected' && data) events.push(data);
+      return original(category, event, data);
+    }) as typeof debug.log;
+    try {
+      const full: Record<string, MemberOccupancy> = { node-b: { occupied: 20 }, node-c: { occupied: 0 } };
+      const fullPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => full });
+      expect((await fullPool.tryAcquire())?.context).toBe('node-c');
+      expect(events.at(-1)).toEqual({ member: 'node-c', free: { node-b: 0, node-c: 4 }, measured: { node-b: true, node-c: true } });
+
+      const both: Record<string, MemberOccupancy> = { node-b: { occupied: 10 }, node-c: { occupied: 1 } };
+      const bothPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => both });
+      expect((await bothPool.tryAcquire())?.context).toBe('node-b');
+
+      const tied: Record<string, MemberOccupancy> = { node-b: { occupied: 16 }, node-c: { occupied: 0 } };
+      const tiedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => tied });
+      expect((await tiedPool.tryAcquire())?.context).toBe('node-b');
+
+      const failed: Record<string, MemberOccupancy> = { node-b: { occupied: 0 }, node-c: { occupied: null, reason: 'timeout' } };
+      const failedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => failed });
+      expect((await failedPool.tryAcquire())?.context).toBe('node-b');
+      expect(events.at(-1)?.measured).toEqual({ node-b: true, node-c: false });
+
+      const picked: string[] = [];
+      for (let n = 0; n < 10; n++) {
+        const occupancy: Record<string, MemberOccupancy> = n % 2 === 0
+          ? { node-b: { occupied: 20 }, node-c: { occupied: 0 } }
+          : { node-b: { occupied: 10 }, node-c: { occupied: 3 } };
+        const launch = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => occupancy });
+        const member = await launch.tryAcquire();
+        if (member) picked.push(member.context);
+      }
+      const minihPicks = picked.filter((context) => context === 'node-c').length;
+      expect(picked).toHaveLength(10);
+      expect(minihPicks).toBeGreaterThanOrEqual(Math.ceil(10 * 4 / 24));
+    } finally { debug.log = original; }
+  });
+
+  test('occupancy reads Running plus Pending per member and marks a failed member unknown, not zero', () => {
+    const members = parsePodPool('node-b:20,node-c:4');
+    const kubectl = (args: readonly string[]) => {
+      if (args[1] === 'node-c') return { status: 1, stdout: '', stderr: 'timeout' };
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'n' }, status: { allocatable: { memory: '64Gi', cpu: '4' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'j', labels: { 'elanous.substrate': 'pod' } } }] }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: [
+        { metadata: { namespace: 'elanous-test', name: 'a', labels: { 'elanous.substrate': 'pod', 'elanous.job': 'j' } }, status: { phase: 'Running' }, spec: { nodeName: 'n', containers: [{ resources: { limits: { memory: '1Gi' }, requests: { memory: '1Gi' } } }] } },
+        { metadata: { namespace: 'elanous-test', name: 'b', labels: { 'elanous.substrate': 'pod', 'elanous.job': 'j' } }, status: { phase: 'Pending' }, spec: { containers: [{ resources: { limits: { memory: '1Gi' }, requests: { memory: '1Gi' } } }] } },
+      ] }), stderr: '' };
+    };
+    const reading = measureMemberOccupancy(members, { kubectl, dns: () => 'ready' });
+    expect(reading.node-b).toEqual({ occupied: 2 });
+    expect(reading.node-c?.occupied).toBeNull();
   });
 
   test('check drops unreachable nodes with the reason, never silently', () => {

@@ -57,7 +57,29 @@ function simulation(reasons: string[], tier?: 'high' | 'standard') {
 }
 
 describe('Pod OOM retry', () => {
-  test('lite OOM recalculates the measured request for the high retry Job without changing either limit', async () => {
+  test('automatic document lite OOM retries exactly once at standard with durable tier and reason', async () => {
+    const s = simulation(['OOMKilled', 'Complete']);
+    const feature = '# Write guide\n- GoalType: document\n\n## PROBLEM\nWrite guide';
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'document-lite-oom-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'oom-retry') events.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: s.kubectl, pool: s.pool as never, env: s.env, credentials: creds })({ feature, spaceId: 'document-oom' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['2Gi', '16Gi']);
+      expect(s.jobs[0].spec.template.spec.containers[0].resources.requests.memory).toBe('2Gi');
+      expect(events).toEqual([expect.objectContaining({ from: '2Gi', to: '16Gi', tier: 'standard', reason: 'OOMKilled' })]);
+      const ledger = readFileSync(runLedgerPath('run-parent-1', runLedgerDir(s.root)), 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+      expect(ledger.filter((entry) => entry.event === 'pod-memory-selected').map((entry) => entry.data)).toEqual([
+        expect.objectContaining({ tier: 'lite', source: 'goal-type-auto', reason: 'declared goal type document', limit: '2Gi' }),
+        expect.objectContaining({ tier: 'standard', source: 'oom-retry', reason: 'OOMKilled', limit: '16Gi' }),
+      ]);
+      expect(ledger.find((entry) => entry.event === 'pod-oom-retry-intent').data).toMatchObject({ tier: 'standard', to: '16Gi' });
+    } finally { off(); rmSync(s.root, { recursive: true, force: true }); }
+  });
+
+  test('lite OOM recalculates the measured request for the standard retry Job without changing either limit', async () => {
     const s = simulation(['OOMKilled', 'Complete']);
     const now = Date.now();
     const rows = [1, 2, 3].flatMap((n) => [
@@ -73,8 +95,32 @@ describe('Pod OOM retry', () => {
       expect(s.jobs.map((job) => job.metadata.annotations['elanous.dev/attempt'])).toEqual(['1', '2']);
       expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources)).toEqual([
         { requests: { cpu: '1', memory: '2Gi' }, limits: { memory: '2Gi', cpu: '4' } },
-        { requests: { cpu: '1', memory: '9Gi' }, limits: { memory: '32Gi', cpu: '4' } },
+        { requests: { cpu: '1', memory: '9Gi' }, limits: { memory: '16Gi', cpu: '4' } },
       ]);
+    } finally { rmSync(s.root, { recursive: true, force: true }); }
+  });
+
+  test('document lite then standard OOM stops after one retry and names the actual tier', async () => {
+    const s = simulation(['OOMKilled', 'OOMKilled']);
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: s.kubectl, pool: s.pool as never, env: s.env, credentials: creds })({ feature: '# Write guide\n- GoalType: document\n\n## PROBLEM\nWrite guide', spaceId: 'document-twice' }).done;
+      expect(result.error?.code).toBe('pod-oom-killed');
+      expect(result.error?.message).toContain('OOM · standard 에서도');
+      expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['2Gi', '16Gi']);
+    } finally { rmSync(s.root, { recursive: true, force: true }); }
+  });
+
+  test('restart after a document lite OOM preserves the standard retry intent', async () => {
+    const feature = '# Write guide\n- GoalType: document\n\n## PROBLEM\nWrite guide';
+    const spaceId = 'document-restart';
+    const s = simulation(['Complete']);
+    appendRunLedgerEntry({ runId: 'run-parent-1', event: 'pod-oom-retry-intent', data: { job: podJobName(spaceId), executionKey: keyFor(spaceId, feature), attempt: 2, from: '2Gi', to: '16Gi', tier: 'standard', fromChildRunId: 'run-first' } }, runLedgerDir(s.root));
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: s.kubectl, pool: s.pool as never, env: s.env, credentials: creds })({ feature, spaceId }).done;
+      expect(result.exitCode).toBe(0);
+      expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['16Gi']);
+      const ledger = readFileSync(runLedgerPath('run-parent-1', runLedgerDir(s.root)), 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+      expect(ledger.find((entry) => entry.event === 'pod-memory-selected').data).toMatchObject({ tier: 'standard', reason: 'OOMKilled' });
     } finally { rmSync(s.root, { recursive: true, force: true }); }
   });
 

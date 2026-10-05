@@ -6,7 +6,8 @@ import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
 import { debug } from '../../src/debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { addItem, setItem } from '../../src/release-loop/checklist.js';
-import { draftReleaseStory } from './draft.js';
+import { listSeatRequests } from '../../src/seat-dispatch/seat-request-ledger.js';
+import { draftReleaseStory, runReleaseStory } from './draft.js';
 
 const version = '9.8.7';
 const dirs: string[] = [];
@@ -74,6 +75,38 @@ test('two user lines, two green cells, one manual candidate and one linked verif
   } finally { spy.mockRestore(); }
 });
 
+test('successful release story delivers three files and one MK request per version, including retries', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- Search is faster\n');
+  green('STORY_RELEASE', '검색 개선');
+  const context = { input: { version, previousVersion: '9.8.6' }, outputs: { publish: { outcome: 'ok' }, verify: { outcome: 'ok' } } };
+  const draft = () => draftReleaseStory(options);
+  expect(runReleaseStory(context, draft)).toMatchObject({ outcome: 'ok', status: 'drafted', files: [
+    join(options.outDir, 'announcement.md'), join(options.outDir, 'site-news.md'), join(options.outDir, 'manual-candidates.md'),
+  ] });
+  expect(readFileSync(join(options.outDir, 'announcement.md'), 'utf8')).toContain('검색 개선');
+  expect(readFileSync(join(options.outDir, 'site-news.md'), 'utf8')).toContain('Search is faster');
+  expect(readFileSync(join(options.outDir, 'manual-candidates.md'), 'utf8')).toContain('STORY_RELEASE');
+  expect(runReleaseStory(context, draft).outcome).toBe('ok');
+  const requests = readFileSync(join(options.dir, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n');
+  expect(requests).toHaveLength(1);
+  expect(listSeatRequests(options.dir, { seat: 'MK' })).toMatchObject([{ key: `release-story:${version}`, seat: 'MK',
+    source: 'release-story', version, status: 'pending', text: `${version} 공지 초안 준비됨: ${options.outDir}` }]);
+});
+
+test('draft failure is observed without queuing an MK request', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- Search is faster\n');
+  const context = { input: { version, previousVersion: '9.8.6' }, outputs: { publish: { outcome: 'ok' }, verify: { outcome: 'ok' } } };
+  const logged = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    expect(runReleaseStory(context, () => { throw new Error('injected generator failure'); })).toMatchObject({ outcome: 'fail', reason: 'injected generator failure' });
+    expect(logged).toHaveBeenCalledWith('release.story', 'draft-failed', { version, reason: 'injected generator failure' });
+    expect(readdirSync(options.dir)).not.toContain('seat-requests');
+    expect(runReleaseStory({ ...context, outputs: { ...context.outputs, publish: { outcome: 'fail' } }, }, () => { throw new Error('should not draft'); }).outcome).toBe('fail');
+  } finally { logged.mockRestore(); }
+});
+
 test('brand finding stays at the top of the offending draft without blocking generation', () => {
   const options = fixture();
   writeFileSync(options.nextPath, '# Next\n## Feat\n- available now for readers\n');
@@ -84,6 +117,21 @@ test('brand finding stays at the top of the offending draft without blocking gen
   expect(readFileSync(join(options.outDir, 'announcement.md'), 'utf8')).toStartWith('> ⚠ 브랜드 규칙: B2 «available now»\n');
   expect(readFileSync(join(options.outDir, 'site-news.md'), 'utf8')).toMatch(/^> ⚠ 브랜드 규칙: [^\n]+\n(?:> ⚠ 브랜드 규칙: [^\n]+\n)*\n# /);
   expect(readFileSync(join(options.outDir, 'site-news.md'), 'utf8')).toContain('> ⚠ 브랜드 규칙: B2 «available now»');
+});
+
+test('missing brand rules mark every release story draft and the returned result unmeasured with zero brand passes', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- A better search\n');
+  const missing = join(options.dir, 'absent-rules.yaml');
+  const result = draftReleaseStory({ ...options, rulesPath: missing });
+  expect(result.brandUnmeasured).toBe('규칙 없음 — 측정 불가');
+  expect(result.brandFindings).toBe(0);
+  expect(result.files).toHaveLength(3);
+  for (const file of result.files) expect(readFileSync(file, 'utf8')).toStartWith('> ⚠ 규칙 없음 — 측정 불가\n\n');
+  const measured = draftReleaseStory(options);
+  expect(measured.brandUnmeasured).toBeUndefined();
+  expect(measured.brandFindings).toBe(0);
+  for (const file of measured.files) expect(readFileSync(file, 'utf8')).not.toContain('규칙 없음 — 측정 불가');
 });
 
 test('empty public input and zero green cells skip all files', () => {
@@ -161,12 +209,12 @@ test('real release/next.md produces clean drafts in an isolated checklist, ledge
     expect(news).not.toContain('⚠ 브랜드 규칙: B11');
     expect(news).not.toContain('가 «delivered»');
     const realMarkdown = readFileSync(realNext, 'utf8');
-    const internalSection = /(?:^|\n)## Internal\s*\n([\s\S]*?)(?=\n## |$)/.exec(realMarkdown)?.[1]?.trim();
+    const internalSection = /(?:^|\n)## Internal[ \t]*\n([\s\S]*?)(?=\n## |$)/.exec(realMarkdown)?.[1]?.trim();
     if (internalSection) {
-      const privateSentence = '`elanous freeze on|off|status|resume` holds ready-PR merges during a landing freeze and resumes them on `freeze off`; a release run started while frozen stops before its gate and publication (`--if-ready` defers, `--force-freeze` overrides) and is run again after the freeze; with the switch off, gate, publish and unattended release behave exactly as before.';
-      expect(internalSection).toContain(`- ${privateSentence}`);
-      expect(announcement).not.toContain(privateSentence);
-      expect(news).not.toContain(privateSentence);
+      for (const line of internalSection.split('\n').filter((line) => line.trim())) {
+        expect(announcement).not.toContain(line);
+        expect(news).not.toContain(line);
+      }
       expect(result.internalDropped).toBeGreaterThan(0);
     } else {
       expect(result.internalDropped).toBe(0);
@@ -237,4 +285,5 @@ test('CLI --version --next --out --json uses isolated inputs and outputs', () =>
     join(options.outDir, 'announcement.md'), join(options.outDir, 'site-news.md'), join(options.outDir, 'manual-candidates.md'),
   ] });
   expect(readdirSync(options.outDir)).toHaveLength(3);
+  expect(readdirSync(options.dir)).not.toContain('seat-requests');
 });

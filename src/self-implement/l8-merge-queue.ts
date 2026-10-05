@@ -8,6 +8,20 @@ import { getDefaultLogStore } from '../mss/logging/log-store.js';
 type Command = (bin: string, args: readonly string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
 export type L8MergeQueueInput = { number: number; cwd: string; matchHeadCommit: string };
 export type L8MergeQueueResult = { merged: boolean; baseRefName?: string; mergeCommit?: string; detail?: string };
+/** Read-only integration report. Never a landing decision and never a remote write. */
+export type L8ChangedTestResult = { file: string; passed: boolean; pass: number; fail: number; detail?: string };
+export type L8IntegrationEvaluation = {
+  number: number;
+  head: string;
+  base?: string;
+  /** True only when the candidate integrates (next.md-only conflicts resolved) and every changed test passed. */
+  feasible: boolean;
+  conflictingFiles: string[];
+  /** True when there is no conflict, or every conflict path is exactly release/next.md. */
+  conflictsLimitedToNextMd: boolean;
+  changedTests: L8ChangedTestResult[];
+  detail?: string;
+};
 export type L8MergeQueueDeps = {
   command?: Command;
   /** Must identify the same shared repository across all harness processes. */
@@ -192,6 +206,124 @@ export async function acquireL8MergeQueue(cwd: string): Promise<() => void> {
       if (Date.now() >= deadline) throw new Error('merge queue occupied for 30 minutes');
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
+  }
+}
+
+const TEST_PATH = /(?:^|\/)[^/]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/;
+
+function parseChangedTestCounts(output: string): { pass: number; fail: number; ran: number; files: number } | null {
+  const counts = /\b(\d+) pass\b[\s\S]*?\b(\d+) fail\b[\s\S]*?Ran ([1-9]\d*) tests? across ([1-9]\d*) files?/.exec(output);
+  if (!counts) return null;
+  return { pass: Number(counts[1]), fail: Number(counts[2]), ran: Number(counts[3]), files: Number(counts[4]) };
+}
+
+/**
+ * Report whether one pinned PR can integrate onto freshly fetched main.
+ * Resolves an append-only release/next.md conflict in a disposable worktree only.
+ * Never pushes, never calls a merge API, and never moves a remote ref.
+ */
+export async function evaluateL8Integration(input: L8MergeQueueInput, deps: L8MergeQueueDeps = {}): Promise<L8IntegrationEvaluation> {
+  const report: L8IntegrationEvaluation = {
+    number: input.number,
+    head: input.matchHeadCommit,
+    feasible: false,
+    conflictingFiles: [],
+    conflictsLimitedToNextMd: false,
+    changedTests: [],
+  };
+  if (!Number.isSafeInteger(input.number) || input.number <= 0 || !/^[0-9a-f]{40}$/i.test(input.matchHeadCommit)) {
+    return { ...report, detail: 'invalid PR number or pinned head' };
+  }
+  const execute = deps.command ?? command;
+  const run = (bin: string, args: readonly string[], cwd: string): string => {
+    const result = execute(bin, args, cwd);
+    if (result.status !== 0) throw new Error(`${bin} ${args.join(' ')}: ${(result.stderr || result.stdout || `exit ${result.status}`).trim().slice(0, 500)}`);
+    return args.includes('-z') ? result.stdout : result.stdout.trim();
+  };
+  const refuseRemote = (bin: string, args: readonly string[]) => {
+    if (bin === 'git' && args.some((arg) => arg === 'push' || arg === 'update-ref')) throw new Error('evaluation must not push');
+    if (bin === 'gh' && args.some((arg) => arg === 'merge')) throw new Error('evaluation must not merge');
+  };
+  const guarded: Command = (bin, args, cwd) => {
+    refuseRemote(bin, args);
+    return execute(bin, args, cwd);
+  };
+  let temp: string | undefined;
+  let attached = false;
+  try {
+    type View = { headRefOid?: string; headRefName?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean };
+    const view = JSON.parse(run('gh', ['pr', 'view', String(input.number), '--json', 'headRefOid,headRefName,baseRefName,state,isDraft,isCrossRepository'], input.cwd)) as View;
+    if (view.headRefOid !== input.matchHeadCommit || view.baseRefName !== 'main' || view.state !== 'OPEN' || view.isDraft !== false || view.isCrossRepository !== false) {
+      throw new Error('PR head, base, or ready/open state changed');
+    }
+    run('git', ['fetch', 'origin', 'refs/heads/main'], input.cwd);
+    const base = run('git', ['rev-parse', 'FETCH_HEAD'], input.cwd);
+    if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
+    report.base = base;
+    run('git', ['fetch', 'origin', `refs/pull/${input.number}/head`], input.cwd);
+    if (run('git', ['rev-parse', 'FETCH_HEAD'], input.cwd) !== input.matchHeadCommit) throw new Error('fetched PR head changed');
+    temp = mkdtempSync(join(tmpdir(), 'elanous-l8-eval-'));
+    run('git', ['worktree', 'add', '--detach', temp, input.matchHeadCommit], input.cwd);
+    attached = true;
+    const fork = run('git', ['merge-base', base, input.matchHeadCommit], temp);
+    const paths = run('git', ['diff', '--name-only', '-z', fork, input.matchHeadCommit], temp).split('\0').filter(Boolean);
+    if (!paths.length) throw new Error('PR changed-file paths unavailable');
+    if (paths.some((path) => path.startsWith('-') || path.startsWith('/') || path.split('/').includes('..') || path.includes('\\'))) throw new Error('unsafe PR changed-file path');
+    const livePaths = run('git', ['diff', '--name-only', '-z', '--diff-filter=ACMRT', fork, input.matchHeadCommit], temp).split('\0').filter(Boolean);
+    const tests = livePaths.filter((path) => TEST_PATH.test(path));
+    const merge = guarded('git', ['-c', 'user.name=elanous merge queue', '-c', 'user.email=queue@localhost', 'merge', '--no-ff', '--no-edit', base], temp);
+    if (merge.status !== 0) {
+      const unresolved = run('git', ['diff', '--name-only', '--diff-filter=U'], temp).split('\n').filter(Boolean);
+      if (!unresolved.length) throw new Error(`git merge failed: ${(merge.stderr || `exit ${merge.status}`).trim()}`);
+      report.conflictingFiles = unresolved;
+      report.conflictsLimitedToNextMd = unresolved.length === 1 && unresolved[0] === NEXT_MD_PATH;
+      if (!report.conflictsLimitedToNextMd) {
+        report.detail = `merge conflicts: ${unresolved.join(', ')}`;
+        return report;
+      }
+      const stage = (n: number): string => {
+        const result = guarded('git', ['show', `:${n}:${NEXT_MD_PATH}`], temp!);
+        if (result.status !== 0) throw new Error(`release/next.md stage ${n} unavailable: ${result.stderr}`);
+        return result.stdout;
+      };
+      const resolved = resolveNextMdConflict(stage(1), stage(3), stage(2));
+      if (resolved === null) {
+        report.feasible = false;
+        report.detail = 'release/next.md conflict is not append-only';
+        return report;
+      }
+      writeFileSync(join(temp, NEXT_MD_PATH), resolved);
+      run('git', ['add', '--', NEXT_MD_PATH], temp);
+      run('git', ['-c', 'user.name=elanous merge queue', '-c', 'user.email=queue@localhost', 'commit', '-m', 'Integrate latest main for L8 evaluation'], temp);
+    } else {
+      report.conflictsLimitedToNextMd = true;
+    }
+    if (tests.length) {
+      const unavailable = tests.filter((path) => !existsSync(join(temp!, path)));
+      if (unavailable.length) throw new Error(`changed test paths unavailable: ${unavailable.join(', ')}`);
+      run('bun', ['install', '--frozen-lockfile'], temp);
+      for (const file of tests) {
+        const result = guarded('bun', ['test', file], temp);
+        const output = `${result.stdout}\n${result.stderr}`;
+        const counts = parseChangedTestCounts(output);
+        if (!counts || counts.pass + counts.fail !== counts.ran || counts.files !== 1 || (result.status !== 0 && counts.fail === 0)) {
+          throw new Error(`changed tests unmeasured: ${output.slice(-400)}`);
+        }
+        const passed = result.status === 0 && counts.fail === 0 && counts.pass > 0;
+        report.changedTests.push({ file, passed, pass: counts.pass, fail: counts.fail, ...(passed ? {} : { detail: output.slice(-400) }) });
+      }
+      if (report.changedTests.some((entry) => !entry.passed)) {
+        report.detail = 'changed tests failed';
+        return report;
+      }
+    }
+    report.feasible = true;
+    return report;
+  } catch (error) {
+    return { ...report, feasible: false, detail: String(error) };
+  } finally {
+    if (attached && temp) execute('git', ['worktree', 'remove', '--force', temp], input.cwd);
+    if (temp) rmSync(temp, { recursive: true, force: true });
   }
 }
 

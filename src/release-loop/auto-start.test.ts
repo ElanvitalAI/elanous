@@ -72,6 +72,14 @@ test('blocked checklist is skipped and does not launch the release', async () =>
   expect(launched).toBe(false);
 });
 
+test('a launch-time deferral is reported as skipped, not started', async () => {
+  setup();
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true,
+    readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }),
+    launch: () => ({ deferred: true, reason: 'frozen' }),
+  })).toEqual({ status: 'skipped', version: '0.2.8', reason: 'frozen' });
+});
+
 test('already published version is skipped before launch', async () => {
   setup();
   mkdirSync(join(root, 'release', '0.2.8'), { recursive: true });

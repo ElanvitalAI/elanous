@@ -3,7 +3,8 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { _resetSessionsServiceSingletonForTest, getSessionsService } from '@/lib/sessions-service';
 import { ChatConversationList, conversationTime, conversationTitle } from './ChatConversationList';
-import { PROJECT_SELECTION_KEY } from './ChatProjectSwitcher';
+import { PROJECT_SELECTION_KEY, readPendingProjects, writePendingProjects } from './ChatProjectSwitcher';
+import { ChatCurrentProject } from './ChatCurrentProject';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let tree: ReactTestRenderer | undefined;
@@ -60,8 +61,14 @@ test('project selection filters conversations, persists on device, and assigns a
   Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
   const client = { fetchJson: async (path: string, init?: RequestInit) => {
     calls.push({ path, init });
-    if (path === '/v1/projects') return init?.method === 'POST'
-      ? { project: { id: 'q', name: '새 일', createdAt: '' } } : { projects };
+    if (path === '/v1/projects') {
+      if (init?.method === 'POST') {
+        const project = { id: 'q', name: '새 일', createdAt: '' };
+        projects = [...projects, project];
+        return { project };
+      }
+      return { projects };
+    }
     if (init?.method === 'PATCH') return { ok: true };
     if (path.includes('?ifExists=1')) return { meta: current.find((card) => path.includes(card.id)) };
     return { sessions: path.includes('?projectId=p') ? current.filter((c) => c.projectId === 'p') : current };
@@ -86,17 +93,91 @@ test('project selection filters conversations, persists on device, and assigns a
   await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
   await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
   expect(saved.get(PROJECT_SELECTION_KEY)).toBe('q');
-  projects = [...projects, { id: 'q', name: '새 일', createdAt: '' }];
   await act(async () => tree!.root.findAllByType('button').find((button) => button.children.includes(' 새 대화'))!.props.onClick());
   expect(selected).toHaveLength(1);
+  expect(readPendingProjects()[selected[0]!]).toBe('q');
   expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(0);
   current = [...current, { ...cards[0]!, id: selected[0]!, title: '새 대화' }];
   await act(async () => { await getSessionsService(client as never).forceRefresh(); });
   expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(1);
+  expect(readPendingProjects()[selected[0]!]).toBeUndefined();
   expect(calls.find((c) => c.init?.method === 'PATCH')?.init?.body).toBe('{"projectId":"q"}');
   await act(async () => { await getSessionsService(client as never).forceRefresh(); });
   expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(1);
   expect(text()).toContain('새 대화');
+});
+
+test('failed pending assignment restores the saved project membership in the sidebar', async () => {
+  const saved = new Map<string, string>();
+  saved.set(PROJECT_SELECTION_KEY, 'p');
+  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage }) });
+  let rejectPatch: ((reason: Error) => void) | undefined;
+  const calls: string[] = [];
+  const old = { ...cards[0]!, projectId: 'p' };
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    if (path === '/v1/projects') return { projects: [{ id: 'p', name: '일', createdAt: '' }, { id: 'q', name: '개인', createdAt: '' }] };
+    if (init?.method === 'PATCH') {
+      calls.push(path);
+      return await new Promise((_, reject) => { rejectPatch = reject; });
+    }
+    if (path.includes('?ifExists=1')) return { meta: old };
+    return { sessions: [old] };
+  }, sessionStoreEventsUrl: () => '' };
+  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
+  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
+  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
+  const text = () => JSON.stringify(tree!.toJSON());
+  expect(text()).toContain('프로젝트 이야기');
+  await act(async () => { writePendingProjects({ old: 'q' }); });
+  expect(calls).toEqual(['/v1/sessions/store/old']);
+  expect(readPendingProjects().old).toBe('q');
+  await act(async () => { rejectPatch!(new Error('offline')); });
+  expect(readPendingProjects().old).toBeUndefined();
+  expect(text()).toContain('프로젝트 이야기');
+  const select = tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' });
+  await act(async () => select.props.onChange({ target: { value: 'q' } }));
+  expect(text()).not.toContain('프로젝트 이야기');
+  await act(async () => select.props.onChange({ target: { value: 'p' } }));
+  expect(text()).toContain('프로젝트 이야기');
+  expect(calls).toHaveLength(1);
+});
+
+test('creating a project in the sidebar refreshes a mounted chat header and opening a conversation refreshes again', async () => {
+  const saved = new Map<string, string>();
+  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage }) });
+  let projects = [{ id: 'p', name: '일', createdAt: '' }];
+  let lists = 0;
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    if (path === '/v1/projects') {
+      if (init?.method === 'POST') {
+        const project = { id: 'q', name: '새 일', createdAt: '' };
+        projects = [...projects, project];
+        return { project };
+      }
+      lists++;
+      return { projects };
+    }
+    if (path.includes('?ifExists=1')) return { meta: { projectId: 'q' } };
+    return { sessions: cards };
+  }, sessionStoreEventsUrl: () => '' };
+  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
+  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /><ChatCurrentProject /></DaemonContext.Provider>); });
+  const header = () => tree!.root.findByProps({ 'aria-label': '현재 대화 프로젝트' });
+  expect(header().findAllByType('option').map((option) => option.props.children)).not.toContain('새 일');
+  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' }).props.onChange({ target: { value: 'create' } }));
+  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
+  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  expect(header().findAllByType('option').find((option) => option.props.value === 'q')?.props.children).toBe('새 일');
+  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' }).props.onChange({ target: { value: 'all' } }));
+  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
+  const beforeOpen = lists;
+  await act(async () => tree!.root.findAllByType('button').find((button) => button.props['aria-current'] === 'page')!.props.onClick());
+  expect(lists).toBeGreaterThan(beforeOpen);
+  expect(header().findAllByType('option').find((option) => option.props.value === 'q')?.props.children).toBe('새 일');
 });
 
 test('recent conversations use title, preview fallback, relative time and current highlight', async () => {

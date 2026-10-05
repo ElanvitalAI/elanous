@@ -37,3 +37,21 @@ test('bash leaves the runBash environment unspecified for workflows without one'
   expect(received).toEqual({ timeoutMs: undefined, signal: undefined, cwd: process.cwd() });
   expect(received).not.toHaveProperty('env');
 });
+
+test('bash node error keeps the first 200 and last 800 of a long stderr, including the real error line', async () => {
+  const head = 'B'.repeat(200);
+  const middle = 'M'.repeat(1_000);
+  const tail = `${'T'.repeat(789)}\nREAL-ERROR`;
+  const stderr = head + middle + tail;
+  expect(stderr.length).toBe(2_000);
+  const deps: WorkflowDeps = {
+    callLLM: async () => '',
+    runBash: async () => ({ stdout: '', stderr, exitCode: 1 }),
+  };
+  const result = await executeBashNode({ id: 'cmd', bash: 'false' }, context, deps);
+  expect(result.ok).toBe(false);
+  expect(result.error).toContain(head);
+  expect(result.error).toContain('REAL-ERROR');
+  expect(result.error).not.toContain(middle);
+  expect(result.error!.indexOf('REAL-ERROR')).toBeGreaterThan(result.error!.indexOf('…'));
+});

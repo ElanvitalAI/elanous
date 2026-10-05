@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../../src/graph-runner/runner.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../../src/self-implement/run-ledger.js';
+import { refuseProductionLedgerWriteInTest } from '../../src/harness/ledger-write-guard.js';
 import { recordFailureEvent } from '../../src/self-implement/heal-intake.js';
 import { roleResult } from './run-role.js';
 
@@ -227,6 +228,18 @@ test('git 이 unknown 이면 삭제 표시를 붙이지 않는다', () => {
   });
   expect((collect.entries as Array<{ unverified: string[] }>)[0]?.unverified).toEqual(['src/cli/daemon-attach.ts']);
   expect(collect.addedFacts).toEqual([]);
+});
+
+test('heal ledger uses an isolated writer root, not a production-root descendant', () => {
+  const production = mkdtempSync(join(tmpdir(), 'heal-production-'));
+  const state = mkdtempSync(join(tmpdir(), 'heal-isolated-'));
+  try {
+    expect(refuseProductionLedgerWriteInTest(join(production, 'run-ledger'), 'run-ledger', { NODE_ENV: 'test' }, production, production)).toBe(true);
+    expect(refuseProductionLedgerWriteInTest(runLedgerDir(state), 'run-ledger', { NODE_ENV: 'test' }, production, state)).toBe(false);
+  } finally {
+    rmSync(production, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
 });
 
 test('원장의 마지막 게이트 사실만 없는 칸에 채운다', () => {

@@ -2,7 +2,7 @@
 import { test, expect, describe, afterEach, spyOn } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { setUserConfigOverlay } from '../../user-config.js';
-import { mergeMainWithLlmResolve, defaultLlmResolve, hasConflictMarkers, conflictResolvePrompt, remoteFetchSpec, defaultGitMergeSeam, LEGACY_MERGE_TARGET, formatLlmMergeOutcome, type MergeGitSeam, type LlmMergeOutcome } from './llm-conflict-merge.js';
+import { DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS, mergeMainWithLlmResolve, defaultLlmResolve, hasConflictMarkers, conflictResolvePrompt, remoteFetchSpec, defaultGitMergeSeam, LEGACY_MERGE_TARGET, formatLlmMergeOutcome, type MergeGitSeam, type LlmMergeOutcome } from './llm-conflict-merge.js';
 import { countTestDeclarations } from '../../self-implement/test-declarations.js';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
@@ -363,6 +363,40 @@ describe('conflictResolvePrompt', () => {
 
 
 describe('defaultLlmResolve intent modes', () => {
+  test('oversized full prompt calls the LLM zero times; small conflicts retain the resolver', async () => {
+    let calls = 0;
+    const stream = (async () => { calls++; return RESOLVED; }) as typeof import('../../llm.js')['streamLLM'];
+    try {
+      expect(DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS).toBe(60_000);
+      setUserConfigOverlay((cfg) => ({ ...cfg, raw: { ...cfg.raw, selfImplement: { mergeConflictInputMaxChars: 600 } } }));
+      const oversizedGit = gitSeam({ fileContents: { '/wt/src/a.ts': CONFLICTED.repeat(40) } });
+      const tooLarge = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { mode: 'off', stream }), oversizedGit.git);
+      expect(tooLarge.reason).toBe('conflict-input-too-large');
+      expect(tooLarge.status).toBe('conflict-unresolved');
+      expect(typeof tooLarge.inputChars).toBe('number');
+      expect(tooLarge.inputChars).toBeGreaterThan(600);
+      expect(oversizedGit.calls).toContain('abort');
+      expect(oversizedGit.calls).not.toContain('commit');
+      expect(calls).toBe(0);
+      const small = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { mode: 'off', stream }), gitSeam().git);
+      expect(small.status).toBe('llm-resolved');
+      expect(calls).toBe(1);
+    } finally { setUserConfigOverlay(null); }
+  });
+  test('unreadable config still uses the default resolver and default 60000-character cap', async () => {
+    let calls = 0;
+    const stream = (async () => { calls++; return RESOLVED; }) as typeof import('../../llm.js')['streamLLM'];
+    setUserConfigOverlay(() => { throw new Error('config unreadable'); });
+    try {
+      const small = await defaultLlmResolve('src/a.ts', CONFLICTED, 'main', { stream });
+      expect(small).toBe(RESOLVED);
+      expect(calls).toBe(1);
+      const oversized = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { stream }), gitSeam({ fileContents: { '/wt/src/a.ts': CONFLICTED.repeat(1300) } }).git);
+      expect(oversized.reason).toBe('conflict-input-too-large');
+      expect(oversized.inputChars).toBeGreaterThan(DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS);
+      expect(calls).toBe(1);
+    } finally { setUserConfigOverlay(null); }
+  });
   test('selfImplement.mergeIntent config selects shadow without changing the default', async () => {
     const prompts: string[] = [];
     const stream = (async (messages: Array<{ content: string }>) => {

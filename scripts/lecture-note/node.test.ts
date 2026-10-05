@@ -25,12 +25,13 @@ test('collect → draft → render without renderer → html → skipped pdf; on
   writeFileSync(join(dir, 'summary.md'), summary);
   writeFileSync(join(dir, 'sketch.png'), 'image stays untouched');
   const out = join(dir, 'lecture-note');
-  const opts = { toolsPath: '', llm: async (prompt: string) => {
+  const opts = { toolsPath: '', ocr: async () => '사진 속 손필기 내용', llm: async (prompt: string) => {
     expect(prompt).toContain(summary);
+    expect(prompt).toContain('사진 속 손필기 내용');
     expect(prompt).toContain('Mermaid 우선');
     return '# 강의 노트\n## 개념\n수식 \\( E = mc^2 \\)는 에너지다.\n> 강조 \\( x^2 + y^2 = z^2 \\)\n```mermaid\nflowchart TB\n A-->B\n```\n## 결론\n```mermaid\nflowchart LR\n B-->C\n```';
   } };
-  expect(collect(dir, opts).inputs).toBe(2);
+  expect((await collect(dir, opts)).inputs).toBe(2);
   expect(JSON.parse(readFileSync(join(out, 'inputs.json'), 'utf8')).map((i: { kind: string }) => i.kind).sort()).toEqual(['image', 'markdown']);
   expect((await draft(dir, opts)).diagrams).toBe(2);
   expect([...readFileSync(join(out, 'notes.md'), 'utf8').matchAll(/```mermaid/g)]).toHaveLength(2);
@@ -56,6 +57,51 @@ test('collect → draft → render without renderer → html → skipped pdf; on
   expect(readFileSync(join(dir, 'sketch.png'), 'utf8')).toBe('image stays untouched');
   expect(readFileSync(join(dir, 'summary.md'), 'utf8')).toBe(summary);
   expect(readdirSync(out).sort()).toEqual(['inputs.json', 'notes.html', 'notes.md']);
+});
+
+test('collect OCRs photos and records failed OCR beside unchanged markdown and PDF inputs', async () => {
+  const dir = folder();
+  const common = join(dir, 'sources/common');
+  mkdirSync(common, { recursive: true });
+  writeFileSync(join(dir, 'a.png'), 'image one');
+  writeFileSync(join(common, 'b.webp'), 'image two');
+  writeFileSync(join(dir, 'summary.md'), '원래 강의 요약');
+  writeFileSync(join(dir, 'handout.pdf'), '%PDF-1.4');
+  const calls: string[] = [];
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    expect((await collect(dir, { toolsPath: '', ocr: async (path) => {
+      calls.push(path);
+      if (path.endsWith('b.webp')) throw new Error('OCR 인증 실패');
+      return '사진 속 핵심 개념';
+    } })).inputs).toBe(4);
+    expect(calls).toEqual([join(dir, 'a.png'), join(common, 'b.webp')]);
+    const inputs = JSON.parse(readFileSync(join(dir, 'lecture-note/inputs.json'), 'utf8')) as
+      { name: string; kind: string; text: string }[];
+    expect(inputs).toContainEqual({ name: 'a.png', kind: 'image', text: '사진 속 핵심 개념' });
+    expect(inputs).toContainEqual({ name: 'sources/common/b.webp', kind: 'image', text: '이미지 텍스트 못 읽음 · OCR 인증 실패' });
+    expect(inputs).toContainEqual({ name: 'summary.md', kind: 'markdown', text: '원래 강의 요약' });
+    expect(inputs).toContainEqual({ name: 'handout.pdf', kind: 'pdf', text: 'PDF 텍스트 없음 — pdftotext 없음' });
+    expect(log).toHaveBeenCalledWith('lecture-note.collect', 'ocr-failed', {
+      name: 'sources/common/b.webp', reason: 'OCR 인증 실패',
+    });
+  } finally { log.mockRestore(); }
+});
+
+test('empty OCR fallback is recorded as unreadable rather than silently omitted', async () => {
+  const dir = folder();
+  writeFileSync(join(dir, 'slide.jpeg'), 'image');
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    await collect(dir, { ocr: async () => '' });
+    const inputs = JSON.parse(readFileSync(join(dir, 'lecture-note/inputs.json'), 'utf8')) as
+      { name: string; kind: string; text: string }[];
+    expect(inputs[0]).toEqual({ name: 'slide.jpeg', kind: 'image',
+      text: '이미지 텍스트 못 읽음 · Upstage/OCR.space 폴백 결과가 비었다' });
+    expect(log).toHaveBeenCalledWith('lecture-note.collect', 'ocr-failed', {
+      name: 'slide.jpeg', reason: 'Upstage/OCR.space 폴백 결과가 비었다',
+    });
+  } finally { log.mockRestore(); }
 });
 
 test('stage observation reports the lecture note counts', async () => {
@@ -94,7 +140,7 @@ test('PDF collection without pdftotext records absence; HTML uses rendered PNG a
   const dir = folder();
   writeFileSync(join(dir, 'handout.pdf'), '%PDF-1.4');
   const opts = { toolsPath: '', llm: async () => '# 강의 노트\n<a id="part1"></a>\n## 첫 부분\n| 항목 | 값 |\n| --- | --- |\n| 개념 | 비교 |\n```mermaid\nflowchart LR\n A-->B\n```\n---\n\n<a id="appendix"></a>\n# 부록: 다이어그램 목록\n| # | 파일명 |' };
-  collect(dir, opts);
+  await collect(dir, opts);
   const out = join(dir, 'lecture-note');
   const inputs = JSON.parse(readFileSync(join(out, 'inputs.json'), 'utf8')) as { name: string; kind: string; text: string }[];
   expect(inputs).toHaveLength(1);
@@ -132,18 +178,39 @@ test('graph execution pauses at confirm; PDF skipped still finishes', async () =
   expect(calls).toEqual(['collect', 'draft', 'render', 'html', 'pdf']);
 });
 
-test('renderer execution error fails rather than reporting renderer absence', async () => {
+test('failed Mermaid renderer keeps HTML fallback and uv cache out of the note output', async () => {
   const dir = folder();
   writeFileSync(join(dir, 'summary.md'), '강의');
-  collect(dir, { toolsPath: '' });
+  await collect(dir, { toolsPath: '' });
   await draft(dir, { llm: async () => '# 강의\n```mermaid\nflowchart LR\n A-->B\n```' });
   const tools = join(dir, 'fake-tools');
   mkdirSync(tools);
   const uv = join(tools, 'uv');
-  writeFileSync(uv, '#!/bin/sh\necho "invalid mermaid" >&2\nexit 2\n');
+  writeFileSync(uv, '#!/bin/sh\nmkdir -p "$UV_CACHE_DIR/sdists-v9" "$UV_CACHE_DIR/interpreter-v4"\ntouch "$UV_CACHE_DIR/CACHEDIR.TAG"\necho "playwright not installed" >&2\necho "extra diagnostic" >&2\nexit 1\n');
   chmodSync(uv, 0o755);
-  expect(() => render(dir, { toolsPath: tools })).toThrow('Mermaid 렌더 실패 (diagram-1, exit=2): invalid mermaid');
-  expect(readdirSync(join(dir, 'lecture-note')).sort()).toEqual(['diagram-1.mmd', 'inputs.json', 'notes.md']);
+  const stateDir = join(dir, 'state');
+  const originalStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const renderLog = spyOn(console, 'log').mockImplementation(() => {});
+  try {
+    expect(render(dir, { toolsPath: tools })).toMatchObject({ outcome: 'ok', diagrams: 1, rendered: 0 });
+    expect(renderLog).toHaveBeenCalledWith('못 그림: 1');
+    expect(log).toHaveBeenCalledWith('lecture-note.render', 'diagram-failed', {
+      name: 'diagram-1', reason: 'Mermaid 렌더 실패 (diagram-1, exit=1): playwright not installed',
+    });
+  } finally {
+    if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = originalStateDir;
+    log.mockRestore(); renderLog.mockRestore();
+  }
+  const cache = join(stateDir, 'lecture-note/uv-cache');
+  expect(readdirSync(cache).sort()).toEqual(['CACHEDIR.TAG', 'interpreter-v4', 'sdists-v9']);
+  const out = join(dir, 'lecture-note');
+  expect(html(dir).outcome).toBe('ok');
+  expect(readFileSync(join(out, 'notes.html'), 'utf8')).toContain('<pre><code class="language-mermaid">');
+  expect(readdirSync(out).sort()).toEqual(['diagram-1.mmd', 'inputs.json', 'notes.html', 'notes.md']);
+  for (const name of ['CACHEDIR.TAG', 'sdists-v9', 'interpreter-v4']) expect(readdirSync(out)).not.toContain(name);
 });
 
 test('PDF conversion error fails, but a missing Playwright engine skips', () => {
@@ -177,12 +244,12 @@ test('PDF failure after human approval reaches failed, unlike engine absence', a
   expect(finished.path).toEqual(['collect', 'draft', 'confirm', 'render', 'html', 'pdf', 'failed']);
 });
 
-test('collect reads shared course materials without modifying sources/common', () => {
+test('collect reads shared course materials without modifying sources/common', async () => {
   const dir = folder();
   const common = join(dir, 'sources/common');
   mkdirSync(common, { recursive: true });
   writeFileSync(join(common, 'syllabus.md'), '강의 계획');
-  expect(collect(dir, { toolsPath: '' }).inputs).toBe(1);
+  expect((await collect(dir, { toolsPath: '' })).inputs).toBe(1);
   expect(JSON.parse(readFileSync(join(dir, 'lecture-note/inputs.json'), 'utf8'))[0])
     .toMatchObject({ name: 'sources/common/syllabus.md', text: '강의 계획' });
   expect(readdirSync(common)).toEqual(['syllabus.md']);
@@ -200,21 +267,21 @@ test('CLI reads graph context and ends with an outcome JSON for graph runner', (
   expect(readdirSync(dir).sort()).toEqual(['lecture-note', 'summary.md']);
 });
 
-test('dangling symlink at an output artifact cannot redirect or be overwritten', () => {
+test('dangling symlink at an output artifact cannot redirect or be overwritten', async () => {
   const dir = folder();
   const target = join(folder(), 'elsewhere.json');
   mkdirSync(join(dir, 'lecture-note'));
   symlinkSync(target, join(dir, 'lecture-note/inputs.json'));
   writeFileSync(join(dir, 'summary.md'), 'untouched');
-  expect(() => collect(dir)).toThrow('출력 파일이 안전하지 않다');
+  await expect(collect(dir)).rejects.toThrow('출력 파일이 안전하지 않다');
   expect(readdirSync(resolve(target, '..'))).toEqual([]);
 });
 
-test('a symlinked output directory cannot escape the lecture folder', () => {
+test('a symlinked output directory cannot escape the lecture folder', async () => {
   const dir = folder();
   const elsewhere = folder();
   writeFileSync(join(dir, 'summary.md'), 'untouched');
   symlinkSync(elsewhere, join(dir, 'lecture-note'));
-  expect(() => collect(dir)).toThrow('출력 폴더가 안전하지 않다');
+  await expect(collect(dir)).rejects.toThrow('출력 폴더가 안전하지 않다');
   expect(readdirSync(elsewhere)).toEqual([]);
 });

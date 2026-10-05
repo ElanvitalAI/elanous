@@ -1,5 +1,5 @@
 // HQ lease (본부 임대) — single writer across mbp · node-b · cloud-vm with a 2-of-3 quorum (OP 10-04 08:33 · 08:40).
-// The arbiter (cloud-vm) keeps one record; only the arbiter promotes the standby, and only after two consecutive
+// The arbiter (cloud-vm) keeps one record; promotion requires an explicit opt-in and consecutive
 // checks in which neither the arbiter nor the standby can reach the holder. Fenced work carries the generation.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
@@ -64,9 +64,9 @@ export function recordView(record: LeaseRecord, observer: string, reachable: boo
 
 /**
  * Arbiter check (rule ②). Records the arbiter's own view; counts a dual-unreachable check only when the standby's
- * fresh view of the same holder also says unreachable; promotes the standby after PROMOTE_AFTER_CHECKS in a row.
+ * fresh view of the same holder also says unreachable; promotion is optional and its threshold is configurable.
  */
-export function decideArbiterCheck(record: LeaseRecord, input: { arbiter: string; standby: string; arbiterReachesHolder: boolean; now: number }):
+export function decideArbiterCheck(record: LeaseRecord, input: { arbiter: string; standby: string; arbiterReachesHolder: boolean; now: number; promote?: boolean; promoteAfterChecks?: number }):
   { next: LeaseRecord; promoted: boolean; streak: number } {
   let next = recordView(record, input.arbiter, input.arbiterReachesHolder, input.now);
   const view = next.views?.[input.standby];
@@ -74,7 +74,7 @@ export function decideArbiterCheck(record: LeaseRecord, input: { arbiter: string
   const dual = !input.arbiterReachesHolder && standbyDown && record.holder !== input.standby;
   const streak = dual ? (record.dualUnreachableStreak ?? 0) + 1 : 0;
   next = { ...next, dualUnreachableStreak: streak, lastCheckAt: input.now };
-  if (streak < PROMOTE_AFTER_CHECKS) return { next, promoted: false, streak };
+  if (input.promote === false || streak < (input.promoteAfterChecks ?? PROMOTE_AFTER_CHECKS)) return { next, promoted: false, streak };
   return {
     next: { holder: input.standby, generation: record.generation + 1, acquiredAt: input.now, renewedAt: input.now, ttlSeconds: record.ttlSeconds, views: {}, dualUnreachableStreak: 0, lastCheckAt: input.now, promotedFrom: record.holder },
     promoted: true, streak,

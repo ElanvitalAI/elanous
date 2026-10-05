@@ -7,7 +7,7 @@ import { debug } from '../debug/log.js';
 import { beginLandingMerge, readLandingFreeze, type LandingFreeze } from '../release-loop/landing-freeze.js';
 
 /** `manual`: the owning repository could not be determined — a sweep never resumes it; a person does. */
-export interface FrozenMerge { prNumber: number; headCommit: string; repoRoot: string; manual?: true }
+export interface FrozenMerge { prNumber: number; headCommit: string; repoRoot: string; manual?: true; /** Host goal document, so a resumed merge can still apply its «이 칸 완료» declaration (CL-AUTO). */ goalFile?: string }
 /** What a resume sweep hands its merge function: the held entry, marked as already claimed by this sweep. */
 export type ResumedMerge = FrozenMerge & { resumed: true };
 
@@ -65,7 +65,8 @@ function readQueue(root: string): FrozenMerge[] {
     Number.isSafeInteger(item.prNumber) && item.prNumber > 0 &&
     typeof item.headCommit === 'string' && /^[a-f0-9]{40}$/i.test(item.headCommit) &&
     typeof item.repoRoot === 'string' && item.repoRoot.length > 0 &&
-    (item.manual === undefined || item.manual === true))) throw new Error(`invalid frozen merge queue: ${path}`);
+    (item.manual === undefined || item.manual === true) &&
+    (item.goalFile === undefined || (typeof item.goalFile === 'string' && item.goalFile.length > 0)))) throw new Error(`invalid frozen merge queue: ${path}`);
   return data as FrozenMerge[];
 }
 

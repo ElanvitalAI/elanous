@@ -8,6 +8,14 @@
 import type { BashNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../types.js';
 import { interpolate } from '../variables.js';
 
+/** Keep the start of stderr and its real error line. Bun prints the source frame first. */
+export function formatBashStderr(stderr: string): string {
+  const head = 200;
+  const tail = 800;
+  if (stderr.length <= head + tail) return stderr;
+  return `${stderr.slice(0, head)}…${stderr.slice(-tail)}`;
+}
+
 export async function executeBashNode(
   node: BashNode,
   ctx: NodeExecContext,
@@ -30,7 +38,7 @@ export async function executeBashNode(
       return {
         ok: false,
         output: r.stdout, // surface partial output for $node.output access
-        error: `bash exit ${r.exitCode}${r.stderr ? `: ${r.stderr.slice(0, 500)}` : ''}`,
+        error: `bash exit ${r.exitCode}${r.stderr ? `: ${formatBashStderr(r.stderr)}` : ''}`,
         durationMs: Date.now() - startedAt,
       };
     }

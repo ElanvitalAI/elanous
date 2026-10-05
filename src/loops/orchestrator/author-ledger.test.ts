@@ -44,6 +44,14 @@ test('resubmit, confirm and uncheckable snapshots are held and cannot enter auth
   }
 }));
 
+test('blank text is accepted only for an uncheckable held receipt', () => withLedger(ledger => {
+  expect(() => ledger.request({ ...approved, text: '' })).toThrow('text is required unless uncheckable');
+  const check = { verdict: 'uncheckable' as const, signals: [{ kind: 'missing', field: 'text', reason: 'missing cell text' }], ratio: null };
+  const row = ledger.request({ ...approved, text: '', check });
+  expect(ledger.get(row.id)).toMatchObject({ status: 'held', text: '', check, history: [{ toStatus: 'held', detail: check }] });
+  expect(() => ledger.transition(row.id, 'authoring', { by: 'MK', detail: '' })).toThrow('invalid author transition');
+}));
+
 test('raw title and text with backticks, newlines, emoji and whitespace survive UTF-8 round trip', () => withLedger(ledger => {
   const title = '  제목 `x` 🔥\n다음 줄  ';
   const text = '  첫 줄 `foo()`\n둘째 줄 🧪\r\n마지막  ';

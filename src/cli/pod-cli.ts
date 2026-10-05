@@ -94,6 +94,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
             const mem = (v: number | null) => v === null ? '?' : `${(v / 1024 ** 3).toFixed(1)}Gi`;
             io.log(`${m.context} | ${m.capacity} | ${m.running ?? '?'} | ${m.pending ?? '?'} | ${mem(m.memoryLimitBytes)}/${mem(m.allocatableMemoryBytes)} | ${m.allocatableCpuMillicores === null ? '?' : m.allocatableCpuMillicores / 1000}${m.reason ? ` (${m.reason})` : ''}`);
           }
+          io.log(`실측 점유: ${measure.members.map((m) => `${m.context} ${m.running === null || m.pending === null ? '못 쟀다' : m.running + m.pending}/${m.capacity}`).join(' · ') || '?'}`);
           io.log(`권장 지금 ${decision.recommended ?? '?'} 개 더 (limitedBy=${decision.limitedBy ?? 'unknown'})${decision.reason ? ` · ${decision.reason}` : ''}`);
           io.log(`예약(저작 중) ${host.reserved} · 대기 Job ${waitingJobs ?? '?'} · 실행 ${decision.running ?? '?'}`);
           io.log(`임대 없는 실행 ${decision.unleasedRunning ?? '?'}`);
@@ -155,6 +156,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         });
         if (result.image) io.error(`[pod] image ${result.image} · job ${result.job}`);
         io.log(result.artifactsDir);
+        if (result.artifacts?.error) io.error(`산출 회수 못 함: ${result.artifacts.error}`);
         io.exit(result.exitCode);
       } catch (err) {
         io.error(err instanceof Error ? err.message : String(err));

@@ -44,6 +44,26 @@ test('card id + line routes to the persisted Telegram chat/thread, PWA session a
   } finally { store.close(); }
 });
 
+test('successful and failed sends are indistinguishable in the card journal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'wish-reply-history-'));
+  roots.push(root);
+  const store = new CardStore(root);
+  try {
+    const { cardId } = createWishCard({ text: '회신 추적', source: 'pwa', ref: 'history-1', replyTo: { surface: 'pwa', sessionId: 'session-1' } }, store);
+    const before = store.getCard(cardId)?.sections;
+    const sinks: WishReplySinks = {
+      telegram: async () => {},
+      pwa: async () => {},
+      linear: async () => {},
+    };
+    await replyToWishCard(cardId, '성공 줄', store, sinks);
+    expect(store.getCard(cardId)?.sections).toEqual(before);
+    await expect(replyToWishCard(cardId, '실패 줄', store, { ...sinks, pwa: async () => { throw new Error('delivery failed'); } }))
+      .rejects.toThrow('delivery failed');
+    expect(store.getCard(cardId)?.sections).toEqual(before);
+  } finally { store.close(); }
+});
+
 test('default PWA sink writes the reply into the named conversation session', async () => {
   const root = mkdtempSync(join(tmpdir(), 'wish-pwa-reply-'));
   roots.push(root);

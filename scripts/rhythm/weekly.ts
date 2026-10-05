@@ -7,13 +7,15 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/reso
 import { getUserConfig } from '../../src/user-config.js';
 import { loopEvent } from '../../src/loops/observe.js';
 import { sendOutbound } from '../../src/domains/outbound-alert.js';
-import { collectLandings, collectRelease, collectDecisions, type Landing, type Release, type Pending, type Section } from './daily.js';
+import { listSchedules } from '../../src/release-loop/release-schedule.js';
+import { listChecklist } from '../../src/release-loop/checklist.js';
+import { collectLandings, collectDecisions, type Landing, type Release, type Pending, type Section } from './daily.js';
 
 type Issue = { id: string; title: string; owner: string; due: string; status: 'open' | 'done'; at: string; by: string };
 type WeeklyParts = { landings: Section<Landing[]>; release: Section<Release>; issues: Section<Issue[]>;
   followThrough: Section<{ issue: Issue; outcome: 'done' | '기한 뒤 완료' | '기한 넘김' | '진행'; doneAt?: string }[]>;
   decisions: Section<Pending[]>; news: Section<{ title: string; url: string }[]> };
-export type WeeklyDeps = { now?: () => Date; root?: string; vaultRoot?: string | null; sendEnabled?: boolean;
+export type WeeklyDeps = { now?: () => Date; root?: string; vaultRoot?: string | null; sendEnabled?: boolean; repoRoot?: string; repoName?: string;
   landings?: (now: Date, window: { from: Date; to: Date }) => Promise<Landing[]>; release?: () => Promise<Release>;
   decisions?: () => Promise<Pending[]>; send?: (text: string, kind: string) => boolean;
   receipt?: (key: string) => 'sent' | 'not-sent' | 'unknown';
@@ -60,6 +62,20 @@ function appendIssue(root: string, row: Issue) {
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, `${JSON.stringify(row)}\n`);
 }
+async function collectWeeklyRelease(now: Date, root: string): Promise<Release> {
+  if (!existsSync(join(root, 'release', 'features.sqlite'))) throw new Error('판 원장 없음');
+  const schedules = listSchedules(root).sort((a, b) => a.cutAt.localeCompare(b.cutAt));
+  const index = schedules.findIndex(schedule => Date.parse(schedule.cutAt) >= now.getTime());
+  if (index < 0) throw new Error('남은 판 일정 없음');
+  const current = schedules[index]!;
+  const items = listChecklist(current.version, root).items;
+  const next = schedules[index + 1];
+  const nextItems = next ? listChecklist(next.version, root).items : null;
+  return { version: current.version, green: items.filter(i => i.status === 'green').length, total: items.length,
+    nextVersion: next?.version ?? null, nextGreen: nextItems ? nextItems.filter(i => i.status === 'green').length : null,
+    nextTotal: nextItems?.length ?? null, cutAt: current.cutAt,
+    red: items.filter(i => i.status === 'red').map(i => ({ name: `${i.id} ${i.title}` })) };
+}
 function readDailyNews(root: string, from: Date, to: Date): Section<{ title: string; url: string }[]> {
   const found = new Map<string, { title: string; url: string }>();
   const failures: string[] = [];
@@ -67,7 +83,7 @@ function readDailyNews(root: string, from: Date, to: Date): Section<{ title: str
   for (let at = from.getTime(); at < to.getTime(); at += DAY) {
     const day = kstDate(new Date(at));
     const file = join(root, 'rhythm', 'daily', `${day}.md`);
-    if (!existsSync(file)) { failures.push(`${day} 데일리 없음`); continue; }
+    if (!existsSync(file)) continue;
     files++;
     try {
       const text = readFileSync(file, 'utf8');
@@ -83,7 +99,8 @@ function readDailyNews(root: string, from: Date, to: Date): Section<{ title: str
     } catch (e) { failures.push(`${day} ${reasonOf(e)}`); }
   }
   const news = [...found.values()].slice(0, 10);
-  if (failures.length) return { status: 'unreadable', reason: `${files ? failures.join('; ') : '데일리 없음'}${news.length ? `\n부분 수집 (완전한 주간 집계 아님):\n${news.map(n => `- ${n.title} — ${n.url}`).join('\n')}` : ''}` };
+  if (!files) return { status: 'unreadable', reason: '데일리 없음' };
+  if (failures.length) return { status: 'unreadable', reason: `${failures.join('; ')}${news.length ? `\n부분 수집 (완전한 주간 집계 아님):\n${news.map(n => `- ${n.title} — ${n.url}`).join('\n')}` : ''}` };
   return { status: 'ok', value: news };
 }
 const labels: Record<keyof WeeklyParts, string> = {
@@ -133,8 +150,10 @@ function vaultCopy(markdown: string, key: string, deps: WeeklyDeps) {
   let root = deps.vaultRoot;
   if (root === undefined) {
     try {
-      root = String(object(getUserConfig().raw.obsidian).vaultRoot || '') || null;
-      if (root && effectiveInstanceRoot() !== prodInstanceRoot()) return { vaultError: '격리 인스턴스 — 운영 볼트 사본 건너뜀', vaultFatal: false };
+      const config = getUserConfig();
+      const obsidian = object(config.raw.obsidian);
+      root = (typeof obsidian.vault === 'string' && obsidian.vault) || (typeof obsidian.vaultRoot === 'string' && obsidian.vaultRoot) || config.obsidian.vault || null;
+      if (root && effectiveInstanceRoot() !== prodInstanceRoot() && !root.startsWith(`${effectiveInstanceRoot()}/`)) return { vaultError: '격리 인스턴스 — 운영 볼트 사본 건너뜀', vaultFatal: false };
     } catch (e) { return { vaultError: reasonOf(e), vaultFatal: true }; }
   }
   if (!root) return { vaultError: null, vaultFatal: false };
@@ -181,6 +200,8 @@ export async function runWeekly(options: { dryRun?: boolean; stage?: 'collect' |
   const now = (deps.now ?? (() => new Date()))();
   const root = deps.root ?? effectiveInstanceRoot();
   const { from, to, key } = weekOf(now);
+  const newsTo = new Date(`${kstDate(now)}T00:00:00+09:00`);
+  const newsFrom = new Date(newsTo.getTime() - 7 * DAY);
   const file = join(root, 'rhythm', 'weekly', `${key}.md`);
   let markdown: string;
   let header: string;
@@ -205,8 +226,8 @@ export async function runWeekly(options: { dryRun?: boolean; stage?: 'collect' |
     };
     const issues = await safe(async () => issueHistory(root));
     const parts: WeeklyParts = {
-      landings: await safe(() => (deps.landings ?? collectLandings)(now, { from, to })),
-      release: await safe(deps.release ?? collectRelease),
+      landings: await safe(() => deps.landings ? deps.landings(now, { from, to }) : collectLandings(now, { from, to }, { repoRoot: deps.repoRoot, repoName: deps.repoName })),
+      release: await safe(deps.release ?? (() => collectWeeklyRelease(now, root))),
       issues: issues.status === 'ok' ? { status: 'ok', value: [...latest(issues.value).values()].filter(i => i.status === 'open') } : issues,
       followThrough: issues.status === 'ok' ? { status: 'ok', value: [...new Set([
         ...[...latest(issues.value, from.getTime()).values()].filter(i => i.status === 'open').map(i => i.id),
@@ -219,7 +240,7 @@ export async function runWeekly(options: { dryRun?: boolean; stage?: 'collect' |
         return { issue, outcome: Date.parse(issue.due) < now.getTime() ? '기한 넘김' as const : '진행' as const };
       }) } : issues,
       decisions: await safe(deps.decisions ?? collectDecisions),
-      news: readDailyNews(root, from, to),
+      news: readDailyNews(root, newsFrom, newsTo),
     };
     const versions = await safe(async () => publishedVersions(root, from, to));
     if (versions.status === 'unreadable') {

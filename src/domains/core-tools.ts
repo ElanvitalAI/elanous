@@ -30,7 +30,7 @@ import { LOGS_QUERY_SPEC, dispatchLogsQuery } from './logs-tool.js';
 import { MISSION_DECIDE_SPEC, dispatchMissionDecide } from '../autopilot/mission-decide-tool.js';
 import { COO_ADMIN_SPEC, dispatchCooAdmin } from './coo-admin-tool.js';
 import { RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, dispatchReleaseStatus, dispatchReleaseChange } from './release-tool.js';
-import { OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, dispatchOpsSeats, dispatchDecisionsPending } from './ops-facts-tool.js';
+import { OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC, dispatchOpsSeats, dispatchDecisionsPending, dispatchProactMeter } from './ops-facts-tool.js';
 
 /** memory_recall — 크로스서피스 기억(자기 발송 원장 회상). 도메인 무관(domain 필터는 옵션).
  *  finance-tools 에서 L2 로 이관(2026-07-08). */
@@ -142,7 +142,7 @@ const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
     },
   },
 };
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC];
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];
@@ -159,10 +159,11 @@ export function buildCoreTools(recallSearch?: RecallSearch): CoreTools {
     names,
     dispatch: async (name, args, onPartial, context) => {
       const h = CORE_TOOL_HANDLERS[name];
-      if (!h && name !== 'release_change' && name !== 'ops_seats' && name !== 'decisions_pending') return { error: `unknown core tool: ${name}` };
+      if (!h && name !== 'release_change' && name !== 'ops_seats' && name !== 'decisions_pending' && name !== 'proact_meter') return { error: `unknown core tool: ${name}` };
       if (name === 'release_change') return dispatchReleaseChange(args, context);
       if (name === 'ops_seats') return dispatchOpsSeats(args, context);
       if (name === 'decisions_pending') return dispatchDecisionsPending(context);
+      if (name === 'proact_meter') return dispatchProactMeter(args, context);
       if (name === 'memory_recall' || name === 'self_recall') {
         return runRecall(name, args, context ?? { surface: 'skill' }, recallSearch, onPartial);
       }

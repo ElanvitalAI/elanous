@@ -1,9 +1,12 @@
-import { setDefaultTimeout, expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addItem, checklistGate, listChecklist, setItem, summarizeChecklist } from '../../src/release-loop/checklist.js';
+import { setSchedule } from '../../src/release-loop/release-schedule.js';
+import * as store from '../../src/release-loop/feature-store.js';
+import { debug } from '../../src/debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { runChecklistGate } from './checklist-gate-node.js';
 
@@ -43,8 +46,9 @@ test('red and undecided yellow fail while known issues, moves and blocked stay s
   expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail', ok: false, red: ['red'], undecided: ['undecided'], blocked: ['blocked'], moved: ['moved'], knownIssues: [{ id: 'known', title: 'title known', evidence: 'tracked issue' }] });
   expect(result.summary).toContain('🔴1 (red)');
   expect(result.summary).toContain('판정 없음 1');
-  expect(listChecklist('0.2.7').items).toEqual([]);
-  expect(summarizeChecklist(listChecklist('0.2.6'))).toEqual(original);
+  expect(listChecklist('0.2.7').items).toMatchObject([{ id: 'moved', status: 'yellow', owner: 'TC' }]);
+  expect(listChecklist('0.2.6').items.some((item) => item.id === 'moved')).toBe(false);
+  expect(summarizeChecklist(listChecklist('0.2.6')).yellow).toBe(3);
   expect(original).toMatchObject({ green: 1, yellow: 4, red: 1, done: 1, blocked: ['red'], byOwner: { TC: 7 } });
   expect(listChecklist('0.2.6').items.find((item) => item.id === 'known')).toMatchObject({ status: 'yellow', evidence: 'tracked issue', owner: 'TC', disposition: 'known-issue' });
   expect(listChecklist('0.2.6').history).toContainEqual(expect.objectContaining({ id: 'known', field: 'disposition', from: null, to: 'known-issue', by: 'TC' }));
@@ -70,19 +74,137 @@ test('undecided or blocked fails alone, known issue alone passes', () => isolate
   expect(checklistGate('0.2.6').ok).toBe(true);
 }));
 
-test('move passes and copies once to next patch without replacing an existing item', () => isolated((root) => {
+test('move transfers once to next patch without replacing a colliding item', () => isolated((root) => {
   addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' });
   setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');
-  expect(node(root, '0.2.6').result).toMatchObject({ outcome: 'ok', moved: ['K13'] });
+  expect(node(root, '0.2.6').result).toMatchObject({ outcome: 'ok', moved: ['K13'], carried: ['K13'] });
   expect(node(root, '0.2.6').result.outcome).toBe('ok');
   expect(listChecklist('0.2.7').items).toMatchObject([{ id: 'K13', title: 'Carry over', status: 'yellow', owner: 'TC' }]);
   expect(listChecklist('0.2.7').items).toHaveLength(1);
-  expect(listChecklist('0.2.7').history).toHaveLength(1);
+  expect(listChecklist('0.2.7').history).toContainEqual(expect.objectContaining({ id: 'K13', field: 'move', from: '0.2.6', to: '0.2.7' }));
+  expect(listChecklist('0.2.6').items).toEqual([]);
   expect(node(root, '0.2.7').result).toMatchObject({ outcome: 'fail', undecided: ['K13'] });
   addItem('0.2.8', { id: 'K13', title: 'Already present' }, { allowDuplicateId: true });
   setItem('0.2.7', 'K13', { disposition: 'move' }, 'TC');
-  expect(node(root, '0.2.7').result.outcome).toBe('ok');
+  const { code, result } = node(root, '0.2.7');
+  expect(code).toBe(1);
+  expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail', ok: false, carried: [] });
+  expect(result.summary).toStartWith('이월 충돌: K13 — 다음 판에 다른 칸이 같은 ID · 확인표');
   expect(listChecklist('0.2.8').items).toMatchObject([{ id: 'K13', title: 'Already present' }]);
+  expect(listChecklist('0.2.7').items).toHaveLength(1);
+}));
+
+test('same carry evidence closes the original only when title and owner also match', () => isolated(() => {
+  addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' });
+  setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');
+  addItem('0.2.7', { id: 'K13', title: 'Carry over', owner: 'TC' }, { allowDuplicateId: true });
+  setItem('0.2.7', 'K13', { evidence: '0.2.6에서 이월 · reviewed' }, 'TC');
+  const result = runChecklistGate(context('0.2.6'));
+  expect(result).toMatchObject({ outcome: 'ok', ok: true, moved: ['K13'], carried: [] });
+  expect(listChecklist('0.2.6').items).toEqual([]);
+  expect(listChecklist('0.2.7').items).toMatchObject([{ id: 'K13', title: 'Carry over', owner: 'TC', evidence: '0.2.6에서 이월 · reviewed' }]);
+  expect(listChecklist('0.2.7').items).toHaveLength(1);
+}));
+
+test('a real earlier move recorded in next-version history counts as the same carry', () => isolated(() => {
+  addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' });
+  setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');
+  expect(runChecklistGate(context('0.2.6'))).toMatchObject({ outcome: 'ok', carried: ['K13'] });
+  addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' }, { allowDuplicateId: true });
+  setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');
+  expect(runChecklistGate(context('0.2.6'))).toMatchObject({ outcome: 'ok', ok: true, carried: [] });
+  expect(listChecklist('0.2.6').items).toEqual([]);
+  expect(listChecklist('0.2.7').items.map((item) => item.id)).toEqual(['K13']);
+}));
+
+test('matching title and owner without source-version carry evidence is still a collision', () => isolated(() => {
+  addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' });
+  setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');
+  addItem('0.2.7', { id: 'K13', title: 'Carry over', owner: 'TC' }, { allowDuplicateId: true });
+  setItem('0.2.7', 'K13', { evidence: '0.2.5에서 이월' }, 'TC');
+  expect(runChecklistGate(context('0.2.6'))).toMatchObject({ outcome: 'fail', ok: false, carried: [], summary: expect.stringMatching(/^이월 충돌: K13 — 다음 판에 다른 칸이 같은 ID · 확인표/) });
+  expect(listChecklist('0.2.6').items.map((item) => item.id)).toEqual(['K13']);
+}));
+
+test('one collision prevents all carries, including earlier noncolliding items', () => isolated(() => {
+  for (const id of ['FIRST', 'K13']) {
+    addItem('0.2.6', { id, title: `title ${id}`, owner: 'TC' });
+    setItem('0.2.6', id, { disposition: 'move' }, 'TC');
+  }
+  addItem('0.2.7', { id: 'K13', title: 'Different', owner: 'UX' }, { allowDuplicateId: true });
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+  try {
+    const result = runChecklistGate(context('0.2.6'));
+    expect(result).toMatchObject({ outcome: 'fail', ok: false, moved: ['FIRST', 'K13'], carried: [] });
+    expect(result.summary).toStartWith('이월 충돌: K13 — 다음 판에 다른 칸이 같은 ID · 확인표');
+    expect(events).toContainEqual({ category: 'release-loop.checklist-gate', event: 'carry-collision', data: { id: 'K13', from: '0.2.6', to: '0.2.7' } });
+    expect(listChecklist('0.2.6').items.map((item) => item.id)).toEqual(['FIRST', 'K13']);
+    expect(listChecklist('0.2.7').items.map((item) => item.id)).toEqual(['K13']);
+  } finally { log.mockRestore(); }
+}));
+
+test('a move exception reports already carried ids so retry can continue', () => isolated(() => {
+  for (const id of ['FIRST', 'SECOND']) {
+    addItem('0.2.6', { id, title: `title ${id}`, owner: 'TC' });
+    setItem('0.2.6', id, { disposition: 'move' }, 'TC');
+  }
+  const originalMove = store.move;
+  const move = spyOn(store, 'move');
+  move.mockImplementation((...args) => {
+    if (args[0] === 'SECOND') throw new Error('injected move failure');
+    return originalMove(...args);
+  });
+  try {
+    const result = runChecklistGate(context('0.2.6'));
+    expect(result).toMatchObject({ outcome: 'fail', ok: false, moved: ['FIRST', 'SECOND'], carried: ['FIRST'] });
+    expect(result.summary).toContain('이월 실패: SECOND — injected move failure');
+    expect(listChecklist('0.2.6').items.map((item) => item.id)).toEqual(['SECOND']);
+    expect(listChecklist('0.2.7').items.map((item) => item.id)).toEqual(['FIRST']);
+  } finally { move.mockRestore(); }
+}));
+
+test('deadline carries undecided yellows with reason, audit event and a one-line list', () => isolated(() => {
+  setSchedule('0.2.6', { cutAt: '2026-10-05T06:00+09:00', landBy: '2026-10-05T05:40+09:00' }, 'OP');
+  addItem('0.2.6', { id: 'LATE', title: 'Missed deadline', owner: 'TC', priority: 'P1', kind: 'screen' });
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const originalLog = debug.log;
+  debug.log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data });
+    return originalLog.call(debug, category, event, data);
+  }) as typeof debug.log;
+  try {
+    const result = runChecklistGate(context('0.2.6'), new Date('2026-10-04T20:41:00Z'));
+    expect(result).toMatchObject({ outcome: 'ok', moved: ['LATE'], undecided: [], carried: ['LATE'] });
+    expect(result.summary).toContain('이월 1(LATE)');
+    expect(result.summary.includes('\n')).toBe(false);
+    expect(events).toContainEqual({ category: 'release-loop.checklist-gate', event: 'carried', data: { id: 'LATE', from: '0.2.6', to: '0.2.7' } });
+    expect(listChecklist('0.2.6').items).toEqual([]);
+    expect(listChecklist('0.2.7').items[0]).toMatchObject({ id: 'LATE', kind: 'screen', owner: 'TC', priority: 'P1', status: 'yellow' });
+    expect(listChecklist('0.2.7').history).toContainEqual(expect.objectContaining({ id: 'LATE', field: 'move', reason: '컷 자동 이월 · 마감 05:40' }));
+    expect(runChecklistGate(context('0.2.6'), new Date('2026-10-04T20:42:00Z')).carried).toEqual([]);
+  } finally { debug.log = originalLog; }
+}));
+
+test('block or P0 stays in the current version and stops the gate after deadline', () => isolated(() => {
+  setSchedule('0.2.6', { cutAt: '2026-10-05T06:00+09:00', landBy: '2026-10-05T05:40+09:00' }, 'OP');
+  addItem('0.2.6', { id: 'BLOCK', title: 'Owner blocked' });
+  setItem('0.2.6', 'BLOCK', { disposition: 'block' }, 'TC');
+  addItem('0.2.6', { id: 'P0-MOVE', title: 'Urgent move', priority: 'P0' });
+  setItem('0.2.6', 'P0-MOVE', { disposition: 'move' }, 'TC');
+  addItem('0.2.6', { id: 'P0-NONE', title: 'Urgent undecided', priority: 'P0' });
+  const result = runChecklistGate(context('0.2.6'), new Date('2026-10-04T20:41:00Z'));
+  expect(result).toMatchObject({ outcome: 'fail', blocked: ['BLOCK', 'P0-MOVE', 'P0-NONE'], moved: [], carried: [] });
+  expect(listChecklist('0.2.6').items).toHaveLength(3);
+  expect(listChecklist('0.2.7').items).toEqual([]);
+}));
+
+test('before the deadline an undecided yellow is not carried and still blocks the gate', () => isolated(() => {
+  setSchedule('0.2.6', { cutAt: '2026-10-05T06:00+09:00', landBy: '2026-10-05T05:40+09:00' }, 'OP');
+  addItem('0.2.6', { id: 'WAIT', title: 'Before deadline' });
+  const result = runChecklistGate(context('0.2.6'), new Date('2026-10-04T20:39:00Z'));
+  expect(result).toMatchObject({ outcome: 'fail', undecided: ['WAIT'], carried: [] });
+  expect(listChecklist('0.2.7').items).toEqual([]);
 }));
 
 test('known issue without evidence is carried without an evidence gate', () => isolated((root) => {

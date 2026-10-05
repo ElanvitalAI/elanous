@@ -1,10 +1,11 @@
 // DEC-TG — 리허설 판정선을 시험으로: 결정 3건(A/B · 예/아니오 · 되돌릴 수 없음) → 텔레그램 하나·디스코드 하나·/decisions 로 하나
 // → 원장 3건 decided ⊕ 올린 자리 회신 3 ⊕ 다른 계정 버튼 거부 1.
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { createPendingQuestion, readPendingQuestions, writePendingQuestion } from '../ask-user-question/pending-questions.js';
 import { DecisionLedger, type DecisionEntry, type RaiseInput } from './decision-ledger.js';
 import { DecisionCardService, parseTap, raiserReplyText, renderCard, renderCardText, type CardPlatform, type CardRef, type CardTransport, type CardView } from './decision-cards.js';
 import { handleDiscordDecisionInteraction, discordComponents, discordDecisionsCommand } from './discord-decision-cards.js';
@@ -35,7 +36,7 @@ class FakeTransport implements CardTransport {
   notes: string[] = [];
   constructor(readonly platform: 'telegram' | 'discord') {}
   async ownerChats() { return ['chat-1']; }
-  async send(chat: string, view: CardView) { this.sent.push({ chat, view }); return { chat, message: String(this.sent.length) }; }
+  async send(chat: string, view: CardView): Promise<CardRef | null> { this.sent.push({ chat, view }); return { chat, message: String(this.sent.length) }; }
   async edit(ref: CardRef, view: CardView) { this.edits.push({ ref, view }); }
   async notify(_chat: string, text: string) { this.notes.push(text); }
 }
@@ -53,6 +54,25 @@ test('30-second pitch leads the card in SCQA, recommendation, alternative, cross
 });
 
 describe('DEC-TG decision cards', () => {
+  test('Telegram retains its existing retry behavior after three failed sends', async () => {
+    const ledger = ledgerAt();
+    const entry = ledger.raise(base());
+    const transport = new FakeTransport('telegram');
+    let attempts = 0;
+    transport.send = async (chat, view) => {
+      attempts++;
+      if (attempts <= 3) return null;
+      transport.sent.push({ chat, view });
+      return { chat, message: 'delivered' };
+    };
+    const service = new DecisionCardService({ transport, ownerIds: ['111'], ledger, now: TEST_NOW });
+    for (let i = 0; i < 3; i++) expect((await service.tick()).sent).toBe(0);
+    expect((await service.tick()).sent).toBe(1);
+    expect((await service.tick()).sent).toBe(0);
+    expect(attempts).toBe(4);
+    expect(transport.sent[0]!.view.text).toContain(entry.id);
+  });
+
   test('rehearsal: three decisions — Telegram tap, Discord tap, /decisions re-send — all decided, three replies, one refusal', async () => {
     const ledger = ledgerAt();
     const old = ledger.raise(base({ title: '배포 전부터 열려 있던 결정' }));
@@ -331,6 +351,118 @@ describe('HITL1 H3 card bridge — pending questions become decision cards', () 
       await new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending(over) as never }).tick();
       expect(ledger.list({ status: 'all' })).toHaveLength(0);
     }
+  });
+
+  test('explicit test-origin questions log once; unmarked temporary questions retain validation and rejection logs', async () => {
+    const ledger = ledgerAt();
+    const transport = new FakeTransport('telegram');
+    const ids = [
+      'goal-clarification:/tmp/clarification-lease-e2e-1/GOAL.txt:delivery_scope',
+      'goal-clarification:/var/folders/ab/clarification-lease-e2e-2/GOAL.txt:delivery_scope',
+      'goal-clarification:/private/var/folders/ab/clarification-lease-e2e-3/GOAL.txt:delivery_scope',
+    ];
+    const source = () => ({
+      ok: true as const,
+      questions: [
+        ...ids.map((id) => ({ ...pending({ impact: 'high', id })().questions[0]!, testOrigin: true as const })),
+        pending({ impact: 'high', id: 'goal-clarification:/tmp/clarification-lease-e2e-operational/GOAL.txt:scope' })().questions[0]!,
+        pending({ impact: 'high', id: 'auq:h3:norma' })().questions[0]!,
+        pending({ id: 'goal-clarification:/home/ubuntu/goals/GOAL.txt:delivery_scope' })().questions[0]!,
+      ],
+    });
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category, event, data) => {
+      if (category === 'hitl.card-bridge') logs.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log);
+    try {
+      const options = { transport, ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: source as never };
+      const service = new DecisionCardService(options);
+      await service.tick();
+      await service.tick();
+      await new DecisionCardService(options).tick();
+      expect(logs.filter(({ data }) => ids.includes(data.questionId as string))).toEqual(ids.map((id) => ({
+        event: 'skipped', data: { questionId: id, runId: 'run-x', reason: 'test-origin' },
+      })));
+      expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === 'goal-clarification:/tmp/clarification-lease-e2e-operational/GOAL.txt:scope' && data.reason === 'Error')).toHaveLength(3);
+      expect(logs.filter(({ event, data }) => event === 'raised' && data.questionId === 'auq:h3:norma')).toHaveLength(1);
+      expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === 'goal-clarification:/home/ubuntu/goals/GOAL.txt:delivery_scope' && data.reason === 'impact')).toHaveLength(3);
+      expect(ledger.list({ status: 'all' }).map((entry) => entry.resume?.questionId)).toEqual(['auq:h3:norma']);
+      expect(transport.sent).toHaveLength(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('unmarked temporary operational questions retry validation and log every failed tick', async () => {
+    const ledger = ledgerAt();
+    const ids = [
+      'goal-clarification:/tmp/live-goal/GOAL.txt:scope',
+      'goal-clarification:/var/folders/ab/live-goal/GOAL.txt:scope',
+      'goal-clarification:/private/var/folders/ab/live-goal/GOAL.txt:scope',
+    ];
+    const raiseSpy = spyOn(ledger, 'raise');
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category, event, data) => {
+      if (category === 'hitl.card-bridge') logs.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log);
+    try {
+      const source = () => ({ ok: true as const, questions: ids.map((id) => pending({ impact: 'high', id })().questions[0]!) });
+      const options = { transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: source as never };
+      await new DecisionCardService(options).tick();
+      await new DecisionCardService(options).tick();
+      await new DecisionCardService(options).tick();
+      expect(raiseSpy).toHaveBeenCalledTimes(ids.length * 3);
+      for (const id of ids) {
+        expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === id && data.reason === 'Error')).toHaveLength(3);
+      }
+      expect(ledger.list({ status: 'all' })).toHaveLength(0);
+      const cardState = readFileSync(join(ledger.path, '..', 'cards-telegram.json'), 'utf8');
+      for (const id of ids) expect(cardState).not.toContain(id);
+    } finally { spy.mockRestore(); raiseSpy.mockRestore(); }
+  });
+
+  test('an unmarked temporary operational question logs every skip including changed reasons', async () => {
+    const ledger = ledgerAt();
+    const id = 'goal-clarification:/tmp/live-goal/GOAL.txt:scope';
+    let impact: 'low' | 'high' = 'low';
+    const source = () => pending({ impact, id })();
+    const raiseSpy = spyOn(ledger, 'raise');
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category, event, data) => {
+      if (category === 'hitl.card-bridge') logs.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log);
+    try {
+      const options = { transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: source as never };
+      await new DecisionCardService(options).tick();
+      impact = 'high';
+      await new DecisionCardService(options).tick();
+      await new DecisionCardService(options).tick();
+      expect(raiseSpy).toHaveBeenCalledTimes(2);
+      expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === id).map(({ data }) => data.reason)).toEqual(['impact', 'Error', 'Error']);
+    } finally { spy.mockRestore(); raiseSpy.mockRestore(); }
+  });
+
+  test('explicit test provenance survives pending store round-trip and the bridge records it once', async () => {
+    const ledger = ledgerAt();
+    const id = 'goal-clarification:/tmp/clarification-lease-e2e-4/GOAL.txt:scope';
+    const pendingQuestion = createPendingQuestion(id, {
+      questions: [{ id: 'scope', header: 'Scope', question: 'Choose scope?', impact: 'high',
+        options: [{ label: 'A', description: 'a' }, { label: 'B', description: 'b' }] }],
+    }, undefined, {}, undefined, { testOrigin: true });
+    writePendingQuestion(pendingQuestion, { root: () => join(ledger.path, '..', '..') });
+    const source = () => readPendingQuestions({ root: () => join(ledger.path, '..', '..') });
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category, event, data) => {
+      if (category === 'hitl.card-bridge') logs.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log);
+    try {
+      const service = new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: source });
+      expect(source()).toMatchObject({ ok: true, questions: [{ id, testOrigin: true }] });
+      await service.tick();
+      await service.tick();
+      expect(logs.filter(({ data }) => data.questionId === id)).toEqual([
+        { event: 'skipped', data: { questionId: id, runId: undefined, reason: 'test-origin' } },
+      ]);
+      expect(ledger.list({ status: 'all' })).toHaveLength(0);
+    } finally { spy.mockRestore(); }
   });
 
   test('a card tap reports a durable decision whose answer cannot reach a missing pending run', async () => {

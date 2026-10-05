@@ -1,9 +1,9 @@
-import { lstatSync, mkdirSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
-import type { LogRecord } from '../../mss/logging/record.js';
+import { fromJsonl, type LogRecord } from '../../mss/logging/record.js';
 
 const FILE_LIMIT = 5 * 1024 * 1024;
 const TOTAL_LIMIT = 20 * 1024 * 1024;
@@ -83,50 +83,58 @@ export function parsePodArtifactChunks(logs: string): ParseResult {
 
 const POD_LOGS_PATH = 'pod-logs/logs.jsonl';
 
-function childRunId(data: unknown): string | undefined {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined;
-  const value = (data as Record<string, unknown>).runId;
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-function decisionRecord(line: string): { rec: LogRecord; surface: string } | undefined {
-  let parsed: unknown;
-  try { parsed = JSON.parse(line); } catch { return undefined; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-  const row = parsed as Record<string, unknown>;
-  if (row.category !== 'harness.decision') return undefined;
-  if (typeof row.ts !== 'string' || typeof row.event !== 'string') return undefined;
-  const runId = childRunId(row.data);
-  if (!runId) return undefined;
-  const data = { ...(row.data as Record<string, unknown>), podJob: '', importedFrom: 'pod' as const };
-  return {
-    rec: {
-      ts: row.ts,
-      category: 'harness.decision',
-      event: row.event,
-      data,
-      ...(typeof row.level === 'string' ? { level: row.level as LogRecord['level'] } : {}),
-      ...(typeof row.trace_id === 'string' ? { trace_id: row.trace_id } : {}),
-    },
-    surface: typeof row.surface === 'string' && row.surface ? row.surface : 'pod',
-  };
-}
-
-/** Import only harness.decision rows from a returned pod log into the launching host store. */
-export function importPodDecisionLogs(bytes: Buffer, job: string, store: LogStore | null = getDefaultLogStore()): { imported: number; skipped: number } {
-  if (!store) return { imported: 0, skipped: 0 };
-  const text = bytes.toString('utf8');
-  const rows: Array<{ rec: LogRecord; surface: string }> = [];
-  let skipped = 0;
-  for (const line of text.split(/\r?\n/)) {
-    if (!line) continue;
-    const row = decisionRecord(line);
-    if (!row) { skipped += 1; continue; }
-    row.rec.data = { ...(row.rec.data as Record<string, unknown>), podJob: job };
-    rows.push(row);
+/** Last measured child ledger context when a failed Pod emitted no terminal JSON. */
+export function podNoResultDiagnostic(ledger: string): string | null {
+  let stage: string | undefined;
+  let round: number | undefined;
+  let mustFix: string | undefined;
+  for (const line of ledger.split(/\r?\n/)) {
+    try {
+      const entry = JSON.parse(line) as { event?: unknown; data?: Record<string, unknown> };
+      if (!entry || typeof entry !== 'object' || !entry.data || typeof entry.data !== 'object' || typeof entry.event !== 'string' || entry.event === 'pod-ledger-incomplete') continue;
+      if (typeof entry.data.round === 'number' && Number.isSafeInteger(entry.data.round)) round = entry.data.round;
+      if (entry.event !== 'run-origin') stage = entry.event;
+      // `reviewed` carries pointers only (count + finding ids); the text stays in the review artifact.
+      if (entry.event === 'reviewed' && typeof entry.data.mustFix === 'number') {
+        const ids = Array.isArray(entry.data.findingIds) ? entry.data.findingIds.filter((id): id is string => typeof id === 'string') : [];
+        mustFix = `${entry.data.mustFix}${ids.length ? ` ${JSON.stringify(ids)}` : ''}`;
+      }
+    } catch { /* incomplete ledger line */ }
   }
-  if (rows.length > 0) store.insertBatch(rows);
-  return { imported: rows.length, skipped };
+  return stage ? `child terminal result missing; last ledger stage=${stage}; round=${round ?? 'unknown'}; mustFix=${mustFix ?? 'unknown'}` : null;
+}
+
+/** Import valid JSONL log records into the launching host store, with durable per-job line receipts. */
+export function importPodLogs(bytes: Buffer, job: string, store: LogStore | null = getDefaultLogStore()): { imported: number; skipped: number } {
+  if (!store) return { imported: 0, skipped: 0 };
+  const rows: Array<{ rec: LogRecord; surface: string; line: number }> = [];
+  let skipped = 0;
+  for (const [lineNumber, line] of bytes.toString('utf8').split(/\r?\n/).entries()) {
+    if (!line) continue;
+    const rec = fromJsonl(line);
+    if (!rec || !Number.isFinite(Date.parse(rec.ts))) { skipped++; continue; }
+    const data = rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
+      ? rec.data as Record<string, unknown>
+      : rec.data === undefined ? {} : { originalData: rec.data };
+    const surface = (rec as LogRecord & { surface?: unknown }).surface;
+    rows.push({
+      rec: { ...rec, data: { ...data, origin: 'pod', podJob: job } },
+      surface: typeof surface === 'string' && surface ? surface : 'pod',
+      line: lineNumber,
+    });
+  }
+  return { imported: store.insertPodBatch(job, rows), skipped };
+}
+
+function importReturnedLogs(bytes: Buffer, job: string, store: LogStore | null,
+  log: (category: string, event: string, data: Record<string, unknown>) => void): void {
+  try {
+    if (!store) throw new Error('host log store unavailable');
+    const imported = importPodLogs(bytes, job, store);
+    log('self-implement.pod', 'pod-logs-imported', { job, imported: imported.imported, skipped: imported.skipped });
+  } catch (error) {
+    debug.log('self-implement.pod', 'pod-logs-import-failed', { job, reason: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 /** Reject symlink parents as well as lexical traversal; never replace a host file. */
@@ -176,17 +184,24 @@ export function collectPodArtifacts(logs: string, { dir, job, log = (c, e, d) =>
         podLogsReturned = true;
         const lines = bytes.length ? bytes.toString('utf8').split('\n').length - (bytes.at(-1) === 10 ? 1 : 0) : 0;
         log('self-implement.pod', 'pod-logs-returned', { job, path: destination, lines });
-        try {
-          const imported = importPodDecisionLogs(bytes, job, logStore);
-          log('self-implement.pod', 'pod-decisions-imported', { job, imported: imported.imported, skipped: imported.skipped });
-        } catch (error) {
-          log('self-implement.pod', 'pod-logs-import-failed', { job, reason: error instanceof Error ? error.message : String(error) });
-        }
+        importReturnedLogs(bytes, job, logStore, log);
       }
     } catch (e) {
       const reason = (e as NodeJS.ErrnoException).code === 'EEXIST' ? 'exists' : e instanceof Error ? e.message : String(e);
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') log('self-implement.pod', 'artifact-collect-skipped', { job, path, reason });
-      else log('self-implement.pod', 'artifact-collect-incomplete', { job, path, reason });
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+        log('self-implement.pod', 'artifact-collect-skipped', { job, path, reason });
+        if (path === podLogsPath) {
+          try {
+            const existing = resolve(dir, job, path);
+            if (!lstatSync(existing).isSymbolicLink() && readFileSync(existing).equals(bytes)) {
+              podLogsReturned = true;
+              importReturnedLogs(bytes, job, logStore, log);
+            }
+          } catch (error) {
+            debug.log('self-implement.pod', 'pod-logs-import-failed', { job, reason: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      } else log('self-implement.pod', 'artifact-collect-incomplete', { job, path, reason });
       if (path === podLogsPath) podLogsMissingReason = reason;
     }
   }

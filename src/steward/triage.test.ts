@@ -1,7 +1,7 @@
 import { setDefaultTimeout, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { buildUserConfig } from '../user-config.js';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runStewardStageCommand, runStewardNodeCommand, type TriageIssue, type TriageDecision } from './triage.js';
 import { markStageStart, readFailureStreak, writeFailureStreak } from './failure-streak.js';
@@ -9,6 +9,7 @@ import { CardStore } from '../task-cards/card-store.js';
 import { triageInputHash, triageWithinBudget } from './triage-budget.js';
 import { readLaunchLedger } from './launch.js';
 import { debug } from '../debug/log.js';
+import { LogStore } from '../mss/logging/log-store.js';
 import { setInProcessOutbound } from '../domains/outbound-alert.js';
 import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
 
@@ -46,6 +47,236 @@ test('off mode skips the stage command before locking or creating state; shadow 
       launchCommand: () => { throw new Error('shadow ran command'); }, spawnLaunch: () => { throw new Error('shadow spawned'); } });
     expect(readLaunchLedger(root).launches['ELA-1']?.status).toBe('shadow');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('one loop.steward decision per graph tick for launch, skip, report and failure without debug.enabled', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-tick-decision-'));
+  const dir = join(root, 'steward');
+  const context = join(root, 'context.json');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const records: Array<{ verdict: string; reason: string; goalId?: string }> = [];
+  const unregister = debug.registerSink({ name: 'steward-tick-decisions', emit: record => {
+    if (record.category === 'loop.steward' && record.event === 'decision') {
+      const { verdict, reason, goalId } = record.data as typeof records[number];
+      records.push({ verdict, reason, ...(goalId ? { goalId } : {}) });
+    }
+  } });
+  const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const { query } = JSON.parse(String(init?.body)) as { query: string };
+    if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
+    throw new Error('unexpected Linear query');
+  }) as typeof fetch;
+  const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
+    launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+    launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
+    spawnLaunch: () => ({ pid: 99999999 }), sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
+  try {
+    expect(debug.enabled).toBe(false);
+    mkdirSync(dir);
+    process.env.ELANOUS_GRAPH_CONTEXT = context;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'tick-launch' }));
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    await runStewardStage('schedule', deps);
+    await runStewardStage('report', deps);
+    expect(records).toEqual([{ verdict: 'launched', reason: 'harness run spawned', goalId: 'linear:ELA-1' }]);
+    expect(existsSync(join(dir, 'decision-logged-tick-launch.json'))).toBe(true);
+    await runStewardStage('report', deps);
+    expect(records).toHaveLength(1);
+
+    records.length = 0;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'tick-digest' }));
+    writeFileSync(join(dir, 'observe.json'), JSON.stringify({ issues: {} }));
+    await runStewardStage('report', deps);
+    expect(records).toEqual([{ verdict: 'reported', reason: 'daily digest sent' }]);
+    await runStewardStage('report', deps);
+    expect(records).toHaveLength(1);
+
+    records.length = 0;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'tick-report' }));
+    await runStewardStage('report', deps);
+    expect(records).toEqual([{ verdict: 'skipped', reason: 'no new outcome or digest' }]);
+
+    records.length = 0;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'tick-skip' }));
+    writeFileSync(join(dir, 'streak.json'), JSON.stringify({ ...readFailureStreak(root),
+      open: { stage: 'triage', startedAt: new Date().toISOString(), pid: process.pid, runId: 'another-run' } }));
+    expect(await runStewardStageCommand('sync', { root, runStage: async () => { throw new Error('overlap ran'); } })).toBe(0);
+    for (const stage of ['triage', 'schedule', 'report'] as const) expect(await runStewardStageCommand(stage, { root, runStage: async () => { throw new Error('skipped stage ran'); } })).toBe(0);
+    expect(records).toEqual([{ verdict: 'skipped', reason: `overlapping triage (pid ${process.pid})` }]);
+
+    records.length = 0;
+    rmSync(join(dir, 'skipped-tick-skip.json'), { force: true });
+    writeFailureStreak(root, { consecutive: 0, lastStage: 'sync', lastReason: '', lastAt: '' });
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'tick-failure' }));
+    expect(await runStewardStageCommand('sync', { root, runStage: async () => { throw new Error('stage failure'); } })).toBe(1);
+    expect(records).toEqual([{ verdict: 'failed', reason: 'sync: stage failure' }]);
+  } finally {
+    unregister();
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed launch is recorded once with its goal and cause at the report boundary', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-failed-launch-decision-'));
+  const dir = join(root, 'steward');
+  const context = join(root, 'context.json');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const rows: Array<{ verdict: string; reason: string; goalId?: string }> = [];
+  const unregister = debug.registerSink({ name: 'failed-launch-decision', emit: record => {
+    if (record.category === 'loop.steward' && record.event === 'decision') {
+      const { verdict, reason, goalId } = record.data as typeof rows[number];
+      rows.push({ verdict, reason, ...(goalId ? { goalId } : {}) });
+    }
+  } });
+  try {
+    mkdirSync(dir);
+    process.env.ELANOUS_GRAPH_CONTEXT = context;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'failed-spawn' }));
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const { query } = JSON.parse(String(init?.body)) as { query: string };
+      if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
+      throw new Error('unexpected Linear query');
+    }) as typeof fetch;
+    const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
+      launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
+      spawnLaunch: () => { throw new Error('spawn unavailable'); }, sendDigest: async () => {},
+      now: () => new Date('2026-10-04T00:00:00Z') };
+    await runStewardStage('schedule', deps);
+    expect(readLaunchLedger(root).launches['ELA-1']).toMatchObject({ status: 'failed', reason: 'Error: spawn unavailable' });
+    await runStewardStage('report', deps);
+    expect(rows).toEqual([{ verdict: 'failed', reason: 'Error: spawn unavailable', goalId: 'linear:ELA-1' }]);
+  } finally {
+    unregister();
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a later failed launch wins over an earlier success and report retries keep one failed decision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-mixed-launch-decision-'));
+  const dir = join(root, 'steward');
+  const context = join(root, 'context.json');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const rows: Array<{ verdict: string; reason: string; goalId?: string }> = [];
+  const unregister = debug.registerSink({ name: 'mixed-launch-decision', emit: record => {
+    if (record.category === 'loop.steward' && record.event === 'decision') {
+      const { verdict, reason, goalId } = record.data as typeof rows[number];
+      rows.push({ verdict, reason, ...(goalId ? { goalId } : {}) });
+    }
+  } });
+  try {
+    mkdirSync(dir);
+    process.env.ELANOUS_GRAPH_CONTEXT = context;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'mixed-spawns' }));
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify(issues));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify(issues.map((issue, index) => ({ issue: issue.identifier, rung: 4, dependsOn: [], priority: index, why: 'build' }))));
+    const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const { query } = JSON.parse(String(init?.body)) as { query: string };
+      if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
+      throw new Error('unexpected Linear query');
+    }) as typeof fetch;
+    let launches = 0;
+    const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const, maxParallel: 2 },
+      launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
+      spawnLaunch: () => { if (++launches === 2) throw new Error('second spawn unavailable'); return { pid: 99999999 }; },
+      sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
+    await runStewardStage('schedule', deps);
+    expect(launches).toBe(2);
+    expect(readLaunchLedger(root).launches['ELA-1']?.status).toBe('launched');
+    expect(readLaunchLedger(root).launches['ELA-2']).toMatchObject({ status: 'failed', reason: 'Error: second spawn unavailable' });
+    await runStewardStage('report', deps);
+    await runStewardStage('report', deps);
+    expect(rows).toEqual([{ verdict: 'failed', reason: 'Error: second spawn unavailable', goalId: 'linear:ELA-2' }]);
+    expect(existsSync(join(dir, 'decision-logged-mixed-spawns.json'))).toBe(true);
+  } finally {
+    unregister();
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed report supersedes a pending launch without emitting a second decision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-report-failure-'));
+  const dir = join(root, 'steward');
+  const context = join(root, 'context.json');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const rows: Array<{ verdict: string; reason: string }> = [];
+  const unregister = debug.registerSink({ name: 'failed-report-decision', emit: record => {
+    if (record.category === 'loop.steward' && record.event === 'decision') {
+      const { verdict, reason } = record.data as typeof rows[number];
+      rows.push({ verdict, reason });
+    }
+  } });
+  try {
+    mkdirSync(dir);
+    process.env.ELANOUS_GRAPH_CONTEXT = context;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'report-failure' }));
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
+      launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
+      spawnLaunch: () => ({ pid: 99999999 }) };
+    await runStewardStage('schedule', deps);
+    expect(existsSync(join(dir, 'decision-report-failure.json'))).toBe(true);
+    expect(await runStewardStageCommand('report', { ...deps, runStage: async () => { throw new Error('report unavailable'); } })).toBe(1);
+    expect(rows).toEqual([{ verdict: 'failed', reason: 'report: report unavailable' }]);
+    expect(existsSync(join(dir, 'decision-report-failure.json'))).toBe(false);
+  } finally {
+    unregister();
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('report retry failure replaces the successful decision in logs.db for the same run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-retry-decision-'));
+  const context = join(root, 'context.json');
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const store = new LogStore(join(root, 'logs.db'));
+  const unregister = debug.registerSink({ name: 'steward-retry-store', emit: rec => {
+    if (rec.category === 'loop.steward' && rec.event === 'decision') store.insertBatch([{ rec, surface: 'steward' }]);
+  } });
+  try {
+    mkdirSync(join(root, 'steward'));
+    process.env.ELANOUS_GRAPH_CONTEXT = context;
+    writeFileSync(context, JSON.stringify({ graphId: 'steward', runId: 'retry-report' }));
+    writeFileSync(join(root, 'steward', 'issues.json'), '[]');
+    writeFileSync(join(root, 'steward', 'schedule.json'), '[]');
+    const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
+      sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
+    await runStewardStage('report', deps);
+    const decisions = () => store.query({ exactCategories: ['loop.steward'], events: ['decision'] });
+    expect(decisions()).toHaveLength(1);
+    expect(JSON.parse(decisions()[0]!.data!)).toMatchObject({ verdict: 'reported', reason: 'daily digest sent', runId: 'retry-report' });
+    expect(await runStewardStageCommand('report', { ...deps, runStage: async () => { throw new Error('retry unavailable'); } })).toBe(1);
+    expect(decisions()).toHaveLength(1);
+    expect(JSON.parse(decisions()[0]!.data!)).toMatchObject({ verdict: 'failed', reason: 'report: retry unavailable', runId: 'retry-report' });
+    expect(await runStewardStageCommand('report', { ...deps, runStage: async () => { throw new Error('retry unavailable'); } })).toBe(1);
+    expect(decisions()).toHaveLength(1);
+    expect(await runStewardStageCommand('report', { ...deps, runStage: async () => { throw new Error('later failure'); } })).toBe(1);
+    expect(decisions()).toHaveLength(1);
+    expect(JSON.parse(decisions()[0]!.data!)).toMatchObject({ verdict: 'failed', reason: 'report: later failure', runId: 'retry-report' });
+    // A later successful rerun of the same run must leave the final verdict, not the earlier failure.
+    expect(await runStewardStageCommand('report', deps)).toBe(0);
+    expect(decisions()).toHaveLength(1);
+    expect(JSON.parse(decisions()[0]!.data!)).toMatchObject({ verdict: 'skipped', reason: 'no new outcome or digest', runId: 'retry-report' });
+  } finally {
+    unregister(); store.close();
+    if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = prior;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('legacy live launch override still runs the stage and launches only after its gates pass', async () => {
@@ -1034,6 +1265,48 @@ test('track table prompt lists every key and is empty without a table', () => {
   for (const k of Object.keys(TRACKS)) expect(text).toContain(`- ${k}: `);
   expect(text).toContain('"S"|"T"|"O"|"F"');
   expect(trackTablePrompt(undefined)).toBe('');
+});
+
+test('schedule stage reproduced from a copied steward state names the first stack line', async () => {
+  const prod = join(homedir(), '.elanous', 'steward');
+  const root = mkdtempSync(join(tmpdir(), 'steward-schedule-repro-'));
+  const dir = join(root, 'steward');
+  mkdirSync(dir, { recursive: true });
+  const linearCalls: string[] = [];
+  const launches: string[] = [];
+  const fetchFn = (async () => {
+    linearCalls.push('linear');
+    return Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+  }) as unknown as typeof fetch;
+  const copied = existsSync(join(prod, 'triage.json'));
+  try {
+    if (copied) cpSync(prod, dir, { recursive: true });
+    let cause = 'passed';
+    let firstLine = '';
+    try {
+      await runStewardStage('schedule', {
+        root,
+        getSecret: async () => 'injected-linear-key',
+        fetch: fetchFn,
+        launchSettings: { mode: 'shadow' },
+        launchCommand: () => { launches.push('command'); throw new Error('real launch'); },
+        spawnLaunch: () => { launches.push('spawn'); throw new Error('real spawn'); },
+      });
+    } catch (error) {
+      firstLine = (error instanceof Error ? error.stack ?? error.message : String(error)).split('\n')[0] ?? '';
+      cause = error instanceof Error ? error.message : String(error);
+    }
+    expect(launches).toEqual([]);
+    if (!copied) {
+      // 못 가름 — 이 시험 우주에 운영 steward 상태(~/.elanous/steward/triage.json)가 없어 최근 40회 실패를 재현할 입력이 없다.
+      expect(cause).toMatch(/ENOENT|triage\.json/);
+      expect(linearCalls).toEqual([]);
+      expect(firstLine.length).toBeGreaterThan(0);
+    } else {
+      expect(cause).toBe('passed');
+      expect(firstLine).toBe('');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('config parses steward tracks and drops bad keys or empty descriptions', () => {

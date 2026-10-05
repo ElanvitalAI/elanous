@@ -61,8 +61,22 @@ export interface IntakeCheckEvidence {
   readonly contrary?: boolean;
 }
 
+export interface IntakeReplacementCandidate {
+  readonly tool: string;
+  readonly paidDependency: string;
+  readonly status: '현장 시험 필요';
+  /** A comparison claim is not evidence that any of these checks have passed. */
+  readonly trial: {
+    readonly installation: '미검증';
+    readonly sampleRun: '미검증';
+    readonly license: '미검증';
+    readonly maintenanceStatus: '미검증';
+  };
+}
+
 export interface IntakeCheckItem {
   readonly fact: string;
+  readonly replacementCandidate?: IntakeReplacementCandidate;
   /** Source identity preserved from the supplied fact for card-backed goal evidence. */
   readonly sourceRef?: string;
   readonly originalClaims?: readonly string[];
@@ -1053,6 +1067,40 @@ function factKey(text: string): string {
   return text.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+/** A stated possibility is a trial candidate, not proof of a working replacement. */
+function replacementCandidate(fact: string): IntakeReplacementCandidate | undefined {
+  if (!/(?:대체(?:하|한|할| 가능| 후보|재)|replace|replacement|alternative to)/i.test(fact)
+    || /(?:대체하지\s*(?:는|도|조차|를)?\s*(?:않|못)|대체\s*못|대체할\s*수\s*(?:는|도|가)?\s*없|대체(?:가|는| 후보가)?\s*(?:아니|불가)|cannot replace|can't replace|does not replace|not a replacement)/i.test(fact)) return undefined;
+  const paid = fact.match(/(?:유료|paid)\s*(?:(?:서비스|의존성|도구|툴|API|dependency|service|tool)\s*)?`?([a-z][\w.-]+)`?/i);
+  // firecrawl is a named paid-dependency example even when the claim omits the word "paid".
+  const paidDependency = paid?.[1] ?? fact.match(/(?:^|[^\w])`?(firecrawl)`?(?=$|[^\w])/i)?.[1];
+  if (!paidDependency) return undefined;
+  const names = [...fact.matchAll(/`([a-z][\w.-]+)`/gi)].map((match) => match[1]!);
+  const explicit = names.filter((name) => name.toLowerCase() !== paidDependency.toLowerCase());
+  const plain = fact.match(/^\s*([a-z][\w.-]+)\s*(?:가|이|는|은|으로|로|can\b|could\b|may\b)/i)?.[1];
+  const tool = explicit.length === 1 ? explicit[0] : explicit.length === 0 ? plain : undefined;
+  if (!tool || tool.toLowerCase() === paidDependency.toLowerCase() || tool.toLowerCase() === 'elanous') return undefined;
+  // Names appearing together do not establish the direction of replacement.
+  const clause = fact.replace(/`/g, '').replace(/(?:유료|paid)\s*(?:(?:서비스|의존성|도구|툴|API|dependency|service|tool)\s*)?/gi, '');
+  const escape = (name: string): string => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const name = (value: string): string => `(?<![\\w.-])${escape(value)}(?![\\w.-])`;
+  const toolName = name(tool);
+  const dependencyName = name(paidDependency);
+  const replaces = (subject: string, object: string): boolean => [
+    new RegExp(`${subject}\\s*(?:이|가|은|는)?\\s+${object}\\s*(?:을|를)\\s*대체(?:하|한|할| 가능| 후보|재)`, 'i'),
+    new RegExp(`${object}\\s*(?:을|를)\\s+${subject}\\s*(?:이|가|은|는)\\s*대체(?:하|한|할| 가능| 후보|재)`, 'i'),
+    new RegExp(`${subject}\\s+(?:can |could |may )?replace(?:s|d)?\\s+${object}`, 'i'),
+    new RegExp(`${subject}\\s+(?:is |could be |may be )?(?:an? )?(?:replacement|alternative)\\s+to\\s+${object}`, 'i'),
+  ].some((pattern) => pattern.test(clause));
+  if (!replaces(toolName, dependencyName) || replaces(dependencyName, toolName)) return undefined;
+  return {
+    tool,
+    paidDependency,
+    status: '현장 시험 필요',
+    trial: { installation: '미검증', sampleRun: '미검증', license: '미검증', maintenanceStatus: '미검증' },
+  };
+}
+
 function isLens(value: string): value is PreprocessLens {
   return (PREPROCESS_LENSES as readonly string[]).includes(value);
 }
@@ -1414,8 +1462,17 @@ export function runIntakeCheck(
     }
     // src/index.ts intake check .action → runIntakeCheck / runIntakeCheckDocument → runIntakeCheck → judgeFact.
     const judged = judgeFact(fact, ruler, deps);
+    const candidate = replacementCandidate(fact.text);
+    const verdict = candidate && judged.verdict !== '못 쟀다' ? '판단 필요' : judged.verdict;
+    const current = candidate && judged.verdict !== '못 쟀다'
+      ? `${judged.current} · 대체 후보 ${candidate.tool} → ${candidate.paidDependency}: 설치·샘플 실행·라이선스·유지보수 상태 현장 시험 필요`
+      : judged.current;
     const item: IntakeCheckItem = {
       ...judged,
+      verdict,
+      current,
+      line: `${fact.text} → ${current} → ${verdict}`,
+      ...(candidate ? { replacementCandidate: candidate } : {}),
       quotes: [quote],
       ...(fact.sourceRef ? { sourceRef: fact.sourceRef } : {}),
       ...(fact.originalClaim ? { originalClaims: [fact.originalClaim] } : {}),
@@ -1711,6 +1768,11 @@ export function renderIntakeCheckReport(report: IntakeCheckReport): string {
   for (const item of report.items) {
     lines.push(item.line);
     lines.push(`  판정: ${item.verdict}`);
+    if (item.replacementCandidate) {
+      const candidate = item.replacementCandidate;
+      lines.push(`  대체 후보: ${candidate.tool} → 유료 의존성 ${candidate.paidDependency} (${candidate.status})`);
+      lines.push('  현장 시험: 설치 미검증 · 샘플 실행 미검증 · 라이선스 미검증 · 유지보수 상태 미검증');
+    }
     if (item.goalDraftPath) lines.push(`  골 초안: ${item.goalDraftPath}`);
     for (const quote of item.quotes) lines.push(`  인용: ${quote}`);
     for (const original of item.originalClaims ?? []) lines.push(`  원 주장: ${original}`);
@@ -1746,6 +1808,7 @@ export function intakeCheckReportJson(report: IntakeCheckReport): Record<string,
       current: item.current,
       verdict: item.verdict,
       line: item.line,
+      ...(item.replacementCandidate ? { replacementCandidate: item.replacementCandidate } : {}),
       quotes: item.quotes,
       evidence: item.evidence,
       patterns: item.patterns,

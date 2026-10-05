@@ -1,10 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, spyOn } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { LogStore } from '../../mss/logging/log-store.js';
-import { collectPodArtifacts, importPodDecisionLogs, parsePodArtifactChunks } from './pod-artifact-return.js';
+import { debug } from '../../debug/log.js';
+import { collectPodArtifacts, importPodLogs, parsePodArtifactChunks } from './pod-artifact-return.js';
 
 function transfer(path: string, bytes: Buffer): string[] {
   const token = Buffer.from(path).toString('base64url');
@@ -14,7 +16,7 @@ function transfer(path: string, bytes: Buffer): string[] {
 }
 
 describe('pod artifact return', () => {
-  test('restores pod logs under the job and reports lines without merging their observations', () => {
+  test('restores pod logs under the job and reports line count', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
     const text = '{"event":"first"}\n{"event":"second"}\n';
@@ -27,29 +29,136 @@ describe('pod artifact return', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('imports only harness.decision rows into the launching host log store', () => {
+  test('imports all three returned log rows exactly once across repeated collection and CLI event lookup', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
+    const db = join(dir, 'logs', 'logs.db');
+    const store = new LogStore(db, { instance: 'test:pod' });
+    const ts = new Date().toISOString();
+    const lines = [
+      JSON.stringify({ ts, category: 'self-implement.review', event: 'pre-pr-sync', surface: 'nexus', level: 'info', trace_id: 'trace-1', data: { runId: 'child-run', status: 'llm-resolved' } }),
+      JSON.stringify({ ts, category: 'harness.decision', event: 'decision', data: { kind: 'KEEP', runId: 'child-run' } }),
+      JSON.stringify({ ts, category: 'self-implement.pod', event: 'progress', data: { runId: 'child-run' } }),
+    ];
+    const text = `${lines.join('\n')}\n`;
+    const logs = transfer('pod-logs/logs.jsonl', Buffer.from(text)).join('\n');
+    const events: string[] = [];
+    try {
+      collectPodArtifacts(logs, { dir, job: 'si-job', logStore: store, log: (_c, e) => events.push(e) });
+      collectPodArtifacts(logs, { dir, job: 'si-job', logStore: store, log: (_c, e) => events.push(e) });
+      expect(readFileSync(join(dir, 'si-job/pod-logs/logs.jsonl'), 'utf8')).toBe(text);
+      expect(store.count()).toBe(3);
+      expect(store.query({ limit: 10 }).map((row) => [row.ts, row.category, row.event, row.trace_id, JSON.parse(row.data ?? '{}')])).toEqual([
+        [ts, 'self-implement.pod', 'progress', null, { runId: 'child-run', origin: 'pod', podJob: 'si-job' }],
+        [ts, 'harness.decision', 'decision', null, { kind: 'KEEP', runId: 'child-run', origin: 'pod', podJob: 'si-job' }],
+        [ts, 'self-implement.review', 'pre-pr-sync', 'trace-1', { runId: 'child-run', status: 'llm-resolved', origin: 'pod', podJob: 'si-job' }],
+      ]);
+      expect(store.query({ events: ['pre-pr-sync'] })).toHaveLength(1);
+      expect(events.filter((event) => event === 'pod-logs-imported')).toHaveLength(2);
+      expect(events.filter((event) => event === 'pod-logs-missing')).toHaveLength(0);
+      const reader = LogStore.openReadOnly(db);
+      try { expect(reader.query({ events: ['pre-pr-sync'] })).toHaveLength(1); }
+      finally { reader.close(); }
+      const cli = spawnSync('bun', ['-e', `import { runLogsCli } from './src/cli/logs-cli.ts'; process.exitCode = await runLogsCli({event:'pre-pr-sync',json:true,jsonData:true}, {resolveTargets: () => ({targets: [{name:'test:pod',dbPath: process.argv[1]}]})});`, db], { cwd: process.cwd(), encoding: 'utf8' });
+      expect(cli.status).toBe(0);
+      expect(cli.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((row) => row.event === 'pre-pr-sync')).toHaveLength(1);
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('skips malformed lines without discarding valid rows or consuming their receipts', () => {
     const store = new LogStore(':memory:');
+    const ts = new Date().toISOString();
+    const openedStores = '{"_meta":{"type":"log-query-opened-stores","stores":[{"name":"prod","path":"/home/ubuntu/.elanous/logs/logs.db"},{"name":"test:repo","path":"/home/ubuntu/repo/.elanous-test/logs/logs.db"}],"scope":{"registeredStores":1,"unopenedStores":0},"queryStatus":{"registeredStores":true}}}';
+    const text = [JSON.stringify({ ts, category: 'harness.decision', event: 'decision', data: { runId: 'child-run' } }), 'not-json', openedStores, ''].join('\n');
+    try {
+      expect(importPodLogs(Buffer.from(text), 'si-job', store)).toEqual({ imported: 1, skipped: 2 });
+      expect(importPodLogs(Buffer.from(text), 'si-job', store)).toEqual({ imported: 0, skipped: 2 });
+      expect(store.count()).toBe(1);
+      expect(importPodLogs(Buffer.from(`${text}\n${JSON.stringify({ ts: 'invalid', category: 'self-implement', event: 'bad-time' })}\n`), 'si-job-2', store)).toEqual({ imported: 1, skipped: 3 });
+      expect(store.query({ events: ['bad-time'] })).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  test('preserves scalar and array payloads while recording Pod origin', () => {
+    const store = new LogStore(':memory:');
+    const ts = new Date().toISOString();
     const text = [
-      JSON.stringify({ ts: '2026-09-01T00:00:01.000Z', category: 'harness.decision', event: 'decision', surface: 'nexus', level: 'info', data: { kind: 'KEEP', runId: 'child-run', reason: 'ok' } }),
-      JSON.stringify({ ts: '2026-09-01T00:00:02.000Z', category: 'self-implement.pod', event: 'noise', data: { runId: 'child-run' } }),
-      JSON.stringify({ ts: '2026-09-01T00:00:03.000Z', category: 'harness.decision', event: 'decision', data: { kind: 'DROP' } }),
-      'not-json',
-      JSON.stringify({ ts: '2026-09-01T00:00:04.000Z', category: 'harness.decision', event: 'decision', data: { kind: 'ESCALATE', runId: 'child-run-2' } }),
-      '',
+      JSON.stringify({ ts, category: 'self-implement', event: 'scalar', data: 'original message' }),
+      JSON.stringify({ ts, category: 'self-implement', event: 'array', data: [1, 'two'] }),
     ].join('\n');
     try {
-      const result = importPodDecisionLogs(Buffer.from(text), 'si-job', store);
-      expect(result).toEqual({ imported: 2, skipped: 3 });
-      const rows = store.query({ exactCategories: ['harness.decision'], limit: 10 });
-      expect(rows.map((row) => ({ ts: row.ts, event: row.event, surface: row.surface, data: JSON.parse(row.data ?? '{}') }))).toEqual([
-        { ts: '2026-09-01T00:00:04.000Z', event: 'decision', surface: 'pod', data: { kind: 'ESCALATE', runId: 'child-run-2', podJob: 'si-job', importedFrom: 'pod' } },
-        { ts: '2026-09-01T00:00:01.000Z', event: 'decision', surface: 'nexus', data: { kind: 'KEEP', runId: 'child-run', reason: 'ok', podJob: 'si-job', importedFrom: 'pod' } },
+      expect(importPodLogs(Buffer.from(text), 'si-job', store)).toEqual({ imported: 2, skipped: 0 });
+      expect(store.query({ events: ['scalar'] }).map(({ data }) => JSON.parse(data ?? '{}'))).toEqual([
+        { originalData: 'original message', origin: 'pod', podJob: 'si-job' },
       ]);
-      collectPodArtifacts(transfer('pod-logs/logs.jsonl', Buffer.from(text)).join('\n'), { dir, job: 'si-job', logStore: store });
-      expect(store.query({ exactCategories: ['harness.decision'], limit: 10 })).toHaveLength(4);
-      expect(store.query({ exactCategories: ['self-implement.pod'], limit: 10 })).toHaveLength(0);
-    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+      expect(store.query({ events: ['array'] }).map(({ data }) => JSON.parse(data ?? '{}'))).toEqual([
+        { originalData: [1, 'two'], origin: 'pod', podJob: 'si-job' },
+      ]);
+    } finally { store.close(); }
+  });
+
+  test('imports distinct steward decision lines without rewriting an existing host decision', () => {
+    const store = new LogStore(':memory:');
+    const ts = new Date().toISOString();
+    const text = [
+      JSON.stringify({ ts, category: 'loop.steward', event: 'decision', data: { runId: 'same-run', decision: 'first' } }),
+      JSON.stringify({ ts, category: 'loop.steward', event: 'decision', data: { runId: 'same-run', decision: 'second' } }),
+    ].join('\n');
+    try {
+      store.insertBatch([{ rec: { ts, category: 'loop.steward', event: 'decision', data: { runId: 'same-run', decision: 'host' } }, surface: 'nexus' }]);
+      expect(importPodLogs(Buffer.from(text), 'si-job', store)).toEqual({ imported: 2, skipped: 0 });
+      expect(store.query({ exactCategories: ['loop.steward'] }).map(({ data }) => JSON.parse(data ?? '{}').decision).sort()).toEqual(['first', 'host', 'second']);
+    } finally { store.close(); }
+  });
+
+  test('dedup receipts survive reopening logs.db and roll back if insertion fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-log-receipts-'));
+    const db = join(dir, 'logs.db');
+    const text = `${JSON.stringify({ ts: new Date().toISOString(), category: 'self-implement', event: 'pre-pr-sync', data: { runId: 'child-run' } })}\n`;
+    try {
+      const first = new LogStore(db);
+      try { expect(importPodLogs(Buffer.from(text), 'si-job', first)).toEqual({ imported: 1, skipped: 0 }); }
+      finally { first.close(); }
+      const reopened = new LogStore(db);
+      try {
+        expect(importPodLogs(Buffer.from(text), 'si-job', reopened)).toEqual({ imported: 0, skipped: 0 });
+        const fail = spyOn(reopened, 'insertBatch').mockImplementation(() => { throw new Error('insert failed'); });
+        try { expect(() => importPodLogs(Buffer.from(text), 'si-job-2', reopened)).toThrow('insert failed'); }
+        finally { fail.mockRestore(); }
+        expect(importPodLogs(Buffer.from(text), 'si-job-2', reopened)).toEqual({ imported: 1, skipped: 0 });
+        expect(reopened.count()).toBe(2);
+      } finally { reopened.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('unavailable host store reports import failure while retaining returned bytes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
+    const errors: unknown[][] = [];
+    const debugSpy = spyOn(debug, 'log').mockImplementation((...args) => { if (args[1] === 'pod-logs-import-failed') errors.push(args); });
+    const events: string[] = [];
+    const text = `${JSON.stringify({ ts: new Date().toISOString(), category: 'self-implement', event: 'pre-pr-sync', data: { runId: 'child-run' } })}\n`;
+    try {
+      collectPodArtifacts(transfer('pod-logs/logs.jsonl', Buffer.from(text)).join('\n'), { dir, job: 'si-job', logStore: null, log: (_c, event) => events.push(event) });
+      expect(readFileSync(join(dir, 'si-job/pod-logs/logs.jsonl'), 'utf8')).toBe(text);
+      expect(events).toContain('pod-logs-returned');
+      expect(errors).toEqual([['self-implement.pod', 'pod-logs-import-failed', { job: 'si-job', reason: 'host log store unavailable' }]]);
+    } finally { debugSpy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('failed import reports through debug while preserving collected bytes and result', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
+    const store = new LogStore(':memory:');
+    const spy = spyOn(store, 'insertPodBatch').mockImplementation(() => { throw new Error('db unavailable'); });
+    const errors: unknown[][] = [];
+    const debugSpy = spyOn(debug, 'log').mockImplementation((...args) => { if (args[1] === 'pod-logs-import-failed') errors.push(args); });
+    const events: string[] = [];
+    const text = `${JSON.stringify({ ts: new Date().toISOString(), category: 'self-implement', event: 'pre-pr-sync', data: { runId: 'child-run' } })}\n`;
+    try {
+      collectPodArtifacts(transfer('pod-logs/logs.jsonl', Buffer.from(text)).join('\n'), { dir, job: 'si-job', logStore: store, log: (_c, event) => events.push(event) });
+      expect(readFileSync(join(dir, 'si-job/pod-logs/logs.jsonl'), 'utf8')).toBe(text);
+      expect(events).toContain('pod-logs-returned');
+      expect(events).not.toContain('pod-logs-missing');
+      expect(errors).toEqual([['self-implement.pod', 'pod-logs-import-failed', { job: 'si-job', reason: 'db unavailable' }]]);
+    } finally { debugSpy.mockRestore(); spy.mockRestore(); store.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('reports absent, export failure, size-skipped and host-skipped pod logs with a reason', () => {

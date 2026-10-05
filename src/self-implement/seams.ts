@@ -2513,7 +2513,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           verdict: rr.verdict,
           mustFix: rr.mustFix,
           shouldFix: rr.shouldFix,
-          summary: renderReview(rr).slice(0, 2000),
+          summary: rr.reviewed ? renderReview(rr).slice(0, 2000) : `리뷰 못 함(사유: ${rr.failureReason ?? '사유 미상'})`,
           reviewed: rr.reviewed ?? false,
           // ⛔⭐ 이 한 줄이 `orchestrator.ts` 의 「찍는 줄」에 값을 «흘린다». 빼면 그 줄은 살아 있는데 값이 안 온다.
           ...(rr.failureReason !== undefined ? { failureReason: rr.failureReason } : {}),

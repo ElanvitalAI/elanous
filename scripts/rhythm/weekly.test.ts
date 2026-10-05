@@ -5,6 +5,9 @@ import { dirname, join } from 'node:path';
 import { main, type WeeklyDeps } from './weekly.js';
 import { collectLandings, main as dailyMain } from './daily.js';
 import { parse as parseYaml } from 'yaml';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { setSchedule } from '../../src/release-loop/release-schedule.js';
+import { addItem, setItem } from '../../src/release-loop/checklist.js';
 
 const now = new Date('2026-10-12T00:00:00Z');
 const release = { version: '0.2.14', green: 21, total: 21, nextVersion: '0.2.15', nextGreen: 1, nextTotal: 3, cutAt: '2026-10-13T00:00:00Z', red: [{ name: 'TC-red' }] };
@@ -32,6 +35,34 @@ function issues(root: string) {
   ];
   writeFileSync(join(dir, 'issues.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
 }
+
+test('weekly release uses earliest cutoff not passed, including cutoff equality, instead of the dev version', async () => {
+  const root = temp();
+  try {
+    setElanousConfigDir(root);
+    setSchedule('0.2.14', { cutAt: '2026-10-11T00:00:00Z' }, 'OP', root);
+    setSchedule('0.2.16', { cutAt: '2026-10-13T00:00:00Z' }, 'OP', root);
+    setSchedule('0.2.15', { cutAt: '2026-10-12T00:00:00Z' }, 'OP', root);
+    addItem('0.2.14', { id: 'OLD', title: '지난 컷' });
+    addItem('0.2.15', { id: 'NEXT', title: '이번 컷' });
+    addItem('0.2.16', { id: 'LATER', title: '다음 컷' });
+    setItem('0.2.15', 'NEXT', { status: 'red' }, 'TC');
+    setItem('0.2.16', 'LATER', { status: 'green' }, 'TC');
+    const { release: _fake, ...deps } = fixtures(root);
+    const result = await main(['--dry-run', '--json'], { ...deps, print: () => {}, log: () => {} });
+    if (!result || !('markdown' in result)) throw new Error('report missing');
+    expect(result.sections.release).toBe('ok');
+    expect(result.markdown).toContain('## ② 이번 주 판 계획\n0.2.15: green 0/1 · 다음 판 0.2.16 1/1 · 다음 컷 2026-10-12T00:00:00.000Z\nred 칸: NEXT 이번 컷');
+    expect(result.markdown).not.toContain('## ② 이번 주 판 계획\n0.2.14:');
+    const later = await main(['--dry-run', '--json'], { ...deps, now: () => new Date('2026-10-12T00:00:01Z'), print: () => {}, log: () => {} });
+    if (!later || !('markdown' in later)) throw new Error('report missing');
+    expect(later.markdown).toContain('## ② 이번 주 판 계획\n0.2.16: green 1/1');
+    const expired = await main(['--dry-run', '--json'], { ...deps, now: () => new Date('2026-10-14T00:00:00Z'), print: () => {}, log: () => {} });
+    if (!expired || !('markdown' in expired)) throw new Error('report missing');
+    expect(expired.sections.release).toBe('unreadable');
+    expect(expired.markdown).toContain('## ② 이번 주 판 계획\n못 읽음 · 남은 판 일정 없음');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test('weekly graph loads from YAML with Monday 09:00 KST stages and recipes', () => {
   const rhythm = join(dirname(import.meta.dir), '..', 'graphs', 'rhythm');
@@ -69,9 +100,9 @@ test('reused landing collector filters exact KST seven-day boundaries without ch
     process.env.PATH = `${bin}:${oldPath ?? ''}`;
     process.env.ELANOUS_STATE_DIR = root;
     const range = { from: new Date('2026-10-04T15:00:00Z'), to: new Date('2026-10-11T15:00:00Z') };
-    expect((await collectLandings(now, range)).map(i => i.title)).toEqual(['[MK] last', '[OP] middle', '[TC] first']);
+    expect((await collectLandings(now, range, { repoName: 'example/agent' })).map(i => i.title)).toEqual(['[MK] last', '[OP] middle', '[TC] first']);
     expect(readFileSync(join(root, 'args.txt'), 'utf8')).toContain('merged:>=2026-10-04');
-    expect((await collectLandings(now)).map(i => i.title)).toEqual(['[MK] last']);
+    expect((await collectLandings(now, undefined, { repoName: 'example/agent' })).map(i => i.title)).toEqual(['[MK] last']);
     expect(readFileSync(join(root, 'args.txt'), 'utf8')).toContain('merged:>=2026-10-11');
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
@@ -92,10 +123,12 @@ test('a 500-item merged PR response makes weekly landings unreadable rather than
     const rows = Array.from({ length: 499 }, (_, number) => ({ number, title: `[TC] PR ${number}`, mergedAt: '2026-10-07T02:00:00Z' }));
     writeFileSync(join(root, 'arrivals.json'), JSON.stringify(rows));
     const { landings: _fake, ...deps } = fixtures(root);
+    deps.repoName = 'example/agent';
     const complete = await main(['--dry-run', '--json'], { ...deps, print: () => {}, log: () => {} });
     if (!complete || !('markdown' in complete)) throw new Error('report missing');
     expect(complete.sections.landings).toBe('ok');
-    expect(complete.markdown).toContain('총 499건 · 자리별 TC 499');
+    // 자리는 런 원장 기준(제목 접두는 근거가 아니다) — 이 픽스처엔 런 원장이 없어 미분류다.
+    expect(complete.markdown).toContain('총 499건 · 자리별 미분류 499');
     writeFileSync(join(root, 'arrivals.json'), JSON.stringify([...rows, { number: 500, title: '[UX] before window', mergedAt: '2026-10-04T14:59:59Z' }]));
     const truncated = await main(['--dry-run', '--json'], { ...deps, print: () => {}, log: () => {} });
     if (!truncated || !('markdown' in truncated)) throw new Error('report missing');
@@ -103,7 +136,7 @@ test('a 500-item merged PR response makes weekly landings unreadable rather than
     expect(truncated.markdown).toContain('## ① 지난주 성과\n못 읽음 · 병합 목록 500건 조회 상한 도달 · 주간 착지 집계 불완전');
     expect(truncated.markdown).not.toContain('총 499건');
     expect(truncated.header).toContain('S: 지난주 착지 못 읽음');
-    expect(await collectLandings(now)).toEqual([]); // 기본 데일리 창은 500건 응답에도 기존대로 날짜만 거른다.
+    expect(await collectLandings(now, undefined, { repoName: 'example/agent' })).toEqual([]); // 기본 데일리 창은 500건 응답에도 기존대로 날짜만 거른다.
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
     if (oldRoot === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldRoot;
@@ -141,9 +174,10 @@ test('weekly CLI dry-run JSON aggregates last week, current issues and deduplica
     expect(result.markdown.match(/https:\/\/example.org\/shared/g)).toHaveLength(1);
     expect(result.markdown).toContain('https://example.org/one');
     expect(result.markdown).toContain('https://example.org/two');
-    expect(tick).toMatchObject({ sections: { news: 'unreadable' }, issuesOpen: 2, issuesOverdue: 1, sent: false });
-    expect(result.markdown).toContain('## ⑥ 주간 외부 동향\n못 읽음 · 2026-10-05 데일리 없음');
-    expect(result.markdown).toContain('부분 수집 (완전한 주간 집계 아님):');
+    expect(tick).toMatchObject({ sections: { news: 'ok' }, issuesOpen: 2, issuesOverdue: 1, sent: false });
+    expect(result.markdown).toContain('## ⑥ 주간 외부 동향\n- 겹침 — https://example.org/shared');
+    expect(result.markdown).not.toContain('데일리 없음');
+    expect(result.markdown).not.toContain('부분 수집 (완전한 주간 집계 아님):');
     expect(sends).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -153,7 +187,7 @@ test('daily entrypoint output flows into weekly news, while malformed article li
   try {
     const days = ['2026-10-06T00:00:00Z', '2026-10-09T00:00:00Z'];
     for (const [index, date] of days.entries()) {
-      await dailyMain(['--dry-run', '--json'], {
+      await dailyMain(['--json'], {
         root, now: () => new Date(date!), vaultRoot: null, sendEnabled: false,
         landings: async () => [], release: async () => release, loops: async () => [], grid: async () => [], decisions: async () => [],
         news: async () => [
@@ -202,6 +236,33 @@ test('dry-run still writes a configured vault copy like daily', async () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('daily and weekly copy to the canonical obsidian.vault when no vaultRoot dependency is given', async () => {
+  const root = temp();
+  const vault = join(root, 'my-vault');
+  const previous = process.env.ELANOUS_STATE_DIR;
+  try {
+    setElanousConfigDir(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ obsidian: { vault, vaultRoot: join(root, 'obsolete-vault') } }));
+    const dailyResult = await dailyMain(['--json'], {
+      root, now: () => new Date('2026-10-06T00:00:00Z'),
+      landings: async () => [], release: async () => release, loops: async () => [], grid: async () => [],
+      decisions: async () => [], news: async () => [], print: () => {}, log: () => {},
+    });
+    expect(dailyResult.status).toBe('degraded');
+    expect(dailyResult.deliveryLine).toContain('send-disabled');
+    expect(readFileSync(join(vault, '00. Inbox', 'Daily Review', '2026-10-06.md'), 'utf8')).toBe(dailyResult.markdown);
+    const weeklyResult = await main(['--dry-run', '--json'], { ...fixtures(root), vaultRoot: undefined, print: () => {}, log: () => {} });
+    if (!weeklyResult || !('markdown' in weeklyResult)) throw new Error('report missing');
+    expect(readFileSync(join(vault, '00. Inbox', 'Weekly Review', '2026-W42.md'), 'utf8')).toBe(weeklyResult.markdown);
+    expect(existsSync(join(root, 'obsolete-vault'))).toBe(false);
+  } finally {
+    resetElanousConfigDir();
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('missing daily and a thrown collector isolate only their sections', async () => {
   const root = temp();
   try {
@@ -210,17 +271,47 @@ test('missing daily and a thrown collector isolate only their sections', async (
     expect(result.sections).toMatchObject({ release: 'unreadable', news: 'unreadable', landings: 'ok', issues: 'ok' });
     expect(result.markdown).toContain('## ② 이번 주 판 계획\n못 읽음 · release down');
     expect(result.markdown).toContain('## ⑥ 주간 외부 동향\n못 읽음 · 데일리 없음');
+    daily(root, '2026-10-05', '수집된 기사 0건');
+    const empty = await main(['--dry-run', '--json'], { ...fixtures(root), print: () => {}, log: () => {} });
+    if (!empty || !('markdown' in empty)) throw new Error('report missing');
+    expect(empty.sections.news).toBe('ok');
+    expect(empty.markdown).toContain('## ⑥ 주간 외부 동향\n수집된 기사 0건');
+    expect(empty.markdown).not.toContain('데일리 없음');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('all seven daily news sections are required for an ok weekly status', async () => {
+test('Tuesday weekly review reads the seven daily dates immediately before today, not the previous calendar week', async () => {
   const root = temp();
   try {
-    for (const day of ['05', '06', '07', '08', '09', '10', '11']) daily(root, `2026-10-${day}`, '- 공통 — https://example.org/shared');
+    daily(root, '2026-10-05', '- 오래됨 — https://example.org/old-day');
+    daily(root, '2026-10-06', '- 첫날 — https://example.org/first-day');
+    daily(root, '2026-10-12', '- 어제 — https://example.org/yesterday');
+    daily(root, '2026-10-13', '- 오늘 — https://example.org/today');
+    const result = await main(['--dry-run', '--json'], { ...fixtures(root), now: () => new Date('2026-10-13T00:00:00Z'), print: () => {}, log: () => {} });
+    if (!result || !('markdown' in result)) throw new Error('report missing');
+    expect(result.sections.news).toBe('ok');
+    expect(result.markdown).toContain('https://example.org/first-day');
+    expect(result.markdown).toContain('https://example.org/yesterday');
+    expect(result.markdown).not.toContain('https://example.org/old-day');
+    expect(result.markdown).not.toContain('https://example.org/today');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('weekly news reads existing days in the previous seven-day window and preserves unreadable daily failures', async () => {
+  const root = temp();
+  try {
+    daily(root, '2026-10-04', '- 이전 — https://example.org/outside');
+    daily(root, '2026-10-05', '- 공통 — https://example.org/shared');
+    daily(root, '2026-10-11', '- 공통 — https://example.org/shared\n- 마지막 — https://example.org/last');
+    daily(root, '2026-10-12', '- 이후 — https://example.org/future');
     const complete = await main(['--dry-run', '--json'], { ...fixtures(root), print: () => {}, log: () => {} });
     if (!complete || !('markdown' in complete)) throw new Error('report missing');
     expect(complete.sections.news).toBe('ok');
     expect(complete.markdown.match(/https:\/\/example.org\/shared/g)).toHaveLength(1);
+    expect(complete.markdown).toContain('https://example.org/last');
+    expect(complete.markdown).not.toContain('https://example.org/outside');
+    expect(complete.markdown).not.toContain('https://example.org/future');
+    expect(complete.markdown).not.toContain('데일리 없음');
     daily(root, '2026-10-08', '못 읽음 · omni-crawl 실패');
     const partial = await main(['--dry-run', '--json'], { ...fixtures(root), print: () => {}, log: () => {} });
     if (!partial || !('markdown' in partial)) throw new Error('report missing');

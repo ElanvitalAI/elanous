@@ -23,6 +23,18 @@ const opts = (over: Partial<SelfImplementCliOpts> = {}): SelfImplementCliOpts =>
 afterEach(() => _setObserveOnlyConfigReaderForTesting());
 
 describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등가)', () => {
+  it('single-run supervisor receives the harvestable branch without relaunching the completed implementation', async () => {
+    const result = RESULT({ ok: false, stage: 'timed-out', outcome: 'abandoned', branch: 'self-impl/finished', harvestable: true });
+    const decisions: string[] = [];
+    const cap = capture(1, result);
+    const out = await runSelfImplementCliCommand('finished merge', { supervise: { onDecision: (decision) => { decisions.push(decision.stopReason ?? 'none'); } } }, {
+      executeReroute: cap.executeReroute,
+    });
+    expect(singleRunAsJobResult('finished merge', result)).toMatchObject({ harvestable: true, branch: result.branch });
+    expect(out.ok).toBe(true);
+    expect(decisions).toEqual(['harvestable-awaiting-human']);
+    expect(cap.calls).toHaveLength(1);
+  });
   it('모든 옵션이 spec 으로 무손실 매핑(base·enhance·draft·autoMerge·autoReview)', async () => {
     const cap = capture();
     const out = await runSelfImplementCliCommand('기능 F', opts({ base: 'main', enhance: true, autoMerge: true }), {

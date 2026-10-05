@@ -5,18 +5,23 @@ import { CliUserError } from '../cli/cli-user-error.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, listChecklist, ownerMatches, parseOwner, setItem, type ChecklistItem } from './checklist.js';
+import { addItem, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { move, releasedVersion } from './feature-store.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 
 export type PlacementPriority = 'P0' | 'P1' | 'P2';
-export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string }
+export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string }
 export interface PlacementDecision { id: string; from: string | null; version: string; reason: string; displaced: Array<{ id: string; from: string; to: string; reason: string }> }
+export interface RebalanceResult {
+  decisions: PlacementDecision[];
+  blocked: Array<{ id: string; from: string; to: string; reason: string }>;
+}
 export interface PlacementDeps {
   now?: Date;
   schedules?: ReleaseSchedule[];
   merged24h?: number;
   seatCap?: Record<string, number>;
+  ceoDailyCap?: number;
   checklist?: typeof listChecklist;
   released?: string;
   dryRun?: boolean;
@@ -47,11 +52,38 @@ export function mergedPrsLast24h(now = new Date()): number {
   return rows.filter((row) => Date.parse(row.mergedAt) >= Date.parse(since) && Date.parse(row.mergedAt) <= now.getTime()).length;
 }
 
-export function placementSeatCap(): Record<string, number> {
+function placementConfig(): { seatCap?: Record<string, number>; ceoDailyCap?: number } {
   const path = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
   if (!existsSync(path)) return {};
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { placement?: { seatCap?: Record<string, number> } } };
-  return raw.release?.placement?.seatCap ?? {};
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { placement?: { seatCap?: Record<string, number>; ceoDailyCap?: number } } };
+  return raw.release?.placement ?? {};
+}
+
+export function placementSeatCap(): Record<string, number> { return placementConfig().seatCap ?? {}; }
+function validCeoCap(cap: number): number {
+  if (!Number.isSafeInteger(cap) || cap < 0) throw new CliUserError('잘못된 대표 하루 상한: release.placement.ceoDailyCap');
+  return cap;
+}
+
+export function placementCeoDailyCap(): number { return validCeoCap(placementConfig().ceoDailyCap ?? 30); }
+
+/** Explicit day wins; otherwise a cell uses the target release's landing day in KST. */
+function ceoDay(item: { ceoDate?: string }, row: ReleaseSchedule): string {
+  return item.ceoDate ?? new Date(Date.parse(row.landBy!) + 9 * 3_600_000).toISOString().slice(0, 10);
+}
+
+type CeoWork = Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>;
+function ceoOverload(item: CeoWork, row: ReleaseSchedule, snapshots: Map<string, { items: CeoWork[] }>, schedules: ReleaseSchedule[], cap: number): string | null {
+  if (!item.ceoMinutes) return null;
+  const day = ceoDay(item, row);
+  const peers = [...snapshots].flatMap(([version, snapshot]) => {
+    const schedule = schedules.find((candidate) => candidate.version === version);
+    return snapshot.items.filter((other) => other.id !== item.id && other.ceoMinutes
+      && (other.ceoDate === day || (!other.ceoDate && schedule?.landBy && ceoDay(other, schedule) === day)));
+  });
+  const total = item.ceoMinutes + peers.reduce((sum, other) => sum + other.ceoMinutes!, 0);
+  if (total <= cap) return null;
+  return `대표 손 과부하 ${day} KST: ${[...peers.map((peer) => `${peer.id} ${peer.ceoMinutes}분`), `${item.id} ${item.ceoMinutes}분`].join(' + ')} = ${total}분 > 하루 상한 ${cap}분 — 늦추기(다음 날짜/판) · 자리 대행(대표 분량 축소) · 묶기(촬영·승인 합산 분량 축소)를 제안`;
 }
 
 function dependencyViolation(
@@ -87,6 +119,7 @@ function available(row: ReleaseSchedule, now: number, backlog: readonly string[]
 export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): PlacementDecision {
   if (!input.id.trim() || !input.title.trim()) throw new CliUserError('칸 id 와 제목이 필요하다');
   if (!Array.isArray(input.predecessors) || input.predecessors.some((id) => typeof id !== 'string' || !id.trim() || id === input.id)) throw new CliUserError('선행 칸 id 가 잘못됐다');
+  validateCeoLoad(input);
   const seat = parseOwner(input.owner).seat;
   if (!['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
   const now = (deps.now ?? new Date()).getTime();
@@ -109,6 +142,8 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   if (from && released && versionOrder(from, released) <= 0) throw new CliUserError(`이미 발행된 판의 칸은 배치하지 않는다: ${input.id}`);
   if (existing?.status === 'done') throw new CliUserError(`끝난 칸은 배치하지 않는다: ${input.id}`);
   if (existing && (existing.title !== input.title || existing.owner !== input.owner)) throw new CliUserError(`기존 칸 제목·담당 불일치: ${input.id}`);
+  const load = { id: input.id, ceoMinutes: input.ceoMinutes ?? existing?.ceoMinutes, ceoDate: input.ceoDate ?? existing?.ceoDate };
+  const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
   const predecessors = input.predecessors.map((id) => {
     const version = locations.get(id);
     if (!version) throw new CliUserError(`없는 선행 칸: ${id}`);
@@ -133,46 +168,63 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   const capacity = (row: ReleaseSchedule) => Math.floor(rate * (Date.parse(row.landBy!) - now) / 86_400_000 * 0.7);
   const displaced: PlacementDecision['displaced'] = [];
   let chosen: ReleaseSchedule | undefined;
-  for (const row of candidates) {
+  let loadIssue: string | null = null;
+  const feasible = candidates.filter((row) => !dependencyViolation(snapshots, locations, new Map([[input.id, row.version]]), input));
+  for (const row of feasible) {
     const placement = new Map([[input.id, row.version]]);
-    if (dependencyViolation(snapshots, locations, placement, input)) continue;
     const items = occupied(row.version);
     const seatItems = items.filter((item) => ownerMatches(item.owner, seat));
-    if (items.length < capacity(row) && seatItems.length < seatLimit) { chosen = row; break; }
-    if (input.priority !== 'P1' || from === row.version) continue;
+    const directIssue = ceoOverload(load, row, snapshots, schedules, ceoCap);
+    if (items.length < capacity(row) && seatItems.length < seatLimit) {
+      if (directIssue) { loadIssue ??= directIssue; continue; }
+      chosen = row;
+      break;
+    }
+    if (input.priority !== 'P1' || from === row.version) { loadIssue ??= directIssue; continue; }
     const next = open.find((later) => versionOrder(later.version, row.version) > 0);
-    if (!next || items.length - 1 >= capacity(row)) continue;
+    if (!next || items.length - 1 >= capacity(row)) { loadIssue ??= directIssue; continue; }
     const p2 = [...items].reverse().find((item) => {
       if (item.priority !== 'P2' || dependencyViolation(snapshots, locations, new Map([...placement, [item.id, next.version]]), input)) return false;
       if (item.deadlineVersion && versionOrder(next.version, item.deadlineVersion) > 0) return false;
       if (items.length < capacity(row) && !(seatItems.length >= seatLimit && ownerMatches(item.owner, seat))) return false;
       if (!item.owner) return false;
       const shiftedSeat = parseOwner(item.owner).seat;
-      return occupied(next.version).length < capacity(next) && occupied(next.version).filter((other) => ownerMatches(other.owner, shiftedSeat)).length < (caps[shiftedSeat] ?? Infinity);
+      if (occupied(next.version).length >= capacity(next) || occupied(next.version).filter((other) => ownerMatches(other.owner, shiftedSeat)).length >= (caps[shiftedSeat] ?? Infinity)) return false;
+      if (!(seatItems.length < seatLimit || (ownerMatches(item.owner, seat) && seatItems.length - 1 < seatLimit))) return false;
+
+      // Evaluate both changed cells against the same post-placement state, before either ledger write.
+      const proposed = new Map<string, { items: CeoWork[] }>([...snapshots].map(([version, snapshot]) => [version, { items: snapshot.items.filter((cell) => cell.id !== input.id && cell.id !== item.id) }]));
+      proposed.get(row.version)!.items.push(load);
+      proposed.get(next.version)!.items.push(item);
+      const issue = ceoOverload(load, row, proposed, schedules, ceoCap)
+        ?? ceoOverload(item, next, proposed, schedules, ceoCap);
+      if (issue) { loadIssue ??= issue; return false; }
+      return true;
     });
-    if (p2 && (seatItems.length < seatLimit || (ownerMatches(p2.owner, seat) && seatItems.length - 1 < seatLimit))) {
+    if (p2) {
       displaced.push({ id: p2.id, from: row.version, to: next.version, reason: `P1 ${input.id} 마감 판 ${row.version} 용량 확보를 위해 P2 이월` });
       chosen = row;
       break;
     }
+    loadIssue ??= directIssue;
   }
-  if (!chosen) throw new CliUserError(`${input.id} 배치할 판이 없다 — 용량·선행·마감·동결을 확인하라`);
+  if (!chosen) throw new CliUserError(loadIssue ?? `${input.id} 배치할 판이 없다 — 용량·선행·마감·동결을 확인하라`);
   const reason = `${input.priority} ${input.priority === 'P0' ? '사고·회귀·발행 막음: 다음 판' : input.priority === 'P1' ? `지시·행사 마감 판 ${deadlineVersion}` : '착지 마감 내 가장 이른 여유 판'} · PR/24h ${rate} · 용량 ${capacity(chosen)} · 자리 ${seatLimit}`;
   const decision = { id: input.id, from, version: chosen.version, reason, displaced };
   if (!deps.dryRun) {
     const by = deps.by ?? 'OP';
     for (const shifted of displaced) move(shifted.id, shifted.from, shifted.to, by, undefined, undefined, shifted.reason);
     if (from && from !== chosen.version) move(input.id, from, chosen.version, by, undefined, undefined, reason);
-    if (from && (existing?.priority !== input.priority || JSON.stringify(existing.predecessors ?? []) !== JSON.stringify(input.predecessors) || (input.deadlineVersion !== undefined && existing.deadlineVersion !== input.deadlineVersion)))
-      setItem(chosen.version, input.id, { priority: input.priority, predecessors: input.predecessors, ...(input.deadlineVersion ? { deadlineVersion: input.deadlineVersion } : {}) }, by);
-    if (!from) addItem(chosen.version, { id: input.id, title: input.title, owner: input.owner, priority: input.priority, predecessors: input.predecessors, deadlineVersion });
+    if (from && (existing?.priority !== input.priority || JSON.stringify(existing.predecessors ?? []) !== JSON.stringify(input.predecessors) || (input.deadlineVersion !== undefined && existing.deadlineVersion !== input.deadlineVersion) || (input.ceoMinutes !== undefined && existing.ceoMinutes !== input.ceoMinutes) || (input.ceoDate !== undefined && existing.ceoDate !== input.ceoDate)))
+      setItem(chosen.version, input.id, { priority: input.priority, predecessors: input.predecessors, ...(input.deadlineVersion ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}) }, by);
+    if (!from) addItem(chosen.version, { id: input.id, title: input.title, owner: input.owner, priority: input.priority, predecessors: input.predecessors, deadlineVersion, ...(load.ceoMinutes !== undefined ? { ceoMinutes: load.ceoMinutes } : {}), ...(load.ceoDate !== undefined ? { ceoDate: load.ceoDate } : {}) });
   }
   return decision;
 }
 
 function moveConstraint(
   item: ChecklistItem, to: ReleaseSchedule, backlog: readonly string[],
-  snapshots: Map<string, ChecklistItem[]>, now: number, rate: number, caps: Record<string, number>,
+  snapshots: Map<string, ChecklistItem[]>, now: number, rate: number, caps: Record<string, number>, rows: ReleaseSchedule[], ceoCap: number,
 ): string | null {
   if (!to.landBy || !available(to, now, backlog)) return '착지 마감이 지났거나 백로그 판이라 이동 불가';
   if (item.deadlineVersion && versionOrder(to.version, item.deadlineVersion) > 0) return '마감 판 뒤로 이월 불가';
@@ -181,6 +233,9 @@ function moveConstraint(
   const destination = snapshots.get(to.version) ?? [];
   if (destination.filter((cell) => cell.status !== 'done').length >= Math.floor(rate * (Date.parse(to.landBy) - now) / 86_400_000 * 0.7)) return '다음 판 PR 용량 초과';
   if (destination.filter((cell) => cell.status !== 'done' && ownerMatches(cell.owner, seat)).length >= (caps[seat] ?? Infinity)) return '다음 판 자리 용량 초과';
+  const loadIssue = ceoOverload(item, to, new Map([...snapshots].map(([version, items]) => [version, { items }])),
+    rows, ceoCap);
+  if (loadIssue) return loadIssue;
   const locations = new Map<string, string>();
   for (const [version, items] of snapshots) for (const cell of items) {
     if (locations.has(cell.id)) return `여러 판의 같은 칸: ${cell.id}`;
@@ -198,30 +253,35 @@ function moveConstraint(
 }
 
 /** Only unstarted cells inside the two-hour pre-deadline window move; a dry run never writes. */
-export function rebalance(version: string, deps: PlacementDeps = {}): PlacementDecision[] {
+export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceResult {
   const rows = [...(deps.schedules ?? listSchedules())].sort((a, b) => versionOrder(a.version, b.version));
   const current = rows.find((row) => row.version === version);
   if (!current?.landBy) throw new CliUserError(`착지 마감이 없는 판: ${version}`);
   const now = (deps.now ?? new Date()).getTime();
-  if (Date.parse(current.landBy) - now > 7_200_000 || Date.parse(current.landBy) <= now) return [];
+  if (Date.parse(current.landBy) - now > 7_200_000 || Date.parse(current.landBy) <= now) return { decisions: [], blocked: [] };
   const backlog = deps.backlog ?? BACKLOG_VERSIONS;
   const next = rows.find((row) => versionOrder(row.version, version) > 0 && !backlog.includes(row.version));
   const snapshots = new Map(rows.map((row) => [row.version, [...(deps.checklist ?? listChecklist)(row.version).items]]));
   const unstarted = snapshots.get(version)!.filter((item) => item.status === 'yellow' && !item.evidence);
   if (unstarted.length && !next) throw new CliUserError(`${version} 다음 판이 없다`);
-  if (!unstarted.length) return [];
+  if (!unstarted.length) return { decisions: [], blocked: [] };
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
   const caps = deps.seatCap ?? placementSeatCap();
-  const decisions: PlacementDecision[] = [];
+  const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
+  const result: RebalanceResult = { decisions: [], blocked: [] };
   for (const item of unstarted) {
-    if (moveConstraint(item, next!, backlog, snapshots, now, rate, caps)) continue;
+    const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap);
+    if (violation) {
+      result.blocked.push({ id: item.id, from: version, to: next!.version, reason: violation });
+      continue;
+    }
     const reason = `${version} 착지 마감 2시간 전 미시작 칸 이월`;
-    decisions.push({ id: item.id, from: version, version: next!.version, reason, displaced: [] });
+    result.decisions.push({ id: item.id, from: version, version: next!.version, reason, displaced: [] });
     snapshots.set(version, snapshots.get(version)!.filter((cell) => cell.id !== item.id));
     snapshots.get(next!.version)!.push(item);
   }
-  if (!deps.dryRun) for (const decision of decisions) move(decision.id, version, decision.version, deps.by ?? 'OP', undefined, undefined, decision.reason);
-  return decisions;
+  if (!deps.dryRun) for (const decision of result.decisions) move(decision.id, version, decision.version, deps.by ?? 'OP', undefined, undefined, decision.reason);
+  return result;
 }
 
 /** A seat may defer its own cell one release, never pull another owner's cell forward. */
@@ -236,7 +296,7 @@ export function seatMove(id: string, from: string, to: string, by: string, reaso
   if (!ownerMatches(item.owner, parseOwner(by).seat) || next?.version !== to) throw new CliUserError('남의 칸 당기기 거부 — COO 에 요청');
   const now = (deps.now ?? new Date()).getTime();
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
-  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap());
+  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()));
   if (violation) throw new CliUserError(`${id}: ${violation}`);
   if (!deps.dryRun) move(id, from, to, by, undefined, undefined, reason);
 }

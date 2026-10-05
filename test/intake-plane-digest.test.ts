@@ -42,23 +42,66 @@ test('그날 흡수·갈래가 끝난 것만 · 축별로 묶고 노트의 한 �
   expect(d.review).toEqual([{ fact: 'elanous 의 `y` 가 같은 것인가', note: '/v/A.md' }]);
   expect(md).toContain('### 🟡 사람이 가를 것 — 판단 필요 (1)');
   expect(md).toContain('- elanous 의 `y` 가 같은 것인가 · [[A]]');
+  expect(renderDigestTelegram(d)).not.toContain('사람이 가를 것');
+  expect(d.absorbed.find((e) => e.id === a)?.impact).toEqual({ fact: 'elanous 에 `x` 가 없다', current: '0건', action: '없는 기능의 골 후보를 세운다' });
   expect(buildIntakeDigest(r, '2026-09-25', (p) => files[p]).absorbed).toHaveLength(0);
 });
 
-test('텔레그램 짧은 판 — 수 · 요약 · 골 후보 수 · 옵시디언 열기 주소', () => {
-  const t = renderDigestTelegram({
-    day: '2026-09-26', grounding: 0, release: 0, manual: 0,
-    absorbed: [{ id: '1', sources: ['youtube'], axis: 'x', oneLiner: '요약 하나' }],
-    goals: [{ fact: 'f' }], review: [{ fact: 'r' }, { fact: 's' }],
-  }, { vaultRoot: '/vault/ElanvitalAI', notePath: '/vault/ElanvitalAI/01. Knowledge/Youtube/_trend/20260926_흡수후보.md' });
-  expect(t).toContain('2026-09-26 흡수 1편');
-  expect(t).toContain('• 요약 하나');
-  expect(t).toContain('엘라누스에 없는 것 1건');
-  expect(t).toContain('🟡 사람이 가를 것 2건');
-  expect(t).toContain('obsidian://open?vault=ElanvitalAI&file=01.%20Knowledge%2FYoutube%2F_trend%2F20260926_%ED%9D%A1%EC%88%98%ED%9B%84%EB%B3%B4');
+test('텔레그램 흡수 12 · 닿는 것 5 — 최대 세 건만 네 줄, 나머지는 닿지 않은 수', () => {
+  const absorbed = Array.from({ length: 12 }, (_, n) => ({
+    id: String(n), sources: ['youtube'], axis: 'x', oneLiner: `외부 사실 ${n}`,
+    ...(n < 5 ? { impact: { fact: `대조 사실 ${n}`, current: `우리 상태 ${n}`, action: '보강한다' } } : {}),
+    ...(n === 0 ? {} : { url: `https://example.org/${n}` }),
+  }));
+  const t = renderDigestTelegram({ day: '2026-09-26', grounding: 0, release: 0, manual: 0, absorbed, goals: [] });
+  expect(t.split('\n')[0]).toBe('흡수 12 → 우리에게 닿는 것 5');
+  expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
+  expect(t.match(/^C 우리에게 왜:/gm)).toHaveLength(3);
+  expect(t.match(/^A 그래서 무엇을 하나:/gm)).toHaveLength(3);
+  expect(t.match(/^🔗 원문 링크:/gm)).toHaveLength(3);
+  expect(t).toContain('S 무엇: 대조 사실 0\nC 우리에게 왜: 우리 상태 0\nA 그래서 무엇을 하나: 보강한다\n🔗 원문 링크: 링크 없음');
+  expect(t).toContain('🔗 원문 링크: 링크 없음');
+  expect(t).toContain('🔗 원문 링크: https://example.org/1');
+  expect(t).not.toContain('외부 사실 3');
+  expect(t).toContain('그 밖 7건 · 닿지 않음');
+  expect(t).not.toContain('사람이 가를 것');
 });
 
-test('저장된 메시지 새 글이 이틀 넘게 없으면 노트·텔레그램 판에 경고 줄 · 이틀 안이면 없다 · 커서가 없으면 없다', () => {
+test('실제 갈래의 없음·판단 필요·있음 대조만 닿는 항목으로 센다 — 체크 없는 흡수는 세지 않는다', () => {
+  const r = root();
+  const at = '2026-09-26T03:00:00.000Z';
+  ingestIntakeItems(r, 'youtube', Array.from({ length: 12 }, (_, n) => ({ url: `https://example.org/${n}` })), at, quiet);
+  const ids = listIntakeItems(r).map((i) => i.id);
+  for (const [n, id] of ids.entries()) {
+    markIntakeItem(r, id, { status: 'absorbed', output: { kind: 'note', ref: `/v/${n}.md` } }, at);
+    if (n < 5) routeIntakeItem(r, id, { items: [{
+      fact: `elanous 의 기능 ${n}`,
+      current: `대조 ${n}`,
+      verdict: n === 0 ? '없음' : n === 1 ? '판단 필요' : '있음',
+      ...(n > 1 ? { evidence: [{ axis: 'repo', repoKind: 'behavior', path: 'src/feature.ts', summary: '구현' }] } : {}),
+    }] }, { lastCommitOf: () => 'sha' }, at);
+  }
+  const d = buildIntakeDigest(r, '2026-09-26', (p) => `## 한줄 결론\n${p}에 대한 외부 소식이다.\n`);
+  const t = renderDigestTelegram(d);
+  expect(t.split('\n')[0]).toBe('흡수 12 → 우리에게 닿는 것 5');
+  expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
+  expect(t.match(/^C 우리에게 왜:/gm)).toHaveLength(3);
+  expect(t.match(/^A 그래서 무엇을 하나:/gm)).toHaveLength(3);
+  expect(t.match(/^🔗 /gm)).toHaveLength(3);
+  expect(t).toContain('그 밖 7건 · 닿지 않음');
+  expect(t).not.toContain('사람이 가를 것');
+});
+
+test('닿는 것 0이면 머리 한 줄만 — 침묵·옵시디언 주소도 덧붙이지 않는다', () => {
+  const t = renderDigestTelegram({
+    day: '2026-09-26', grounding: 0, release: 0, manual: 0,
+    absorbed: [{ id: '1', sources: ['youtube'], axis: 'x' }], goals: [{ fact: 'old aggregate without an item id' }],
+    savedSilence: { days: 3, lastNewAt: '2026-09-20T00:00:00Z' },
+  }, { vaultRoot: '/vault/ElanvitalAI', notePath: '/vault/ElanvitalAI/digest.md' });
+  expect(t).toBe('흡수 1 → 우리에게 닿는 것 0');
+});
+
+test('저장된 메시지 새 글이 이틀 넘게 없으면 노트에 경고 · 텔레그램 닿는 것 0은 머리만 · 이틀 안이면 없다', () => {
   const r = root();
   expect(buildIntakeDigest(r, '2026-09-30', () => undefined, new Date('2026-09-30T00:00:00Z')).savedSilence).toBeUndefined();
   mkdirSync(join(r, 'intake'), { recursive: true });
@@ -67,5 +110,5 @@ test('저장된 메시지 새 글이 이틀 넘게 없으면 노트·텔레그�
   const d = buildIntakeDigest(r, '2026-10-01', () => undefined, new Date('2026-10-01T00:00:00Z'));
   expect(d.savedSilence).toEqual({ days: 2, lastNewAt: '2026-09-28T22:07:49.773Z' });
   expect(renderDigestMarkdown(d)).toContain('새 글을 2일째 못 받았다(마지막 새 글 수집 2026-09-29)');
-  expect(renderDigestTelegram(d)).toContain('⚠️ 저장된 메시지 새 글 2일째 0');
+  expect(renderDigestTelegram(d)).toBe('흡수 0 → 우리에게 닿는 것 0');
 });

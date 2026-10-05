@@ -15,6 +15,7 @@ import { tasksDbPath } from '../../task-orchestrator/paths.js';
 import { jsonResponse } from './http-server.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { listScheduleRuns } from '../../domains/schedule-runs.js';
+import { listLoops } from '../../loops/registry.js';
 
 export interface SchedulesReadDeps {
   rows?: () => ScheduleRow[];
@@ -24,6 +25,7 @@ export interface SchedulesReadDeps {
   logsPath?: () => string;
   /** 발화 이력 원천(`schedule_runs`) — 기본은 schedules.db 를 읽기 전용으로 연다. */
   schedulesDbPath?: () => string;
+  loopOwners?: () => Array<{ id: string; title: string; owner?: string | null; enabled: boolean; lastRun: { at: string; status: string } | null; jobs: Array<{ id: string }> }>;
   now?: () => Date;
 }
 
@@ -201,6 +203,17 @@ export function handleSchedulesList(req: Request, opts: MetaApiOpts, deps: Sched
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   const cards = readSchedulesInventory(deps);
   const schedules = new URL(req.url).searchParams.get('includeOff') === '1' ? cards : cards.filter(c => c.state !== 'off');
+  if (new URL(req.url).searchParams.get('includeOwners') === '1') {
+    try {
+      const owners = (deps.loopOwners ?? (() => listLoops({ schedules: registryRows() })))().map(loop => ({ id: loop.id, title: redactSecretText(loop.title), owner: loop.owner ?? null,
+        enabled: loop.enabled, lastRun: loop.lastRun ? { at: loop.lastRun.at, status: loop.lastRun.status } : null,
+        jobs: loop.jobs.map(job => job.id) }));
+      return jsonResponse({ schedules, count: schedules.length, owners }, 200);
+    } catch {
+      // The ordinary inventory stays readable; an opted-in map must not mistake an outage for unowned loops.
+      return jsonResponse({ schedules, count: schedules.length, owners: null }, 200);
+    }
+  }
   return jsonResponse({ schedules, count: schedules.length }, 200);
 }
 

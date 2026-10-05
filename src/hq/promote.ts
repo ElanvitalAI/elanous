@@ -1,6 +1,10 @@
 // HQ promotion runbook: read-only preview by default; all remote mutations are behind --apply.
 import { spawnSync } from 'node:child_process';
 import { getUserConfig } from '../user-config.js';
+import { debug } from '../debug/log.js';
+import { join } from 'node:path';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../seat-dispatch/seat-request-ledger.js';
 import { parseLease, sshLeaseStore, defaultSshRunner, localShellRunner } from './lease.js';
 
 export interface PromoteRunner {
@@ -293,6 +297,33 @@ export function promoteHq(host: string, apply = false, runner: PromoteRunner = d
       try { runner.run(host, promoteLockRelease); } catch { /* the lock names its owner for manual release */ }
     }
   }
+}
+
+/** One OP seat request (never a CEO decision card · 대표 10-05 10:03); idempotent by key. */
+export type HqOpRequest = { key: string; text: string; [field: string]: unknown };
+export type HqOpRequestWriter = (request: HqOpRequest) => { key: string; created: boolean };
+
+export function writeOpSeatRequest(request: HqOpRequest, root = effectiveInstanceRoot()): { key: string; created: boolean } {
+  const path = join(root, 'seat-requests', 'requests.jsonl');
+  return withSeatRequestLedgerLock(path, () => {
+    if (listSeatRequests(root).some((row) => row.key === request.key)) return { key: request.key, created: false };
+    appendSeatRequestRows(path, [{ ...request, seat: 'OP', status: 'pending' as const, queuedAt: new Date().toISOString(), source: 'hq-arbiter' }]);
+    return { key: request.key, created: true };
+  });
+}
+
+/** Propose promotion to the OP seat for a silent lease generation; the runbook runs only under explicit opt-in (see hqArbiterCheck). */
+export function proposeHqPromotion(
+  input: { holder: string; standby: string; generation: number; streak: number },
+  deps: { request?: HqOpRequestWriter; log?: typeof debug.log } = {},
+): { promoted: false; requestKey: string; created: boolean } {
+  const key = `hq:promote:${input.holder}:${input.generation}`;
+  const written = (deps.request ?? writeOpSeatRequest)({ key,
+    text: `본부 ${input.holder}(임대 세대 ${input.generation}) 연속 무응답 ${input.streak}회 — ${input.standby} 승격을 OP 가 판단한다(자동 승격 꺼짐). 승격하면 \`eln hq promote --to ${input.standby} --apply\`.`,
+    holder: input.holder, standby: input.standby, generation: input.generation, streak: input.streak });
+  try { (deps.log ?? debug.log.bind(debug))('hq.arbiter', 'promote-proposed', { ...input, ref: key, mode: 'op-request', created: written.created }); }
+  catch { /* observation cannot change the proposal */ }
+  return { promoted: false, requestKey: key, created: written.created };
 }
 
 export function formatPromote(result: PromoteResult): string {

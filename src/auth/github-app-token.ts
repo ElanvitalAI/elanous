@@ -1,6 +1,6 @@
 import { createHash, createSign } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
@@ -45,21 +45,23 @@ export function githubAutomationToken(deps: GithubAutomationTokenDeps = {}): str
   return githubInstallationCredential(deps)?.token ?? null;
 }
 
+/** The App credential is machine-level (like `gh auth` in ~/.config/gh), not per universe: a tree-derived test
+ *  universe resolves its config dir to `<tree>/.elanous-test`, where the file never is — 09-29 #21879 was inert there.
+ *  Order: explicit path → this universe's config dir → the prod root `~/.elanous`.
+ *  An explicit config-dir override (tests · `--config-dir`) is a deliberate boundary — never reach past it.
+ *  ELANOUS_GITHUB_APP_CONFIG_PATH pins the machine-level fallback (the bun test preload points it at nothing,
+ *  so tests never mint); an explicit config-dir override still wins. */
+function appConfigPath(explicit?: string): string {
+  const rel = join('secrets', 'github-app', 'app.json');
+  const own = join(getElanousConfigDir(), rel);
+  const pinned = process.env.ELANOUS_GITHUB_APP_CONFIG_PATH?.trim();
+  return explicit ?? (getElanousConfigDirOverride() ? own : pinned || (existsSync(own) ? own : join(prodInstanceRoot(), rel)));
+}
+
 /** Scoped requests always mint anew; the returned expiry comes from GitHub's response. */
 export function githubInstallationCredential(deps: GithubAutomationTokenDeps = {}): { token: string; expires_at: string } | null {
   let path: string;
-  // The App credential is machine-level (like `gh auth` in ~/.config/gh), not per universe: a tree-derived test
-  // universe resolves its config dir to `<tree>/.elanous-test`, where the file never is — 09-29 #21879 was inert there.
-  // Order: explicit path → this universe's config dir → the prod root `~/.elanous`.
-  try {
-    const rel = join('secrets', 'github-app', 'app.json');
-    const own = join(getElanousConfigDir(), rel);
-    // An explicit config-dir override (tests · `--config-dir`) is a deliberate boundary — never reach past it.
-    // ELANOUS_GITHUB_APP_CONFIG_PATH pins the machine-level fallback (the bun test preload points it at nothing,
-    // so tests never mint); an explicit config-dir override still wins.
-    const pinned = process.env.ELANOUS_GITHUB_APP_CONFIG_PATH?.trim();
-    path = deps.configPath ?? (getElanousConfigDirOverride() ? own : pinned || (existsSync(own) ? own : join(prodInstanceRoot(), rel)));
-  }
+  try { path = appConfigPath(deps.configPath); }
   catch {
     try { debug.log('auth.github-app', 'token-failed', { reason: 'config-path-failed' }); } catch { /* fail open */ }
     return null;
@@ -111,5 +113,102 @@ export function githubInstallationCredential(deps: GithubAutomationTokenDeps = {
     // Do not log exceptions: crypto/HTTP failures can include key or bearer material.
     try { debug.log('auth.github-app', 'token-failed', { reason: 'mint-failed' }); } catch { /* fail open */ }
     return null;
+  }
+}
+
+/** PODCRED1 (10-05): simultaneous launches each minted a scoped token in the same second and the Pods' logins died
+ *  together (12:49Z · 5 in 2 s). Concurrent issuers for one repository — across processes — share one mint: the first
+ *  takes a lock and mints, the others wait and reuse that result while it is recent and long-lived. */
+export interface CoalescedInstallationOptions {
+  cacheDir?: string;
+  /** Reuse a token minted at most this long ago. */
+  windowMs?: number;
+  /** …and only while it still has this much life left. */
+  minRemainingMs?: number;
+  /** Skip reuse (still mint under the lock and publish the result) — for a retry after the shared token failed. */
+  fresh?: boolean;
+  lockWaitMs?: number;
+  staleLockMs?: number;
+  now?: () => number;
+  sleepSync?: (ms: number) => void;
+  mint?: (scope: GithubInstallationTokenScope) => { token: string; expires_at: string } | null;
+}
+
+const COALESCE_WINDOW_MS = 120_000;
+const COALESCE_MIN_REMAINING_MS = 50 * 60_000;
+
+function blockingSleep(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export function coalescedInstallationCredential(scope: GithubInstallationTokenScope, opts: CoalescedInstallationOptions = {}): { token: string; expires_at: string } | null {
+  const now = opts.now ?? Date.now;
+  const mint = opts.mint ?? ((s: GithubInstallationTokenScope) => githubInstallationCredential({ scope: s }));
+  const windowMs = opts.windowMs ?? COALESCE_WINDOW_MS;
+  const minRemainingMs = opts.minRemainingMs ?? COALESCE_MIN_REMAINING_MS;
+  const sleepSync = opts.sleepSync ?? blockingSleep;
+  // Same boundary as the App config: a test process (or config-dir override) never writes the operational root.
+  if (!opts.cacheDir && (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME)) return mint(scope);
+  let dir: string;
+  let identity: string;
+  try {
+    const configPath = appConfigPath();
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<AppConfig>;
+    identity = JSON.stringify([configPath, config.id, config.installation_id]);
+    dir = opts.cacheDir ?? join(getElanousConfigDirOverride() ? getElanousConfigDir() : prodInstanceRoot(), 'cache', 'github-app-scoped');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    if (!opts.cacheDir) return mint(scope);
+    dir = opts.cacheDir;
+    identity = 'injected';
+  }
+  // Keyed by App installation and repository, so another App (another universe or owner) never reuses this token.
+  const key = createHash('sha256').update(`${identity}\0${scope.repository}`).digest('hex').slice(0, 32);
+  const file = join(dir, `${key}.json`);
+  const lock = join(dir, `${key}.lock`);
+  let waitStart: number | undefined;
+  const reuse = (): { token: string; expires_at: string } | null => {
+    try {
+      const entry = JSON.parse(readFileSync(file, 'utf8')) as { token?: unknown; expiresAt?: unknown; mintedAt?: unknown };
+      const t = now();
+      if (typeof entry.token === 'string' && entry.token && typeof entry.expiresAt === 'number' && typeof entry.mintedAt === 'number'
+        && t - entry.mintedAt <= windowMs && entry.expiresAt - t >= minRemainingMs) {
+        try { debug.log('auth.github-app', 'token-coalesced', { ageMs: t - entry.mintedAt, expiresAt: new Date(entry.expiresAt).toISOString(), ...(waitStart === undefined ? {} : { waitedMs: t - waitStart }) }); } catch { /* fail open */ }
+        return { token: entry.token, expires_at: new Date(entry.expiresAt).toISOString() };
+      }
+    } catch { /* no usable entry */ }
+    return null;
+  };
+  const hit = opts.fresh ? null : reuse();
+  if (hit) return hit;
+  waitStart = now();
+  const deadline = waitStart + (opts.lockWaitMs ?? 15_000);
+  let locked = false;
+  for (;;) {
+    try { mkdirSync(lock); locked = true; break; }
+    catch {
+      try { if (now() - statSync(lock).mtimeMs > (opts.staleLockMs ?? 30_000)) { rmSync(lock, { recursive: true, force: true }); continue; } } catch { continue; }
+      if (now() >= deadline) break;
+      sleepSync(200);
+      const waited = opts.fresh ? null : reuse();
+      if (waited) return waited;
+    }
+  }
+  if (!locked) { try { debug.log('auth.github-app', 'token-coalesce-lock-timeout', { waitedMs: now() - (waitStart ?? now()) }); } catch { /* fail open */ } }
+  try {
+    const again = opts.fresh ? null : reuse();
+    if (again) return again;
+    const minted = mint(scope);
+    const expiresAt = minted ? Date.parse(minted.expires_at) : NaN;
+    if (minted && Number.isFinite(expiresAt)) {
+      const temp = `${file}.${process.pid}.tmp`;
+      try {
+        writeFileSync(temp, JSON.stringify({ token: minted.token, expiresAt, mintedAt: now() }), { mode: 0o600 });
+        renameSync(temp, file);
+      } catch { try { rmSync(temp, { force: true }); } catch { /* best effort */ } }
+    }
+    return minted;
+  } finally {
+    if (locked) { try { rmSync(lock, { recursive: true, force: true }); } catch { /* stale-lock rule recovers */ } }
   }
 }

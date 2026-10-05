@@ -49,6 +49,7 @@ export interface SelfImplementDisposition {
   ok?: boolean;
   worktreePath?: string;
   branch?: string;
+  harvestable?: true;
   prUrl?: string;
   prNumber?: number;
   /** Head SHA checked by the Pod before host regate. */
@@ -84,6 +85,7 @@ export interface SelfImplementDisposition {
   reviewVerdict?: 'pass' | 'warn' | 'fail';
   /** 마지막 리뷰의 must-fix 수(`review.mustFix.length`). 같은 조건. */
   reviewMustFixCount?: number;
+  mustFix?: string[];
 }
 
 /**
@@ -265,7 +267,7 @@ export function createSelfImplementAdapter(opts: SelfImplementAdapterOptions) {
           : r.output.length === 0
             ? `${exitMessage} (child produced no output)`
             : r.disposition
-              ? `${exitMessage} (child terminal result contained no error diagnostic)`
+              ? `${exitMessage} (child stage=${r.disposition.stage ?? 'unknown'}; ${r.disposition.detail ?? `mustFix=${JSON.stringify(r.disposition.mustFix ?? 'unknown')}`})`
               : `${exitMessage} (child output did not contain a parseable terminal JSON diagnostic)`;
         return {
           ...exec,
@@ -461,6 +463,7 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
         ...(typeof o.ok === 'boolean' ? { ok: o.ok } : {}),
         ...(typeof o.worktreePath === 'string' ? { worktreePath: o.worktreePath } : {}),
         ...(typeof o.branch === 'string' ? { branch: o.branch } : {}),
+        ...(o.harvestable === true && typeof o.branch === 'string' && o.branch.trim() ? { harvestable: true } : {}),
         ...(typeof o.prUrl === 'string' ? { prUrl: o.prUrl } : {}),
         ...(typeof o.prNumber === 'number' ? { prNumber: o.prNumber } : {}),
         ...(typeof o.checkedHeadCommit === 'string' ? { checkedHeadCommit: o.checkedHeadCommit } : {}),
@@ -483,6 +486,7 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
           ? { providerErrors: o.providerErrors as SelfImplementDisposition['providerErrors'] } : {}),
         ...(typeof o.runId === 'string' && o.runId.trim() ? { runId: o.runId, childRunId: o.runId } : {}),
         ...reviewGateFields(o),
+        ...(Array.isArray(o.mustFix) && o.mustFix.every((item) => typeof item === 'string') ? { mustFix: o.mustFix as string[] } : {}),
       };
       reportUnmappedDispositionFields(o, mapped);
       return mapped;

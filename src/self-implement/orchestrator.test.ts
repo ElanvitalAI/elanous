@@ -24,6 +24,7 @@ import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
 import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, prTitle, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
+import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
 import { WORKTREE_BRANCH_PREFIX, plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { branchGoalId } from '../cli/pr-lineage.js';
@@ -88,6 +89,25 @@ beforeEach(() => {
 afterEach(() => { setUserConfigOverlay(null); });
 
 describe('run-origin ledger attribution', () => {
+  test('run-origin records the child provider the run will use (10-05 PODPROVIDER)', async () => {
+    const runIdBefore = process.env.ELANOUS_RUN_ID;
+    try {
+      const named: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+      delete process.env.ELANOUS_RUN_ID;
+      await runSelfImplement({ feature: 'child provider fixture', observeOnly: true,
+        childLlm: { provider: 'grok', model: 'grok-4.7', source: 'flag' },
+        seams: seams({ writeRunLedger: (entry) => named.push(entry) }) });
+      expect(named.find((entry) => entry.event === 'run-origin')!.data).toMatchObject({ childProvider: 'grok', childModel: 'grok-4.7' });
+      const unnamed: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+      delete process.env.ELANOUS_RUN_ID;
+      await runSelfImplement({ feature: 'default provider fixture', observeOnly: true,
+        seams: seams({ writeRunLedger: (entry) => unnamed.push(entry) }) });
+      expect(unnamed.find((entry) => entry.event === 'run-origin')!.data).toMatchObject({ childProvider: 'default' });
+    } finally {
+      if (runIdBefore === undefined) delete process.env.ELANOUS_RUN_ID; else process.env.ELANOUS_RUN_ID = runIdBefore;
+    }
+  });
+
   test('each run writes exactly one run-origin with host metadata via the ledger seam', async () => {
     const before = process.env.ELANOUS_HOST_ID;
     const substrate = process.env.ELANOUS_SUBSTRATE;
@@ -3126,6 +3146,24 @@ describe('runSelfImplement — Fix A rework', () => {
     expect(parsePrComment(comments[2]!.body)).toEqual({ role: 'author', round: 1, run: 'run-review-conversation' });
     expect(comments[2]!.body).toContain('고유 자식 요약: retry policy 반영 완료');
     expect(parsePrComment(comments[3]!.body)).toEqual({ role: 'reviewer', round: 1, run: 'run-review-conversation' });
+  });
+
+  test('reviewed=false ⊕ verdict pass는 PR 리뷰 코멘트에 사유를 쓰되 PASS로 오인시키지 않는다', async () => {
+    const comments: string[] = [];
+    const s = seams({
+      reviewDiff: async () => ({
+        verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false,
+        failureReason: 'Codex overloaded', summary: '✅ 자율 PR 리뷰: PASS',
+      }),
+      postPrComment: async ({ body }) => { comments.push(body); },
+    });
+    const result = await runSelfImplement({ feature: 'failed review comment', runId: 'run-failed-review', autoMerge: true, seams: s });
+    const reviewerComment = comments.find((body) => parsePrComment(body)?.role === 'reviewer');
+    expect(result.mergeReason).toBe('no-real-review');
+    expect(reviewerComment).toContain('리뷰 못 함(사유: Codex overloaded)');
+    expect(reviewerComment).not.toContain('PASS');
+    expect(reviewerComment).not.toContain('review completed');
+    expect(parsePrComment(reviewerComment!)).toEqual({ role: 'reviewer', round: 0, run: 'run-failed-review' });
   });
 
   test('PR comment 게시 실패는 warn을 남기고 다음 코멘트와 PR 결과를 계속 처리한다', async () => {
@@ -7983,6 +8021,7 @@ describe('runSelfImplement — G2 PR-直前 main-싱크', () => {
       //   (실측 2026-09-12: 단독 호출 40,003ms). 그래서 이 블록의 시험이 5초에서도 30초에서도
       //   ***전부 타임아웃***했다(19~23건 · 최소 3주). 매달린 게 아니라 «예산»이었다.
       refreshCodexQuotaSignals: async () => ({}),
+      headCommit: () => 'c'.repeat(40),
       createWorktree: async ({ branch, base }) => ({ path: `/wt/${branch}`, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
       implement: async () => ({ ok: true, summary: 'impl' }),
       gate: async (_cwd, ctx) => { const passed = gateResults[Math.min(gateCall, gateResults.length - 1)]!; gateCall++; gateContexts?.push(ctx); order.push(`gate:${passed}`); return { passed, log: passed ? 'ok' : 'tsc err', ...(gateCall === 2 ? { scopeReason: 'changed-tests', measuredFileCount: 3, comparisonBase: 'merge-base-sha' } : {}) }; },
@@ -8104,6 +8143,137 @@ describe('runSelfImplement — G2 PR-直前 main-싱크', () => {
     } finally {
       (debug as { log: typeof debug.log }).log = original;
     }
+  });
+
+  test('oversized merge conflict preserves the finished branch and records harvestable input size', async () => {
+    const order: string[] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = g2Seams({ mergeStatus: 'conflict-unresolved', order });
+      s.mergeMain = async () => ({ status: 'conflict-unresolved', reason: 'conflict-input-too-large', inputChars: 120_000 });
+      s.preserveBlockedBranch = async ({ branch }) => { order.push(`push:${branch}`); return true; };
+      const result = await runSelfImplement({ feature: 'F', seams: s });
+      const branch = result.branch;
+      expect(result).toMatchObject({ stage: 'merge-conflict', harvestable: true, detail: expect.stringContaining('충돌 큼 — 사람 수확') });
+      expect(branch).toBeString();
+      expect(order.filter((event) => event.startsWith('push:'))).toEqual([`push:${branch}`]);
+      expect(order).not.toContain('openPr');
+      expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement', event: 'merge-abandoned-harvestable', data: expect.objectContaining({ branch: result.branch, reason: 'conflict-input-too-large', inputChars: 120_000, commit: 'c'.repeat(40), worktree: 'left-as-is' }) }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('merge step timeout pushes finished branch once before returning harvestable', async () => {
+    const order: string[] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = g2Seams({ mergeStatus: 'merged', order });
+      s.mergeMain = () => { order.push('mergeMain:pending'); return new Promise<never>(() => {}); };
+      s.preserveBlockedBranch = async ({ branch }) => { order.push(`push:${branch}`); return true; };
+      const result = await runSelfImplement({ feature: 'F', stepTimeouts: { merge: 40 }, seams: s });
+      expect(result).toMatchObject({ stage: 'timed-out', harvestable: true, detail: expect.stringContaining('수확 대기') });
+      expect(result.branch).toBeString();
+      expect(order.filter((event) => event.startsWith('push:'))).toEqual([`push:${result.branch}`]);
+      expect(order.indexOf('mergeMain:pending')).toBeLessThan(order.indexOf(`push:${result.branch}`));
+      expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement', event: 'step-timeout', data: expect.objectContaining({ step: 'merge', ms: 40 }) }));
+      expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement', event: 'merge-abandoned-harvestable', data: expect.objectContaining({ branch: result.branch, reason: 'step-timeout', inputChars: null, commit: 'c'.repeat(40), worktree: 'left-as-is' }) }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('merge timeout pushes the commit pinned before main sync, not the HEAD a late merge moved', async () => {
+    const pushed: Array<string | undefined> = [];
+    let head = 'p'.repeat(40);
+    const s = g2Seams({ mergeStatus: 'merged' });
+    s.headCommit = () => head;
+    s.mergeMain = () => { head = 'm'.repeat(40); return new Promise<never>(() => {}); };
+    s.preserveBlockedBranch = async ({ commit }) => { pushed.push(commit); return true; };
+    const result = await runSelfImplement({ feature: 'F', stepTimeouts: { merge: 40 }, seams: s });
+    expect(result).toMatchObject({ stage: 'timed-out', harvestable: true });
+    expect(pushed).toEqual(['p'.repeat(40)]);
+  });
+
+  test('without a pinned pre-sync commit the run never pushes HEAD and never claims harvestable', async () => {
+    let pushes = 0;
+    const s = g2Seams({ mergeStatus: 'merged' });
+    s.headCommit = () => undefined;
+    s.mergeMain = () => new Promise<never>(() => {});
+    s.preserveBlockedBranch = async () => { pushes++; return true; };
+    const result = await runSelfImplement({ feature: 'F', stepTimeouts: { merge: 40 }, seams: s });
+    expect(result.stage).toBe('timed-out');
+    expect(result.harvestable).toBeUndefined();
+    expect(pushes).toBe(0);
+  });
+
+  test('failed branch push never claims harvestable', async () => {
+    const s = g2Seams({ mergeStatus: 'conflict-unresolved' });
+    s.mergeMain = async () => ({ status: 'conflict-unresolved', reason: 'conflict-input-too-large', inputChars: 120_000 });
+    s.preserveBlockedBranch = async () => false;
+    const result = await runSelfImplement({ feature: 'F', seams: s });
+    expect(result.stage).toBe('merge-conflict');
+    expect(result.harvestable).toBeUndefined();
+  });
+
+  test('rejected conflict resolver stream preserves the finished branch through the real merger', async () => {
+    const order: string[] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = g2Seams({ mergeStatus: 'merged', order });
+      const git: MergeGitSeam = {
+        isConfiguredRemote: () => false,
+        fetch: () => true,
+        merge: () => ({ ok: false, conflict: true, stdout: '' }),
+        conflictedFiles: () => ['src/a.ts'],
+        readIndexStage: () => '',
+        readFile: () => '<<<<<<< ours\nold\n=======\nnew\n>>>>>>> theirs\n',
+        writeFile: () => { throw new Error('unexpected write'); },
+        add: () => { throw new Error('unexpected add'); },
+        commit: () => { throw new Error('unexpected commit'); },
+        abort: () => { order.push('abort'); },
+      };
+      let streamCalls = 0;
+      s.mergeMain = (wt, target) => mergeMainWithLlmResolve(wt, target,
+        (file, conflicted) => defaultLlmResolve(file, conflicted, target, {
+          mode: 'off', stream: (async () => { streamCalls++; throw new Error('stream stopped'); }) as typeof import('../llm.js')['streamLLM'],
+        }), git);
+      s.preserveBlockedBranch = async ({ branch }) => { order.push(`push:${branch}`); return true; };
+      const result = await runSelfImplement({ feature: 'F', seams: s });
+      expect(streamCalls).toBe(1);
+      const branch = result.branch;
+      expect(branch).toBeString();
+      expect(result).toMatchObject({ stage: 'merge-conflict', harvestable: true, detail: expect.stringContaining('사람 수확') });
+      expect(order.filter((entry) => entry.startsWith('push:'))).toEqual([`push:${branch}`]);
+      expect(order).toContain('abort');
+      expect(order).not.toContain('openPr');
+      expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement', event: 'merge-abandoned-harvestable', data: expect.objectContaining({ branch: result.branch, reason: 'conflict-resolver-interrupted', inputChars: null, commit: 'c'.repeat(40), worktree: 'left-as-is' }) }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('merge interruption pushes completed branch once and waits for harvest', async () => {
+    const order: string[] = [];
+    const s = g2Seams({ mergeStatus: 'merged', order });
+    s.mergeMain = async () => { throw new Error('stream stopped'); };
+    s.preserveBlockedBranch = async ({ branch }) => { order.push(`push:${branch}`); return true; };
+    const result = await runSelfImplement({ feature: 'F', seams: s });
+    expect(result).toMatchObject({ stage: 'merge-conflict', harvestable: true, branch: expect.any(String) });
+    expect(order.filter((event) => event.startsWith('push:'))).toHaveLength(1);
+    expect(order).not.toContain('openPr');
   });
 
   test('conflict-unresolved → merge-conflict escalate·PR 미개설', async () => {
@@ -15300,6 +15470,7 @@ describe('successful-run PR open failure reports preserved worktree·branch', ()
   const remoteUnavailable = "self-implement PR push 실패: fatal: 'origin' does not appear to be a git repository";
 
   test('review-passed run reports branch and worktree with interrupted-path vocabulary, keeps the raw error, and does not succeed', async () => {
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, provider: 'openai', apiKey: 'test-placeholder' } }));
     const progress: string[] = [];
     const branch = 'self-impl/reviewed-pr-open-fail';
     const worktreePath = '/wt/self-impl/reviewed-pr-open-fail';

@@ -128,9 +128,9 @@ test('list --all warning includes quoted env assignment and flock -c, but not re
     '*/10 * * * * env X=1 elanous config get roleLlm',
   ]);
   expect(lines.some(line => line.includes('\tseat\tUX\t'))).toBe(true);
-  // LOOP-REG1E: an elanous-related cron line that is not a loop (config get) is warned, never silently dropped.
-  expect(lines.at(-1)).toContain('미등록 4:');
-  expect(lines.at(-1)).toContain('env X=1 elanous config get roleLlm');
+  // `config` is a recognised entry point since #23931 — the config get line is a named row, not an unregistered warning.
+  expect(lines.at(-1)).toContain('미등록 3:');
+  expect(lines.at(-1)).not.toContain('env X=1 elanous config get roleLlm');
   expect(lines.at(-1)).toContain('env FOO="bar" elanous future-loop');
   expect(lines.at(-1)).toContain("flock /tmp/lock -c 'elanous future-loop'");
   expect(lines.at(-1)).not.toContain('seat-loop.ts --seat UX');

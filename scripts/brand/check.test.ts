@@ -38,8 +38,14 @@ test('real rule file compiles and four public fixtures have exact findings and e
           : file === site ? '---\nlang: ko\n---\nElanous is here. 완전 자율\n' : 'Elanous is a tool.\n');
     }
     const missing = run('public-docs', [english], join(dir, 'missing.yaml'));
-    expect(missing.status).toBe(0);
-    expect(missing.stdout.trim()).toBe('규칙 없음');
+    expect(missing.status).toBe(2);
+    expect(missing.stdout.trim()).toBe('규칙 없음 — 측정 불가');
+    expect(checkBrand('public-docs', [english], join(dir, 'missing.yaml'))).toEqual({
+      files: 0, findings: [], rules: 0, missing: true, message: '규칙 없음 — 측정 불가',
+    });
+    expect(JSON.parse(run('public-docs', [english], join(dir, 'missing.yaml'), true).stdout)).toMatchObject({
+      files: 0, findings: [], rules: 0, missing: true, message: '규칙 없음 — 측정 불가',
+    });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

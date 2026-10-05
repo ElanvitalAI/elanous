@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight.js';
 import { isRunStatus } from './run-status-mapping.js';
@@ -402,6 +403,7 @@ export function describeFederatedMissingRunLedger(runId: string, options: Federa
 
 /** Append one observer event. Callers own fail-soft handling. */
 export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()): void {
+  if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return;
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const live = runLedgerPath(entry.runId, dir);
   withRunLedgerLock(dir, entry.runId, () => {

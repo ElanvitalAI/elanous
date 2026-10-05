@@ -1,8 +1,8 @@
 import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
-import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -486,6 +486,35 @@ describe('pod grok credentials', () => {
 });
 
 describe('pod memory inheritance from parent goal', () => {
+  test('document launch selects an actual 2Gi Job request and records the chosen reason with its run', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-document-memory-'));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'pod-document-memory-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && (record.event === 'memory-limit' || record.event === 'memory-request')) {
+        events.push({ event: record.event, data: record.data as Record<string, unknown> });
+      }
+    } });
+    try {
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const parentRunId = 'run-document-memory-test';
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId, ELANOUS_POD_MEMORY_TIER: 'lite',
+          ELANOUS_POD_MEMORY_REASON: 'goal-type-default', ELANOUS_POD_GOAL_TYPE: 'document' } })(
+        { feature: 'Write the guide', spaceId: 'document-memory' }).done;
+      expect(result.exitCode).toBe(0);
+      const jobs = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+        .filter((item) => item.kind === 'Job');
+      expect(jobs).toHaveLength(1);
+      const resources = jobs[0]!.spec.template.spec.containers[0].resources;
+      expect(resources.requests.memory).toBe('2Gi');
+      expect(resources.limits.memory).toBe('2Gi');
+      expect(events).toContainEqual({ event: 'memory-limit', data: expect.objectContaining({ tier: 'lite', reason: 'goal-type-default', memoryLimit: '2Gi' }) });
+      expect(events).toContainEqual({ event: 'memory-request', data: expect.objectContaining({ tier: 'lite', reason: 'goal-type-default', memoryRequest: '2Gi' }) });
+      expect(loadRunLedger(parentRunId, join(root, 'run-ledger'))).toContainEqual(expect.objectContaining({
+        event: 'pod-memory-selected', data: expect.objectContaining({ tier: 'lite', reason: 'goal-type-default', limit: '2Gi', request: '2Gi' }),
+      }));
+    } finally { off(); rmSync(root, { recursive: true, force: true }); }
+  });
   test('a pathless PWA shard inherits 32Gi from the goal body, not its execution ledger', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-memory-parent-'));
     const previous = process.cwd();
@@ -625,14 +654,19 @@ test('a host-recorded dispatch marker reaches the actual Pod Job without alterin
 describe('pod memory evidence', () => {
   const lines = [1, 2, 3, 4, 5].map((n) => `ELANOUS_MEM ${1700000000 + n} ${n * 1073741824} ${n * 1048576}:node 512:bun`);
 
-  async function waitForChildArgv(pid: number, comm: string, secret: string): Promise<void> {
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const probe = Bun.spawnSync(['/bin/ps', '-p', String(pid), '-o', 'comm=,args=']);
-      const argv = probe.stdout.toString();
-      if (probe.exitCode === 0 && argv.trimStart().startsWith(`${comm} `) && argv.includes(secret)) return;
-      await Bun.sleep(20);
-    }
-    throw new Error(`child ${comm} argv was not observable before sampling`);
+  // Exercise the generated Pod sampler with fixed ps RSS/comm/argv rows, never the host's platform-specific process list.
+  function sampleProcessRow(row: string): string {
+    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
+    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
+    const root = mkdtempSync(join(tmpdir(), 'pod-mem-ps-'));
+    try {
+      const ps = join(root, 'ps');
+      writeFileSync(ps, '#!/bin/sh\nprintf "%s\\n" "$PS_ROW"\n');
+      chmodSync(ps, 0o755);
+      const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_ROW: row } });
+      expect(run.exitCode).toBe(0);
+      return run.stdout.toString();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   }
 
   test('sampler follows setup, precedes both harness routes, redacts argv and leaves exit unchanged', () => {
@@ -679,97 +713,41 @@ describe('pod memory evidence', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  test('real child argv is redacted inside the generated sampler before it crosses the Pod boundary', async () => {
-    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
-    const root = mkdtempSync(join(tmpdir(), 'pod-mem-argv-'));
-    try {
-      const bin = join(root, 'ps');
-      writeFileSync(bin, '#!/bin/sh\nexec /bin/ps -p "$PS_TARGET_PID" -o rss=,comm=,args=\n');
-      chmodSync(bin, 0o755);
-      const token = 'sk-live-abcdefghijklmnopqrstuvwxyz0123456789';
-      const gh = 'ghp_0123456789abcdefghij0123456789abcd';
-      const hex = 'a'.repeat(40);
-      const command = `sleep 30 --api_key short-secret --api-key ${token} GITHUB_TOKEN=${gh} --password pass-short --secret secret-short --token token-short Bearer bearer-short SERVICE_KEY=key-short SERVICE_SECRET=secret-value SERVICE_PASSWORD=password-value ${hex}`;
-      const child = Bun.spawn(['bash', '-c', `exec -a ${JSON.stringify(command)} /bin/sleep 30`], { stdout: 'ignore', stderr: 'ignore' });
-      try {
-        await waitForChildArgv(child.pid, 'sleep', 'short-secret');
-        const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
-        expect(run.exitCode).toBe(0);
-        const raw = run.stdout.toString();
-        const cmd = parseMemSamples(raw).flatMap((sample) => sample.top).find((entry) => entry.cmd?.includes('sleep 30'))?.cmd;
-        expect(cmd).toContain('sleep 30');
-        expect(cmd).toBe('sleep 30 <redacted>');
-        expect(cmd).not.toContain('--api-key');
-        expect(cmd).not.toContain('GITHUB_TOKEN=');
-        expect(raw).not.toContain('short-secret');
-        expect(cmd!.length).toBeLessThanOrEqual(120);
-        expect(raw).not.toContain(token);
-        expect(raw).not.toContain(gh);
-        expect(raw).not.toContain(hex);
-        expect(cmd).not.toContain('sk-live-');
-        expect(cmd).not.toContain('ghp_');
-      } finally { child.kill(); }
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  test('fixed sleep argv emits only a bounded duration shape and redacts tokens before crossing the Pod boundary', () => {
+    // A recognized sleep duration may leave the Pod, but neither flags nor arbitrary secret values may.
+    const token = 'sk-live-abcdefghijklmnopqrstuvwxyz0123456789';
+    const gh = 'ghp_0123456789abcdefghij0123456789abcd';
+    const hex = 'a'.repeat(40);
+    const raw = sampleProcessRow(` 2048 sleep sleep 30 --api_key short-secret --api-key ${token} GITHUB_TOKEN=${gh} --password pass-short --secret secret-short --token token-short Bearer bearer-short SERVICE_KEY=key-short SERVICE_SECRET=secret-value SERVICE_PASSWORD=password-value ${hex}`);
+    const cmd = parseMemSamples(raw)[0]?.top[0]?.cmd;
+    expect(cmd).toBe('sleep 30 <redacted>');
+    expect(cmd!.length).toBeLessThanOrEqual(120);
+    for (const secret of ['short-secret', token, gh, hex, '--api-key', 'GITHUB_TOKEN=', 'sk-live-', 'ghp_']) expect(raw).not.toContain(secret);
+    // Changing the injected comm must change the sanitizer's decision, not just its input text.
+    expect(parseMemSamples(sampleProcessRow(' 2048 bash bash -c sleep 30 --api_key short-secret'))[0]?.top[0]?.cmd).toBe('<redacted>');
   });
 
-  test('real argv with whitespace inside a secret never crosses the Pod sampler boundary', async () => {
-    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
-    const root = mkdtempSync(join(tmpdir(), 'pod-mem-space-secret-'));
-    const secret = 'short secret';
-    try {
-      writeFileSync(join(root, 'ps'), '#!/bin/sh\nexec /bin/ps -p "$PS_TARGET_PID" -o rss=,comm=,args=\n');
-      chmodSync(join(root, 'ps'), 0o755);
-      const child = Bun.spawn(['/bin/bash', '-c', 'sleep 30 & wait', 'bun', '--api_key', secret], { stdout: 'ignore', stderr: 'ignore' });
-      try {
-        await waitForChildArgv(child.pid, 'bash', secret);
-        const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
-        expect(run.exitCode).toBe(0);
-        const raw = run.stdout.toString();
-        const cmd = parseMemSamples(raw)[0]?.top[0]?.cmd;
-        expect(cmd).toBe('<redacted>');
-        expect(raw).not.toContain(secret);
-        expect(cmd).not.toContain('short');
-        expect(cmd).not.toContain('secret');
-      } finally { child.kill(); }
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  test('fixed bash argv with whitespace inside a secret is redacted before crossing the Pod boundary', () => {
+    // A multiword secret in shell argv must not become a partial command shape.
+    const raw = sampleProcessRow(' 1024 bash bash -c sleep 30 --api_key short secret');
+    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 1024, name: 'bash', cmd: '<redacted>' });
+    expect(raw).not.toContain('short secret');
+    expect(raw).not.toContain('short');
+    expect(raw).not.toContain('secret');
   });
 
-  test('a real bash -c child with an unknown secret cannot send its argv to the host', async () => {
-    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
-    const root = mkdtempSync(join(tmpdir(), 'pod-mem-shell-secret-'));
-    try {
-      writeFileSync(join(root, 'ps'), '#!/bin/sh\nexec /bin/ps -p "$PS_TARGET_PID" -o rss=,comm=,args=\n');
-      chmodSync(join(root, 'ps'), 0o755);
-      const child = Bun.spawn(['/bin/bash', '-c', 'while :; do sleep 1; done # short secret'], { stdout: 'ignore', stderr: 'ignore' });
-      try {
-        await waitForChildArgv(child.pid, 'bash', 'short secret');
-        const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
-        expect(run.exitCode).toBe(0);
-        expect(parseMemSamples(run.stdout.toString())[0]?.top[0]).toMatchObject({ name: 'bash', cmd: '<redacted>' });
-        expect(run.stdout.toString()).not.toContain('short secret');
-      } finally { child.kill(); }
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  test('fixed bash -c argv with an unknown secret cannot send its command to the host', () => {
+    // Unknown shell payloads must be hidden without relying on known token prefixes.
+    const raw = sampleProcessRow(' 4096 bash bash -c while :; do sleep 1; done # short secret');
+    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 4096, name: 'bash', cmd: '<redacted>' });
+    expect(raw).not.toContain('short secret');
   });
 
-  test('an argv0 masquerade cannot turn bash -c secrets into an allowed command', async () => {
-    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
-    const root = mkdtempSync(join(tmpdir(), 'pod-mem-masquerade-'));
-    try {
-      writeFileSync(join(root, 'ps'), '#!/bin/sh\nexec /bin/ps -p "$PS_TARGET_PID" -o rss=,comm=,args=\n');
-      chmodSync(join(root, 'ps'), 0o755);
-      const child = Bun.spawn(['/bin/bash', '-c', 'while :; do sleep 1; done # short secret'], { argv0: 'sleep', stdout: 'ignore', stderr: 'ignore' });
-      try {
-        await waitForChildArgv(child.pid, 'bash', 'short secret');
-        const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
-        expect(run.exitCode).toBe(0);
-        expect(parseMemSamples(run.stdout.toString())[0]?.top[0]).toMatchObject({ name: 'bash', cmd: '<redacted>' });
-        expect(run.stdout.toString()).not.toContain('short secret');
-      } finally { child.kill(); }
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  test('fixed argv0 masquerade cannot turn bash -c secrets into an allowed sleep command', () => {
+    // Kernel comm is bash even when argv0 claims sleep; classify by comm, not argv0.
+    const raw = sampleProcessRow(' 8192 bash sleep -c while :; do sleep 1; done # short secret');
+    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 8192, name: 'bash', cmd: '<redacted>' });
+    expect(raw).not.toContain('short secret');
   });
 
   test('Pod sampler never emits arbitrary command text, including shell -c secrets', () => {
@@ -963,6 +941,27 @@ describe('podSelfImplementSpawn', () => {
     expect(script).not.toContain('--auto-merge');
     expect(received).toEqual([{ prNumber: 9, headCommit, repoRoot: expect.any(String) }]);
     expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
+  });
+
+  test('host regate receives the host goal file so a merged PR can apply the goal «이 칸 완료» declaration (CL-AUTO)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-regate-goal-'));
+    const previous = process.cwd();
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, 'docs', 'goals', 'cell.md'), '# 골\n칸: X\n이 칸 완료\n');
+      process.chdir(root);
+      const headCommit = 'b'.repeat(40);
+      const json = JSON.stringify({ stage: 'merge-ready', ok: true, prUrl: 'https://github.com/o/r/pull/11', prNumber: 11, checkedHeadCommit: headCommit });
+      const { k } = fakeKubectl(['Complete'], `${json}\n`);
+      const received: Array<{ goalFile?: string }> = [];
+      await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: 'docs/goals/cell.md' }, hostRegate: async (request) => {
+        received.push(request);
+        return { passed: true, failures: [], os: process.platform };
+      } })({ feature: 'host regate goal', spaceId: 'pod-merge-host-goal', autoMerge: true }).done;
+      expect(received).toHaveLength(1);
+      expect(received[0]!.goalFile).toBe(realpathSync(join(root, 'docs', 'goals', 'cell.md')));
+    } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
   });
 
   test('real runHostRegate path: Pod merge-ready becomes merged only through the host gh merge and MERGED confirmation', async () => {
@@ -1736,7 +1735,7 @@ describe('podSelfImplementSpawn', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS })({ feature: 'x', spaceId: 'backoff' }).done;
-    expect(r.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff')} failed (BackoffLimitExceeded) — childError=no-result-line` });
+    expect(r.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff')} failed (BackoffLimitExceeded) — childError=no-result-line · reason=사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음` });
     expect(r.disposition?.failureClassification).toBeUndefined();
   });
 
@@ -3448,4 +3447,36 @@ describe('pod GitHub token watchdog (host refresher gone)', () => {
       expect(run.stdout.toString()).toContain('ELANOUS_POD_SALVAGE_NONE clean');
     } finally { rmSync(r.root, { recursive: true, force: true }); }
   });
+});
+
+describe('named child provider in Pod runs (10-05 PODPROVIDER)', () => {
+  test('grok child gets the named model, and codex gets flags only when named', async () => {
+    const { podChildLlmArgs } = await import('./self-implement-pod.js');
+    expect(podChildLlmArgs({ provider: 'grok', childModel: 'grok-4.7', childEffort: 'high', childProviderExplicit: true }))
+      .toEqual(['--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.7']); // effort is not a `self implement` flag
+    expect(podChildLlmArgs({ provider: 'grok' }).slice(0, 2)).toEqual(['--child-llm-provider', 'grok']);
+    expect(podChildLlmArgs({ provider: 'openai-codex', childModel: 'gpt-6-sol', childProviderExplicit: true }))
+      .toEqual(['--child-llm-provider', 'openai-codex', '--child-llm-model', 'gpt-6-sol']);
+    expect(podChildLlmArgs({ provider: 'openai-codex' })).toEqual([]);
+  });
+  test('a named grok child without a usable credential is refused, never a silent codex', async () => {
+    const { podNamedChildProvider } = await import('./self-implement-pod.js');
+    expect(podNamedChildProvider('grok', { grokSubscription: true, grokApiKey: false })).toEqual({ provider: 'grok' });
+    expect(podNamedChildProvider('grok', { grokSubscription: false, grokApiKey: true })).toEqual({ provider: 'grok' });
+    expect(podNamedChildProvider('grok', { grokSubscription: false, grokApiKey: false }).refuse).toContain('grok 자격 없음');
+    expect(podNamedChildProvider('openai-codex', { grokSubscription: false, grokApiKey: false })).toEqual({ provider: 'openai-codex' });
+    expect(podNamedChildProvider('anthropic', { grokSubscription: true, grokApiKey: true }).refuse).toContain('openai-codex|grok');
+    expect(podNamedChildProvider(undefined, { grokSubscription: true, grokApiKey: true })).toEqual({});
+  });
+});
+
+test('a named codex child plans with grok fallback off, so no codex account means refusal (10-05 PODPROVIDER)', async () => {
+  const { podFallbackCredentials } = await import('./self-implement-pod.js');
+  const { planPodProvider } = await import('./pod-account-broker.js');
+  expect(podFallbackCredentials('openai-codex', { grokSubscription: true, grokApiKey: true })).toEqual({ grokSubscription: false, grokApiKey: false });
+  expect(podFallbackCredentials(undefined, { grokSubscription: true, grokApiKey: false })).toEqual({ grokSubscription: true, grokApiKey: false });
+  const named = planPodProvider({ codexCandidates: [], grokApiKeyOptIn: false, ...podFallbackCredentials('openai-codex', { grokSubscription: true, grokApiKey: false }) });
+  expect(named.provider).toBeNull();
+  const unnamed = planPodProvider({ codexCandidates: [], grokApiKeyOptIn: false, ...podFallbackCredentials(undefined, { grokSubscription: true, grokApiKey: false }) });
+  expect(unnamed.provider).toBe('grok');
 });

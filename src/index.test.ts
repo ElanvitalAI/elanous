@@ -2712,11 +2712,13 @@ describe('self orchestrate CLI help tiers', () => {
     // 2026-09-27 pod 원천 표면이 더한 하나 — `--help-all` 에만 보인다.
     '--pod-source',
     '--goal-file',
+    // 2026-10-05 PODPROVIDER — the harness child LLM choice reaches the Pod orchestrator (`--help-all` only).
+    '--child-llm-provider', '--child-llm-model', '--child-llm-effort',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(24);
+    expect(existingOptionNames.size).toBe(27);
   });
 
   function help(...args: string[]): string {
@@ -3743,6 +3745,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'browser-type',
     'clean',
     'deliverable-verify',
+    // 🚪 입구×대기열 경유 하루 표 — `harness doors`(ONEDOOR-1 · launch-stamp.ts).
+    'doors',
     // 🧹 draft PR 정리 — `harness drafts`(installHarnessDraftSweepCommand).
     'drafts',
     // 🎯 골 조회 — `harness goal <pr|runId>`(GOAL-LIFE1B #23800).

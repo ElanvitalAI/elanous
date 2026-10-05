@@ -1,12 +1,12 @@
 // 흡수 하루 다이제스트 — 그날 흡수한 것을 사람이 «발견»하는 자리. 노트 절(마크다운) ⊕ 텔레그램 짧은 판.
 // 결정론만: 요약 한 줄은 각 노트가 이미 쓴 「한 줄 결론」을 뽑는다(LLM 을 다시 부르지 않는다).
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join, relative } from 'node:path';
+import { basename, join } from 'node:path';
 import { loadIntakeLedger, type IntakeItem } from './items.js';
 import { readSavedCursorAt } from './collect-telegram-saved.js';
 import { intakeOutboxDir, kstDay } from './route.js';
 
-export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string }
+export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { fact: string; current: string; action: string } }
 export interface IntakeDigest { day: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
 const AXIS_LABEL: Record<string, string> = {
@@ -43,17 +43,38 @@ const SAVED_SILENCE_MS = 48 * 3600_000;
 export function buildIntakeDigest(root: string, day: string, readFile: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : undefined), now: Date = new Date()): IntakeDigest {
   const items = [...loadIntakeLedger(root).items.values()]
     .filter((i) => (i.status === 'absorbed' || i.status === 'routed') && kstDay(i.lastSeenAt) === day && i.outputs.some((o) => o.kind === 'note'));
+  const out = intakeOutboxDir(root);
+  const relevant = new Map<string, NonNullable<DigestEntry['impact']>>();
+  for (const [folder, action] of [
+    ['goals', '없는 기능의 골 후보를 세운다'],
+    ['manual', '문서·약속을 현재 동작에 맞게 보강한다'],
+    ['review', '대조 근거를 추가로 확인한다'],
+    ['release', '이미 착지한 기능의 바깥 맥락을 릴리스 노트에 반영한다'],
+  ] as const) {
+    for (const row of readJsonl(join(out, folder, `${day}.jsonl`))) {
+      if (typeof row.id !== 'string' || relevant.has(row.id)) continue;
+      const fact = folder === 'release' ? row.title : row.fact;
+      if (typeof fact !== 'string' || !fact.trim()) continue;
+      relevant.set(row.id, {
+        fact,
+        current: typeof (folder === 'release' ? row.summary : row.current) === 'string'
+          ? String(folder === 'release' ? row.summary : row.current) : '대조 근거 없음',
+        action,
+      });
+    }
+  }
   const absorbed = items.map((i: IntakeItem): DigestEntry => {
     const note = [...i.outputs].reverse().find((o) => o.kind === 'note')?.ref;
     const md = note ? readFile(note) : undefined;
+    const impact = relevant.get(i.id);
     return {
       id: i.id, sources: i.sources, ...(i.url ? { url: i.url } : {}),
       ...(note ? { note, noteName: basename(note, '.md') } : {}),
       ...(md ? { oneLiner: noteOneLiner(md) } : {}),
       axis: AXIS_LABEL[i.judgement?.axis ?? i.axis ?? ''] ?? (i.sources.includes('telegram-saved') ? '내가 저장한 것' : '그 밖'),
+      ...(impact ? { impact } : {}),
     };
   });
-  const out = intakeOutboxDir(root);
   const goals = readJsonl(join(out, 'goals', `${day}.jsonl`)).map((g) => ({ fact: String(g.fact ?? ''), ...(g.url ? { url: String(g.url) } : {}) }));
   const review = readJsonl(join(out, 'review', `${day}.jsonl`)).map((r) => ({ fact: String(r.fact ?? ''), ...(r.note ? { note: String(r.note) } : {}) }));
   const grounding = readJsonl(join(out, 'grounding.jsonl')).filter((g) => typeof g.at === 'string' && kstDay(g.at) === day).length;
@@ -94,18 +115,19 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
   return L.join('\n');
 }
 
-/** 텔레그램 짧은 판 — 수 · 한 줄 요약 다섯 · 골 후보 · 노트 자리. */
-export function renderDigestTelegram(d: IntakeDigest, opts: { vaultRoot?: string; notePath?: string } = {}): string {
-  const L = [`📰 *${d.day} 흡수 ${d.absorbed.length}편*`];
-  if (d.savedSilence) L.push(`⚠️ 저장된 메시지 새 글 ${d.savedSilence.days}일째 0 — 저장한 곳 확인`);
-  for (const e of d.absorbed.slice(0, 5)) L.push(`• ${e.oneLiner ?? e.noteName ?? e.url ?? e.id}`);
-  if (d.absorbed.length > 5) L.push(`… 외 ${d.absorbed.length - 5}편`);
-  if (d.goals.length) L.push('', `🔴 엘라누스에 없는 것 ${d.goals.length}건 — 골 후보`);
-  if (d.review?.length) L.push(`${d.goals.length ? '' : '\n'}🟡 사람이 가를 것 ${d.review.length}건 — 노트 🧭 절`);
-  if (opts.vaultRoot && opts.notePath) {
-    const vault = basename(opts.vaultRoot);
-    const file = relative(opts.vaultRoot, opts.notePath).replace(/\.md$/, '');
-    L.push('', `📂 obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(file)}`);
+/** 텔레그램 — 흡수 렌즈가 대조한 항목만 SCQA 짧은 판으로 낸다. */
+export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string } = {}): string {
+  const touching = d.absorbed.filter((e) => e.impact);
+  const L = [`흡수 ${d.absorbed.length} → 우리에게 닿는 것 ${touching.length}`];
+  if (!touching.length) return L[0];
+  for (const e of touching.slice(0, 3)) {
+    L.push('',
+      `S 무엇: ${e.impact!.fact}`,
+      `C 우리에게 왜: ${e.impact!.current}`,
+      `A 그래서 무엇을 하나: ${e.impact!.action}`,
+      `🔗 원문 링크: ${e.url?.trim() || '링크 없음'}`,
+    );
   }
+  if (d.absorbed.length > touching.length) L.push('', `그 밖 ${d.absorbed.length - touching.length}건 · 닿지 않음`);
   return L.join('\n');
 }

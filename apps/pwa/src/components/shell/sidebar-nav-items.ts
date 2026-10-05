@@ -106,6 +106,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'files', href: '/field', label: '현장 올리기', hint: '현장 올리기 · 사진과 메모', icon: Inbox, kind: null },
   { group: 'files', href: '/market', label: '마켓', hint: '플러그인 찾아보기 · 상세 · 설치됨', icon: Store, kind: null },
   { group: 'settings', href: '/settings', label: '설정', hint: '환경 + provider + theme', icon: Settings, kind: 'settings' },
+  { group: 'ops', href: '/ceo', label: '대표 조망판', hint: '판 진행 · 루프 판정 · 결정 대기 · 오늘 병합', icon: LayoutGrid, kind: null },
   { group: 'ops', href: '/loops', label: '루프 현황', hint: '루프·크론 발화 상태 (읽기 전용 · beta)', icon: Activity, kind: null },
   { group: 'ops', href: '/ops/release', label: '릴리스', hint: '판 진행 노드 줄 · 로그 꼬리', icon: GitBranch, kind: null },
   { group: 'ops', href: '/ops/checklist', label: '판별 피처', hint: '확인표 칸 목록 · 상태 · 담당 · 근거', icon: GitPullRequest, kind: null },

@@ -18,6 +18,12 @@ export interface FrontClassifierDecision extends IntakeFrontRouteDecision {
   urlRoute: UrlRouteDecision | null;
 }
 
+/** Only Telegram links explicitly routed to saved/absorbed work enter the event lane. */
+export function telegramAbsorbUrls(input: FrontClassifierInput, decision: FrontClassifierDecision): string[] {
+  if (input.surface !== 'telegram' || decision.track !== 'absorb' || !decision.urlRoute) return [];
+  return decision.urlRoute.urls;
+}
+
 const QUESTION_WORD_RE = new RegExp(
   `(?:${INTAKE_FRONT_QUESTION_WORDS.map((word) => /^[a-z]+$/i.test(word) ? `(?<![\\p{L}\\p{N}_])${word}(?![\\p{L}\\p{N}_])` : word).join('|')})[.!?。？！]*$`,
   'iu',

@@ -4,9 +4,80 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
+import { authorOnPodGoal, dispatchHarnessOnPod, fenceVerbatimSentence, podOrchestrateArgs } from './harness-pod-dispatch.js';
+import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
 
 describe('harness say/ask --substrate pod', () => {
+  test('unspecified document selects lite; implement retains standard and explicit tier wins', () => {
+    const previous = process.env.ELANOUS_POD_MEMORY_TIER;
+    const previousReason = process.env.ELANOUS_POD_MEMORY_REASON;
+    delete process.env.ELANOUS_POD_MEMORY_TIER;
+    delete process.env.ELANOUS_POD_MEMORY_REASON;
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.substrate' && event === 'memory-selected') events.push(data);
+    }) as typeof debug.log);
+    const seen: Array<{ tier: string | undefined; reason: string | undefined; limit: string }> = [];
+    const run = (_cmd: string, _args: readonly string[], env: NodeJS.ProcessEnv) => {
+      const memory = podMemoryLimitFor('Write the guide', env);
+      seen.push({ tier: env.ELANOUS_POD_MEMORY_TIER, reason: env.ELANOUS_POD_MEMORY_REASON,
+        limit: memory.limit });
+      return 0;
+    };
+    try {
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Write the guide', goalType: 'document' }, { run });
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Implement the widget', goalType: 'implement' }, { run });
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Write the guide', goalType: 'document', podMemory: 'high' }, { run });
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: '대상 경로: apps/pwa/page.tsx', goalType: 'implement' }, { run });
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Pod 메모리: standard\nWrite the guide', goalType: 'document' }, { run });
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Write the guide\n- GoalType: document' }, { run });
+      process.env.ELANOUS_POD_MEMORY_TIER = 'high';
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'Write the guide', goalType: 'document' }, { run });
+      expect(seen).toEqual([
+        { tier: 'lite', reason: 'goal-type-default', limit: '2Gi' },
+        { tier: 'standard', reason: 'existing-tier', limit: '16Gi' },
+        { tier: 'high', reason: 'explicit-option', limit: '32Gi' },
+        { tier: 'high', reason: 'existing-tier', limit: '32Gi' },
+        { tier: 'standard', reason: 'existing-tier', limit: '16Gi' },
+        { tier: 'lite', reason: 'goal-type-default', limit: '2Gi' },
+        { tier: 'high', reason: 'existing-tier', limit: '32Gi' },
+      ]);
+      expect(events).toEqual([
+        expect.objectContaining({ goalType: 'document', tier: 'lite', reason: 'goal-type-default', memoryLimit: '2Gi' }),
+        expect.objectContaining({ goalType: 'implement', tier: 'standard', reason: 'existing-tier', memoryLimit: '16Gi' }),
+        expect.objectContaining({ goalType: 'document', tier: 'high', reason: 'explicit-option', memoryLimit: '32Gi' }),
+        expect.objectContaining({ goalType: 'implement', tier: 'high', reason: 'existing-tier', memoryLimit: '32Gi' }),
+        expect.objectContaining({ goalType: 'document', tier: 'standard', reason: 'existing-tier', memoryLimit: '16Gi' }),
+        expect.objectContaining({ goalType: 'document', tier: 'lite', reason: 'goal-type-default', memoryLimit: '2Gi' }),
+        expect.objectContaining({ goalType: 'document', tier: 'high', reason: 'existing-tier', memoryLimit: '32Gi' }),
+      ]);
+    } finally {
+      log.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_POD_MEMORY_TIER;
+      else process.env.ELANOUS_POD_MEMORY_TIER = previous;
+      if (previousReason === undefined) delete process.env.ELANOUS_POD_MEMORY_REASON;
+      else process.env.ELANOUS_POD_MEMORY_REASON = previousReason;
+    }
+  });
+
+  test('a declared document ask without --pod-memory reaches the orchestrator with the lite tier', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-document-ask-'));
+    const goal = join(root, 'goal.md');
+    writeFileSync(goal, 'Write a guide\n- GoalType: document\n');
+    try {
+      let selected: string | undefined;
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, {
+        run: (_command, args, env) => {
+          expect(args[args.indexOf('--goal-file') + 1]).toBe(goal);
+          selected = env.ELANOUS_POD_MEMORY_TIER;
+          expect(env.ELANOUS_POD_MEMORY_REASON).toBe('goal-type-default');
+          return 0;
+        },
+      })).toBe(0);
+      expect(selected).toBe('lite');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('the explicit seat is present in the spawned orchestrator environment', () => {
     let stamped: string | undefined;
     dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', seat: 'TC' }, {
@@ -161,11 +232,57 @@ describe('harness say/ask --substrate pod', () => {
     }
   });
 
+  test('authorOnPod wraps the sentence as a GOAL file and leaves only a receipt', () => {
+    const sentence = 'fix the pod author path';
+    const seen: string[][] = [];
+    const status = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: sentence, authorOnPod: true }, {
+      run: (_c, args) => { seen.push([...args]); return 0; },
+    });
+    expect(status).toBe(0);
+    const goalFile = seen[0]![seen[0]!.indexOf('--goal-file') + 1]!;
+    expect(goalFile).toContain('GOAL-pod-author-');
+    const doc = readFileSync(goalFile, 'utf8');
+    expect(doc).toBe(authorOnPodGoal(sentence));
+    expect(doc).toContain('elanous harness say --substrate local');
+    expect(doc).toContain(sentence);
+    expect(seen[0]).not.toContain(sentence);
+    rmSync(goalFile.slice(0, goalFile.lastIndexOf('/')), { recursive: true, force: true });
+  });
+
+  test('a sentence that contains fences stays inside one fence', () => {
+    const sentence = 'keep ```this``` literal';
+    const { fence } = fenceVerbatimSentence(sentence);
+    const doc = authorOnPodGoal(sentence);
+    expect(fence.length).toBeGreaterThan(3);
+    expect(doc.split(fence)).toHaveLength(3);
+    expect(doc.split(fence)[1]).toBe(`\n${sentence}\n`);
+  });
+
+  test('authorOnPod off keeps the raw sentence file', () => {
+    let body = '';
+    dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'plain sentence' }, {
+      run: (_c, args) => { body = readFileSync(args[args.indexOf('--goal-file') + 1]!, 'utf8'); return 0; },
+    });
+    expect(body).toBe('plain sentence');
+  });
+
   test('the exit status of the pod run is the harness exit status', () => {
     const seen: string[][] = [];
     const status = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix it' }, { run: (_c, a) => { seen.push([...a]); return 3; } });
     expect(status).toBe(3);
     expect(seen[0]).not.toContain('fix it');
     expect(seen[0]).toContain('--goal-file');
+  });
+});
+
+describe('child LLM selection reaches the Pod orchestrator (10-05 PODPROVIDER)', () => {
+  test('named provider, model and effort are carried to self orchestrate', () => {
+    const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x', childLlmProvider: 'grok', childLlmModel: 'grok-4.7', childLlmEffort: 'high' }, 'x');
+    expect(args.slice(args.indexOf('--child-llm-provider'), args.indexOf('--child-llm-provider') + 6))
+      .toEqual(['--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.7', '--child-llm-effort', 'high']);
+  });
+  test('without a named provider the args are unchanged', () => {
+    const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x' }, 'x');
+    expect(args.some((arg) => arg.startsWith('--child-llm'))).toBe(false);
   });
 });

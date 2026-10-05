@@ -45,6 +45,7 @@ export const FEATURE_MATURITY = {
     '/ops/release': { pwa: 'ops' },
     '/ops/seats': { pwa: 'ops' },
     '/ops/checklist': { pwa: 'ops' },
+    '/ceo': { pwa: 'ops' },
     '/dashboard': { pwa: 'ops' },
     '/bots': { pwa: 'ops' },
     '/botlab': { pwa: 'ops' },
@@ -55,7 +56,7 @@ export const FEATURE_MATURITY = {
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
-    pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta',
+    pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', 'agent-env': 'beta',
     where: 'stable', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', live: 'beta',
     research: 'beta', release: 'beta', freeze: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',

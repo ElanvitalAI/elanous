@@ -90,6 +90,23 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test('harness.repo accepts a non-empty repository name, stays optional, and survives config save', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).harness?.repo).toBeUndefined();
+  for (const repo of ['', '   ', null, 42, ['owner/repo'], { name: 'owner/repo' }]) {
+    writeConfig({ harness: { repo } });
+    expect(buildUserConfig(configPath).harness?.repo).toBeUndefined();
+  }
+  writeConfig({ harness: { repo: '  owner/repo  ', defaultRepo: '/local/repository', exposeGate: 'strict' } });
+  const config = buildUserConfig(configPath);
+  expect(config.harness?.repo).toBe('owner/repo');
+  expect(config.harness?.defaultRepo).toBe('/local/repository');
+  expect(config.harness?.exposeGate).toBe('strict');
+  saveUserConfig(config, configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).harness.repo).toBe('owner/repo');
+  expect(buildUserConfig(configPath).harness).toMatchObject({ repo: 'owner/repo', defaultRepo: '/local/repository', exposeGate: 'strict' });
+});
+
 test('harness revert guard depth defaults, validates, and survives config save', () => {
   writeConfig({});
   expect(buildUserConfig(configPath).harness?.revertGuard?.depth).toBe(50);

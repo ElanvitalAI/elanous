@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -21,17 +21,18 @@ function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'webpush-dec-')); dirs.push(dir);
   let now = start;
   let subscribers = 1;
+  let delivered: number | undefined;
   const payloads: PushPayload[] = [];
   const ledger = new DecisionLedger({ stateDir: dir, now: () => now, resolveVersion: () => ({ released: '0.2.8', dev: '0.2.9-dev.0' }) as never });
   const transport = webPushDecisionTransport(ledger, {
     subscriptions: () => Array.from({ length: subscribers }, (_, i) => ({ id: String(i) }) as PushSubscriptionRecord),
     push: async (payload): Promise<SendPushResult> => {
       payloads.push(payload);
-      return { attempted: subscribers, delivered: subscribers, removed: 0, errors: [] };
+      return { attempted: subscribers, delivered: delivered ?? subscribers, removed: 0, errors: [] };
     },
   });
   const service = new DecisionCardService({ transport, ownerIds: [], ledger, now: () => now });
-  return { ledger, transport, service, payloads, setNow: (date: Date) => { now = date; }, setSubscribers: (count: number) => { subscribers = count; } };
+  return { ledger, transport, service, payloads, dir, setNow: (date: Date) => { now = date; }, setSubscribers: (count: number) => { subscribers = count; }, setDelivered: (count: number) => { delivered = count; } };
 }
 
 describe('AN1a web push decision cards', () => {
@@ -48,6 +49,60 @@ describe('AN1a web push decision cards', () => {
     expect(await f.transport.ownerChats()).toEqual(['webpush']);
     expect((await f.service.tick()).sent).toBe(1);
     expect(f.payloads).toHaveLength(1);
+  });
+
+  test('zero subscribers: no push and one no-subscribers observation per card across ticks and service restarts', async () => {
+    const f = fixture();
+    f.setSubscribers(0);
+    const logs: unknown[][] = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+    try {
+      await f.service.tick();
+      f.setNow(new Date(start.getTime() + 1000));
+      const e = f.ledger.raise(input());
+      for (let i = 0; i < 3; i++) expect((await f.service.tick()).sent).toBe(0);
+      const restarted = new DecisionCardService({ transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => new Date(start.getTime() + 2000) });
+      await restarted.tick();
+      expect(f.payloads).toHaveLength(0);
+      expect(logs.filter(args => args[0] === 'decisions.webpush' && args[1] === 'no-subscribers')).toEqual([
+        ['decisions.webpush', 'no-subscribers', { id: e.id }],
+      ]);
+      expect(logs.filter(args => args[0] === 'decisions.telegram' && args[1] === 'card-sent' && (args[2] as { id?: string }).id === e.id)).toEqual([]);
+      f.setSubscribers(1);
+      expect((await restarted.tick()).sent).toBe(1);
+      expect((await f.service.tick()).sent).toBe(0);
+      expect(f.payloads).toHaveLength(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('failed delivery retries only up to the bounded attempt count, then stops across restarts', async () => {
+    const f = fixture();
+    f.setDelivered(0);
+    await f.service.tick();
+    f.setNow(new Date(start.getTime() + 1000));
+    const e = f.ledger.raise(input());
+    for (let i = 0; i < 8; i++) expect((await f.service.tick()).sent).toBe(0);
+    expect(f.payloads).toHaveLength(3);
+    const state = JSON.parse(readFileSync(join(f.dir, 'decisions', 'cards-webpush.json'), 'utf8')) as { cards: Record<string, { attempts: number; refs: unknown[] }> };
+    expect(state.cards[e.id]).toMatchObject({ attempts: 3, refs: [] });
+    f.setDelivered(1);
+    const restarted = new DecisionCardService({ transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => new Date(start.getTime() + 2000) });
+    expect((await restarted.tick()).sent).toBe(0);
+    expect(f.payloads).toHaveLength(3);
+  });
+
+  test('a failed delivery followed by success sends no further duplicate after restart', async () => {
+    const f = fixture();
+    f.setDelivered(0);
+    await f.service.tick();
+    f.setNow(new Date(start.getTime() + 1000));
+    f.ledger.raise(input());
+    await f.service.tick();
+    f.setDelivered(1);
+    expect((await f.service.tick()).sent).toBe(1);
+    const restarted = new DecisionCardService({ transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => new Date(start.getTime() + 2000) });
+    for (let i = 0; i < 4; i++) expect((await restarted.tick()).sent).toBe(0);
+    expect(f.payloads).toHaveLength(2);
   });
 
   test('title is limited to 60 characters; url and tag identify the decision; no option labels, button text or notes escape', async () => {

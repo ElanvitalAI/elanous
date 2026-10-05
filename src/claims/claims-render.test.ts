@@ -60,6 +60,28 @@ test('four claims: public fresh only, stale recheck once per KST day, brand excl
   } finally { spy.mockRestore(); rmSync(stateDir, { recursive: true, force: true }); rmSync(instanceRoot, { recursive: true, force: true }); }
 });
 
+test('missing brand rules leave zero rendered claims and explain the unmeasured markdown on all surfaces', () => {
+  const stateDir = root();
+  const ledger = new ClaimsLedger({ stateDir, now: () => new Date('2026-10-04T00:00:00Z') });
+  try {
+    ledger.add({ id: 'public', claim: 'Measured change.', audience: 'personal', owner: 'MK' });
+    ledger.verify('public', { value: '12건', command: 'measure', measuredAt: '2026-10-04T00:00:00Z', validUntil: '2026-10-07T00:00:00Z', by: 'TC' });
+    ledger.publish('public', 'MK');
+    for (const surface of ['deck', 'site', 'notice'] as const) {
+      const result = renderClaims(ledger, { surface, rulesPath: join(stateDir, 'absent.yaml') });
+      expect(result.included).toEqual([]);
+      expect(result.excluded).toEqual([{ id: 'public', reason: 'rules-missing' }]);
+      expect(result.unmeasured).toBe('규칙 없음 — 측정 불가');
+      expect(result.markdown).toContain('> ⚠ 규칙 없음 — 측정 불가');
+      expect(result.markdown).not.toContain('Measured change.');
+    }
+    const measured = renderClaims(ledger, { surface: 'deck' });
+    expect(measured.included).toEqual(['public']);
+    expect(measured.unmeasured).toBeUndefined();
+    expect(measured.markdown).toContain('Measured change. — 12건');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
 test('multiline claims render one sentence and one representative number; brand excludes the offending line', () => {
   const stateDir = root();
   const now = new Date('2026-10-04T00:00:00Z');

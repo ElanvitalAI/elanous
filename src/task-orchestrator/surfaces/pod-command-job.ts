@@ -7,6 +7,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
@@ -35,6 +36,14 @@ export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
 
 export const POD_LITE_MEMORY_LIMIT = '2Gi';
 
+/** 요청은 한도를 넘을 수 없다(쿠버네티스가 Job 을 거부한다) — lite 2Gi 처럼 한도가 기본 요청보다 작으면 한도로 맞춘다. */
+export function memoryRequestWithin(limit: string | undefined): string {
+  const gi = (value: string | undefined) => { const m = /^(\d+)Gi$/.exec(value ?? ''); return m ? Number(m[1]) : null; };
+  const request = gi(POD_CHILD_REQUESTS.memory);
+  const max = gi(limit);
+  return request !== null && max !== null && request > max ? limit! : POD_CHILD_REQUESTS.memory;
+}
+
 /** POD7 must-fix: the skill list alone can't tell a network-only job from one that needs ffmpeg/browser — so lite is
  *  only ever chosen when the caller says so (`lite`), and then only for network skills without a clone. Anything we
  *  can't judge keeps the full image. A lite request that doesn't fit is refused with the reason, not silently widened. */
@@ -49,6 +58,26 @@ export function podCommandImageFor(skills: readonly string[], clone: boolean, li
 }
 
 const COMMAND_LOG_CHARS = 80;
+
+/** 자식 로그 전문 상한(바이트) — 넘으면 끝부분을 남긴다. config `pod.childLogMaxBytes` 가 양의 정수일 때만 그 값. */
+export const POD_CHILD_LOG_MAX_BYTES_DEFAULT = 1_048_576;
+
+export function podChildLogMaxBytes(read: () => number | undefined = () => getUserConfig().pod?.childLogMaxBytes): number {
+  const configured = read();
+  return typeof configured === 'number' && Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : POD_CHILD_LOG_MAX_BYTES_DEFAULT;
+}
+
+/** 크기 상한을 넘으면 끝부분을 남긴다(잘린 앞은 표시). */
+export function tailBytes(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  const cut = bytes.subarray(bytes.length - maxBytes);
+  let start = 0;
+  while (start < cut.length && (cut[start]! & 0xc0) === 0x80) start += 1;
+  return `…[앞 ${bytes.length - maxBytes}바이트 생략]\n${cut.subarray(start).toString('utf8')}`;
+}
 
 const GATE = `ok=0
 for i in $(seq 1 60); do
@@ -156,7 +185,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
           initContainers: [{ name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] }],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
-            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: '4' } },
+            resources: { requests: { ...POD_CHILD_REQUESTS, memory: memoryRequestWithin(o.memoryLimit) }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: '4' } },
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
@@ -214,12 +243,23 @@ export function podCommandSecretKeys(secret: Record<string, unknown> | null): st
   return Object.keys((secret.stringData as Record<string, string> | undefined) ?? {});
 }
 
+export interface PodArtifactCollection {
+  /** 회수한 산출 파일 수(child.log 제외). 로그 조회 실패면 null. */
+  files: number | null;
+  /** 회수한 산출 파일의 상대 경로. */
+  names: string[];
+  /** 로그 조회 자체가 실패했을 때의 사유. 성공이면 null. */
+  error: string | null;
+}
+
 export interface PodCommandResult {
   exitCode: number;
   artifactsDir: string;
   job: string;
   /** 이 런이 실제로 쓴 이미지(레지스트리 판 태그 또는 로컬 이름). */
   image?: string;
+  /** collectPodArtifacts 가 회수한 파일. 로그 조회 실패면 files=null · error=사유. runPodCommand 는 항상 채운다. */
+  artifacts?: PodArtifactCollection;
 }
 
 export interface RunPodCommandOptions {
@@ -255,12 +295,27 @@ export interface RunPodCommandOptions {
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   env?: NodeJS.ProcessEnv;
   configHostMirror?: () => string | undefined;
+  /** 자식 로그 전문 상한(바이트). 생략 시 config `pod.childLogMaxBytes`, 없으면 1MiB. 넘으면 끝부분 우선. */
+  childLogMaxBytes?: number;
 }
 
 function jobFinished(types: string): 'complete' | 'failed' | null {
   if (/Complete|SuccessCriteriaMet/.test(types)) return 'complete';
   if (/Failed|FailureTarget/.test(types)) return 'failed';
   return null;
+}
+
+function artifactNames(logs: string): string[] {
+  const names = new Set<string>();
+  for (const line of logs.split(/\r?\n/)) {
+    const match = /^ELANOUS_POD_ARTIFACT (\S+) \d+\/\d+ /.exec(line);
+    if (!match) continue;
+    try {
+      const path = Buffer.from(match[1]!, 'base64url').toString('utf8');
+      if (path && !path.split('/').some((part) => part === '' || part === '.' || part === '..')) names.add(path);
+    } catch { /* 회수 쪽(collectPodArtifacts)이 불완전 사유를 남긴다 */ }
+  }
+  return [...names];
 }
 
 function exitCodeFromPod(kubectl: Kubectl, namespace: string, job: string, state: 'complete' | 'failed'): number {
@@ -316,7 +371,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   }
   if (pool) {
     for (;;) {
-      member = pool.tryAcquire();
+      member = await pool.tryAcquire();
       if (member) break;
       await sleep(options.pollMs ?? 15_000);
     }
@@ -387,12 +442,29 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       if (finished) { state = finished; break; }
       await sleep(options.pollMs ?? 15_000);
     }
-    const logs = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']).stdout;
-    collectPodArtifacts(logs, {
-      dir: options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`,
-      job: name,
-      log: (c, e, d) => log(c, e, d),
-    });
+    const logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
+    const logsFailed = logsResult.status !== 0;
+    const logs = logsFailed ? '' : logsResult.stdout;
+    const artifactDir = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
+    let artifacts: PodArtifactCollection;
+    if (logsFailed) {
+      const reason = logsResult.stderr.trim() || `kubectl logs exit ${logsResult.status}`;
+      artifacts = { files: null, names: [], error: reason };
+      log('pod.command', 'artifact-collect-failed', { job: name, reason });
+    } else {
+      collectPodArtifacts(logs, {
+        dir: artifactDir,
+        job: name,
+        log: (c, e, d) => log(c, e, d),
+      });
+      const names = artifactNames(logs);
+      artifacts = { files: names.length, names, error: null };
+    }
+    // 표지가 없어도 알리는 경로는 실제로 존재해야 한다. 자식 로그 전문은 child.log (상한 넘으면 끝부분).
+    mkdirSync(artifactsDir, { recursive: true });
+    const maxBytes = options.childLogMaxBytes ?? podChildLogMaxBytes();
+    const childLog = logsFailed ? `산출 회수 못 함: ${artifacts.error}` : tailBytes(logs, maxBytes);
+    writeFileSync(resolve(artifactsDir, 'child.log'), childLog);
     const exitCode = exitCodeFromPod(kubectl, namespace, name, state);
     cleanupSecret();
     log('pod.command', 'job-finished', {
@@ -401,8 +473,11 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       skills,
       llm: llm ?? null,
       command: command.join(' ').slice(0, COMMAND_LOG_CHARS),
+      artifactsDir,
+      artifacts,
+      ...(logsFailed ? { artifactError: `산출 회수 못 함: ${artifacts.error}` } : {}),
     });
-    return { exitCode, artifactsDir, job: name, image: imageRef ?? image };
+    return { exitCode, artifactsDir, job: name, image: imageRef ?? image, artifacts };
   } catch (err) {
     cleanupSecret();
     throw err;

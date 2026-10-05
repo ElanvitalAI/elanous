@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { listChecklist, devVersion, type Checklist } from '../release-loop/checklist.js';
@@ -22,6 +23,7 @@ export interface ContextNowDeps {
   decisions?: () => DecisionEntry[];
   seatEntries?: (now: Date) => Array<{ entry: SeatEntry; source: string }>;
   events?: (since: string) => CoordEvent[];
+  brandCheck?: typeof checkBrand;
 }
 
 function todaySeatEntries(now: Date): Array<{ entry: SeatEntry; source: string }> {
@@ -101,5 +103,5 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
     .map(event => `📌 ${event.summary} — ${event.source}`);
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };
   debug.log('context.now', 'answer', { topic, facts: answer.facts, events: answer.events });
-  return options.audience === 'public-demo' ? filterPublicDemoContext(answer) : answer;
+  return options.audience === 'public-demo' ? filterPublicDemoContext(answer, deps.brandCheck) : answer;
 }

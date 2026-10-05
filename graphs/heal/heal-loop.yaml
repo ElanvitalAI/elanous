@@ -2,7 +2,7 @@
 #
 # 📄 설계 = 내부 문서 `RFC-the-heal-loop-is-a-graph-that-raises-its-own-resolution-2026-09-26` §3.1 · §3.4 · §7
 # 🧩 노드 recipe 는 전부 카탈로그 역할이다 — graphs/catalog/catalog.yaml (test/graph-heal-standard.test.ts 가 확인)
-# ⚠️ 이 판은 «선언»이다 — ③ runner 가 역할 recipe 를 실행하는 것은 다음 단계(H1 · 카탈로그 역할 실행). 지금은 파싱·카탈로그·결과 간선·도달성을 시험이 확인한다.
+# 힐 받은편지함의 신규 기록은 heal-intake.ts 가 이 그래프를 시작한다. 접힌 기록은 시작하지 않는다.
 #
 # ⭐⭐ 관측 · 인지 · 힐링 3구조 ⊕ 루프 엔지니어링(대표 2026-09-26 · 제1원칙)
 #   관측  = kind observe  — collect(L0 실패 서명) · observe-deeper(L1 면밀 관측) · ground-external(L2 외부 그라운딩)

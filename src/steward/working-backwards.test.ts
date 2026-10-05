@@ -1,7 +1,8 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { authorIntakeGoals } from '../intake-plane/author-goals.js';
 import { runIntakeCheck } from '../intake-plane/check.js';
@@ -83,6 +84,43 @@ test('new-capability drafts precede launch, quote the card signal in the goal; i
       expect(decisionSection).toContain(`출처: 카드 linear:ELA-501 / ${promise.key}`);
     } finally { store.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an already-launched card without drafts is skipped while a new wish still gets both drafts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-launched-before-draft-'));
+  const store = new CardStore(root);
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const issues: TriageIssue[] = [
+    { identifier: 'ELA-28', ref: 'old', title: 'already launched', body: 'old wish' },
+    { identifier: 'ELA-506', ref: 'new', title: 'new capability', body: 'new wish' },
+    { identifier: 'ELA-507', ref: 'done', title: 'already drafted', body: 'drafted wish' },
+  ];
+  const decisions = issues.map((issue, priority) => ({
+    issue: issue.identifier, rung: 4 as const, why: 'new', capability: 'new-capability' as const,
+    dependsOn: [], priority, disposition: 'now' as const,
+  }));
+  let drafts = 0;
+  try {
+    const launched = store.createCard({ goalId: 'linear:ELA-28', title: issues[0]!.title });
+    store.appendSection(launched.id, { key: 'launch:old', owner: 'steward', content: 'previous launch' });
+    const complete = store.createCard({ goalId: 'linear:ELA-507', title: issues[2]!.title });
+    store.appendSection(complete.id, { key: 'prfaq:old', owner: 'steward', content: prfaq });
+    store.appendSection(complete.id, { key: 'manual:old', owner: 'steward', content: manual });
+    store.appendSection(complete.id, { key: 'launch:done', owner: 'steward', content: 'previous launch' });
+
+    await recordWorkingBackwardsOnCards(decisions, issues, store, async () => {
+      drafts++;
+      return { prfaq, manual, signals: [signal] };
+    });
+
+    expect(drafts).toBe(1);
+    const cards = new Map(store.listCards().map(card => [card.goalId, card]));
+    expect(cards.get('linear:ELA-28')!.sections.map(section => section.key)).toEqual(['launch:old']);
+    expect(cards.get('linear:ELA-506')!.sections.map(section => section.key.split(':')[0])).toEqual(['prfaq', 'manual']);
+    expect(cards.get('linear:ELA-507')!.sections.map(section => section.key)).toEqual(['prfaq:old', 'manual:old', 'launch:done']);
+    expect(log.mock.calls.filter(([category, event]) => category === 'steward.working-backwards' && event === 'skipped-launched-before-draft'))
+      .toEqual([['steward.working-backwards', 'skipped-launched-before-draft', { issueId: 'ELA-28' }]]);
+  } finally { log.mockRestore(); store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('missing capability verdict proceeds without a draft (triage is not blocked)', async () => {

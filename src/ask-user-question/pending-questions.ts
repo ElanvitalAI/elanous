@@ -9,6 +9,8 @@ export interface PendingQuestion {
   id: string;
   sessionId?: string;
   runId?: string;
+  /** Explicit provenance for isolated test questions; a temporary goal path alone is not proof. */
+  testOrigin?: true;
   questions: Array<Pick<Question, 'id' | 'question' | 'options' | 'impact' | 'recommendedIndex'>>;
   startedAt: string;
   expiresAt?: string;
@@ -84,6 +86,7 @@ function isPendingQuestion(value: unknown): value is PendingQuestion {
   return typeof pending.id === 'string'
     && (pending.sessionId === undefined || typeof pending.sessionId === 'string')
     && (pending.runId === undefined || typeof pending.runId === 'string')
+    && (pending.testOrigin === undefined || pending.testOrigin === true)
     && Array.isArray(pending.questions)
     && pending.questions.every((question) => {
       if (question === null || typeof question !== 'object' || Array.isArray(question)) return false;
@@ -175,6 +178,7 @@ export function createPendingQuestion(
   sessionId?: string,
   deps: Pick<PendingQuestionStoreDeps, 'now'> = {},
   presentation: PendingQuestionPresentation = { surface: 'tui', delivery: request.delivery ?? 'modal' },
+  provenance: { testOrigin?: true } = {},
 ): PendingQuestion {
   // File-surface waits must carry a concrete deadline so the CLI answer path can
   // reject an expired record (see isPendingQuestion). Fail loudly at creation
@@ -186,6 +190,7 @@ export function createPendingQuestion(
     id,
     ...(sessionId === undefined ? {} : { sessionId }),
     ...(request.runId === undefined ? {} : { runId: request.runId }),
+    ...(provenance.testOrigin ? { testOrigin: true as const } : {}),
     questions: request.questions.map(({ id, question, options, impact, recommendedIndex }) => ({
       id, question, options,
       ...(impact === undefined ? {} : { impact }),

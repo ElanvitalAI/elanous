@@ -21,6 +21,13 @@ export interface IntakeToTasksCliDeps {
   llm?: (input: IntakeTaskInput) => Promise<string>;
 }
 
+export interface IntakeDigestCliDeps {
+  root?: string;
+  annotateLens?: (root: string, day: string) => Promise<unknown>;
+  buildDigest?: typeof import('../intake-plane/digest.js').buildIntakeDigest;
+  sendTelegram?: (text: string) => Promise<boolean>;
+}
+
 export function intakeToTasksMessages(content: string) {
   return [
     { role: 'system' as const, content: 'Interpret the supplied goal line or idea note into up to three actionable tasks. Respond only with JSON: {"tasks":[{"type":"implement|research|document|operate","title":"...","description":"...","priority":"low|medium|high","acceptanceCriteria":["..."]}],"questions":["..."]}. Each task needs a verifiable acceptance criterion; put unresolved requests in questions instead. Do not invent facts. Limit each title to 80 characters and description to 4000 characters.' },
@@ -74,6 +81,44 @@ export async function runIntakeToTasksCli(
     return { taskId: result.taskId, deduplicated: result.deduplicated === true };
   };
   return runIntakeToTasks(deps.root, opts, { llm, post });
+}
+
+/** `--telegram` 다이제스트. 렌즈는 digest 를 만들기 전에 돈다. 렌즈 실패는 보고를 막지 않는다. */
+export async function runIntakeDigestCli(
+  opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string },
+  deps: IntakeDigestCliDeps = {},
+): Promise<{ sent?: boolean; empty?: boolean }> {
+  const { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
+  const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+  const root = deps.root ?? effectiveInstanceRoot();
+  const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
+  if (opts.telegram) {
+    const annotate = deps.annotateLens ?? (async (lensRoot, lensDay) => {
+      const { annotateIntakeLens } = await import('../intake-plane/lens.js');
+      return annotateIntakeLens(lensRoot, lensDay);
+    });
+    try { await annotate(root, day); }
+    catch (error) { debug.log('intake.lens', 'annotate-failed', { day, reason: error instanceof Error ? error.message : String(error) }); }
+  }
+  const d = (deps.buildDigest ?? buildIntakeDigest)(root, day);
+  if (opts.telegram) {
+    if (!d.absorbed.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
+    const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
+    const sent = deps.sendTelegram
+      ? await deps.sendTelegram(text)
+      : await (async () => {
+        const { sendTelegramReport } = await import('../telegram-report.js');
+        const { getUserConfig } = await import('../user-config.js');
+        return sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
+      })();
+    debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
+    console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
+    if (!sent) process.exitCode = 3;
+    return { sent };
+  }
+  if (opts.json) { await writeStdoutFully(JSON.stringify(d, null, 2)); return {}; }
+  await writeStdoutFully(renderDigestMarkdown(d));
+  return {};
 }
 
 export function resolveIntakeCheckRoot(
@@ -283,23 +328,7 @@ export function registerIntakeCommands(program: Command): void {
     .option('--vault <root>', '옵시디언 볼트 뿌리 — 텔레그램 판에 노트 열기 주소를 싣는다')
     .option('--note <path>', '열기 주소가 가리킬 노트(그날 트렌드 노트)')
     .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string }) => {
-      const { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
-      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
-      const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
-      const d = buildIntakeDigest(effectiveInstanceRoot(), day);
-      if (opts.telegram) {
-        if (!d.absorbed.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return; }
-        const { sendTelegramReport } = await import('../telegram-report.js');
-        const { getUserConfig } = await import('../user-config.js');
-        const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
-        const sent = await sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
-        debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
-        console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
-        if (!sent) process.exitCode = 3;
-        return;
-      }
-      if (opts.json) { await writeStdoutFully(JSON.stringify(d, null, 2)); return; }
-      await writeStdoutFully(renderDigestMarkdown(d));
+      await runIntakeDigestCli(opts);
     });
 
   intakeCmd

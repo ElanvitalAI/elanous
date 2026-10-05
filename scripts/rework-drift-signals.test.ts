@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { refuseProductionLedgerWriteInTest } from '../src/harness/ledger-write-guard.js';
 import { analyzeRunDriftSignals, renderReworkDriftSignals, runReworkDriftSignals, scanReworkDriftSignals } from './rework-drift-signals.js';
 import type { RunLedgerEntry } from '../src/self-implement/run-ledger.js';
 
@@ -30,6 +31,13 @@ function writeLedger(dir: string, runId: string, entries: readonly RunLedgerEntr
   writeFileSync(path, `${entries.map((value) => JSON.stringify(value)).join('\n')}\n`);
   return path;
 }
+
+test('drift reader remains read-only while the shared writer guard rejects a nested production ledger', () => {
+  const production = root();
+  const dir = join(production, 'nested', 'run-ledger');
+  expect(refuseProductionLedgerWriteInTest(dir, 'run-ledger', { NODE_ENV: 'test' }, production, production)).toBe(true);
+  expect(runReworkDriftSignals(['--dir', dir]).scan).toMatchObject({ readableRunCount: 0, unreadableRunCount: 0 });
+});
 
 describe('rework drift signals', () => {
   test('emits distinct independent last-round signals for divergent and convergent histories', () => {

@@ -120,9 +120,11 @@ export class AuthorLedger {
   }
 
   request(input: AuthorRequest): AuthorRow & { duplicate: boolean } {
-    for (const key of ['seat', 'cellId', 'version', 'title', 'text'] as const) {
+    for (const key of ['seat', 'cellId', 'version', 'title'] as const) {
       if (typeof input[key] !== 'string' || !input[key].trim()) throw new Error(`${key} is required`);
     }
+    if (typeof input.text !== 'string' || (!input.text.trim() && input.check?.verdict !== 'uncheckable'))
+      throw new Error('text is required unless uncheckable');
     if (!['approved', 'resubmit', 'confirm', 'uncheckable'].includes(input.check?.verdict)
       || !Array.isArray(input.check.signals)
       || (input.check.ratio !== null && (typeof input.check.ratio !== 'number' || !Number.isFinite(input.check.ratio))))
