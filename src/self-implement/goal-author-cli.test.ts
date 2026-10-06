@@ -7,6 +7,74 @@ import { formatGoalAuthorSelfInspection, formatGoalInterviewRound, inspectDecisi
 import { writeAuthoredGoal, type GoalAuthorDeps, type GoalFileLintFinding } from './goal-author.js';
 import type { LaunchPreflightResult } from '../self-dev/launch-preflight.js';
 
+test('say-first records the shared self-answer observation without a second resolver call', async () => {
+  const observed = spyOn(debug, 'log').mockImplementation(() => undefined);
+  let resolverCalls = 0;
+  try {
+    const document = [
+      '- Clarification:', '  - id: q', '  - header: Clarification', '  - question: Which contract?',
+      '  - options:', '    - label: Keep API', '      description: Verified.', '  - includeOther: true',
+      '  - answer: Keep API', '  - provenance.source: self-authored', '  - evidence: src/api.ts:12', '',
+    ].join('\n');
+    await runGoalAuthorCli(['new goal'], { cwd: '/tmp', selfResolveClarifications: true }, {
+      write: async () => ({ path: '/tmp/GOAL.txt', authored: { document, authorRunId: 'author-first', grounded: false, facts: null } }),
+      selfResolveClarification: async () => { resolverCalls++; return {}; },
+      recordAsk: () => true,
+    });
+    expect(resolverCalls).toBe(0);
+    expect(observed).toHaveBeenCalledWith('self-implement.clarification-escalation', 'self-answer', {
+      path: 'say-first', asked: 1, answered: 1, unanswered: 0, reason: 'answered',
+    });
+  } finally { observed.mockRestore(); }
+});
+
+test('say-first self-answers a question the authoring pass left unanswered and writes the goal file', async () => {
+  const observed = spyOn(debug, 'log').mockImplementation(() => undefined);
+  const written: Array<{ path: string; document: string }> = [];
+  try {
+    const document = [
+      '- evidence: src/api.ts:12: contract',
+      '- Clarification:', '  - id: preservation_contract', '  - header: Clarification', '  - question: Which behavior must stay?',
+      '  - options:', '    - label: Keep API', '      description: Verified.', '  - includeOther: true',
+      '  - answer: DEFERRED-UNTIL: Which behavior must stay?', '',
+    ].join('\n');
+    await runGoalAuthorCli(['new goal'], { cwd: '/tmp', selfResolveClarifications: true }, {
+      write: async () => ({ path: '/tmp/GOAL.txt', authored: { document, authorRunId: 'author-first', grounded: false, facts: null } }),
+      selfResolveClarification: async ({ evidence }) => ({ answer: 'Keep API', evidence }),
+      writeFile: (path, next) => { written.push({ path, document: next }); },
+      recordAsk: () => true,
+    });
+    expect(written).toHaveLength(1);
+    expect(written[0]!.path).toBe('/tmp/GOAL.txt');
+    expect(written[0]!.document).toContain('  - answer: Keep API');
+    expect(observed).toHaveBeenCalledWith('self-implement.clarification-escalation', 'self-answer', {
+      path: 'say-first', asked: 1, answered: 1, unanswered: 0, reason: 'answered',
+    });
+  } finally { observed.mockRestore(); }
+});
+
+test('supersedes reauthor invokes the shared self-answer after writing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'goal-author-rework-'));
+  const source = join(root, 'GOAL-parent.md');
+  const ask = '대상 경로: src/example.ts\nPreserve the contract.';
+  const question = '- Clarification:\n  - id: contract\n  - header: Clarification\n  - question: What is the contract?\n  - options:\n    - label: Focused test\n      description: Test file.\n  - includeOther: true\n  - answer: DEFERRED-UNTIL: What is the contract?\n';
+  const document = `- GoalId: 0123456789abcdef\nOriginal ask (verbatim, unmodified):\n\`\`\`\n${ask}\n\`\`\`\n\n- evidence: src/example.ts: contract\n${question}`;
+  const calls: string[] = [];
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(source, document);
+  try {
+    await runGoalAuthorCli([], { cwd: root, supersedes: 'GOAL-parent.md', selfResolveClarifications: true }, {
+      write: async () => ({ path: join(root, 'GOAL-child.md'), authored: { document, authorRunId: 'author-rework', grounded: false, facts: null } }),
+      readFile: (() => document) as unknown as NonNullable<GoalAuthorCliDeps['readFile']>,
+      writeFile: (_path, value) => { calls.push(value); },
+      selfResolveClarification: async ({ evidence }) => { calls.push('resolver'); return { answer: 'Focused test', evidence }; },
+      recordAsk: () => true,
+    });
+    expect(calls[0]).toBe('resolver');
+    expect(calls[1]).toContain('  - answer: Focused test');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 describe('runGoalAuthorCli clarification self-resolution selection', () => {
   const document = '- GoalId: 0123456789abcdef\n';
   const write: NonNullable<GoalAuthorCliDeps['write']> = async (_ask, _cwd, deps = {}) => {
@@ -29,6 +97,18 @@ describe('runGoalAuthorCli clarification self-resolution selection', () => {
     expect(resolver).toHaveBeenCalledTimes(1);
     expect(defaultResult.authored.document).toContain('DEFERRED-UNTIL');
     expect(optedInResult.authored.document).toContain('resolved evidence');
+  });
+});
+
+describe('runGoalAuthorCli author grade forwarding', () => {
+  test('passes flag grade to the existing writeAuthoredGoal call without creating decomposition', async () => {
+    const write = spyOn({ call: async (_ask: string, _cwd: string, authorDeps?: Partial<GoalAuthorDeps>) => {
+      expect(authorDeps?.authorGrade).toEqual({ grade: 'lite', source: 'flag' });
+      expect(authorDeps?.decomposeSteps).toBeUndefined();
+      return { path: 'docs/goals/GOAL-test.md', authored: { document: '- GoalId: 0123456789abcdef\n', authorRunId: 'author-test', facts: null, grounded: false } };
+    } }, 'call');
+    await runGoalAuthorCli(['대상 경로: src/example.ts'], { cwd: process.cwd(), authorGrade: { grade: 'lite', source: 'flag' } }, { write, recordAsk: () => true });
+    expect(write).toHaveBeenCalledTimes(1);
   });
 });
 

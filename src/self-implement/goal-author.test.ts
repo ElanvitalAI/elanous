@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { setMissionSlugStreamForTest } from '../autopilot/mission-registry.js';
@@ -97,6 +97,65 @@ function existingGoalDocumentsRoot(prefix: string): string {
 afterEach(() => {
   _setGoalAuthorPersistentGroundingDepsForTesting();
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+describe('goal author grade', () => {
+  test('flag overrides config; absent and malformed configuration preserve full', () => {
+    expect(resolveGoalAuthorGrade('lite', 'full')).toEqual({ grade: 'lite', source: 'flag' });
+    expect(resolveGoalAuthorGrade(undefined, 'lite')).toEqual({ grade: 'lite', source: 'config' });
+    expect(resolveGoalAuthorGrade(undefined, 'unknown')).toEqual({ grade: 'full', source: 'default' });
+    expect(resolveGoalAuthorGrade()).toEqual({ grade: 'full', source: 'default' });
+  });
+
+  test('same ask: lite omits three phases and retains falsifiable signal and pointers; default full runs them', async () => {
+    const sentence = '대상 경로: src/example.ts · 체크리스트 칸 AUTHOR-LITE2. 판정선(반증): output contains signal.';
+    const run = async (grade?: 'lite' | 'full') => {
+      const progress: Array<{ phase: string; event: string }> = [];
+      const ground = mock(async () => facts);
+      const decomposeSteps = mock(async () => ['Investigate and implement the requested change.']);
+      const authored = await authorGoal(sentence, {
+        ...deps,
+        ground,
+        decomposeSteps,
+        ...(grade ? { authorGrade: { grade, source: 'flag' } as const } : {}),
+        onProgress: (phase, event) => progress.push({ phase, event }),
+      });
+      return { authored, progress, ground, decomposeSteps };
+    };
+    const gradeEvents: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      if (event === 'author-grade' && category === 'harness.author') gradeEvents.push({ category, event, data });
+    }) as typeof debug.log;
+    let lite: Awaited<ReturnType<typeof run>>;
+    let full: Awaited<ReturnType<typeof run>>;
+    try {
+      lite = await run('lite');
+      full = await run();
+    } finally {
+      debug.log = originalLog;
+    }
+    expect(gradeEvents).toEqual([
+      { category: 'harness.author', event: 'author-grade', data: { authorRunId: lite.authored.authorRunId, grade: 'lite', source: 'flag', skippedPhases: ['adversarial-review', 'goal-steps-decomposed', 'persistent-grounding'] } },
+      { category: 'harness.author', event: 'author-grade', data: { authorRunId: full.authored.authorRunId, grade: 'full', source: 'default', skippedPhases: [] } },
+    ]);
+    expect(lite.progress.filter((event) => event.event === 'end').length).toBeLessThan(full.progress.filter((event) => event.event === 'end').length);
+    for (const phase of ['adversarial-review', 'goal-steps-decomposed', 'persistent-grounding']) {
+      expect(lite.progress.filter((event) => event.phase === phase)).toHaveLength(0);
+    }
+    expect(lite.ground).not.toHaveBeenCalled();
+    expect(lite.decomposeSteps).not.toHaveBeenCalled();
+    expect(full.ground).toHaveBeenCalled();
+    expect(full.decomposeSteps).toHaveBeenCalled();
+    expect(lite.authored.document).toContain('## 판정 신호');
+    expect(lite.authored.document).not.toContain('## 검증 시나리오');
+    expect(lintGoalFile(lite.authored.document, 'main').filter((finding) => finding.level === 'ERROR')).toEqual([]);
+    expect(lite.authored.document).toContain('output contains signal');
+    expect(lite.authored.document).toContain('src/example.ts');
+    expect(lite.authored.document).toContain('AUTHOR-LITE2');
+    expect(lite.authored.document).toContain(`\`\`\`\n${sentence}\n\`\`\``);
+    expect(full.authored.document).toContain('## PROBLEM');
+  });
 });
 
 describe('goal author grounding failure classifier', () => {
@@ -10314,4 +10373,8 @@ describe('default-invocation-observation lint', () => {
   });
 
   // ⭐ 2026-09-25 — 실물 docs/goals 골 문서를 읽는 시험은 goal-author-real-goal-docs.test.ts 로 옮겼다(원본 전용 · 공개본 exclude).
+
+  test('lite refuses an ask without any falsifiable signal line instead of emitting a goal without one', async () => {
+    await expect(authorGoal('대상 경로: src/a.ts\n그냥 고쳐 주세요', { authorGrade: { grade: 'lite', source: 'flag' } } as never)).rejects.toThrow('falsifiable signal');
+  });
 });

@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
+import { buildGridData, type GridDeps } from './grid.js';
 import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
 import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
 import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
@@ -341,7 +342,7 @@ import {
   handleTasksList,
   handleTaskDetail,
 } from './tasks-scheduler.js';
-import { handleTaskCardsGet, handleTaskCardsWishPost } from './task-cards-api.js';
+import { handleTaskCardsGet, handleTaskCardsWishPost, handleTaskCardsClosePost } from './task-cards-api.js';
 import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
 import { matchIngestAuthorization } from './ingest-token.js';
 import {
@@ -478,6 +479,8 @@ export interface NexusHttpServerOpts {
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
   outputs?: OutputsDeps;
+  /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
+  grid?: GridDeps;
   decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
   cardFollowup?: CardFollowupJobs;
   skillExec?: SkillExecJobs;
@@ -1385,6 +1388,12 @@ export async function routeRequest(
     });
   }
 
+  // routeRequest is the live GET-only caller of buildGridData; keep it behind the owner auth gate.
+  if (pathname === '/v1/grid') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
+    return jsonResponse(buildGridData(opts.grid));
+  }
   if (method === 'GET' && pathname === '/v1/outputs') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleOutputsGet(req, opts.outputs);
@@ -1456,6 +1465,15 @@ export async function routeRequest(
       if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const mutated = await handleGraphsMutation(pathname, req);
       if (mutated) return mutated;
+    }
+    const cardClose = /^\/v1\/task-cards\/([^/]+)\/close$/.exec(pathname);
+    if (method === 'POST' && cardClose) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      if (bearerCredential(req, opts.metaApi) !== 'bearer-match') return jsonResponse({ error: 'forbidden' }, 403);
+      let id: string;
+      try { id = decodeURIComponent(cardClose[1]!); }
+      catch { return jsonResponse({ error: 'not_found' }, 404); }
+      return handleTaskCardsClosePost(req, id);
     }
     if (method === 'POST' && pathname === '/v1/task-cards/wish') {
       if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);

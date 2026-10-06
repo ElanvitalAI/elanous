@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as yaml } from 'yaml';
 import { decideGraphApproval, runGraph } from '../../src/graph-runner/runner.js';
-import { runPrLand } from '../../src/cli/pr-cli.js';
+import { runPrLand as realRunPrLand } from '../../src/cli/pr-cli.js';
+import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
+import { addItem, setItem } from '../../src/release-loop/checklist.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { makePrManager, type CmdRunner } from '../../src/autopilot/pr-manager.js';
 import { publicNotes, runPublish } from './publish-node.js';
 import { runPrepare } from './prepare-node.js';
@@ -15,6 +18,29 @@ import { runVerify } from './verify-node.js';
 import { runAutoApprove } from './auto-approve-node.js';
 import { runVaultNote } from './vault-note-node.js';
 import type { GraphContext } from './node-verdict.js';
+import { afterEach as freezeIsolationAfterEach, beforeEach as freezeIsolationBeforeEach } from 'bun:test';
+import { rmSync as freezeIsolationRm } from 'node:fs';
+import { resetEffectiveInstanceRoot as freezeIsolationReset } from '../../src/instance/resolve.js';
+
+// Both freeze authorities are isolated for every runPrLand here: the operational root (injected) and the
+// local universe (ELANOUS_STATE_DIR) — these tests must never read or write the real ~/.elanous (FREEZE-HOSTMERGE).
+let isolatedFreezeRoot = '';
+let isolatedStateDirForFreeze = '';
+let savedStateDirForFreeze: string | undefined;
+freezeIsolationBeforeEach(() => {
+  isolatedFreezeRoot = mkdtempSync(join(tmpdir(), 'pr-land-freeze-'));
+  isolatedStateDirForFreeze = mkdtempSync(join(tmpdir(), 'pr-land-state-'));
+  savedStateDirForFreeze = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = isolatedStateDirForFreeze;
+  freezeIsolationReset();
+});
+freezeIsolationAfterEach(() => {
+  if (savedStateDirForFreeze === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDirForFreeze;
+  freezeIsolationReset();
+  freezeIsolationRm(isolatedFreezeRoot, { recursive: true, force: true });
+  freezeIsolationRm(isolatedStateDirForFreeze, { recursive: true, force: true });
+});
+const runPrLand: typeof realRunPrLand = (opts = {}, deps = {}) => realRunPrLand(opts, { prodFreezeRoot: isolatedFreezeRoot, ...deps });
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -219,36 +245,57 @@ test('release story follows vault note and every outcome continues to ops upgrad
   }
 });
 
-test('published graph executes the real story recipe into the isolated release directory and MK inbox once', async () => {
+test('0.2.14 published graph executes the real story recipe into the isolated release directory and MK inbox once', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-story-published-'));
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const version = '9.9.9';
+  const version = '0.2.14';
   const story = join(root, 'release', version, 'story');
   const requests = join(root, 'seat-requests', 'requests.jsonl');
   try {
+    const checklistDir = join(root, 'release', version);
+    mkdirSync(checklistDir, { recursive: true });
+    setElanousConfigDir(root);
+    addItem(version, { id: 'STORY_214', title: 'New reading mode — details' });
+    setItem(version, 'STORY_214', { status: 'green' }, 'MK');
+    const ledger = new ClaimsLedger({ stateDir: root });
+    ledger.add({ id: 'EXPORT_214', claim: 'New export mode is available.', audience: 'personal', owner: 'MK' });
+    ledger.verify('EXPORT_214', { value: 'yes', command: 'bun measure-export.ts', measuredAt: new Date().toISOString(),
+      validUntil: new Date(Date.now() + 86400000).toISOString(), by: 'MK' });
+    ledger.link('EXPORT_214', { cell: 'STORY_214', version });
+    // 실제 release/next.md 는 판 올림마다 비워진다 — 시험은 자기 판 노트 픽스처를 쓴다.
+    const nextFixture = join(root, 'next.md');
+    writeFileSync(nextFixture, '# next\n\n## User\n\n- A new public guide shows how to attach a coding session to an elanous seat.\n');
     const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
       if (body.includes('release-story/draft.ts')) {
         const child = spawnSync(process.execPath, [join(import.meta.dir, '../release-story/draft.ts'), '--graph'], {
-          cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, ELANOUS_STATE_DIR: root },
+          cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, ELANOUS_STATE_DIR: root, ELANOUS_RELEASE_NEXT_PATH: nextFixture },
         });
         return { exitCode: child.status ?? 2, stdout: child.stdout, stderr: child.stderr };
       }
       return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
     };
     for (let i = 0; i < 2; i++) {
-      const state = await runGraph(graphPath, { input: { version, previousVersion: '9.9.8' }, deps: { root, runBash } });
+      const state = await runGraph(graphPath, { input: { version, previousVersion: '0.2.13' }, deps: { root, runBash } });
       expect(state.status).toBe('done');
       expect(state.path.slice(-5)).toEqual(['vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
       expect(JSON.parse(String(state.nodes.find((node) => node.nodeId === 'release-story')?.output))).toMatchObject({ outcome: 'ok', status: 'drafted' });
     }
-    expect(readFileSync(join(story, 'announcement.md'), 'utf8')).toContain(version);
+    const announcement = readFileSync(join(story, 'announcement.md'), 'utf8');
+    expect(announcement).toContain(version);
+    const next = readFileSync(nextFixture, 'utf8');
+    const selected = next.split(/\r?\n/).find((line) => /^- (?:feat — )?A new public guide/.test(line))?.replace(/^- (?:feat — )?/, '');
+    expect(selected).toBeDefined();
+    expect(announcement).toContain(`새 종류 후보: ${selected}\n- 출처: release/next.md\n- 재측정: 확인 명령 없음 — 게시 전 확인`);
+    expect(announcement).not.toContain('재측정: bun measure-export.ts');
+    expect(announcement).toContain('New export mode is available.');
+    expect(announcement).toContain('CMO 게시 판단');
     expect(readFileSync(join(story, 'site-news.md'), 'utf8')).toContain(version);
-    expect(readFileSync(join(story, 'manual-candidates.md'), 'utf8')).toContain(version);
+    expect(readFileSync(join(story, 'manual-candidates.md'), 'utf8')).toContain('STORY_214 · New reading mode · 매뉴얼 언급 없음');
     const rows = readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, string>);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ key: `release-story:${version}`, seat: 'MK', source: 'release-story', version,
       status: 'pending', text: `${version} 공지 초안 준비됨: ${story}` });
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('graph recipes carry start notices and measured long-node timeouts', () => {

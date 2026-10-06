@@ -36,7 +36,7 @@ export function waitForAssets(run: CommandRunner, repo: string, tag: string, nam
   }
 }
 
-export function runPublish(run: CommandRunner = runCommand) {
+export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string) {
   const context = readGraphContext();
   const version = context.input.version;
   // A measured automatic decision or the existing human approval must authorize publication.
@@ -68,7 +68,7 @@ export function runPublish(run: CommandRunner = runCommand) {
     writeFileSync(file, body);
     // Same in-flight marker as merges: `freeze on` waits for a publication that already passed this check.
     // Unlike a merge, a frozen publication is not queued: it fails, and the release run is run again after `freeze off`.
-    const landing = beginLandingMerge();
+    const landing = beginLandingMerge(undefined, undefined, prodFreezeRoot);
     const frozen = landing.frozen;
     if (frozen) {
       landing.end(); // already released by beginLandingMerge when frozen; kept explicit so no path leaves a marker

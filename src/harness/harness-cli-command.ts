@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { constants as osConstants, hostname } from 'node:os';
-import { basename, dirname, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
@@ -14,7 +14,7 @@ import { archiveGoals, type GoalArchiveOptions } from '../self-implement/goal-ar
 import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
 import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
-import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, type GoalType } from '../self-implement/goal-author.js';
+import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, runLedgerDir, type RunLedgerMatch } from '../self-implement/run-ledger.js';
 import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
@@ -33,7 +33,8 @@ import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDep
 import { getUserConfig } from '../user-config.js';
 import { resolveRepositoryName } from './repository-name.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
-import { addHarnessQueue, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps, type QueueSeat } from './harness-queue.js';
+import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps, type QueueItem, type QueueSeat } from './harness-queue.js';
+import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
@@ -110,9 +111,12 @@ export interface HarnessAskSayOptions {
   supervise?: boolean;
   supervisorSource?: HarnessSupervisorSource;
   goalType?: GoalType;
+  authorGrade?: GoalAuthorGrade;
+  authorGradeSource?: GoalAuthorGradeSelection['source'];
   correlation?: string;
   /** Depth 0 only. At depth >= 1 this flag is ignored and the launch stays refused. */
   nestedElanous?: 'allow';
+  queue?: boolean;
 }
 
 export interface ResolvedHarnessSupervisor {
@@ -263,6 +267,7 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--yes', 'git 아닌 프로젝트에 git init 및 첫 커밋을 만들도록 동의')
     .option('--correlation <id>', '요청과 런을 잇는 불투명 correlation 값')
     .addOption(new Option('--seat <seat>', '런 귀속 자리 (OP|TC|MK|UX)').choices(['OP', 'TC', 'MK', 'UX']))
+    .option('--no-queue', '비상시 자리별 대기열을 건너뛰고 직접 발사')
     .addOption(new Option('--goal-type <type>', `골 종류 (${GOAL_TYPES.join('|')})`).choices([...GOAL_TYPES]))
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
     .option('--force-gate', '같은 골 실행 중 막힘을 명시 요청으로 우회(관측에 남음; 예산 막힘은 우회 불가)')
@@ -302,6 +307,8 @@ function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSa
     ...(opts.mergeByHost === true ? { mergeByHost: true } : {}),
     ...(opts.observeOnly ? { observeOnly: true } : {}),
     ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
+    ...(opts.authorGrade !== undefined ? { authorGrade: opts.authorGrade } : {}),
+    ...(opts.authorGradeSource !== undefined ? { authorGradeSource: opts.authorGradeSource } : {}),
     ...resolveHarnessSupervisor(opts),
     ...resolveNestedElanousOption(opts),
   };
@@ -589,6 +596,16 @@ function announceLocalChildProvider(opts: unknown): void {
   console.error(`child provider 요청 = ${child.childLlmProvider.trim()}${child.childLlmModel?.trim() ? `/${child.childLlmModel.trim()}` : ''} (local)`);
 }
 
+/** `harness.queue.directSay` (ONEDOOR-2 · OP 10-06 기본 끔): config > env ELANOUS_HARNESS_QUEUE_DIRECT_SAY > false. */
+export function harnessQueueDirectSay(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    const configured = getUserConfig().harness?.queue?.directSay;
+    if (typeof configured === 'boolean') return configured;
+  } catch { /* An unreadable config keeps the old direct path. */ }
+  const raw = env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY?.trim().toLowerCase();
+  return raw === '1' || raw === 'true';
+}
+
 /** `harness.authorOnPod` — 명시 true 만 켠다. 읽기 실패는 끔(호스트 저작)으로 둔다. */
 function harnessAuthorOnPod(): boolean {
   try { return getUserConfig().harness?.authorOnPod === true; }
@@ -633,12 +650,17 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   let output = '';
   let runId: string | undefined;
   const child = opts as HarnessAskSayChildLlmOptions;
+  const podAuthorGrade = authorOnPod && entrance === 'cli-harness-say'
+    ? child.authorGradeSource && child.authorGrade
+      ? { grade: child.authorGrade, source: child.authorGradeSource }
+      : resolveGoalAuthorGrade(child.authorGrade, getUserConfig().harness?.authorGrade)
+    : undefined;
   // 10-05 PODPROVIDER: say which child provider the Pod will use when the launch named one.
   if (child.childLlmProvider?.trim()) console.error(`child provider 요청 = ${child.childLlmProvider.trim()}${child.childLlmModel?.trim() ? `/${child.childLlmModel.trim()}` : ''} (pod · 자격 없으면 발사 전 거부)`);
   const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(authorOnPod && entrance === 'cli-harness-say' ? { authorOnPod: true } : {}),
     ...(child.childLlmProvider?.trim() ? { childLlmProvider: child.childLlmProvider.trim() } : {}),
     ...(child.childLlmModel?.trim() ? { childLlmModel: child.childLlmModel.trim() } : {}),
-    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
+    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(authorOnPod && podAuthorGrade ? { authorGrade: podAuthorGrade.grade, authorGradeSource: podAuthorGrade.source } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.seat ? { seat: o.seat } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
@@ -716,22 +738,102 @@ async function dispatchHarnessAskSay(
   },
   dispatch: (resolved: ResolvedHarnessSubstrate, stampedOpts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => Promise<void>,
   gate: PreLaunchGateDeps & { readBudget?: () => Promise<BudgetDecision | 'unknown'> } = {},
+  queueDeps?: HarnessQueueDeps,
+  immediateLaunch?: HarnessQueueDeps['launch'],
+  immediateExit?: () => Promise<number>,
 ): Promise<void> {
   await runInjectedHarnessHandler(async () => {
     assertHarnessChildLlmModel(opts);
-    const resolved = resolveLaunchSubstrate(opts);
     if (isHarnessDryRun(opts)) {
+      resolveLaunchSubstrate(opts);
       printHarnessLaunchDryRun(dryRunPreview);
       return;
     }
     // Resolve the launch directory once; descendants and the checkpoint retain the same identity.
     const queued = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH && process.env.ELANOUS_HARNESS_SEAT;
     const queueSeat = queued === 'OP' || queued === 'TC' || queued === 'MK' || queued === 'UX' ? queued : undefined;
-    const assigned = opts.seat ?? queueSeat ?? queueSeatForCwd(process.cwd(), getUserConfig().loops?.orchestrator?.seatTrees);
+    let cwdSeatMemo: { seat: QueueSeat | undefined } | undefined;
+    const cwdSeat = (): QueueSeat | undefined =>
+      (cwdSeatMemo ??= { seat: queueSeatForCwd(process.cwd(), getUserConfig().loops?.orchestrator?.seatTrees) }).seat;
+    const assigned = opts.seat ?? queueSeat ?? cwdSeat();
     const inheritedSeat = process.env.ELANOUS_HARNESS_SEAT;
+    const directSay = harnessQueueDirectSay();
+    const shouldQueue = directSay && opts.queue !== false && !process.env.ELANOUS_HARNESS_QUEUE_LAUNCH
+      && Boolean(opts.seat ?? cwdSeat());
+    const resolved = shouldQueue
+      ? resolveHarnessSubstrate({ flag: opts as HarnessSubstrateOpts, config: getUserConfig(), env: process.env })
+      : resolveLaunchSubstrate(opts);
     const podSeat = resolved.substrate === 'pod' && ['OP', 'TC', 'MK', 'UX'].includes(inheritedSeat ?? '')
       ? inheritedSeat as QueueSeat : undefined;
     const stampedSeat = resolved.substrate === 'pod' ? opts.seat ?? queueSeat ?? podSeat ?? assigned : assigned;
+    if (directSay && opts.queue === false) {
+      try { debug.log('harness.queue', 'bypass', { seat: stampedSeat ?? null, reason: '--no-queue' }); }
+      catch { /* Observation must not prevent an emergency launch. */ }
+    } else if (shouldQueue && stampedSeat) {
+      resolveNestedElanousOption(opts);
+      const flags: string[] = [];
+      const values: Array<[string, string | undefined]> = [
+        ['--base', opts.base], ['--target', opts.target], ['--correlation', opts.correlation],
+        ['--goal-type', opts.goalType], ...(dryRunPreview.entrance === 'cli-harness-say' ? [['--author-grade', opts.authorGradeSource === 'flag' ? opts.authorGrade : undefined] as [string, string | undefined]] : []), ['--child-llm-provider', opts.childLlmProvider],
+        ['--child-llm-model', opts.childLlmModel], ['--child-llm-effort', opts.childLlmEffort],
+        ['--pod-pool', (opts as HarnessSubstrateOpts).podPool], ['--pod-memory', (opts as HarnessSubstrateOpts).podMemory],
+        ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source],
+      ];
+      for (const [flag, value] of values) if (value !== undefined) flags.push(flag, value);
+      if ((opts as HarnessSubstrateOpts).source !== undefined && resolved.substrate !== 'pod') {
+        console.error('`--source` 는 `--substrate pod` 와 함께');
+        process.exitCode = 2;
+        return;
+      }
+      if (resolved.substrate === 'pod' && opts.target !== undefined) {
+        console.error('`--target` 은 Pod 경로에서 아직 지원하지 않는다 — 로컬로 돌리거나 `--target` 을 빼라');
+        console.error('Pod 로 특정 원천을 주려면 `--source`');
+        process.exitCode = 2;
+        return;
+      }
+      for (const [enabled, flag] of [
+        [opts.json, '--json'], [opts.yes, '--yes'], [opts.autoMerge === false, '--no-auto-merge'],
+        [opts.mergeByHost, '--merge-by-host'], [opts.observeOnly, '--observe-only'],
+        [opts.supervise === false, '--no-supervise'], [opts.forcePreflight, '--force-preflight'],
+        [opts.forceGate, '--force-gate'],
+      ] as const) if (enabled) flags.push(flag);
+      let row: QueueItem;
+      try {
+        row = await addHarnessQueue({ seat: stampedSeat, launchCwd: process.cwd(), refuseDuplicate: true,
+        ...(dryRunPreview.goalPath ? { ask: dryRunPreview.goalPath } : { say: dryRunPreview.input }),
+        launchArgs: ['harness', dryRunPreview.goalPath ? 'ask' : 'say', dryRunPreview.goalPath ?? dryRunPreview.input,
+          '--seat', stampedSeat, ...((opts as HarnessSubstrateOpts).substrate ? ['--substrate', (opts as HarnessSubstrateOpts).substrate!] : []), ...flags,
+          ...(opts.nestedElanous ? ['--nested-elanous', opts.nestedElanous] : [])],
+        }, queueDeps);
+        await queueDeps?.afterEnqueue?.(row);
+      } catch (error) {
+        if (!(error instanceof HarnessQueueDuplicateError)) throw error;
+        console.error(`발사 거절 — ${error.message.replace(/[\r\n]+/g, ' ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      const result = await tickHarnessQueue({ ...queueDeps, ...(immediateLaunch ? { launch: immediateLaunch } : {}) }, row.id);
+      if (result.outcome === 'launched' && result.item?.id === row.id) {
+        if (immediateExit) process.exitCode = await immediateExit();
+      } else if (result.outcome === 'waiting') {
+        const reason = listHarnessQueue(queueDeps).find((item) => item.id === row.id)?.waitingReason ?? result.reason;
+        console.log(`대기열에 들어갔다 — ${reason.replace(/[\r\n]+/g, ' ')}`);
+        process.exitCode = 0;
+      } else if (result.outcome === 'skipped' && result.item?.id === row.id && result.item.status !== 'queued') {
+        // Another tick won the race for this row. Only a confirmed launch (pid recorded) is reported as launched;
+        // a row still `launching` may yet fail, so the direct call ends non-zero instead of claiming success.
+        const confirmed = (result.item.status === 'launched' || result.item.status === 'finished') && result.item.pid !== undefined;
+        const log = join(queueDeps?.root ?? effectiveInstanceRoot(), 'harness', `${row.id}.log`);
+        if (confirmed) console.log(`다른 대기열 tick 이 이미 발사했다 — ${row.id} (pid ${result.item.pid}) · 출력: ${log}`);
+        else console.error(`다른 대기열 tick 이 발사 중이다(확정 전) — ${row.id} (${result.item.status}) · harness queue list 로 확인`);
+        try { debug.log('harness.queue', 'raced-launch', { id: row.id, seat: row.seat, status: result.item.status, confirmed }); }
+        catch { /* Observation cannot change the launch outcome. */ }
+        process.exitCode = confirmed ? 0 : 1;
+      } else {
+        throw new Error(`harness queue: ${result.reason}`);
+      }
+      return;
+    }
     // Depth >= 1 cannot re-allow. Drop the flag here so the launch sees the refusal, not the raw argv.
     const nested = resolveNestedElanousOption(opts);
     const stampedOpts = {
@@ -2413,6 +2515,30 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
   const queue = harnessCmd.command('queue').description('자리별 영속 발사 대기열');
   const queueDeps = deps.queue ?? {};
+  let launchedExit: Promise<number> | undefined;
+  const immediateLaunch: NonNullable<HarnessQueueDeps['launch']> = queueDeps.launch ?? (async (item: QueueItem, args: string[], root: string) => {
+    const child = spawn(process.execPath, [join(import.meta.dir, 'harness-queue-child.ts'),
+      harnessQueueReceiptPath(root, item.launchId!), queueDeps.launchCommand ?? join(import.meta.dir, '../../bin/elanous.mjs'),
+      ...(resolve(root) === prodInstanceRoot() ? [] : [`--test=${root}`]), ...args], {
+      cwd: item.launchCwd ?? resolve(import.meta.dir, '../..'), stdio: 'inherit',
+      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_HARNESS_SEAT: item.seat,
+        ELANOUS_HARNESS_QUEUE_LAUNCH: item.launchId! },
+    });
+    // Capture the end at spawn time: a child that already closed (or died by a signal) must not leave the parent waiting.
+    launchedExit = new Promise<number>((done) => child.once('close', (code, signal) => {
+      const signo = signal ? (osConstants.signals as Record<string, number>)[signal] : undefined;
+      done(code ?? (signo ? 128 + signo : 1));
+    }));
+    return await new Promise<number>((done, reject) => {
+      child.once('spawn', () => done(child.pid!));
+      child.once('error', (error) => {
+        try { writeHarnessQueueReceipt(harnessQueueReceiptPath(root, item.launchId!), 'not-started'); }
+        catch { /* An unreadable receipt leaves the reservation indeterminate. */ }
+        reject(error);
+      });
+    });
+  });
+  const immediateExit = async (): Promise<number> => launchedExit ? await launchedExit : 0;
   const queueAction = (action: () => Promise<void>): Promise<void> => runInjectedHarnessHandler(action);
   queue.command('add').requiredOption('--seat <seat>', 'OP|TC|MK|UX')
     .option('--say <sentence>', '원문 문장').option('--ask <goal-path>', '골 문서 경로')
@@ -2458,7 +2584,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             }
             return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : (announceLocalChildProvider(stampedOpts), ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts)));
           },
-          deps.launchGate,
+          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit,
         );
       });
   }
@@ -2466,9 +2592,15 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   const say = deps.say;
   if (say) {
     registerHarnessAskSayOptions(harnessCmd.command('say <sentence...>').description('문장을 받아 구동한다'))
+      .addOption(new Option('--author-grade <grade>', 'say 저작 등급 (full|lite)').choices(['full', 'lite']))
       .action(async (sentence: string[], opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => {
+        const grade = resolveGoalAuthorGrade(opts.authorGrade, getUserConfig().harness?.authorGrade);
+        const podSource = process.env.ELANOUS_POD_AUTHOR_ON_POD === '1' && process.env.ELANOUS_POD_AUTHOR_GRADE === grade.grade
+          ? process.env.ELANOUS_POD_AUTHOR_GRADE_SOURCE : undefined;
+        const gradedOpts = grade.source === 'default' && podSource === undefined ? opts
+          : { ...opts, authorGrade: grade.grade, authorGradeSource: podSource === 'config' || podSource === 'default' || podSource === 'flag' ? podSource : grade.source };
         await dispatchHarnessAskSay(
-          opts,
+          gradedOpts,
           {
             input: sentence.join(' '),
             entrance: 'cli-harness-say',
@@ -2485,7 +2617,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, harnessAuthorOnPod())
               : (announceLocalChildProvider(stampedOpts), say(sentence, normalizeHarnessAskSayOptions(stampedOpts)));
           },
-          deps.launchGate,
+          deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit,
         );
       });
   }

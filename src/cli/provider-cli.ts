@@ -392,6 +392,20 @@ export function registerProviderCommands(program: Command): void {
       console.log('   확인:  bun bin/elanous.mjs provider codex account list   ·   bun bin/elanous.mjs usage');
     });
 
+  // POD-TOKEN-PREREFRESH (10-06): 사람이 두 번 손으로 한 «백업 → refresh → 원자적 0600 쓰기 → import» 를 한 명령으로.
+  // ⛔ 토큰 값은 안 찍는다 — 남은 시간 전→후만. ⛔ default(~/.codex · 대표 기본 계정)는 거부.
+  accountCmd
+    .command('refresh <name>')
+    .description('그 계정의 codex 토큰을 호스트에서 갱신해 정본 스토어로 반영한다 (⛔ default 거부 · 토큰 값은 안 찍는다 · ⚠️ refresh 토큰은 갱신마다 회전 — 본부 한 곳에서만)')
+    .action(async (name: string) => {
+      const { refreshCodexAccountHome } = await import('../oauth/codex.js');
+      const r = await refreshCodexAccountHome(name);
+      if (!r.ok) { console.error(`갱신 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
+      const h = (v: number | null) => (v === null ? '?' : `${v}h`);
+      console.log(`✅ ${name} 갱신 — 남은 시간 ${h(r.beforeH)} → ${h(r.afterH)} · storeKey=${r.storeKey}`);
+      console.log(`   백업: ${r.backupPath}`);
+    });
+
   const resetCreditsCmd = codexCmd.command('reset-credits').description('리셋 크레딧 — 조회 · 관측 · 사용(⛔ 사용은 되돌릴 수 없다)');
 
   resetCreditsCmd

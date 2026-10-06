@@ -16,6 +16,7 @@ export interface TaskCard {
   goalId: string;
   title: string;
   status: CardStatus;
+  closedReason?: string;
   createdAt: string;
   sections: CardSection[];
 }
@@ -206,7 +207,7 @@ export class CardStore {
       if (card.status === 'closed') return card;
       this.append(id, { type: 'closed', createdAt: new Date().toISOString(),
         ...(reason === undefined ? {} : { reason: redactSecrets(reason.trim()) }) });
-      return { ...card, status: 'closed' as const };
+      return { ...card, status: 'closed' as const, ...(reason === undefined ? {} : { closedReason: redactSecrets(reason.trim()) }) };
     }).immediate();
   }
 
@@ -216,8 +217,10 @@ export class CardStore {
     } | null;
     if (!row) return null;
     const events = readFileSync(cardEventsPath(id, this.root), 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as CardEvent);
+    const closed = events.find((event): event is Extract<CardEvent, { type: 'closed' }> => event.type === 'closed');
     return {
       id: row.id, goalId: row.goal_id, title: row.title, status: row.status, createdAt: row.created_at,
+      ...(closed?.reason === undefined ? {} : { closedReason: closed.reason }),
       sections: events.filter((event): event is Extract<CardEvent, { type: 'section' }> => event.type === 'section')
         .map(({ key, owner, content, createdAt }) => ({ key, owner, content, createdAt })),
     };

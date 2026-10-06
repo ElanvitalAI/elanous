@@ -71,7 +71,8 @@ export function cardFromWire(wire: TaskCardWire): TaskCard {
       ts: Math.max(createdAt, ...entries.map((entry) => entry.ts)),
       data: { ...lastRelease?.data, status: 'done' } });
   }
-  return { ...foldCard(entries)!, apiTitle: wire.title,
+  return { ...foldCard(entries)!, apiTitle: wire.title, status: wire.status,
+    ...(wire.closedReason === undefined ? {} : { closedReason: wire.closedReason }),
     ...(wire.goalId.startsWith('wish:') ? { wishReply } : {}) };
 }
 
@@ -92,13 +93,15 @@ export function isSameSelection(current: string | null, next: string | null): bo
   return next !== null && current === next;
 }
 
-export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detailError, placements }: {
+export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detailError, placements, onCloseCard, publicCapture }: {
   cards: readonly TaskCard[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   selectedCard?: TaskCard | null;
   detailError?: string | null;
   placements?: readonly WishPlacementWire[];
+  onCloseCard?: (reason: string) => Promise<void>;
+  publicCapture?: boolean;
 }) {
   const selected = selectedCard?.taskId === selectedId ? selectedCard : null;
   return (
@@ -124,7 +127,7 @@ export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detai
       {selectedId && (
         <aside className="max-w-3xl space-y-2" aria-label="Selected card">
           <button type="button" onClick={() => onSelect(null)} aria-label="Close card detail" className="text-sm text-muted-foreground">Close</button>
-          {selected ? <TaskCardDetail card={selected} placements={placements} /> :
+          {selected ? <TaskCardDetail card={selected} placements={placements} onClose={onCloseCard} publicCapture={publicCapture} /> :
             <p role="status">{detailError ?? 'Loading card detail…'}</p>}
         </aside>
       )}
@@ -198,7 +201,15 @@ export function TaskBoard() {
     return () => { cancelled = true; };
   }, [client, selectedId]);
 
+  const closeSelectedCard = async (reason: string) => {
+    if (!client || !selectedId || publicCapture) throw new Error('Card close unavailable');
+    const id = selectedId;
+    const { card } = await client.closeTaskCard(id, reason);
+    setSelectedCard((current) => current?.taskId === id ? cardFromWire(card) : current);
+    setCards((current) => current.map((item) => item.taskId === card.id ? cardFromWire(card) : item));
+  };
+
   return <>{message && <p role="status" className="p-4 text-sm text-muted-foreground">{message}</p>}
-    <TaskBoardView cards={shownCards} selectedId={selectedId} selectedCard={shownSelectedCard} detailError={detailError} placements={shownPlacements} onSelect={selectCard} />
+    <TaskBoardView cards={shownCards} selectedId={selectedId} selectedCard={shownSelectedCard} detailError={detailError} placements={shownPlacements} onSelect={selectCard} onCloseCard={closeSelectedCard} publicCapture={publicCapture} />
   </>;
 }

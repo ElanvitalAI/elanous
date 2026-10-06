@@ -84,6 +84,27 @@ describe('TaskCardDetail', () => {
     expect(html).not.toContain('회신 이력');
   });
 
+  test('open detail offers one-line reason and close action; public capture hides it', () => {
+    const card = foldCard([entry('triage', 'open', 1700000000000, 'steward', { title: 'Open' })]);
+    if (!card) throw new Error('expected a card');
+    const html = renderToStaticMarkup(<TaskCardDetail card={{ ...card, status: 'open' }} onClose={async () => {}} />);
+    expect(html).toContain('닫기 사유 (한 줄)');
+    expect(html).toContain('type="text"');
+    expect(html).toContain('type="submit"');
+    expect(html).toContain('닫기</button>');
+    const capture = renderToStaticMarkup(<TaskCardDetail card={{ ...card, status: 'open' }} publicCapture onClose={async () => {}} />);
+    expect(capture).not.toContain('type="submit"');
+    expect(capture).not.toContain('닫기 사유');
+  });
+
+  test('closed detail replaces the action with the persisted reason', () => {
+    const card = foldCard([entry('triage', 'closed', 1700000000000, 'steward', { title: 'Closed' })]);
+    if (!card) throw new Error('expected a card');
+    const html = renderToStaticMarkup(<TaskCardDetail card={{ ...card, status: 'closed', closedReason: '완료' }} onClose={async () => {}} />);
+    expect(html).toContain('닫힘 · 완료');
+    expect(html).not.toContain('type="submit"');
+  });
+
   test('does not invent a gate decision or incident when neither exists', () => {
     const html = render([entry('triage', 'triage-1', 1700000000000, 'steward', { title: 'Ready' })]);
     expect(html).not.toContain('Gate decisions');

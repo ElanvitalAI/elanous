@@ -73,6 +73,42 @@ test('channel-bot GET and authenticated POST reach HTTP handlers without leaking
   }
 });
 
+test('GET /v1/grid is bearer-gated, combines HQ and pool data without writes, and leaves existing routes intact', async () => {
+  let hqReads = 0, poolReads = 0;
+  const fixture = serverFixture();
+  const server = startNexusHttpServer({ ...fixture, startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false },
+    grid: { readHq: () => { hqReads++; return { record: { holder: 'mbp', generation: 2, acquiredAt: 1, renewedAt: 2, ttlSeconds: 1500 }, ageSeconds: 3, expired: false }; },
+      poolSpec: () => 'node-b:4', measure: () => { poolReads++; return { members: [{ context: 'node-b', capacity: 4, running: 1, pending: 1, reason: null }] as ReturnType<typeof import('../../task-orchestrator/surfaces/pod-lease.js').measurePoolLease>['members'] }; } },
+  });
+  try {
+    const untrusted = { 'sec-fetch-site': 'cross-site' };
+    for (const headers of [untrusted, { ...untrusted, authorization: 'Bearer wrong' }]) {
+      const denied = await fetch(`${server.url}/v1/grid`, { headers });
+      expect(denied.status).toBe(401);
+      expect(await denied.json()).toEqual({ error: 'unauthorized' });
+    }
+    expect([hqReads, poolReads]).toEqual([0, 0]);
+    const headers = { ...untrusted, authorization: 'Bearer auth' };
+    const grid = await fetch(`${server.url}/v1/grid`, { headers });
+    expect(grid.status).toBe(200);
+    expect(grid.headers.get('content-type')).toBe('application/json; charset=utf-8');
+    expect(await grid.json()).toEqual({ hq: { record: { holder: 'mbp', generation: 2, acquiredAt: 1, renewedAt: 2, ttlSeconds: 1500 }, ageSeconds: 3, expired: false, reason: null },
+      members: [{ context: 'node-b', capacity: 4, running: 1, pending: 1, occupied: 2, reason: null }], poolReason: null });
+    expect([hqReads, poolReads]).toEqual([1, 1]);
+    const write = await fetch(`${server.url}/v1/grid`, { method: 'POST', headers });
+    expect(write.status).toBe(405);
+    expect(await write.json()).toEqual({ error: 'method-not-allowed', method: 'POST' });
+    expect([hqReads, poolReads]).toEqual([1, 1]);
+    const health = await fetch(`${server.url}/v1/health`);
+    expect(health.status).toBe(200);
+    expect((await health.json() as { ok: boolean }).ok).toBe(true);
+    const nexus = await fetch(`${server.url}/v1/nexus`, { headers });
+    expect(nexus.status).toBe(200);
+    expect((await nexus.json() as { nexusVersion: string }).nexusVersion).toBe('test');
+  } finally { server.stop(); }
+});
+
 function uniquePort(): number {
   return 43000 + Math.floor(Math.random() * 2000);
 }

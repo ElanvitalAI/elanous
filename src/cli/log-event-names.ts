@@ -1064,6 +1064,7 @@ export const KNOWN_LOG_EVENT_NAMES: ReadonlySet<string> = new Set([
   "redecompose-opus-tap",
   "redecompose-respawn",
   "redecompose-tap",
+  "reemit-target",
   "reflect.done",
   "refresh-attempt",
   "refused",

@@ -24,9 +24,11 @@
 // the official CLI stays in sync.
 
 import { execFileSync } from 'node:child_process';
+import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveCodexAccount, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
-import { resolveCodexAccountForRun } from './codex-account-store.js';
+import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, resolveCodexAccount, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
+import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
+import { decodeJWTPayload } from './jwt.js';
 import { authStorePath } from './store.js';
 import { platform, release, arch } from 'node:os';
 import {
@@ -532,4 +534,82 @@ export async function getCodexAccessToken(
 ): Promise<OAuthTokens | null> {
   const state = await loadFreshCodexAuthState(opts);
   return state ? state.tokens : null;
+}
+
+// ── Named-account host refresh (POD-TOKEN-PREREFRESH · 10-06) ─────────
+//
+// 🩸 10-06 05:3x team · 09:47 third — Pod launches refused a codex account whose access token had
+// under 3 h left, and a human refreshed it by hand (refreshCodexTokens → atomic 0600 write → account
+// import). This is that path as one function: backup → refresh → atomic write → canonical store via
+// the same import path. ⛔ Token values never leave this function — the result carries hours only.
+
+export type CodexAccountRefreshResult =
+  | { ok: true; storeKey: string; codexHome: string; beforeH: number | null; afterH: number | null; backupPath: string }
+  | { ok: false; kind: 'bad-name' | 'default-refused' | 'unknown-account' | 'unreadable' | 'no-tokens' | 'refresh-failed' | 'write-failed' | 'import-failed'; message: string };
+
+/** Hours left on a JWT access token (one decimal) — null when the token carries no readable `exp`. */
+export function codexAccessHoursLeft(accessToken: unknown, now: number = Date.now()): number | null {
+  if (typeof accessToken !== 'string') return null;
+  const exp = decodeJWTPayload(accessToken)?.exp;
+  return typeof exp === 'number' ? Math.round(((exp * 1000 - now) / 3_600_000) * 10) / 10 : null;
+}
+
+export async function refreshCodexAccountHome(
+  name: string,
+  opts: {
+    /** ⛔ Test isolation seam — default is the canonical store. */
+    storePath?: string;
+    /** ⛔ Test seam — tests inject a fake refresher; never the network. */
+    refresh?: (refreshToken: string) => Promise<TokenResponse>;
+    now?: () => number;
+  } = {},
+): Promise<CodexAccountRefreshResult> {
+  // ⛔ The CEO's default account (~/.codex) is shared with the official CLI — refreshing it here
+  //   rotates the refresh token out from under that CLI. Named accounts only.
+  if (name === DEFAULT_CODEX_ACCOUNT) {
+    return { ok: false, kind: 'default-refused', message: `'${DEFAULT_CODEX_ACCOUNT}'(~/.codex) 는 대표 기본 계정이다 — 여기서 갱신하지 않는다` };
+  }
+  if (!isValidAccountName(name)) return { ok: false, kind: 'bad-name', message: `계정 이름이 부적격이다: ${name}` };
+  const storePath = opts.storePath ?? authStorePath();
+  const now = opts.now ?? Date.now;
+  const storeKey = codexStoreKey(name);
+  const codexHome = loadTokens(storeKey, storePath)?.codexHome;
+  if (!codexHome) return { ok: false, kind: 'unknown-account', message: `${storeKey} 계정이 없거나 codexHome 을 모른다 — 먼저 account import` };
+  const authPath = join(codexHome, 'auth.json');
+  let raw: string;
+  let parsed: { tokens?: Record<string, unknown> } & Record<string, unknown>;
+  try { raw = readFileSync(authPath, 'utf8'); parsed = JSON.parse(raw); }
+  catch (error) { return { ok: false, kind: 'unreadable', message: `${authPath} 를 못 읽었다 (${error instanceof Error ? error.name : 'error'})` }; }
+  const refreshToken = parsed.tokens?.refresh_token;
+  if (typeof refreshToken !== 'string' || !refreshToken) return { ok: false, kind: 'no-tokens', message: '그 홈에 refresh 토큰이 없다 — 그 홈으로 codex login' };
+  const beforeH = codexAccessHoursLeft(parsed.tokens?.access_token, now());
+  // Backup first — the server rotates the refresh token, so a failed write after refresh must leave something to recover from.
+  const backupPath = `${authPath}.bak-${new Date(now()).toISOString().replace(/[:.]/g, '-')}`;
+  try { writeFileSync(backupPath, raw, { mode: 0o600, flag: 'wx' }); }
+  catch (error) { return { ok: false, kind: 'write-failed', message: `백업을 못 썼다 (${error instanceof Error ? error.name : 'error'})` }; }
+  let fresh: TokenResponse;
+  try { fresh = await (opts.refresh ?? ((token) => refreshCodexTokens(token)))(refreshToken); }
+  catch (error) {
+    // refreshCodexTokens' message is `codex refresh failed: status=N` — no token. Anything else: a fixed line.
+    const message = error instanceof Error && /^codex refresh failed: status=\d+$/.test(error.message) ? error.message : 'codex refresh failed';
+    return { ok: false, kind: 'refresh-failed', message };
+  }
+  const next = {
+    ...parsed,
+    tokens: { ...parsed.tokens, access_token: fresh.access_token, refresh_token: fresh.refresh_token, ...(fresh.id_token ? { id_token: fresh.id_token } : {}) },
+    last_refresh: new Date(now()).toISOString(),
+  };
+  const tmp = `${authPath}.tmp-${process.pid}-${now()}`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, authPath);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    return { ok: false, kind: 'write-failed', message: `${authPath} 원자적 쓰기 실패 (${error instanceof Error ? error.name : 'error'}) — 백업: ${backupPath}` };
+  }
+  // ⭐ Canonical store through the same path as `account import` — not a second writer.
+  const imported = await importCodexAccountFromHome(name, codexHome, storePath);
+  if (!imported.ok) return { ok: false, kind: 'import-failed', message: imported.message };
+  return { ok: true, storeKey, codexHome, beforeH, afterH: codexAccessHoursLeft(fresh.access_token, now()), backupPath };
 }

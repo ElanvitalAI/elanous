@@ -140,6 +140,25 @@ test('release lands once from -dev.N, installs first, and returns the merged com
   expect(existsSync(tree!)).toBe(false);
 });
 
+test('version landing passes a reasoned freeze override only when graph input.forceFreeze is true', () => {
+  for (const kind of ['release', 'dev-bump'] as const) for (const forceFreeze of [false, true]) {
+    const { run } = fixture(kind === 'release' ? '0.2.4-dev.0' : '0.2.4');
+    const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', forceFreeze } });
+    try {
+      const result = run(kind, '--json');
+      expect(result.status).toBe(0);
+      const landing = result.calls.split('\n').find((line) => line.startsWith('bun bin/elanous.mjs pr land '));
+      expect(landing).toBeDefined();
+      if (forceFreeze) expect(landing).toContain(`--force-freeze release run version bump ${kind === 'release' ? '0.2.4' : '0.2.5-dev.0'}`);
+      else expect(landing).not.toContain('--force-freeze');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    }
+  }
+});
+
 test('release and dev-bump keep package.json and both server.json versions aligned when server.json exists', () => {
   for (const [kind, current, target] of [
     ['release', '0.2.4-dev.0', '0.2.4'],

@@ -64,7 +64,7 @@ function shippedNextMdLines(repo: string, cut: string | undefined): { lines: Set
   return { lines: new Set(shown.stdout.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('- '))) };
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string): Output {
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false): Output {
   const target = kind === 'release' ? releaseVersion : nextDevVersion(releaseVersion);
   const source = kind === 'release' ? `${releaseVersion}-dev.N` : releaseVersion;
   fetchMain(repo);
@@ -183,7 +183,8 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
       }
     }
     const title = kind === 'release' ? `release: ${target}` : `version: ${target}`;
-    const land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`], {
+    const land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`,
+      ...(forceFreeze ? ['--force-freeze', `release run version bump ${target}`] : [])], {
       cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     });
     const transcript = `${land.stdout ?? ''}\n${land.stderr ?? ''}`;
@@ -211,6 +212,7 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
   let version: string | null = null;
   let cut: string | undefined;
   let cutCommit: string | undefined;
+  let forceFreeze = false;
   try {
     if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] [--cut-commit <sha>] --json');
     kind = args[0];
@@ -224,8 +226,9 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        input?: { version?: unknown; cutCommit?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+        input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
+      forceFreeze = context.input?.forceFreeze === true;
       if (kind === 'release' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
         if (typeof context.input.cutCommit !== 'string') throw new Error('cutCommit must be a commit SHA');
         cutCommit = context.input.cutCommit;
@@ -237,7 +240,7 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
-    return landing(resolve(repo), kind, version, cut, cutCommit);
+    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];

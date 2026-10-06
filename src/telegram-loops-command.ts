@@ -1,6 +1,6 @@
 import { dashboardLoops } from './domains/dashboard-data.js';
 import { readSchedulesInventory } from './nexus/api/schedules-read.js';
-import { loadLoopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopRow } from './loops/status-rows.js';
+import { loadLoopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH } from './loops/status-rows.js';
 
 interface LoopsSources {
   schedules: () => unknown;
@@ -25,20 +25,27 @@ export async function telegramLoopsStatus(args: string[], sources: LoopsSources 
       if (path === LOOPS_PATH) return sources.loops();
       throw new Error('unknown inventory');
     }, sources.now());
-    if (!rows.length) return '등록된 루프·크론이 없습니다.';
-    const counts = (['늦음', '실패', '살아 있음', '꺼짐', '판정 불가'] as const)
-      .map(verdict => `${verdict} ${rows.filter(row => row.verdict === verdict).length}`);
-    const priority: Record<LoopRow['verdict'], number> = { '늦음': 0, '실패': 1, '살아 있음': 2, '꺼짐': 3, '판정 불가': 4 };
-    const lines = rows.slice().sort((a, b) => priority[a.verdict] - priority[b.verdict]).map(row =>
-      `• ${row.verdict === '늦음' ? '🔴' : row.verdict === '실패' ? '❌' : row.verdict === '살아 있음' ? '🟢' : '⚪'} ${row.verdict} · ${clean(row.name)} (${clean(row.layer)}) · ${clean(row.mode)} · 마지막 ${row.lastRun ?? '기록 없음'} · ${clean(row.id)}`);
-    let reply = ['루프·크론 현황', counts.join(' · ')].join('\n');
-    for (const [index, line] of lines.entries()) {
-      // Telegram caps a message at 4096 characters; leave space for an explicit omission count.
-      if (reply.length + line.length + 35 > 4000) return `${reply}\n… ${lines.length - index}개 더 (메시지 길이 제한)`;
-      reply += `\n${line}`;
+    if (!rows.length) return '모두 정상';
+    const problems = rows.filter(row => row.verdict === '늦음' || row.verdict === '실패');
+    const ordered = [
+      ...problems.filter(row => row.verdict === '늦음'),
+      ...problems.filter(row => row.verdict === '실패'),
+    ];
+    const summary = (['살아 있음', '꺼짐', '판정 불가'] as const)
+      .map(verdict => `${verdict} ${rows.filter(row => row.verdict === verdict).length}`).join(' · ');
+    const lines = ['루프·크론 현황'];
+    let shown = 0;
+    for (const row of ordered.slice(0, 10)) {
+      const line = `• ${row.verdict === '늦음' ? '🔴' : '❌'} ${row.verdict} · ${clean(row.name)} (${clean(row.layer)}) · ${clean(row.mode)} · 마지막 ${row.lastRun ?? '기록 없음'} · ${clean(row.id)}`;
+      // Leave room for the summary and an omission count under Telegram's 4096-character cap.
+      if (lines.join('\n').length + line.length + summary.length + 60 > 4000) break;
+      lines.push(line);
+      shown++;
     }
-    return reply;
+    if (shown < ordered.length) lines.push(`… ${ordered.length - shown}개 더`);
+    lines.push(summary);
+    return lines.join('\n');
   } catch {
-    return '루프 현황을 읽지 못했습니다. 일부 레지스트리 조회가 실패했습니다. 데몬 연결을 확인하세요.';
+    return '루프 현황 못 읽음';
   }
 }

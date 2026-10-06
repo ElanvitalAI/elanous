@@ -167,3 +167,20 @@ test('a lens «why» that only names paths, even behind a label, is not shown as
   expect(pathOnly('file: src/a.ts')).toBe(true);
   expect(pathOnly('video-gen 의 유료 렌더링 의존을 줄일 가능성이 있다.')).toBe(false);
 });
+
+test('NEWS-INTAKE: telegram carries at most three news items, each with S · A · link', () => {
+  const news = Array.from({ length: 4 }, (_, i) => ({ title: `기사 ${i}`, url: `https://n.example/${i}`, summary: [`요약 ${i}`, '둘째 줄'], implication: [`함의 ${i}`] }));
+  const t = renderDigestTelegram({ day: '2026-10-06', grounding: 0, release: 0, manual: 0, absorbed: [], goals: [], news });
+  expect(t.match(/^📰 /gm)).toHaveLength(3);
+  expect(t).toContain('S: 요약 0');
+  expect(t).toContain('A: 함의 0');
+  expect(t).toContain('https://n.example/2');
+  expect(t).not.toContain('기사 3');
+});
+
+test('NEWS-INTAKE: the news recipe resolves the script from the graph dir, not the cron cwd', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { parse } = await import('yaml');
+  const recipes = parse(readFileSync(new URL('../graphs/intake/recipes.yaml', import.meta.url), 'utf8')) as Record<string, { command: string }>;
+  expect(recipes['intake-news']!.command).toContain('$ELANOUS_GRAPH_DIR/../../scripts/intake-news.ts');
+});

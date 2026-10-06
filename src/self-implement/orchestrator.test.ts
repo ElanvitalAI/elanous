@@ -2377,6 +2377,48 @@ describe('runSelfImplement — Fix A rework', () => {
     expect(openedBody).toContain('- 이유: 골 보존 기준이 현장 API와 어긋난다');
   });
 
+  test('supervisor contract-conflict rework self-answers before plan revision without installing terminal HITL', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-rework-self-answer-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, [
+      '# Goal', '- evidence: src/example.ts: contract', '- Clarification:',
+      '  - id: target', '  - header: Clarification', '  - question: Which contract?',
+      '  - options:', '    - label: Keep API', '      description: Verified.',
+      '  - includeOther: true', '  - answer: DEFERRED-UNTIL: Which contract?', '',
+      '## ACCEPTANCE CRITERIA', '- AC-1: Keep API', '',
+    ].join('\n'));
+    const calls: string[] = [];
+    const originalLog = debug.log;
+    const observations: Array<{ category: string; event: string; data: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      observations.push({ category, event, data });
+    }) as typeof debug.log;
+    const supervised = seams({ gateResults: [false, true] });
+    supervised.stdinIsInteractive = () => false;
+    supervised.selfResolveClarification = async ({ evidence }) => {
+      calls.push('self-answer');
+      return calls.length === 1 ? {} : { answer: 'Keep API', evidence };
+    };
+    supervised.escalateGoalClarifications = async () => ({
+      output: '{"answers":{}}', result: { answers: {} },
+    });
+    supervised.diagnose = async () => 'BUDGET: CONTRACT-CONFLICT\nREASON: contract revision\nTARGET: - AC-1: Keep API\nEXPECTED: - AC-1: Keep API\nREPLACEMENT: - AC-1: Preserve API';
+    try {
+      await runSelfImplement({ feature: 'supervisor rework authoring', maxReworkRounds: 1,
+        goalFile, seams: supervised, writeGoalExecutionRecord: () => {},
+      });
+      expect(calls).toEqual(['self-answer', 'self-answer']);
+      expect(readFileSync(goalFile, 'utf8')).toContain('  - answer: Keep API');
+      expect(readFileSync(goalFile, 'utf8')).toContain('- AC-1: Preserve API');
+      expect(observations.filter(({ category, event }) => category === 'self-implement.clarification-escalation' && event === 'self-answer')
+        .map(({ data }) => data)).toContainEqual(expect.objectContaining({ path: 'rework', asked: 1, answered: 1, unanswered: 0 }));
+      expect(getAskUserQuestionResolver()).toBe(null);
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('supervisor relaxation appears in blocked-draft and review-budget PRs only when recorded', async () => {
     const target = '- AC-1: Preserve the blocked-run context.';
     const diagnosis = `BUDGET: CONTRACT-CONFLICT\nREASON: blocked-run contract correction\nTARGET: ${target}\nEXPECTED: ${target}\nREPLACEMENT: - AC-1: Preserve the corrected blocked-run context.`;
@@ -5643,6 +5685,45 @@ describe('runSelfImplement — pre-launch authored clarification escalation', ()
     expect(timeoutHint).toContain('tools.selfImplement.clarificationEscalation.timeoutMs');
     expect(unattendedHint).toBe('무인 발사(비-TTY)라 사람 대기를 설치하지 않는다 — LLM 릴레이가 못 답한 되묻기는 미답으로 진행한다 (대표 2026-09-14)');
     expect(new Set([disabledHint, timeoutHint, unattendedHint])).toHaveLength(3);
+  });
+
+  test('non-TTY pre-implementation escalation self-answers via injected author resolver without terminal HITL', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'clarification-self-answer-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, [
+      'Goal', '- evidence: src/example.ts: contract', '- Clarification:', '  - id: delivery_scope', '  - header: Delivery',
+      '  - question: Which surface?', '  - options:', '    - label: Telegram', '      description: Send there.',
+      '  - includeOther: true', '  - answer: DEFERRED-UNTIL: Which surface?', '',
+    ].join('\n'));
+    let called = 0;
+    let dispatched = 0;
+    const originalLog = debug.log;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      setAskUserQuestionResolver(null);
+      await runSelfImplement({ feature: 'non-TTY clarification', goalFile,
+        writeGoalExecutionRecord: () => {},
+        seams: seams({
+          stdinIsInteractive: () => false,
+          selfResolveClarification: async ({ evidence }) => { called++; return { answer: 'Telegram', evidence }; },
+          escalateGoalClarifications: async () => { dispatched++; return { output: 'no resolver', absenceReason: 'no-delivery-resolver' }; },
+        }),
+      });
+      expect(called).toBe(1);
+      expect(dispatched).toBe(0);
+      expect(readFileSync(goalFile, 'utf8')).toContain('  - answer: Telegram');
+      expect(getAskUserQuestionResolver()).toBe(null);
+      expect(events).toContainEqual(expect.objectContaining({
+        category: 'self-implement.clarification-escalation', event: 'self-answer',
+        data: expect.objectContaining({ path: 'ask', asked: 1, answered: 1, unanswered: 0 }),
+      }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // 비TTY harness는 사람 대기 리졸버를 설치하지 않고 기존 비차단 폴백으로 진행한다.

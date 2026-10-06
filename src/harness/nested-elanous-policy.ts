@@ -13,6 +13,7 @@
 // an allow flag is ignored and the launch stays refused.
 
 import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
 
 export const ELANOUS_NESTED_DEPTH_ENV = 'ELANOUS_NESTED_DEPTH';
 
@@ -26,7 +27,7 @@ export interface NestedElanousDecision {
   readonly depth: number;
   /** True when depth >= 1 supplied allow and it was ignored. */
   readonly allowIgnored: boolean;
-  readonly reason: 'depth-0' | 'depth-0-allow' | 'depth-unknown' | 'nested-refused' | 'allow-ignored';
+  readonly reason: 'depth-0' | 'depth-0-allow' | 'depth-unknown' | 'nested-refused' | 'allow-ignored' | 'depth-cap';
 }
 
 /** Current process depth from the nested-depth marker. Unset or unreadable = 0 (outer launcher). */
@@ -56,11 +57,25 @@ export function nestedDepthCodexArgs(backendName: string, childDepth: number): s
  * Allow decision. Depth 0 allows only when `allow` is true.
  * Depth >= 1 always refuses; a supplied allow is ignored and logged.
  */
+/** Nested depth cap: explicit value, else `harness.nestedElanousMaxDepth`, else 2. */
+export function resolveNestedDepthCap(maxDepth?: number): number {
+  const configured = maxDepth ?? getUserConfig().harness?.nestedElanousMaxDepth;
+  return typeof configured === 'number' && Number.isSafeInteger(configured) && configured > 0 ? configured : 2;
+}
+
 export function decideNestedElanousLaunch(input: {
   readonly depth: number;
   readonly allow?: boolean;
+  readonly maxDepth?: number;
+  /** False for an ordinary mission spawn that did not request a nested launch — no cap log. */
+  readonly logCap?: boolean;
 }): NestedElanousDecision {
   const depth = Number.isInteger(input.depth) && input.depth >= 0 ? input.depth : 0;
+  const cap = resolveNestedDepthCap(input.maxDepth);
+  if (depth >= cap) {
+    if (input.logCap !== false) debug.log('agent-mission.nested', 'depth-cap', { depth, cap });
+    return { allowed: false, depth, allowIgnored: input.allow === true, reason: 'depth-cap' };
+  }
   if (depth >= 1) {
     if (input.allow === true) {
       debug.log('agent-mission.nested', 'allow-ignored', { depth });
@@ -101,14 +116,18 @@ export function gateNestedElanousLaunch(input: {
   readonly nestedLaunchRequested: boolean;
   readonly allow?: boolean;
   readonly configAllow?: boolean;
+  readonly maxDepth?: number;
 }): NestedElanousDecision {
   const depth = Number.isInteger(input.depth) && input.depth >= 0 ? input.depth : 0;
+  const allow = input.nestedLaunchRequested && (input.allow === true || (depth === 0 && input.configAllow === true));
   if (!input.nestedLaunchRequested) {
-    return decideNestedElanousLaunch({ depth, allow: false });
+    return decideNestedElanousLaunch({ depth, allow: false, logCap: false, ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }) });
   }
   if (!backendCarriesNestedDepth(input.backendName)) {
+    // The depth-unknown refusal stands; reaching the cap is still recorded.
+    const cap = resolveNestedDepthCap(input.maxDepth);
+    if (depth >= cap) debug.log('agent-mission.nested', 'depth-cap', { depth, cap, backend: input.backendName });
     return { allowed: false, depth, allowIgnored: false, reason: 'depth-unknown' };
   }
-  const allow = input.allow === true || (depth === 0 && input.configAllow === true);
-  return decideNestedElanousLaunch({ depth, allow });
+  return decideNestedElanousLaunch({ depth, allow, ...(input.maxDepth === undefined ? {} : { maxDepth: input.maxDepth }) });
 }

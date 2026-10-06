@@ -113,7 +113,7 @@ test('inside a test process the default loop starter records the event but start
   let skipped: unknown[] = [];
   for (let i = 0; i < 200 && skipped.length === 0; i++) {
     await new Promise(resolve => setTimeout(resolve, 10));
-    skipped = debug.events(200).filter(entry => entry.category === 'heal.intake' && entry.event === 'loop-start-skipped-test');
+    skipped = debug.events(200).filter(entry => entry.category === 'heal.intake' && entry.event === (process.env.ELANOUS_POD_NAME ? 'skipped-in-pod' : 'loop-start-skipped-test'));
   }
   expect(skipped.length).toBeGreaterThan(0);
   expect(existsSync(join(dir, 'graph-runs', 'heal-loop'))).toBe(false);
@@ -262,6 +262,25 @@ test('parallel processes acquire the file lock before deciding to append or fold
   expect(lines).toHaveLength(7);
   expect(lines.map(line => JSON.parse(line) as typeof base).filter(row => row.ref === base.ref)).toHaveLength(1);
   expect(readFailureInbox({}, dir)).toHaveLength(7);
+});
+
+test('Pod intake retains the failure in the inbox but does not start a heal graph; host still starts it', async () => {
+  const dir = root();
+  const started: string[] = [];
+  const run = async (_file: string, args: Parameters<typeof startHealLoop>[1]) => { started.push(args.runId); };
+  const start = (env: NodeJS.ProcessEnv) => (file: string, args: Parameters<typeof startHealLoop>[1]) => startHealLoop(file, args, env, run);
+  expect(recordFailureEvent(base, dir, start({ ELANOUS_POD_NAME: 'pod-1' }))).toEqual({ folded: false });
+  await settleLoopStart();
+  expect(readFailureInbox({}, dir)).toEqual([base]);
+  expect(started).toHaveLength(0);
+  expect(debug.events(200).filter(entry => entry.category === 'heal.intake' && entry.event === 'skipped-in-pod').at(-1))
+    .toMatchObject({ data: { ref: base.ref } });
+  const hostDir = root();
+  const hostEvent = { ...base, ref: 'release/host-2' };
+  expect(recordFailureEvent(hostEvent, hostDir, start({}))).toEqual({ folded: false });
+  await settleLoopStart();
+  expect(started).toHaveLength(1);
+  expect(readFailureInbox({}, hostDir)).toEqual([hostEvent]);
 });
 
 test('the default heal loop starter never starts a real graph inside a test process', async () => {

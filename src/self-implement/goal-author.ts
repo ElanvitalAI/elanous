@@ -18,6 +18,17 @@ function observeGoalAuthor(
   debug.log(category === 'goal-author' ? 'harness.author' : 'harness.author.clarify', event, data);
 }
 import { getUserConfig } from '../user-config.js';
+
+export type GoalAuthorGrade = 'full' | 'lite';
+export type GoalAuthorGradeSource = 'flag' | 'config' | 'default';
+export interface GoalAuthorGradeSelection { grade: GoalAuthorGrade; source: GoalAuthorGradeSource }
+
+/** The flag is authoritative; malformed or absent configuration keeps the full pipeline. */
+export function resolveGoalAuthorGrade(flag?: GoalAuthorGrade, configured?: unknown): GoalAuthorGradeSelection {
+  if (flag !== undefined) return { grade: flag, source: 'flag' };
+  if (configured === 'lite' || configured === 'full') return { grade: configured, source: 'config' };
+  return { grade: 'full', source: 'default' };
+}
 import type { ObserveOnlySource } from './observe-only.js';
 import type { Question } from '../ask-user-question/types.js';
 import { requestTestScenario as defaultRequestTestScenario, type TestScenarioRequestInput, type TestScenarioRequestResult } from './test-scenario-request.js';
@@ -45,6 +56,7 @@ type GoalEnhancement = Omit<Pick<EnhanceResult, 'original' | 'checklist' | 'verb
 export interface GoalAuthorDeps {
   ground: (ask: string, groundingDeps?: GoalAuthorGroundingDeps) => Promise<CodebaseGrounding>;
   persistentGrounding?: GoalAuthorGroundingDeps;
+  authorGrade?: GoalAuthorGradeSelection;
   enhance: (ask: string, opts?: EnhanceOpts) => Promise<GoalEnhancement>;
   /** Additive enhancer options supplied by the file-writing entrypoint. */
   enhanceOpts?: EnhanceOpts;
@@ -4925,6 +4937,17 @@ async function authorGoalWithSupersededRootIntent(
   }
   // ⭐ 이 저작 «한 번»의 id. goalId 보다 «먼저» 있어야 ground·enhance 의 소요를 그 골에 붙일 수 있다.
   const authorRunId = generateGoalId();
+  const authorGrade = deps.authorGrade ?? resolveGoalAuthorGrade(undefined, getUserConfig().harness?.authorGrade);
+  const lite = authorGrade.grade === 'lite';
+  // lite 는 판정선을 남기는 대신 단계를 덜 한다 — 요청에 반증 줄이 하나도 없으면 판정선 없는 골이 나가므로 시작 전에 멈춘다.
+  if (lite && !ask.split(/\r?\n/u).some((line) => /판정선|판정 신호|반증|decision signal/iu.test(line))) {
+    try { observeGoalAuthor('goal-author', 'author-grade-refused', { authorRunId, reason: 'lite-without-falsifiable-signal' }); }
+    catch { /* observation is fail-soft */ }
+    throw new Error('lite authoring needs a falsifiable signal line (판정선/반증) in the ask — add one or use --author-grade full');
+  }
+  const skippedPhases = lite ? ['adversarial-review', 'goal-steps-decomposed', 'persistent-grounding'] : [];
+  try { observeGoalAuthor('goal-author', 'author-grade', { authorRunId, grade: authorGrade.grade, source: authorGrade.source, skippedPhases }); }
+  catch { /* observation is fail-soft */ }
   const authorStartedAt = Date.now();
   const enhanceTokens: GoalAuthorTokens = { inputTokens: null, outputTokens: null };
   const onEnhanceUsage = (usage: LLMUsage): void => {
@@ -4934,18 +4957,20 @@ async function authorGoalWithSupersededRootIntent(
   };
   let facts: CodebaseGrounding | null = null;
   let groundingError = false;
-  const persistentGrounding = resolveGoalAuthorPersistentGrounding('persistentGrounding' in deps ? deps.persistentGrounding : undefined);
-  const groundStartedAt = startGoalAuthorPhase('ground', authorRunId, deps.onProgress);
-  try {
-    facts = await deps.ground(ask, persistentGrounding.deps);
-  } catch {
-    groundingError = true;
-  } finally {
-    endGoalAuthorPhase('ground', groundStartedAt, authorRunId, deps.onProgress);
-    observeGoalAuthorPersistentGroundingResult(
-      persistentGrounding.decision,
-      goalAuthorPersistentGroundingMetrics(facts, groundingError, authorRunId),
-    );
+  if (!lite) {
+    const persistentGrounding = resolveGoalAuthorPersistentGrounding('persistentGrounding' in deps ? deps.persistentGrounding : undefined);
+    const groundStartedAt = startGoalAuthorPhase('ground', authorRunId, deps.onProgress);
+    try {
+      facts = await deps.ground(ask, persistentGrounding.deps);
+    } catch {
+      groundingError = true;
+    } finally {
+      endGoalAuthorPhase('ground', groundStartedAt, authorRunId, deps.onProgress);
+      observeGoalAuthorPersistentGroundingResult(
+        persistentGrounding.decision,
+        goalAuthorPersistentGroundingMetrics(facts, groundingError, authorRunId),
+      );
+    }
   }
 
   const enhanceStartedAt = startGoalAuthorPhase('enhance', authorRunId, deps.onProgress);
@@ -4988,6 +5013,57 @@ async function authorGoalWithSupersededRootIntent(
     throw new Error('goal author refused an enhancement that does not preserve its input verbatim');
   }
   enhancement = { ...enhancement, original: ask };
+
+  if (lite) {
+    const goalType = deps.goalType ?? 'implement';
+    const goalId = deps.goalId ?? generateGoalId();
+    const signal = decisionSignalSection(null, ask, enhancement.decisionSignal);
+    const falsifiableSignal = signal.filled > 0 ? signal.lines : [
+      ...signal.lines,
+      ...ask.split(/\r?\n/u).filter((line) => /판정선|판정 신호|반증|decision signal/iu.test(line) && !signal.lines.some((rendered) => rendered.includes(line.trim()))),
+    ];
+    const targetPaths = [...new Set(declaredTargetPaths(ask))];
+    const checklistIds = [...new Set(Array.from(ask.matchAll(/\b[A-Z][A-Z0-9]+-[A-Z0-9]+\b/g), (match) => match[0]))];
+    const askFile = deps.askFile === undefined ? undefined : validateAskFile(deps.askFile);
+    const inheritedRootIntent = deps.parentDocument === undefined ? null : parseRootIntent(deps.parentDocument);
+    const rootIntent = validateRootIntent(deps.supersessionRootIntent ?? inheritedRootIntent ?? deps.rootIntent ?? goalSummary(ask));
+    const document = [
+      deps.goalTitle ?? goalSummary(ask),
+      `- GoalId: ${goalId}`,
+      `- RootIntent: ${rootIntent}`,
+      `- GoalType: ${goalType}`,
+      ...(askFile === undefined ? [] : [`- AskFile: ${askFile}`]),
+      '',
+      '## PROBLEM',
+      `- 왜: ${enhancement.complication ?? goalSummary(ask)}`,
+      '',
+      '## WHAT TO BUILD',
+      `- 무엇: ${enhancement.situation ?? goalSummary(ask)}`,
+      ORIGINAL_ASK_MARKER,
+      fenceFor(ask), ask, fenceFor(ask),
+      '',
+      '## ACCEPTANCE CRITERIA',
+      ...enhancement.checklist.map(requestedCriterionLine),
+      '',
+      '## REQUIRED EVIDENCE',
+      '- [requested] Verify the decision signal and the verbatim ask.',
+      '',
+      ...(goalType === 'implement' ? ['## TRACED PATHS', ...(targetPaths.length ? targetPaths.map((path) => `- ${path}`) : ['- Target paths: not declared in the ask.']), ''] : []),
+      '## SCOPE BOUNDARY',
+      `- 대상 경로: ${targetPaths.length ? targetPaths.join(' · ') : 'not declared'}`,
+      `- 칸 id: ${checklistIds.length ? checklistIds.join(' · ') : 'not declared'}`,
+      '',
+      '## 답하지 못하는 것',
+      '- No persistent grounding was performed in lite authoring.',
+      '',
+      '## 불변식',
+      '- No persistent grounding was performed in lite authoring.',
+      '',
+      '## 판정 신호',
+      ...falsifiableSignal,
+    ].join('\n');
+    return { document, facts: null, grounded: false, authorRunId };
+  }
 
   observeGoalAuthor('goal-author', 'constant-instruction-placement', {
     authorRunId,

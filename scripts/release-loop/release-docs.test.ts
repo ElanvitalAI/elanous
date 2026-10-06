@@ -1,6 +1,15 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { closeSeatRequests, listSeatRequests } from '../../src/seat-dispatch/seat-request-ledger.js';
 import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
-import { flipNextReleaseMarkers, foldPreLandedNotes, renderReleaseNotes } from './release-docs.js';
+import { calculateDocsFollow, flipNextReleaseMarkers, foldPreLandedNotes, recordDocsFollow, renderReleaseNotes } from './release-docs.js';
+
+const publicExposure = { verdict: 'public' as const, judge: 'MK' as const,
+  rubric: 'release/public/expose-rubric.yaml', verifiedAt: '2026-10-05T00:00:00Z' };
+const internalExposure = { ...publicExposure, verdict: 'internal' as const };
+const betaExposure = { ...publicExposure, verdict: 'beta' as const };
 
 const manifest: ReleaseManifest = {
   version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'baseline' }, cutoff: { sha: 'cutoff' },
@@ -14,6 +23,108 @@ const manifest: ReleaseManifest = {
   deferred: [{ sha: 'deferred', reason: 'release-target-later' }],
   escalate: [{ kind: 'command-removed', command: 'removed-command' }],
 };
+
+test('docs-follow reports missing per-surface evidence and never counts unknown or internal as published', () => {
+  const evidence = { location: 'https://docs.elanous.ai/feature', verifiedAt: '2026-10-05T00:00:00Z', publishedAt: '2026-10-04T23:00:00Z' };
+  const homepage = { elanous: evidence, elanvital: evidence };
+  const release = { ...manifest, in: [manifest.in[0]!, { ...manifest.in[0]!, sha: 'second' }] };
+  const report = calculateDocsFollow(release, [
+    { id: 'F1', status: 'green', sha: 'feature', exposure: publicExposure, docs: evidence, homepage, readme: evidence },
+    { id: 'F2', status: 'green', sha: 'second', exposure: publicExposure, docs: evidence },
+    { id: 'not-landed', status: 'green', sha: 'future', exposure: publicExposure, docs: evidence, homepage, readme: evidence },
+    { id: 'internal', status: 'green', sha: 'feature', exposure: internalExposure, docs: evidence, homepage, readme: evidence },
+    { id: 'beta', status: 'green', sha: 'feature', exposure: betaExposure },
+  ]);
+  expect(report.ratio).toBeNull();
+  expect(report.coverage).toMatchObject([{ id: 'F1', missing: [] }, { id: 'F2', missing: ['homepage', 'readme'] }, { id: 'beta', missing: ['docs', 'homepage', 'readme'] }]);
+  expect(report.pending.map((item) => item.id)).toEqual(['F2', 'beta']);
+  expect(report.unassessed).toEqual(['not-landed']);
+  expect(calculateDocsFollow(release, [{ id: 'F1', status: 'green', sha: 'feature',
+    exposure: { ...publicExposure, rubric: '' }, docs: evidence, homepage, readme: evidence }]).coverage).toEqual([]);
+  expect(calculateDocsFollow(release, [
+    { id: 'F1', status: 'green', sha: 'feature', exposure: publicExposure, docs: evidence, homepage, readme: evidence },
+    { id: 'F2', status: 'green', sha: 'second', exposure: publicExposure, docs: evidence },
+  ], '2026-10-04T00:00:00Z', '2026-10-05T00:00:00Z').ratio).toBe(0.5);
+  expect(report.verdict).toBe('unmeasured');
+  expect(calculateDocsFollow(release, []).ratio).toBeNull();
+  expect(calculateDocsFollow(release, [{ id: 'F1', status: 'green', sha: 'feature', exposure: publicExposure,
+    docs: evidence, homepage: { elanous: evidence, elanvital: { location: '', verifiedAt: evidence.verifiedAt, publishedAt: evidence.publishedAt } }, readme: evidence }])
+    .coverage[0]?.homepage).toBe(false);
+  expect(calculateDocsFollow(release, []).unassessed).toContain('landing:feature');
+  expect(calculateDocsFollow(release, [{ id: 'F1', status: 'green', sha: 'feature', exposure: publicExposure,
+    docs: { location: 'somewhere', verifiedAt: 'invalid', publishedAt: evidence.publishedAt } }]).coverage[0]?.docs).toBe(false);
+});
+
+test('24-hour coverage passes only when all three surfaces are evidenced and backlog is zero', () => {
+  const proof = { location: 'https://elanous.ai/feature', verifiedAt: '2026-10-05T00:00:00Z', publishedAt: '2026-10-04T23:00:00Z' };
+  const items = [{ id: 'F1', sha: 'feature', status: 'green', exposure: publicExposure, docs: proof,
+    homepage: { elanous: proof, elanvital: proof }, readme: proof }];
+  const release = { ...manifest, in: [manifest.in[0]!] };
+  expect(calculateDocsFollow(release, items, '2026-10-04T23:00:00Z', '2026-10-05T00:00:00Z'))
+    .toMatchObject({ ratio: 1, pending: [], unassessed: [], verdict: 'pass' });
+  expect(calculateDocsFollow(release, items, '2026-10-03T00:00:00Z', '2026-10-05T00:00:00Z').verdict).toBe('unmeasured');
+  expect(calculateDocsFollow(release, items).verdict).toBe('unmeasured');
+  const root = mkdtempSync(join(tmpdir(), 'docs-follow-expired-'));
+  try {
+    expect(recordDocsFollow(root, release, items, new Date('2026-10-07T00:00:00Z'), '2026-10-04T23:00:00Z').verdict).toBe('pass');
+    expect(recordDocsFollow(root, release, [{ ...items[0]!, docs: undefined }],
+      new Date('2026-10-07T00:00:00Z'), '2026-10-04T23:00:00Z').verdict).toBe('unmeasured');
+    expect(recordDocsFollow(root, release, [{ ...items[0]!, docs: { ...proof, publishedAt: '2026-10-06T00:00:00Z', verifiedAt: '2026-10-06T01:00:00Z' } }],
+      new Date('2026-10-07T00:00:00Z'), '2026-10-04T23:00:00Z').verdict).toBe('fail');
+    expect(recordDocsFollow(root, release, [{ ...items[0]!, docs: { ...proof, verifiedAt: '2026-10-06T01:00:00Z' } }],
+      new Date('2026-10-07T00:00:00Z'), '2026-10-04T23:00:00Z').verdict).toBe('unmeasured');
+    expect(recordDocsFollow(root, release, [{ ...items[0]!, docs: { ...proof, publishedAt: '2026-10-06T00:00:00Z', verifiedAt: '2026-10-06T01:00:00Z' } }],
+      new Date('2026-10-07T00:00:00Z')).verdict).toBe('unmeasured');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+  const future = { ...proof, verifiedAt: '2026-10-06T00:00:00Z' };
+  expect(calculateDocsFollow(release, [{ ...items[0]!, readme: future }],
+    '2026-10-04T23:00:00Z', '2026-10-05T00:00:00Z').coverage[0]?.readme).toBe(false);
+  expect(calculateDocsFollow(release, [{ ...items[0]!, docs: { ...proof, publishedAt: '2026-10-06T00:00:00Z' } }],
+    '2026-10-04T23:00:00Z', '2026-10-05T00:00:00Z').coverage[0]?.docs).toBe(false);
+});
+
+test('late README evidence fails only when the 80% deadline is impossible even if unknowns were timely', () => {
+  const publishedAt = '2026-10-04T00:00:00Z';
+  const deadline = '2026-10-05T00:00:00Z';
+  const timely = { location: 'https://elanous.ai/release', publishedAt: '2026-10-04T12:00:00Z', verifiedAt: deadline };
+  const late = { ...timely, publishedAt: '2026-10-05T12:00:00Z', verifiedAt: '2026-10-06T00:00:00Z' };
+  const release: ReleaseManifest = { ...manifest, in: Array.from({ length: 10 }, (_, i) =>
+    ({ sha: `sha-${i}`, title: `Feature ${i}`, kind: 'feat' as const, line: `Feature ${i}`, docs: 'present' as const })) };
+  const items = release.in.map((entry, i) => ({ id: `F${i}`, sha: entry.sha, status: 'green',
+    exposure: publicExposure, docs: timely, homepage: { elanous: timely, elanvital: timely },
+    readme: i < 7 ? timely : i === 7 ? late : undefined }));
+  const after = '2026-10-07T00:00:00Z';
+  expect(calculateDocsFollow(release, items, publishedAt, after)).toMatchObject({
+    ratio: 0.8, pending: [], unassessed: [], verdict: 'unmeasured',
+  });
+  expect(calculateDocsFollow(release, items, publishedAt, '2026-10-08T00:00:00Z').verdict).toBe('unmeasured');
+  expect(calculateDocsFollow(release, items.map((item, i) => i === 8 ? { ...item, readme: timely } : item),
+    publishedAt, after).verdict).toBe('pass');
+  expect(calculateDocsFollow(release, items.map((item, i) => i >= 8 ? { ...item, readme: late } : item),
+    publishedAt, after).verdict).toBe('fail');
+});
+
+test('docs-follow writes measured report and idempotent MK queue only after verified landing input', () => {
+  const root = mkdtempSync(join(tmpdir(), 'docs-follow-'));
+  try {
+    const items = [{ id: 'F1', status: 'green', sha: 'feature', exposure: publicExposure }];
+    const first = recordDocsFollow(root, manifest, items, new Date('2026-10-05T00:00:00Z'));
+    expect(first.pending).toHaveLength(1);
+    recordDocsFollow(root, manifest, items, new Date('2026-10-05T01:00:00Z'));
+    const row = listSeatRequests(root, { seat: 'MK', status: 'queued' });
+    expect(row).toHaveLength(3);
+    expect(row[0]).toMatchObject({ key: 'docs-follow:9.9.9:F1', seat: 'MK', status: 'queued' });
+    expect(row[0]!.text).toContain('docs, homepage, readme');
+    closeSeatRequests(root, [row[0]!.key], { reason: 'MK verified', status: 'done' });
+    recordDocsFollow(root, manifest, items, new Date('2026-10-05T02:00:00Z'));
+    expect(listSeatRequests(root).filter((entry) => entry.key === row[0]!.key)).toHaveLength(1);
+    expect(listSeatRequests(root).find((entry) => entry.key === row[0]!.key)?.status).toBe('done');
+    const saved = JSON.parse(readFileSync(join(root, 'release/9.9.9/docs-follow.json'), 'utf8'));
+    expect(saved.pending).toMatchObject([{ id: 'F1' }]);
+    expect(saved.verdict).toBe('unmeasured');
+    expect(listSeatRequests(root, { seat: 'MK' }).some((entry) => entry.key === 'docs-follow:9.9.9:landing:fix')).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('release notes show only curated public IN lines without private PR links', () => {
   const notes = renderReleaseNotes(manifest, '9.9.9');

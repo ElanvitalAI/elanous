@@ -102,7 +102,7 @@ export async function runIntakeDigestCli(
   }
   const d = (deps.buildDigest ?? buildIntakeDigest)(root, day);
   if (opts.telegram) {
-    if (!d.absorbed.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
+    if (!d.absorbed.length && !d.news?.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
     const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
     const sent = deps.sendTelegram
       ? await deps.sendTelegram(text)

@@ -25,6 +25,25 @@ export async function handleTaskCardsWishPost(req: Request, root?: string): Prom
   }
 }
 
+export async function handleTaskCardsClosePost(req: Request, id: string, root?: string): Promise<Response> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) return jsonResponse({ error: 'not_found' }, 404);
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return jsonResponse({ error: 'bad_request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonResponse({ error: 'bad_request' }, 400);
+  const { reason } = body as Record<string, unknown>;
+  if (typeof reason !== 'string' || !reason.trim() || reason.trim().includes('\n') || reason.trim().includes('\r')) {
+    return jsonResponse({ error: 'bad_request' }, 400);
+  }
+  const store = new CardStore(root);
+  try {
+    if (!store.getCard(id)) return jsonResponse({ error: 'not_found' }, 404);
+    return jsonResponse({ card: store.closeCard(id, reason) });
+  } finally {
+    store.close();
+  }
+}
+
 export interface WishPlacement { cellId: string; cellTitle: string; version: string; status: 'green' | 'yellow' | 'red' | 'done' }
 
 export function isSplitCell(cell: unknown): cell is { id: string } {

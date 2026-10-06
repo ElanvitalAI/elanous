@@ -34,6 +34,7 @@ import { judgePredictionAccuracy } from './judge-prediction-accuracy.js';
 import { measureReviewFindingRecurrence, type ReviewFindingRecurrence } from './review-finding-recurrence.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import { hostname, loadavg } from 'node:os';
 import { resolveHostId } from '../platform/host-id.js';
 import { resolveInstanceName } from '../instance-identity.js';
@@ -242,7 +243,7 @@ export type { QuotaAccountAvailabilityEvidence };
 import { decideReworkSalvage, type ReworkSalvageEvidence } from './rework-salvage.js';
 import { type SupervisorGoalFillEvidence, fillUnverifiableGoalSlots, type SupervisorGoalFillResult } from './goal-supervisor-fill.js';
 import { escalateGoalDocumentClarifications, recordSupervisorPlanRevision, type GoalClarificationEscalationResult, type SupervisorPlanRevisionRelaxation, type SupervisorPlanRevisionResult } from './goal-clarification-escalation.js';
-import { parseGoalDocumentClarifications } from './goal-author-clarification.js';
+import { parseGoalDocumentClarifications, selfAnswerGoalDocumentClarifications, type GoalClarificationSelfResolver } from './goal-author-clarification.js';
 import {
   createFileAskUserQuestionResolver,
   type AskUserQuestionDispatchContext,
@@ -1154,6 +1155,8 @@ export interface SelfImplementSeams {
   /** ⭐ 「이 표면에 답할 사람이 있나」. 기본은 실제 stdin 의 TTY 여부다 —
    *  ⛔ 실물에 매이면 테스트가 «환경»을 검사하게 되므로 주입 가능하게 둔다. */
   stdinIsInteractive?: () => boolean;
+  /** Optional author self-answer seam for non-TTY Pods; never installs a terminal HITL resolver. */
+  selfResolveClarification?: GoalClarificationSelfResolver;
 }
 
 /** onProgress seam 이 통지하는 단계(관측·UX 라벨). */
@@ -5364,6 +5367,7 @@ async function runSelfImplementInner(
           ? { resolvedDelivery: installDecision.delivery }
           : {}),
         ...(s.escalateGoalClarifications ? { dispatch: s.escalateGoalClarifications } : {}),
+        ...(!stdinIsInteractive && !clarificationResolverLease.installed ? { selfAnswerPath: 'ask' as const, selfResolveClarification: s.selfResolveClarification } : {}),
         fallback: (message) => process.stdout.write(`${message}\n`),
       });
     } finally {
@@ -6175,6 +6179,20 @@ async function runSelfImplementInner(
             if (relaxation) pendingPlanRevision = { ...pendingPlanRevision!, relaxation };
             if (opts.goalFile) {
               try {
+                if (!(s.stdinIsInteractive ?? (() => Boolean(process.stdin.isTTY && process.stdout.isTTY)))()) {
+                  try {
+                    const source = readFileSync(opts.goalFile, 'utf8');
+                    // Always run the shared self-answer so every rework pass leaves one observation, even with nothing pending.
+                    const resolved = await selfAnswerGoalDocumentClarifications(source, {
+                      path: 'rework', ask: source, resolver: s.selfResolveClarification,
+                    });
+                    if (resolved.newlyAnswered > 0) writeGoalDocumentAtomic(opts.goalFile, resolved.document);
+                  } catch (error) {
+                    debug.log('self-implement.clarification-escalation', 'self-answer-failed', {
+                      path: 'rework', reason: error instanceof Error ? error.message : String(error),
+                    });
+                  }
+                }
                 const recorded: SupervisorPlanRevisionResult = recordSupervisorPlanRevision(opts.goalFile, { reason: parsedDecision.reason, round, ...(relaxation ? { relaxation } : {}) });
                 pendingPlanRevision = { ...pendingPlanRevision!, ...(relaxation ? { relaxation } : {}), application: {
                   status: recorded.status === 'applied' || recorded.status === 'already-applied' ? recorded.status : 'failed',

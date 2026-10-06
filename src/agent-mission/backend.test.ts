@@ -1,7 +1,56 @@
 import { describe, it, expect } from 'bun:test';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import '../acp/client.js';
-import { asideBackend, codexBackend, claudeBackend, geminiBackend, grokBackend, refuseNestedElanousOnBackend, resolveBackend, resolveBackendSpawn, agentBackendNames, type AgentBackend } from './driver.js';
+import { asideBackend, codexBackend, claudeBackend, geminiBackend, grokBackend, refuseNestedElanousOnBackend, resolveBackend, resolveBackendSpawn, prepareClaudeChildSpawn, agentBackendNames, type AgentBackend } from './driver.js';
 import { CODEX_NESTED_DEPTH_CONFIG_KEY } from '../harness/nested-elanous-policy.js';
+
+describe('Claude nested deny child args', () => {
+  it('uses strict MCP config with no elanous server, keeps user settings untouched through child lifetime', () => {
+    const home = mkdtempSync(join(tmpdir(), 'nested-claude-home-'));
+    const settings = join(home, '.claude.json');
+    const claudeDir = join(home, '.claude');
+    mkdirSync(claudeDir);
+    writeFileSync(settings, '{"mcpServers":{"elanous":{"command":"elanous"}}}');
+    writeFileSync(join(claudeDir, 'settings.json'), '{"keep":true}');
+    try {
+      const spawn = resolveBackendSpawn(claudeBackend, { HOME: home });
+      const child = prepareClaudeChildSpawn(spawn, { backendName: 'claude', depth: 0, allowNestedElanous: false, tempRoot: home });
+      try {
+        expect(child.args).toEqual([...spawn.args, '--strict-mcp-config', '--mcp-config', child.configPath!]);
+        expect(existsSync(child.configPath!)).toBe(true);
+        expect(JSON.parse(readFileSync(child.configPath!, 'utf8'))).toEqual({ mcpServers: {} });
+      } finally { child.cleanup(); }
+      expect(existsSync(child.configPath!)).toBe(false);
+      expect(readFileSync(settings, 'utf8')).toBe('{"mcpServers":{"elanous":{"command":"elanous"}}}');
+      expect(readFileSync(join(claudeDir, 'settings.json'), 'utf8')).toBe('{"keep":true}');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('explicit depth-0 allow retains Claude spawn arguments', () => {
+    const spawn = resolveBackendSpawn(claudeBackend, { PATH: '/usr/bin' });
+    const child = prepareClaudeChildSpawn(spawn, { backendName: 'claude', depth: 0, allowNestedElanous: true });
+    expect(child.args).toEqual(spawn.args);
+    expect(child.configPath).toBeUndefined();
+    child.cleanup();
+  });
+});
+
+describe('NESTED-GUARD2 — Claude deny follows backend identity', () => {
+  it('an absolute-path claude command still gets the strict MCP config; another backend never does', () => {
+    const base = resolveBackendSpawn(claudeBackend, { PATH: '/usr/bin' });
+    const absolute = { ...base, cmd: '/opt/homebrew/bin/claude' };
+    const child = prepareClaudeChildSpawn(absolute, { backendName: 'claude', depth: 0, allowNestedElanous: false });
+    try {
+      expect(child.args).toContain('--strict-mcp-config');
+      expect(child.args).toContain('--mcp-config');
+    } finally { child.cleanup(); }
+    const codex = prepareClaudeChildSpawn({ ...base, cmd: 'claude' }, { backendName: 'codex', depth: 0, allowNestedElanous: false });
+    expect(codex.args).toEqual(base.args);
+    expect(codex.configPath).toBeUndefined();
+  });
+});
 
 describe('AgentBackend — agent-agnostic PTY 추상화', () => {
   it('codexBackend = codex --yolo·구독 스크럽·trust=1', () => {
@@ -58,6 +107,13 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     });
     expect(codex.refused).toBe(false);
     expect(codex.depth).toBe(0);
+  });
+
+  it('the mission refusal caller enforces the depth cap for Codex, even with allow', () => {
+    expect(refuseNestedElanousOnBackend({
+      backendName: 'codex', nestedLaunchRequested: true, allow: true,
+      env: { ELANOUS_NESTED_DEPTH: '2' },
+    })).toEqual({ refused: true, reason: 'depth-cap', depth: 2 });
   });
 
   it('U3: claudeBackend = claude --dangerously-skip-permissions·ANTHROPIC 키 스크럽', () => {

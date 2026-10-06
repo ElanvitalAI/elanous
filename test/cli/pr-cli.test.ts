@@ -1,4 +1,5 @@
-import { describe, expect, it, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import * as fs from 'node:fs';
 import type { SpawnSyncOptions } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,9 +9,12 @@ import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
 import { debug } from '../../src/debug/log.js';
 import { setGitCommandRunnerForTesting } from '../../src/git-fs/runner.js';
-import { parseNumstat, parsePorcelainStatus, registerPrCommands, runPrGranularity, runPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
+import { parseNumstat, parsePorcelainStatus, registerPrCommands as realRegisterPrCommands, runPrGranularity, runPrLand as realRunPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
 import type { ConfirmOpts, ConfirmResult } from '../../src/hitl/confirm.js';
 import { LANDING_HISTORY_META_MARK, TOP_PREFIX_COUNT_LIMIT } from '../../src/cli/pr-granularity.js';
+import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
+import { effectiveInstanceRoot, prodInstanceRoot, resetEffectiveInstanceRoot } from '../../src/instance/resolve.js';
+import type { PrLandDeps, PrLandOpts } from '../../src/cli/pr-cli.js';
 import { renderBaseline } from '../../scripts/ci-public-leak-gate.js';
 import type { CmdRunner, FindPrForBranchOutcome, MergePrOutcome, PrManager, UpsertPrInput, UpsertPrOutcome } from '../../src/autopilot/pr-manager.js';
 import type { FederatedUnfinishedRunLedgerEntry, FederatedUnfinishedRunLedgerQuery } from '../../src/self-implement/run-ledger.js';
@@ -61,7 +65,30 @@ const baseLookupRun = (cmd: string, args: readonly string[]) =>
           : cmd === 'gh' && args.join(' ').includes('pr view')
             ? { ok: true, out: 'main' }
             : { ok: false, out: '' };
+let prodFreezeRoot: string;
+let isolatedStateDir: string;
+let savedStateDir: string | undefined;
+// Both freeze authorities are isolated: the operational root (injected) and the local universe (ELANOUS_STATE_DIR).
+beforeEach(() => {
+  prodFreezeRoot = mkdtempSync(join(tmpdir(), 'pr-cli-freeze-'));
+  isolatedStateDir = mkdtempSync(join(tmpdir(), 'pr-cli-state-'));
+  savedStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+  resetEffectiveInstanceRoot();
+  expect(effectiveInstanceRoot()).not.toBe(prodInstanceRoot());
+});
+afterEach(() => {
+  if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDir;
+  resetEffectiveInstanceRoot();
+  rmSync(prodFreezeRoot, { recursive: true, force: true });
+  rmSync(isolatedStateDir, { recursive: true, force: true });
+});
+
+const runPrLand = (opts: PrLandOpts = {}, deps: PrLandDeps = {}) => realRunPrLand(opts, { ...deps, prodFreezeRoot });
+const registerPrCommands = (program: Command, deps: PrLandDeps = {}) => realRegisterPrCommands(program, { ...deps, prodFreezeRoot });
+
 const baseDeps = {
+  get prodFreezeRoot() { return prodFreezeRoot; },
   currentBranch: () => 'feat/land', resolveBase: () => 'origin/main', run: baseLookupRun, listUnfinishedRuns: () => [] as const,
   queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
@@ -253,6 +280,85 @@ describe('findSiblingPrs', () => {
 });
 
 describe('elanous pr land', () => {
+  it('defers a frozen landing and queues its head; a reasoned --force-freeze merges once and emits the force event', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const state = mkdtempSync(join(tmpdir(), 'pr-cli-queue-'));
+    const before = process.env.ELANOUS_STATE_DIR;
+    const logged = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      process.env.ELANOUS_STATE_DIR = state;
+      enableLandingFreeze({ reason: 'cut', by: 'OP' }, prodFreezeRoot);
+      const run = (cmd: string, args: readonly string[]) => cmd === 'git' && args.join(' ') === 'rev-parse HEAD'
+        ? { ok: true, out: 'a'.repeat(40) } : baseLookupRun(cmd, args);
+      const deps = { ...baseDeps, manager, run, out: sink.out };
+      expect(await runPrLand({}, deps)).toBe(0);
+      expect(calls).toEqual(['find', 'upsert']);
+      expect(JSON.parse(readFileSync(join(state, 'landing-freeze-pending.json'), 'utf8'))).toMatchObject([{ prNumber: 42, headCommit: 'a'.repeat(40) }]);
+      expect(await runPrLand({ forceFreeze: '  version bump  ' }, deps)).toBe(0);
+      expect(calls).toEqual(['find', 'upsert', 'find', 'upsert', 'merge']);
+      expect(JSON.parse(readFileSync(join(state, 'landing-freeze-pending.json'), 'utf8'))).toEqual([]);
+      expect(logged.mock.calls.filter((call) => call[0] === 'release-loop.freeze' && call[1] === 'force-merge')).toEqual([
+        ['release-loop.freeze', 'force-merge', { pr: 42, reason: 'version bump' }],
+      ]);
+    } finally {
+      logged.mockRestore();
+      if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = before;
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects --force-freeze without a nonblank reason before creating a PR', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    expect(await runPrLand({ forceFreeze: '   ' }, { ...baseDeps, manager, out: sink.out })).toBe(1);
+    expect(calls).toEqual([]);
+    expect(sink.errors.join('\n')).toContain('--force-freeze');
+  });
+
+  it('uses an injected temporary operational root, not the real operational root', async () => {
+    expect(prodFreezeRoot).not.toBe(prodInstanceRoot());
+    const liveRoot = prodInstanceRoot();
+    const originalRead = fs.readFileSync;
+    const read = spyOn(fs, 'readFileSync').mockImplementation(((path: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (typeof path === 'string' && path.startsWith(`${liveRoot}/`)) throw new Error('operational-root access');
+      return (originalRead as (...args: unknown[]) => unknown)(path, ...args);
+    }) as typeof fs.readFileSync);
+    const originalWrite = fs.writeFileSync;
+    const write = spyOn(fs, 'writeFileSync').mockImplementation(((path: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (typeof path === 'string' && path.startsWith(`${liveRoot}/`)) throw new Error('operational-root access');
+      return (originalWrite as (...args: unknown[]) => unknown)(path, ...args);
+    }) as typeof fs.writeFileSync);
+    const originalMkdir = fs.mkdirSync;
+    const mkdir = spyOn(fs, 'mkdirSync').mockImplementation(((path: fs.PathLike, ...args: unknown[]) => {
+      if (typeof path === 'string' && (path === liveRoot || path.startsWith(`${liveRoot}/`))) throw new Error('operational-root access');
+      return (originalMkdir as (...args: unknown[]) => unknown)(path, ...args);
+    }) as typeof fs.mkdirSync);
+    enableLandingFreeze({ reason: 'isolated', by: 'OP' }, prodFreezeRoot);
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const root = mkdtempSync(join(tmpdir(), 'pr-cli-child-state-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      const run = (cmd: string, args: readonly string[]) => cmd === 'git' && args.join(' ') === 'rev-parse HEAD'
+        ? { ok: true, out: 'a'.repeat(40) } : baseLookupRun(cmd, args);
+      expect(await runPrLand({}, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+      expect(calls).toEqual(['find', 'upsert']);
+      expect(sink.logs.join('\n')).toContain('동결 중 · isolated');
+      expect(JSON.parse(readFileSync(join(root, 'landing-freeze-pending.json'), 'utf8'))).toMatchObject([{ prNumber: 42 }]);
+      expect(() => readFileSync(join(liveRoot, 'landing-freeze.json'), 'utf8')).toThrow('operational-root access');
+    } finally {
+      mkdir.mockRestore();
+      write.mockRestore();
+      read.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('finds, upserts ready with its resolved base and head, and squash merges in order', async () => {
     const { manager, calls, upserts } = fakeManager();
     const sink = output();
@@ -2017,6 +2123,23 @@ describe('elanous pr land', () => {
     expect(calls).toEqual(['find', 'upsert']);
     expect(upserts[0]?.draft).toBe(true);
     expect(sink.logs.some((line) => line.includes('hold'))).toBe(true);
+  });
+
+  it('registers --force-freeze with a required reason through the command path', async () => {
+    const program = new Command();
+    program.exitOverride();
+    const sink = output();
+    const { manager, calls } = fakeManager();
+    const exitCodes: number[] = [];
+    registerPrCommands(program, { ...baseDeps, manager, out: sink.out, setExitCode: (code) => exitCodes.push(code) });
+    const land = program.commands.find((command) => command.name() === 'pr')?.commands.find((command) => command.name() === 'land');
+    expect(land?.helpInformation()).toContain('--force-freeze <reason>');
+    expect(land?.options.find((option) => option.long === '--force-freeze')?.flags).toContain('<reason>');
+    expect(calls).toEqual([]);
+    await program.parseAsync(['pr', 'land', '--force-freeze', ' '], { from: 'user' });
+    expect(calls).toEqual([]);
+    expect(sink.errors.join('\n')).toContain('--force-freeze');
+    expect(exitCodes).toEqual([1]);
   });
 
   it('registers pr land --land-reason in help and passes the reason into runPrLand', async () => {

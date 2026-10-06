@@ -2,9 +2,9 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync,
 import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
-import { beginLandingMerge, readLandingFreeze, type LandingFreeze } from '../release-loop/landing-freeze.js';
+import { beginLandingMerge, type LandingFreeze } from '../release-loop/landing-freeze.js';
 
 /** `manual`: the owning repository could not be determined — a sweep never resumes it; a person does. */
 export interface FrozenMerge { prNumber: number; headCommit: string; repoRoot: string; manual?: true; /** Host goal document, so a resumed merge can still apply its «이 칸 완료» declaration (CL-AUTO). */ goalFile?: string }
@@ -182,8 +182,10 @@ export function admitLandingMerge(
   root = effectiveInstanceRoot(),
   hooks: { afterQueue?: () => void } = {},
   claimKey?: { prNumber: number; repoRoot: string; headCommit?: string },
+  opts: { prodFreezeRoot?: string; forceReason?: string } = {},
 ): LandingAdmission {
   let entry: FrozenMerge | null | undefined;
+  const prodFreezeRoot = opts.prodFreezeRoot ?? prodInstanceRoot();
   // A held PR is merged by exactly one runner: the claim (repository + PR) is held from admission until the lander's
   // merge has ended. Its queue entry stays until that merge is confirmed — `end(true)` removes this lander's own head;
   // a failed or interrupted merge leaves it for the next resume sweep.
@@ -201,7 +203,7 @@ export function admitLandingMerge(
     } finally { landing.end(); held?.release(); }
   };
   for (;;) {
-    const landing = beginLandingMerge(root);
+    const landing = beginLandingMerge(root, new Date(), prodFreezeRoot, opts.forceReason);
     if (!landing.frozen) {
       if (!claim && claimKey) {
         const key = { prNumber: claimKey.prNumber, repoRoot: repoIdentity(claimKey.repoRoot), headCommit: claimKey.headCommit };
@@ -222,17 +224,19 @@ export function admitLandingMerge(
     if (!entry) return { kind: 'held', freeze: landing.frozen };
     queueFrozenMerge(entry, root);
     hooks.afterQueue?.();
-    if (readLandingFreeze(root)) return { kind: 'held', freeze: landing.frozen };
-    const mine = { ...entry, repoRoot: repoIdentity(entry.repoRoot) };
-    claim = claimFrozenMerge(mine, root);
-    if (!claim) return { kind: 'taken' };
-    // A resume sweep already merged and dequeued it between our queueing and our claim: nothing left to merge.
-    let stillHeld = false;
-    try { stillHeld = readQueue(root).some((item) => sameEntry(item, mine)); }
-    catch (error) { claim.release(); throw error; }
-    if (!stillHeld) { claim.release(); return { kind: 'taken' }; }
-    ownHead = mine;
-    debug.log('harness.merge', 'freeze-lifted-while-queueing', { pr: entry.prNumber });
+    const afterQueue = beginLandingMerge(root, new Date(), prodFreezeRoot, opts.forceReason);
+    if (afterQueue.frozen) return { kind: 'held', freeze: afterQueue.frozen };
+    try {
+      const mine = { ...entry, repoRoot: repoIdentity(entry.repoRoot) };
+      claim = claimFrozenMerge(mine, root);
+      if (!claim) return { kind: 'taken' };
+      // A resume sweep already merged and dequeued it between our queueing and our claim: nothing left to merge.
+      const stillHeld = readQueue(root).some((item) => sameEntry(item, mine));
+      if (!stillHeld) { claim.release(); return { kind: 'taken' }; }
+      ownHead = mine;
+      debug.log('harness.merge', 'freeze-lifted-while-queueing', { pr: entry.prNumber });
+    } catch (error) { claim?.release(); throw error; }
+    finally { afterQueue.end(); }
   }
 }
 
@@ -259,16 +263,17 @@ export async function sweepFrozenMerges(
   },
   root = effectiveInstanceRoot(),
   alreadyMerged: (entry: FrozenMerge) => boolean | Promise<boolean> = githubMergedAt,
+  prodFreezeRoot = prodInstanceRoot(),
 ): Promise<{ pending: number; merged: number }> {
-  const frozen = readLandingFreeze(root);
-  if (frozen) return { pending: readQueue(root).length, merged: 0 };
   const pending = readQueue(root);
   let merged = 0;
   for (const entry of pending) {
-    if (readLandingFreeze(root)) break;
-    const claim = claimFrozenMerge(entry, root);
-    if (!claim) continue; // another sweep or the original lander is on it
+    const guard = beginLandingMerge(root, new Date(), prodFreezeRoot);
+    if (guard.frozen) break;
+    let claim: { release: () => void } | null = null;
     try {
+      claim = claimFrozenMerge(entry, root);
+      if (!claim) continue; // another sweep or the original lander is on it
       if (!readQueue(root).some((item) => sameEntry(item, entry))) continue; // taken back by its lander
       if (entry.manual) { debug.log('harness.merge', 'resume-manual', { pr: entry.prNumber, repoRoot: entry.repoRoot }); continue; }
       if (!(await alreadyMerged(entry))) {
@@ -289,7 +294,7 @@ export async function sweepFrozenMerges(
       });
     } catch (error) {
       debug.log('harness.merge', 'resume-failed', { pr: entry.prNumber, error: String(error) });
-    } finally { claim.release(); }
+    } finally { guard.end(); claim?.release(); }
   }
   return { pending: readQueue(root).length, merged };
 }

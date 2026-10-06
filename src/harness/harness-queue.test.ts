@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { getUserConfig } from '../user-config.js';
-import { addHarnessQueue, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, readHarnessQueueProcesses, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
+import { addHarnessQueue, HarnessQueueDuplicateError, queueCellId, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, readHarnessQueueProcesses, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
 import { checkpointDependenciesForRun, loadSelfDevRun, processBirthId, saveSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
 import { bindOrchestrateRunLedger } from '../self-dev/self-orchestrate-runtime.js';
 import { debug } from '../debug/log.js';
@@ -57,6 +57,18 @@ test('a capped UX head does not block a later MK goal', async () => {
   expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: mk.id } });
   expect(listHarnessQueue(deps).find(row => row.id === ux.id)?.status).toBe('queued');
   expect(launches).toEqual([['harness', 'say', 'free', '--substrate', 'pod']]);
+});
+
+test('a requested immediate tick judges only its own FIFO head without launching another seat', async () => {
+  const dir = root(), launches: string[][] = [], deps = fixture(dir, launches);
+  const earlier = await addHarnessQueue({ seat: 'TC', say: 'earlier' }, deps);
+  const later = await addHarnessQueue({ seat: 'TC', say: 'later' }, deps);
+  const other = await addHarnessQueue({ seat: 'UX', say: 'other' }, deps);
+  expect(await tickHarnessQueue(deps, later.id)).toMatchObject({ outcome: 'waiting', item: { id: later.id }, reason: '앞선 대기열 항목 차례' });
+  expect(launches).toEqual([]);
+  expect(await tickHarnessQueue(deps, earlier.id)).toMatchObject({ outcome: 'launched', item: { id: earlier.id } });
+  expect(await tickHarnessQueue(deps, other.id)).toMatchObject({ outcome: 'launched', item: { id: other.id } });
+  expect(launches).toHaveLength(2);
 });
 
 test('round robin persists across ticks and preserves FIFO within each seat', async () => {
@@ -327,6 +339,116 @@ test('hold and heavy map to existing ask/say flags, and queue removal refuses li
   expect(listHarnessQueue(deps)).toHaveLength(1);
   await expect(addHarnessQueue({ seat: 'MK', say: 'a', ask: goal }, deps)).rejects.toThrow('중 하나만');
   await expect(addHarnessQueue({ seat: 'other', say: 'a' }, deps)).rejects.toThrow('unknown seat');
+});
+
+test('direct CLI launch args and cwd persist for later ticks while ordinary queue args stay unchanged', async () => {
+  const dir = root(), launches: string[][] = [], deps = fixture(dir, launches);
+  const args = ['harness', 'say', 'exact words', '--seat', 'TC', '--substrate', 'local', '--no-auto-merge'];
+  const item = await addHarnessQueue({ seat: 'TC', say: 'exact words', launchArgs: args, launchCwd: '/tmp/owner' }, deps);
+  expect(listHarnessQueue(deps)[0]).toMatchObject({ id: item.id, launchArgs: args, launchCwd: '/tmp/owner' });
+  expect(await tickHarnessQueue(deps, item.id)).toMatchObject({ outcome: 'launched', item: { id: item.id } });
+  expect(launches).toEqual([args]);
+  expect(queueLaunchArgs(await addHarnessQueue({ seat: 'UX', say: 'ordinary' }, deps)))
+    .toEqual(['harness', 'say', 'ordinary', '--substrate', 'pod']);
+});
+
+test('refuseDuplicate refuses the same goal or the same cell while one is queued or running, and allows it after a retryable finish', async () => {
+  const dir = root(), launches: string[][] = [], deps = fixture(dir, launches);
+  expect(queueCellId('하니스로 구현 … 칸: ONEDOOR-2 · P0')).toBe('ONEDOOR-2');
+  expect(queueCellId('[TC 자리 · 체크리스트 칸 FREEZE-HOSTMERGE · P0]')).toBe('FREEZE-HOSTMERGE');
+  expect(queueCellId('칸: P0 없음')).toBeUndefined();
+  const first = await addHarnessQueue({ seat: 'TC', say: 'fix it · 칸: ONEDOOR-2', refuseDuplicate: true }, deps);
+  await expect(addHarnessQueue({ seat: 'TC', say: 'fix it · 칸: ONEDOOR-2', refuseDuplicate: true }, deps))
+    .rejects.toBeInstanceOf(HarnessQueueDuplicateError);
+  await expect(addHarnessQueue({ seat: 'OP', say: 'other words · 칸: ONEDOOR-2', refuseDuplicate: true }, deps))
+    .rejects.toThrow(`같은 칸 ONEDOOR-2 이 이미 대기열에 있거나 도는 중이다 — ${first.id} (queued)`);
+  // Falsifier: without the flag the same text still enqueues (other callers keep their own idempotency keys).
+  expect((await addHarnessQueue({ seat: 'TC', say: 'fix it · 칸: ONEDOOR-2' }, deps)).id).not.toBe(first.id);
+  await addHarnessQueue({ seat: 'TC', say: 'different cell · 칸: HQ-FENCE-RAIL', refuseDuplicate: true }, deps);
+  // A launched row whose wrapper finished non-zero is retryable — the same goal may be sent again.
+  const launched = await tickHarnessQueue(deps, first.id);
+  expect(launched.outcome).toBe('launched');
+  mkdirSync(join(dir, 'harness'), { recursive: true });
+  const row = listHarnessQueue(deps).find((item) => item.id === first.id)!;
+  writeFileSync(harnessQueueReceiptPath(dir, row.launchId!), JSON.stringify({ state: 'finished', exitCode: 1 }));
+  await expect(addHarnessQueue({ seat: 'TC', say: 'retry · 칸: ONEDOOR-2', refuseDuplicate: true }, deps)).rejects.toBeInstanceOf(HarnessQueueDuplicateError);
+  await removeHarnessQueue(listHarnessQueue(deps).find((item) => item.input === 'fix it · 칸: ONEDOOR-2' && item.id !== first.id)!.id, deps);
+  expect((await addHarnessQueue({ seat: 'TC', say: 'retry · 칸: ONEDOOR-2', refuseDuplicate: true }, deps)).status).toBe('queued');
+});
+
+test('refuseDuplicate reads the cell inside ask goal documents: ask–ask and ask–say on the same cell are refused', async () => {
+  const dir = root(), launches: string[][] = [], deps = fixture(dir, launches);
+  const goalA = join(dir, 'goal-a.md'), goalB = join(dir, 'goal-b.md'), goalC = join(dir, 'goal-c.md');
+  writeFileSync(goalA, '대상 경로: src/x.ts\n칸: ONEDOOR-2\n');
+  writeFileSync(goalB, '다른 문서 · 칸: ONEDOOR-2 · P0\n');
+  writeFileSync(goalC, '칸: HQ-FENCE-RAIL\n');
+  await addHarnessQueue({ seat: 'TC', ask: goalA, refuseDuplicate: true }, deps);
+  await expect(addHarnessQueue({ seat: 'TC', ask: goalB, refuseDuplicate: true }, deps)).rejects.toThrow('같은 칸 ONEDOOR-2');
+  await expect(addHarnessQueue({ seat: 'OP', say: 'fix it · 칸: ONEDOOR-2', refuseDuplicate: true }, deps)).rejects.toThrow('같은 칸 ONEDOOR-2');
+  // Falsifier: a document on another cell enqueues.
+  expect((await addHarnessQueue({ seat: 'TC', ask: goalC, refuseDuplicate: true }, deps)).status).toBe('queued');
+  // The cell is recorded at enqueue: editing or deleting the queued document does not reopen it.
+  expect(listHarnessQueue(deps).map((row) => row.cellId)).toEqual(['ONEDOOR-2', 'HQ-FENCE-RAIL']);
+  writeFileSync(goalA, 'rewritten without a cell\n');
+  await expect(addHarnessQueue({ seat: 'OP', say: 'again · 칸: ONEDOOR-2', refuseDuplicate: true }, deps)).rejects.toThrow('같은 칸 ONEDOOR-2');
+  rmSync(goalC);
+  await expect(addHarnessQueue({ seat: 'MK', say: 'again · 칸: HQ-FENCE-RAIL', refuseDuplicate: true }, deps)).rejects.toThrow('같은 칸 HQ-FENCE-RAIL');
+});
+
+test('a requested row blocked by its own seat cap reports that cap, not another seat\'s turn', async () => {
+  const dir = root(), launches: string[][] = [];
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches), cap: (seat) => (seat === 'TC' ? 0 : 2) };
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'tc capped' }, deps);
+  await addHarnessQueue({ seat: 'MK', say: 'mk has room' }, deps);
+  const tick = await tickHarnessQueue(deps, tc.id);
+  expect(tick.outcome).toBe('waiting');
+  expect(tick.reason).toContain('seat TC: 0/0');
+  expect(launches).toEqual([]);
+  // Same check when the other seat comes first in the rotation (MK enqueued first, TC requested later).
+  const dir2 = root(), launches2: string[][] = [];
+  const deps2: HarnessQueueDeps = { ...fixture(dir2, launches2), cap: (seat) => (seat === 'TC' ? 0 : 2) };
+  await addHarnessQueue({ seat: 'MK', say: 'mk first with room' }, deps2);
+  const tc2 = await addHarnessQueue({ seat: 'TC', say: 'tc capped later' }, deps2);
+  const tick2 = await tickHarnessQueue(deps2, tc2.id);
+  expect(tick2).toMatchObject({ outcome: 'waiting', item: { id: tc2.id } });
+  expect(tick2.reason).toContain('seat TC: 0/0');
+  expect(launches2).toEqual([]);
+});
+
+test('a requested tick keeps the seat round-robin: an earlier seat head with room makes the requested row wait without launching', async () => {
+  const dir = root(), launches: string[][] = [], deps = fixture(dir, launches);
+  const mk = await addHarnessQueue({ seat: 'MK', say: 'mk first' }, deps);
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'tc direct' }, deps);
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'waiting', item: { id: tc.id }, reason: '다른 자리 차례 — MK' });
+  expect(launches).toEqual([]);
+  expect(listHarnessQueue(deps).find((row) => row.id === tc.id)?.waitingReason).toBe('다른 자리 차례 — MK');
+  // Falsifier: once MK has launched, the requested TC row is the first head with room and launches.
+  expect(await tickHarnessQueue(deps, mk.id)).toMatchObject({ outcome: 'launched', item: { id: mk.id } });
+  expect(await tickHarnessQueue(deps, tc.id)).toMatchObject({ outcome: 'launched', item: { id: tc.id } });
+});
+
+test('default queue launcher runs the stored launch args in the stored cwd under the receipt wrapper', async () => {
+  const dir = root(), owner = mkdtempSync(join(tmpdir(), 'hq-owner-'));
+  const stub = join(dir, 'stub.ts');
+  writeFileSync(stub, "console.log('STUB ' + JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) })); process.exitCode = 7;\n");
+  const deps: HarnessQueueDeps = { root: dir, pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 2 }), cap: () => 2,
+    alive: () => true, processes: () => [], authorShadow: () => {}, idleRequest: () => {}, log: () => {}, launchCommand: stub };
+  mkdirSync(join(dir, 'harness'), { recursive: true });
+  const args = ['harness', 'say', 'exact words', '--seat', 'TC', '--substrate', 'local'];
+  const item = await addHarnessQueue({ seat: 'TC', say: 'exact words', launchArgs: args, launchCwd: owner }, deps);
+  expect((await tickHarnessQueue(deps, item.id)).outcome).toBe('launched');
+  const launched = listHarnessQueue(deps).find((row) => row.id === item.id)!;
+  const receipt = harnessQueueReceiptPath(dir, launched.launchId!);
+  for (let i = 0; i < 200; i += 1) {
+    if (existsSync(receipt) && JSON.parse(readFileSync(receipt, 'utf8')).state === 'finished') break;
+    await Bun.sleep(50);
+  }
+  expect(JSON.parse(readFileSync(receipt, 'utf8'))).toMatchObject({ state: 'finished', exitCode: 7 });
+  const line = readFileSync(join(dir, 'harness', `${item.id}.log`), 'utf8').split('\n').find((l) => l.startsWith('STUB '))!;
+  const seen = JSON.parse(line.slice(5)) as { cwd: string; args: string[] };
+  expect(realpathSync(seen.cwd)).toBe(realpathSync(owner));
+  expect(seen.args.filter((arg) => !arg.startsWith('--test='))).toEqual(args);
+  rmSync(owner, { recursive: true, force: true });
 });
 
 test('concurrent ticks cannot launch the same item twice; a failed/ambiguous launch stays indeterminate', async () => {

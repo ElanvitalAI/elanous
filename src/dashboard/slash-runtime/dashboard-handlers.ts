@@ -2442,6 +2442,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
         cwd: () => process.cwd(),
         now: () => Date.now(),
         isInteractive: () => ctx.surfaceUx !== undefined,
+        selfResolveClarification: (await import('../../self-implement/goal-author-clarification.js')).defaultGoalAuthorSelfResolve,
+        writeGoalDocument: (await import('../../self-implement/goal-document-write.js')).writeGoalDocumentAtomic,
         buildPreflightDeps: askIo.buildAskPreflightDeps,
         priorBlockSamples: () => askIo.priorBlockSamplesFrom(rows),
         recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(rows),

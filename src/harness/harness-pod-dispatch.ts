@@ -49,6 +49,8 @@ export interface HarnessPodDispatchInput {
   readonly childLlmEffort?: string;
   /** `harness.authorOnPod` — say 문장을 Pod 안에서 저작부터 돌린다. 호스트는 영수증만 남긴다. */
   readonly authorOnPod?: boolean;
+  readonly authorGrade?: import('../self-implement/goal-author.js').GoalAuthorGrade;
+  readonly authorGradeSource?: import('../self-implement/goal-author.js').GoalAuthorGradeSource;
 }
 
 export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: string): string[] {
@@ -146,6 +148,15 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
   if (input.after) env.ELANOUS_POD_AFTER = input.after;
   if (input.authorOnPod) env.ELANOUS_POD_AUTHOR_ON_POD = '1';
   else delete env.ELANOUS_POD_AUTHOR_ON_POD;
+  if (input.authorOnPod && input.authorGrade) {
+    env.ELANOUS_POD_AUTHOR_GRADE = input.authorGrade;
+    // 출처는 호스트가 알 때만 싣는다 — 모르면 «flag» 로 지어내지 않고 Pod 가 자기가 본 출처를 쓰게 둔다.
+    if (input.authorGradeSource) env.ELANOUS_POD_AUTHOR_GRADE_SOURCE = input.authorGradeSource;
+    else delete env.ELANOUS_POD_AUTHOR_GRADE_SOURCE;
+  } else {
+    delete env.ELANOUS_POD_AUTHOR_GRADE;
+    delete env.ELANOUS_POD_AUTHOR_GRADE_SOURCE;
+  }
   if (input.entrance === 'cli-harness-ask') {
     const root = findGitDir(cwd)?.root;
     const path = resolve(cwd, input.input);

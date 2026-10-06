@@ -205,6 +205,14 @@ function mutate(r: Resolved, decide: (record: LeaseRecord | null, now: number) =
   return { ok: false, reason: 'lost the race five times', record: null };
 }
 
+/** Snapshot for read-only consumers: never advances the seen-generation marker or CASes the arbiter. */
+export function readHqLease(deps: HqDeps = {}) {
+  const { store } = resolve(deps);
+  const { now, raw } = store.read();
+  const record = parseLease(raw);
+  return { record, ageSeconds: record ? now - record.renewedAt : null, expired: record ? leaseExpired(record, now) : null };
+}
+
 export type LeaseAction = 'acquire' | 'renew' | 'status' | 'release';
 export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: string; expectedHolder?: string; expectedGeneration?: number } = {}) {
   const r0 = resolve(deps);

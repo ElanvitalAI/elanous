@@ -93,7 +93,16 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
   const c = scqaField(input.scqa.c, 'c');
   const q = input.scqa.q?.trim() ? scqaField(input.scqa.q, 'q') : undefined;
   const a = input.scqa.a?.trim() ? scqaField(input.scqa.a, 'a') : undefined;
-  if (q && q === c) throw new Error('SCQA Q repeats C — leave Q empty');
+  if (q && q === c && input.raisedBy.agent !== 'seat-loop') throw new Error('SCQA Q repeats C — leave Q empty');
+  if (input.raisedBy.agent === 'seat-loop') {
+    if (!q || !a || !input.pendingQuestion?.trim()) throw new Error('seat-loop cards require --q, --a and --pending-question');
+    if ('skipped' in input.recommendation && !(['money', 'security', 'secret'].includes(input.category)
+      || (['publish', 'irreversible'].includes(input.category)
+        && /공개|게시|발행|출시|publish|release/i.test(`${title} ${input.pendingQuestion} ${input.recommendation.reason}`)
+        && /되돌릴 수 없|철회 불가|복구 불가|irreversib|cannot (?:undo|retract)/i.test(`${input.pendingQuestion} ${input.recommendation.reason}`)))) {
+      throw new Error('seat-loop recommendation may only be skipped for money, security or irreversible publication');
+    }
+  }
   if (!Array.isArray(input.options) || (input.options.length < 2 && !(historical && input.options.length === 0))) throw new Error('at least two options required');
   const options = input.options.map(o => ({ key: single(o.key, 'option key'), label: safe(single(o.label, 'option label')), consequence: safe(single(o.consequence, 'option consequence')) }));
   if (options.some(o => !/^[a-z]$/.test(o.key)) || new Set(options.map(o => o.key)).size !== options.length) throw new Error('option keys must be unique lowercase letters');

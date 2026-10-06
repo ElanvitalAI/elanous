@@ -5,6 +5,10 @@ import { spawnSync } from 'node:child_process';
 import { decideRestartNeeded, type RestartNeededResult } from './nexus-restart-needed.js';
 import { debug } from '../debug/log.js';
 import { envLiteral } from '../platform/env-literal.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { getUserConfig } from '../user-config.js';
+import { planEdgeRail, type EdgeRailInput, type EdgeRailPlan } from './self-update-canary.js';
+import { loadRunLedger } from '../self-implement/run-ledger.js';
 
 export interface SelfUpdateOptions {
   from?: string;
@@ -22,6 +26,14 @@ export interface SelfUpdateOptions {
   dev?: boolean;
   /** install.json 의 이전 versionDir 로 current 를 되돌린다. 이전이 없으면 거부. */
   rollback?: boolean;
+  /** Canary rollout action; legacy --auto on|off|status is handled by the CLI scheduler. */
+  auto?: boolean;
+  dryRun?: boolean;
+  seat?: string;
+  quietWindow?: boolean;
+  failureRate?: EdgeRailInput['failureRate'];
+  /** Unique ID of an independently successful canary run; no id means no new run. */
+  canaryRunId?: string;
 }
 
 export interface SelfUpdateDeps {
@@ -30,6 +42,8 @@ export interface SelfUpdateDeps {
   decide?: (opts: { to: string; cwd: string; out: { log: (s: string) => void; error: (s: string) => void } }) => Promise<RestartNeededResult>;
   run?: (command: string, args: string[], cwd: string, options?: { timeout?: number }) => { status: number | null; stderr: string; stdout?: string };
   installedVersion?: () => string;
+  /** 캐너리 시작 «뒤»에 시작해 `completed` 로 끝난 런인가(주입 안 하면 런 원장 `canaryRunSucceededInLedger`). */
+  canaryRunSucceeded?: (runId: string, sinceIso: string) => boolean;
   /** 재시작 뒤 데몬이 이 커밋으로 떴나(주입 안 하면 `/v1/health` 를 최대 90초 폴링). */
   verifyRestart?: (expectedCommit: string) => Promise<VerifyRestartResult>;
   /** 판 목록(이름) — 되돌릴 판 찾기. */
@@ -58,6 +72,13 @@ export interface SelfUpdateDeps {
   packageVersion?: (checkout: string) => string;
   /** 재시작을 실제로 호출해도 되는지. NODE_ENV=test · ELANOUS_TEST_HOME 이면 기본 false. */
   allowLiveRestart?: boolean;
+  /** Automatic edge-rail inputs; injected in tests, never a service registration. */
+  now?: () => Date;
+  stateDir?: string;
+  edgeRailConfig?: () => Pick<EdgeRailInput, 'canaryOkRuns' | 'failureMultiplier' | 'minSamples'>;
+  installEdgeRail?: (options: SelfUpdateOptions, deps: SelfUpdateDeps) => Promise<SelfUpdateResult>;
+  rollbackEdgeRail?: (deps: Pick<SelfUpdateDeps, 'installRoot'>) => ReturnType<typeof rollbackDevInstall>;
+  restartEdgeRail?: () => Promise<boolean>;
 }
 
 export interface SelfUpdateResult {
@@ -87,6 +108,10 @@ export interface SelfUpdateResult {
   relay?: RelayUpdateOutcome;
   /** 텔레그램 러너(`com.elanous.telegram` · `elanous-telegram.service`) 판정 — 🆕 2026-09-25. */
   telegramRunner?: RelayUpdateOutcome;
+  edgeRail?: EdgeRailPlan;
+  missingFixes?: string;
+  /** 실패율 측정 원천이 없으면 자동 되돌림이 판단되지 않는다 — 측정 원천은 다음 조각(EDGE-RAIL2 범위 밖). */
+  autoRollback?: 'active' | 'inactive-no-failure-rate';
 }
 
 export interface RelayUpdateOutcome {
@@ -628,12 +653,186 @@ function readInstallSource(cliRoot: string, exists: (path: string) => boolean, r
   }
 }
 
+/** Output only; never uses a title to decide whether to install. */
+export function missingFixCommitTitles(checkout: string, installed: string, main: string, git: NonNullable<SelfUpdateDeps['git']>): string {
+  if (!/^[a-f0-9]{12,40}$/i.test(installed) || !/^[a-f0-9]{12,40}$/i.test(main)) return 'main 엔 있고 운영엔 없는 수리: 판정 불가';
+  const result = git(checkout, ['log', '--format=%s', '--no-merges', `${installed}..${main}`]);
+  if (result.status !== 0) return 'main 엔 있고 운영엔 없는 수리: 판정 불가';
+  const titles = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => /\bfix(?:es|ed)?\b|(?:^|[(:])fix[:)]/i.test(line))
+    .map((line) => line.replace(/[\r\n\t]+/g, ' ').slice(0, 160)).slice(0, 10);
+  return `main 엔 있고 운영엔 없는 수리: ${titles.length ? titles.join(' · ') : '없음'}`;
+}
+
+interface EdgeRailState { canary: NonNullable<EdgeRailInput['canary']>; mainCommit: string; lastRunId?: string; countedRunIds?: string[]; failureRate?: NonNullable<EdgeRailInput['failureRate']>; promoted?: boolean; rolledBack?: boolean }
+
+function saveEdgeRailState(file: string, state: EdgeRailState): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  renameSync(tmp, file);
+}
+
+/** 런 원장에서: `start` 가 캐너리 시작 이후이고 마지막 `run-status` 가 `completed` 인 런만 참. 못 읽으면 거짓. */
+export function canaryRunSucceededInLedger(runId: string, sinceIso: string, dir?: string): boolean {
+  try {
+    const entries = (dir ? loadRunLedger(runId, dir) : loadRunLedger(runId)) ?? [];
+    const started = Date.parse(entries.find((entry) => entry.event === 'start')?.timestamp ?? '');
+    const last = entries.filter((entry) => entry.event === 'run-status').at(-1);
+    return Number.isFinite(started) && started >= Date.parse(sinceIso) && last?.data.runStatus === 'completed';
+  } catch { return false; }
+}
+
+async function restartEdgeRail(deps: SelfUpdateDeps, checkout: string): Promise<boolean> {
+  if (deps.restartEdgeRail) return deps.restartEdgeRail();
+  if (deps.allowLiveRestart === false || (deps.allowLiveRestart !== true && liveRestartBlocked())) return false;
+  const os = deps.os ?? platform();
+  const command = os === 'darwin' ? 'launchctl' : os === 'linux' ? 'systemctl' : null;
+  if (!command) return false;
+  const args = os === 'darwin' ? ['kickstart', '-k', `gui/${deps.uid ?? process.getuid?.() ?? userInfo().uid}/com.elanous.nexus`] : ['--user', 'restart', 'elanous-nexus'];
+  return (deps.run ?? execute)(command, args, checkout).status === 0;
+}
+
+export async function runEdgeRailUpdate(options: SelfUpdateOptions, deps: SelfUpdateDeps = {}): Promise<SelfUpdateResult> {
+  const out = deps.out ?? console;
+  const root = deps.installRoot ?? defaultInstallRoot();
+  const record = readInstallRecord(root);
+  const checkout = resolve(options.from ?? record?.source ?? deps.cliRoot ?? resolve(import.meta.dir, '../..'));
+  const stateFile = join(deps.stateDir ?? elanousStateRoot(), 'self-update-edge-rail.json');
+  const git = deps.git ?? ((cwd: string, args: string[]) => execute('git', args, cwd));
+  const fail = (reason: string): SelfUpdateResult => {
+    const result: SelfUpdateResult = { exitCode: 2, installedVersion: null, decision: null, restarted: false, reason };
+    out.log(options.json ? JSON.stringify(result) : `self-update --auto: hold — ${reason}`);
+    return result;
+  };
+  if (options.dev || options.rollback || options.version || options.restart) return fail('--auto cannot combine with --dev, --rollback, --version or --restart');
+  if (options.seat !== 'OP' && options.seat !== 'TC' && options.seat !== 'MK' && options.seat !== 'UX') return fail('--auto requires a known --seat (OP|TC|MK|UX)');
+  if (!record?.commit) return fail('installed commit unknown');
+  const currentName = versionDirName(record.versionDir);
+  if (!currentName || !installEntryExists(root, currentName)) return fail('installed entry missing');
+  try {
+    if (readlinkSync(join(root, 'current')) !== record.versionDir) return fail('current does not match installed record');
+  } catch { return fail('current is not a version link'); }
+  if (!options.from && (!record.source || /^(?:https?:|file:)/.test(record.source))) return fail('local checkout source unknown — use --from');
+  if (!existsSync(join(checkout, 'scripts', 'install.sh'))) return fail('checkout installer missing');
+  const verifiedRoot = git(checkout, ['rev-parse', '--show-toplevel']);
+  try {
+    if (verifiedRoot.status !== 0 || !verifiedRoot.stdout.trim() || realpathSync(verifiedRoot.stdout.trim()) !== realpathSync(checkout)) return fail('checkout git root mismatch');
+  } catch { return fail('checkout git root mismatch'); }
+  const head = git(checkout, ['rev-parse', '--verify', 'main']);
+  if (head.status !== 0 || !/^[a-f0-9]{12,40}$/i.test(head.stdout.trim())) return fail('main commit unknown');
+  if (!options.dryRun) {
+    const tracked = git(checkout, ['diff', '--quiet', 'HEAD', '--']);
+    const working = git(checkout, ['rev-parse', '--verify', 'HEAD']);
+    if (tracked.status !== 0 || working.status !== 0 || working.stdout.trim() !== head.stdout.trim()) return fail('main is not the clean checkout HEAD');
+    const untracked = git(checkout, ['ls-files', '--others', '--exclude-standard']);
+    if (untracked.status !== 0 || untracked.stdout.trim()) return fail('checkout contains untracked files');
+  }
+  let state: EdgeRailState | null = null;
+  if (existsSync(stateFile)) {
+    try {
+      const value: unknown = JSON.parse(readFileSync(stateFile, 'utf8'));
+      if (value && typeof value === 'object' && 'canary' in value && 'mainCommit' in value) state = value as EdgeRailState;
+      else return fail('invalid edge-rail state');
+    } catch { return fail('invalid edge-rail state'); }
+  }
+  const mainCommit = head.stdout.trim();
+  const config = deps.edgeRailConfig?.() ?? getUserConfig().harness?.edgeRail ?? {};
+  const canary = state?.mainCommit === mainCommit ? state.canary : null;
+  const observed = (deps.now ?? (() => new Date()))();
+  if (!options.dryRun && canary && canary.okRuns < (config.canaryOkRuns ?? 3) && options.seat === 'OP' && (record.commit.startsWith(mainCommit) || mainCommit.startsWith(record.commit))
+    && !options.failureRate && options.canaryRunId?.trim() && options.canaryRunId !== state?.lastRunId
+    // 같은 런을 두 번 세지 않고, 캐너리 시작 뒤 «성공으로 끝난» 런만 센다(임의·과거·실패 id 로 승격을 열지 못하게).
+    && !(state?.countedRunIds ?? []).includes(options.canaryRunId.trim())
+    && (deps.canaryRunSucceeded ?? canaryRunSucceededInLedger)(options.canaryRunId.trim(), canary.startedAt)
+    && Number.isFinite(observed.getTime()) && observed.getTime() >= Date.parse(canary.startedAt)) {
+    const health = await (deps.verifyRestart ?? defaultVerifyRestart)(mainCommit);
+    if (health.ok && health.daemonSha && (health.daemonSha.startsWith(mainCommit) || mainCommit.startsWith(health.daemonSha)) && state) {
+      state = { ...state, canary: { ...canary, okRuns: canary.okRuns + 1 }, lastRunId: options.canaryRunId, countedRunIds: [...(state.countedRunIds ?? []), options.canaryRunId.trim()] };
+      saveEdgeRailState(stateFile, state);
+    }
+  }
+  const input: EdgeRailInput = {
+    // 설정에서는 세 수치만 받는다 — 여분 키가 판단 입력(seat·failureRate·canary…)을 덮지 못하게.
+    ...(config.canaryOkRuns !== undefined ? { canaryOkRuns: config.canaryOkRuns } : {}),
+    ...(config.failureMultiplier !== undefined ? { failureMultiplier: config.failureMultiplier } : {}),
+    ...(config.minSamples !== undefined ? { minSamples: config.minSamples } : {}),
+    now: observed, mainCommit, installed: record.commit, seat: options.seat,
+    canary: state?.mainCommit === mainCommit ? state.canary : null,
+    failureRate: options.failureRate ?? (state?.mainCommit === mainCommit ? state.failureRate : null) ?? null,
+    quietWindow: options.quietWindow === true, promoted: state?.mainCommit === mainCommit ? state.promoted : false,
+  };
+  // 이 main 은 이미 되돌렸다 — 새 main 이 올 때까지 다시 깔거나 승격하지 않는다.
+  const plan = state?.mainCommit === mainCommit && state.rolledBack
+    ? { decision: 'hold' as const, reason: 'this main was rolled back; waiting for a new main' }
+    : planEdgeRail(input);
+  const fixes = missingFixCommitTitles(checkout, record.commit, mainCommit, git);
+  if (!options.dryRun) try { debug.log('self-update.edge-rail', 'plan', { decision: plan.decision, reason: plan.reason, seat: options.seat, mainCommit, installed: record.commit, fixes }); } catch { /* log sink optional */ }
+  const emit = (result: SelfUpdateResult): SelfUpdateResult => {
+    const autoRollback = input.failureRate ? 'active' as const : 'inactive-no-failure-rate' as const;
+    const merged = { ...result, edgeRail: plan, missingFixes: fixes, autoRollback };
+    out.log(options.json ? JSON.stringify(merged) : `self-update --auto: ${plan.decision} — ${plan.reason} · ${fixes}${autoRollback === 'active' ? '' : ' · 자동 되돌림 비활성 — 실패율 측정 원천 없음'}`);
+    return merged;
+  };
+  if (options.dryRun || plan.decision === 'hold' || plan.decision === 'wait-quiet') return emit({ exitCode: 0, installedVersion: null, decision: null, restarted: false, reason: plan.reason });
+  if (plan.decision === 'rollback' && (!record.previous || !versionDirName(record.previous))) return emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: 'no previous version for rollback' });
+  if (plan.decision === 'rollback' && !deps.restartEdgeRail && liveRestartBlocked()) return emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: 'live restart blocked' });
+  if (plan.decision === 'rollback') {
+    const rolled = (deps.rollbackEdgeRail ?? rollbackDevInstall)(deps);
+    if (!rolled.ok) return emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: rolled.reason });
+    // 되돌린 main 은 표시해 둔다 — 캐너리 OK 수가 남아 있어도 다음 실행이 다시 승격하지 못하게.
+    if (state?.mainCommit === mainCommit) saveEdgeRailState(stateFile, { ...state, promoted: false, rolledBack: true });
+    else saveEdgeRailState(stateFile, { mainCommit, canary: { seat: 'OP', okRuns: 0, startedAt: input.now.toISOString() }, rolledBack: true });
+    const restarted = await restartEdgeRail(deps, checkout);
+    const health = restarted ? await (deps.verifyRestart ?? defaultVerifyRestart)(rolled.record.commit ?? '') : null;
+    const confirmed = !!(health?.ok && health.daemonSha && rolled.record.commit
+      && (health.daemonSha.startsWith(rolled.record.commit) || rolled.record.commit.startsWith(health.daemonSha)));
+    return emit({ exitCode: confirmed ? 0 : 1, installedVersion: rolled.versionName, decision: null, restarted, current: `versions/${rolled.versionName}`, reason: confirmed ? plan.reason : `${plan.reason}; rollback health not confirmed` });
+  }
+  if (!deps.restartEdgeRail && liveRestartBlocked()) return emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: 'live restart blocked' });
+  const installer = deps.installEdgeRail ?? ((next: SelfUpdateOptions, injected: SelfUpdateDeps) => runUpdateForInstallation(next, { cliRoot: injected.cliRoot, checkout: injected }));
+  // The existing --from dev installer checks entry existence and restores current even when install.sh fails after relinking.
+  const installed = await installer({ from: checkout, dev: true, restart: false }, { ...deps, notice: () => {}, out: { log: () => {}, error: () => {} } });
+  if (installed.exitCode !== 0) return emit(installed);
+  const nextRecord = readInstallRecord(root);
+  const nextName = versionDirName(nextRecord?.versionDir);
+  let currentLink = '';
+  try { currentLink = readlinkSync(join(root, 'current')); } catch { /* no valid installed current */ }
+  if (!nextName || !installEntryExists(root, nextName) || nextRecord?.commit !== mainCommit || currentLink !== nextRecord.versionDir) {
+    const rolled = record.versionDir && nextRecord?.previous === record.versionDir ? (deps.rollbackEdgeRail ?? rollbackDevInstall)(deps) : null;
+    return emit({ ...installed, exitCode: 1, reason: `installed entry/commit not confirmed${rolled?.ok ? '; previous build restored' : '; rollback not confirmed'}` });
+  }
+  const restarted = await restartEdgeRail(deps, checkout);
+  // 설치한 판이 재시작·건강에서 실패해 되돌렸으면 같은 main 을 다시 깔지 않게 표시한다.
+  const markRolledBack = (): void => saveEdgeRailState(stateFile, { mainCommit, canary: { seat: 'OP', okRuns: 0, startedAt: input.now.toISOString() }, rolledBack: true });
+  if (!restarted) {
+    const rolled = record.versionDir && readInstallRecord(root)?.previous === record.versionDir
+      ? (deps.rollbackEdgeRail ?? rollbackDevInstall)(deps) : null;
+    if (rolled?.ok) markRolledBack();
+    return emit({ ...installed, exitCode: 1, restarted: false, reason: `${plan.reason}; restart not confirmed${rolled?.ok ? '; previous build restored' : '; rollback not confirmed'}` });
+  }
+  const verified = await (deps.verifyRestart ?? defaultVerifyRestart)(mainCommit);
+  if (!verified.ok || !verified.daemonSha || !(verified.daemonSha.startsWith(mainCommit) || mainCommit.startsWith(verified.daemonSha))) {
+    const rolled = record.versionDir && readInstallRecord(root)?.previous === record.versionDir
+      ? (deps.rollbackEdgeRail ?? rollbackDevInstall)(deps) : null;
+    if (rolled?.ok) { markRolledBack(); await restartEdgeRail(deps, checkout); }
+    return emit({ ...installed, exitCode: 1, restarted: true, reason: `${plan.reason}; restarted build health not confirmed${rolled?.ok ? '; previous build restored' : '; rollback not confirmed'}` });
+  }
+  if (plan.decision === 'canary-install') {
+    const next: EdgeRailState = { mainCommit, canary: { seat: 'OP', okRuns: 0, startedAt: input.now.toISOString() }, ...(options.failureRate ? { failureRate: options.failureRate } : {}) };
+    saveEdgeRailState(stateFile, next);
+  } else if (state?.mainCommit === mainCommit && plan.decision === 'promote-all') {
+    saveEdgeRailState(stateFile, { ...state, promoted: true });
+  }
+  return emit({ ...installed, restarted: true });
+}
+
 /** Route an installed CLI by where it was installed from: a release URL → release installer, a local checkout → git update. */
 export async function runUpdateForInstallation(
   options: SelfUpdateOptions = {},
   deps: { cliRoot?: string; exists?: (path: string) => boolean; readText?: (path: string) => string; release?: ReleaseUpdateDeps; checkout?: SelfUpdateDeps } = {},
 ): Promise<SelfUpdateResult> {
   const cliRoot = resolve(deps.cliRoot ?? resolve(import.meta.dir, '../..'));
+  if (options.auto) return runEdgeRailUpdate(options, { cliRoot, ...deps.checkout });
   const exists = deps.exists ?? existsSync;
   const holder = resolve(cliRoot, '..', '..');
   const parent = resolve(holder, '..');
@@ -726,7 +925,7 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
 
     if (options.dev) {
       try {
-        const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path'], checkout) });
+        const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path', ...(deps.installRoot ? ['--prefix', deps.installRoot] : [])], checkout) });
         return emit({
           exitCode: 0,
           installedVersion: installed.versionName,

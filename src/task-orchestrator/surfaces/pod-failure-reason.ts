@@ -1,3 +1,31 @@
+/** Executor kinds of the dev child's `--json` result line (`src/index.ts` writeStdoutJson · DevExecutor.kind). */
+const CHILD_RESULT_KINDS = new Set(['self', 'external']);
+
+/** The dev child's terminal line nests the stage: {ok, kind, result:{stage, ok, node, outcome, …}}. Other JSON rows are not results. */
+export function nestedPodResult(row: Record<string, unknown>): { stage: string; ok: boolean; error?: string } | null {
+  if (typeof row.kind !== 'string' || !CHILD_RESULT_KINDS.has(row.kind) || typeof row.ok !== 'boolean') return null;
+  if (!row.result || typeof row.result !== 'object' || Array.isArray(row.result)) return null;
+  const result = row.result as Record<string, unknown>;
+  if (typeof result.stage !== 'string' || typeof result.ok !== 'boolean') return null;
+  if (result.ok) return { stage: result.stage, ok: true };
+  const classification = result.abandonedClassification;
+  const detail = typeof result.supervisorVerdict === 'string' ? result.supervisorVerdict
+    : classification && typeof classification === 'object' && !Array.isArray(classification)
+      ? (classification as Record<string, unknown>).classification : undefined;
+  const reason = [result.node, result.outcome].filter((part): part is string => typeof part === 'string' && part.length > 0).join(' ');
+  const error = [reason || (typeof result.error === 'string' ? result.error : ''), typeof detail === 'string' && detail ? detail : ''].filter(Boolean).join(' · ');
+  return { stage: result.stage, ok: false, ...(error ? { error } : {}) };
+}
+
+/** A child terminal row: the legacy flat form {stage, ok, error?} (no kind, or a child kind) or the nested dev result. Any other kind is not a result. */
+export function podTerminalRow(row: Record<string, unknown>): { stage: string; ok: boolean; error?: string } | null {
+  if (typeof row.kind === 'string' && !CHILD_RESULT_KINDS.has(row.kind)) return null;
+  if (typeof row.stage === 'string' && typeof row.ok === 'boolean') {
+    return { stage: row.stage, ok: row.ok, ...(typeof row.error === 'string' ? { error: row.error } : {}) };
+  }
+  return nestedPodResult(row);
+}
+
 /** Extract a human-readable reason from a failed child Pod without treating transfer markers as child errors. */
 export function extractPodFailureReason(input: {
   logs: string;
@@ -12,7 +40,7 @@ export function extractPodFailureReason(input: {
   if (input.containerReason === 'OOMKilled') return 'OOMKilled: 컨테이너 메모리 한도 초과';
 
   const isBookkeeping = (line: string): boolean =>
-    /^ELANOUS_(?:MEM|RUN_LEDGER|USAGE_ROLLUP|POD_)/u.test(line) || /^(?:at\s+\S|\.\.\.\s+\d+\s+more\b|cleanup\s+(?:complete|done|finished)\b)/iu.test(line);
+    /^(?:ELANOUS_(?:MEM|RUN_LEDGER|USAGE_ROLLUP|POD_)|\[graph\] )/u.test(line) || /^(?:at\s+\S|\.\.\.\s+\d+\s+more\b|cleanup\s+(?:complete|done|finished)\b)/iu.test(line);
   const isError = (line: string): boolean =>
     /\berror\b|\bfail(?:ed|ure)?\b|exception|fatal|denied|timed?\s*out|exceeded|overloaded|unavailable|exhausted|오류|실패/iu.test(line);
   const meaningful: Array<{ text: string; terminal: boolean }> = [];
@@ -24,10 +52,11 @@ export function extractPodFailureReason(input: {
       try { parsed = JSON.parse(trimmed); } catch { /* An ordinary line may begin with a brace. */ }
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         const row = parsed as Record<string, unknown>;
-        if (typeof row.ok === 'boolean' && typeof row.stage === 'string') {
+        const terminal = podTerminalRow(row);
+        if (terminal) {
           meaningful.length = 0;
-          if (row.ok === false && typeof row.error === 'string') {
-            const errorLines = row.error.split(/\r\n|\n|\r/u).map((part) => part.trim())
+          if (terminal.ok === false && typeof terminal.error === 'string') {
+            const errorLines = terminal.error.split(/\r\n|\n|\r/u).map((part) => part.trim())
               .filter((part) => part && !isBookkeeping(part));
             const errorLine = [...errorLines].reverse().find(isError) ?? errorLines.at(-1);
             if (errorLine) meaningful.push({ text: errorLine, terminal: true });

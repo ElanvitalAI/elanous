@@ -6,6 +6,7 @@ import type { SelfDevJobResult } from './orchestrate.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
+import { routeSupervisorVerdict, type SupervisorNext } from './supervisor-verdict-edges.js';
 
 export interface SupervisorRound {
   round: number;
@@ -186,6 +187,7 @@ function formatGoalPlanRevisionObservation(results: readonly SelfDevJobResult[])
 export type SupervisorJobResult = SelfDevJobResult & {
   reviewReason?: string;
   salvage?: 'launched' | 'parked';
+  next?: SupervisorNext;
 };
 
 export function decideNextRun(input: {
@@ -592,9 +594,13 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     } catch { /* fail-open */ }
 
     if (decision.action === 'stop') {
+      const reason = decision.stopReason ?? 'unregistered-stop';
+      const next = routeSupervisorVerdict(reason, results).next;
+      try { debug.log('self-dev.supervisor', 'verdict-edge', { runId, reason, next }); } catch { /* observation must not interrupt supervision */ }
+      results = results.map((result) => ({ ...result, next }));
       if (runId && decision.stopReason) {
         const storage = resolveSupervisorStopStorage(opts.runStore);
-        const persistence = recordSelfDevRunSupervisorStop(runId, decision.stopReason, storage.path);
+        const persistence = recordSelfDevRunSupervisorStop(runId, decision.stopReason, storage.path, next);
         const storageObservation = {
           storagePath: storage.path,
           storageSource: storage.source,

@@ -38,6 +38,33 @@ describe('extractPodFailureReason', () => {
     expect(extractPodFailureReason({ logs: trailing })).toBe('Error: dependency unavailable');
   });
 
+  test('nested child result wins over later graph bookkeeping and reports classification', () => {
+    const logs = [
+      JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned', prNumber: 24407, abandonedClassification: { classification: 'report-deficit', classificationBasis: 'terminal-state-not-reviewed' } } }),
+      '[graph] collect fail (0.28s)',
+    ].join('\n');
+    expect(extractPodFailureReason({ logs })).toBe('implement abandoned · report-deficit');
+    expect(extractPodFailureReason({ logs: '[graph] collect fail (0.28s)' })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+  });
+
+  test('nested rework verdict and nested success do not reuse earlier failures', () => {
+    const failed = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, node: 'rework', outcome: 'abandoned', supervisorVerdict: 'UNCONVERGEABLE' } });
+    expect(extractPodFailureReason({ logs: failed })).toBe('rework abandoned · UNCONVERGEABLE');
+    const success = JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } });
+    expect(extractPodFailureReason({ logs: `${failed}\n${success}\n[graph] collect fail (0.28s)` })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+  });
+
+  test('a non-child JSON row shaped like a result cannot clear the child failure', () => {
+    const failed = JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned' } });
+    const graph = JSON.stringify({ kind: 'graph', result: { stage: 'merged', ok: true } });
+    const noTopOk = JSON.stringify({ kind: 'self', result: { stage: 'merged', ok: true } });
+    expect(extractPodFailureReason({ logs: `${failed}\n${graph}\n${noTopOk}` })).toBe('implement abandoned');
+    const flatGraph = JSON.stringify({ kind: 'graph', stage: 'merged', ok: true });
+    expect(extractPodFailureReason({ logs: `${failed}\n${flatGraph}` })).toBe('implement abandoned');
+    const legacyFlat = JSON.stringify({ stage: 'merged', ok: true });
+    expect(extractPodFailureReason({ logs: `${failed}\n${legacyFlat}` })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+  });
+
   test('a later successful child result prevents attributing an earlier error to the failed Job', () => {
     const logs = `${JSON.stringify({ stage: 'error', ok: false, error: 'earlier error' })}\n${JSON.stringify({ stage: 'merged', ok: true })}\n`;
     expect(extractPodFailureReason({ logs })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');

@@ -1,5 +1,139 @@
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../../src/seat-dispatch/seat-request-ledger.js';
 import { debug } from '../../src/debug/log.js';
 import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
+
+type DocsFollowEvidence = { location: string; verifiedAt: string; publishedAt: string };
+type DocsFollowExposure = {
+  verdict: 'public' | 'beta' | 'internal';
+  judge: 'MK';
+  rubric: string;
+  verifiedAt: string;
+};
+export type DocsFollowItem = {
+  id: string;
+  status: string;
+  sha?: string;
+  exposure?: DocsFollowExposure;
+  docs?: DocsFollowEvidence;
+  homepage?: { elanous: DocsFollowEvidence; elanvital: DocsFollowEvidence };
+  readme?: DocsFollowEvidence;
+};
+type DocsFollowCoverage = {
+  id: string;
+  sha: string | null;
+  docs: boolean;
+  homepage: boolean;
+  readme: boolean;
+  missing: Array<'docs' | 'homepage' | 'readme'>;
+};
+type DocsFollowReport = {
+  coverage: DocsFollowCoverage[];
+  pending: DocsFollowCoverage[];
+  unassessed: string[];
+  ratio: number | null;
+  verdict: 'pass' | 'fail' | 'unmeasured';
+};
+
+/** An attestation is not coverage unless it points to a measured, timestamped surface. */
+function evidenced(value: DocsFollowEvidence | undefined, measuredAt?: string): boolean {
+  const at = value?.verifiedAt ? Date.parse(value.verifiedAt) : NaN;
+  const published = value?.publishedAt ? Date.parse(value.publishedAt) : NaN;
+  return !!value?.location?.trim() && Number.isFinite(at) && Number.isFinite(published)
+    && /(?:Z|[+-]\d\d:\d\d)$/.test(value.verifiedAt)
+    && /(?:Z|[+-]\d\d:\d\d)$/.test(value.publishedAt)
+    && published <= at && (measuredAt === undefined || at <= Date.parse(measuredAt));
+}
+
+/** Unknown exposure/landing never becomes a published claim; it remains visible as an unassessed item. */
+export function calculateDocsFollow(manifest: ReleaseManifest, items: readonly DocsFollowItem[], publishedAt?: string, measuredAt?: string): DocsFollowReport {
+  const landed = new Set(manifest.in.map((entry) => entry.sha).filter(Boolean));
+  const green = items.filter((item) => item.status === 'green');
+  const ids = new Set<string>();
+  for (const item of items) {
+    if (!item.id?.trim() || ids.has(item.id)) throw new Error('invalid or duplicate docs-follow item');
+    ids.add(item.id);
+  }
+  const judged = (item: DocsFollowItem) => item.exposure?.judge === 'MK'
+    && !!item.exposure.rubric?.trim() && evidenced({ location: item.exposure.rubric, verifiedAt: item.exposure.verifiedAt,
+      publishedAt: item.exposure.verifiedAt }, measuredAt)
+    && ['public', 'beta', 'internal'].includes(item.exposure.verdict);
+  const unassessed = green.filter((item) => !judged(item) || !item.sha || !landed.has(item.sha))
+    .map((item) => item.id);
+  const supplied = new Set(items.map((item) => item.sha));
+  for (const entry of manifest.in) {
+    if (entry.sha && (entry.kind === 'feat' || entry.kind === 'fix' || entry.kind === 'security') && entry.line && !supplied.has(entry.sha)) {
+      unassessed.push(`landing:${entry.sha}`);
+    }
+  }
+  const visible = green.filter((item) => judged(item) && (item.exposure?.verdict === 'public' || item.exposure?.verdict === 'beta') && item.sha && landed.has(item.sha));
+  const coverage: DocsFollowCoverage[] = visible.map((item) => {
+    const docs = evidenced(item.docs, measuredAt);
+    const homepage = evidenced(item.homepage?.elanous, measuredAt) && evidenced(item.homepage?.elanvital, measuredAt);
+    const readme = evidenced(item.readme, measuredAt);
+    return { id: item.id, sha: item.sha!, docs, homepage, readme,
+      missing: ([['docs', docs], ['homepage', homepage], ['readme', readme]] as const)
+        .filter(([, present]) => !present).map(([surface]) => surface) };
+  });
+  const pending = coverage.filter((item) => !item.docs || !item.homepage);
+  const covered = coverage.filter((item) => item.docs && item.homepage && item.readme).length;
+  const start = publishedAt ? Date.parse(publishedAt) : NaN;
+  const end = measuredAt ? Date.parse(measuredAt) : NaN;
+  const deadline = start + 24 * 60 * 60 * 1000;
+  const validWindow = Number.isFinite(start) && Number.isFinite(end) && end >= start
+    && /(?:Z|[+-]\d\d:\d\d)$/.test(publishedAt ?? '')
+    && /(?:Z|[+-]\d\d:\d\d)$/.test(measuredAt ?? '');
+  const atDeadline = validWindow && end > deadline
+    ? calculateDocsFollow(manifest, items, publishedAt, new Date(deadline).toISOString()) : null;
+  const timely = atDeadline ?? { coverage, pending, unassessed,
+    ratio: coverage.length && !unassessed.length ? covered / coverage.length : null };
+  const pass = validWindow && timely.coverage.length > 0 && !timely.unassessed.length
+    && timely.ratio !== null && timely.ratio >= 0.8 && !timely.pending.length;
+  // Missing proof may still establish timely coverage; only a verified late publication rules it out.
+  const lateProof = (proof: DocsFollowEvidence | undefined) => evidenced(proof, measuredAt)
+    && Date.parse(proof!.publishedAt) > deadline;
+  const impossible = validWindow && end > deadline && !pass && !timely.unassessed.length
+    && visible.length > 0 && (
+      visible.some((item) => lateProof(item.docs) || lateProof(item.homepage?.elanous) || lateProof(item.homepage?.elanvital))
+      || visible.filter((item) => ![item.docs, item.homepage?.elanous, item.homepage?.elanvital, item.readme]
+        .some(lateProof)).length / visible.length < 0.8
+    );
+  return { coverage, pending, unassessed,
+    ratio: coverage.length && !unassessed.length ? covered / coverage.length : null,
+    verdict: pass ? 'pass' as const : impossible ? 'fail' as const : 'unmeasured' as const };
+}
+
+/** Persist a per-release report and queue each missing docs/home item once for MK. */
+export function recordDocsFollow(root: string, manifest: ReleaseManifest, items: readonly DocsFollowItem[], now: Date = new Date(), publishedAt?: string) {
+  if (!Number.isFinite(now.getTime())) throw new Error('invalid docs-follow time');
+  if (!/^\d+\.\d+\.\d+$/.test(manifest.version)) throw new Error('invalid docs-follow version');
+  const report = calculateDocsFollow(manifest, items, publishedAt, now.toISOString());
+  const path = join(root, 'release', manifest.version, 'docs-follow.json');
+  const journal = join(root, 'seat-requests', 'requests.jsonl');
+  withSeatRequestLedgerLock(journal, () => {
+    const known = new Set(listSeatRequests(root).map((row) => row.key));
+    const missing = [
+      ...report.pending.map((item) => ({ id: item.id, text: `문서 반영 대기 목록 v${manifest.version} · ${item.id}: ${item.missing.join(', ')} — 착지 ${item.sha}; docs·홈 실측 뒤 닫기` })),
+      ...report.unassessed.map((id) => ({ id, text: `문서 반영 대기 목록 v${manifest.version} · ${id}: 착지·green·EXPOSE-RUBRIC 근거 미판정 — 확인 전 공개 문면 금지` })),
+    ];
+    const rows = missing.filter((item) => !known.has(`docs-follow:${manifest.version}:${item.id}`)).map((item) => ({
+      key: `docs-follow:${manifest.version}:${item.id}`, seat: 'MK', status: 'queued' as const,
+      text: item.text, queuedAt: now.toISOString(), ref: `release:${manifest.version}:docs-follow`,
+    }));
+    mkdirSync(join(root, 'release', manifest.version), { recursive: true });
+    const temp = `${path}.${createHash('sha256').update(now.toISOString()).digest('hex').slice(0, 12)}.tmp`;
+    try {
+      writeFileSync(temp, JSON.stringify({ version: manifest.version, measuredAt: now.toISOString(), ...report }, null, 2) + '\n');
+      renameSync(temp, path);
+    } finally {
+      if (existsSync(temp)) unlinkSync(temp);
+    }
+    appendSeatRequestRows(journal, rows);
+  });
+  return report;
+}
 
 /** Render public IN lines only; keep private titles and PR numbers out of release notes. */
 export function renderReleaseNotes(manifest: ReleaseManifest, version: string): string {

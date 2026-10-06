@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 
 export interface LandingFreeze {
   reason: string;
@@ -60,15 +60,23 @@ function mergesDir(root: string): string { return join(root, 'landing-merges'); 
 
 export interface LandingMergeGuard { frozen: LandingFreeze | null; end: () => void }
 
-export function beginLandingMerge(root = effectiveInstanceRoot(), now = new Date()): LandingMergeGuard {
-  const dir = mergesDir(root);
-  mkdirSync(dir, { recursive: true });
-  const marker = join(dir, `${process.pid}-${randomUUID()}.json`);
-  writeFileSync(marker, `${JSON.stringify({ pid: process.pid, startedAt: now.toISOString() })}\n`, { mode: 0o600 });
-  const end = () => { rmSync(marker, { force: true }); };
+/** Mark both authorities before reading either freeze: the host and the child each drain their own in-flight merges. */
+export function beginLandingMerge(root = effectiveInstanceRoot(), now = new Date(), prodFreezeRoot = prodInstanceRoot(), forceReason?: string): LandingMergeGuard {
+  const markers: string[] = [];
+  const end = () => { for (const marker of markers) rmSync(marker, { force: true }); };
+  try {
+    for (const authority of new Set([prodFreezeRoot, root])) {
+      const dir = mergesDir(authority);
+      mkdirSync(dir, { recursive: true });
+      const marker = join(dir, `${process.pid}-${randomUUID()}.json`);
+      markers.push(marker);
+      writeFileSync(marker, `${JSON.stringify({ pid: process.pid, startedAt: now.toISOString() })}\n`, { mode: 0o600 });
+    }
+  } catch (error) { end(); throw error; }
   let frozen: LandingFreeze | null;
-  try { frozen = readLandingFreeze(root, now); } catch (error) { end(); throw error; }
-  if (frozen) { end(); return { frozen, end: () => {} }; }
+  try { frozen = readLandingFreeze(prodFreezeRoot, now) ?? (root === prodFreezeRoot ? null : readLandingFreeze(root, now)); }
+  catch (error) { end(); throw error; }
+  if (frozen && !forceReason?.trim()) { end(); return { frozen, end: () => {} }; }
   return { frozen: null, end };
 }
 

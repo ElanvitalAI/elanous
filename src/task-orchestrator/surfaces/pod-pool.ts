@@ -14,7 +14,8 @@
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
@@ -186,7 +187,8 @@ export class PodPoolScheduler {
   private readonly hostLease: HostPoolLease;
   private readonly pollMs: number;
   private readonly occupancy: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>;
-  constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
+  private readonly memberMemory: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>;
+  constructor(readonly members: readonly PodPoolMember[], options: { status?: () => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; memberMemory?: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
     this.hostLease = options.hostLease ?? podPoolHostLease(members);
@@ -195,6 +197,9 @@ export class PodPoolScheduler {
       return recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
     });
     this.measure = async () => measureStatus();
+    // An injected status (tests, callers with their own measurement) without memberMemory never shells out to kubectl here.
+    this.memberMemory = options.memberMemory ?? (options.status ? (() => []) : () => measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }).members
+      .map((m: PodLeaseMember) => ({ context: m.context, allocatableMemoryBytes: m.allocatableMemoryBytes })));
     this.occupancy = options.occupancy ?? (() => measureMemberOccupancy(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }));
     this.admission = new PodLeaseAdmission({ status: async () => {
       const measured = await measureStatus();
@@ -267,6 +272,23 @@ export class PodPoolScheduler {
       };
     });
   }
+  /**
+   * LAUNCH-STALL (10-06): members whose total allocatable memory is below one Job's limit can never take it —
+   * waiting for them is an endless silent stall (minio 12.5GB vs a 16Gi standard Job). A member whose memory
+   * could not be read is not judged unfit (unknown ≠ too small).
+   */
+  async unfitMembers(limitBytes: number): Promise<Array<{ context: string; allocatableMemoryBytes: number }>> {
+    let rows: Array<{ context: string; allocatableMemoryBytes: number | null }>;
+    try { rows = await this.memberMemory(); } catch { return []; }
+    return rows.flatMap((r) => r.allocatableMemoryBytes !== null && r.allocatableMemoryBytes < limitBytes
+      ? [{ context: r.context, allocatableMemoryBytes: r.allocatableMemoryBytes }] : []);
+  }
+  /** Why admission is still waiting: the pool-wide lease measurement (null before any reading). Slot waits get their reason from tryAcquire's onEmpty. */
+  waitReason(): string | null {
+    const r = this.lastRaw;
+    if (!r) return null;
+    return `recommended=${r.recommended ?? 'unknown'} limitedBy=${r.limitedBy ?? '-'} memorySlots=${r.memorySlots ?? '?'}${r.reason ? ` reason=${r.reason}` : ''}`;
+  }
   admissionSnapshot(): ReturnType<PodLeaseAdmission['snapshot']> {
     return this.admission.snapshot();
   }
@@ -277,7 +299,7 @@ export class PodPoolScheduler {
    * A member whose occupancy could not be read falls back to inflight-only (never treated as zero occupied).
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void): Promise<PodPoolMember | null> {
     let reading: Record<string, MemberOccupancy>;
     try { reading = await this.occupancy(); }
     catch (error) {
@@ -293,6 +315,8 @@ export class PodPoolScheduler {
       || (cand.measured !== best.measured ? cand.measured
         : cand.slots / cand.member.capacity > best.slots / best.member.capacity);
     for (const m of this.members) {
+      // LAUNCH-STALL: a member this launch cannot fit is skipped for this call only (other launches may fit it).
+      if (skip?.has(m.context)) continue;
       const inflight = this.inflight.get(m.context) ?? 0;
       const row = reading[m.context];
       const ok = !!row && row.occupied !== null;
@@ -304,7 +328,10 @@ export class PodPoolScheduler {
       const cand = { member: m, slots, measured: ok };
       if (better(cand)) best = cand;
     }
-    if (!best) return null;
+    if (!best) {
+      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}`);
+      return null;
+    }
     this.inflight.set(best.member.context, (this.inflight.get(best.member.context) ?? 0) + 1);
     const share = Object.fromEntries(this.members.map((m) => [m.context, Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100]));
     debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured, share });
@@ -396,13 +423,14 @@ export function podImageBuildScript(cwd: string = process.cwd()): string | null 
   return null;
 }
 
-type RemoteBuild = (host: string, cluster: string, registry?: string) => Promise<{ ok: boolean; detail: string }>;
+/** packedTgz = 풀 동기화가 한 번 만든 패키지 묶음(있으면 build.sh 가 pack 을 다시 하지 않는다). */
+type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?: string) => Promise<{ ok: boolean; detail: string }>;
 
-function defaultRemoteBuild(script: string, image: string): RemoteBuild {
-  return (host, cluster, registry) => new Promise((done) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ELANOUS_BUILD_IMAGE: image === 'elanous-harness-lite:local' ? 'lite' : 'full' };
-    delete env.ELANOUS_BUILD_REGISTRY;
-    if (registry) env.ELANOUS_BUILD_REGISTRY = registry;
+/** 같은 트리의 패키지 묶음(tgz)을 «한 번» 만든다 — 멤버들이 같이 쓴다. cleanup 은 동기화가 끝나면 부른다. */
+type PoolPack = () => Promise<{ ok: boolean; tgz?: string; detail: string; cleanup?: () => void }>;
+
+function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<{ ok: boolean; detail: string }> {
+  return new Promise((done) => {
     const child = spawn('bash', [script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
@@ -412,17 +440,52 @@ function defaultRemoteBuild(script: string, image: string): RemoteBuild {
 }
 
 /**
+ * 🩸 2026-10-06: 멤버마다 build.sh 가 같은 트리에서 `bun pm pack` 을 «동시에» 돌렸다 — prepack 이 트리에 쓰는
+ * src/version/packed-revision.json 을 다른 쪽 postpack 이 지워 한쪽이 «⛔ pack» 으로 죽었다(node-c 가 매 발사 빠졌다).
+ * ⇒ 원격 멤버가 둘 이상이면 pack 은 여기서 한 번만 하고 그 tgz 를 나눠 준다.
+ */
+function defaultPoolPack(script: string): PoolPack {
+  return async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-pool-pack-'));
+    const tgz = join(dir, 'elanous.tgz');
+    const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_BUILD_PACK_ONLY: tgz };
+    delete env.ELANOUS_BUILD_PACKED_TGZ;
+    delete env.ELANOUS_BUILD_REMOTE;
+    const r = await runBuildScript(script, env);
+    const cleanup = () => rmSync(dir, { recursive: true, force: true });
+    if (!r.ok || !existsSync(tgz)) { cleanup(); return { ok: false, detail: r.detail }; }
+    return { ok: true, tgz, detail: r.detail, cleanup };
+  };
+}
+
+function defaultRemoteBuild(script: string, image: string): RemoteBuild {
+  return (host, cluster, registry, packedTgz) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ELANOUS_BUILD_IMAGE: image === 'elanous-harness-lite:local' ? 'lite' : 'full' };
+    delete env.ELANOUS_BUILD_REGISTRY;
+    if (registry) env.ELANOUS_BUILD_REGISTRY = registry;
+    delete env.ELANOUS_BUILD_PACK_ONLY;
+    delete env.ELANOUS_BUILD_PACKED_TGZ;
+    if (packedTgz) env.ELANOUS_BUILD_PACKED_TGZ = packedTgz;
+    return runBuildScript(script, env);
+  };
+}
+/**
  * 풀의 원격 노드들을 «동시에» 이 트리의 판으로 맞춘다 (09-25 개선).
  *   1순위 = 노드 «쪽에서» 빌드(build.sh ELANOUS_BUILD_REMOTE) — 빌드 재료(수십 MB)만 보내고 무거운 층은 그 노드의 캐시가 재사용한다.
  *           📏 커밋이 바뀐 뒤 두 노드를 올리는 데 벽시계 55초(종전: 다시 굽기 1분 40초 ⊕ 4GB 차례 전송 5분 48초).
  *   실패하면 = 종전의 통째 전송(syncPoolImage)으로 떨어진다.
  */
-export async function syncPoolImages(members: readonly PodPoolMember[], image: string, localCommit: string | null, deps: { run?: RemoteRun; remoteBuild?: RemoteBuild; buildScript?: string | null; ship?: typeof syncPoolImage; localSkillsDigest?: string | null; waitIntervalMs?: number; waitMaxMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; inspect?: LocalImageInspect; transfer?: ImageShip } = {}): Promise<Map<string, PoolImageSync>> {
+export async function syncPoolImages(members: readonly PodPoolMember[], image: string, localCommit: string | null, deps: { run?: RemoteRun; remoteBuild?: RemoteBuild; buildScript?: string | null; ship?: typeof syncPoolImage; localSkillsDigest?: string | null; waitIntervalMs?: number; waitMaxMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; inspect?: LocalImageInspect; transfer?: ImageShip; pack?: PoolPack | null } = {}): Promise<Map<string, PoolImageSync>> {
   const run = deps.run ?? defaultRemoteRun;
   const script = deps.buildScript === undefined ? podImageBuildScript() : deps.buildScript;
   const remoteBuild = deps.remoteBuild ?? (script ? defaultRemoteBuild(script, image) : null);
   const ship = deps.ship ?? ((m: PodPoolMember, img: string, commit: string | null, remote: RemoteRun) => syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer }));
   const results = new Map<string, PoolImageSync>();
+  // pack 한 번 ⊕ 나눠 쓰기 — 원격 멤버가 둘 이상일 때만(하나뿐이면 종전대로 build.sh 가 스스로 pack 한다).
+  //   주입된 remoteBuild(시험)에는 진짜 pack 을 붙이지 않는다 — pack 도 주입해야 쓴다.
+  const pack = deps.pack !== undefined ? deps.pack : (!deps.remoteBuild && script ? defaultPoolPack(script) : null);
+  const sharePack = pack && members.filter((m) => m.sshHost).length >= 2 ? pack : null;
+  let packed: ReturnType<PoolPack> | null = null;
   await Promise.all(members.map(async (m) => {
     const t0 = Date.now();
     if (!m.sshHost) { results.set(m.context, { ok: true, action: 'local', detail: 'this machine', ms: 0 }); return; }
@@ -437,7 +500,12 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
       return;
     }
     if (remoteBuild) {
-      const b = await remoteBuild(m.sshHost, m.k3dCluster, m.registry);
+      // 같은 판이 아닌 멤버가 처음 여기 닿을 때 pack 한다(전부 fresh 면 pack 도 없다).
+      const shared = sharePack ? await (packed ??= sharePack()) : null;
+      if (shared && !shared.ok) debug.log('self-implement.pod', 'pool-image-pack-failed', { context: m.context, detail: shared.detail });
+      const b = shared && !shared.ok
+        ? { ok: false, detail: shared.detail }
+        : await remoteBuild(m.sshHost, m.k3dCluster, m.registry, shared?.tgz);
       const after = remoteImageCommit(m, image, run);
       const refAfter = registryImageRef(m, localCommit ?? after, run, image);
       // ⭐ 레지스트리 노드면 «이 판 커밋 태그가 레지스트리에 있나»로 판정한다 — Pod 는 그 커밋 태그를 pull 한다.
@@ -462,6 +530,6 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
       return;
     }
     results.set(m.context, { ...ship(m, image, localCommit, run), ms: Date.now() - t0 });
-  }));
+  })).finally(async () => { if (packed) (await packed).cleanup?.(); });
   return results;
 }

@@ -19,6 +19,8 @@ export interface TaskCard {
   updatedAt: number;
   runId?: string;
   apiTitle?: string;
+  status?: 'open' | 'closed';
+  closedReason?: string;
   wishReply?: { surface: string; address: string | null } | null;
 }
 

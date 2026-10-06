@@ -8,7 +8,7 @@ import { intakeOutboxDir, kstDay } from './route.js';
 
 export type DigestLensVerdict = '대체 후보' | '보강' | '경쟁 대조';
 export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
-export interface IntakeDigest { day: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
+export interface IntakeDigest { day: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
 const AXIS_LABEL: Record<string, string> = {
   video_automation: '영상 자동화', agent_basics: '에이전트 기본', agent_applied: '에이전트 응용', unrelated: '그 밖',
@@ -82,12 +82,24 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
     };
   });
   const goals = readJsonl(join(out, 'goals', `${day}.jsonl`)).map((g) => ({ fact: String(g.fact ?? ''), ...(g.url ? { url: String(g.url) } : {}) }));
+  const lensRows = readJsonl(join(out, 'lens', `${day}.jsonl`));
+  const news = lensRows.flatMap((row) =>
+    typeof row.title === 'string' && typeof row.url === 'string' && Array.isArray(row.summary) && Array.isArray(row.implication)
+      ? [{ title: row.title, url: row.url, summary: row.summary.filter((s): s is string => typeof s === 'string'), implication: row.implication.filter((s): s is string => typeof s === 'string') }]
+      : []);
+  const shadowSuggestions = lensRows.flatMap((row) =>
+    Array.isArray(row.suggestions) ? row.suggestions.flatMap((raw: unknown) => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+      const suggestion = raw as Record<string, unknown>;
+      if (suggestion.status !== '제안' || typeof suggestion.fact !== 'string' || !suggestion.fact.trim()) return [];
+      return [{ fact: suggestion.fact, ...(typeof row.url === 'string' ? { url: row.url } : {}), verdict: typeof suggestion.verdict === 'string' ? suggestion.verdict : '판단 필요' }];
+    }) : []);
   const review = readJsonl(join(out, 'review', `${day}.jsonl`)).map((r) => ({ fact: String(r.fact ?? ''), ...(r.note ? { note: String(r.note) } : {}) }));
   const grounding = readJsonl(join(out, 'grounding.jsonl')).filter((g) => typeof g.at === 'string' && kstDay(g.at) === day).length;
   const lastNewAt = readSavedCursorAt(root);
   const silentMs = lastNewAt ? now.getTime() - Date.parse(lastNewAt) : NaN;
   return {
-    day, absorbed, goals, review, grounding,
+    day, absorbed, goals, ...(news.length ? { news } : {}), ...(shadowSuggestions.length ? { shadowSuggestions } : {}), review, grounding,
     release: readJsonl(join(out, 'release', `${day}.jsonl`)).length,
     manual: readJsonl(join(out, 'manual', `${day}.jsonl`)).length,
     ...(lastNewAt && silentMs > SAVED_SILENCE_MS ? { savedSilence: { days: Math.floor(silentMs / 86_400_000), lastNewAt } } : {}),
@@ -98,7 +110,8 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
 export function renderDigestMarkdown(d: IntakeDigest): string {
   const L: string[] = [`## 📰 오늘의 흡수 요약 (${d.absorbed.length})`, ''];
   if (d.savedSilence) L.push(`> ⚠️ 텔레그램 «저장된 메시지»에서 새 글을 ${d.savedSilence.days}일째 못 받았다(마지막 새 글 수집 ${kstDay(d.savedSilence.lastNewAt)}) — 저장했는데 안 들어왔다면 저장한 곳(본인 «저장된 메시지»인지)을 확인한다.`, '');
-  if (!d.absorbed.length) { L.push('오늘 흡수한 것이 없다.', ''); return L.join('\n'); }
+  if (!d.absorbed.length) L.push('오늘 흡수한 것이 없다.', '');
+  if (!d.absorbed.length && !d.news?.length) return L.join('\n');
   const byAxis = new Map<string, DigestEntry[]>();
   for (const e of d.absorbed) (byAxis.get(e.axis) ?? byAxis.set(e.axis, []).get(e.axis)!).push(e);
   for (const [axis, rows] of byAxis) {
@@ -106,9 +119,23 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
     for (const e of rows) L.push(`- ${e.noteName ? `[[${e.noteName}]]` : e.url ?? e.id} — ${e.oneLiner ?? '(요약 줄 없음)'}`);
     L.push('');
   }
+  if (d.news?.length) {
+    L.push(`### 📰 관심 뉴스 (${d.news.length})`, '');
+    for (const article of d.news.slice(0, 10)) {
+      L.push(`- [${article.title}](${article.url})`);
+      for (const line of article.summary) L.push(`  - ${line}`);
+      for (const line of article.implication) L.push(`  - 엘라누스 함의: ${line}`);
+    }
+    L.push('');
+  }
   if (d.goals.length) {
     L.push(`### 🔴 엘라누스에 없는 것 — 골 후보 (${d.goals.length})`, '');
     for (const g of d.goals.slice(0, 10)) L.push(`- ${g.fact}${g.url ? ` · [원본](${g.url})` : ''}`);
+    L.push('');
+  }
+  if (d.shadowSuggestions?.length) {
+    L.push(`### 📰 뉴스 칸 제안 — 그림자, 판 미등록 (${d.shadowSuggestions.length})`, '');
+    for (const s of d.shadowSuggestions.slice(0, 10)) L.push(`- [${s.verdict}] ${s.fact}${s.url ? ` · [원본](${s.url})` : ''}`);
     L.push('');
   }
   const undecided = d.absorbed.filter((e) => !e.impact).length;
@@ -122,7 +149,15 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
   // «Touching» is decided by the lens verdict alone; a missing note summary only changes how S reads (ACP must-fix).
   const touching = d.absorbed.filter((e) => e.impact);
   const L = [`흡수 ${d.absorbed.length} → 우리에게 닿는 것 ${touching.length}`];
-  if (!touching.length) return L[0];
+  // 관심 뉴스는 최대 셋 — 기사마다 S(요약 첫 줄) · A(엘라누스 함의 첫 줄) · 링크를 한 덩어리로(NEWS-INTAKE).
+  for (const article of (d.news ?? []).slice(0, 3)) {
+    L.push(`📰 ${article.title}`);
+    if (article.summary[0]) L.push(`S: ${article.summary[0]}`);
+    if (article.implication[0]) L.push(`A: ${article.implication[0]}`);
+    L.push(article.url);
+  }
+  if (d.shadowSuggestions?.length) L.push(`뉴스 칸 제안 ${d.shadowSuggestions.length}건 (그림자·판 미등록): ${d.shadowSuggestions.slice(0, 3).map((s) => `[${s.verdict}] ${s.fact}${s.url ? ` ${s.url}` : ''}`).join(' · ')}`);
+  if (!touching.length) return L.join('\n');
   // At most three items are shown, each as its own S·C·A·link block so context and source stay paired;
   // a later item sharing (verdict, target) says «위와 같은 행동» instead of repeating the A sentence (ACP must-fix).
   // S must be the note's own summary: items without one still count as touching but are not shown (ACP must-fix).

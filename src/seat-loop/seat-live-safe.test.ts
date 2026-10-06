@@ -239,11 +239,12 @@ test('live-safe refuses a prohibited publication but may raise its decision card
     const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
       run: async (args) => { calls.push(args); return args[1] === 'budget' ? '{"outcome":"proceed"}' : '{"id":"dec-1"}'; },
       enqueue: async () => { throw Error('publication queued'); } });
-    expect(result).toMatchObject({ status: 'hitl', action: 'decision', reason: '게시' });
+    // The market-publication rule now names the whole requested phrase (DECISION-CARD-QUALITY: the card says which words matched).
+    expect(result).toMatchObject({ status: 'hitl', action: 'decision', reason: '마켓에 게시' });
     expect(calls.map((args) => args.slice(0, 2))).toEqual([['harness', 'budget'], ['decisions', 'raise']]);
     expect(listHarnessQueue({ root: f.root })).toEqual([]);
     expect(spy.mock.calls.find(([category, event]) => category === 'seat.loop' && event === 'refused')?.[2])
-      .toMatchObject({ seat: 'TC', item: 'K1', action: '게시', reason: 'execution forbidden; decision card only' });
+      .toMatchObject({ seat: 'TC', item: 'K1', action: '마켓에 게시', reason: 'execution forbidden; decision card only' });
   } finally { spy.mockRestore(); f.close(); }
 });
 

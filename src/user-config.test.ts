@@ -90,6 +90,17 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test('harness.authorGrade retains full or lite and discards absent or invalid values', () => {
+  for (const grade of ['full', 'lite'] as const) {
+    writeConfig({ harness: { authorGrade: grade } });
+    expect(buildUserConfig(configPath).harness?.authorGrade).toBe(grade);
+  }
+  for (const grade of [undefined, 'invalid', 4, null]) {
+    writeConfig({ harness: { authorGrade: grade } });
+    expect(buildUserConfig(configPath).harness?.authorGrade).toBeUndefined();
+  }
+});
+
 test('harness.repo accepts a non-empty repository name, stays optional, and survives config save', () => {
   writeConfig({});
   expect(buildUserConfig(configPath).harness?.repo).toBeUndefined();
@@ -105,6 +116,20 @@ test('harness.repo accepts a non-empty repository name, stays optional, and surv
   saveUserConfig(config, configPath);
   expect(JSON.parse(readFileSync(configPath, 'utf8')).harness.repo).toBe('owner/repo');
   expect(buildUserConfig(configPath).harness).toMatchObject({ repo: 'owner/repo', defaultRepo: '/local/repository', exposeGate: 'strict' });
+});
+
+test('harness.nestedElanousMaxDepth defaults to 2, validates and survives saving', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).harness?.nestedElanousMaxDepth).toBe(2);
+  for (const invalid of [0, -1, 1.5, '3', null, Number.MAX_SAFE_INTEGER + 1]) {
+    writeConfig({ harness: { nestedElanousMaxDepth: invalid } });
+    expect(buildUserConfig(configPath).harness?.nestedElanousMaxDepth).toBe(2);
+  }
+  writeConfig({ harness: { nestedElanousMaxDepth: 4 } });
+  const config = buildUserConfig(configPath);
+  expect(config.harness?.nestedElanousMaxDepth).toBe(4);
+  saveUserConfig(config, configPath);
+  expect(buildUserConfig(configPath).harness?.nestedElanousMaxDepth).toBe(4);
 });
 
 test('harness revert guard depth defaults, validates, and survives config save', () => {

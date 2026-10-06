@@ -3618,9 +3618,13 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
+  /** Maximum nested elanous depth; safe positive integer, default 2. */
+  nestedElanousMaxDepth?: number;
+  /** Minutes a Pod launch may wait in one stage (admission · pool slot) before a `launch-stalled` event; positive number, default 15. */
+  launchStallMinutes?: number;
   /** Follow-up goal after a merged harness PR. Omitted and anything but `live` record only. */
   followUp?: 'shadow' | 'live';
 };
@@ -4022,7 +4026,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { revertGuard: { depth: 50 }, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, followUp: 'shadow' },
+    harness: { revertGuard: { depth: 50 }, nestedElanousMaxDepth: 2, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, followUp: 'shadow' },
     grounding: { sources: [] },
     raw: {},
   };
@@ -4741,6 +4745,15 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       })() },
     },
     harness: {
+      edgeRail: (() => {
+        const value = harness.edgeRail && typeof harness.edgeRail === 'object' && !Array.isArray(harness.edgeRail)
+          ? harness.edgeRail as Record<string, unknown> : {};
+        return {
+          canaryOkRuns: typeof value.canaryOkRuns === 'number' && Number.isSafeInteger(value.canaryOkRuns) && value.canaryOkRuns > 0 ? value.canaryOkRuns : 3,
+          failureMultiplier: typeof value.failureMultiplier === 'number' && Number.isFinite(value.failureMultiplier) && value.failureMultiplier > 1 ? value.failureMultiplier : 2,
+          minSamples: typeof value.minSamples === 'number' && Number.isSafeInteger(value.minSamples) && value.minSamples > 0 ? value.minSamples : 30,
+        };
+      })(),
       revertGuard: { depth: (() => {
         const value = harness.revertGuard && typeof harness.revertGuard === 'object' && !Array.isArray(harness.revertGuard)
           ? (harness.revertGuard as Record<string, unknown>).depth : undefined;
@@ -4754,7 +4767,10 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           && (harness.queue as Record<string, unknown>).seatCap && typeof (harness.queue as Record<string, unknown>).seatCap === 'object'
           && !Array.isArray((harness.queue as Record<string, unknown>).seatCap)
           ? (harness.queue as { seatCap: Record<string, unknown> }).seatCap : {},
-      ).filter(([seat, cap]) => /^(OP|TC|MK|UX)$/.test(seat) && typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0)) },
+      ).filter(([seat, cap]) => /^(OP|TC|MK|UX)$/.test(seat) && typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0)),
+      ...(harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
+        && typeof (harness.queue as Record<string, unknown>).directSay === 'boolean'
+        ? { directSay: (harness.queue as { directSay: boolean }).directSay } : {}) },
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
@@ -4774,9 +4790,15 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
             ? repairPerDay : 3,
         };
       })(),
+      ...(harness.authorGrade === 'lite' || harness.authorGrade === 'full' ? { authorGrade: harness.authorGrade } : {}),
       ...(harness.authorOnPod === true ? { authorOnPod: true } : {}),
       ...(harness.nestedElanous === 'allow' || harness.nestedElanous === 'refuse'
         ? { nestedElanous: harness.nestedElanous } : {}),
+      nestedElanousMaxDepth: typeof harness.nestedElanousMaxDepth === 'number'
+        && Number.isSafeInteger(harness.nestedElanousMaxDepth) && harness.nestedElanousMaxDepth > 0
+        ? harness.nestedElanousMaxDepth : 2,
+      ...(typeof harness.launchStallMinutes === 'number' && Number.isFinite(harness.launchStallMinutes) && harness.launchStallMinutes > 0
+        ? { launchStallMinutes: harness.launchStallMinutes } : {}),
       followUp: harness.followUp === 'live' ? 'live' : 'shadow',
       budgetGate: parseHarnessBudgetGate(
         rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness)

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,23 @@ import { runAutoApprove, WARNING_ONLY } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 import { runPublish, waitForAssets } from './publish-node.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
+import { effectiveInstanceRoot, prodInstanceRoot, resetEffectiveInstanceRoot } from '../../src/instance/resolve.js';
+
+// The local freeze universe is isolated too (runPublish → beginLandingMerge reads effectiveInstanceRoot()).
+let isolatedStateDir = '';
+let savedStateDir: string | undefined;
+beforeEach(() => {
+  isolatedStateDir = mkdtempSync(join(tmpdir(), 'publish-node-state-'));
+  savedStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+  resetEffectiveInstanceRoot();
+  expect(effectiveInstanceRoot()).not.toBe(prodInstanceRoot());
+});
+afterEach(() => {
+  if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDir;
+  resetEffectiveInstanceRoot();
+  rmSync(isolatedStateDir, { recursive: true, force: true });
+});
 
 const runner = (answers: Record<string, string[]>) => {
   const calls: string[] = [];
@@ -65,14 +82,14 @@ test('publish accepts real auto-approve output with warning-only rows but reject
       }
       throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
     };
-    expect(runPublish(run)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
     expect(calls.some((call) => call.startsWith('bun bin/elanous.mjs release publish '))).toBe(true);
 
     const missing = auto.metrics.find((metric) => !WARNING_ONLY.has(metric.name))!;
     context.outputs['auto-approve'] = { ...auto, metrics: auto.metrics.filter((metric) => metric !== missing) };
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
     calls.length = 0;
-    expect(runPublish(run)).toMatchObject({ outcome: 'fail', summary: 'publish blocked: neither auto-approve nor approve-publish approved' });
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: 'publish blocked: neither auto-approve nor approve-publish approved' });
     expect(calls).toEqual([]);
   } finally {
     if (previousContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
@@ -95,13 +112,13 @@ test('publish rechecks freeze immediately before irreversible publication; only 
     process.env.ELANOUS_STATE_DIR = root;
     enableLandingFreeze({ reason: 'drill', by: 'MK' }, root);
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
-    expect(runPublish(run)).toMatchObject({ outcome: 'fail', summary: expect.stringContaining('동결 중 · drill') });
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'fail', summary: expect.stringContaining('동결 중 · drill') });
     expect(publishCalls).toBe(0);
     // A frozen publication leaves no in-flight marker behind (so `freeze on` does not wait on it).
     const { inFlightLandingMerges } = await import('../../src/release-loop/landing-freeze.js');
     expect(inFlightLandingMerges(root)).toBe(0);
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3', forceFreeze: true }, outputs });
-    expect(runPublish(run)).toMatchObject({ outcome: 'ok' });
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok' });
     expect(publishCalls).toBe(1);
   } finally {
     if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;

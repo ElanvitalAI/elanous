@@ -94,6 +94,100 @@ test('successful release story delivers three files and one MK request per versi
     source: 'release-story', version, status: 'pending', text: `${version} 공지 초안 준비됨: ${options.outDir}` }]);
 });
 
+test('0.2.14 post-release MK request contains announcement, site news and manual candidates without publishing', () => {
+  const options = fixture();
+  const releaseVersion = '0.2.14';
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- New reading mode\n');
+  addItem(releaseVersion, { id: 'STORY_214', title: 'Reading mode — details' });
+  setItem(releaseVersion, 'STORY_214', { status: 'green' }, 'MK');
+  const context = { input: { version: releaseVersion, previousVersion: '0.2.13' }, outputs: { publish: { outcome: 'ok' }, verify: { outcome: 'ok' } } };
+  const draft = () => draftReleaseStory({ ...options, version: releaseVersion });
+  expect(runReleaseStory(context, draft).outcome).toBe('ok');
+  const request = listSeatRequests(options.dir, { seat: 'MK' })[0]!;
+  expect(request).toMatchObject({ key: 'release-story:0.2.14', status: 'pending', source: 'release-story' });
+  expect(request.text).toContain(options.outDir);
+  expect(readFileSync(join(options.outDir, 'announcement.md'), 'utf8')).toContain('New reading mode');
+  expect(readFileSync(join(options.outDir, 'site-news.md'), 'utf8')).toContain('New reading mode');
+  expect(readFileSync(join(options.outDir, 'manual-candidates.md'), 'utf8')).toContain('STORY_214');
+  expect(readdirSync(options.outDir).sort()).toEqual(['announcement.md', 'manual-candidates.md', 'site-news.md']);
+  expect(runReleaseStory({ ...context, outputs: { publish: { outcome: 'ok' }, verify: { outcome: 'fail' } } }, draft).outcome).toBe('fail');
+  expect(listSeatRequests(options.dir, { seat: 'MK' })).toHaveLength(1);
+});
+
+test('first verified public number becomes a review-only lead card with measurement and CMO rubric', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- New reading mode\n');
+  green('NUMERIC', 'Reading mode — details');
+  const ledger = new ClaimsLedger({ stateDir: options.dir });
+  ledger.add({ id: 'NUMBER', claim: 'Readers can open 12 views.', audience: 'personal', owner: 'MK' });
+  ledger.verify('NUMBER', { value: '12', command: 'bun measure-views.ts', measuredAt: new Date().toISOString(),
+    validUntil: new Date(Date.now() + 86400000).toISOString(), by: 'MK' });
+  ledger.link('NUMBER', { cell: 'NUMERIC', version });
+  const result = draftReleaseStory(options);
+  const announcement = readFileSync(result.files[0]!, 'utf8');
+  expect(announcement).toContain('첫 공개 숫자 후보: Readers can open 12 views.');
+  expect(announcement).toContain('소구점 NUMBER');
+  expect(announcement).toContain('재측정: bun measure-views.ts');
+  expect(announcement).toContain('CMO 게시 판단');
+  expect(announcement).toContain('게시/수정/보류와 이유');
+  expect(readFileSync(result.files[1]!, 'utf8')).toContain('Lead card candidate (CMO review required)\nReaders can open 12 views.');
+  ledger.publish('NUMBER', 'MK');
+  const afterPublic = draftReleaseStory(options);
+  expect(readFileSync(afterPublic.files[0]!, 'utf8')).not.toContain('첫 공개 숫자 후보: Readers can open 12 views.');
+  expect(readFileSync(afterPublic.files[0]!, 'utf8')).toContain('새 종류 후보: New reading mode');
+});
+
+test('numeric claim linked to an earlier release is not selected as a first-public card', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- New reading mode\n');
+  green('REPEATED', 'Reading mode — details');
+  const ledger = new ClaimsLedger({ stateDir: options.dir });
+  ledger.add({ id: 'OLD_NUMBER', claim: 'Readers can open 12 views.', audience: 'personal', owner: 'MK' });
+  ledger.verify('OLD_NUMBER', { value: '12', command: 'bun measure-views.ts', measuredAt: new Date().toISOString(),
+    validUntil: new Date(Date.now() + 86400000).toISOString(), by: 'MK' });
+  ledger.link('OLD_NUMBER', { cell: 'OLD_CELL', version: '9.8.6' });
+  ledger.link('OLD_NUMBER', { cell: 'REPEATED', version });
+  const result = draftReleaseStory(options);
+  expect(readFileSync(result.files[0]!, 'utf8')).toContain('새 종류 후보: New reading mode');
+  expect(readFileSync(result.files[0]!, 'utf8')).not.toContain('첫 공개 숫자 후보: Readers can open 12 views.');
+});
+
+test('new kind is the lead card when no newly verified numeric claim exists; unverifiable numeric prose is not a first-public claim', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- New kind of reading\n- 200 old events\n');
+  green('NEW_KIND', 'Reading mode — details');
+  const result = draftReleaseStory(options);
+  expect(readFileSync(result.files[0]!, 'utf8')).toContain('새 종류 후보: New kind of reading');
+  expect(readFileSync(result.files[0]!, 'utf8')).not.toContain('첫 공개 숫자 후보: 200 old events');
+  expect(readFileSync(result.files[1]!, 'utf8')).toContain('Lead card candidate (CMO review required)\nNew kind of reading');
+});
+
+test('new-kind lead card keeps the measurement tied to its selected source', () => {
+  const options = fixture();
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- New reading mode\n');
+  green('READ', 'Reading mode');
+  green('EXPORT', 'New export mode');
+  const ledger = new ClaimsLedger({ stateDir: options.dir });
+  ledger.add({ id: 'EXPORT_CLAIM', claim: 'New export mode is available.', audience: 'personal', owner: 'MK' });
+  ledger.verify('EXPORT_CLAIM', { value: 'yes', command: 'bun measure-export.ts', measuredAt: new Date().toISOString(),
+    validUntil: new Date(Date.now() + 86400000).toISOString(), by: 'MK' });
+  ledger.link('EXPORT_CLAIM', { cell: 'EXPORT', version });
+  let announcement = readFileSync(draftReleaseStory(options).files[0]!, 'utf8');
+  expect(announcement).toContain('새 종류 후보: New reading mode\n- 출처: release/next.md\n- 재측정: 확인 명령 없음 — 게시 전 확인');
+  expect(announcement).not.toContain('재측정: bun measure-export.ts');
+
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- Reading mode\n');
+  announcement = readFileSync(draftReleaseStory(options).files[0]!, 'utf8');
+  expect(announcement).toContain('새 종류 후보: New export mode\n- 출처: green 칸\n- 재측정: 확인 명령 없음 — 게시 전 확인');
+  expect(announcement).not.toContain('재측정: bun measure-export.ts');
+
+  writeFileSync(options.nextPath, '# Next\n## Feat\n- Reading mode\n');
+  setItem(version, 'EXPORT', { status: 'yellow' }, 'MK');
+  ledger.link('EXPORT_CLAIM', { cell: 'READ', version });
+  announcement = readFileSync(draftReleaseStory(options).files[0]!, 'utf8');
+  expect(announcement).toContain('새 종류 후보: New export mode is available.\n- 출처: 소구점 EXPORT_CLAIM\n- 재측정: bun measure-export.ts');
+});
+
 test('draft failure is observed without queuing an MK request', () => {
   const options = fixture();
   writeFileSync(options.nextPath, '# Next\n## Feat\n- Search is faster\n');

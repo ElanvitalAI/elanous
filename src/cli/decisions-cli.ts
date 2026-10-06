@@ -53,6 +53,7 @@ export function formatDecisionDetail(e: DecisionEntry): string {
       ...(e.note ? [`메모: ${e.note}`] : [])] : []),
     ...(e.withdrawnAt ? [`철회: ${kst(e.withdrawnAt)} · ${e.withdrawReason}`] : []),
     '이력:', ...e.history.map(h => `  ${h.type} · ${h.at ? kst(h.at) : '시각 미상'} · ${h.by}${h.choice ? ` · ${h.choice}` : ''}${h.reason ? ` · ${h.reason}` : ''} · ${h.version ? version(h.version) : '판 미상'}`),
+    ...(e.pendingQuestion ? [`판단 재료:\n${e.pendingQuestion}`] : []),
     ...(e.refs?.length ? [`참조: ${e.refs.join(' · ')}`] : [])].join('\n');
 }
 
@@ -86,6 +87,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
   root.command('raise').description('SCQA·선택지와 권고로 결정 항목을 올린다')
     .requiredOption('--title <text>').requiredOption('--category <category>')
     .requiredOption('--s <text>').requiredOption('--c <text>').option('--q <text>').option('--a <text>')
+    .option('--pending-question <text>', '판단 재료 전문 (무엇·지금까지·재측·선택지별 결과·권고·확신·그냥 두면·근거)')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
     .option('--recommend <key>').option('--why <text>').option('--skip-recommend <reason>')
     .option('--xcheck <SEAT:메모>', '교차 확인 (반복)', repeat, [] as string[])
@@ -96,7 +98,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .option('--ref <url>', '참조 (반복)', repeat, [] as string[])
     .option('--due <when>', '기한 — UTC ISO(2026-10-04T09:00:00Z) 또는 +Nh(지금부터 N시간) · 기한 2시간 전 텔레그램·디스코드로 다시 알린다')
     .option('--json').option('--hq-override')
-    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; xcheck: string[]; noXcheck?: string; alternative?: string; dissent?: string; track?: DecisionTrack; agent?: string; session?: string; resumeQuestion?: string; run?: string; ref: string[]; json?: boolean; hqOverride?: boolean }) => fail(() => {
+    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; pendingQuestion?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; xcheck: string[]; noXcheck?: string; alternative?: string; dissent?: string; track?: DecisionTrack; agent?: string; session?: string; resumeQuestion?: string; run?: string; ref: string[]; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (o.run !== undefined && o.resumeQuestion === undefined) throw new Error('--run requires --resume-question');
       if (o.skipRecommend !== undefined && (o.recommend !== undefined || o.why !== undefined)) throw new Error('choose recommendation or skip, not both');
       if (o.skipRecommend === undefined && (!o.recommend || !o.why)) throw new Error('--recommend and --why required, or --skip-recommend <reason>');
@@ -111,6 +113,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const who = agent(o.agent);
       if (!mayWrite('raise', o.hqOverride)) return;
       const entry = new DecisionLedger(config).raise({ title: o.title, category: o.category, scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) }, options,
+        ...(o.pendingQuestion ? { pendingQuestion: o.pendingQuestion } : {}),
         ...(crossCheck.length ? { crossCheck } : { crossCheckSkipped: o.noXcheck ?? 'missing' }),
         ...(o.alternative !== undefined ? { alternative: o.alternative } : {}), ...(o.dissent !== undefined ? { dissent: o.dissent } : {}),
         recommendation: o.skipRecommend !== undefined ? { skipped: true, reason: o.skipRecommend } : { option: o.recommend!, why: o.why! },

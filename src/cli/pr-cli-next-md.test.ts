@@ -4,7 +4,30 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
-import { nextMdWarning, runPrLand, type PrLandDeps } from './pr-cli';
+import { nextMdWarning, runPrLand as realRunPrLand, type PrLandDeps } from './pr-cli';
+import { afterEach as freezeIsolationAfterEach, beforeEach as freezeIsolationBeforeEach } from 'bun:test';
+import { rmSync as freezeIsolationRm } from 'node:fs';
+import { resetEffectiveInstanceRoot as freezeIsolationReset } from '../instance/resolve.js';
+
+// Both freeze authorities are isolated for every runPrLand here: the operational root (injected) and the
+// local universe (ELANOUS_STATE_DIR) — these tests must never read or write the real ~/.elanous (FREEZE-HOSTMERGE).
+let isolatedFreezeRoot = '';
+let isolatedStateDirForFreeze = '';
+let savedStateDirForFreeze: string | undefined;
+freezeIsolationBeforeEach(() => {
+  isolatedFreezeRoot = mkdtempSync(join(tmpdir(), 'pr-land-freeze-'));
+  isolatedStateDirForFreeze = mkdtempSync(join(tmpdir(), 'pr-land-state-'));
+  savedStateDirForFreeze = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = isolatedStateDirForFreeze;
+  freezeIsolationReset();
+});
+freezeIsolationAfterEach(() => {
+  if (savedStateDirForFreeze === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDirForFreeze;
+  freezeIsolationReset();
+  freezeIsolationRm(isolatedFreezeRoot, { recursive: true, force: true });
+  freezeIsolationRm(isolatedStateDirForFreeze, { recursive: true, force: true });
+});
+const runPrLand: typeof realRunPrLand = (opts = {}, deps = {}) => realRunPrLand(opts, { prodFreezeRoot: isolatedFreezeRoot, ...deps });
 
 const warning = '⚠ next-md: 사용자에게 보이는 변경인데 release/next.md 에 줄이 없습니다 — 공개 노트에서 빠집니다. 「- <kind> — <영어 한 문장>. Documentation: … Target: next.」 한 줄을 더하십시오.';
 

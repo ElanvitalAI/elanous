@@ -17,6 +17,36 @@ import { registerDecisionsCommands } from './decisions-cli.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
 
+test('seat-loop CLI raise retains full judgment material, Q/A and recommendation and refuses unjustified omission', () => {
+  const stateDir = root();
+  const lines: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const base = ['raise', '--agent', 'seat-loop', '--title', '반복 정지', '--category', 'other', '--s', '칸 반복', '--c', '착지 없음',
+    '--q', '계속할까?', '--a', '멈춘다', '--pending-question', '무엇: 칸 반복\n지금까지: 3회\n지금 상태 재측: yellow\n그냥 두면: 중복\n근거: 원장',
+    '--option', 'a=재개:재시도', '--option', 'b=정지:중단', '--json'];
+  try {
+    expect(() => run(...base, '--skip-recommend', '모르겠다')).toThrow('seat-loop recommendation may only be skipped');
+    expect(() => run(...base.filter(x => !['--q', '계속할까?'].includes(x)), '--recommend', 'b', '--why', '중복 방지')).toThrow('seat-loop cards require');
+    const entry = JSON.parse(run(...base, '--recommend', 'b', '--why', '중복 방지'));
+    expect(entry.scqa).toMatchObject({ q: '계속할까?', a: '멈춘다' });
+    expect(entry.recommendation).toEqual({ option: 'b', why: '중복 방지' });
+    expect(run('show', entry.id)).toContain('판단 재료:\n무엇: 칸 반복');
+    expect(() => run(...base.map(x => x === 'other' ? 'publish' : x), '--skip-recommend', '홍보 메시지')).toThrow('seat-loop recommendation may only be skipped');
+    expect(() => run(...base.map(x => x === 'other' ? 'irreversible' : x), '--skip-recommend', 'DB 삭제 복구 불가')).toThrow('seat-loop recommendation may only be skipped');
+    for (const [category, reason] of [['money', '결제는 사람 승인 필요'], ['security', '보안 자격 변경은 사람 승인 필요'],
+      ['publish', '되돌릴 수 없는 공개는 사람 승인 필요'], ['irreversible', '공개 철회 불가']] as const) {
+      const exceptional = JSON.parse(run(...base.map(x => x === 'other' ? category : x), '--skip-recommend', reason));
+      expect(exceptional.recommendation).toEqual({ skipped: true, reason });
+    }
+    const sameQuestion = JSON.parse(run(...base.map(x => x === '착지 없음' ? '계속할까?' : x), '--recommend', 'b', '--why', '중복 방지'));
+    expect(sameQuestion.scqa).toMatchObject({ c: '계속할까?', q: '계속할까?', a: '멈춘다' });
+    expect(() => run(...base.map(x => x === '착지 없음' ? '계속할까?' : x).map(x => x === 'seat-loop' ? 'codex' : x),
+      '--recommend', 'b', '--why', '중복 방지')).toThrow('SCQA Q repeats C');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
 test('CLI records delegated decisions and the owner reads overnight seat report without cards', () => {
   const stateDir = root();
   const lines: string[] = [];

@@ -577,6 +577,43 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(again.get('pool-node-b')?.action).toBe('fresh');   // 같은 판이면 아무것도 안 한다
   });
 
+  // 🩸 2026-10-06 MINIH-PACK: 멤버마다 build.sh 가 같은 트리에서 pack 을 동시에 돌려 한쪽이 «⛔ pack» 으로 빠졌다.
+  test('two remote members share one pack; its failure reason reaches the detail; single and fresh members do not pack', async () => {
+    const labels = new Map<string, string>([['node-b', 'old'], ['node-c', 'old']]);
+    const run: RemoteRun = (host, cmd) => (cmd.includes('k3d-elanous-registry') ? { status: 1, stdout: '', stderr: '' } : { status: 0, stdout: `${labels.get(host)}\n`, stderr: '' });
+    const tgzSeen: (string | undefined)[] = [];
+    const remoteBuild = async (host: string, _cluster: string, _registry?: string, tgz?: string) => { tgzSeen.push(tgz); labels.set(host, 'new'); return { ok: true, detail: 'built' }; };
+    let packs = 0, cleanups = 0;
+    const pack = async () => { packs++; await new Promise((r) => setTimeout(r, 10)); return { ok: true, tgz: '/shared/elanous.tgz', detail: '✓ pack', cleanup: () => { cleanups++; } }; };
+    const members = parsePodPool('pool-node-b@node-b:2,pool-node-c@node-c:1');
+    const r = await syncPoolImages(members, 'img', 'new', { run, remoteBuild, pack, waitMaxMs: 0 });
+    expect(r.get('pool-node-b')).toMatchObject({ ok: true, action: 'built' });
+    expect(r.get('pool-node-c')).toMatchObject({ ok: true, action: 'built' });
+    expect(packs).toBe(1);
+    expect(tgzSeen).toEqual(['/shared/elanous.tgz', '/shared/elanous.tgz']);
+    expect(cleanups).toBe(1);
+    // 이미 같은 판이면 pack 도 없다.
+    const fresh = await syncPoolImages(members, 'img', 'new', { run, remoteBuild, pack });
+    expect([...fresh.values()].map((x) => x.action)).toEqual(['fresh', 'fresh']);
+    expect(packs).toBe(1);
+    // 멤버 하나뿐이면 종전대로 — 나눠 줄 pack 없이 build.sh 가 스스로.
+    labels.set('node-b', 'old'); tgzSeen.length = 0;
+    await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'img', 'new', { run, remoteBuild, pack });
+    expect(packs).toBe(1);
+    expect(tgzSeen).toEqual([undefined]);
+    // pack 이 실패하면 원인 줄이 detail 에 남고, 종전의 통째 전송으로 떨어진다.
+    labels.set('node-b', 'old'); labels.set('node-c', 'old');
+    const failing = async () => ({ ok: false, detail: "⛔ pack — error: ENOENT: open 'src/version/packed-revision.json'" });
+    const ship = (m: { sshHost?: string }) => { labels.set(m.sshHost!, 'new'); return { ok: true, action: 'shipped' as const, detail: 'old → new' }; };
+    let builds = 0;
+    const failed = await syncPoolImages(members, 'img', 'new', { run, remoteBuild: async () => { builds++; return { ok: true, detail: 'built' }; }, pack: failing, ship, waitMaxMs: 0 });
+    expect(builds).toBe(0);
+    for (const ctx of ['pool-node-b', 'pool-node-c']) {
+      expect(failed.get(ctx)).toMatchObject({ ok: true, action: 'shipped' });
+      expect(failed.get(ctx)!.detail).toContain('packed-revision.json');
+    }
+  });
+
   // 델타(대표 2026-09-26): 레지스트리 노드는 «커밋 ⊕ 스킬 해시 ⊕ 레지스트리 태그»가 다 맞아야 fresh — 셋 중 하나라도 어긋나면 다시 굽는다.
   test('registry node: fresh only when commit, skills digest and registry tag all match; Pod gets the registry ref', async () => {
     const state = { commit: 'new', skills: 'sk1', tags: [] as string[] };

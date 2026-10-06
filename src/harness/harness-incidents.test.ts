@@ -243,9 +243,9 @@ test('Pod launch warns only for its own seat and entrance burst', async () => {
   const errors: string[] = [];
   const error = spyOn(console, 'error').mockImplementation((line) => { errors.push(String(line)); });
   try {
-    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'UX']);
+    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'UX', '--no-queue']);
     expect(errors.filter((line) => line.includes('최근 묶음 사고'))).toEqual([]);
-    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK']);
+    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK', '--no-queue']);
     expect(errors.filter((line) => line.includes('최근 묶음 사고'))).toEqual([
       expect.stringContaining('seat=MK entrance=cli-harness-ask'),
     ]);
@@ -262,7 +262,7 @@ test('Pod ask records plain pod-error tail with its flagged seat and entrance be
   });
   const error = spyOn(console, 'error').mockImplementation(() => {});
   try {
-    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK']);
+    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK', '--no-queue']);
     expect(readRunExits(dir)).toMatchObject([{ runId: 'run-before-ledger', reason: 'pod-error',
       seat: 'MK', entrance: 'cli-harness-ask', lastLines: [expect.any(String), 'pod-error: pool unavailable'] }]);
     expect(process.exitCode).toBe(1);
@@ -296,7 +296,7 @@ test('Pod launch uses a flagged seat over an inherited seat when recording incid
   });
   const error = spyOn(console, 'error').mockImplementation(() => {});
   try {
-    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK']);
+    await cli().parseAsync(['node', 'elanous', 'harness', 'ask', 'not-read-by-dispatch', '--substrate', 'pod', '--seat', 'MK', '--no-queue']);
     expect(readRunExits(dir)).toMatchObject([{ runId: 'run-flag-seat', entrance: 'cli-harness-ask', seat: 'MK' }]);
   } finally { dispatch.mockRestore(); error.mockRestore(); }
 });

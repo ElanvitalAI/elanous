@@ -8,8 +8,8 @@
 //   - 증거 게이트(doc 존재 / tsc 0 / test pass)로 완료 판정 후 commit
 // 재사용: startPty(Bun 네이티브 PTY)·createWorktree·streamLLM·worktreeHasChanges·commitWorktree.
 import { execFileSync, spawnSync, spawn as spawnChild } from 'node:child_process';
-import { homedir } from 'node:os';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, statSync, readlinkSync, realpathSync, lstatSync, unlinkSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { existsSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, readlinkSync, realpathSync, lstatSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { startPty, mintPtyId, onPtyEvent, type PtyHandle, type StartOpts } from '../pty-shell/registry.js';
@@ -18,7 +18,7 @@ import { NESTED_AGENT_ENV_BLOCKLIST } from '../agent/nested-agent-env.js';
 import { getNestDepth } from '../agent/nest-depth.js';
 import { gateNestedElanousLaunch, nestedDepthCodexArgs, readNestedElanousDepth } from '../harness/nested-elanous-policy.js';
 import { createWorktree, resolveMainRepoRoot, type CreateWorktreeOpts } from '../git-fs/worktree.js';
-import { configuredWorktreeRoot } from '../user-config.js';
+import { configuredWorktreeRoot, getUserConfig } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
@@ -330,6 +330,27 @@ export function resolveBackendSpawn(
   return { cmd: backend.cmd, args, env, unsetEnv, nestedEnvRemovedCount, forcedEnv };
 }
 
+/** Claude's strict MCP override is per-child; never edit the user's Claude settings. */
+export function prepareClaudeChildSpawn(
+  spawn: ReturnType<typeof resolveBackendSpawn>,
+  options: { readonly backendName: string; readonly depth: number; readonly allowNestedElanous: boolean; readonly tempRoot?: string },
+): { readonly args: string[]; readonly cleanup: () => void; readonly configPath?: string } {
+  // Backend identity, not the command string — an absolute-path claude binary is still the Claude backend.
+  if (options.backendName !== 'claude' || (options.depth === 0 && options.allowNestedElanous)) {
+    return { args: [...spawn.args], cleanup: () => {} };
+  }
+  const dir = mkdtempSync(join(options.tempRoot ?? tmpdir(), 'elanous-claude-mcp-'));
+  try {
+    const configPath = join(dir, 'mcp.json');
+    writeFileSync(configPath, JSON.stringify({ mcpServers: {} }), { mode: 0o600 });
+    return { args: [...spawn.args, '--strict-mcp-config', '--mcp-config', configPath], configPath,
+      cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 /**
  * Refuse a requested nested elanous launch when this backend cannot carry the depth marker.
  * Unset depth is 0. A normal mission spawn (`nestedLaunchRequested: false`) is never refused here.
@@ -528,6 +549,8 @@ export interface AgentMissionSpec {
    * Absent means an ordinary mission spawn — never refused for a missing marker.
    */
   nestedElanousLaunch?: boolean;
+  /** Explicit depth-0 allow from the caller (e.g. `--nested-elanous allow`). Ignored at depth >= 1. Config `harness.nestedElanous` also counts at depth 0. */
+  nestedElanousAllow?: boolean;
   /** Concurrent missions may share one decision stream alias without sharing a PTY or worktree. */
   decisionMissionId?: string;
   /** ⭐⭐ 그 브랜치를 이미 쥔 «소유» 워크트리가 있으면 지우지 말고 그대로 재사용하라고 요청한다
@@ -1574,6 +1597,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   const nestedRefusal = refuseNestedElanousOnBackend({
     backendName: backend.name,
     nestedLaunchRequested: spec.nestedElanousLaunch === true,
+    ...(spec.nestedElanousAllow === true ? { allow: true } : {}),
+    ...(getUserConfig().harness?.nestedElanous === 'allow' ? { configAllow: true } : {}),
     env: process.env,
   });
   if (nestedRefusal.refused) {
@@ -1691,12 +1716,16 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       evidencePath: finalEv.path, evidenceSatisfied: true, committed, usedOmniCrawl: false, detail: '완료(증거 충족)' };
   }
   env.TERM = 'xterm-256color';
+  // Claude's per-child MCP override is held until the PTY exits, not until the control loop returns.
+  const claudeChild = backend.name === 'claude'
+    ? prepareClaudeChildSpawn(spawnParams, { backendName: backend.name, depth: readNestedElanousDepth(process.env), allowNestedElanous: spec.nestedElanousAllow === true || getUserConfig().harness?.nestedElanous === 'allow' })
+    : undefined;
   // ⭐run-identity — runId was resolved before either headless or PTY spawn.
-  debug.log('agent-mission', 'spawn', { agent: backend.name, cmd: `${spawnParams.cmd} ${spawnParams.args.join(' ')}`, scrubbed: backend.scrubEnv ?? [], nestedEnvRemovedCount: spawnParams.nestedEnvRemovedCount, runId });
+  debug.log('agent-mission', 'spawn', { agent: backend.name, cmd: `${spawnParams.cmd} ${(claudeChild?.args ?? spawnParams.args).join(' ')}`, scrubbed: backend.scrubEnv ?? [], nestedEnvRemovedCount: spawnParams.nestedEnvRemovedCount, runId });
   // PTY 정체성 — kind(=backend)·nickname(goto 로 나중 접근)·accessMode='auto'(헤드리스 자율·brain 이 write 소유).
   const ptyOpts = buildAgentMissionPtySpawnOptions({
     backend,
-    spawn: { cmd: spawnParams.cmd, args: spawnParams.args, env, unsetEnv: spawnParams.unsetEnv },
+    spawn: { cmd: spawnParams.cmd, args: claudeChild?.args ?? spawnParams.args, env, unsetEnv: spawnParams.unsetEnv },
     workdir: wt.path,
     nickname: spec.nickname ?? spec.branch ?? backend.name,
   });
@@ -1706,6 +1735,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   let usageReemitted = false;
   let childSessionId: string | undefined;
   let sessionOutput = '';
+  let claudeCleanupTimer: ReturnType<typeof setInterval> | undefined;
+  const cleanupClaude = (): void => {
+    if (claudeCleanupTimer) clearInterval(claudeCleanupTimer);
+    claudeChild?.cleanup();
+  };
   const offLive = onPtyEvent((ev) => {
     if (ev.id !== ptyOpts.id) return;
     if (ev.type === 'output') {
@@ -1718,6 +1752,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     if (ev.type === 'exit') {
       offLive();
       if (liveTimer) clearInterval(liveTimer);
+      cleanupClaude();
     }
     if (ev.type === 'exit' && backend.name === 'codex' && !usageReemitted) {
       usageReemitted = true;
@@ -1740,9 +1775,17 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     }
   });
   let h: PtyHandle;
-  if (deps.isMissionAborted?.()) { offLive(); throw new Error('MISSION_ABORTED'); }
+  if (deps.isMissionAborted?.()) { offLive(); cleanupClaude(); throw new Error('MISSION_ABORTED'); }
   try { h = spawnPty(ptyOpts); }
-  catch (error) { offLive(); throw error; }
+  catch (error) { offLive(); cleanupClaude(); throw error; }
+  if (!h.isAlive()) cleanupClaude();
+  else if (claudeChild) {
+    // A test-injected PTY may not emit registry events; keep the config until its handle exits.
+    claudeCleanupTimer = setInterval(() => {
+      if (!h.isAlive()) cleanupClaude();
+    }, 1000);
+    claudeCleanupTimer.unref();
+  }
   if (backend.name === 'codex') observeExternalEvent({ origin: 'codex-agent-mission', kind: 'started',
     summary: 'Codex agent mission started', source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
   let contextFinished = false;
@@ -1753,8 +1796,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       summary: `Codex agent mission ${ok ? 'completed' : 'failed'}`,
       source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
   };
-  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); finishContext(false); });
-  if (deps.isMissionAborted?.()) { finishContext(false); return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); finishContext(false); cleanupClaude(); });
+  if (deps.isMissionAborted?.()) { finishContext(false); cleanupClaude(); return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
     rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' }; }
   const executorRef = buildExecutorPtyRef({
     ptyId: h.id,
@@ -2275,7 +2318,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     ptyId: h.id, webUrl: webAddress.webUrl, driveVerdict: driveVerdict.kind,
     detail: recoverExhausted ? control.termination.reason : driveVerdict.kind === 'done-but-failed' ? `미완(DRIVE-OK: ${driveVerdict.reason})` : driveVerdict.kind === 'success-unverified' && finalEv.ok ? '완료(증거)' : done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
-  } finally { stopLive(); finishContext(false); }
+  } finally { stopLive(); finishContext(false); if (!h.isAlive() || deps.isMissionAborted?.()) cleanupClaude(); }
 }
 
 /** @deprecated codex 특정 이름 — runAgentMission 을 쓰라(codex 는 기본 backend). */

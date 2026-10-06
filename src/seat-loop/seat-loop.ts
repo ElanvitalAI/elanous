@@ -10,7 +10,7 @@ import { surfaceEventsDbPath } from '../domains/surface-events.js';
 import { judgeNeighbor } from '../loops/neighbors.js';
 import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
 import { isRescueAllowedAction } from '../steward/rescue.js';
-import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
+import { DecisionLedger, type DecisionEntry, type DecisionOption, type Recommendation } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { loopEvent } from '../loops/observe.js';
 import { getUserConfig, type PersonaLoopConfig, type SeatLoopConfig, type UserConfig } from '../user-config.js';
@@ -43,7 +43,7 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
+export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'resolved' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off'; modeDowngradeReason?: string };
 
 export function seatLoopTickLine(result: SeatLoopResult): string {
@@ -375,6 +375,23 @@ function decisionSummary(text: string): string {
   return Array.from(sentences).slice(0, 240).join('').trim();
 }
 
+function decisionCardMaterial(input: {
+  what: string; soFar: string; current: string; question: string; answer: string;
+  options: DecisionOption[]; recommendation: Recommendation; ifUntouched: string; evidence: string; confidence: string;
+}): { scqa: { s: string; c: string; q: string; a: string }; pendingQuestion: string } {
+  const short = (value: string) => decisionSummary(value) || '관측되지 않음';
+  return {
+    scqa: { s: short(input.what), c: short(input.current), q: short(input.question), a: short(input.answer) },
+    pendingQuestion: [
+      `무엇: ${input.what}`, `지금까지: ${input.soFar}`, `지금 상태 재측: ${input.current}`,
+      ...input.options.map((option) => `선택지 ${option.key} (${option.label}) 결과: ${option.consequence}`),
+      'skipped' in input.recommendation ? `권고 비움: ${input.recommendation.reason}` : `권고: ${input.recommendation.option} — ${input.recommendation.why}`,
+      `확신: ${input.confidence}`, `그냥 두면: ${input.ifUntouched}`, `근거: ${input.evidence}`,
+      `Q: ${input.question}`, `A: ${input.answer}`,
+    ].join('\n'),
+  };
+}
+
 function decisionSourceRef(seat: string, item: SeatItem): string {
   return item.source === 'request' && item.id.startsWith('coord:') ? item.id : decisionRef(seat, item);
 }
@@ -388,7 +405,7 @@ function decisionReceipt(root: string, seat: string, item: SeatItem): DecisionEn
 function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: string, liveSafe = false): Set<string> {
   const inquiryRow = (entry: SeatEntry) => entry.action === 'seat-question' || entry.action === 'seat-answer' || !!entry.inquiry;
   return new Set(ledger.filter((entry, index) => entry.status === 'asked' || entry.status === 'answered'
-    || entry.status === 'resolved-by-neighbor'
+    || entry.status === 'resolved-by-neighbor' || entry.status === 'resolved'
     // RM3a: only TC's other-seat defect ask-shadows are deduplicated here — an ordinary inquiry recorded in shadow must still be delivered once questions turn on.
     || (entry.status === 'shadow' && entry.candidate?.kind === 'other-seat-cell-defect')
     || (entry.status === 'hitl' && (!entry.inquiry || (!!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))))
@@ -853,7 +870,7 @@ const SEAT_ACTION_RULES: ReadonlyArray<{ kind: 'wait' | 'harness' | 'decision'; 
   { kind: 'wait', signal: /실측\s*대기|(?:사람|실제)\s*기기(?!\s*(?:(?:실측|측정|확인)\s*)?완료)(?:\s*(?:실측|측정|확인|대기))?|실물\s*측정(?!\s*완료)/iu, source: 'content', resolvedBy: /(?:실측|측정|(?:사람|실제)\s*기기|실물\s*측정)\s*완료/iu },
   { kind: 'wait', signal: /\u{1F451}\s*확인\s*대기/iu, source: 'content', resolvedBy: /\u{1F451}\s*확인\s*완료/iu },
   { kind: 'decision', signal: TRACK_AGENT_FORBIDDEN_ACTION_REGEX, source: 'task' },
-  { kind: 'decision', signal: /(?:마켓|레지스트리)(?:에|로)?\s*(?:게시|등록|발행)|사이트\s*운영\s*반영|SNS(?:에|로)?\s*(?:게시|발행|업로드)|공개\s*발행/iu, source: 'content' },
+  { kind: 'decision', signal: /(?:마켓|레지스트리)(?:에|로)?\s*(?:게시|등록|발행)|사이트\s*운영\s*반영|SNS(?:에|로)?\s*(?:게시|발행|업로드)|공개\s*발행/iu, source: 'task' },
   { kind: 'harness', signal: /(?:마켓|레지스트리|사이트|SNS|공개)?(?:에|로)?\s*(?:게시|발행|배포|등록|운영\s*반영)(?:를?\s*위한)?\s*(?:준비|초안|원고|자료|구현|점검|테스트)|(?:마켓|레지스트리|사이트|SNS|공개)?(?:에|로)?\s*(?:게시|발행|배포|등록)(?:용|를?\s*위한)\s*(?:초안|원고|자료|코드|기능)/iu, source: 'task' },
 ];
 
@@ -861,9 +878,9 @@ export function planAction(item: SeatItem, seat?: string): { kind: 'decision' | 
   const task = `${item.id}\n${item.title}\n${item.text}`;
   const content = `${task}\n${item.evidence ?? ''}`;
   const preparation = SEAT_ACTION_RULES.find(({ kind }) => kind === 'harness')!;
-  const prepared = [...content.matchAll(new RegExp(preparation.signal.source, `${preparation.signal.flags.replace('g', '')}g`))];
+  const prepared = [...item.text.matchAll(new RegExp(preparation.signal.source, `${preparation.signal.flags.replace('g', '')}g`))];
   const rule = SEAT_ACTION_RULES.map(({ kind, signal, source, resolvedBy }) => {
-    const text = source === 'content' ? content : task;
+    const text = kind === 'decision' ? item.text : source === 'content' ? content : task;
     if (resolvedBy?.test(item.evidence ?? '')) return null;
     const hits = [...text.matchAll(new RegExp(signal.source, `${signal.flags.replace('g', '')}g`))];
     const hit = kind === 'decision' ? hits.find((match) => !prepared.some((prep) =>
@@ -936,13 +953,16 @@ function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps
       if (judgment.state === 'absent') {
         if (config.mode === 'live-safe' && judgment.action?.action === 'escalate' && isRescueAllowedAction('decision-card')) {
           const ref = `seat-loop:neighbor:${seat}:${neighbor.id}:${lastSeenAt}`;
+          const options = [{ key: 'a', label: '사람 판단 후 별도 조치', consequence: '자리 루프는 대행하지 않는다' },
+            { key: 'b', label: '현상 유지', consequence: '결측 상태를 계속 관측한다' }];
+          const recommendation = { option: 'b', why: '새 사건을 확인하기 전에는 이웃 업무를 대행하지 않는다' };
           cardLedger(root, deps, now).raiseOnce({ title: `${seat}: 이웃 ${neighbor.id} 결측`, category: 'other',
-            scqa: { s: `${seat} 이웃 ${neighbor.id}의 마지막 맥락 버스 사건: ${lastSeenAt}.`,
-              c: `설정한 heartbeat ${neighbor.heartbeat.everyMinutes}분 × ${neighbor.heartbeat.missedTicks}회 동안 새 사건이 없다.`,
-              q: '결측 이웃의 업무를 어떻게 처리할까?' },
-            options: [{ key: 'a', label: '사람 판단 후 별도 조치', consequence: '자리 루프는 대행하지 않는다' },
-              { key: 'b', label: '현상 유지', consequence: '결측 상태를 계속 관측한다' }],
-            recommendation: { skipped: true, reason: '결측만으로 대행이나 보류를 자동 결정하지 않는다' },
+            ...decisionCardMaterial({ what: `${seat} 이웃 ${neighbor.id} 결측`, soFar: '마지막 맥락 버스 사건 이후 새 ACK 없음',
+              current: `현재 시각 ${now.toISOString()}; 마지막 사건 ${lastSeenAt}; heartbeat ${neighbor.heartbeat.everyMinutes}분 × ${neighbor.heartbeat.missedTicks}회 결측`,
+              question: '결측 이웃의 업무를 어떻게 처리할까?', answer: '새 ACK까지 현상 유지하고 이웃 업무는 대행하지 않는다',
+              options, recommendation, confidence: '중간 — 사건의 부재만 관측됨',
+              ifUntouched: '결측 상태를 계속 관측하며 대행은 하지 않는다', evidence: `맥락 버스 마지막 사건 ${lastSeenAt}; ${ref}` }),
+            options, recommendation,
             raisedBy: { agent: 'seat-loop' }, refs: [ref], raisedAt: now.toISOString(),
             crossCheckSkipped: '이웃 결측으로 교차 확인 불가' }, ref);
           action = 'decision-card';
@@ -1012,10 +1032,17 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
         const question = proposal.inquiry?.question ?? proposal.item!.title;
         const note = `${proposal.xcheckNote ?? ''} — 해결 가능하다고 했으나 ${waited}분 안 해소 안 됨`.trim();
         if (!decisionReceipt(stateRoot, seat, proposal.item!)) {
+          const options = [{ key: 'a', label: '승인', consequence: '사람 판단으로 진행' }, { key: 'b', label: '보류', consequence: '진행하지 않음' }];
+          const recommendation = { option: 'b', why: `기한 ${waited}분 뒤에도 ${cell?.status ?? '질문 미해결'}이므로 착지 확인 전에는 진행하지 않는다` };
+          const material = decisionCardMaterial({ what: `${seat} 질문 · ${proposal.item!.title}`, soFar: `이웃 ${neighbor} 해결 제안: ${proposal.xcheckNote ?? '기록 없음'}`,
+            current: `기한 ${waited}분 경과 · 칸 상태 ${cell?.status ?? '질문 미해결'}`, question, answer: '재측상 미해결이므로 보류를 권고한다',
+            options, recommendation, confidence: '중간 — 기한 경과와 미해결을 재측함', ifUntouched: '질문/칸은 미해결로 남는다',
+            evidence: `${proposal.item!.evidence ?? '원천 근거 미기재'} · ${note} · ${decisionRef(seat, proposal.item!)}` });
           await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${question}`, '--category', 'other',
-            '--s', `${seat} 질문 · ${proposal.item!.title}`, '--c', '이웃 자리 해결 제안이 기한 안에 해소되지 않았다',
+            '--s', material.scqa.s, '--c', material.scqa.c, '--q', material.scqa.q, '--a', material.scqa.a,
+            '--pending-question', material.pendingQuestion,
             '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
-            '--skip-recommend', '근거가 부족하다', '--xcheck', `${neighbor}:${note}`,
+            '--recommend', recommendation.option, '--why', recommendation.why, '--xcheck', `${neighbor}:${note}`,
             '--agent', 'seat-loop', '--ref', decisionRef(seat, proposal.item!), '--json']);
         }
         const entry: SeatEntry = { ...proposal, ts: now.toISOString(), at: now.toISOString(), status: 'hitl' };
@@ -1313,10 +1340,18 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
                   const check = answer ? ['--xcheck', `${requestedNeighbor}:${answer.note}`,
                     ...(answer.agree ? [] : ['--dissent', `${requestedNeighbor}: ${answer.note}`])]
                     : ['--no-xcheck', `이웃 ${requestedNeighbor} 무응답 ${entry.xcheckWaitMinutes}분`];
+                  const options = [{ key: 'a', label: '승인', consequence: '사람 판단으로 진행' }, { key: 'b', label: '보류', consequence: '진행하지 않음' }];
+                  const recommendation = { option: 'b', why: '교차 확인에서 해소 근거가 확보되지 않았다' };
+                  const material = decisionCardMaterial({ what: `${seat} 질문 · ${item.title}`, soFar: `이웃 ${requestedNeighbor}에 교차 확인 요청`,
+                    current: answer ? `이웃 응답: ${answer.note}` : `이웃 ${requestedNeighbor} 무응답 ${entry.xcheckWaitMinutes}분`,
+                    question: ask.question, answer: '해소 근거 확인 전까지 보류를 권고한다', options, recommendation,
+                    confidence: answer ? '중간 — 이웃 응답을 확인함' : '낮음 — 기한 내 이웃 응답 없음',
+                    ifUntouched: '사람 판단 전 집행하지 않는다', evidence: `${item.evidence ?? '원천 근거 미기재'} · ${decisionRef(seat, item)}` });
                   await (deps.run ?? defaultRun)(['decisions', 'raise', '--title', `${seat}: ${ask.question}`, '--category', 'other',
-                    '--s', `${seat} 질문 · ${item.title}`, '--c', '판단 근거 부족 — 사람의 결정이 필요하다',
+                    '--s', material.scqa.s, '--c', material.scqa.c, '--q', material.scqa.q, '--a', material.scqa.a,
+                    '--pending-question', material.pendingQuestion,
                     '--option', 'a=승인:사람 판단으로 진행', '--option', 'b=보류:진행하지 않음',
-                    '--skip-recommend', '근거가 부족하다', ...check, '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
+                    '--recommend', recommendation.option, '--why', recommendation.why, ...check, '--agent', 'seat-loop', '--ref', decisionRef(seat, item), '--json']);
                   if (!decisionReceipt(root, seat, item)) throw new Error('decisions raise did not deliver a matching card');
                   entry.status = 'hitl';
                   xcheckEvent('raised', seat, requestedNeighbor, itemKey(item), answer ? answer.agree ? 'agree' : 'dissent' : 'timed-out');
@@ -1442,11 +1477,27 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     if (action.kind === 'decision') {
       const title = `${seat}: ${decisionSummary(action.text)}`;
       const source = decisionSourceRef(seat, item);
+      const options = [{ key: 'a', label: '사람 승인', consequence: '승인 후 별도로 집행' }, { key: 'b', label: '보류', consequence: '집행하지 않음' }];
+      const recommendation = { option: 'b', why: `요청에서 걸린 문면 «${action.reason}»은 자동 집행 대상이 아니므로 보류한다` };
+      let currentStatus: string | undefined;
+      try {
+        currentStatus = item.source === 'checklist' && item.version
+          ? (deps.checklistItems ?? ((version: string) => listChecklist(version, deps.root ?? releaseLedgerRoot()).items))(item.version)
+            .find((cell) => cell.id === item.id && cell.owner === seat)?.status
+          : item.source === 'request' ? listSeatRequests(stateRoot).find((row) => row.key === item.id && row.seat === seat)?.status
+            : undefined;
+      } catch (error) { observe('decision-source-unreadable', { seat, item: item.id, error: String(error).slice(0, 200) }); }
+      const material = decisionCardMaterial({ what: `${seat} 배정 항목: ${item.title} 역할: ${inputs.role || '역할 근거 없음'}`, soFar: `요청 내용: ${item.text}`,
+        current: `밑바탕 재측: ${currentStatus ?? '상태 미확인'}; 요청에서 금지 문면 «${action.reason}» 발견 — 실행 전 사람 승인 필요`,
+        question: `금지 문면 «${action.reason}»이 걸린 요청을 승인할까?`, answer: '승인 전에는 집행하지 않고 보류한다',
+        options, recommendation, confidence: '높음 — 요청에 금지 문면 직접 일치',
+        ifUntouched: '자동 집행되지 않고 해당 칸은 보류 상태로 남는다',
+        evidence: `${item.evidence?.trim() || '추가 근거 미기재'} · 요청 ${source} · 걸린 낱말 ${action.reason}` });
       const raised = await run(['decisions', 'raise', '--title', title, '--category', 'other',
-        '--s', decisionSummary(`${seat} 배정 항목: ${action.text.replace(/[\r\n]+/g, ' ')} 역할: ${inputs.role}`),
-        '--c', '자동 실행 금지 문면에 해당하여 사람 결정이 필요하다',
+        '--s', material.scqa.s, '--c', material.scqa.c, '--q', material.scqa.q, '--a', material.scqa.a,
+        '--pending-question', material.pendingQuestion,
         '--option', 'a=사람 승인:승인 후 별도로 집행', '--option', 'b=보류:집행하지 않음',
-        '--skip-recommend', '금지 문면은 자동으로 권고하지 않는다', '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②',
+        '--recommend', recommendation.option, '--why', recommendation.why, '--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②',
         '--agent', 'seat-loop', '--ref', source, '--json']);
       const decision: unknown = JSON.parse(raised.trim());
       if (!decision || typeof decision !== 'object' || typeof (decision as { id?: unknown }).id !== 'string') {
@@ -1461,25 +1512,38 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       const limit = repeatStopLimit(config);
       const attempts = unlandedAttemptCount(seat, item, ledger, stateRoot, deps);
       if (attempts >= limit && !personReopened(ledger, seat, item, stateRoot)) {
+        // Re-read the underlying item at the decision boundary, not the picked snapshot.
+        const current = item.source === 'checklist' && item.version
+          ? (deps.checklistItems ?? ((version: string) => listChecklist(version, deps.root ?? releaseLedgerRoot()).items))(item.version)
+            .find((cell) => cell.id === item.id && cell.owner === seat)?.status
+          : item.source === 'request' ? listSeatRequests(stateRoot).find((row) => row.key === item.id && row.seat === seat)?.status
+            : undefined;
+        if (current === 'green' || current === 'done') {
+          entry.status = 'resolved';
+          entry.reason = `밑바탕 재측: ${current} — 반복 정지 카드 불필요`;
+          append(path, entry);
+          observe('repeat-recovered', { seat, item: item.id, status: current });
+          return entry;
+        }
         const reason = repeatStopReason(attempts);
         entry.status = 'held';
         entry.reason = reason;
         const ref = decisionRef(seat, item);
         const prior = new DecisionLedger({ stateDir: stateRoot }).list({ status: 'all' }).find((card) => card.refs?.includes(ref) && card.status === 'open');
         if (!prior) {
+          const options = [
+            { key: 'a', label: '다시 연다', consequence: '결정 뒤에 자리 루프가 한 번 더 시도할 수 있다' },
+            { key: 'b', label: '멈춘다', consequence: '같은 칸은 다시 발사하지 않는다' },
+          ];
+          const recommendation = { option: 'b', why: `착지 없는 ${attempts}회 재시도보다 현재 칸을 멈추는 편이 중복 실행을 피한다` };
           cardLedger(stateRoot, deps, now).raiseOnce({
-            title: `${seat}: ${item.id} 반복 착지 0`,
-            category: 'other',
-            scqa: {
-              s: `${seat} 칸 ${item.id} 가 착지 없이 ${attempts}회 끝났다.`,
-              c: '같은 칸을 다시 발사하지 않고 사람 판단을 기다린다.',
-              q: '이 칸을 계속할까, 멈출까?',
-            },
-            options: [
-              { key: 'a', label: '다시 연다', consequence: '결정 뒤에 자리 루프가 한 번 더 시도할 수 있다' },
-              { key: 'b', label: '멈춘다', consequence: '같은 칸은 다시 발사하지 않는다' },
-            ],
-            recommendation: { skipped: true, reason: '착지 없는 반복만으로 계속할지 자동 결정하지 않는다' },
+            title: `${seat}: ${item.id} 반복 착지 0`, category: 'other',
+            ...decisionCardMaterial({ what: `${seat} 칸 ${item.id} · ${item.title}`, soFar: `${attempts}회 착지 없이 종료`,
+              current: `발행 직전 밑바탕 재측: ${current ?? '상태 미확인'}; 같은 칸 착지 0`,
+              question: '이 칸을 계속할까, 멈출까?', answer: '중복 발사를 멈추고 사람의 재개 결정을 기다린다',
+              options, recommendation, confidence: current ? '높음 — 밑바탕 상태 재측됨' : '낮음 — 밑바탕 상태 미확인',
+              ifUntouched: '같은 칸은 다시 발사되지 않는다', evidence: `${item.evidence ?? '원천 근거 미기재'} · ${ref} · 완료되지 않은 시도 ${attempts}회` }),
+            options, recommendation,
             raisedBy: { agent: 'seat-loop' },
             refs: [ref],
             raisedAt: now.toISOString(),

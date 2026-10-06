@@ -681,6 +681,87 @@ export function injectGoalDocumentClarificationOtherAnswer(document: string, que
  *    「답이 한 번도 안 들어가서 효과를 못 쟀다」***일 수 있다 — 두 무리 다 «답이 없는» 무리였다.
  *  ⛔ 무인 계약은 유지한다 — 대화형이 아니면 종전대로 지나가되 «그 사실을 값으로» 낸다.
  */
+export type GoalClarificationSelfAnswerPath = 'say-first' | 'ask' | 'rework';
+export type GoalClarificationSelfResolver = NonNullable<GoalAuthorClarificationResolutionDeps['selfResolve']>;
+
+/** Attempt only unanswered document questions; retain every unanswered line if evidence is insufficient. */
+export async function selfAnswerGoalDocumentClarifications(
+  document: string,
+  options: {
+    path: GoalClarificationSelfAnswerPath;
+    ask?: string;
+    evidence?: readonly string[];
+    resolver?: GoalClarificationSelfResolver;
+  },
+): Promise<{ document: string; asked: number; answered: number; unanswered: number; newlyAnswered: number }> {
+  const clarifications = parseGoalDocumentClarifications(document);
+  const pending = clarifications.filter((item) => !item.answered);
+  // The first say pass may already have self-answered some questions while authoring: count those,
+  // never re-ask them, and still attempt every question that is left unanswered.
+  const alreadySelfAnswered = options.path === 'say-first'
+    ? clarifications.filter((item) => item.answered && item.provenanceSource === 'self-authored').length
+    : 0;
+  let updated = document;
+  let answered = 0;
+  const evidence = options.evidence ?? document.split(/\r?\n/)
+    .filter((line) => /^(?:\s*- (?:\[code:|\[document:|TRACED PATHS|evidence:|Evidence:)|\s*-?\s*`?(?:src|test|scripts)\/[^\s`]+:\d+)/i.test(line))
+    .slice(0, 40);
+  for (const item of pending) {
+    if (parseGoalDocumentClarifications(updated).filter((entry) => entry.questionId === item.questionId).length !== 1) continue;
+    let response: Awaited<ReturnType<typeof resolveGoalAuthorClarification>>;
+    try { response = await resolveGoalAuthorClarification({
+      questionId: item.questionId,
+      kind: 'scope',
+      header: item.header,
+      question: item.question,
+      options: item.options.map((option) => ({ label: option.label, description: option.description })),
+      blocking: false,
+    }, {
+      selfResolve: options.resolver ?? defaultGoalAuthorSelfResolve,
+      evidence,
+      ask: options.ask,
+      selfResolutionSelected: true,
+    }); } catch {
+      // A resolver failure leaves this question unanswered; the remaining questions are still attempted.
+      continue;
+    }
+    if (response.answer === null || response.provenance?.source !== 'self-authored'
+      || response.answer.startsWith(DEFERRED_ANSWER_PREFIX)) continue;
+    try {
+      if (!response.answer.trim() || /[\r\n]/.test(response.answer)
+        || (!item.includeOther && !item.options.some((option) => option.label === response.answer))) continue;
+      const current = findUnansweredGoalDocumentClarification(updated, item.questionId);
+      const lines = updated.split(/\r?\n/);
+      const provenanceLines = current.provenanceLines ?? [];
+      for (const line of [...provenanceLines].sort((left, right) => right - left)) lines.splice(line, 1);
+      const answerLine = current.answerLine - provenanceLines.filter((line) => line < current.answerLine).length;
+      lines[answerLine] = `  - answer: ${response.answer}`;
+      lines.splice(answerLine + 1, 0,
+        '  - provenance.source: self-authored',
+        ...response.provenance.evidence!.map((entry) => `  - evidence: ${entry.replace(/[\r\n]/g, ' ')}`));
+      updateWhatToBuildRenderAnswers(lines, item.questionId, response.answer);
+      if (hasWhatToBuildUnansweredRenderAnswer(lines, item.questionId)) continue;
+      const candidate = lines.join(document.includes('\r\n') ? '\r\n' : '\n');
+      if (!parseGoalDocumentClarifications(candidate).some((entry) => entry.questionId === item.questionId
+        && entry.answered && entry.answer === response.answer && entry.provenanceSource === 'self-authored')) continue;
+      updated = candidate;
+      answered += 1;
+    } catch {
+      // Leave malformed or disallowed answers deferred.
+    }
+  }
+  const asked = pending.length + alreadySelfAnswered;
+  const unanswered = pending.length - answered;
+  const newlyAnswered = answered;
+  answered += alreadySelfAnswered;
+  debug.log('self-implement.clarification-escalation', 'self-answer', {
+    path: options.path, asked, answered, unanswered,
+    reason: unanswered === 0 ? 'answered' : 'insufficient-evidence',
+  });
+  return { document: updated, asked, answered, unanswered, newlyAnswered };
+}
+
+
 export type ClarificationIntakeMode = 'none' | 'deferred-noninteractive' | 'ask';
 
 export interface ClarificationIntakePlan {

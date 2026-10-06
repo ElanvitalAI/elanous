@@ -64,6 +64,9 @@ export interface PoolLeaseRecommendation {
 }
 
 /** Kubernetes quantity to bytes (memory) or millicores (CPU). */
+/** Kubernetes memory quantity (`16Gi`, `2Gi`, `512Mi`) → bytes; null when unparseable. */
+export function memoryQuantityBytes(raw: string): number | null { return quantity(raw, 'memory'); }
+
 function quantity(raw: string, unit: 'memory' | 'cpu'): number | null {
   const m = /^(\d+(?:\.\d+)?)(n|u|m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(raw);
   if (!m) return null;
@@ -235,7 +238,7 @@ function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
 }
 
 /** Each cluster reads resource reservations; DNS requires a bounded disposable Pod. */
-export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe } = {}): PoolLeaseMeasure {
+export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; /** Read-only snapshots must not create the disposable DNS Pod or update its cache. */ skipDnsProbe?: boolean } = {}): PoolLeaseMeasure {
   const kubectl = deps.kubectl ?? leaseKubectl;
   return { members: members.map((member) => {
     const base = ['--context', member.context, '--request-timeout=10s'];
@@ -354,7 +357,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
         else if (!reservationsValid && !unknownPhase) reasons.push('cluster reservations: node assignment or memory request/limit missing/invalid');
       }
       result.reason = reasons.length ? reasons.join('; ').slice(0, 240) : null;
-      if (nodeItems?.length && jobItems && podItems) {
+      if (!deps.skipDnsProbe && nodeItems?.length && jobItems && podItems) {
         let dnsState: PoolDnsProbe = 'unknown';
         try { dnsState = (deps.dns ?? ((context) => probePoolDns(context, kubectl)))(member.context); } catch { /* probe could not be measured */ }
         if (dnsState === 'dns') { result.capacity = 0; result.availableMemoryByNodeBytes = []; result.reason = 'dns'; }

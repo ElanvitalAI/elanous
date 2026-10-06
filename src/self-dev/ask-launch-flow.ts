@@ -35,6 +35,8 @@ import { dirname, isAbsolute as isAbsolutePath, relative as relativePath, resolv
 import {
   applyClarificationReply,
   planClarificationIntake,
+  selfAnswerGoalDocumentClarifications,
+  type GoalClarificationSelfResolver,
 } from '../self-implement/goal-author-clarification.js';
 import { classifyReauthoredAsk, countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
 import { observeFrontNodeEntry } from './graph-front-nodes.js';
@@ -143,6 +145,9 @@ export interface AskLaunchFlowDeps {
   /** Optional structured clarification adapter. Omitted callers retain the
    * existing CLI line-input contract exactly. */
   readClarification?(clarification: GoalDocumentClarification): Promise<string>;
+  selfResolveClarification?: GoalClarificationSelfResolver;
+  /** Replaces the goal document after a self-answer; production entrances pass an atomic writer. */
+  writeGoalDocument?(path: string, document: string): void;
   readFile(path: string): string;
   writeFile(path: string, data: string): void;
   cwd(): string;
@@ -188,6 +193,7 @@ export interface AskLaunchFlowInput {
   readonly askFile?: string;
   /** Optional repository root used only for code grounding during goal authoring. */
   readonly groundingCwd?: string;
+  readonly authorGrade?: import('../self-implement/goal-author.js').GoalAuthorGradeSelection;
   readonly liveRunWindowMinutes: number;
   readonly recentChangeWindowDays: number;
   readonly forceRequested: boolean;
@@ -724,16 +730,27 @@ async function intakeClarifications(
     return effectiveGoalFile;
   }
   if (mode === 'deferred-noninteractive') {
-    // ⛔⭐ 종전엔 「N건 있다」만 말하고 «무엇을 묻는지»도 «어떻게 답하는지»도 안 줬다.
-    //   ⇒ 비대화형 표면(무인 런 · TUI 슬래시)에서 그 물음은 사실상 «사라졌다».
-    //   ⛔ 여기에 새 인터뷰 UI 를 만들지 «않는다» — 답변 창구는 `elanous self clarify answer` 로 «이미» 있다.
-    //     이 자리는 그것을 «가리키기»만 한다(2026-08-11 72차: 오늘만 `F12` 를 여섯 번 셌다).
-    deps.print(`[ask] ⑴b ⚠️ 미답 되묻기 ${pending.length}건 — 저작은 그대로 간다 · 구현 전에 LLM 릴레이가 먼저 답하고, 못 하면 미답으로 진행한다 (사람을 기다리지 않는다)`);
-    for (const item of pending) {
+    // The resolver comes in through deps (I/O seam): production entrances pass the author
+    // self-resolver; a caller that injects none keeps the previous deferred behaviour.
+    if (selfResolveClarifications.value && deps.selfResolveClarification) try {
+      const resolution = await selfAnswerGoalDocumentClarifications(document, {
+        path: 'ask', ask: input.askText, resolver: deps.selfResolveClarification,
+      });
+      if (resolution.newlyAnswered > 0) {
+        (deps.writeGoalDocument ?? deps.writeFile)(effectiveGoalFile, resolution.document);
+        document = resolution.document;
+      }
+    } catch (error) {
+      deps.log('ask-clarify', { goalFile: effectiveGoalFile, reason: 'self-answer-failed', error: error instanceof Error ? error.message : String(error) }, 'warn');
+    }
+    const remaining = planClarificationIntake(document, false).pending;
+    // 미답으로 남은 문항만 기존 답변 창구를 안내한다.
+    deps.print(`[ask] ⑴b ⚠️ 미답 되묻기 ${remaining.length}건 — 저작은 그대로 간다 · 구현 전에 LLM 릴레이가 먼저 답하고, 못 하면 미답으로 진행한다 (사람을 기다리지 않는다)`);
+    for (const item of remaining) {
       deps.print(`[ask]    ❓ [${item.questionId}] ${item.question}`);
       item.options.forEach((option, index) => deps.print(`[ask]       ${index}) ${option.label}`));
     }
-    if (pending.length > 0) {
+    if (remaining.length > 0) {
       const goalArg = deps.relativeToCwd(effectiveGoalFile);
       deps.print(`[ask]    ▶ 답하려면: elanous self clarify answer ${goalArg} <questionId> <옵션번호>   (자유 답은 --other "<문장>")`);
       deps.print(`[ask]    ▶ 답한 뒤 재저작: elanous self author --supersedes ${goalArg}`);
@@ -771,6 +788,7 @@ async function intakeClarifications(
   const reauthored = await deps.authorGoal([], {
     cwd: deps.cwd(),
     ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
+    ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
     fromClarification: `${deps.relativeToCwd(effectiveGoalFile)}#${seedQuestionId}`,
     reauthorFromAnsweredClarification: true,
     selfResolveClarifications: selfResolveClarifications.value,
@@ -853,6 +871,7 @@ export async function runAskLaunchFlow(
     const authored = await deps.authorGoal([input.askText], {
       cwd: deps.cwd(),
       ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
+      ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
       ...(goalType === null ? {} : { goalType }),
       // ⛔ 인라인 ask(`harness say`)는 askFile 이 없다 — 그 칸을 넘기면 저작기가 빈 줄을 쓴다.
       ...(() => {

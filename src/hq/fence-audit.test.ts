@@ -98,6 +98,20 @@ test('an unfenced writer with no elanous name and no known write verb is listed 
   expect(readFileSync(join(cron.root, 'crontab'), 'utf8')).toBe(cron.text);
 });
 
+test('CLI fence-audit warns when the installed hq-fence wrapper cd targets a worktree', () => {
+  const cron = fakeCrontab('*/5 * * * * hq-fence cron "echo ok"\n');
+  const configDir = join(cron.root, 'config');
+  mkdirSync(join(configDir, 'bin'), { recursive: true });
+  writeFileSync(join(configDir, 'bin', 'hq-fence'), '#!/bin/sh\ncd /Users/example/src/wt-ops-hq || exit 1\n');
+  const result = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, 'hq', 'fence-audit'], {
+    encoding: 'utf8', timeout: 60_000,
+    env: { ...process.env, PATH: `${cron.bin}${delimiter}${process.env.PATH}`, HOME: cron.root, ELANOUS_STATE_DIR: join(cron.root, 'state') },
+  });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toContain('hq fence-audit: warning — hq-fence wrapper cd targets a repository worktree');
+  expect(readFileSync(join(configDir, 'bin', 'hq-fence'), 'utf8')).toContain('wt-ops-hq');
+});
+
 test('CLI --json reads fake operational crontab once and performs zero crontab writes', () => {
   const cron = fakeCrontab('*/5 * * * * bun scripts/steward.ts\n*/6 * * * * hq-fence cron \'bun scripts/steward.ts\'\n');
   const result = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', 'hq', 'fence-audit', '--json'], {

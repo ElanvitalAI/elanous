@@ -2,9 +2,11 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { Command } from 'commander';
 import { registerFreezeCommands } from '../cli/freeze-cli.js';
 import { awaitLandingMergesDrained, beginLandingMerge, disableLandingFreeze, enableLandingFreeze, inFlightLandingMerges, landingFreezePath, readLandingFreeze } from './landing-freeze.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const at = new Date('2026-10-04T06:00:00Z');
 
@@ -52,21 +54,45 @@ test('freeze status --json reads the isolated state folder', async () => {
 test('a merge that passed its freeze check makes `freeze on` wait; a merge starting after `freeze on` sees the freeze', async () => {
   const root = mkdtempSync(join(tmpdir(), 'landing-freeze-race-'));
   try {
-    const inFlight = beginLandingMerge(root, at);
+    const inFlight = beginLandingMerge(root, at, root);
     expect(inFlight.frozen).toBeNull();
     expect(inFlightLandingMerges(root)).toBe(1);
     enableLandingFreeze({ reason: 'drill', by: 'OP' }, root, at);
-    const late = beginLandingMerge(root, at);
+    const late = beginLandingMerge(root, at, root);
     expect(late.frozen).toMatchObject({ reason: 'drill' });
     expect(inFlightLandingMerges(root)).toBe(1);
     let polls = 0;
     const waited = await awaitLandingMergesDrained(root, { timeoutMs: 60_000, pollMs: 1, sleep: async () => { polls++; if (polls === 3) inFlight.end(); } });
     expect(waited).toEqual({ drained: true, pending: 0 });
     expect(polls).toBe(3);
-    const stuck = beginLandingMerge(join(root, 'other'), at);
+    const stuck = beginLandingMerge(join(root, 'other'), at, join(root, 'other'));
     expect(await awaitLandingMergesDrained(join(root, 'other'), { timeoutMs: 0, sleep: async () => {} })).toEqual({ drained: false, pending: 1 });
     stuck.end();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('child universe merge checks operational freeze and writes its marker there, with an explicit bypass only', () => {
+  const root = mkdtempSync(join(tmpdir(), 'landing-freeze-universes-'));
+  const prod = join(root, 'prod');
+  const child = join(root, 'child');
+  try {
+    enableLandingFreeze({ reason: 'operational', by: 'OP' }, prod);
+    setElanousConfigDir(child);
+    expect(prodInstanceRoot()).not.toBe(child);
+    const refused = beginLandingMerge(undefined, new Date(), prod);
+    expect(refused.frozen?.reason).toBe('operational');
+    expect(inFlightLandingMerges(prod)).toBe(0);
+    const forced = beginLandingMerge(child, new Date(), prod, 'release version bump');
+    expect(forced.frozen).toBeNull();
+    expect(inFlightLandingMerges(prod)).toBe(1);
+    expect(inFlightLandingMerges(child)).toBe(1);
+    forced.end();
+    expect(inFlightLandingMerges(child)).toBe(0);
+    expect(inFlightLandingMerges(prod)).toBe(0);
+    disableLandingFreeze(prod);
+    enableLandingFreeze({ reason: 'child-only', by: 'OP' }, child);
+    expect(beginLandingMerge(child, new Date(), prod).frozen?.reason).toBe('child-only');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('freeze on rejects a non-finite or out-of-range --wait-seconds before writing the freeze', async () => {

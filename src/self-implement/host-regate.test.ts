@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,9 @@ import { sweepFrozenMerges } from './frozen-merges.js';
 import { syncMergedPrChecklist } from '../release-loop/merged-pr-checklist.js';
 import { addItem, listChecklist } from '../release-loop/checklist.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+
+const testFreezeRoot = mkdtempSync(join(tmpdir(), 'host-regate-freeze-'));
+afterAll(() => rmSync(testFreezeRoot, { recursive: true, force: true }));
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'c'.repeat(40);
@@ -43,6 +46,7 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
     interference: async () => ({ passed: true }),
     log: (event) => events.push(event),
     ...overrides,
+    prodFreezeRoot: overrides.prodFreezeRoot ?? overrides.freezeRoot ?? testFreezeRoot,
   };
   return { deps, calls, events };
 }
@@ -76,6 +80,21 @@ describe('host regate: never merge without a measured host pass', () => {
     const { deps } = mock({ runExposeGate: () => { throw new Error('unexpected exposure check'); } });
     expect((await runHostRegate(input, deps)).passed).toBe(true);
   });
+  test('host merge in a child universe reads the operational freeze even with an explicit config override', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-child-freeze-'));
+    const child = join(root, 'child');
+    const prod = join(root, 'operational');
+    setElanousConfigDir(child);
+    try {
+      enableLandingFreeze({ reason: 'host cut', by: 'OP' }, prod);
+      const { deps, calls } = mock({ freezeRoot: child, prodFreezeRoot: prod });
+      const result = await runHostRegate(input, deps);
+      expect(result).toMatchObject({ passed: true, status: 'frozen' });
+      expect(calls.filter((call) => call.startsWith('gh pr merge'))).toHaveLength(0);
+      expect(JSON.parse(readFileSync(join(child, 'landing-freeze-pending.json'), 'utf8'))).toMatchObject([{ prNumber: 42, headCommit: HEAD }]);
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('freeze keeps the PR ready and defers merge; next pass after off resumes merge', async () => {
     const root = mkdtempSync(join(tmpdir(), 'landing-freeze-regate-'));
     const path = process.env.PATH;
@@ -108,10 +127,10 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(pending()[0]).toMatchObject({ goalFile: join(root, 'goal.md') });
       disableLandingFreeze(root);
       // A merge that reports success but GitHub still shows OPEN stays queued.
-      const notYet = await sweepFrozenMerges(async () => ({ passed: true }), root);
+      const notYet = await sweepFrozenMerges(async () => ({ passed: true }), root, undefined, root);
       expect(notYet).toEqual({ pending: 1, merged: 0 });
       expect(pending()).toHaveLength(1);
-      const sweep = await sweepFrozenMerges((item) => runHostRegate(item, deps), root);
+      const sweep = await sweepFrozenMerges((item) => runHostRegate(item, deps), root, undefined, root);
       expect(sweep).toEqual({ pending: 0, merged: 1 });
       expect(synced).toEqual([join(root, 'goal.md')]);
       expect(pending()).toEqual([]);

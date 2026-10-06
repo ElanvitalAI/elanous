@@ -259,7 +259,7 @@ interface RunDevAskFromGoalFileDeps {
   runSayLaunchFlow: (
     sayText: string,
     entrance?: import('./self-dev/entrance-registry.js').EntranceDeclaration,
-    selection?: { readonly forcePreflight?: boolean; readonly goalType?: import('./self-implement/goal-author.js').GoalType; readonly groundingCwd?: string },
+    selection?: { readonly forcePreflight?: boolean; readonly goalType?: import('./self-implement/goal-author.js').GoalType; readonly groundingCwd?: string; readonly authorGrade?: import('./self-implement/goal-author.js').GoalAuthorGradeSelection },
   ) => Promise<RunDevAskFlowResult>;
   runAskFileLaunchFlow: (
     askPath: string,
@@ -294,7 +294,7 @@ export function assembleAskLaunchPolicy(selection: {
 async function runDefaultSayLaunchFlow(
   sayText: string,
   entrance?: import('./self-dev/entrance-registry.js').EntranceDeclaration,
-  selection: { readonly forcePreflight?: boolean; readonly goalType?: import('./self-implement/goal-author.js').GoalType; readonly groundingCwd?: string } = {},
+  selection: { readonly forcePreflight?: boolean; readonly goalType?: import('./self-implement/goal-author.js').GoalType; readonly groundingCwd?: string; readonly authorGrade?: import('./self-implement/goal-author.js').GoalAuthorGradeSelection } = {},
 ): Promise<RunDevAskFlowResult> {
   const { readFileSync, writeFileSync } = await import('node:fs');
   const [flowMod, { runGoalAuthorCli }, { relative: relativeToCwdPath }, { CLI_HARNESS_SAY_ENTRANCE }] = await Promise.all([
@@ -319,6 +319,7 @@ async function runDefaultSayLaunchFlow(
     ...assembleAskLaunchPolicy(selection),
     ...(selection.goalType === undefined ? {} : { goalType: selection.goalType }),
     ...(selection.groundingCwd === undefined ? {} : { groundingCwd: selection.groundingCwd }),
+    ...(selection.authorGrade === undefined ? {} : { authorGrade: selection.authorGrade }),
   }, {
     print: (line) => console.error(line),
     log: (event, data, level) => debug.log('dev-pipeline', event, data, { level }),
@@ -328,6 +329,9 @@ async function runDefaultSayLaunchFlow(
     cwd: () => process.cwd(),
     now: () => Date.now(),
     isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+    // POD-SELF-ANSWER: non-TTY (Pod) authoring self-answers clarifications with the author resolver.
+    selfResolveClarification: (await import('./self-implement/goal-author-clarification.js')).defaultGoalAuthorSelfResolve,
+    writeGoalDocument: (await import('./self-implement/goal-document-write.js')).writeGoalDocumentAtomic,
     buildPreflightDeps: askIo.buildAskPreflightDeps,
     priorBlockSamples: () => askIo.priorBlockSamplesFrom(askLogRows),
     recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(askLogRows),
@@ -376,6 +380,9 @@ async function runDefaultAskFileLaunchFlow(
     cwd: () => process.cwd(),
     now: () => Date.now(),
     isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+    // POD-SELF-ANSWER: non-TTY (Pod) authoring self-answers clarifications with the author resolver.
+    selfResolveClarification: (await import('./self-implement/goal-author-clarification.js')).defaultGoalAuthorSelfResolve,
+    writeGoalDocument: (await import('./self-implement/goal-document-write.js')).writeGoalDocumentAtomic,
     buildPreflightDeps: askIo.buildAskPreflightDeps,
     priorBlockSamples: () => askIo.priorBlockSamplesFrom(askLogRows),
     recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(askLogRows),
@@ -818,6 +825,7 @@ async function runDevSayFromWords(
     authoringEntrance,
     {
       ...(opts.forcePreflight === undefined ? {} : { forcePreflight: opts.forcePreflight }),
+      ...(opts.authorGrade === undefined ? {} : { authorGrade: { grade: opts.authorGrade, source: opts.authorGradeSource ?? 'flag' } }),
       ...(grounding.groundingCwd === undefined ? {} : { groundingCwd: grounding.groundingCwd }),
     },
   );
@@ -977,12 +985,47 @@ hqCmd.command('seen').description('이 호스트가 본 가장 높은 임대 세
     process.exitCode = result.seen ? 0 : 3;
   });
 registerHqMovePlanCommand(hqCmd);
+const fenceWrapperCmd = hqCmd.command('fence-wrapper').description('설치본 HQ 울타리 크론 래퍼');
+fenceWrapperCmd.command('install').description('래퍼 제안 또는 백업 후 원자적 설치')
+  .option('--dry-run', '변경 내용만 출력 (기본)')
+  .option('--yes', '기존 파일 백업 후 설치')
+  .action(async (opts: { dryRun?: boolean; yes?: boolean }) => {
+    try {
+      if (opts.dryRun && opts.yes) throw new Error('--dry-run and --yes cannot be used together');
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      const { installedHqFenceEntry, installHqFenceWrapper, renderHqFenceWrapper, resolveHqFenceBun } = await import('./hq/fence-wrapper.js');
+      const configDir = getElanousConfigDir();
+      const bun = resolveHqFenceBun();
+      const body = renderHqFenceWrapper({ entry: installedHqFenceEntry(), configDir, bun });
+      const result = installHqFenceWrapper(configDir, body, opts.yes === true);
+      if (opts.yes) console.log(`hq-fence installed: ${result.path} · bun: ${bun}${result.backup ? ` · backup: ${result.backup}` : ''}`);
+      else console.log(`hq-fence bun (absolute · cron has no PATH): ${bun}\n${result.preview}`);
+    } catch (error) { console.error(`hq fence-wrapper install: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+fenceWrapperCmd.command('alert <reason>').description('HQ 울타리 실패를 기존 루프 소유자 요청 원장에 적재')
+  .action(async (reason: string) => {
+    try {
+      const { notifyOwners } = await import('./loops/checker.js');
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      notifyOwners([{ id: `hq-fence:${Date.now()}:${process.pid}`, owner: 'TC', enabled: true, registered: true,
+        state: 'failing', reason }], { root: getElanousConfigDir() });
+    } catch (error) { console.error(`hq fence-wrapper alert: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 hqCmd.command('fence-audit').description('운영 crontab 의 HQ 울타리 밖 쓰기 잡 목록과 감싼 줄 제안(읽기 전용)')
   .option('--json', 'JSON 출력')
   .action(async (opts: { json?: boolean }) => {
     try {
       await hqSink();
       const rows = (await import('./hq/fence-audit.js')).hqFenceAudit();
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      const { repositoryWorktreeCdWarning } = await import('./hq/fence-wrapper.js');
+      const wrapper = _joinPath(getElanousConfigDir(), 'bin', 'hq-fence');
+      if (existsSync(wrapper)) {
+        try {
+          const warning = repositoryWorktreeCdWarning(readFileSync(wrapper, 'utf8'));
+          if (warning) console.error(warning);
+        } catch (error) { console.error(`hq fence-audit: wrapper inspection unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+      }
       if (opts.json) await writeStdoutJson(`${JSON.stringify(rows)}\n`);
       else if (!rows.length) console.log('hq fence-audit: unfenced 0');
       else for (const row of rows) console.log(`${row.raw}\n  role: ${row.recommendedRole}\n  suggested: ${row.suggestedLine}`);
@@ -1255,7 +1298,7 @@ pythonCmd.command('setup').description('elanous venv(~/.local/share/elanous/pyth
 
 program.command('self-update')
   .alias('update')
-  .description('설치본은 릴리스로, 체크아웃은 깨끗한 체크아웃으로 갱신하고 승인 시 넥서스 재시작 · `elanous update` 와 같다 · `--auto on` 이면 매일 자동')
+  .description('설치본은 릴리스로, 체크아웃은 깨끗한 체크아웃으로 갱신 · --auto 는 캐너리 자동 판단, --auto on|off|status 는 기존 자동 갱신 서비스 관리')
   .option('--from <checkout>', '설치할 체크아웃 (기본: 설치본은 릴리스, 체크아웃은 현재 체크아웃)')
   .option('--version <version>', '설치본에서 지정한 릴리스 버전 설치 (기본: latest)')
   .option('--restart', '넥서스 재시작 승인')
@@ -1265,9 +1308,13 @@ program.command('self-update')
   .option('--skip-pwa-build', '체크아웃 설치 전 PWA 빌드를 명시적으로 건너뜀')
   .option('--dev', '판 사이 dev 빌드 설치 — versions/<판>-dev.<sha12> · install.json channel=dev · 이전 versionDir 보존 (사람 승인 · 자동 아님)')
   .option('--rollback', 'install.json 의 이전 versionDir 로 current 를 되돌린다 (이전이 없으면 거부)')
-  .option('--auto <on|off|status>', '자동 갱신 — macOS launchd · Linux systemd 타이머가 매일 04:17 에 `self-update --restart --alert` (크론이 이미 부르면 켜지 않는다)')
-  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; dev?: boolean; rollback?: boolean; auto?: string }) => {
-    if (opts.auto !== undefined) {
+  .option('--auto [on|off|status]', '인자 없이: 에지 레일 계획/실행 · on|off|status: 기존 자동 갱신 서비스 관리')
+  .option('--dry-run', '에지 레일 계획만 출력; 설치·되돌림·상태 쓰기 없음')
+  .option('--seat <seat>', '에지 레일 자리 (OP|TC|MK|UX)')
+  .option('--quiet-window', '상주 프로세스 재시작이 가능한 조용한 창이라고 명시')
+  .option('--canary-run-id <id>', '캐너리 성공 런의 고유 ID (독립 검증된 성공 런에서만 입력; 같은 ID 는 중복 적중하지 않음)')
+  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; dev?: boolean; rollback?: boolean; auto?: string | boolean; dryRun?: boolean; seat?: string; quietWindow?: boolean; canaryRunId?: string }) => {
+    if (typeof opts.auto === 'string') {
       if (!['on', 'off', 'status'].includes(opts.auto)) { console.error(`--auto 는 on · off · status 중 하나: ${opts.auto}`); process.exitCode = 2; return; }
       const { runAutoUpdate } = await import('./cli/update-auto.js');
       process.exitCode = (await runAutoUpdate(opts.auto as 'on' | 'off' | 'status')).exitCode;
@@ -1275,9 +1322,9 @@ program.command('self-update')
     }
     const { runUpdateForInstallation } = await import('./cli/self-update.js');
     // ⭐ 한 번 도는 CLI 는 logs.db 싱크를 스스로 붙여야 `debug.log('self-update', …)` 가 저장된다(없으면 조용히 사라진다 · 09-24 실측).
-    try { const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js'); await registerStandaloneLogSink('self-update'); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+    if (!opts.dryRun) try { const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js'); await registerStandaloneLogSink('self-update'); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
     const keep = Number.parseInt(opts.keep ?? '3', 10);
-    const result = await runUpdateForInstallation({ ...opts, skipPwaBuild: opts.skipPwaBuild, keep: Number.isFinite(keep) ? keep : 3 }, { cliRoot: REPOSITORY_ROOT });
+    const result = await runUpdateForInstallation({ ...opts, auto: opts.auto === true, quietWindow: opts.quietWindow === true, skipPwaBuild: opts.skipPwaBuild, keep: Number.isFinite(keep) ? keep : 3 }, { cliRoot: REPOSITORY_ROOT });
     process.exitCode = result.exitCode;
   });
 
@@ -7001,6 +7048,8 @@ const selfDevCmd = program
           now: () => Date.now(),
           // ⛔ 「대화형인가」는 «두 쪽»을 본다 — 파이프로 몰면 물어도 답이 안 온다.
           isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+          selfResolveClarification: (await import('./self-implement/goal-author-clarification.js')).defaultGoalAuthorSelfResolve,
+          writeGoalDocument: (await import('./self-implement/goal-document-write.js')).writeGoalDocumentAtomic,
           buildPreflightDeps: buildAskPreflightDeps,
           priorBlockSamples: () => askIo.priorBlockSamplesFrom(askLogRows),
           recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(askLogRows),

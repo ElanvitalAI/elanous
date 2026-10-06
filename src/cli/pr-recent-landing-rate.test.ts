@@ -9,9 +9,35 @@ import {
   landingHistoryLogArgs,
   parseCommitNameLog,
 } from './pr-granularity.js';
-import { runPrLand, type PrLandDeps } from './pr-cli.js';
+import { runPrLand as realRunPrLand, type PrLandDeps } from './pr-cli.js';
 import type { CmdRunner, PrManager, UpsertPrInput } from '../autopilot/pr-manager.js';
 import type { RunningRunsResult } from '../self-implement/running-runs.js';
+import { mkdtempSync as freezeRootTemp } from 'node:fs';
+import { tmpdir as freezeRootTmp } from 'node:os';
+import { join as freezeRootJoin } from 'node:path';
+import { afterEach as freezeIsolationAfterEach, beforeEach as freezeIsolationBeforeEach } from 'bun:test';
+import { rmSync as freezeIsolationRm } from 'node:fs';
+import { resetEffectiveInstanceRoot as freezeIsolationReset } from '../instance/resolve.js';
+
+// Both freeze authorities are isolated for every runPrLand here: the operational root (injected) and the
+// local universe (ELANOUS_STATE_DIR) — these tests must never read or write the real ~/.elanous (FREEZE-HOSTMERGE).
+let isolatedFreezeRoot = '';
+let isolatedStateDirForFreeze = '';
+let savedStateDirForFreeze: string | undefined;
+freezeIsolationBeforeEach(() => {
+  isolatedFreezeRoot = freezeRootTemp(freezeRootJoin(freezeRootTmp(), 'pr-land-freeze-'));
+  isolatedStateDirForFreeze = freezeRootTemp(freezeRootJoin(freezeRootTmp(), 'pr-land-state-'));
+  savedStateDirForFreeze = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = isolatedStateDirForFreeze;
+  freezeIsolationReset();
+});
+freezeIsolationAfterEach(() => {
+  if (savedStateDirForFreeze === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDirForFreeze;
+  freezeIsolationReset();
+  freezeIsolationRm(isolatedFreezeRoot, { recursive: true, force: true });
+  freezeIsolationRm(isolatedStateDirForFreeze, { recursive: true, force: true });
+});
+const runPrLand: typeof realRunPrLand = (opts = {}, deps = {}) => realRunPrLand(opts, { prodFreezeRoot: isolatedFreezeRoot, ...deps });
 
 const AUTHOR = 'me@example.com';
 const OTHER = 'other@example.com';

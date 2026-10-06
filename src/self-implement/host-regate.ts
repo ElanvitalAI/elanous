@@ -30,6 +30,8 @@ export type HostRegateDeps = {
   acquire?: (repoRoot: string) => Promise<() => void>;
   log?: (event: 'passed' | 'failed' | 'unmeasured' | 'base-raced', data: Record<string, unknown>) => void;
   freezeRoot?: string;
+  /** Test seam for the operational freeze authority; production always uses the host root. */
+  prodFreezeRoot?: string;
   runExposeGate?: typeof runExposeGate;
   syncMergedChecklist?: typeof import('../release-loop/merged-pr-checklist.js').syncMergedPrChecklist;
 };
@@ -241,7 +243,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just
     // above; the seconds between that read and the merge are checked after the fact below.
     if (input.verifyOnly) return result('passed');
-    const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot, ...(input.goalFile ? { goalFile: input.goalFile } : {}) }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit });
+    const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot, ...(input.goalFile ? { goalFile: input.goalFile } : {}) }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit }, { prodFreezeRoot: deps.prodFreezeRoot });
     if (landing.kind !== 'merge') {
       debug.log('harness.merge', 'frozen', { pr: input.prNumber, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
       return { passed: true, failures: [], os: process.platform, status: 'frozen' };

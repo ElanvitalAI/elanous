@@ -4,10 +4,11 @@ import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
-import { setUserConfigOverlay } from '../user-config.js';
+import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
+import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
@@ -28,6 +29,7 @@ import {
   defaultLookupHarnessProcessLedger,
   formatHarnessProcessElapsed,
   installHarnessCliCommand,
+  harnessQueueDirectSay,
   killHarnessProcess,
   githubDraftSweepAdapters,
   supersedeMergedGoalDrafts,
@@ -118,6 +120,25 @@ describe('harness CLI command', () => {
       process.exitCode = undefined;
       if (prev === undefined) delete process.env.ELANOUS_NESTED_DEPTH;
       else process.env.ELANOUS_NESTED_DEPTH = prev;
+    }
+  });
+
+  it('harness say author-grade flag overrides config and absent config stays full', async () => {
+    const seen: Array<{ authorGrade?: string; authorGradeSource?: string }> = [];
+    const { program } = install(undefined, async (_words, opts) => { seen.push({ authorGrade: opts.authorGrade, authorGradeSource: opts.authorGradeSource }); });
+    const prior = getUserConfig().harness;
+    try {
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...prior, authorGrade: 'full' } }));
+      await program.parseAsync(['harness', 'say', 'same sentence', '--author-grade', 'lite'], { from: 'user' });
+      expect(seen.at(-1)).toEqual({ authorGrade: 'lite', authorGradeSource: 'flag' });
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...prior, authorGrade: 'lite' } }));
+      await program.parseAsync(['harness', 'say', 'same sentence'], { from: 'user' });
+      expect(seen.at(-1)).toEqual({ authorGrade: 'lite', authorGradeSource: 'config' });
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...prior, authorGrade: undefined } }));
+      await program.parseAsync(['harness', 'say', 'same sentence'], { from: 'user' });
+      expect(seen.at(-1)).toEqual({ authorGrade: undefined, authorGradeSource: undefined });
+    } finally {
+      setUserConfigOverlay(null);
     }
   });
 
@@ -236,13 +257,13 @@ describe('harness CLI command', () => {
     const { program } = install(async (_file, opts) => { received.push({ kind: 'ask', seat: opts.seat, env: process.env.ELANOUS_HARNESS_SEAT }); },
       async (_words, opts) => { received.push({ kind: 'say', seat: opts.seat, env: process.env.ELANOUS_HARNESS_SEAT }); });
     try {
-      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'objective', '--seat', 'UX']);
-      await program.parseAsync(['node', 'elanous', 'harness', 'ask', 'goal.md', '--seat', 'TC']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'objective', '--seat', 'UX', '--no-queue']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', 'goal.md', '--seat', 'TC', '--no-queue']);
       expect(received).toEqual([{ kind: 'say', seat: 'UX', env: 'UX' }, { kind: 'ask', seat: 'TC', env: 'TC' }]);
       expect(process.env.ELANOUS_HARNESS_SEAT).toBe(previous);
       setUserConfigOverlay((config) => ({ ...config, loops: { ...config.loops,
         orchestrator: { ...config.loops?.orchestrator!, seatTrees: { OP: [process.cwd()] } } } }));
-      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'inferred']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'inferred', '--no-queue']);
       expect(received.at(-1)).toEqual({ kind: 'say', seat: 'OP', env: 'OP' });
       setUserConfigOverlay(null);
       process.env.ELANOUS_HARNESS_SEAT = 'MK';
@@ -259,6 +280,282 @@ describe('harness CLI command', () => {
       if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
       else process.env.ELANOUS_HARNESS_SEAT = previous;
     }
+  });
+
+  test('harness.queue.directSay off (default): direct say keeps the old path — no enqueue, no refusal, handler output and exit kept', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-queue-off-'));
+    const queue: HarnessQueueDeps = { root, log: () => {}, launch: async () => { throw Error('queue must not launch'); } };
+    let calls = 0;
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+      say: async () => { calls += 1; console.log('direct output'); process.exitCode = 7; },
+      ask: async () => { calls += 1; console.log('direct ask output'); process.exitCode = 7; }, queue });
+    const goal = join(root, 'goal.md');
+    writeFileSync(goal, '대상 경로: src/x.ts\n칸: ONEDOOR-2\n');
+    const oldExit = process.exitCode;
+    const oldFlag = process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: false } } }));
+      for (let i = 0; i < 2; i += 1) {
+        process.exitCode = 0;
+        expect(await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'same words · 칸: ONEDOOR-2', '--seat', 'TC', '--substrate', 'local']))).toContain('direct output');
+        expect(process.exitCode).toBe(7);
+      }
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'emergency', '--seat', 'TC', '--substrate', 'local', '--no-queue']);
+      // Off also covers ask and a seat inferred from the working tree: both stay on the direct path.
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: false } },
+        loops: { ...config.loops, orchestrator: { ...config.loops?.orchestrator!, seatTrees: { OP: [process.cwd()] } } } }));
+      process.exitCode = 0;
+      expect(await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'local']))).toContain('direct ask output');
+      expect(process.exitCode).toBe(7);
+      process.exitCode = 0;
+      expect(await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'inferred seat', '--substrate', 'local']))).toContain('direct output');
+      expect(calls).toBe(5);
+      expect(listHarnessQueue(queue)).toEqual([]);
+      expect(log.mock.calls.filter(([category]) => category === 'harness.queue')).toEqual([]);
+    } finally {
+      log.mockRestore(); process.exitCode = oldExit ?? 0; setUserConfigOverlay(null);
+      if (oldFlag === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY; else process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = oldFlag;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('harnessQueueDirectSay reads env only when config leaves it unset; anything else is off', () => {
+    const pin = (value: boolean | undefined) => setUserConfigOverlay((config) => {
+      const { directSay: _drop, ...queue } = config.harness?.queue ?? {};
+      return { ...config, harness: { ...config.harness, queue: value === undefined ? queue : { ...queue, directSay: value } } };
+    });
+    try {
+    pin(undefined); // isolate from any operator setting: the key is absent, so env decides
+    expect(getUserConfig().harness?.queue?.directSay).toBeUndefined();
+    expect(harnessQueueDirectSay({})).toBe(false);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: '1' })).toBe(true);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: 'true' })).toBe(true);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: '0' })).toBe(false);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: 'yes please' })).toBe(false);
+    pin(false);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: '1' })).toBe(false); // config false > env 1
+    pin(true);
+    expect(harnessQueueDirectSay({ ELANOUS_HARNESS_QUEUE_DIRECT_SAY: '0' })).toBe(true); // config true > env 0
+    } finally { setUserConfigOverlay(null); }
+  });
+
+  describe('harness.queue.directSay on', () => {
+    let oldFlag: string | undefined;
+    beforeEach(() => {
+      oldFlag = process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY; process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = '1';
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: true } } }));
+    });
+    afterEach(() => {
+      setUserConfigOverlay(null);
+      if (oldFlag === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY; else process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = oldFlag;
+    });
+
+    test('unmarked say/ask queue and tick the requested item, while capped say waits with one reason', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'cli-queue-'));
+      const goal = join(root, 'goal.md');
+      writeFileSync(goal, 'an existing goal');
+      const launches: string[][] = [];
+      const queue: HarnessQueueDeps = { root, authorShadow: () => {}, idleRequest: () => {},
+        processes: () => [], pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }),
+        launch: async (_item, args) => { launches.push(args); return 901; }, log: () => {} };
+      const program = new Command().exitOverride();
+      installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+        say: async () => { throw Error('parent must not dispatch'); }, ask: async () => { throw Error('parent must not dispatch'); }, queue });
+      const before = process.exitCode;
+      try {
+        process.exitCode = 0;
+        await program.parseAsync(['node', 'elanous', 'harness', 'say', 'verbatim', 'request', '--seat', 'TC']);
+        expect(listHarnessQueue(queue)).toMatchObject([{ status: 'launched', kind: 'say', seat: 'TC', input: 'verbatim request' }]);
+        expect(launches).toEqual([['harness', 'say', 'verbatim request', '--seat', 'TC']]);
+        expect(process.exitCode).toBe(0);
+        await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--seat', 'UX']);
+        expect(listHarnessQueue(queue)).toMatchObject([{ status: 'launched' }, { status: 'launched', kind: 'ask', seat: 'UX', input: goal }]);
+        expect(launches).toHaveLength(2);
+        expect(process.exitCode).toBe(0);
+        // Keep config directSay true while env says 0: precedence and seat inference are checked together.
+        setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: true } },
+          loops: { ...config.loops, orchestrator: { ...config.loops?.orchestrator!, seatTrees: { OP: [process.cwd()] } } } }));
+        process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = '0';
+        await program.parseAsync(['node', 'elanous', 'harness', 'say', 'inferred']);
+        expect(listHarnessQueue(queue).at(-1)).toMatchObject({ seat: 'OP', status: 'launched', kind: 'say' });
+        expect(launches).toHaveLength(3);
+        await program.parseAsync(['node', 'elanous', 'harness', 'say', 'explicit-substrate', '--seat', 'MK', '--substrate', 'local']);
+        expect(launches.at(-1)).toEqual(['harness', 'say', 'explicit-substrate', '--seat', 'MK', '--substrate', 'local']);
+      } finally { setUserConfigOverlay(null); process.exitCode = before; rmSync(root, { recursive: true, force: true }); }
+    });
+
+    test('capped unmarked say persists once, reports its own blocking reason and launches zero', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'cli-queue-cap-'));
+      const launches: string[][] = [];
+      const queue: HarnessQueueDeps = { root, authorShadow: () => {}, idleRequest: () => {},
+        processes: () => [{ pid: 900, seat: 'TC' }], cap: () => 1,
+        pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }),
+        launch: async (_item, args) => { launches.push(args); return 901; }, log: () => {} };
+      const program = new Command().exitOverride();
+      installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+        say: async () => { throw Error('must wait'); }, queue });
+      const before = process.exitCode;
+      try {
+        process.exitCode = 0;
+        const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'blocked', '--seat', 'TC']));
+        expect(lines.filter((line) => line.startsWith('대기열에 들어갔다 — '))).toEqual([
+          '대기열에 들어갔다 — seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)',
+        ]);
+        expect(listHarnessQueue(queue)).toMatchObject([{ status: 'queued', waitingReason: 'seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)' }]);
+        expect(launches).toHaveLength(0);
+        expect(process.exitCode).toBe(0);
+      } finally { process.exitCode = before; rmSync(root, { recursive: true, force: true }); }
+    });
+
+    test('an existing queue head keeps a new direct say waiting without launching a different item', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'cli-queue-fifo-'));
+      const launches: string[][] = [];
+      const queue: HarnessQueueDeps = { root, authorShadow: () => {}, idleRequest: () => {},
+        processes: () => [], pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }),
+        launch: async (_item, args) => { launches.push(args); return 901; }, log: () => {} };
+      const head = await addHarnessQueue({ seat: 'TC', say: 'already waiting' }, queue);
+      const program = new Command().exitOverride();
+      installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+        say: async () => { throw Error('must not dispatch'); }, queue });
+      const oldExit = process.exitCode;
+      try {
+        process.exitCode = 0;
+        const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'new', '--seat', 'TC']));
+        expect(lines.filter((line) => line.startsWith('대기열에 들어갔다 — '))).toEqual(['대기열에 들어갔다 — 앞선 대기열 항목 차례']);
+        expect(listHarnessQueue(queue)).toMatchObject([{ id: head.id, status: 'queued' },
+          { status: 'queued', waitingReason: '앞선 대기열 항목 차례' }]);
+        expect(launches).toEqual([]);
+        expect(process.exitCode).toBe(0);
+      } finally { process.exitCode = oldExit; rmSync(root, { recursive: true, force: true }); }
+    });
+
+    test('a direct say launched at once through the real queue launcher keeps the child output, cwd and exit code; a second say for the same cell is refused', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-queue-real-'));
+      const owner = mkdtempSync(join(tmpdir(), 'cli-queue-owner-'));
+      const stub = join(dir, 'stub.ts');
+      writeFileSync(stub, "if (process.env.STUB_SIGNAL) process.kill(process.pid, 'SIGTERM');\nconsole.log('STUB ' + JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) })); process.exitCode = 7;\n");
+      const driver = join(dir, 'driver.ts');
+      const src = join(import.meta.dir, 'harness-cli-command.ts');
+      // The fixture lives outside this repository; resolve Commander from this checkout explicitly.
+      writeFileSync(driver, [
+        `import { Command } from ${JSON.stringify(join(import.meta.dir, '..', '..', 'node_modules', 'commander', 'index.js'))};`,
+        `import { installHarnessCliCommand } from ${JSON.stringify(src)};`,
+        `const root = ${JSON.stringify(join(dir, 'state'))};`,
+        `const queue = { root, authorShadow: () => {}, idleRequest: () => {}, processes: () => [], cap: () => 4, log: () => {},`,
+        `  pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }), launchCommand: ${JSON.stringify(stub)} };`,
+        `const program = new Command().exitOverride();`,
+        `installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',`,
+        `  say: async () => { throw new Error('direct dispatch must not run'); }, queue });`,
+        `await program.parseAsync(['node', 'elanous', ...process.argv.slice(2)]);`,
+      ].join('\n'));
+      mkdirSync(join(dir, 'state', 'harness'), { recursive: true });
+      const env = { ...process.env, ELANOUS_STATE_DIR: join(dir, 'state'), ELANOUS_CONFIG_DIR: join(dir, 'config') };
+      delete (env as Record<string, string | undefined>).ELANOUS_HARNESS_QUEUE_LAUNCH;
+      const run = (words: string) => Bun.spawnSync(['bun', driver, 'harness', 'say', words, '--seat', 'TC', '--substrate', 'local'],
+        { cwd: owner, env, stdout: 'pipe', stderr: 'pipe' });
+      try {
+        const first = run('probe · 칸: ONEDOOR-2');
+        const out = first.stdout.toString();
+        expect(first.exitCode).toBe(7);
+        const line = out.split('\n').find((l) => l.startsWith('STUB '));
+        expect(line).toBeDefined();
+        const seen = JSON.parse(line!.slice(5)) as { cwd: string; args: string[] };
+        expect(realpathSync(seen.cwd)).toBe(realpathSync(owner));
+        expect(seen.args).toContain('probe · 칸: ONEDOOR-2');
+        // The finished row is retryable (exit 7), so the same cell may be sent again; a queued twin is refused.
+        const twinRow = await addHarnessQueue({ seat: 'MK', say: 'queued twin · 칸: HQ-FENCE-RAIL' }, { root: join(dir, 'state') });
+        const twin = run('another sentence · 칸: HQ-FENCE-RAIL');
+        expect(twin.exitCode).toBe(1);
+        expect(twin.stderr.toString().split('\n').filter((l) => l.startsWith('발사 거절 — '))).toHaveLength(1);
+        expect(twin.stdout.toString()).not.toContain('STUB ');
+        // Clear the MK head first: with it queued, round-robin would make the next TC say wait for MK's turn.
+      await removeHarnessQueue(twinRow.id, { root: join(dir, 'state') });
+      // A child killed by a signal still ends the parent (no hang waiting for a missed close) with a non-zero code.
+        const killed = Bun.spawnSync(['bun', driver, 'harness', 'say', 'signal probe', '--seat', 'TC', '--substrate', 'local'],
+          { cwd: owner, env: { ...env, STUB_SIGNAL: '1' }, stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
+        expect(killed.signalCode ?? null).toBeNull();
+        expect(killed.exitCode).not.toBe(0);
+        expect(killed.stdout.toString()).not.toContain('STUB ');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(owner, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test('when a separate real tick launches the new row first, the direct say reports that launch; a row left launching ends non-zero', async () => {
+      for (const mode of ['launched', 'launching'] as const) {
+        const root = mkdtempSync(join(tmpdir(), `cli-queue-race-${mode}-`));
+        const launches: string[][] = [];
+        let racer: Awaited<ReturnType<typeof tickHarnessQueue>> | undefined;
+        const queue: HarnessQueueDeps = { root, authorShadow: () => {}, idleRequest: () => {}, processes: () => [], cap: () => 4,
+          pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }), log: () => {},
+          launch: async (_item, args) => {
+            launches.push(args);
+            if (mode === 'launching') throw new Error('spawn failed after reservation');
+            return 901;
+          },
+          // A separate, real tick runs between the CLI's enqueue and the CLI's own tick.
+          afterEnqueue: async () => { try { racer = await tickHarnessQueue(queue); } catch { racer = undefined; } } };
+        const program = new Command().exitOverride();
+        installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+          say: async () => { throw Error('must not dispatch'); }, queue });
+        const oldExit = process.exitCode;
+        try {
+          process.exitCode = 0;
+          const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', `raced ${mode}`, '--seat', 'TC']));
+          expect(launches).toHaveLength(1); // only the racing tick launched — the CLI did not launch it a second time
+          if (mode === 'launched') {
+            expect(racer?.outcome).toBe('launched');
+            expect(lines.filter((line) => line.startsWith('다른 대기열 tick 이 이미 발사했다 — ') && line.includes('pid 901'))).toHaveLength(1);
+            expect(process.exitCode).toBe(0);
+          } else {
+            expect(listHarnessQueue(queue)[0]?.status).toBe('launching');
+            expect(lines.some((line) => line.startsWith('다른 대기열 tick 이 이미 발사했다'))).toBe(false);
+            expect(process.exitCode).toBe(1);
+          }
+        } finally { process.exitCode = oldExit; rmSync(root, { recursive: true, force: true }); }
+      }
+    });
+
+    test('marked say does not requeue; --no-queue bypass logs once and preserves handler output and exit', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'cli-queue-bypass-'));
+      const queue: HarnessQueueDeps = { root, log: () => {} };
+      const program = new Command().exitOverride();
+      installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+        say: async () => { console.log('same output'); process.exitCode = 7; }, queue });
+      const oldLaunch = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+      const oldSeat = process.env.ELANOUS_HARNESS_SEAT;
+      const oldExit = process.exitCode;
+      const log = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = 'hq-marked';
+        process.env.ELANOUS_HARNESS_SEAT = 'MK';
+        process.exitCode = 0;
+        expect(await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'marked']))).toContain('same output');
+        expect(listHarnessQueue(queue)).toEqual([]);
+        expect(process.exitCode).toBe(7);
+        await program.parseAsync(['node', 'elanous', 'harness', 'say', 'marked', '--seat', 'TC']);
+        expect(listHarnessQueue(queue)).toEqual([]);
+        delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+        process.exitCode = 0;
+        expect(await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'emergency', '--seat', 'UX', '--no-queue']))).toContain('same output');
+        expect(process.exitCode).toBe(7);
+        expect(listHarnessQueue(queue)).toEqual([]);
+        expect(log.mock.calls.filter(([category, event]) => category === 'harness.queue' && event === 'bypass'))
+          .toEqual([['harness.queue', 'bypass', { seat: 'UX', reason: '--no-queue' }]]);
+      } finally {
+        log.mockRestore(); process.exitCode = oldExit;
+        if (oldLaunch === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+        else process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = oldLaunch;
+        if (oldSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+        else process.env.ELANOUS_HARNESS_SEAT = oldSeat;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
   });
 
   test('processes --kill checks repository, owning run and terminal status before sending one SIGTERM', async () => {

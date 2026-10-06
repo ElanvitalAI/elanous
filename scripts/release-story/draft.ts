@@ -86,18 +86,25 @@ function manualTexts(dir: string): string[] {
   return texts;
 }
 
-function linkedClaims(stateDir: string, version: string, ids: Set<string>): { sentences: string[]; error?: string } {
+type StoryClaim = { id: string; sentence: string; command: string | null; firstPublicCandidate: boolean };
+
+function linkedClaims(stateDir: string, version: string, ids: Set<string>): { claims: StoryClaim[]; error?: string } {
   const ledger = new ClaimsLedger({ stateDir });
   try {
-    if (!existsSync(stateDir)) return { sentences: [], error: '상태 경로 없음' };
-    if (!statSync(stateDir).isDirectory()) return { sentences: [], error: '상태 경로가 폴더가 아님' };
-    if (!existsSync(ledger.path)) return { sentences: [], error: '원장 없음' };
-    const sentences = [...ledger.list({ status: 'verified' }), ...ledger.list({ status: 'public' })]
-      .filter((row) => ledger.get(row.id).links.some((link) => link.version === version && ids.has(link.cell)))
-      .map((row) => row.claim);
-    return { sentences };
+    if (!existsSync(stateDir)) return { claims: [], error: '상태 경로 없음' };
+    if (!statSync(stateDir).isDirectory()) return { claims: [], error: '상태 경로가 폴더가 아님' };
+    if (!existsSync(ledger.path)) return { claims: [], error: '원장 없음' };
+    const claims = [...ledger.list({ status: 'verified' }), ...ledger.list({ status: 'public' })]
+      .map((row): StoryClaim | null => {
+        const detail = ledger.get(row.id);
+        if (!detail.links.some((link) => link.version === version && ids.has(link.cell))) return null;
+        return { id: row.id, sentence: row.claim, command: detail.evidence.at(-1)?.command ?? null,
+          firstPublicCandidate: !detail.history.some((entry) => entry.event === 'publish')
+            && !detail.links.some((link) => link.version !== version && link.version !== null) };
+      }).filter((claim): claim is StoryClaim => claim !== null);
+    return { claims };
   } catch (error) {
-    return { sentences: [], error: error instanceof Error ? error.message : String(error) };
+    return { claims: [], error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -117,15 +124,34 @@ export function draftReleaseStory(options: DraftOptions): DraftResult {
   const candidates = green.filter((item) => !mentions.some((text) => text.includes(item.id)));
   const evidence = linkedClaims(options.stateDir ?? effectiveInstanceRoot(), version, new Set(publicCells.map((item) => item.id)));
   const changes = [...userLines, ...publicCells.map((item) => firstPhrase(item.title))];
+  const numeric = evidence.claims.find((claim) => claim.firstPublicCandidate && /\d/.test(claim.sentence) && claim.command);
+  const kindPattern = /\bnew\b|새로운|신규|새 종류/i;
+  const kindFromNext = userLines.find((line) => kindPattern.test(line));
+  const kindFromCell = publicCells.map((item) => firstPhrase(item.title)).find((line) => kindPattern.test(line));
+  const kindFromClaim = evidence.claims.find((claim) => kindPattern.test(claim.sentence));
+  const newKind = kindFromNext ? { text: kindFromNext, source: 'release/next.md', command: null }
+    : kindFromCell ? { text: kindFromCell, source: 'green 칸', command: null }
+    : kindFromClaim ? { text: kindFromClaim.sentence, source: `소구점 ${kindFromClaim.id}`, command: kindFromClaim.command } : null;
+  const card = numeric ? { kind: '첫 공개 숫자 후보', text: numeric.sentence, source: `소구점 ${numeric.id}`, command: numeric.command }
+    : newKind ? { kind: '새 종류 후보', ...newKind } : null;
   const announcement = [
-    `# ${version} 판 공지 초안`, '', '## 무엇이 달라졌나',
+    `# ${version} 판 공지 초안`, '', '## 대표 카드 · CMO 확인 전',
+    ...(card ? [`- ${card.kind}: ${card.text}`, `- 출처: ${card.source}`, `- 재측정: ${card.command ?? '확인 명령 없음 — 게시 전 확인'}`]
+      : ['- 후보 없음 — CMO가 이번 판의 대표 문장을 고른다']),
+    '- 첫 공개 여부·새 종류 여부는 앞 판의 공개 문장과 대조한 뒤 CMO가 확정한다.',
+    '', '## 무엇이 달라졌나',
     ...(changes.length ? changes.map((line) => `- ${line}`) : ['- 사용자 쪽 변경 없음']),
     '', '## 근거',
-    ...(evidence.error ? [`근거: 소구점 원장 못 읽음(${evidence.error})`] : evidence.sentences.length ? evidence.sentences.map((claim) => `- ${claim}`) : ['근거: 연결된 소구점 없음']),
+    ...(evidence.error ? [`근거: 소구점 원장 못 읽음(${evidence.error})`] : evidence.claims.length ? evidence.claims.map((claim) => `- ${claim.sentence}`) : ['근거: 연결된 소구점 없음']),
+    '', '## CMO 게시 판단 · 초안은 게시가 아니다',
+    '- 착지·출처: release/next.md와 green 칸의 공개 상태, 연결된 검증 소구점을 대조한다. 근거가 없거나 원장을 못 읽었으면 보류한다.',
+    '- 사실·톤: 숫자는 근거 명령으로 재측정하고 첫 공개·새 종류는 앞 판 공개 문장과 대조한다. 브랜드 규칙과 금지 표현을 확인한다.',
+    '- 채널·결정: 공지·사이트·매뉴얼 문장의 대상과 영어 원문을 대조하고 CMO가 게시/수정/보류와 이유를 기록한다. 실제 바깥 게시는 역할 파일의 사람 결정 관문을 따른다.',
     '',
   ].join('\n');
   const siteChanges = [...userLines, ...publicCells.map((item) => firstPhrase(item.title)).filter((title) => !/[가-힣]/.test(title))];
-  const siteNews = [`# What's new in ${version}`, '', ...siteChanges.slice(0, 3).map((line) => `- ${line}`), '', `Release: ${version}`, ''].join('\n');
+  const siteCard = card && !/[가-힣]/.test(card.text) ? [`## Lead card candidate (CMO review required)`, card.text, ''] : [];
+  const siteNews = [`# What's new in ${version}`, '', ...siteCard, ...siteChanges.slice(0, 3).map((line) => `- ${line}`), '', `Release: ${version}`, ''].join('\n');
   const manual = [`# ${version} 매뉴얼 갱신 후보`, '', ...candidates.map((item: ChecklistItem) => `- ${item.id} · ${firstPhrase(item.title)} · 매뉴얼 언급 없음`), ''].join('\n');
   const outDir = options.outDir ?? join(effectiveInstanceRoot(), 'release', version, 'story');
   mkdirSync(outDir, { recursive: true });
@@ -150,7 +176,7 @@ export function draftReleaseStory(options: DraftOptions): DraftResult {
     files.push(file);
   }
   const result: DraftResult = { version, status: 'drafted', userLines: userLines.length, internalDropped, greenCells: green.length,
-    claims: evidence.sentences.length, manualCandidates: candidates.length, brandFindings, ...(brandUnmeasured ? { brandUnmeasured } : {}), files };
+    claims: evidence.claims.length, manualCandidates: candidates.length, brandFindings, ...(brandUnmeasured ? { brandUnmeasured } : {}), files };
   debug.log('release.story', 'drafted', { version, userLines: result.userLines, internalDropped, greenCells: result.greenCells,
     claims: result.claims, manualCandidates: result.manualCandidates, brandFindings, ...(brandUnmeasured ? { brandUnmeasured } : {}) });
   return result;
@@ -161,7 +187,9 @@ export function runReleaseStory(context: GraphContext = readGraphContext(), draf
   try {
     if (context.outputs.publish?.outcome !== 'ok' || context.outputs.verify?.outcome !== 'ok')
       throw new Error('published release and verification required');
-    const result = draft({ version });
+    // 판 노트 원천은 기본이 저장소의 release/next.md — 시험·재현은 env 로 다른 파일을 준다(실제 next.md 는 판마다 비워진다).
+    const nextPath = process.env.ELANOUS_RELEASE_NEXT_PATH?.trim();
+    const result = draft({ version, ...(nextPath ? { nextPath } : {}) });
     if (result.status === 'drafted') {
       const root = effectiveInstanceRoot();
       const requestsPath = join(root, 'seat-requests', 'requests.jsonl');

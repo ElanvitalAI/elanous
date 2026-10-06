@@ -1,7 +1,12 @@
-# 몸은 저장소 밖 스킬(yt-vault)이다 — 자리는 YT_VAULT_DIR 로 받는다(크론이 준다).
+# 기존 흡수 몸은 저장소 밖 스킬(yt-vault)이다 — 자리는 YT_VAULT_DIR 로 받는다(크론이 준다).
+# 뉴스 흡수는 이 저장소 scripts/intake-news.ts · 소스 배열은 news-sources.yaml.
 intake-trend:
   command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" trend'
   timeout_ms: 1200000
+intake-news:
+  # 크론 입구(intake-cron.sh)는 cd "$YT_VAULT_DIR" 뒤 그래프를 돌린다 — 상대 경로면 yt-vault 쪽을 찾아 죽는다.
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/intake-news.ts"'
+  timeout_ms: 600000
 intake-ingest:
   command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" ingest'
   timeout_ms: 300000

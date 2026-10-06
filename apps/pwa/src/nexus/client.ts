@@ -104,6 +104,7 @@ export interface TaskCardWire {
   goalId: string;
   title: string;
   status: 'open' | 'closed';
+  closedReason?: string;
   createdAt: string;
   sections: Array<{ key: string; owner: string; content: string; createdAt: string }>;
 }
@@ -127,6 +128,7 @@ export interface NexusClient {
   getTab(id: string): Promise<{ tab: NexusTabState; recentEvents: NexusEvent[] }>;
   getTaskCards(): Promise<{ cards: TaskCardWire[] }>;
   getTaskCard(id: string): Promise<{ card: TaskCardWire; placements?: WishPlacementWire[] }>;
+  closeTaskCard(id: string, reason: string): Promise<{ card: TaskCardWire }>;
   /** PWA mirror PR 1 — chat-backend Quick Setup snapshot. PR 2's
    *  QuickSetupCard component consumes this to mirror the TUI Settings
    *  card on mobile / iOS / remote PWA users. Cache-free; the PWA's
@@ -1245,6 +1247,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getTab: (id) => request('GET', `/v1/nexus/tabs/${encodeURIComponent(id)}`),
     getTaskCards: () => request('GET', TASK_CARDS_PATH),
     getTaskCard: (id) => request('GET', `${TASK_CARDS_PATH}/${encodeURIComponent(id)}`),
+    closeTaskCard: (id, reason) => request('POST', `${TASK_CARDS_PATH}/${encodeURIComponent(id)}/close`, { reason }),
     getChatBackendDetection: () => request<ChatBackendDetection>('GET', '/v1/nexus/chat-backend-detection'),
     mintConnectToken: () => request<MintConnectToken>('POST', '/v1/nexus/connect-info/mint-token', {}),
     // ---- tabs mutation ----

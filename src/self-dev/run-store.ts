@@ -28,6 +28,7 @@ import type { RunIdSource } from '../harness/harness-space.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import type { SelfDevJobResult, SelfDevGoal } from './orchestrate.js';
 import type { SupervisorStopReason } from './run-supervisor.js';
+import type { SupervisorNext } from './supervisor-verdict-edges.js';
 import { loadMirroredRunRecord, mirrorRunRecord } from './run-record-mirror.js';
 
 export interface SelfDevRunParticipant {
@@ -92,6 +93,8 @@ export interface SelfDevRunState {
   parkedResolution?: SelfDevRunResolution;
   /** The closed supervisor termination reason, persisted independently from per-goal results. */
   supervisorStopReason?: SupervisorStopReason;
+  /** Named next step at supervisor termination; legacy checkpoints omit it. */
+  next?: SupervisorNext;
   /** ★ C(2026-07-21·HITL 정황 품질) — 이 run 을 구동하는 오케스트레이터 프로세스 pid. 살아있으면
    *  non-terminal goal 은 **실행중(running)** 이지 막힌(interrupted) 게 아니다. 죽었으면(오케스트레이터
    *  killed) 진짜 interrupted. isPidAlive 로 구분해 라이브 잡을 parked/repair-signals 에서 제외. */
@@ -311,13 +314,14 @@ export function recordSelfDevRunSupervisorStop(
   runId: string,
   supervisorStopReason: SupervisorStopReason,
   dir = selfDevRunsDir(),
+  next?: SupervisorNext,
 ): SupervisorStopPersistenceOutcome {
   try {
     if (!existsSync(dir)) return { outcome: 'missing-directory' };
     return withFileLockSync(join(dir, `${runId}.lock`), () => {
       const state = loadSelfDevRunFromPath(runPath(runId, dir));
       if (!state) return { outcome: 'missing-record' };
-      writeSelfDevRun({ ...state, updatedAt: Date.now(), supervisorStopReason }, dir);
+      writeSelfDevRun({ ...state, updatedAt: Date.now(), supervisorStopReason, ...(next === undefined ? {} : { next }) }, dir);
       return { outcome: 'persisted' };
     });
   } catch {

@@ -68,6 +68,10 @@ function liveHealRuns(root: string): Set<string> {
 /** A test process must never start the real heal loop — it spawns external grounding (10-05 load 150 incident). */
 export async function startHealLoop(file: string, options: HealLoopOptions, env: NodeJS.ProcessEnv = process.env,
   run: StartHealLoop = async (graph, args) => (await import('../graph-runner/runner.js')).runGraph(graph, args)): Promise<unknown> {
+  if (env.ELANOUS_POD_NAME) {
+    debug.log('heal.intake', 'skipped-in-pod', { ref: options.input.failureEvent.ref });
+    return undefined;
+  }
   if (env.NODE_ENV === 'test' || env.ELANOUS_TEST_HOME) {
     debug.log('heal.intake', 'loop-start-skipped-test', { runId: options.runId });
     return undefined;

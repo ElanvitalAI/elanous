@@ -66,6 +66,77 @@ describe('mapClarificationDeliveryIds', () => {
 });
 
 describe('escalateGoalDocumentClarifications', () => {
+  test('attempts self-answer before missing-delivery-resolver fallback in rework', async () => {
+    const file = goalFile(`${unresolvedGoal}\n  - evidence: src/example.ts: grounded`);
+    const sequence: string[] = [];
+    try {
+      const result = await escalateGoalDocumentClarifications({
+        goalFile: file.path,
+        selfAnswerPath: 'rework',
+        selfResolveClarification: async ({ evidence }) => {
+          sequence.push('self-answer');
+          return { answer: 'Telegram', evidence };
+        },
+        dispatch: async () => {
+          sequence.push('dispatch');
+          return { output: 'requires a HITL resolver, but none is installed in this surface', absenceReason: 'no-delivery-resolver' };
+        },
+        fallback: () => { sequence.push('fallback'); },
+        pendingQuestionPersistence: pendingPersistenceStub(),
+      });
+      expect(sequence).toEqual(['self-answer']);
+      expect(result.outcome).toBe('skipped');
+      expect(readFileSync(file.path, 'utf8')).toContain('  - answer: Telegram');
+    } finally { file.clean(); }
+  });
+  test('partial self-answer only dispatches and falls back for the remaining question', async () => {
+    const second = unresolvedGoal.replaceAll('delivery_scope', 'delivery_other')
+      .replaceAll('Which human surface should receive this?', 'Which other surface should receive this?');
+    const file = goalFile(`${unresolvedGoal}\n${second}\n  - evidence: src/example.ts: grounded`);
+    const dispatched: string[][] = [];
+    const fallback: string[] = [];
+    try {
+      const result = await escalateGoalDocumentClarifications({
+        goalFile: file.path, selfAnswerPath: 'ask',
+        selfResolveClarification: async ({ questionId, evidence }) => questionId === 'delivery_scope'
+          ? { answer: 'Telegram', evidence } : {},
+        dispatch: async ({ questions }) => {
+          dispatched.push((questions as Array<{ id: string }>).map(({ id }) => id));
+          return { output: 'requires a HITL resolver, but none is installed in this surface', absenceReason: 'no-delivery-resolver' };
+        },
+        fallback: (message) => { fallback.push(message); },
+        pendingQuestionPersistence: pendingPersistenceStub(),
+      });
+      expect(dispatched).toEqual([['delivery_other']]);
+      expect(fallback).toHaveLength(1);
+      expect(fallback[0]).toContain('Which other surface');
+      expect(result).toMatchObject({ unanswered: 1, answeredBy: 'agent', outcome: 'fallback' });
+      const updated = readFileSync(file.path, 'utf8');
+      expect(updated).toContain('  - answer: Telegram');
+      expect(updated).toContain('  - answer: DEFERRED-UNTIL: Which other surface should receive this?');
+    } finally { file.clean(); }
+  });
+
+  test('defers fallback until after self-answer abstains', async () => {
+    const file = goalFile(`${unresolvedGoal}\n  - evidence: src/example.ts: grounded`);
+    const order: string[] = [];
+    try {
+      const result = await escalateGoalDocumentClarifications({
+        goalFile: file.path, selfAnswerPath: 'rework',
+        selfResolveClarification: async () => { order.push('self-answer'); return {}; },
+        dispatch: async () => {
+          order.push('dispatch');
+          return { output: 'requires a HITL resolver, but none is installed in this surface', absenceReason: 'no-delivery-resolver' };
+        },
+        fallback: () => { order.push('fallback'); },
+        pendingQuestionPersistence: pendingPersistenceStub(),
+      });
+      expect(order).toEqual(['self-answer', 'dispatch', 'fallback']);
+      expect(result.outcome).toBe('fallback');
+      expect(readFileSync(file.path, 'utf8')).toContain('  - answer: DEFERRED-UNTIL: Which human surface should receive this?');
+    } finally { file.clean(); }
+  });
+
   test('keeps an unmarked resolver compatible and infers a returned answer as human', async () => {
     const file = goalFile(unresolvedGoal);
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];

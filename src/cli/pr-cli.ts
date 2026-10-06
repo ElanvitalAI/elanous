@@ -75,6 +75,8 @@ export interface PrLandOpts {
   excludeActiveRunFiles?: boolean;
   excludeActiveRunSources?: boolean;
   landReason?: string;
+  /** Explicit reason for bypassing the landing freeze. */
+  forceFreeze?: string;
   /** Land even though changed files would leak into the public export (the reason goes in --land-reason). */
   allowPublicLeak?: boolean;
 }
@@ -130,6 +132,8 @@ export interface PrLandDeps {
   overlapConfirmChannels?: ConfirmChannel[];
   overlapConfirmTimeoutMs?: number;
   decideOverlapLanding?: () => OverlapLandingDecision | Promise<OverlapLandingDecision>;
+  /** Operational freeze authority (isolated in tests). */
+  prodFreezeRoot?: string;
 }
 
 export const OVERLAP_DECISION_PROMPT = '겹친 파일이 있습니다. 이번 착지를 그대로 병합할까요?';
@@ -1132,6 +1136,10 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.error('✗ body: --body와 --body-file은 함께 사용할 수 없습니다.');
     return 1;
   }
+  if (opts.forceFreeze !== undefined && !opts.forceFreeze.trim()) {
+    out.error('✗ freeze: --force-freeze 에는 이유가 필요합니다.');
+    return 1;
+  }
   if (opts.allowPublicLeak && !opts.landReason?.trim()) {
     out.error('✗ public-export-leak: --allow-public-leak 에는 --land-reason "<이유>" 가 필요합니다.');
     return 1;
@@ -1649,7 +1657,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const headCommit = landedHead.ok && /^[a-f0-9]{40}$/i.test(landedHead.out.trim()) ? landedHead.out.trim() : undefined;
   const validPr = Number.isSafeInteger(prNumber) && prNumber > 0;
   const heldEntry = validPr && headCommit ? { prNumber, headCommit, repoRoot: cwd } : null;
-  const admission = admitLandingMerge(heldEntry, undefined, {}, validPr ? { prNumber, repoRoot: cwd, ...(headCommit ? { headCommit } : {}) } : undefined);
+  const admission = admitLandingMerge(heldEntry, undefined, {}, validPr ? { prNumber, repoRoot: cwd, ...(headCommit ? { headCommit } : {}) } : undefined,
+    { prodFreezeRoot: deps.prodFreezeRoot, forceReason: opts.forceFreeze });
   if (admission.kind === 'held' && !heldEntry) {
     out.error(`✗ freeze: ready PR의 검증 HEAD/번호를 보존하지 못했습니다: ${upsert.url}`);
     return 1;
@@ -1712,6 +1721,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
     return 1;
   }
+  if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
   record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
   if (merged.remoteBranchDeletion) {
     out.log(`⚠ remote branch deletion: ${merged.remoteBranchDeletion.detail}`);
@@ -1763,6 +1773,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
     .option('--exclude-active-run-files', '도는 런과 겹친 파일을 이번 착지에서 제외')
     .option('--exclude-active-run-sources', '⚠ 위험: --exclude-active-run-files 가 골 문서가 아닌 파일(소스)을 빼도 착지를 강행')
     .option('--land-reason <text>', '권고를 보고도 지금 내는 이유(예: 남이 기다리는 차단 해제)')
+    .option('--force-freeze <reason>', '동결을 넘겨 병합할 명시적 이유(필수)')
     .option('--allow-public-leak', '바뀐 파일이 공개본에 사적 흔적을 실어도 착지(이유는 --land-reason)')
     .action(async (opts: PrLandOpts) => {
       // ⛔⭐⭐⭐ **관측 sink 를 먼저 건다** — 라이브 도그푸드가 잡은 결함(2026-08-03).

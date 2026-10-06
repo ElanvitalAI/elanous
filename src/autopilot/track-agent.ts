@@ -47,7 +47,9 @@ const runCli = async (args: string[]): Promise<{ stdout: string }> => {
   const { argv, env } = universeLaunch(args);
   return exec('bun', argv, { cwd: repoDir(), env, timeout: 120_000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
 };
-const forbiddenActionRegex = /\b(?:delete|remove|deploy|publish|release|restart|reboot|merge|force|pay|purchase|secret|credential|sudo|rm\s+-rf|config\s+set)\b|(?:^|\s)--prod\b|삭제|배포|게시|릴리스|재시작|재부팅|병합|결제|자격|비밀|강제/i;
+// A work topic containing a verb is not necessarily an instruction; the guard matches executable requests.
+// Security words (secret · credential · force · 자격 · 비밀 · 강제) stay blocked anywhere — topic or request (UX harvest).
+const forbiddenActionRegex = /\b(?:delete|remove|deploy|publish|release|restart|reboot|merge|pay|purchase|sudo)\b(?=\s+(?:the\s+(?:branch|site|app|release|file|record)\b|(?:this\s+)?branch\b|(?:to|into)\s+main\b|main\b|now\b|(?:site|app)\b))|\bcut\s+a\s+release\b|\brm\s+-rf\b|\bconfig\s+set\b|\b(?:secret|credential|force|sudo)\b|자격|비밀|강제|(?:^|\s)--prod\b|(?:삭제|배포|게시|릴리스|재시작|재부팅|병합|결제|강제)(?:해라|하세요|해줘|하라|해\s*주세요|하시오)(?!\S)|(?:^\s*|후\s*)(?:삭제|배포|게시|릴리스|재시작|재부팅|병합|결제)(?=\s*$|\s*후\s*)|(?:^\s*운영\s*(?:배포|재시작)(?=\s*$))|(?:삭제|배포|게시|릴리스|재시작|재부팅|병합|결제)(?=\s*(?:해|실행|진행)(?:\s|$))/iu;
 export const TRACK_AGENT_FORBIDDEN_ACTION_REGEX = new RegExp(forbiddenActionRegex.source, forbiddenActionRegex.flags);
 let running = 0;
 
@@ -101,7 +103,7 @@ async function decideTrackActionOnce(input: TrackAgentInput, deps: RunnerDeps): 
     const values = decision as Record<string, unknown>;
     if (!['say', 'hold'].includes(String(values.action)) || (values.reason !== undefined && typeof values.reason !== 'string')
       || Object.keys(values).some((key) => !['action', 'reason'].includes(key))) throw new Error('invalid decision');
-    if (typeof values.reason === 'string' && forbiddenActionRegex.test(values.reason)) throw new Error('forbidden action');
+    if (values.action === 'say' && typeof values.reason === 'string' && forbiddenActionRegex.test(values.reason)) throw new Error('forbidden action');
     return decision as TrackAgentDecision;
   } catch (error) {
     log('decision-failed', { track: input.track, taskId: input.taskId, error: redactSecretText(String(error)) });
@@ -111,7 +113,7 @@ async function decideTrackActionOnce(input: TrackAgentInput, deps: RunnerDeps): 
 
 export async function executeTrackAction(decision: TrackAgentDecision, input: TrackAgentInput, deps: RunnerDeps = {}): Promise<TrackAgentResult> {
   if (decision.action !== 'say') return { status: 'held', detail: decision.reason ?? '사람 확인' };
-  if (forbiddenActionRegex.test(`${input.title}\n${input.prompt}`)) return { status: 'held', detail: '금지 작업 — 사람 확인' };
+  if (forbiddenActionRegex.test(input.prompt)) return { status: 'held', detail: '금지 작업 — 사람 확인' };
   if (!findTrack(input.track)) return { status: 'held', detail: '트랙 미정 — 사람 확인' };
   try {
     const checkBudget = deps.checkBudget ?? (async () => {

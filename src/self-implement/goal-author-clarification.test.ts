@@ -5,6 +5,7 @@ import type { IntakeClarification } from '../autopilot/mission-intake-clarify.js
 import { defaultGoalAuthorSelfResolve, injectGoalDocumentClarificationAnswer, injectGoalDocumentClarificationOption, injectGoalDocumentClarificationOtherAnswer, parseGoalAuthorClarifications, parseGoalDocumentClarifications, resolveGoalAuthorClarification, seedGoalAuthorFromClarification, serializeGoalAuthorClarification, serializeResolvedGoalAuthorClarification,
   planClarificationIntake,
   applyClarificationReply,
+  selfAnswerGoalDocumentClarifications,
 } from './goal-author-clarification.js';
 
 function clarification(overrides: Partial<IntakeClarification> = {}): IntakeClarification {
@@ -25,6 +26,111 @@ function clarification(overrides: Partial<IntakeClarification> = {}): IntakeClar
 function responseFor(clarification: IntakeClarification) {
   return parseGoalAuthorClarifications(serializeGoalAuthorClarification(clarification))[0].response;
 }
+
+test('shared document self-answer persists one response and leaves the other deferred', async () => {
+  const document = ['## WHAT TO BUILD', '- TRACED PATHS:', '  - evidence: src/example.ts: contract',
+    ...['one', 'two'].flatMap((id) => [
+      '- Clarification:', `  - id: ${id}`, '  - header: Clarification', `  - question: Question ${id}?`,
+      '  - options:', '    - label: Option', '      description: Choose option.',
+      '  - includeOther: true', `  - answer: DEFERRED-UNTIL: Question ${id}?`, '',
+    ]),
+  ].join('\n');
+  const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+  try {
+    const result = await selfAnswerGoalDocumentClarifications(document, {
+      path: 'ask', resolver: async ({ questionId, evidence }) => questionId === 'one'
+        ? { answer: 'Option', evidence } : {},
+  });
+    expect(result).toMatchObject({ asked: 2, answered: 1, unanswered: 1 });
+    expect(parseGoalDocumentClarifications(result.document).map(({ answer, answered }) => ({ answer, answered }))).toEqual([
+      { answer: 'Option', answered: true },
+      { answer: 'DEFERRED-UNTIL: Question two?', answered: false },
+    ]);
+    expect(result.document).toContain('  - provenance.source: self-authored');
+    expect(log).toHaveBeenCalledWith('self-implement.clarification-escalation', 'self-answer', {
+      path: 'ask', asked: 2, answered: 1, unanswered: 1, reason: 'insufficient-evidence',
+    });
+  } finally { log.mockRestore(); }
+});
+
+test('say-first keeps existing self-authored answers and still attempts the questions left unanswered', async () => {
+  const document = [
+    '- Clarification:', '  - id: existing', '  - header: Clarification', '  - question: Which contract?',
+    '  - options:', '    - label: Keep API', '      description: Verified.', '  - includeOther: true',
+    '  - answer: Keep API', '  - provenance.source: self-authored', '  - evidence: src/api.ts:12', '',
+    '- Clarification:', '  - id: pending', '  - header: Clarification', '  - question: Which other?',
+    '  - options:', '    - label: Other', '      description: Unknown.', '  - includeOther: true',
+    '  - answer: DEFERRED-UNTIL: Which other?', '',
+  ].join('\n');
+  const asked: string[] = [];
+  const result = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence: ['src/api.ts:12: contract'],
+    resolver: async ({ questionId, evidence }) => { asked.push(questionId); return { answer: 'Other', evidence }; },
+  });
+  // The already self-authored answer is never re-asked; the deferred one is attempted and answered.
+  expect(asked).toEqual(['pending']);
+  expect(result).toMatchObject({ asked: 2, answered: 2, unanswered: 0 });
+  expect(parseGoalDocumentClarifications(result.document).every((item) => item.answered)).toBe(true);
+});
+
+test('say-first with no evidence-backed answer leaves the question unanswered and reports it', async () => {
+  const document = [
+    '- Clarification:', '  - id: pending', '  - header: Clarification', '  - question: Which other?',
+    '  - options:', '    - label: Other', '      description: Unknown.', '  - includeOther: true',
+    '  - answer: DEFERRED-UNTIL: Which other?', '',
+  ].join('\n');
+  const result = await selfAnswerGoalDocumentClarifications(document, { path: 'say-first', resolver: async () => ({}) });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+});
+
+test('a resolver failure on one question leaves it unanswered, still attempts the rest and still observes', async () => {
+  const document = ['- evidence: src/example.ts: contract', ...['one', 'two'].flatMap((id) => [
+    '- Clarification:', `  - id: ${id}`, '  - header: Clarification', `  - question: Question ${id}?`,
+    '  - options:', '    - label: Option', '      description: Choose option.',
+    '  - includeOther: true', `  - answer: DEFERRED-UNTIL: Question ${id}?`, '',
+  ])].join('\n');
+  const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+  try {
+    const result = await selfAnswerGoalDocumentClarifications(document, {
+      path: 'rework', resolver: async ({ questionId, evidence }) => {
+        if (questionId === 'one') throw new Error('provider down');
+        return { answer: 'Option', evidence };
+      },
+    });
+    expect(result).toMatchObject({ asked: 2, answered: 1, unanswered: 1, newlyAnswered: 1 });
+    expect(parseGoalDocumentClarifications(result.document).map(({ questionId, answered }) => ({ questionId, answered }))).toEqual([
+      { questionId: 'one', answered: false }, { questionId: 'two', answered: true },
+    ]);
+    expect(log).toHaveBeenCalledWith('self-implement.clarification-escalation', 'self-answer', {
+      path: 'rework', asked: 2, answered: 1, unanswered: 1, reason: 'insufficient-evidence',
+    });
+  } finally { log.mockRestore(); }
+});
+
+test('say-first counts existing self-authored answers but reports none as newly answered', async () => {
+  const document = [
+    '- Clarification:', '  - id: existing', '  - header: Clarification', '  - question: Which contract?',
+    '  - options:', '    - label: Keep API', '      description: Verified.', '  - includeOther: true',
+    '  - answer: Keep API', '  - provenance.source: self-authored', '  - evidence: src/api.ts:12', '',
+  ].join('\n');
+  const result = await selfAnswerGoalDocumentClarifications(document, { path: 'say-first', resolver: async () => { throw new Error('not called'); } });
+  expect(result).toEqual({ document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0 });
+});
+
+test('shared self-answer keeps duplicate IDs deferred and never overwrites a prior answer', async () => {
+  const block = (id: string, answer: string) => [
+    '- Clarification:', `  - id: ${id}`, '  - header: Clarification', `  - question: Question ${id}?`,
+    '  - options:', '    - label: A', '      description: A', '    - label: B', '      description: B',
+    '  - includeOther: true', `  - answer: ${answer}`, '',
+  ].join('\n');
+  const document = ['- evidence: src/test.ts: fact', block('answered', 'A'), block('duplicate', 'DEFERRED-UNTIL: Q'), block('duplicate', 'DEFERRED-UNTIL: Q')].join('\n');
+  let calls = 0;
+  const result = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'rework', resolver: async ({ evidence }) => { calls++; return { answer: 'B', evidence }; },
+  });
+  expect(calls).toBe(0);
+  expect(result).toMatchObject({ asked: 2, answered: 0, unanswered: 2, document });
+});
 
 test('auto-answers exactly one recommended non-safety option and preserves the clarification round trip', () => {
   const log = spyOn(debug, 'log').mockImplementation(() => undefined);

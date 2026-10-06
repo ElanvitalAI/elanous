@@ -1,3 +1,6 @@
+'use client';
+
+import { useState, type FormEvent } from 'react';
 import { cardTitle, type TaskCard, type TaskCardEntry, type TaskCardSection } from '@/lib/task-card-model';
 import type { WishPlacementWire } from '@/nexus/client';
 
@@ -39,13 +42,39 @@ function EntryMeta({ entry }: { entry: TaskCardEntry }) {
   );
 }
 
-export function TaskCardDetail({ card, placements }: { card: TaskCard; placements?: readonly WishPlacementWire[] }) {
+export function TaskCardDetail({ card, placements, onClose, publicCapture = false }: {
+  card: TaskCard; placements?: readonly WishPlacementWire[];
+  onClose?: (reason: string) => Promise<void>; publicCapture?: boolean;
+}) {
+  const [reason, setReason] = useState('');
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submitClose = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!onClose || !reason.trim() || /[\r\n]/.test(reason) || pending) return;
+    setPending(true);
+    setError(null);
+    try { await onClose(reason.trim()); }
+    catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
+    finally { setPending(false); }
+  };
   const gates = card.sections.gates?.data;
   return (
     <section aria-label="Task card detail" className="min-w-0 space-y-4 rounded-2xl border border-border bg-card p-4">
       <header>
         <h2 className="text-lg font-semibold">{cardTitle(card)}</h2>
         <p className="break-all text-xs text-muted-foreground">{card.taskId}</p>
+        {card.status === 'closed' ? <p role="status">닫힘 · {card.closedReason ?? '사유 없음'}</p> :
+          !publicCapture && onClose ? (
+            <form onSubmit={submitClose} className="mt-3 flex flex-wrap items-end gap-2">
+              <label className="text-sm">닫기 사유 (한 줄)
+                <input type="text" required value={reason} onChange={(event) => setReason(event.target.value)}
+                  className="block rounded-md border border-border bg-background px-2 py-1" />
+              </label>
+              <button type="submit" disabled={pending || !reason.trim() || /[\r\n]/.test(reason)} className="rounded-md border border-border px-3 py-1 text-sm">{pending ? '닫는 중…' : '닫기'}</button>
+              {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+            </form>
+          ) : null}
       </header>
       {card.wishReply !== undefined && (
         <section aria-label="Wish reply destination" className="rounded-xl border border-border p-3 text-sm">

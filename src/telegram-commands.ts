@@ -332,7 +332,7 @@ export function defaultTelegramCommands(
     {
       name: 'loops',
       description: '루프·크론 현황 — 늦음·실패를 먼저 보여줍니다',
-      handler: async (args) => telegramLoopsStatus(args),
+      handler: (args) => telegramLoopsStatus(args),
     },
     {
       name: 'status',

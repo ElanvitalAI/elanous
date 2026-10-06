@@ -28,6 +28,8 @@ test('PWA and Telegram share the row loader and the exact two-interval boundary'
   const telegram = await telegramLoopsStatus([], {
     schedules: () => ({ schedules }), loops: () => ({ loops: { loops: [] } }), now: () => now + 1,
   });
-  for (const row of afterBoundary) expect(telegram).toContain(`${row.verdict} · ${row.name} (${row.layer})`);
-  expect(telegram).toContain('늦음 3 · 실패 0 · 살아 있음 0 · 꺼짐 0 · 판정 불가 1');
+  for (const row of afterBoundary.filter(row => row.verdict === '늦음' || row.verdict === '실패'))
+    expect(telegram).toContain(`${row.verdict} · ${row.name} (${row.layer})`);
+  expect(telegram).not.toContain('판정 불가 · Never (ops)');
+  expect(telegram.split('\n').at(-1)).toBe('살아 있음 0 · 꺼짐 0 · 판정 불가 1');
 });

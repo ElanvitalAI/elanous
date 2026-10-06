@@ -3,7 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
-import { admitLandingMerge, claimPath, owningRepoRoot, pendingFrozenMerges, queueFrozenMerge, sweepFrozenMerges, tryLandingLock, type FrozenMerge } from './frozen-merges.js';
+import { admitLandingMerge as realAdmitLandingMerge, claimPath, owningRepoRoot, pendingFrozenMerges, queueFrozenMerge, sweepFrozenMerges as realSweepFrozenMerges, tryLandingLock, type FrozenMerge } from './frozen-merges.js';
+
+const admitLandingMerge = (...args: Parameters<typeof realAdmitLandingMerge>) => realAdmitLandingMerge(args[0], args[1], args[2], args[3], { prodFreezeRoot: args[1] });
+const sweepFrozenMerges = (...args: Parameters<typeof realSweepFrozenMerges>) => realSweepFrozenMerges(args[0], args[1], args[2], args[1]);
 
 const entry = { prNumber: 42, headCommit: 'a'.repeat(40), repoRoot: '/repo' };
 
@@ -17,6 +20,31 @@ function github() {
     merge: (passed = true, extra?: () => void) => async (item: FrozenMerge) => { extra?.(); if (passed) merged.add(key(item)); return { passed }; },
   };
 }
+
+test('host admission and resumed sweep in a child universe defer to operational freeze without merging', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'frozen-host-operational-'));
+  const prod = join(root, 'prod');
+  const child = join(root, 'child');
+  try {
+    enableLandingFreeze({ reason: 'release cut', by: 'OP' }, prod);
+    const admission = realAdmitLandingMerge(entry, child, {}, entry, { prodFreezeRoot: prod });
+    expect(admission.kind).toBe('held');
+    expect(pendingFrozenMerges(child)).toBe(1);
+    let merges = 0;
+    expect(await realSweepFrozenMerges(async () => { merges++; return { passed: true }; }, child, () => false, prod)).toEqual({ pending: 1, merged: 0 });
+    expect(merges).toBe(0);
+    expect(pendingFrozenMerges(child)).toBe(1);
+    disableLandingFreeze(prod);
+    const gh = github();
+    expect(await realSweepFrozenMerges(gh.merge(true), child, gh.alreadyMerged, prod)).toEqual({ pending: 0, merged: 1 });
+    expect(gh.merged.size).toBe(1);
+    enableLandingFreeze({ reason: 'second cut', by: 'OP' }, prod);
+    queueFrozenMerge(entry, child);
+    let swept = 0;
+    expect(await realSweepFrozenMerges(async () => { swept++; return { passed: true }; }, child, () => false, prod)).toEqual({ pending: 1, merged: 0 });
+    expect(swept).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('frozen PR remains queued; off resumes pinned merge on next sweep without losing failed work', async () => {
   const root = mkdtempSync(join(tmpdir(), 'frozen-merge-'));

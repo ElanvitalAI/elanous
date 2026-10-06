@@ -7,9 +7,75 @@ import { writeStdoutJson } from './stdout-json.js';
 // AutopilotLoopDriver against the mission, prints agent deltas on
 // stdout + envelope/termination summary on stderr.
 export function registerAutopilotCommands(program: Command): void {
+  // Explicit runtime entry for a selected action; the task chooser can invoke this entry.
   const autopilotCmd = program
     .command('autopilot')
     .description('Mission-driven autopilot — runs an ACP agent against a single mission with safety + budget guards');
+  autopilotCmd.command('task-agent-action <actionJson>')
+    .description('Execute a selected task-agent action; defaults to shadow')
+    .action(async (actionJson: string) => {
+      const { executeNextAction } = await import('../task-agent/actions.js');
+      const { getUserConfig } = await import('../user-config.js');
+      const { spawnSync } = await import('node:child_process');
+      const { readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+      const { join, dirname } = await import('node:path');
+      const { debug } = await import('../debug/log.js');
+      const { withFileLockSync } = await import('../storage/file-lock.js');
+      const config = getUserConfig() as ReturnType<typeof getUserConfig> & { taskAgent?: { mode?: string } };
+      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+      const statePath = join(effectiveInstanceRoot(), 'task-agent-actions.json');
+      let state: { landingDay?: string; landingsToday?: number; failureCounts?: Record<string, number> } = {};
+      try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first run */ }
+      const action = JSON.parse(actionJson) as import('../task-agent/actions.js').NextAction;
+      const deps: import('../task-agent/actions.js').ActionDeps = {
+        ...state,
+        failureCounts: state.failureCounts ?? {},
+        saveState: () => {
+          mkdirSync(dirname(statePath), { recursive: true });
+          // 실패 횟수는 incrementFailure 가 잠금 안에서 키별로 더한다 — 여기선 덮어쓰지 않는다.
+        },
+        mode: config.taskAgent?.mode,
+        // 하루 착지 칸은 상태 파일 잠금 안에서 확보·반환한다 — 두 CLI 프로세스가 같은 잔여 칸을 쓰지 않게.
+        reserveLanding: (day, limit) => withFileLockSync(`${statePath}.lock`, () => {
+          let disk: typeof state = {};
+          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first */ }
+          const used = disk.landingDay === day ? disk.landingsToday ?? 0 : 0;
+          if (used >= limit) return false;
+          mkdirSync(dirname(statePath), { recursive: true });
+          writeFileSync(statePath, JSON.stringify({ ...disk, landingDay: day, landingsToday: used + 1 }));
+          deps.landingDay = day; deps.landingsToday = used + 1;
+          return true;
+        }),
+        incrementFailure: (key) => withFileLockSync(`${statePath}.lock`, () => {
+          let disk: typeof state = {};
+          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first */ }
+          const counts = { ...(disk.failureCounts ?? {}) };
+          counts[key] = (counts[key] ?? 0) + 1;
+          mkdirSync(dirname(statePath), { recursive: true });
+          writeFileSync(statePath, JSON.stringify({ ...disk, failureCounts: counts }));
+          return counts[key]!;
+        }),
+        releaseLanding: (day) => withFileLockSync(`${statePath}.lock`, () => {
+          let disk: typeof state = {};
+          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { return; }
+          if (disk.landingDay !== day || !disk.landingsToday) return;
+          writeFileSync(statePath, JSON.stringify({ ...disk, landingsToday: disk.landingsToday - 1 }));
+          deps.landingsToday = disk.landingsToday - 1;
+        }),
+        observe: (_event, data) => debug.log('task-agent', 'action', data),
+        command: async args => {
+          const p = args[0] === 'gh'
+            // PR 조회는 착지할 작업 트리에서 — 다른 저장소에서 불러도 엉뚱한 PR 을 읽지 않게.
+            ? spawnSync('gh', args.slice(1), { encoding: 'utf8', ...(action.cwd ? { cwd: action.cwd } : {}) })
+            // 지금 돌고 있는 진입점으로 부른다 — 저장소 밖(설치본)에서 불러도 같은 elanous 를 쓴다.
+            : spawnSync(process.execPath, [process.argv[1]!, ...(process.argv.includes('--test') ? ['--test'] : []), ...args], { encoding: 'utf8' });
+          return { status: p.status ?? 1, stdout: p.stdout ?? '', stderr: p.stderr ?? '' };
+        },
+      };
+      const result = await executeNextAction(action, deps);
+      if (config.taskAgent?.mode === 'live') deps.saveState?.();
+      process.stdout.write(`${result}\n`);
+    });
 
 autopilotCmd
   .command('run <mission...>')

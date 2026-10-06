@@ -152,6 +152,21 @@ test('to-tasks CLI refuses an unavailable Nexus without consuming the goal line'
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('intake digest --telegram sends news-only shadow suggestions without promoting them to goals', async () => {
+  const order: string[] = [];
+  const sent = await runIntakeDigestCli({ telegram: true, day: '2026-10-06' }, {
+    root: '/tmp/intake-digest-news-unused', annotateLens: async () => { order.push('lens'); },
+    buildDigest: () => { order.push('digest'); return {
+      day: '2026-10-06', absorbed: [], goals: [], grounding: 0, release: 0, manual: 0,
+      news: [{ title: 'RRSI', url: 'https://www.aitimes.com/news/articleView.html?idxno=215802', summary: ['구글 RRSI'], implication: ['RRSI → 없음'] }],
+      shadowSuggestions: [{ fact: 'RRSI 관련 하니스', verdict: '없음' }],
+    }; },
+    sendTelegram: async (message) => { order.push('telegram'); expect(message).toContain('뉴스 칸 제안 1건 (그림자·판 미등록)'); return true; },
+  });
+  expect(order).toEqual(['lens', 'digest', 'telegram']);
+  expect(sent).toEqual({ sent: true });
+});
+
 test('intake digest --telegram annotates the lens before building the digest, and a lens failure still sends', async () => {
   const order: string[] = [];
   const sent = await runIntakeDigestCli({ telegram: true, day: '2026-10-05' }, {

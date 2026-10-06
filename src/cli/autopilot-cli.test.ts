@@ -4,6 +4,7 @@ import { registerAutopilotCommands } from './autopilot-cli.js';
 
 // Literal baseline recorded from src/index.ts before extraction (Commander registration tree).
 const expectedSubcommands = [
+  "task-agent-action",
   "run",
   "rerun",
   "signal",
@@ -56,6 +57,7 @@ const expectedSubcommands = [
 ];
 const expectedFlags = {
   "autopilot": [],
+  "task-agent-action": [],
   "run": [
     "-b, --backend <id>",
     "-i, --max-iterations <n>",

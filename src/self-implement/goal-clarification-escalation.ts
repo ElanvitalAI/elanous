@@ -11,9 +11,13 @@ import {
   writePendingQuestion,
 } from '../ask-user-question/pending-questions.js';
 import { debug } from '../debug/log.js';
+import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import {
   applyClarificationReply,
   parseGoalDocumentClarifications,
+  selfAnswerGoalDocumentClarifications,
+  type GoalClarificationSelfResolver,
+  type GoalClarificationSelfAnswerPath,
 } from './goal-author-clarification.js';
 import type { HitlDelivery } from '../hitl/types.js';
 
@@ -49,6 +53,8 @@ export interface GoalClarificationEscalationInput {
   resolveOriginDelivery?: (sessionId: string) => HitlDelivery | undefined;
   /** Non-blocking terminal fallback for a non-TUI delivery with no installed resolver. */
   fallback?: (message: string) => void;
+  selfResolveClarification?: GoalClarificationSelfResolver;
+  selfAnswerPath?: GoalClarificationSelfAnswerPath;
   /** Fail-soft pending persistence for terminal fallbacks; injectable for focused tests. */
   pendingQuestionPersistence?: {
     create: typeof createPendingQuestion;
@@ -404,6 +410,7 @@ export async function escalateGoalDocumentClarifications(
   const dispatchDelivery = delivery ?? 'modal';
   const recordedDelivery = input.resolvedDelivery ?? dispatchDelivery;
   let answersWritten = 0;
+  let selfAnswered = 0;
   let questionIds: string[] = [];
   const observeEscalation = (event: GoalClarificationObservationEvent, data: Record<string, unknown>): void => {
     writeEscalationObservation(event, { ...data, deliverySource, answersWritten, questionIds });
@@ -430,6 +437,35 @@ export async function escalateGoalDocumentClarifications(
     return result;
   }
 
+  if (input.selfAnswerPath) {
+    try {
+      const resolution = await selfAnswerGoalDocumentClarifications(document, {
+        path: input.selfAnswerPath,
+        ask: document,
+        resolver: input.selfResolveClarification,
+      });
+      if (resolution.newlyAnswered > 0) {
+        writeGoalDocumentAtomic(input.goalFile, resolution.document);
+        answersWritten += resolution.newlyAnswered;
+        selfAnswered += resolution.newlyAnswered;
+        document = resolution.document;
+        clarifications = parseGoalDocumentClarifications(document);
+        unanswered = clarifications.filter((clarification) => !clarification.answered);
+        deliveryIds = mapClarificationDeliveryIds(clarifications);
+        questionIds = [...new Set(unanswered.map((clarification) => clarification.questionId))];
+      }
+      if (unanswered.length === 0) {
+        const result = { unanswered: 0, escalated: 0, delivery: recordedDelivery, outcome: 'skipped' as const, answeredBy: 'agent' as const };
+        observeEscalation(result.outcome, { goalFile: input.goalFile, ...result, reason: 'self-answered' });
+        return result;
+      }
+    } catch (error) {
+      debug.log(GOAL_CLARIFICATION_ESCALATION_CATEGORY, 'self-answer-failed', {
+        path: input.selfAnswerPath, reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   const dispatch = input.dispatch ?? dispatchAskUserQuestion;
   const pendingQuestionPersistence = input.pendingQuestionPersistence ?? {
     create: createPendingQuestion,
@@ -444,7 +480,7 @@ export async function escalateGoalDocumentClarifications(
   // ⛔⭐⭐⭐ 여기서부터의 조기 반환·폴백은 이 «누적값»을 쓴다 — 'none' 을 하드코딩하면
   //  앞 배치가 답했는데 뒤 배치가 취소·실패했을 때 「아무도 안 답했다」는 «거짓»이 된다
   //  (무인 리뷰 R2 must-fix · 실측 형태: 관측이 거짓말한다).
-  const seenProvenance = { explicit: new Set<'human' | 'agent'>(), unmarkedAnswer: false };
+  const seenProvenance = { explicit: new Set<'human' | 'agent'>(selfAnswered > 0 ? ['agent' as const] : []), unmarkedAnswer: false };
   const aggregate = (): GoalClarificationAnsweredBy => {
     const { explicit, unmarkedAnswer } = seenProvenance;
     // ⭐ 표시 없는 답도 «한 출처»로 센다 — legacy 경로는 사람이다(레포 안 리졸버는 이제 전부 명시한다).

@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import { _setRotationConfigReaderForTesting } from '../oauth/codex-account-store.js';
-import { saveTokens } from '../oauth/store.js';
+import { refreshCodexAccountHome } from '../oauth/codex.js';
+import { loadTokens, saveTokens } from '../oauth/store.js';
 import {
   registerProviderCommands,
   buildCodexAccountImportGuidance as directGuidance,
@@ -172,5 +173,75 @@ describe('provider codex status — local policy and credit signals', () => {
     _setRotationConfigReaderForTesting(() => ({ llm: { codexCreditsAllowed: true } }));
     expect(await runCodexStatus()).toContain('정책      credits (크레딧까지 · llm.codexQuotaPolicy) · 옛 codexCreditsAllowed 에서');
     expect(JSON.parse(await runCodexStatus(true)).policy).toEqual({ value: 'credits', source: 'legacy-credits' });
+  });
+});
+
+// POD-TOKEN-PREREFRESH (10-06) — `account refresh <name>`: backup → refresh → atomic 0600 → import path.
+describe('provider codex account refresh', () => {
+  const jwt = (hours: number) => `eyJhbGciOiJSUzI1NiJ9.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + Math.round(hours * 3600) })).toString('base64url')}.sig-Ab_c-D3`;
+  async function runRefresh(name: string): Promise<{ text: string; fetches: number }> {
+    const lines: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation((...values: unknown[]) => { lines.push(values.join(' ')); });
+    const err = spyOn(console, 'error').mockImplementation((...values: unknown[]) => { lines.push(values.join(' ')); });
+    let fetches = 0;
+    // ⛔ never the network — the default refresher's fetch is answered here.
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () => {
+      fetches++;
+      return new Response(JSON.stringify({ access_token: jwt(240), refresh_token: 'rt-new.Zz-9_rotated-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch);
+    const prevExit = process.exitCode;
+    process.exitCode = 0;
+    try {
+      const program = new Command('elanous');
+      registerProviderCommands(program);
+      directSinkSeam({ registerStandaloneLogSink: async () => {} } as never);
+      await program.parseAsync(['provider', 'codex', 'account', 'refresh', name], { from: 'user' });
+      return { text: `${lines.join('\n')}\nexit=${process.exitCode ?? 0}`, fetches };
+    } finally {
+      process.exitCode = prevExit ?? 0;
+      directSinkSeam(undefined);
+      fetchSpy.mockRestore(); err.mockRestore(); log.mockRestore();
+    }
+  }
+
+  test('default account is refused before any refresh', async () => {
+    statusFixture();
+    const r = await runRefresh('default');
+    expect(r.text).toContain('default-refused');
+    expect(r.text).toContain('exit=1');
+    expect(r.fetches).toBe(0);
+  });
+
+  test('a named account is refreshed once, written 0600, imported, and only hours are printed', async () => {
+    const homes = statusFixture();
+    const oldAccess = jwt(2.5);
+    writeFileSync(join(homes[2]!, 'auth.json'), JSON.stringify({ tokens: { access_token: oldAccess, refresh_token: 'rt-old.Yy-8_original-token', account_id: 'acct-third-1234' } }), { mode: 0o600 });
+    const r = await runRefresh('third');
+    expect(r.fetches).toBe(1);
+    expect(r.text).toMatch(/남은 시간 2\.5h → 240h/);
+    expect(r.text).toContain('exit=0');
+    for (const secret of [oldAccess, 'rt-old.Yy-8_original-token', 'rt-new.Zz-9_rotated-token', 'eyJ']) expect(r.text).not.toContain(secret);
+    const authFile = join(homes[2]!, 'auth.json');
+    expect(statSync(authFile).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(authFile, 'utf8')).tokens.refresh_token).toBe('rt-new.Zz-9_rotated-token');
+    const backups = readdirSync(homes[2]!).filter((f) => f.startsWith('auth.json.bak-'));
+    expect(backups).toHaveLength(1);
+    expect(statSync(join(homes[2]!, backups[0]!)).mode & 0o777).toBe(0o600);
+    const stored = loadTokens('openai-codex:third', join(process.env.XDG_CONFIG_HOME!, 'elanous', 'auth.json'));
+    expect(stored?.tokens.refreshToken).toBe('rt-new.Zz-9_rotated-token');
+    expect(stored?.codexHome).toBe(homes[2]);
+  });
+
+  test('a rejected refresh leaves the home untouched and returns no token', async () => {
+    const homes = statusFixture();
+    const original = JSON.stringify({ tokens: { access_token: jwt(2.5), refresh_token: 'rt-old.Yy-8_original-token' } });
+    writeFileSync(join(homes[1]!, 'auth.json'), original, { mode: 0o600 });
+    const res = await refreshCodexAccountHome('team', {
+      storePath: join(process.env.XDG_CONFIG_HOME!, 'elanous', 'auth.json'),
+      refresh: async () => { throw new Error('codex refresh failed: status=400 rt-old.Yy-8_original-token'); },
+    });
+    expect(res).toMatchObject({ ok: false, kind: 'refresh-failed' });
+    expect(JSON.stringify(res)).not.toContain('rt-old');
+    expect(readFileSync(join(homes[1]!, 'auth.json'), 'utf8')).toBe(original);
   });
 });

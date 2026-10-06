@@ -178,6 +178,11 @@ test('seat tick drafts exactly one decision card for a stale neighbor in live-sa
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ status: 'open', raisedBy: { agent: 'seat-loop' }, refs: [expect.stringContaining('neighbor:MK:op-seat')] });
     expect(calls).toEqual([]);
+    expect(cards[0]!.scqa.q?.trim()).not.toBe('');
+    expect(cards[0]!.scqa.a?.trim()).not.toBe('');
+    expect(cards[0]!.recommendation).toMatchObject({ option: 'b', why: expect.stringContaining('대행하지 않는다') });
+    for (const label of ['무엇:', '지금까지:', '지금 상태 재측:', '선택지 a', '선택지 b', '권고:', '확신:', '그냥 두면:', '근거:'])
+      expect(cards[0]!.pendingQuestion).toContain(label);
     expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
       .toEqual(Array(2).fill({ seat: 'MK', neighbor: 'op-seat', state: 'absent', action: 'decision-card', plannedAction: 'escalate', mode: 'live-safe' }));
   } finally { bus.close(); spy.mockRestore(); f.close(); }
@@ -426,6 +431,8 @@ for (const [label, answer, expectedStatus] of [
       const raises = f.calls.filter((args) => args[0] === 'decisions');
       if (label === 'dissent') {
         expect(raises).toHaveLength(1);
+        for (const flag of ['--q', '--a', '--pending-question', '--recommend', '--why']) expect(raises[0]![raises[0]!.indexOf(flag) + 1]?.trim()).toBeTruthy();
+        expect(raises[0]![raises[0]!.indexOf('--pending-question') + 1]).toContain('지금 상태 재측:');
         expect(raises[0]!.slice(raises[0]!.indexOf('--xcheck'), raises[0]!.indexOf('--xcheck') + 2)).toEqual(['--xcheck', 'OP:화면 문구 미정']);
         expect(raises[0]!.slice(raises[0]!.indexOf('--dissent'), raises[0]!.indexOf('--dissent') + 2)).toEqual(['--dissent', 'OP: 화면 문구 미정']);
       } else {
@@ -1476,11 +1483,113 @@ test('forbidden 게시 문면은 decision, on 에서 하니스 0 · 재상정 0'
   } finally { f.close(); }
 });
 
+test('repeat stop remeasures a recovered checklist cell before raising a card and closes only that cell', async () => {
+  const f = fixture();
+  try {
+    let status = 'yellow';
+    let reads = 0;
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.9'], config: { mode: 'live-safe', seats: ['TC'], repeatStop: 1 },
+      checklistItems: () => { reads++; return [{ id: 'K-stop', owner: 'TC', title: '검사 구현', status }]; },
+      queueItems: () => [], queueOutcome: () => 'failed' as never,
+      run: async (args) => { calls.push(args); if (args[1] === 'budget') { status = 'green'; return '{"outcome":"proceed"}'; } throw Error('recovered cell launched'); } };
+    const item = (await gatherSeatInputs('TC', deps)).checklist[0]!;
+    const ledgerPath = seatLedgerPath('TC', f.root, now);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(ledgerPath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'refused', item, action: 'harness', reason: 'prior failure' }) + '\n');
+    const result = await runSeatLoopOnce('TC', deps);
+    expect(result).toMatchObject({ status: 'resolved', item: { id: 'K-stop' }, reason: expect.stringContaining('green') });
+    expect(JSON.parse(readFileSync(ledgerPath, 'utf8').trim().split('\n').at(-1)!)).toMatchObject({ status: 'resolved', item: { id: 'K-stop' } });
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(calls.map(args => args[1])).toEqual(['budget']);
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toHaveLength(0);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+  } finally { f.close(); }
+});
+
+test('repeat stop remeasures a completed request and raises no card', async () => {
+  const f = fixture();
+  try {
+    let lines = [JSON.stringify({ key: 'req-stop', seat: 'TC', text: '검사 구현', status: 'pending', queuedAt: now.toISOString() })];
+    const requests = join(f.root, 'seat-requests', 'requests.jsonl');
+    writeFileSync(requests, lines.join('\n') + '\n');
+    const deps: SeatDeps = { ...f.deps, versions: () => [], config: { mode: 'live-safe', seats: ['TC'], repeatStop: 1 },
+      queueItems: () => [], queueOutcome: () => 'failed' as never,
+      run: async (args) => {
+        if (args[1] === 'budget') {
+          lines = [...lines, JSON.stringify({ key: 'req-stop', seat: 'TC', text: '검사 구현', status: 'done', queuedAt: now.toISOString() })];
+          writeFileSync(requests, lines.join('\n') + '\n');
+          return '{"outcome":"proceed"}';
+        }
+        throw Error('completed request launched');
+      } };
+    const item = (await gatherSeatInputs('TC', deps)).requests[0]!;
+    const path = seatLedgerPath('TC', f.root, now);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'refused', item, action: 'harness', reason: 'prior failure' }) + '\n');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('resolved');
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toHaveLength(0);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+  } finally { f.close(); }
+});
+
+test('repeat stop with an unresolved cell raises one fully grounded recommended card', async () => {
+  const f = fixture();
+  try {
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.9'], config: { mode: 'live-safe', seats: ['TC'], repeatStop: 1 },
+      checklistItems: () => [{ id: 'K-stop', owner: 'TC', title: '검사 구현', status: 'yellow', evidence: '테스트 실패 기록' }],
+      queueItems: () => [], queueOutcome: () => 'failed' as never,
+      resolveDecisionVersion: () => ({ released: null, dev: null, codename: null }),
+      run: async (args) => args[1] === 'budget' ? '{"outcome":"proceed"}' : Promise.reject(Error('must not launch')) };
+    const item = (await gatherSeatInputs('TC', deps)).checklist[0]!;
+    const path = seatLedgerPath('TC', f.root, now);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'refused', item, action: 'harness', reason: 'prior failure' }) + '\n');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('held');
+    const cards = new DecisionLedger({ stateDir: f.root }).list();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.scqa.q?.trim()).not.toBe('');
+    expect(cards[0]!.scqa.a?.trim()).not.toBe('');
+    expect(cards[0]!.recommendation).toMatchObject({ option: 'b', why: expect.stringContaining('중복') });
+    for (const label of ['무엇:', '지금까지:', '지금 상태 재측:', '선택지 a', '선택지 b', '권고:', '확신:', '그냥 두면:', '근거:'])
+      expect(cards[0]!.pendingQuestion).toContain(label);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(new DecisionLedger({ stateDir: f.root }).list()).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('topic of merge repair does not raise a forbidden card; an explicit merge request carries the matched word and judgment material', async () => {
+  const f = fixture();
+  try {
+    const calls: string[][] = [];
+    checklist(f, '0.2.9', [{ id: 'K-merge', owner: 'TC', title: '병합 경로에 동결 검사를 더하는', status: 'yellow' }]);
+    expect(planAction({ source: 'checklist', id: 'K-merge', title: '병합 경로에 동결 검사를 더하는', text: '병합 경로에 동결 검사를 더하는' }).kind).toBe('harness');
+    expect(planAction({ source: 'checklist', id: 'K-merge', title: '병합 경로에 동결 검사를 더하는', text: '병합 경로에 동결 검사를 더하는', evidence: 'main 에 병합해라 예시를 막는다' }).kind).toBe('harness');
+    expect(planAction({ source: 'checklist', id: 'K-merge', title: 'main 에 병합해라', text: '동결 검사 구현' }).kind).toBe('harness');
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => {
+      calls.push(args);
+      return args[1] === 'budget' ? '{"outcome":"proceed"}' : args[1] === 'say'
+        ? '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]' : '{"id":"dec-test"}';
+    } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    expect(calls.filter(args => args[1] === 'raise')).toHaveLength(0);
+    writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'), JSON.stringify({ key: 'merge-now', seat: 'TC', text: 'main 에 병합해라', status: 'pending', queuedAt: now.toISOString() }) + '\n');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
+    const raises = calls.filter(args => args[1] === 'raise');
+    expect(raises).toHaveLength(1);
+    const value = (flag: string) => raises[0]![raises[0]!.indexOf(flag) + 1]!;
+    expect(value('--pending-question')).toContain('걸린 낱말 병합');
+    for (const flag of ['--q', '--a', '--recommend', '--why']) expect(value(flag).trim()).not.toBe('');
+    for (const label of ['무엇:', '지금까지:', '지금 상태 재측:', '선택지 a', '선택지 b', '권고:', '확신:', '그냥 두면:', '근거:', 'Q:', 'A:'])
+      expect(value('--pending-question')).toContain(label);
+  } finally { f.close(); }
+});
+
 test('plan table separates publication, preparation and physical measurement across item text and evidence', () => {
   const spy = spyOn(debug, 'log').mockImplementation(() => {});
   try {
     const cases = [
-      { title: '마켓에 게시', kind: 'decision', reason: '게시' },
+      { title: '마켓에 게시', kind: 'decision', reason: '마켓에 게시' },
       { title: '레지스트리에 등록', kind: 'decision', reason: '레지스트리에 등록' },
       { title: '사이트 운영 반영', kind: 'decision', reason: '사이트 운영 반영' },
       { title: 'SNS에 업로드', kind: 'decision', reason: 'SNS에 업로드' },
@@ -1511,8 +1620,7 @@ test('plan table separates publication, preparation and physical measurement acr
       .toMatchObject({ kind: 'decision', reason: '삭제' });
     expect(planAction({ source: 'request', id: 'r', title: '구현', text: '구현', evidence: '기존 배포 기록' }, 'MK'))
       .toMatchObject({ kind: 'harness', text: '[MK 자리 · 자리 요청 r · 역할 docs/roles/MK.md] 구현' });
-    expect(planAction({ source: 'request', id: 'r', title: '검토', text: '검토', evidence: 'SNS에 게시' }, 'MK'))
-      .toMatchObject({ kind: 'decision', reason: 'SNS에 게시' });
+    expect(planAction({ source: 'request', id: 'r', title: '검토', text: '검토', evidence: 'SNS에 게시' }, 'MK').kind).toBe('harness');
     expect(planAction({ source: 'request', id: 'r', title: '마켓에 게시', text: '마켓에 게시', evidence: '마켓 게시 준비 완료' }, 'MK').kind)
       .toBe('decision');
     for (const text of ['마켓 게시 준비 후 마켓에 게시', '삭제 후 게시 준비', '마켓 게시 준비 후 배포', '마켓 게시 준비 후 SNS에 업로드']) {
@@ -1697,9 +1805,10 @@ test('600-character four-sentence coord request raises one bounded card with its
       raises.push(args);
       const value = (flag: string) => args[args.indexOf(flag) + 1]!;
       const card = cards.raise({ title: value('--title'), category: 'other',
-        scqa: { s: value('--s'), c: value('--c') },
+        scqa: { s: value('--s'), c: value('--c'), q: value('--q'), a: value('--a') },
+        pendingQuestion: value('--pending-question'),
         options: [{ key: 'a', label: '승인', consequence: '별도 집행' }, { key: 'b', label: '보류', consequence: '집행하지 않음' }],
-        recommendation: { skipped: true, reason: '자동 권고 없음' }, raisedBy: { agent: 'seat-loop' }, refs: [value('--ref')] });
+        recommendation: { option: value('--recommend'), why: value('--why') }, raisedBy: { agent: 'seat-loop' }, refs: [value('--ref')] });
       return JSON.stringify({ id: card.id });
     } };
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
@@ -1708,6 +1817,10 @@ test('600-character four-sentence coord request raises one bounded card with its
     expect(cards.list()).toHaveLength(1);
     const [card] = cards.list();
     expect(card!.refs).toContain(source);
+    expect(card!.scqa.q).toContain('승인할까?');
+    expect(card!.scqa.a).toContain('보류한다');
+    expect(card!.recommendation).toMatchObject({ option: 'b', why: expect.stringContaining('보류한다') });
+    expect(card!.pendingQuestion).toContain('걸린 낱말 마켓에 게시');
     expect(raises[0]).toContain(source);
     for (const field of Object.values(card!.scqa)) {
       expect(Array.from(field).length).toBeLessThanOrEqual(240);
@@ -2181,7 +2294,7 @@ test('V3 ledger row shape (MK 18:54 · METHOD-v3-shadow-compare): ts · item.id 
     expect(rows.map((r) => r.ts)).toEqual([now.toISOString(), now.toISOString(), now.toISOString()]);
     expect(rows[0]).toMatchObject({ action: 'harness', item: { id: 'req-1', kind: 'request', createdAt: '2026-10-02T09:00:00.000Z' } });
     expect(rows[0].reason).toBeUndefined();
-    expect(rows[1]).toMatchObject({ action: 'decision', reason: '게시', item: { id: 'M1', kind: 'cell' } });
+    expect(rows[1]).toMatchObject({ action: 'decision', reason: '마켓에 게시', item: { id: 'M1', kind: 'cell' } });
     expect(rows[1].item.createdAt).toBeUndefined();
     expect(rows[2]).toMatchObject({ action: 'skipped-empty' });
   } finally { f.close(); }

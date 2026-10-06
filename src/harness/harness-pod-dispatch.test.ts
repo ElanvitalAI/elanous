@@ -260,6 +260,15 @@ describe('harness say/ask --substrate pod', () => {
     expect(existsSync(seen[0]!.args[seen[0]!.args.indexOf('--goal-file') + 1]!)).toBe(false);
   });
 
+  test('authorOnPod carries host grade and source through the dispatch environment', () => {
+    let env: NodeJS.ProcessEnv = {};
+    dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'same sentence', authorOnPod: true, authorGrade: 'lite', authorGradeSource: 'config' }, {
+      run: (_command, _args, supplied) => { env = { ...supplied }; return 0; },
+    });
+    expect(env.ELANOUS_POD_AUTHOR_GRADE).toBe('lite');
+    expect(env.ELANOUS_POD_AUTHOR_GRADE_SOURCE).toBe('config');
+  });
+
   test('authorOnPod off keeps the raw sentence file', () => {
     let body = '';
     dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'plain sentence' }, {

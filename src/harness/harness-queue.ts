@@ -22,6 +22,7 @@ export type QueueSeat = 'OP' | 'TC' | 'MK' | 'UX';
 export type QueueItem = {
   id: string; seat: QueueSeat; kind: 'say' | 'ask'; input: string; hold: boolean; heavy: boolean;
   at: string; status: 'queued' | 'launching' | 'launched' | 'finished'; pid?: number; launchId?: string; idempotencyKey?: string; waitingReason?: string;
+  launchArgs?: string[]; launchCwd?: string; cellId?: string;
 };
 export type QueuePool = { running: number; pending: number; reserved: number; limit: number };
 export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string };
@@ -53,6 +54,10 @@ export interface HarnessQueueDeps {
   cap?: (seat: QueueSeat) => number;
   pool?: () => QueuePool;
   launch?: (item: QueueItem, args: string[], root: string) => Promise<number>;
+  /** Test seam: runs after a direct CLI call enqueued its row and before that call's own tick (race tests). */
+  afterEnqueue?: (item: QueueItem) => void | Promise<void>;
+  /** Script the default launcher runs under the queue child wrapper (default bin/elanous.mjs). */
+  launchCommand?: string;
   alive?: (pid: number) => boolean;
   processes?: () => readonly QueueProcess[];
   receipt?: (root: string, launchId: string) => 'started' | 'finished' | 'not-started' | null;
@@ -143,6 +148,9 @@ function read(path: string): QueueItem[] {
     && (row.pid === undefined || Number.isSafeInteger(row.pid))
     && (row.launchId === undefined || typeof row.launchId === 'string')
     && (row.idempotencyKey === undefined || typeof row.idempotencyKey === 'string')
+    && (row.launchArgs === undefined || Array.isArray(row.launchArgs) && row.launchArgs.every((arg: unknown) => typeof arg === 'string'))
+    && (row.launchCwd === undefined || typeof row.launchCwd === 'string' && row.launchCwd.startsWith('/'))
+    && (row.cellId === undefined || typeof row.cellId === 'string')
     && (row.waitingReason === undefined || typeof row.waitingReason === 'string'))) {
     throw new Error('harness queue: invalid queue file (no launch)');
   }
@@ -207,7 +215,24 @@ function seat(value: string): QueueSeat {
   return value as QueueSeat;
 }
 
-export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
+/** Cell id named in a goal text (`칸: ONEDOOR-2` · `칸 ONEDOOR-2`) — ids carry at least one hyphen. */
+export function queueCellId(text: string): string | undefined {
+  return /칸[:\s]\s*([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)/u.exec(text)?.[1];
+}
+
+/** A say row names its cell in the sentence; an ask row names it inside the goal document (unreadable → none). */
+function queueRowCellId(kind: QueueItem['kind'], input: string): string | undefined {
+  if (kind === 'say') return queueCellId(input);
+  try { return queueCellId(readFileSync(input, 'utf8')); } catch { return undefined; }
+}
+
+export class HarnessQueueDuplicateError extends Error {
+  constructor(existing: QueueItem, key: string) {
+    super(`같은 ${key} 이 이미 대기열에 있거나 도는 중이다 — ${existing.id} (${existing.status})`);
+  }
+}
+
+export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string; launchArgs?: string[]; launchCwd?: string; refuseDuplicate?: boolean }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
   const assigned = seat(input.seat);
   if ((input.say === undefined) === (input.ask === undefined)) throw new Error('harness queue add: --say 또는 --ask 중 하나만 필요');
   const kind = input.ask === undefined ? 'say' : 'ask';
@@ -228,8 +253,24 @@ export async function addHarnessQueue(input: { seat: string; say?: string; ask?:
         return existing;
       }
     }
+    // Recorded at enqueue: a later edit or deletion of an ask document cannot reopen its cell.
+    const cellId = queueRowCellId(kind, value);
+    if (input.refuseDuplicate) {
+      const cell = cellId;
+      const existing = rows.find((row) => row.status !== 'finished'
+        && !['retryable', 'succeeded'].includes(queueRowOutcome(row, root))
+        && ((row.kind === kind && row.input === value) || (cell !== undefined && (row.cellId ?? queueRowCellId(row.kind, row.input)) === cell)));
+      if (existing) {
+        const key = existing.kind === kind && existing.input === value ? '골' : `칸 ${cell}`;
+        observe('skipped', { id: existing.id, seat: assigned, reason: 'duplicate', key }, deps);
+        throw new HarnessQueueDuplicateError(existing, key);
+      }
+    }
     const item: QueueItem = { id: `hq-${randomUUID()}`, seat: assigned, kind, input: value,
       hold: input.hold === true, heavy: input.heavy === true, at: new Date().toISOString(), status: 'queued',
+      ...(input.launchArgs === undefined ? {} : { launchArgs: input.launchArgs }),
+      ...(input.launchCwd === undefined ? {} : { launchCwd: input.launchCwd }),
+      ...(cellId === undefined ? {} : { cellId }),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }) };
     save(path, [...rows, item]);
     observe('enqueued', { id: item.id, seat: item.seat, kind }, deps);
@@ -318,6 +359,7 @@ export async function removeHarnessQueue(id: string, deps: HarnessQueueDeps = {}
 }
 
 export function queueLaunchArgs(item: QueueItem): string[] {
+  if (item.launchArgs) return item.launchArgs;
   return ['harness', item.kind, item.input, '--substrate', 'pod',
     ...(item.hold ? ['--no-auto-merge'] : []), ...(item.heavy ? ['--pod-memory', 'high'] : [])];
 }
@@ -468,15 +510,19 @@ function receipt(root: string, launchId: string): 'started' | 'finished' | 'not-
   }
 }
 
-async function launch(item: QueueItem, args: string[], root: string): Promise<number> {
+function defaultLaunch(command?: string) {
+  return (item: QueueItem, args: string[], root: string) => launch(item, args, root, command);
+}
+
+async function launch(item: QueueItem, args: string[], root: string, command?: string): Promise<number> {
   const repo = resolve(import.meta.dir, '../..');
   const logPath = join(root, 'harness', `${item.id}.log`);
   const fd = openSync(logPath, 'a', 0o600);
   try {
     const child = spawn(process.execPath, [join(repo, 'src', 'harness', 'harness-queue-child.ts'),
-      harnessQueueReceiptPath(root, item.launchId!), join(repo, 'bin', 'elanous.mjs'),
+      harnessQueueReceiptPath(root, item.launchId!), command ?? join(repo, 'bin', 'elanous.mjs'),
       ...(resolve(root) === prodInstanceRoot() ? [] : [`--test=${root}`]), ...args], {
-      cwd: repo, detached: true, stdio: ['ignore', fd, fd],
+      cwd: item.launchCwd ?? repo, detached: true, stdio: ['ignore', fd, fd],
       env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_HARNESS_SEAT: item.seat,
         ELANOUS_HARNESS_QUEUE_LAUNCH: item.launchId! },
     });
@@ -675,7 +721,7 @@ export function requestIdleSeats(root: string, now: Date, items: readonly QueueI
   }
 }
 
-export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<QueueTick> {
+export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?: string): Promise<QueueTick> {
   const root = deps.root ?? effectiveInstanceRoot();
   return locked(root, async (path) => {
     try {
@@ -699,10 +745,20 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<Que
     }
     const heads = new Map<QueueSeat, QueueItem>();
     for (const row of items) if (row.status === 'queued' && !heads.has(row.seat)) heads.set(row.seat, row);
+    if (requestedId && ![...heads.values()].some((row) => row.id === requestedId)) {
+      const row = items.find((item) => item.id === requestedId);
+      if (!row || row.status !== 'queued') return { outcome: 'skipped', item: row, reason: '이미 처리됨 또는 항목 없음' };
+      const reason = '앞선 대기열 항목 차례';
+      if (row.waitingReason !== reason) save(path, items.map((item) => item.id === requestedId ? { ...item, waitingReason: reason } : item));
+      observe('waiting', { id: row.id, seat: row.seat, reason }, deps);
+      return { outcome: 'waiting', item: { ...row, waitingReason: reason }, reason };
+    }
     if (!heads.size) { observe('skipped', { reason: 'empty' }, deps); return { outcome: 'skipped', reason: 'empty' }; }
     const lastSeat = lastLaunchedSeat(path);
     const first = lastSeat ? (queueSeatNames.indexOf(lastSeat) + 1) % queueSeatNames.length
       : queueSeatNames.indexOf(items.find((row) => row.status === 'queued')!.seat);
+    // A requested tick (direct CLI call) keeps the seat round-robin: it launches its row only when that row is the first
+    // head with room; an earlier seat's head with room means the requested row waits for its turn.
     const candidates = [...queueSeatNames.slice(first), ...queueSeatNames.slice(0, first)]
       .flatMap((name) => heads.get(name) ? [heads.get(name)!] : []);
     const config = deps.configPath === undefined ? getUserConfig() : getUserConfig(deps.configPath);
@@ -729,7 +785,9 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<Que
           ...(details.injectedCap === undefined ? {} : { injectedCap: details.injectedCap }), capKeys: details.winners,
           attributed, unattributed }, deps);
       }
-      return { outcome: 'waiting', item: { ...candidates[0]!, waitingReason: blocked.get(candidates[0]!.seat)!.reason }, reason };
+      const subject = (requestedId ? candidates.find((item) => item.id === requestedId) : undefined) ?? candidates[0]!;
+      const subjectReason = blocked.get(subject.seat)!.reason;
+      return { outcome: 'waiting', item: { ...subject, waitingReason: subjectReason }, reason: requestedId ? subjectReason : reason };
     };
     for (const item of candidates) {
       const injectedCap = deps.cap?.(item.seat);
@@ -799,11 +857,32 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}): Promise<Que
           + current.filter((row) => row.status === 'launching' || row.status === 'launched').length, pool!.limit, deps);
       }
       if (finishHeld) { blocked.set(item.seat, { reason: finishHeld, active }); continue; }
+      if (requestedId && item.id !== requestedId) {
+        const requested = current.find((row) => row.id === requestedId)!;
+        // The requested row's own block is the truthful reason — even when its seat comes later in the rotation and was not
+        // evaluated yet; «another seat's turn» only when the requested seat itself has room.
+        const own = blocked.get(requested.seat)?.reason ?? (() => {
+          const ownCap = deps.cap?.(requested.seat);
+          const details = seatCapDetails({ seat: requested.seat, caps, gate, injectedCap: ownCap });
+          const charged = runs.filter((run) => !run.seat || run.seat === requested.seat);
+          const launchIds = new Set(charged.flatMap((run) => [...run.launchIds]));
+          const active = charged.length + current.filter((row) => row.seat === requested.seat &&
+            (row.status === 'launching' || row.status === 'launched')
+            && (!row.launchId || !launchIds.has(row.launchId))).length;
+          if (active >= details.cap) return seatCapReason(requested.seat, active, details);
+          const budget = decideSpawn({ seat: requested.seat, running: active, caps, gate, injectedCap: ownCap });
+          return budget.allow ? undefined : `${budget.reason}: ${seatCapReason(requested.seat, active, details)}`;
+        })();
+        const reason = own ?? `다른 자리 차례 — ${item.seat}`;
+        if (requested.waitingReason !== reason) save(path, current.map((row) => row.id === requestedId ? { ...row, waitingReason: reason } : row));
+        observe('waiting', { id: requested.id, seat: requested.seat, reason }, deps);
+        return { outcome: 'waiting', item: { ...requested, waitingReason: reason }, reason };
+      }
       const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${randomUUID()}` };
       delete launching.waitingReason;
       save(path, current.map((row) => row.id === item.id ? launching : row));
       try {
-        const pid = await (deps.launch ?? launch)(launching, queueLaunchArgs(launching), root);
+        const pid = await (deps.launch ?? defaultLaunch(deps.launchCommand))(launching, queueLaunchArgs(launching), root);
         if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('launcher returned no pid');
         const launched: QueueItem = { ...launching, pid, status: 'launched' };
         save(path, current.map((row) => row.id === item.id ? launched : row));

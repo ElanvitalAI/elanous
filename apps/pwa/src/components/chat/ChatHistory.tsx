@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ChatMessageView } from './ChatMessage';
+import { ChatPendingDecision } from './ChatPendingDecision';
 import type { ChatMessage } from '@/lib/chat-runtime';
 import {
   createStickState, findScrollViewport, followBehavior, isScrollIntentKey, onUserScroll,
@@ -233,6 +234,7 @@ export function ChatHistory({ messages, pending, tabId }: Props) {
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
         <p>무엇이든 말을 걸어 보세요.</p>
         <p className="text-xs"><code className="rounded bg-muted px-1.5 py-0.5 font-mono">:help</code> 를 치면 명령 목록이 나옵니다.</p>
+        <ChatPendingDecision />
       </div>
     );
   }
@@ -244,6 +246,7 @@ export function ChatHistory({ messages, pending, tabId }: Props) {
           {messages.map((m) => (
             <ChatMessageView key={m.id} message={m} />
           ))}
+          <ChatPendingDecision />
           {pending && (
             <div className="flex justify-start px-4 py-3">
               <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm text-muted-foreground">

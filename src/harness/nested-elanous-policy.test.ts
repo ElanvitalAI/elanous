@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import {
   CODEX_NESTED_DEPTH_CONFIG_KEY,
   configAllowsNestedElanous,
@@ -75,6 +76,49 @@ describe('nested elanous policy', () => {
     } finally {
       debug.log = original;
     }
+  });
+
+  it('depth cap denies at 2 even with allow, logs the configured cap, and can be lowered', () => {
+    const seen: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    debug.log = ((category: string, event: string, data?: unknown) => { seen.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      const capped = gateNestedElanousLaunch({ backendName: 'codex', depth: 2, nestedLaunchRequested: true, allow: true });
+      expect(capped).toMatchObject({ allowed: false, reason: 'depth-cap', depth: 2 });
+      expect(seen).toContainEqual({ category: 'agent-mission.nested', event: 'depth-cap', data: { depth: 2, cap: 2 } });
+      const lowered = gateNestedElanousLaunch({ backendName: 'codex', depth: 1, nestedLaunchRequested: true, allow: true, maxDepth: 1 });
+      expect(lowered.reason).toBe('depth-cap');
+      expect(seen).toContainEqual({ category: 'agent-mission.nested', event: 'depth-cap', data: { depth: 1, cap: 1 } });
+      expect(gateNestedElanousLaunch({ backendName: 'codex', depth: 1, nestedLaunchRequested: true, allow: true, maxDepth: 3 }).reason).toBe('allow-ignored');
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, nestedElanousMaxDepth: 1 } }));
+      expect(gateNestedElanousLaunch({ backendName: 'codex', depth: 1, nestedLaunchRequested: true, allow: true }).reason).toBe('depth-cap');
+      expect(seen).toContainEqual({ category: 'agent-mission.nested', event: 'depth-cap', data: { depth: 1, cap: 1 } });
+    } finally { setUserConfigOverlay(null); debug.log = original; }
+  });
+
+  it('a backend that cannot carry depth stays depth-unknown at the cap but still logs depth-cap', () => {
+    const seen: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    debug.log = ((category: string, event: string, data?: unknown) => { seen.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      const claude = gateNestedElanousLaunch({ backendName: 'claude', depth: 2, nestedLaunchRequested: true, allow: true });
+      expect(claude).toMatchObject({ allowed: false, reason: 'depth-unknown', depth: 2 });
+      expect(seen).toContainEqual({ category: 'agent-mission.nested', event: 'depth-cap', data: { depth: 2, cap: 2, backend: 'claude' } });
+      seen.length = 0;
+      expect(gateNestedElanousLaunch({ backendName: 'claude', depth: 1, nestedLaunchRequested: true, allow: true }).reason).toBe('depth-unknown');
+      expect(seen.filter((row) => row.event === 'depth-cap')).toHaveLength(0);
+    } finally { debug.log = original; }
+  });
+
+  it('an ordinary mission spawn at the cap does not log depth-cap', () => {
+    const seen: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    debug.log = ((category: string, event: string, data?: unknown) => { seen.push({ category, event, data }); }) as typeof debug.log;
+    try {
+      gateNestedElanousLaunch({ backendName: 'codex', depth: 3, nestedLaunchRequested: false });
+      gateNestedElanousLaunch({ backendName: 'claude', depth: 3, nestedLaunchRequested: false });
+      expect(seen.filter((row) => row.event === 'depth-cap')).toHaveLength(0);
+    } finally { debug.log = original; }
   });
 
   it('config allow counts only at depth 0', () => {

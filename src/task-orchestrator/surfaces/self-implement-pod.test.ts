@@ -244,8 +244,15 @@ describe('pod codex rotation credentials', () => {
       expect(unredacted.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
       const expired = join(root, 'home-0', 'auth.json');
       writeFileSync(expired, JSON.stringify({ tokens: { access_token: token(Math.floor(Date.now() / 1000) + 60), refresh_token: 'cli-refresh-team' } }));
+      // POD-TOKEN-PREREFRESH (10-06): an expiring rotation candidate is dropped (no lease ⇒ no refresh), not fatal.
+      const dropped = fakeKubectl(['Complete'], '');
+      const kept = await podSelfImplementSpawn({ kubectl: dropped.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-expired' }).done;
+      expect(kept.exitCode).toBe(0);
+      const keptSecret = dropped.calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!))[0];
+      expect(Object.keys(keptSecret.stringData).filter((key) => key.startsWith('codex-'))).toEqual(['codex-0.json']);
+      writeFileSync(join(root, 'home-1', 'auth.json'), JSON.stringify({ tokens: { access_token: token(Math.floor(Date.now() / 1000) + 60), refresh_token: 'cli-refresh-third' } }));
       const rejected = fakeKubectl(['Complete'], '');
-      const failure = await podSelfImplementSpawn({ kubectl: rejected.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-expired' }).done;
+      const failure = await podSelfImplementSpawn({ kubectl: rejected.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-expired-all' }).done;
       expect(failure.error?.message).toContain('3시간 안에 만료');
       expect(rejected.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -669,6 +676,13 @@ describe('pod memory evidence', () => {
       return run.stdout.toString();
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
+
+  test('authorOnPod never passes --author-grade to the Pod elanous (it may not know the flag — 10-06 «unknown option»)', () => {
+    const job = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, authorSentence: true, authorGrade: 'lite' }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+    const script = job.spec.template.spec.containers[0]!.args[0]!;
+    expect(script).toContain('elanous harness say --substrate local --json');
+    expect(script).not.toContain('--author-grade');
+  });
 
   test('sampler follows setup, precedes both harness routes, redacts argv and leaves exit unchanged', () => {
     for (const goalDoc of [undefined, 'GOAL.md']) {
@@ -1617,6 +1631,44 @@ describe('podSelfImplementSpawn', () => {
       expect(result.error?.message).not.toContain('intermediate line');
       expect(finished[0]).toMatchObject({ childStage: 'error', childError });
     } finally { off(); }
+  });
+
+  test('failed nested child result is the Job error, not a later graph failure', async () => {
+    const child = JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned', abandonedClassification: { classification: 'report-deficit' } } });
+    const { k } = fakeKubectl(['Failed'], `${child}\n[graph] collect fail (0.28s)`);
+    const finished: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-nested-result', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-result' }).done;
+      expect(result.error?.message).toContain('childStage=aborted · childError=implement abandoned · report-deficit');
+      expect(result.error?.message).not.toContain('no-result-line');
+      expect(result.error?.message).not.toContain('[graph] collect fail');
+      expect(finished[0]).toMatchObject({ childStage: 'aborted', childError: 'implement abandoned · report-deficit' });
+    } finally { off(); }
+  });
+
+  test('a later non-child JSON result row does not erase the nested child failure', async () => {
+    const child = JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'rework', outcome: 'abandoned', supervisorVerdict: 'UNCONVERGEABLE' } });
+    const graph = JSON.stringify({ kind: 'graph', result: { stage: 'merged', ok: true } });
+    const flatGraph = JSON.stringify({ kind: 'graph', stage: 'merged', ok: true });
+    const { k } = fakeKubectl(['Failed'], `${child}\n${graph}\n${flatGraph}`);
+    const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-result-graph' }).done;
+    expect(result.error?.message).toContain('childStage=aborted · childError=rework abandoned · UNCONVERGEABLE');
+    expect(result.error?.message).not.toContain('no-result-line');
+  });
+
+  test('nested rework verdict is surfaced and nested success does not reuse an earlier failure', async () => {
+    const failed = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, node: 'rework', outcome: 'abandoned', supervisorVerdict: 'UNCONVERGEABLE' } });
+    const { k } = fakeKubectl(['Failed'], failed);
+    const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-rework' }).done;
+    expect(result.error?.message).toContain('childError=rework abandoned · UNCONVERGEABLE');
+    const success = JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } });
+    const { k: successKubectl } = fakeKubectl(['Failed'], `${failed}\n${success}\n[graph] collect fail (0.28s)`);
+    const completed = await podSelfImplementSpawn({ kubectl: successKubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-success' }).done;
+    expect(completed.error?.message).toContain('childError=no-result-line');
+    expect(completed.error?.message).not.toContain('UNCONVERGEABLE');
   });
 
   test('a failed Job whose last result is successful does not reuse an earlier failure', async () => {

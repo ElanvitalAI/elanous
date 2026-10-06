@@ -1,6 +1,6 @@
 # 정기 흡수 한 판 — RFC-regular-external-intake-and-normalization-pipeline §5.1 (1판: cmd 노드만).
 # 입력원 하나가 실패해도 판은 끝까지 간다(수집 노드의 fail 도 다음 노드로) — 각 단계가 «못 모음»을 로그에 남긴다.
-# 몸 = yt-vault 의 scripts/intake-daily.sh <step> · 크론 입구 스크립트 intake-cron.sh 가 그래프를 부른다.
+# 몸 = yt-vault 의 scripts/intake-daily.sh <step> ⊕ 이 저장소의 scripts/intake-news.ts · 크론 입구 스크립트 intake-cron.sh 가 그래프를 부른다.
 graph_id: intake-daily
 cron_entry: intake-cron.sh
 loop:
@@ -15,6 +15,10 @@ nodes:
   - node_id: trend
     kind: agent
     recipe: cmd:intake-trend
+    max_visits: 1
+  - node_id: news
+    kind: agent
+    recipe: cmd:intake-news
     max_visits: 1
   - node_id: ingest
     kind: agent
@@ -41,7 +45,10 @@ nodes:
 edges:
   - from: trend
     on: outcome
-    map: { ok: ingest, fail: telegram }
+    map: { ok: news, fail: news }
+  - from: news
+    on: outcome
+    map: { ok: ingest, fail: ingest }
   - from: ingest
     on: outcome
     map: { ok: telegram, fail: telegram }

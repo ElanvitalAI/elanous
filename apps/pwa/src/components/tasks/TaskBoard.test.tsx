@@ -102,6 +102,39 @@ describe('TaskBoardView detail wiring', () => {
     expect(cardFromWire({ ...wire, sections: [] }).wishReply).toBeNull();
   });
 
+  test('selected API card closes from the board, updates detail and list; public capture has no action', async () => {
+    const wire: TaskCardWire = { id: 'card-1', goalId: 'goal-1', title: 'Close me', status: 'open',
+      createdAt: '2023-11-14T22:13:20.000Z', sections: [] };
+    const calls: Array<{ url: string; method?: string; body?: string }> = [];
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method, body: init?.body as string | undefined });
+      return Response.json(url.endsWith('/close') ? { card: { ...wire, status: 'closed', closedReason: '완료' } }
+        : url.endsWith('/card-1') ? { card: wire } : { cards: [wire] });
+    }, { preconnect: fetch.preconnect }));
+    const config = { baseUrl: 'http://board.test', token: 'owner-token', provider: '' };
+    const client = new DaemonClient(config);
+    let renderer: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => {
+        renderer = create(<DaemonContext.Provider value={{ config, client, sessionId: '', setConfig: () => {}, setSessionId: () => {} }}><TaskBoard /></DaemonContext.Provider>);
+      });
+      await act(async () => { renderer!.root.findByProps({ 'aria-label': 'steward column' }).findByType('button').props.onClick(); });
+      const detail = renderer!.root.findByProps({ 'aria-label': 'Task card detail' });
+      await act(async () => { detail.findByType('input').props.onChange({ target: { value: '완료' } }); });
+      await act(async () => { detail.findByType('form').props.onSubmit({ preventDefault() {} }); });
+      expect(calls.at(-1)).toMatchObject({ url: 'http://board.test/v1/task-cards/card-1/close', method: 'POST' });
+      expect(calls.at(-1)?.body).toContain('완료');
+      expect(renderer!.root.findByProps({ 'aria-label': 'Task card detail' }).findByProps({ role: 'status' }).props.children).toEqual(['닫힘 · ', '완료']);
+      expect(renderer!.root.findByProps({ 'aria-label': 'Task card detail' }).findAllByType('form')).toHaveLength(0);
+      const capture = renderToStaticMarkup(<TaskBoardView cards={[cardFromWire(wire)]} selectedId="card-1" selectedCard={cardFromWire(wire)} onSelect={() => {}} onCloseCard={async () => {}} publicCapture />);
+      expect(capture).not.toContain('type="submit"');
+    } finally {
+      await act(async () => { renderer?.unmount(); });
+      fetchMock.mockRestore();
+    }
+  });
+
   test('loads the list and selected detail via the task-card API', async () => {
     const wire: TaskCardWire = {
       id: 'card-1', goalId: 'goal-1', title: 'Ship it', status: 'open', createdAt: '2023-11-14T22:13:20.000Z', sections: [],

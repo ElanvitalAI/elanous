@@ -1,9 +1,11 @@
 import { readFileSync, realpathSync } from 'node:fs';
+import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
 import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
 import { createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen, type RecentStepCountReader } from './goal-author-decompose.js';
-import { defaultGoalAuthorSelfResolve, parseGoalDocumentClarifications, seedGoalAuthorFromAnsweredClarification, seedGoalAuthorFromClarification } from './goal-author-clarification.js';
+import { defaultGoalAuthorSelfResolve, parseGoalDocumentClarifications, seedGoalAuthorFromAnsweredClarification, seedGoalAuthorFromClarification, selfAnswerGoalDocumentClarifications } from './goal-author-clarification.js';
 import { classifyGoalInterviewRound, type GoalInterviewRoundStatus } from './goal-author-closure.js';
 import { recordGoalAsk } from './goal-ask-store.js';
 import { pressDecisionSignal } from './decision-signal-press.js';
@@ -15,6 +17,8 @@ import {
   verbatimOriginalAsk,
   writeAuthoredGoal,
   type GoalAuthorDeps,
+  type GoalAuthorGradeSelection,
+  resolveGoalAuthorGrade,
   type GoalType,
   type GoalFileLintFinding,
 } from './goal-author.js';
@@ -77,6 +81,7 @@ interface GoalAuthorCliOptions {
   supersedes?: string;
   rootIntent?: string;
   goalType?: string;
+  authorGrade?: GoalAuthorGradeSelection;
   selfResolveClarifications?: boolean;
   adversarialReview?: boolean;
   disableAdversarialReview?: boolean;
@@ -97,6 +102,7 @@ export interface GoalAuthorCliDeps {
   recentStepCountReader?: RecentStepCountReader;
   /** Resolver supplied only by the explicit CLI self-resolution opt-in. */
   selfResolveClarification?: NonNullable<GoalAuthorDeps['selfResolveClarification']>;
+  writeFile?: (path: string, document: string) => void;
   recordAsk?: typeof recordGoalAsk;
 }
 
@@ -268,8 +274,9 @@ export async function runGoalAuthorCli(
     : opts.reauthorFromAnsweredClarification
       ? { origin: 'answered-clarification-reauthor' }
       : { origin: 'direct-request' };
-  const recentStepCounts = readRecentStepCountsFailOpen(deps.recentStepCountReader);
-  const decomposeSteps = deps.decomposeSteps ?? (deps.createDecomposeSteps ?? createGoalAuthorDecomposeSteps)(undefined, {
+  const authorGrade = opts.authorGrade ?? resolveGoalAuthorGrade(undefined, getUserConfig().harness?.authorGrade);
+  const recentStepCounts = authorGrade.grade === 'lite' ? undefined : readRecentStepCountsFailOpen(deps.recentStepCountReader);
+  const decomposeSteps = authorGrade.grade === 'lite' ? undefined : deps.decomposeSteps ?? (deps.createDecomposeSteps ?? createGoalAuthorDecomposeSteps)(undefined, {
     ...(adversarialReview !== undefined ? { adversarialReview, adversarialReviewSource: 'cli' as const } : {}),
     ...(recentStepCounts !== undefined ? { recentStepCounts } : {}),
   });
@@ -283,13 +290,34 @@ export async function runGoalAuthorCli(
   debug.log('goal-author', 'goal-title-forwarded', proseTitle === undefined
     ? { passed: false }
     : { passed: true, titleChars: proseTitle.length });
+  const gradeDeps = authorGrade.grade === 'lite' || opts.authorGrade ? { authorGrade } : {};
   const authorDeps: Partial<GoalAuthorDeps> = parentGoalFile && parentQuestionId
-    ? { parent: { goalFile: parentGoalFile, questionId: parentQuestionId }, parentDocument, clarificationAnswers, decomposeSteps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps }
-    : { ...(clarificationAnswers && { clarificationAnswers }), decomposeSteps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps };
+    ? { parent: { goalFile: parentGoalFile, questionId: parentQuestionId }, parentDocument, clarificationAnswers, ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps }
+    : { ...(clarificationAnswers && { clarificationAnswers }), ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps };
   const write = deps.write ?? writeAuthoredGoal;
   const result = opts.groundingCwd === undefined
     ? await write(ask, opts.cwd, authorDeps, superseded ? { supersedes: superseded } : undefined)
     : await write(ask, opts.cwd, authorDeps, superseded ? { supersedes: superseded } : undefined, opts.groundingCwd);
+  if (opts.selfResolveClarifications) {
+    const rework = Boolean(supersededDocument || opts.reauthorFromAnsweredClarification);
+    {
+      try {
+        const resolved = await selfAnswerGoalDocumentClarifications(result.authored.document, {
+          path: rework ? 'rework' : 'say-first', ask, resolver: deps.selfResolveClarification ?? defaultGoalAuthorSelfResolve,
+          evidence: result.authored.facts
+            ? [...(result.authored.facts.persistentEvidence ?? []), ...result.authored.facts.codeFacts, ...result.authored.facts.documentFacts]
+            : undefined,
+        });
+        if (resolved.newlyAnswered > 0) {
+          (deps.writeFile ?? writeGoalDocumentAtomic)(result.path, resolved.document);
+          result.authored.document = resolved.document;
+        }
+      } catch (error) {
+        // The previous goal file is left intact (atomic replace); implementation proceeds from it with the questions deferred.
+        debug.log('goal-author.clarify', 'self-answer-deferred', { reason: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
   try {
     const recorded = (deps.recordAsk ?? recordGoalAsk)({
       authorRunId: result.authored.authorRunId,

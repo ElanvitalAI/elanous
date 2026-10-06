@@ -8,6 +8,19 @@ import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, decideTrackAction, executeTrackActi
 const input = { missionId: 'apm_test', taskId: 'task:test', title: '티저 제작', prompt: '영상 티저', track: 'T' };
 
 describe('track agent', () => {
+  test('work topic does not become a forbidden operation but an imperative merge request does', async () => {
+    expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test('병합 경로에 동결 검사를 더하는')).toBe(false);
+    expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test('main 에 병합해라')).toBe(true);
+    const launched = await executeTrackAction({ action: 'say' }, { ...input, title: '병합 경로에 동결 검사를 더하는', prompt: '동결 검사 구현' },
+      { shadow: false, checkBudget: async () => true, launch: async () => {} });
+    expect(launched.status).toBe('launched');
+    expect((await executeTrackAction({ action: 'say' }, { ...input, prompt: 'main 에 병합해라' })).status).toBe('held');
+    expect(await executeTrackAction({ action: 'say' }, { ...input, title: 'main 에 병합해라', prompt: '구현' },
+      { shadow: false, checkBudget: async () => true, launch: async () => {} }))
+      .toMatchObject({ status: 'launched' });
+    expect((await executeTrackAction({ action: 'say' }, { ...input, title: 'main 에 병합해라', prompt: 'main 에 병합해라' })).status).toBe('held');
+  });
+
   test('the exported forbidden-action regex matches the decision and launch gates', async () => {
     const forbidden = ['deploy site', '운영 배포', 'run with --prod', 'config set llm.model x'];
     const allowed = ['draft a teaser', '티저 제작'];
@@ -229,4 +242,11 @@ describe('track agent', () => {
       else process.env.ELANOUS_STATE_DIR_SOURCE = previousSource;
     }
   });
+});
+
+test('security words stay blocked even as a topic: secret · credential · 자격 · 비밀 · force', () => {
+  for (const text of ['rotate the secret store', 'credential refresh', 'Pod 자격 갱신', '비밀 값 정리', 'git push --force']) {
+    expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test(text)).toBe(true);
+  }
+  expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test('병합 경로에 동결 검사를 더하는 수리')).toBe(false);
 });
