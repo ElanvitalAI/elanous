@@ -20,7 +20,7 @@ function createTable(store: MsgStore): void {
   store.db.exec(`CREATE TABLE IF NOT EXISTS seat_asks (
     id TEXT PRIMARY KEY, seat TEXT NOT NULL, origin TEXT NOT NULL,
     deadline INTEGER NOT NULL, timeout_minutes INTEGER NOT NULL DEFAULT 120, status TEXT NOT NULL DEFAULT 'pending',
-    answer TEXT, answered_at INTEGER
+    answer TEXT, answered_at INTEGER, asked_at INTEGER
   ); CREATE TABLE IF NOT EXISTS seat_ask_outbox (
     id TEXT PRIMARY KEY, origin TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
     claim_until INTEGER NOT NULL DEFAULT 0, claim_token TEXT
@@ -28,6 +28,7 @@ function createTable(store: MsgStore): void {
   const askColumns = store.db.query('PRAGMA table_info(seat_asks)').all() as Array<{ name: string }>;
   if (!askColumns.some(({ name }) => name === 'answer')) store.db.exec('ALTER TABLE seat_asks ADD COLUMN answer TEXT');
   if (!askColumns.some(({ name }) => name === 'answered_at')) store.db.exec('ALTER TABLE seat_asks ADD COLUMN answered_at INTEGER');
+  if (!askColumns.some(({ name }) => name === 'asked_at')) store.db.exec('ALTER TABLE seat_asks ADD COLUMN asked_at INTEGER');
   const columns = store.db.query('PRAGMA table_info(seat_ask_outbox)').all() as Array<{ name: string }>;
   if (!columns.some(({ name }) => name === 'claim_until')) store.db.exec('ALTER TABLE seat_ask_outbox ADD COLUMN claim_until INTEGER NOT NULL DEFAULT 0');
   if (!columns.some(({ name }) => name === 'claim_token')) store.db.exec('ALTER TABLE seat_ask_outbox ADD COLUMN claim_token TEXT');
@@ -87,8 +88,9 @@ export async function askSeat(text: string, origin: AskOrigin, command: CeoComma
   const store = (deps.open ?? openMsgStore)();
   try {
     createTable(store);
-    store.db.query('INSERT INTO seat_asks (id, seat, origin, deadline, timeout_minutes, status) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(id, 'TC', JSON.stringify(origin), (deps.now ?? Date.now)() + timeout, minutes, 'pending');
+    const askedAt = (deps.now ?? Date.now)();
+    store.db.query('INSERT INTO seat_asks (id, seat, origin, deadline, timeout_minutes, status, asked_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id, 'TC', JSON.stringify(origin), askedAt + timeout, minutes, 'pending', askedAt);
   } finally { store.close(); }
   try {
     const result = await (deps.dispatch ?? dispatchCeoTask)('TC', `질문: ${body}\n답장 요청: ${id}\n회신: elanous seat answer ${id} "<답>"`, command,
@@ -119,12 +121,25 @@ export function answerSeatAsk(id: string, text: string, deps: Pick<SeatAskDeps, 
   } finally { store.close(); }
 }
 
+/** Return only the recorded reply's return address and measured ask time. */
+export function seatAskReplyInfo(id: string, open: () => MsgStore = openMsgStore): { origin: AskOrigin; askedAt: number | null; answeredAt: number } {
+  const store = open();
+  try {
+    createTable(store);
+    const row = store.db.query('SELECT origin, asked_at, answered_at FROM seat_asks WHERE id = ? AND answer IS NOT NULL')
+      .get(id) as { origin: string; asked_at: number | null; answered_at: number } | null;
+    if (!row) throw new Error(`seat ask answer not recorded: ${id}`);
+    return { origin: JSON.parse(row.origin) as AskOrigin, askedAt: row.asked_at, answeredAt: row.answered_at };
+  } finally { store.close(); }
+}
+
 /** Deliver recorded seat answers or expiration notices via the original surface. */
-export async function deliverSeatAnswers(deps: SeatAskDeps): Promise<void> {
+export async function deliverSeatAnswers(deps: SeatAskDeps & { askId?: string }): Promise<void> {
   const store = (deps.open ?? openMsgStore)();
   try {
     createTable(store);
-    const pending = store.db.query("SELECT id, seat, origin, deadline, timeout_minutes, answer, answered_at FROM seat_asks WHERE status = 'pending'").all() as AskRow[];
+    const pending = store.db.query("SELECT id, seat, origin, deadline, timeout_minutes, answer, answered_at FROM seat_asks WHERE status = 'pending' AND (? IS NULL OR id = ?)")
+      .all(deps.askId ?? null, deps.askId ?? null) as AskRow[];
     const decide = store.db.transaction((id: string, now: number): 'answered' | 'expired' | null => {
       const ask = store.db.query("SELECT id, seat, origin, deadline, timeout_minutes, answer, answered_at FROM seat_asks WHERE id = ? AND status = 'pending'").get(id) as AskRow | null;
       if (!ask) return null;
@@ -150,7 +165,8 @@ export async function deliverSeatAnswers(deps: SeatAskDeps): Promise<void> {
       const status = decide(ask.id, (deps.now ?? Date.now)());
       if (status) debug.log('seat.ask', status, { seat: ask.seat, id: ask.id, via: origin.channel });
     }
-    const outbox = store.db.query("SELECT id, origin, text FROM seat_ask_outbox WHERE status = 'pending'").all() as Array<{ id: string; origin: string; text: string }>;
+    const outbox = store.db.query("SELECT id, origin, text FROM seat_ask_outbox WHERE status = 'pending' AND (? IS NULL OR id = ?)")
+      .all(deps.askId ?? null, deps.askId ?? null) as Array<{ id: string; origin: string; text: string }>;
     for (const item of outbox) {
       const origin = JSON.parse(item.origin) as AskOrigin;
       if (deps.channel && origin.channel !== deps.channel) continue;
@@ -174,6 +190,17 @@ export async function deliverSeatAnswers(deps: SeatAskDeps): Promise<void> {
         throw error;
       }
     }
+  } finally { store.close(); }
+}
+
+/** A pending outbox with a live claim is being delivered by another worker. */
+export function seatAskDeliveryInProgress(id: string, open: () => MsgStore = openMsgStore): boolean {
+  const store = open();
+  try {
+    createTable(store);
+    const row = store.db.query("SELECT claim_until FROM seat_ask_outbox WHERE id = ? AND status = 'pending' AND claim_token IS NOT NULL")
+      .get(id) as { claim_until: number } | null;
+    return row !== null && row.claim_until > Date.now();
   } finally { store.close(); }
 }
 

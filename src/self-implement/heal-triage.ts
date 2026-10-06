@@ -156,6 +156,50 @@ export interface HealTriageResult {
   readonly evidence: readonly string[];
 }
 
+/** 수리 한도를 다 쓴 런의 결함 셋. 힐 루프가 이 셋 중 하나만 고른다. */
+export type ReworkCapDefectClass = 'test-defect' | 'goal-defect' | 'code-defect';
+
+/** 분류 뒤 힐 루프가 고르는 다음 행동. */
+export type ReworkCapNextAction = 'harvest' | 'relaunch' | 'card';
+
+export interface ReworkCapHealInput {
+  /** 게이트가 이번 diff 가 들여온 실패 수. 없으면 0. */
+  readonly introduced?: readonly string[];
+  /** 마지막 리뷰 must-fix. 없으면 빈 목록. */
+  readonly mustFix?: readonly string[];
+  readonly summary?: string;
+}
+
+export interface ReworkCapHealDecision {
+  readonly defectClass: ReworkCapDefectClass;
+  readonly nextAction: ReworkCapNextAction;
+  readonly evidence: readonly string[];
+}
+
+const GOAL_DEFECT = /골|goal|acceptance|수용 기준|요구가 모순|스펙|경계:/i;
+
+/**
+ * 수리 한도 소진 런을 «시험 결함 · 골 결함 · 코드 결함» 중 하나로 가르고
+ * 수확·재발사·카드 중 하나를 고른다. 근거는 게이트 introduced 목록과 마지막 리뷰 지적이다.
+ * 도입 실패가 있으면 코드 결함(재발사). 리뷰가 골·수용 기준을 짚으면 골 결함(카드).
+ * 그 밖(리뷰만 있거나 근거가 비면)은 시험 결함(수확)이다.
+ */
+export function classifyReworkCapExhaustion(input: ReworkCapHealInput): ReworkCapHealDecision {
+  const introduced = (input.introduced ?? []).map((item) => item.trim()).filter(Boolean);
+  const mustFix = (input.mustFix ?? []).map((item) => item.trim()).filter(Boolean);
+  const evidence = [
+    ...introduced.map((item) => `gate introduced: ${item}`),
+    ...mustFix.map((item) => `review must-fix: ${item}`),
+  ];
+  if (introduced.length > 0) {
+    return { defectClass: 'code-defect', nextAction: 'relaunch', evidence };
+  }
+  if (mustFix.some((item) => GOAL_DEFECT.test(item)) || (input.summary ? GOAL_DEFECT.test(input.summary) : false)) {
+    return { defectClass: 'goal-defect', nextAction: 'card', evidence };
+  }
+  return { defectClass: 'test-defect', nextAction: 'harvest', evidence };
+}
+
 const UNTESTABLE_EXT = new Set(['.md', '.json', '.yaml', '.yml', '.txt']);
 const ENVIRONMENT_CLAIM = /할당량|자격|기판|quota|credential|substrate/i;
 

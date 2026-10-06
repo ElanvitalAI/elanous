@@ -106,6 +106,12 @@ export function activityTraceTarget(id: string, edge?: ActivityEdge): string {
   return '/trace';
 }
 
+export function cardPathEdges(edges: readonly ActivityEdge[], cardId: string): ActivityEdge[] {
+  const order = (from: string) => from.startsWith('surface:') ? 0 : from.startsWith('card:') ? 1 : from.startsWith('loop:') ? 2 : 3;
+  return edges.filter(edge => edge.kind === 'card' && edge.ref === cardId)
+    .sort((a, b) => a.at.localeCompare(b.at) || order(a.from) - order(b.from));
+}
+
 export function activityEdgeKey(edge: ActivityEdge): string {
   return JSON.stringify([edge.at, edge.kind, edge.from, edge.to, edge.ref]);
 }

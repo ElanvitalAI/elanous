@@ -1,11 +1,12 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { authorOnPodGoal, dispatchHarnessOnPod, fenceVerbatimSentence, podOrchestrateArgs } from './harness-pod-dispatch.js';
+import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { HARNESS_RUN_ID_ENV } from './harness-space.js';
 
 describe('harness say/ask --substrate pod', () => {
   test('unspecified document selects lite; implement retains standard and explicit tier wins', () => {
@@ -84,6 +85,15 @@ describe('harness say/ask --substrate pod', () => {
       run: (_command, _args, env) => { stamped = env.ELANOUS_HARNESS_SEAT; return 0; },
     });
     expect(stamped).toBe('TC');
+  });
+
+  test('POD-OBS: the spawned orchestrator learns the launch home logs.db (the parent universe)', async () => {
+    const { logsDbPath } = await import('../mss/logging/log-store.js');
+    let stamped: string | undefined;
+    dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal', seat: 'MK' }, {
+      run: (_command, _args, env) => { stamped = env.ELANOUS_POD_REEMIT_LOGS_DB; return 0; },
+    });
+    expect(stamped).toBe(logsDbPath());
   });
 
   test('routes to the one pod path (orchestrate --substrate pod), keeping the harness completion default', () => {
@@ -232,30 +242,22 @@ describe('harness say/ask --substrate pod', () => {
     }
   });
 
-  test('authorOnPod wraps the sentence as a GOAL file and leaves only a receipt', () => {
+  test('authorOnPod hands the verbatim sentence to the Pod, marks the run and writes nothing under docs/goals', () => {
     const sentence = 'fix the pod author path';
-    const seen: string[][] = [];
+    const seen: { args: string[]; env: NodeJS.ProcessEnv; body: string }[] = [];
+    const before = existsSync(join(process.cwd(), 'docs', 'goals')) ? readdirSync(join(process.cwd(), 'docs', 'goals')).filter((n) => n.startsWith('.pod-author-')).length : 0;
     const status = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: sentence, authorOnPod: true }, {
-      run: (_c, args) => { seen.push([...args]); return 0; },
+      run: (_c, args, env) => { seen.push({ args: [...args], env: { ...env }, body: readFileSync(args[args.indexOf('--goal-file') + 1]!, 'utf8') }); return 0; },
     });
     expect(status).toBe(0);
-    const goalFile = seen[0]![seen[0]!.indexOf('--goal-file') + 1]!;
-    expect(goalFile).toContain('GOAL-pod-author-');
-    const doc = readFileSync(goalFile, 'utf8');
-    expect(doc).toBe(authorOnPodGoal(sentence));
-    expect(doc).toContain('elanous harness say --substrate local');
-    expect(doc).toContain(sentence);
-    expect(seen[0]).not.toContain(sentence);
-    rmSync(goalFile.slice(0, goalFile.lastIndexOf('/')), { recursive: true, force: true });
-  });
-
-  test('a sentence that contains fences stays inside one fence', () => {
-    const sentence = 'keep ```this``` literal';
-    const { fence } = fenceVerbatimSentence(sentence);
-    const doc = authorOnPodGoal(sentence);
-    expect(fence.length).toBeGreaterThan(3);
-    expect(doc.split(fence)).toHaveLength(3);
-    expect(doc.split(fence)[1]).toBe(`\n${sentence}\n`);
+    expect(seen[0]!.body).toBe(sentence);
+    expect(seen[0]!.args).not.toContain(sentence);
+    expect(seen[0]!.env.ELANOUS_POD_AUTHOR_ON_POD).toBe('1');
+    expect(seen[0]!.env.ELANOUS_POD_GOAL_DOC).toBeUndefined();
+    expect(seen[0]!.env[HARNESS_RUN_ID_ENV]).toMatch(/^run-/);
+    const after = existsSync(join(process.cwd(), 'docs', 'goals')) ? readdirSync(join(process.cwd(), 'docs', 'goals')).filter((n) => n.startsWith('.pod-author-')).length : 0;
+    expect(after).toBe(before);
+    expect(existsSync(seen[0]!.args[seen[0]!.args.indexOf('--goal-file') + 1]!)).toBe(false);
   });
 
   test('authorOnPod off keeps the raw sentence file', () => {

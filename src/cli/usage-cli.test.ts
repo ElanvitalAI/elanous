@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { registerUsageCommand } from './usage-cli.js';
+import { outcomeTableHasCodexGrokUnknown, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import type { collectUnifiedUsage } from '../budget/unified-usage.js';
 import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 import type { LogRecord } from '../mss/logging/record.js';
@@ -84,5 +85,60 @@ describe('usage runs', () => {
     registerUsageCommand(b, { collect: async () => report, creditPlan: () => plan, out: { log: (line) => json.push(line) } });
     await b.parseAsync(['usage', '--json'], { from: 'user' });
     expect(JSON.parse(json[0]!).codexCreditPlan).toEqual(plan);
+  });
+});
+
+describe('usage outcomes', () => {
+  it('최근 이틀 표에 codex·grok·불명 세 줄을 내고 provider 미기록 런은 불명으로 센다', async () => {
+    const now = Date.parse('2026-10-05T00:00:00Z');
+    const day = 24 * 60 * 60 * 1000;
+    const ledger = (provider: string | undefined, event: string, data: Record<string, unknown>, ageDays: number) => ([
+      { timestamp: new Date(now - ageDays * day).toISOString(), runId: 'r', event: 'run-origin', data: provider ? { childProvider: provider } : {} },
+      { timestamp: new Date(now - ageDays * day + 1000).toISOString(), runId: 'r', event, data },
+    ]);
+    const files: Record<string, ReturnType<typeof ledger>> = {
+      'run-codex.jsonl': ledger('codex', 'merged', { merged: true, round: 1 }, 0),
+      'run-grok.jsonl': ledger('grok', 'pr-opened', { draft: true, round: 2 }, 1),
+      'run-unknown.jsonl': ledger(undefined, 'failed', { stopReason: 'no-progress', round: 3 }, 1),
+      'run-old.jsonl': ledger('codex', 'merged', { merged: true }, 5),
+    };
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, {
+      out: { log: (line) => lines.push(line) },
+      exit: (code) => { throw new Error(`exit ${code}`); },
+      outcomeDeps: {
+        nowMs: now,
+        dir: '/ledger',
+        list: () => Object.keys(files),
+        load: (runId) => files[`${runId}.jsonl`] ?? null,
+      },
+    });
+    await command.parseAsync(['usage', 'outcomes', '--days', '2', '--json'], { from: 'user' });
+    const report = JSON.parse(lines[0]!) as UsageOutcomesReport & { hasCodexGrokUnknown: boolean };
+    expect(outcomeTableHasCodexGrokUnknown(report)).toBe(true);
+    expect(report.hasCodexGrokUnknown).toBe(true);
+    expect(new Set(report.rows.map((row) => row.provider))).toEqual(new Set(['codex', 'grok', '불명']));
+    expect(report.rows.find((row) => row.provider === 'codex')).toMatchObject({ landed: 1, rounds: 1 });
+    expect(report.rows.find((row) => row.provider === 'grok')).toMatchObject({ draft: 1, rounds: 1 });
+    expect(report.rows.find((row) => row.provider === '불명')).toMatchObject({ failed: 1, rounds: 1, blockReasons: { 'no-progress': 1 } });
+    const text: string[] = [];
+    const shown = new Command();
+    registerUsageCommand(shown, {
+      out: { log: (line) => text.push(line) },
+      outcomeDeps: {
+        nowMs: now,
+        dir: '/ledger',
+        list: () => Object.keys(files),
+        load: (runId) => files[`${runId}.jsonl`] ?? null,
+      },
+    });
+    await shown.parseAsync(['usage', 'outcomes', '--days', '2'], { from: 'user' });
+    const table = text.join('\n');
+    expect(table).toContain('판정: codex·grok·불명');
+    expect(table).toContain('codex');
+    expect(table).toContain('grok');
+    expect(table).toContain('불명');
+    expect(table).toContain('no-progress=1');
   });
 });

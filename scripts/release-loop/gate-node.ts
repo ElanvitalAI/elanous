@@ -242,8 +242,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       // GNU timeout signals its own process group: -s KILL would kill timeout too (ssh 255), so TERM first then KILL after 10s (124 / 137).
       // No coreutils timeout on the remote → run unlimited there and rely on the local ssh deadline.
       const limitPrefix = limitMs ? `$(command -v timeout >/dev/null 2>&1 && echo 'timeout -k 10 ${Math.ceil(limitMs / 1000)}') ` : '';
+      // Start in /tmp, not the caller checkout. macOS resolves that symlink to /private/tmp before the child sees it;
+      // the remote command still `cd`s to the quoted path, so either spelling is the same directory.
       const run = spawnSync('ssh', [remote, `PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd ${quote(cwd)} && ${limitPrefix}${[cmd, ...args].map(quote).join(' ')}`],
-        { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024, ...(limitMs ? { timeout: limitMs + 60_000, killSignal: 'SIGKILL' as const } : {}) });
+        { cwd: '/tmp', encoding: 'utf8', maxBuffer: 128 * 1024 * 1024, ...(limitMs ? { timeout: limitMs + 60_000, killSignal: 'SIGKILL' as const } : {}) });
       const timedOut = !!limitMs && (run.status === 124 || run.status === 137 || (run.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT');
       return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}`, ...(timedOut ? { timedOut } : {}) };
     }

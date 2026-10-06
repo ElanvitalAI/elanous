@@ -153,14 +153,36 @@ describe('decideLaunchBudget only', () => {
       decision: expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }),
       unmeasuredProvider: 'openai-codex',
     }));
-    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).unmeasuredProvider).toBe('grok');
+    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).decision.action).toBe('stop');
+    expect(decideLaunchBudget(input({ codex: [], chain: [{ provider: 'grok' }] })).unmeasuredProvider).toBeUndefined();
+  });
+
+  it('grok 잔량을 못 재면 발사 관문이 거부하고, 80% 이상은 상한을 넘긴 것으로 거부한다', () => {
+    const unmeasured = input({ codex: [{ name: 'default', usedPercent: 100, reached: true }], chain: [{ provider: 'grok' }] });
+    expect(decideLaunchBudget(unmeasured).decision.action).toBe('stop');
+    expect(decideLaunchBudget(unmeasured).decision.reasons.join(' ')).toContain('grok: 모름');
+    const overCap = input({
+      codex: [],
+      grok: 80,
+      chain: [{ provider: 'grok' }],
+      max: { 'openai-codex': 95 },
+    });
+    expect(decideLaunchBudget(overCap).decision.action).toBe('stop');
+    expect(decideLaunchBudget(overCap).decision.reasons.join(' ')).toContain('80% ≥ 80');
+    const underCap = input({
+      codex: [],
+      grok: 79,
+      chain: [{ provider: 'grok' }],
+      max: { 'openai-codex': 95 },
+    });
+    expect(decideLaunchBudget(underCap).decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'grok' }));
   });
 
   it('reached and measured exhaustion do not become unmeasured', () => {
-    const exhausted = input({ codex: [{ name: 'default', reached: true }], grok: 48 });
+    const exhausted = input({ codex: [{ name: 'default', reached: true }], grok: 80 });
     expect(decideLaunchBudget(exhausted).decision.action).toBe('stop');
     expect(decideLaunchBudget(exhausted).unmeasuredProvider).toBeUndefined();
-    const mixed = input({ codex: [{ name: 'default', reached: true }, { name: 'team' }], grok: 48 });
+    const mixed = input({ codex: [{ name: 'default', reached: true }, { name: 'team' }], grok: 80 });
     expect(decideLaunchBudget(mixed).unmeasuredProvider).toBe('openai-codex');
   });
 });
@@ -262,7 +284,7 @@ describe('codex credits policy (BUDGET-GATE)', () => {
     { name: 'third', usedPercent: 100 },
   ];
   const credits = (codex: DecideBudgetInput['codexCandidates'], allowed: boolean): DecideBudgetInput => ({
-    ...input({ codex: [], grok: 60, onShortfall: 'wait-reset' }),
+    ...input({ codex: [], grok: 80, onShortfall: 'wait-reset' }),
     codexCandidates: codex,
     ...(allowed ? { codexCreditsAllowed: true } : {}),
   });

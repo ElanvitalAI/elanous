@@ -9,6 +9,7 @@ import type { UsageSnapshot } from '../budget/types.js';
 import { debug } from '../debug/log.js';
 import {
   DEFAULT_BUDGET_GATE_MAX_USED_PERCENT,
+  LAUNCH_GROK_USED_PERCENT_CAP,
   type BudgetGateMaxUsedPercent,
   type BudgetGateOnShortfall,
 } from '../user-config.js';
@@ -137,16 +138,17 @@ function slotUsable(
     return { usable: measuredUsable || unmeasured, reason: formatCodexReason(input.codexCandidates, cap), ...(unmeasured ? { unmeasured: true } : {}) };
   }
   if (provider === GROK_PROVIDER) {
-    const cap = capFor(input.maxUsedPercent, GROK_PROVIDER);
+    const configured = capFor(input.maxUsedPercent, GROK_PROVIDER);
+    // 발사 관문은 `elanous usage` 와 같은 주간 사용률에 80% 상한을 실제로 적용한다.
+    // «못 쟀다»(undefined)는 통과가 아니다. decideBudget 은 설정 상한을 그대로 쓴다.
+    const cap = allowUnmeasured ? LAUNCH_GROK_USED_PERCENT_CAP : configured;
     const known = typeof input.grokUsedPercent === 'number' && Number.isFinite(input.grokUsedPercent);
-    const unmeasured = allowUnmeasured && !known;
-    const usable = unmeasured || (cap === undefined
+    const usable = cap === undefined
       ? known
-      : known && (input.grokUsedPercent as number) < cap);
+      : known && (input.grokUsedPercent as number) < cap;
     return {
       usable,
       reason: formatGrokReason(input.grokUsedPercent, cap),
-      ...(unmeasured ? { unmeasured: true } : {}),
     };
   }
   return { usable: false, reason: `${provider}: 예산 판정 없음` };

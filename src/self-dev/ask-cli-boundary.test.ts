@@ -23,15 +23,34 @@ setDefaultTimeout(60_000);
 const REPO = resolve(import.meta.dir, '..', '..');
 const BIN = resolve(REPO, 'bin', 'elanous.mjs');
 
-function runDev(args: readonly string[]): { code: number | null; stderr: string } {
+// #24330 closed `dev --ask` to outside callers. The argument contract below still runs for the harness-internal
+// caller (`harness ask` drives this door with the stamp), so these cases spawn it the way that caller does.
+function runDev(args: readonly string[], caller: 'harness-ask' | 'outside' = 'harness-ask'): { code: number | null; stderr: string } {
+  const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY: '1' };
+  if (caller === 'harness-ask') env.ELANOUS_HARNESS_ENTRANCE = 'cli-harness-ask';
+  else delete env.ELANOUS_HARNESS_ENTRANCE;
   const r = spawnSync('bun', [BIN, '--test', 'dev', ...args], {
     cwd: REPO,
     encoding: 'utf8',
     timeout: 60_000,
-    env: { ...process.env, ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY: '1' },
+    env,
   });
   return { code: r.status, stderr: `${r.stderr ?? ''}${r.stdout ?? ''}` };
 }
+
+describe('dev --ask — 바깥 호출자에게는 닫힌 문이다(#24330)', () => {
+  test('[closed-door] 도장 없는 `dev --ask` 는 파일을 열기 전에 한 줄 안내와 rc 1 로 멈춘다', () => {
+    const { code, stderr } = runDev(['--ask', '/tmp/elanous-ask-does-not-exist.txt'], 'outside');
+    expect(code).toBe(1);
+    // Every non-empty line of stdout+stderr is either a tagged boot log (`[test-isolation] …`, `[llm] …`) or the notice.
+    const lines = stderr.split('\n').map((line) => line.trim()).filter(Boolean);
+    const content = lines.filter((line) => !/^\[[a-z0-9-]+\] /.test(line));
+    expect(content).toHaveLength(1);
+    expect(content[0]).toContain('dev --ask 는 닫혔습니다');
+    expect(content[0]).toContain('harness say / harness ask');
+    expect(stderr).not.toContain('ENOENT');
+  });
+});
 
 describe('dev --ask — 실물 진입점(spawn)에서 인자 계약이 서는가', () => {
   test('[substrate-selection] dev --ask exposes the substrate options and rejects an unsupported Pod target before authoring', () => {

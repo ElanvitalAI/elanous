@@ -134,6 +134,33 @@ describe('buildDiscordSelfOnMessage — interweaving', () => {
     expect(getActiveDelegation(delegationChatKey('dc', 'CH1'))).toBeNull(); // not trapped
   });
 
+  test('TUI-only slash replies once without a self turn; supported slash and system grade stay private', async () => {
+    const { handler, selfCalls } = makeHandler(['normal']);
+    expect(await handler(incoming('/model'))).toBe('/model은(는) 디스코드에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.');
+    expect(await handler(incoming('/run-skill something'))).toBe('/run-skill은(는) 디스코드에서 아직 지원되지 않습니다. TUI에서 /run-skill을(를) 사용하세요.');
+    expect(selfCalls).toHaveLength(0);
+    expect(await handler(incoming('/brain'))).toContain('브레인');
+    expect(await handler(incoming('/mystery'))).toBe('normal');
+    expect(selfCalls.map(({ userText }) => userText)).toEqual(['/mystery']);
+  });
+
+  test('injected system grade does not reveal a TUI-only command on the Discord message path', async () => {
+    const selfCalls: string[] = [];
+    const handler = buildDiscordSelfOnMessage({
+      userConfig: cfg(),
+      runTurnImpl: (async (opts: { userText: string }) => {
+        selfCalls.push(opts.userText);
+        return { text: 'ordinary self reply' } as RunTurnResult;
+      }) as never,
+      getBot: () => null,
+      tuiSlashAvailability: [{ name: 'model', maturity: 'system', telegram: false, discord: false }],
+    });
+
+    expect(await handler(incoming('/model'))).toBe('ordinary self reply');
+    expect(await handler(incoming('/mystery'))).toBe('ordinary self reply');
+    expect(selfCalls).toEqual(['/model', '/mystery']);
+  });
+
   test('channelScope filters other channels; /voice-* stays silent', async () => {
     const { handler: scoped, selfCalls } = (() => {
       const selfCalls: Array<{ userText: string }> = [];

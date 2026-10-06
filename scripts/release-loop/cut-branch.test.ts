@@ -79,11 +79,76 @@ test('a pick not on origin/main is refused before branch creation', () => {
   expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4')).toBe('');
 });
 
-test('existing remote branch is refused without changing its tip', () => {
+test('existing remote branch is refused without changing its tip and names --append', () => {
   const f = fixture();
   const existing = cutReleaseBranch({ version: '0.2.4', base: f.base, pick: [f.pick], repoRoot: f.repo, log: () => {} });
-  expect(() => cutReleaseBranch({ version: '0.2.4', base: f.base, pick: [f.pick], repoRoot: f.repo, log: () => {} })).toThrow('already exists on origin');
+  expect(() => cutReleaseBranch({ version: '0.2.4', base: f.base, pick: [f.pick], repoRoot: f.repo, log: () => {} })).toThrow('--append');
   expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4').split('\t')[0]).toBe(existing.commit!);
+});
+
+test('--append fast-forwards a new main pick onto release/9.9.9 and refuses a moved tip without force-push', () => {
+  const f = fixture();
+  writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');
+  f.git(f.repo, 'add', 'package.json');
+  f.git(f.repo, 'commit', '-q', '-m', 'bump 9.9.9');
+  f.base = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.pick = f.commit('repair.txt', 'fixed on 9.9.9\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  f.git(f.repo, 'push', '-q', 'origin', `${f.pick}:refs/heads/release/9.9.9`);
+  const existing = f.pick;
+  const added = f.commit('repair-three.txt', 'fourth\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const lines: string[] = [];
+  const appended = cutReleaseBranch({ version: '9.9.9', base: f.base, pick: [added], append: true, repoRoot: f.repo, log: (line) => lines.push(line) });
+  expect(appended.commit).toMatch(/^[0-9a-f]{40}$/);
+  expect(appended.commit).not.toBe(existing);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(appended.commit!);
+  expect(f.git(f.repo, 'merge-base', '--is-ancestor', existing, appended.commit!)).toBe('');
+  expect(f.git(f.repo, 'show', `${appended.commit}:repair-three.txt`)).toBe('fourth');
+  expect(lines[0]).toContain('(append)');
+  const sneak = f.commit('sneak.txt', 'moved\n');
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const bin = join(f.root, 'bin-append');
+  mkdirSync(bin);
+  const wrapper = join(bin, 'git');
+  writeFileSync(wrapper, `#!/bin/sh
+if [ "$1" = push ]; then
+  "${realGit}" --git-dir="${join(f.root, 'remote.git')}" update-ref refs/heads/release/9.9.9 "${sneak}" || exit $?
+fi
+exec "${realGit}" "$@"
+`);
+  // The sneak is already the advertised tip. Move it again only when push runs, after fetch has pinned the lease.
+  chmodSync(wrapper, 0o755);
+  const next = f.commit('repair-four.txt', 'later\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const oldPath = process.env.PATH;
+  let refused: unknown;
+  try {
+    process.env.PATH = `${bin}:${oldPath}`;
+    try { cutReleaseBranch({ version: '9.9.9', base: f.base, pick: [next], append: true, repoRoot: f.repo, log: () => {} }); }
+    catch (error) { refused = error; }
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  expect(refused).toBeInstanceOf(Error);
+  expect((refused as Error).message).toMatch(/fast-forward refused|stale info/);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(sneak);
+  expect(sneak).not.toBe(appended.commit);
+  expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-branch-');
+});
+
+test('--append refuses a pick already on the release branch and a missing branch', () => {
+  const f = fixture();
+  writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');
+  f.git(f.repo, 'add', 'package.json');
+  f.git(f.repo, 'commit', '-q', '-m', 'bump 9.9.9');
+  f.base = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.pick = f.commit('repair.txt', 'fixed on 9.9.9\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  expect(() => cutReleaseBranch({ version: '9.9.9', base: f.base, pick: [f.pick], append: true, repoRoot: f.repo, log: () => {} })).toThrow('does not exist on origin');
+  f.git(f.repo, 'push', '-q', 'origin', `HEAD:refs/heads/release/9.9.9`);
+  expect(() => cutReleaseBranch({ version: '9.9.9', base: f.base, pick: [f.pick], append: true, repoRoot: f.repo, log: () => {} })).toThrow('already in release/9.9.9');
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(f.pick);
 });
 
 test('a remote branch created after the absence check is refused and its tip preserved', () => {

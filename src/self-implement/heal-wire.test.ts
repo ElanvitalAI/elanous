@@ -70,6 +70,60 @@ test('timeout and an uncaught crash each reach the terminal inbox once', async (
   ]);
 });
 
+test('a run that spends maxRework and stops on a draft PR records one failure and one heal classification', async () => {
+  const root = isolatedRoot();
+  const result = await runSelfImplement({
+    feature: 'POD7 gate introduced stays in another file',
+    runId: 'heal-rework-cap',
+    memory: false,
+    maxReworkRounds: 0,
+    seams: seams({
+      gate: async () => ({
+        passed: true,
+        log: 'gate named introduced 1 outside the child diff',
+        reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0 },
+      }),
+      reviewDiff: async () => ({
+        verdict: 'fail',
+        mustFix: ['src/other.ts still fails and the child never opened it'],
+        shouldFix: [],
+        summary: 'introduced stays',
+        reviewed: true,
+      }),
+      diagnose: async () => 'BUDGET: SUFFICIENT\\nREASON: cap reached',
+    }),
+  });
+  expect(result).toMatchObject({
+    stage: 'pr-opened',
+    outcome: 'completed',
+    ok: true,
+    runId: 'heal-rework-cap',
+  });
+  const inbox = readFailureInbox({}, root);
+  expect(inbox).toHaveLength(1);
+  expect(inbox[0]).toMatchObject({
+    source: 'harness-run',
+    kind: 'rework-cap-exhausted',
+    ref: 'heal-rework-cap',
+  });
+  expect(inbox[0]!.summary).toContain('code-defect');
+  expect(inbox[0]!.summary).toContain('relaunch');
+  expect(inbox[0]!.summary).toContain('gate introduced: introduced=1');
+  expect(inbox[0]!.summary).toContain('review must-fix: src/other.ts still fails and the child never opened it');
+  const heal = debug.events(200).filter(entry => entry.category === 'self-implement'
+    && entry.event === 'rework-cap-heal'
+    && (entry.data as { runId?: string }).runId === 'heal-rework-cap');
+  expect(heal).toHaveLength(1);
+  expect(heal[0]!.data).toMatchObject({
+    defectClass: 'code-defect',
+    nextAction: 'relaunch',
+    evidence: [
+      'gate introduced: introduced=1',
+      'review must-fix: src/other.ts still fails and the child never opened it',
+    ],
+  });
+});
+
 test('failed heal write logs one error and cannot change the terminal result', async () => {
   const root = isolatedRoot();
   writeFileSync(join(root, 'heal'), 'not a directory');

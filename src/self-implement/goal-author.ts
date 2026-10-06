@@ -5452,23 +5452,29 @@ async function authorGoalWithSupersededRootIntent(
     assembleCompleted = true;
     endGoalAuthorPhase('assemble', assembleStartedAt, authorRunId, deps.onProgress);
     const lintStartedAt = startGoalAuthorPhase('lint', authorRunId, deps.onProgress);
+    let lintPassed = false;
     try {
       assertRequiredBlocks(document);
+      lintPassed = true;
     } finally {
-      endGoalAuthorPhase('lint', lintStartedAt, authorRunId, deps.onProgress);
+      try {
+        endGoalAuthorPhase('lint', lintStartedAt, authorRunId, deps.onProgress);
+      } finally {
+        try {
+          observeGoalAuthor('goal-author', 'summary', {
+            authorRunId,
+            elapsedMs: Date.now() - authorStartedAt,
+            inputTokens: enhanceTokens.inputTokens,
+            outputTokens: enhanceTokens.outputTokens,
+            totalTokens: enhanceTokens.inputTokens === null || enhanceTokens.outputTokens === null
+              ? null : enhanceTokens.inputTokens + enhanceTokens.outputTokens,
+            goalChars: [...document].length,
+            sectionChars: authoredGoalSectionChars(document),
+            ...(!lintPassed ? { outcome: 'lint-failed' } : {}),
+          });
+        } catch { /* observation is fail-soft */ }
+      }
     }
-    try {
-      observeGoalAuthor('goal-author', 'summary', {
-        authorRunId,
-        elapsedMs: Date.now() - authorStartedAt,
-        inputTokens: enhanceTokens.inputTokens,
-        outputTokens: enhanceTokens.outputTokens,
-        totalTokens: enhanceTokens.inputTokens === null || enhanceTokens.outputTokens === null
-          ? null : enhanceTokens.inputTokens + enhanceTokens.outputTokens,
-        goalChars: [...document].length,
-        sectionChars: authoredGoalSectionChars(document),
-      });
-    } catch { /* observation is fail-soft */ }
     return { document, facts, grounded: !groundingError && hasEvidence, authorRunId };
   } finally {
     endAssembleSubphase();

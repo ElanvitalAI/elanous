@@ -43,6 +43,7 @@ import { observeDeliverables, type DeliverableObservationResult, type Deliverabl
 import { debug } from '../debug/log.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
+import { applyLaunchOverloadFailover, codexProviderNamed } from '../oauth/overload-failover-launch.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { queryAbandonedDraftPrs, type AbandonedDraftPr } from '../cli/logs-abandoned-draft-prs.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
@@ -1631,6 +1632,18 @@ function resolveChildLlmFromParts(
   return undefined;
 }
 
+/** Pinned `tools.selfImplement.childLlm` naming codex. Fallback-chain codex is not pinned. */
+function childLlmCodexPinned(flagProvider: string | undefined): boolean {
+  if (flagProvider !== undefined) return false;
+  try {
+    const preference = resolveChildLlmPreference(getUserConfig());
+    const provider = preference.chain[0]?.provider;
+    return preference.mode === 'pinned' && preference.source.chain === 'pinned' && codexProviderNamed(provider);
+  } catch {
+    return false;
+  }
+}
+
 export function buildChildLlmSelection(
   opts: Pick<DevCliOpts, 'childLlmProvider' | 'childLlmModel' | 'childLlmEffort'> & {
     /** 발사 인자가 있을 때 관측용 선호를 읽는다. 없으면 getUserConfig. 기존 두 인자 시그니처는 그대로다. */
@@ -1967,7 +1980,12 @@ export function buildDevCliSpec(
   }
 
   if (path === 'self-mission') {
-    const childLlm = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
+    const builtChild = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
+    const childLlm = applyLaunchOverloadFailover(builtChild, {
+      provider: opts.childLlmProvider,
+      model: opts.childLlmModel,
+      codexPinned: childLlmCodexPinned(opts.childLlmProvider),
+    });
     // 잔량 조회(약 3초)는 한 발사에 한 번만 — 자식·부모가 같은 값을 쓴다.
     let grokQuotaOnce: ReturnType<typeof readCachedGrokQuota> | undefined;
     const readGrokQuotaOnce = () => (grokQuotaOnce ??= readGrokQuota());

@@ -6,7 +6,8 @@ import { loadIntakeLedger, type IntakeItem } from './items.js';
 import { readSavedCursorAt } from './collect-telegram-saved.js';
 import { intakeOutboxDir, kstDay } from './route.js';
 
-export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { fact: string; current: string; action: string } }
+export type DigestLensVerdict = '대체 후보' | '보강' | '경쟁 대조';
+export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
 export interface IntakeDigest { day: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
 const AXIS_LABEL: Record<string, string> = {
@@ -40,27 +41,32 @@ function readJsonl(file: string): Record<string, unknown>[] {
 /** Saved Messages silent for more than two days → the digest says so (a quiet 0 must not look like «nothing to do»). */
 const SAVED_SILENCE_MS = 48 * 3600_000;
 
+/** A «why» that only names paths (optionally behind a label like «경로:») is evidence, not a reason for us. */
+export function pathOnly(why: string): boolean {
+  const rest = why
+    .replace(/`?(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]{1,6}(?::\d+)?`?/g, ' ')
+    .replace(/`?(?:[\w.-]+\/)+[\w.-]*`?/g, ' ')
+    .replace(/(?:경로|파일|근거|path|file|evidence)\s*[:：]?/gi, ' ')
+    .replace(/[\s,·:;()[\]\-–—]+/g, '');
+  return rest.length < 4;
+}
+
 export function buildIntakeDigest(root: string, day: string, readFile: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : undefined), now: Date = new Date()): IntakeDigest {
   const items = [...loadIntakeLedger(root).items.values()]
     .filter((i) => (i.status === 'absorbed' || i.status === 'routed') && kstDay(i.lastSeenAt) === day && i.outputs.some((o) => o.kind === 'note'));
   const out = intakeOutboxDir(root);
   const relevant = new Map<string, NonNullable<DigestEntry['impact']>>();
-  for (const [folder, action] of [
-    ['goals', '없는 기능의 골 후보를 세운다'],
-    ['manual', '문서·약속을 현재 동작에 맞게 보강한다'],
-    ['review', '대조 근거를 추가로 확인한다'],
-    ['release', '이미 착지한 기능의 바깥 맥락을 릴리스 노트에 반영한다'],
-  ] as const) {
+  // The lens (src/intake-plane/lens.ts) writes its verdicts to outbox/lens/<day>.jsonl; route folders carry none.
+  for (const folder of ['lens'] as const) {
     for (const row of readJsonl(join(out, folder, `${day}.jsonl`))) {
       if (typeof row.id !== 'string' || relevant.has(row.id)) continue;
-      const fact = folder === 'release' ? row.title : row.fact;
-      if (typeof fact !== 'string' || !fact.trim()) continue;
-      relevant.set(row.id, {
-        fact,
-        current: typeof (folder === 'release' ? row.summary : row.current) === 'string'
-          ? String(folder === 'release' ? row.summary : row.current) : '대조 근거 없음',
-        action,
-      });
+      const verdict = row.lensVerdict;
+      if (verdict !== '대체 후보' && verdict !== '보강' && verdict !== '경쟁 대조') continue;
+      const why = typeof row.why === 'string' ? row.why.trim() : '';
+      const target = typeof row.target === 'string' ? row.target.trim() : '';
+      // A check's fact/current or repo path is evidence, not a lens judgement or a reason for us.
+      if (!why || !target || pathOnly(why)) continue;
+      relevant.set(row.id, { verdict, why, target });
     }
   }
   const absorbed = items.map((i: IntakeItem): DigestEntry => {
@@ -105,29 +111,45 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
     for (const g of d.goals.slice(0, 10)) L.push(`- ${g.fact}${g.url ? ` · [원본](${g.url})` : ''}`);
     L.push('');
   }
-  if (d.review?.length) {
-    L.push(`### 🟡 사람이 가를 것 — 판단 필요 (${d.review.length})`, '', '> 근거가 실행 코드에 닿지만 «같은 것인가»는 결정론으로 못 가른다 — 노트의 🧭 절에서 판단한다.', '');
-    for (const r of d.review.slice(0, 10)) L.push(`- ${r.fact}${r.note ? ` · [[${basename(r.note, '.md')}]]` : ''}`);
-    if (d.review.length > 10) L.push(`- … 외 ${d.review.length - 10}건`);
-    L.push('');
-  }
+  const undecided = d.absorbed.filter((e) => !e.impact).length;
+  if (undecided) L.push(`렌즈 판정 못 함 ${undecided} — 원장 \`elanous intake items\``, '');
   L.push(`> 매뉴얼 후보 ${d.manual} · 릴리스 노트 맥락 ${d.release} · 그라운딩 후보 ${d.grounding} — 흡수 원장 \`elanous intake items\` · 큐 \`<인스턴스>/intake/outbox/\``, '');
   return L.join('\n');
 }
 
 /** 텔레그램 — 흡수 렌즈가 대조한 항목만 SCQA 짧은 판으로 낸다. */
 export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string } = {}): string {
+  // «Touching» is decided by the lens verdict alone; a missing note summary only changes how S reads (ACP must-fix).
   const touching = d.absorbed.filter((e) => e.impact);
   const L = [`흡수 ${d.absorbed.length} → 우리에게 닿는 것 ${touching.length}`];
   if (!touching.length) return L[0];
-  for (const e of touching.slice(0, 3)) {
+  // At most three items are shown, each as its own S·C·A·link block so context and source stay paired;
+  // a later item sharing (verdict, target) says «위와 같은 행동» instead of repeating the A sentence (ACP must-fix).
+  // S must be the note's own summary: items without one still count as touching but are not shown (ACP must-fix).
+  const shownItems = touching.filter((e) => e.oneLiner?.trim()).slice(0, 3);
+  const actionSeen = new Set<string>();
+  const actionsUsed = new Set<string>();
+  for (const e of shownItems) {
+    const impact = e.impact!;
+    const key = `${impact.verdict}\u0000${impact.target}`;
+    const base = impact.verdict === '대체 후보' ? `${impact.target} lite Pod 실증 제안`
+      : impact.verdict === '보강' ? `칸 ${impact.target} 에 근거 추가`
+        : `${impact.target} 비교표 갱신`;
+    // Every item keeps its own concrete action; a repeat of (verdict, target) names which item it is, so no two A lines match.
+    const label = (e.oneLiner?.trim() || impact.why).slice(0, 24);
+    let action = actionSeen.has(key) ? `${base} — «${label}» 근거로` : base;
+    // Two identical labels still differ by their position in the list.
+    if (actionsUsed.has(action)) action = `${action} (${shownItems.indexOf(e) + 1})`;
+    actionsUsed.add(action);
+    actionSeen.add(key);
     L.push('',
-      `S 무엇: ${e.impact!.fact}`,
-      `C 우리에게 왜: ${e.impact!.current}`,
-      `A 그래서 무엇을 하나: ${e.impact!.action}`,
+      `S 무엇: ${e.oneLiner?.trim() || '노트 한 줄 요약 없음'}`,
+      `C 우리에게 왜: ${impact.why}`,
+      `A 그래서 무엇을 하나: ${action}`,
       `🔗 원문 링크: ${e.url?.trim() || '링크 없음'}`,
     );
   }
-  if (d.absorbed.length > touching.length) L.push('', `그 밖 ${d.absorbed.length - touching.length}건 · 닿지 않음`);
+  if (touching.length > shownItems.length) L.push('', `닿는 것 ${touching.length - shownItems.length}건 더(요약 없는 것 포함) · 원장 \`elanous intake items\``);
+  if (d.absorbed.length > touching.length) L.push('', `그 밖 ${d.absorbed.length - touching.length}건 · 참고`);
   return L.join('\n');
 }

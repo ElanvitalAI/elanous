@@ -2,16 +2,17 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
+import { splitCard } from '../../flow-loop/split.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig } from '../../user-config.js';
-import { reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
 
-const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'reconcile', 'report'];
+const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'];
 const fixture = async (run: (root: string, id: string, logged: Array<{ event: string; reason: string; targetLoopId?: string }>) => Promise<void>) => {
   const root = mkdtempSync(join(tmpdir(), 'orch-test-'));
   const store = new CardStore(root);
@@ -26,7 +27,8 @@ const fixture = async (run: (root: string, id: string, logged: Array<{ event: st
 const invoke = async (root: string, runId: string, window: '08' | '12' | '18', deps: TickDeps, logged: Array<{ event: string; reason: string; targetLoopId?: string }>) => {
   let final;
   for (const node of stages) final = await runOrchestratorNode(node, { root, runId, window, now: new Date('2026-10-04T00:00:00Z'),
-    print: () => {}, observe: (event, data) => logged.push({ event, reason: data.reason, ...(data.targetLoopId ? { targetLoopId: data.targetLoopId } : {}) }), ...deps });
+    print: () => {}, observe: (event, data) => logged.push({ event, reason: data.reason, ...(data.targetLoopId ? { targetLoopId: data.targetLoopId } : {}) }),
+    seatTurn: async () => ({ status: 'skipped-empty' }), ...deps });
   return final!;
 };
 
@@ -41,18 +43,17 @@ describe('orchestrator graph command nodes', () => {
   }));
   test('shadow without adapters picks only the unsplit wish, records both absences and does not touch the request journal', async () => fixture(async (root, id, logged) => {
     const before = readFileSync(join(root, 'task-cards', `${id}.jsonl`), 'utf8');
-    const state = await invoke(root, 'shadow08', '08', {}, logged);
+    const state = await invoke(root, 'shadow08', '08', { loadAdapter: async (path, name) =>
+      path === '../../flow-loop/split.js' && name === 'splitCard' ? splitCard : undefined }, logged);
     expect(state.cards.map(card => card.id)).toEqual([id]);
-    expect(state.cells).toEqual([{ cardId: id, id, title: '새 카드', origin: 'candidate' }]);
-    // Availability follows the callable export, not the source file's presence.
-    const placement = await import('../../release-loop/placement.js');
-    expect(state.missing).toEqual(typeof placement.placeCell === 'function' ? ['flow1a-absent'] : ['flow1a-absent', 'relplan1-absent']);
+    expect(state.cells).toEqual([{ cardId: id, id, title: '새 카드', origin: 'flow1a' }]);
+    expect(state.missing).toEqual(['relplan1-absent']);
     expect(logged.filter(row => row.event === 'node-missing').map(row => row.reason)).toEqual(state.missing);
     expect(logged.some(row => row.event === 'would-delegate')).toBe(false); // no owner is guessed
     expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
     expect(readFileSync(join(root, 'task-cards', `${id}.jsonl`), 'utf8')).toBe(before);
     expect(existsSync(join(root, 'release', 'features.sqlite'))).toBe(false);
-    expect(readFileSync(join(root, 'loop', 'orchestrator', 'shadow08.json'), 'utf8')).toContain('flow1a-absent');
+    expect(readFileSync(join(root, 'loop', 'orchestrator', 'shadow08.json'), 'utf8')).toContain('split:');
   }));
 
   test('shadow asks the splitter in shadow mode only, never the placer, and leaves card and placement ledgers as they were', async () => fixture(async (root, id, logged) => {
@@ -86,7 +87,7 @@ describe('orchestrator graph command nodes', () => {
     }, logged);
     // The state file was written by the run itself, not by the test.
     const saved = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'shadow-projection.json'), 'utf8'));
-    expect(saved.nodes).toMatchObject({ intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok' });
+    expect(saved.nodes).toMatchObject({ intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok', launch: 'ok' });
     expect(state.wouldDelegate).toBe(1);
     expect(logged).toContainEqual({ event: 'would-delegate', reason: `orch:${id}:C1 (unplaced)`, targetLoopId: 'cmo-seat' });
     expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
@@ -94,7 +95,7 @@ describe('orchestrator graph command nodes', () => {
   }));
 
   test('rerunning a completed node with the same runId keeps its ok result (review round 3)', async () => fixture(async (root, _id, logged) => {
-    await invoke(root, 'rerun', '08', { mode: 'shadow', split: () => [{ id: 'C1', title: '칸', seat: 'MK' }] }, logged);
+    await invoke(root, 'rerun', '08', { mode: 'shadow', split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => null }, logged);
     const again = await runOrchestratorNode('delegate', { root, runId: 'rerun', window: '08', mode: 'shadow', now: new Date('2026-10-04T00:00:00Z') });
     expect(again.nodes.delegate).toBe('ok');
     // and a later window still finds this morning's cells
@@ -128,27 +129,42 @@ describe('orchestrator graph command nodes', () => {
     const state = await invoke(root, 'no-flow1a', '08', { mode: 'live',
       placeCell: () => { placements++; return { version: '0.2.14', seat: 'MK' }; },
     }, logged);
-    expect(state.cells).toEqual([{ cardId: id, id, title: '새 카드', origin: 'candidate' }]);
-    expect(state.missing).toContain('flow1a-absent');
+    expect(state.cells).toEqual([{ cardId: id, id, title: '새 카드', origin: 'flow1a' }]);
+    expect(state.cells[0]?.seat).toBeUndefined();
     expect(placements).toBe(0);
     expect(state.placed).toBe(0);
     expect(state.delegated).toBe(0);
     expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
   }));
 
-  test('CLI nodes share graph runId and window override across subprocesses', async () => fixture(async (root, id) => {
+  test('changed graph YAML and recipes execute a shadow tick across subprocesses without a seat session', async () => fixture(async (root, id) => {
     const context = join(root, 'graph-context.json');
     writeFileSync(context, JSON.stringify({ graphId: 'orchestrator', runId: 'cli08' }));
-    for (const node of stages) {
-      const result = spawnSync('bun', [join(import.meta.dir, 'tick.ts'), node, '--window', '08'], {
-        env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root }, encoding: 'utf8',
+    const graphDir = resolve(import.meta.dir, '../../../graphs/orchestrator');
+    const graph = parseYaml(readFileSync(join(graphDir, 'orchestrator.yaml'), 'utf8'));
+    const recipes = parseYaml(readFileSync(join(graphDir, 'recipes.yaml'), 'utf8'));
+    let next = graph.entry_node as string;
+    for (const expected of stages) {
+      expect(next).toBe(expected);
+      const definition = graph.nodes.find((row: { node_id: string }) => row.node_id === next);
+      const recipe = recipes[definition.recipe.slice('cmd:'.length)];
+      expect(recipe.command).toContain(`tick.ts\" ${expected}`);
+      const result = spawnSync('bash', ['-c', `${recipe.command} --window 08`], {
+        env: { ...process.env, ELANOUS_GRAPH_DIR: graphDir, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root }, encoding: 'utf8',
       });
       expect(result.status).toBe(0);
+      const edge = graph.edges.find((row: { from: string }) => row.from === next);
+      expect(edge.map.fail).toBe('failed');
+      next = edge.map.ok;
     }
+    expect(next).toBe('done');
     const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'cli08.json'), 'utf8'));
     expect(state.cards.map((card: { id: string }) => card.id)).toEqual([id]);
-    expect(state.nodes).toEqual({ intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok', reconcile: 'skipped', report: 'ok' });
-  }));
+    expect(state.nodes).toEqual({ intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok', launch: 'ok', reconcile: 'skipped', report: 'ok' });
+    expect(state.steps.map((step: { node: Node }) => step.node)).toContain('split');
+    expect(state.steps.map((step: { node: Node }) => step.node)).toContain('place');
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  }), 60_000);
 
   test('live writes two append-only requests once; noon skips intake and delegate and reconciles persisted cells', async () => fixture(async (root, id, logged) => {
     const requestPath = join(root, 'seat-requests', 'requests.jsonl');
@@ -297,7 +313,7 @@ describe('ORCH1b tick isolation and adapter exports', () => {
     const path = join(root, 'task-cards', `${broken.id}.jsonl`);
     writeFileSync(path, readFileSync(path, 'utf8') + '{');
     const state = await invoke(root, 'broken08', '08', {
-      mode: 'shadow', split: card => [{ id: `cell-${card.id}`, title: card.title, seat: 'MK' }],
+      mode: 'shadow', split: card => [{ id: `cell-${card.id}`, title: card.title, seat: 'MK' }], placeCell: () => null,
     }, logged);
     expect(state.cards.map(card => card.id)).toEqual([id]);
     expect(state.cells.map(cell => cell.cardId)).toEqual([id]);
@@ -314,7 +330,7 @@ describe('ORCH1b tick isolation and adapter exports', () => {
     writeFileSync(path, readFileSync(path, 'utf8') + '{\n');
     const counts: number[] = [];
     const state = await invoke(root, 'malformed08', '08', { mode: 'shadow',
-      split: card => [{ id: `cell-${card.id}`, title: card.title, seat: 'MK' }],
+      split: card => [{ id: `cell-${card.id}`, title: card.title, seat: 'MK' }], placeCell: () => null,
       observe: (event, data) => { logged.push({ event, reason: data.reason }); if (data.reason === 'card-unreadable') counts.push(data.count); },
     }, logged);
     expect(state.cards.map(card => card.id)).toEqual([id]);
@@ -333,8 +349,7 @@ describe('ORCH1b tick isolation and adapter exports', () => {
     for (const mode of ['shadow', 'live'] as const) {
       const state = await invoke(root, `no-placer-${mode}`, '08', { mode, loadAdapter }, logged);
       expect(state.missing).toContain('relplan1-absent');
-      expect(state.missing).toContain('flow1a-absent');
-      expect(state.cells.every(cell => cell.origin === 'candidate')).toBe(true);
+    expect(state.cells.every(cell => cell.origin === 'candidate')).toBe(true);
       expect(state.placed).toBe(0);
     }
     expect(loaded.filter(name => name === '../../release-loop/placement.js:placeCell')).toHaveLength(2);
@@ -407,6 +422,49 @@ describe('ORCH1b tick isolation and adapter exports', () => {
   }));
 });
 
+describe('ORCH1 complete card cycle without a seat Claude session', () => {
+  test('real FLOW1 adapter, RELPLAN decision, request queue, launch receipt and next tick have stage evidence', async () => fixture(async (root, id, logged) => {
+    const store = new CardStore(root);
+    store.appendSection(id, { key: 'intake:wish:1', owner: 'steward', content: JSON.stringify({ text: '[MK] 원고 초안 준비' }) });
+    store.close();
+    const calls: string[] = [];
+    const placeCell: NonNullable<TickDeps['placeCell']> = (input, opts) => {
+      calls.push(`place:${input.owner}:${opts?.dryRun}`);
+      return { version: '0.2.16' };
+    };
+    const original = readFileSync(join(root, 'task-cards', `${id}.jsonl`), 'utf8');
+    const shadow = await invoke(root, 'cycle-shadow', '08', { mode: 'shadow', placeCell: () => { throw new Error('shadow must not invoke injected writer'); } }, logged);
+    expect(shadow.cells).toMatchObject([{ seat: 'MK', title: '원고 초안 준비', origin: 'flow1a' }]);
+    expect(shadow.steps.map(step => step.node)).toEqual(expect.arrayContaining(['intake', 'split', 'place', 'delegate']));
+    expect(shadow.wouldDelegate).toBe(1);
+    expect(shadow.launched).toEqual([]);
+    expect(readFileSync(join(root, 'task-cards', `${id}.jsonl`), 'utf8')).toBe(original);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+    const live = await invoke(root, 'cycle-live', '08', { mode: 'live', placeCell, seatTurn: async (seat, stateRoot) => {
+      const rows = readFileSync(join(stateRoot, 'seat-requests', 'requests.jsonl'), 'utf8');
+      expect(rows).toContain('원고 초안 준비');
+      calls.push(`seat:${seat}`);
+      return { status: 'queued', queueId: 'hq-00000000-0000-0000-0000-000000000001', item: { source: 'request', id: JSON.parse(rows.trim()).key } };
+    } }, logged);
+    expect(calls).toEqual(['place:MK:false', 'seat:MK']);
+    expect(live.placed).toBe(1);
+    expect(live.delegated).toBe(1);
+    const requestKey = `orch:${id}:${live.cells[0]!.id}`;
+    expect(live.launched).toEqual([{ seat: 'MK', status: 'queued', key: requestKey, queueId: 'hq-00000000-0000-0000-0000-000000000001' }]);
+    const request = JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim());
+    expect(request).toMatchObject({ seat: 'MK', version: '0.2.16', cell: live.cells[0]!.id, text: '원고 초안 준비' });
+    expect(live.steps.map(step => step.node)).toEqual(expect.arrayContaining(['intake', 'split', 'place', 'delegate', 'launch']));
+    const noon = await invoke(root, 'cycle-next', '12', { mode: 'live', queueOutcome: () => 'pending', checklist: () => [{ id: live.cells[0]!.id, status: 'yellow' }] }, logged);
+    expect(noon.queueOutcomes).toEqual([{ queueId: 'hq-00000000-0000-0000-0000-000000000001', key: requestKey, outcome: 'pending' }]);
+    expect(noon.reconciled.progressing).toBe(1);
+    // 체크리스트에 칸이 아직 없어도 그 칸의 큐 결과(pending)로 진행 중이라 판정한다.
+    const noonNoChecklist = await invoke(root, 'cycle-next-2', '12', { mode: 'live', queueOutcome: () => 'pending', checklist: () => [] }, logged);
+    expect(noonNoChecklist.reconciled).toEqual({ reached: 0, progressing: 1, blocked: 0, unknown: 0 });
+    expect(noon.steps).toContainEqual(expect.objectContaining({ node: 'reconcile', reason: 'queue-outcome:hq-00000000-0000-0000-0000-000000000001:pending' }));
+    expect(JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'cycle-next.json'), 'utf8')).steps).toEqual(noon.steps);
+  }));
+});
+
 describe('TC review must-fixes (ORCH1 #23638)', () => {
   test('live delegate rows satisfy the seat-requests journal contract — the daemon reader still lists every seat', async () => fixture(async (root, id, logged) => {
     const deps: TickDeps = { mode: 'live', split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }],
@@ -435,5 +493,33 @@ describe('TC review must-fixes (ORCH1 #23638)', () => {
     expect(seen).toEqual([{ id: 'C1', title: '첫 칸', owner: 'MK', priority: 'P2', predecessors: [] }]);
     expect(state.placed).toBe(1);
     expect(state.unplaced).toBe(1);
+  }));
+
+  test('shadow with an injected placer still counts owner-less cells as unplaced', async () => fixture(async (root, _id, logged) => {
+    const state = await invoke(root, 'mf3', '08', { mode: 'shadow',
+      split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '주인 없는 칸' }], placeCell: () => ({ version: '0.2.16' }) }, logged);
+    expect(state.unplaced).toBe(1);
+  }));
+
+  test('reconciliation falls back to the seat queue outcome only when the checklist has no status', () => {
+    const cells = [{ cardId: 'k', id: 'C1', title: 't', origin: 'flow1a', seat: 'MK', version: '0.2.16' },
+      { cardId: 'k', id: 'C2', title: 't', origin: 'flow1a', seat: 'TC', version: '0.2.16' }] as never;
+    const requests = [{ key: 'orch:k:C1', status: 'queued' }, { key: 'orch:k:C2', status: 'queued' }];
+    expect(reconciliation(cells, requests, () => [])).toEqual({ reached: 0, progressing: 0, blocked: 0, unknown: 2 });
+    expect(reconciliation(cells, requests, () => [], [{ key: 'orch:k:C1', outcome: 'pending' }, { key: 'orch:k:C2', outcome: 'retryable' }]))
+      .toEqual({ reached: 0, progressing: 1, blocked: 1, unknown: 0 });
+    expect(reconciliation(cells, requests, () => [{ id: 'C1', status: 'green' }], [{ key: 'orch:k:C1', outcome: 'retryable' }]).reached).toBe(1);
+    // 같은 자리의 다른 칸은 남의 큐 결과를 물려받지 않는다.
+    const sameSeat = [{ cardId: 'k', id: 'C1', title: 't', origin: 'flow1a', seat: 'MK', version: '0.2.16' },
+      { cardId: 'k', id: 'C3', title: 't', origin: 'flow1a', seat: 'MK', version: '0.2.16' }] as never;
+    expect(reconciliation(sameSeat, [...requests, { key: 'orch:k:C3', status: 'queued' }], () => [], [{ key: 'orch:k:C1', outcome: 'pending' }]))
+      .toEqual({ reached: 0, progressing: 1, blocked: 0, unknown: 1 });
+  });
+
+  test('a seat turn that handled some other request is not recorded as this card launch', async () => fixture(async (root, _id, logged) => {
+    const state = await invoke(root, 'mf4', '08', { mode: 'live', split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.16' }),
+      seatTurn: async () => ({ status: 'queued', queueId: 'hq-x', item: { source: 'request', id: 'orch:other-card:C9' } }) }, logged);
+    expect(state.launched).toEqual([{ seat: 'MK', status: 'queued', queueId: 'hq-x' }]);
+    expect(state.steps).toContainEqual(expect.objectContaining({ reason: 'seat-turn-other-request:MK' }));
   }));
 });

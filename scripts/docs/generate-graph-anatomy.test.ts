@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { renderGraphAnatomy } from './generate-graph-anatomy.js';
+import { diffAnatomy, renderGraphAnatomy, type AnatomySnapshot } from './generate-graph-anatomy.js';
 
 const COMMIT = 'abc1234fixed';
 const GENERATED_AT = '2026-10-05T00:00:00.000Z';
@@ -140,4 +141,102 @@ edges:
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+const PREV: AnatomySnapshot = {
+  generatedAt: '2026-10-04T00:00:00.000Z',
+  commit: 'prev',
+  graphs: { 'sample-loop': ['alpha', 'beta'], 'gone-loop': ['only'] },
+};
+const NEXT: AnatomySnapshot = {
+  generatedAt: GENERATED_AT,
+  commit: COMMIT,
+  graphs: { 'sample-loop': ['alpha', 'beta', 'gamma'], 'fresh-loop': ['start'] },
+};
+
+describe('diffAnatomy', () => {
+  test('더해진 그래프·노드와 빠진 그래프·노드를 graph_id/nodeId 로 낸다', () => {
+    const diff = diffAnatomy(PREV, NEXT);
+    expect(diff.addedGraphs).toEqual(['fresh-loop']);
+    expect(diff.removedGraphs).toEqual(['gone-loop']);
+    // A new or removed graph lists its nodes too (ACP must-fix).
+    expect(diff.addedNodes).toEqual(['fresh-loop/start', 'sample-loop/gamma']);
+    expect(diff.removedNodes).toEqual(['gone-loop/only']);
+  });
+
+  test('같은 스냅샷이면 네 목록이 모두 비다', () => {
+    const diff = diffAnatomy(PREV, PREV);
+    expect(diff.addedGraphs).toEqual([]);
+    expect(diff.removedGraphs).toEqual([]);
+    expect(diff.addedNodes).toEqual([]);
+    expect(diff.removedNodes).toEqual([]);
+  });
+});
+
+describe('main --out 어제 대비', () => {
+  const script = join(import.meta.dir, 'generate-graph-anatomy.ts');
+  const THREE = TWO_NODE.replace(
+    '  - node_id: beta\n    kind: gate\n    recipe: cmd:beta\n    max_visits: 1\n',
+    '  - node_id: beta\n    kind: gate\n    recipe: cmd:beta\n    max_visits: 1\n  - node_id: gamma\n    kind: observe\n    recipe: cmd:gamma\n    max_visits: 1\n',
+  ).replace('terminal_nodes: [beta]', 'terminal_nodes: [beta, gamma]').replace(
+    '  - from: alpha\n    to: beta\n',
+    '  - from: alpha\n    to: beta\n  - from: beta\n    to: gamma\n',
+  );
+
+  function runMain(graphs: string, out: string, repo: string): string {
+    const result = spawnSync('bun', [script, '--graphs', graphs, '--out', out, '--repo', repo], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    return readFileSync(out, 'utf8');
+  }
+
+  test('첫 판은 «이전 판 없음», 노드를 더한 둘째 판은 + graph_id/nodeId 한 줄과 json 에 그 nodeId', () => {
+    const graphs = mkdtempSync(join(tmpdir(), 'graph-anatomy-main-'));
+    const outDir = mkdtempSync(join(tmpdir(), 'graph-anatomy-out-'));
+    const out = join(outDir, 'a.md');
+    try {
+      writeFileSync(join(graphs, 'sample.yaml'), TWO_NODE);
+      const first = runMain(graphs, out, graphs);
+      expect(first).toContain('## 어제 대비');
+      expect(first).toContain('이전 판 없음(첫 생성)');
+      const firstJson = JSON.parse(readFileSync(`${out}.json`, 'utf8')) as AnatomySnapshot;
+      expect(firstJson.graphs['sample-loop']).toEqual(['alpha', 'beta']);
+      expect(firstJson.graphs['sample-loop']).not.toContain('gamma');
+
+      writeFileSync(join(graphs, 'sample.yaml'), THREE);
+      const second = runMain(graphs, out, graphs);
+      const yesterday = second.split('## 표 1')[0] ?? '';
+      expect(yesterday).toContain('## 어제 대비');
+      expect(yesterday).toContain('+ sample-loop/gamma');
+      expect(yesterday).not.toContain('변화 없음');
+      const secondJson = JSON.parse(readFileSync(`${out}.json`, 'utf8')) as AnatomySnapshot;
+      expect(secondJson.graphs['sample-loop']).toContain('gamma');
+    } finally {
+      rmSync(graphs, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('git 이 없는 디렉토리를 뿌리로 하면 commit 이 «(설치본 v» 로 시작하고 죽지 않는다', () => {
+    const graphs = mkdtempSync(join(tmpdir(), 'graph-anatomy-nongit-'));
+    const outDir = mkdtempSync(join(tmpdir(), 'graph-anatomy-nongit-out-'));
+    try {
+      writeFileSync(join(graphs, 'package.json'), '{"name":"installed","version":"9.9.9"}\n');
+      writeFileSync(join(graphs, 'sample.yaml'), TWO_NODE);
+      const markdown = runMain(graphs, join(outDir, 'a.md'), graphs);
+      expect(markdown).toContain('commit: (설치본 v9.9.9)');
+    } finally {
+      rmSync(graphs, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('graphs/doc-gen/doc-gen.yaml 을 graph run --dry-run 이 경로로 미리 보여 준다', () => {
+  const bin = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
+  const graph = join(import.meta.dir, '..', '..', 'graphs', 'doc-gen', 'doc-gen.yaml');
+  const result = spawnSync('bun', [bin, '--test', 'graph', 'run', graph, '--dry-run'], { encoding: 'utf8' });
+  const text = `${result.stdout}\n${result.stderr}`;
+  expect(result.status, text).toBe(0);
+  expect(text).toContain('doc-gen-daily');
+  expect(text).toMatch(/generate\s*→\s*done/);
 });

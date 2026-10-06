@@ -682,3 +682,40 @@ test('an earlier unpublished version with no published one marks the landing sec
   run();
   expect(readFileSync(note, 'utf8')).toContain('못 읽음 · manifest.json: 직전 판 컷 확인 못 함');
 }));
+
+test('0.2.15 real cut lines: version bumps and «docs: release» never headline, commit prefixes drop, long clauses shorten', () => fixture(({ root, run, note }) => {
+  // Real lines from the 0.2.15 cut manifest (10-06) — the published note's title was the version bump and prefixed subjects.
+  const real = [
+    'docs: LOOP-VIZ 활동 지도 설계',
+    'docs: release 0.2.14',
+    'version: 0.2.15-dev.0',
+    'docs(marketing): restore AX-BRIEF (deleted out-of-scope by #23901); managed seats move past December',
+    'the harness no longer deletes files that were added to main after a run started when they are outside the run\'s target paths.',
+  ];
+  const entries = real.map((line, i) => ({ sha: String(i).repeat(40).slice(0, 40), title: line, line }));
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: entries }));
+  expect(run().outcome).toBe('ok');
+  const title = (parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title;
+  expect(title).not.toContain('version:');
+  expect(title).not.toContain('release 0.2.14');
+  expect(title).not.toMatch(/(^|· )docs(\([^)]*\))?:/);
+  for (const part of title.replace(/^엘라누스 v[\d.]+ — /, '').split(' · ')) expect([...part].length).toBeLessThanOrEqual(61);
+}));
+
+test('a long headline clause is cut at its first comma or semicolon (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  const line = 'seat requests can be listed, closed with a reason; and audited later from the command line interface';
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: [{ sha: 'a'.repeat(40), title: line, line }] }));
+  expect(run().outcome).toBe('ok');
+  const title = (parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title;
+  expect(title).toBe(`엘라누스 v${version} — seat requests can be listed`);
+}));
+
+test('a separator without a following space still ends a long headline clause (ACP must-fix)', () => fixture(({ root, run, note }) => {
+  const line = 'abcdefghijk,다음 절은 길게 이어진다 그래서 육십 자를 넘기려고 계속 쓰는 문장이다 끝까지 더 길게 이어서 육십 자를 확실히 넘긴다';
+  writeFileSync(join(root, 'release', version, 'manifest.json'), JSON.stringify({ version, baseline: { sha: 'e'.repeat(40) },
+    cutoff: { sha: '8cd885efe701bf47c1df020c32ccd17e31cd4a25' }, in: [{ sha: 'a'.repeat(40), title: line, line }] }));
+  expect(run().outcome).toBe('ok');
+  expect((parse(readFileSync(note, 'utf8').split('---\n')[1]!) as { title: string }).title).toBe(`엘라누스 v${version} — abcdefghijk`);
+}));

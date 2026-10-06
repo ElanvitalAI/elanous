@@ -72,10 +72,12 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
   //   종전: `harness ask`(권장 문)로 들어오면 *"권장: cli-dev-ask"* 라 말하고,
   //         `dev --ask`(옛 문)로 들어오면 «아무 말도 안 했다».
   //   CLAUDE.md 가 「터미널이면 `harness say`」라고 말하므로 CLI 표면의 권장은 `cli-harness-say` 다.
-  it('옛 문(dev --ask)으로 들어오면 권장 문을 말한다', () => {
+  // OLD-DOOR-CLOSE(#24330): `cli-dev-ask` 는 이제 «닫힌» 문이다 — 바깥 호출은 CLI 입구에서 안내와 함께 거부되고
+  //   (아래 «dev 은퇴 옵션 실물»), 하니스 안 호출만 여기까지 온다. 닫힌 문은 권장 문 안내를 내지 않는다(live 문만 안내).
+  it('옛 문(dev --ask)은 닫혔으므로 권장 문 안내를 내지 않고 하니스 안 구동은 그대로다', () => {
     const spec = buildDevCliSpec(IN, SELF, {});
 
-    expect(spec.notice).toBe('[ask] ℹ️ 권장 발사 입구: cli-harness-say');
+    expect(spec.notice).toBeUndefined();
     expect(planDevPipeline(spec).dispatch).toBe('self-mission');
   });
 
@@ -4081,12 +4083,25 @@ describe('dev 은퇴 옵션 실물', () => {
     expect(result.stderr.split('\n').filter((line) => line.includes(`${option} 은퇴`))).toHaveLength(1);
   }, 60_000);
 
+  // OLD-DOOR-CLOSE(#24330): 바깥(표지 없는) `dev --ask` 는 은퇴 안내 전에 «닫혔다» 로 거부된다.
+  it('바깥에서 부른 dev --ask 는 닫힌 문으로 거부되고 대응 문을 말한다', () => {
+    const env = { ...process.env };
+    delete env.ELANOUS_HARNESS_ENTRANCE;
+    const result = spawnSync('bun', [cli, '--test', 'dev', '--ask', 'missing goal with spaces.md'], { cwd: repo, env, encoding: 'utf8', timeout: 60_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('elanous dev --ask 는 닫혔습니다 — harness say / harness ask 로');
+    expect(result.stderr).not.toContain('ENOENT');
+  }, 60_000);
+
+  // 하니스 안(ELANOUS_HARNESS_ENTRANCE 표지)에서는 옛 동작 그대로 — 은퇴 안내 ⊕ 기존 하위 오류.
   it.each([
     ['--ask', ['--ask', 'missing goal with spaces.md'], "elanous harness ask 'missing goal with spaces.md'", "ENOENT: no such file or directory, open 'missing goal with spaces.md'"],
     ['--file', ['--file', 'missing file with spaces.md'], "elanous harness ask 'missing file with spaces.md'", "ENOENT: no such file or directory, open 'missing file with spaces.md'"],
     ['--say', ['--say', '   '], "elanous harness say '   '", '--say 입력이 비었다'],
   ] as const)('%s 실행은 대응 명령에 사용자 인자를 보존하고 기존 하위 오류까지 유지한다', (_kind, args, replacement, existingFailure) => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', ...args], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+    const result = spawnSync('bun', [cli, '--test', 'dev', ...args], { cwd: repo, env: { ...process.env, ELANOUS_HARNESS_ENTRANCE: 'harness-ask' }, encoding: 'utf8', timeout: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);

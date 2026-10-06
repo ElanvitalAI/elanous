@@ -6,8 +6,10 @@
  *   노드 종류 = src/graph-kinds/registry.ts (HARNESS_CORE_KINDS · WORKFLOW_CORE_KINDS · listNodeKinds)
  *   그래프     = graphs/ YAML 을 src/self-implement/graph-yaml.ts 의 loadGraphTemplates · edgeMapOf 가 읽는다
  *
- * renderGraphAnatomy 는 순수하다 — 파일을 쓰지 않고 process.cwd() 를 읽지 않는다.
- * 뿌리·커밋·시각은 인자로만 받는다. main 만 내부 문서 `graph-anatomy` 에 쓴다.
+ * renderGraphAnatomy · diffAnatomy 는 순수하다 — 파일을 쓰지 않고 process.cwd() 를 읽지 않는다.
+ * 뿌리·커밋·시각은 인자로만 받는다. 쓰기는 main 만 한다.
+ * main: `--out <path>` (기본 내부 문서 `graph-anatomy`) 와 같은 이름 `.json` 옆 파일.
+ * git 트리가 아니면 죽지 않고 `commit: (설치본 v<package.json version>)`.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -33,6 +35,22 @@ export interface RenderGraphAnatomyInput {
   readonly graphsRoot: string;
   readonly commit: string;
   readonly generatedAt: string;
+}
+
+/** `<out>.json` 옆 파일. graphs 값은 graph_id → nodeId 목록. */
+export interface AnatomySnapshot {
+  readonly generatedAt: string;
+  readonly commit: string;
+  readonly graphs: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface AnatomyDiff {
+  readonly addedGraphs: readonly string[];
+  readonly removedGraphs: readonly string[];
+  /** `graph_id/nodeId` */
+  readonly addedNodes: readonly string[];
+  /** `graph_id/nodeId` */
+  readonly removedNodes: readonly string[];
 }
 
 export interface ScannedGraphDir {
@@ -165,6 +183,58 @@ function graphIdPaths(graphsRoot: string, dir: string): ReadonlyMap<string, stri
   return paths;
 }
 
+function sortedIds(ids: Iterable<string>): string[] {
+  return [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** 순수. 어제 판과 오늘 판의 그래프·노드 차이. 파일을 읽거나 쓰지 않는다. */
+export function diffAnatomy(prev: AnatomySnapshot, next: AnatomySnapshot): AnatomyDiff {
+  const prevIds = new Set(Object.keys(prev.graphs));
+  const nextIds = new Set(Object.keys(next.graphs));
+  const addedGraphs = sortedIds([...nextIds].filter((id) => !prevIds.has(id)));
+  const removedGraphs = sortedIds([...prevIds].filter((id) => !nextIds.has(id)));
+  const addedNodes: string[] = [];
+  const removedNodes: string[] = [];
+  // A graph that appears or disappears contributes all of its nodes, so the node list never hides them (ACP must-fix).
+  for (const id of sortedIds([...new Set([...prevIds, ...nextIds])])) {
+    const before = new Set(prev.graphs[id] ?? []);
+    const after = new Set(next.graphs[id] ?? []);
+    for (const nodeId of sortedIds([...after].filter((node) => !before.has(node)))) addedNodes.push(`${id}/${nodeId}`);
+    for (const nodeId of sortedIds([...before].filter((node) => !after.has(node)))) removedNodes.push(`${id}/${nodeId}`);
+  }
+  return { addedGraphs, removedGraphs, addedNodes, removedNodes };
+}
+
+/** 머리(`# Graph anatomy` 와 생성물 경고) 바로 아래. 파일을 쓰지 않는다. */
+export function renderYesterdaySection(prev: AnatomySnapshot | null, next: AnatomySnapshot): string {
+  if (prev === null) return ['## 어제 대비', '', '이전 판 없음(첫 생성)', ''].join('\n');
+  const diff = diffAnatomy(prev, next);
+  const lines = ['## 어제 대비', ''];
+  const changed = diff.addedGraphs.length + diff.removedGraphs.length + diff.addedNodes.length + diff.removedNodes.length;
+  if (changed === 0) {
+    lines.push('변화 없음', '');
+    return lines.join('\n');
+  }
+  for (const id of diff.addedGraphs) lines.push(`+ ${id}`);
+  for (const id of diff.removedGraphs) lines.push(`- ${id}`);
+  for (const node of diff.addedNodes) lines.push(`+ ${node}`);
+  for (const node of diff.removedNodes) lines.push(`- ${node}`);
+  lines.push('');
+  return lines.join('\n');
+}
+
+function snapshotOf(scanned: readonly ScannedGraphDir[], commit: string, generatedAt: string): AnatomySnapshot {
+  const graphs: Record<string, string[]> = {};
+  for (const { result } of scanned) {
+    for (const template of Object.values(result.templates)) {
+      const ids = template.nodes.map((node) => node.nodeId);
+      const prev = graphs[template.graphId];
+      graphs[template.graphId] = prev === undefined ? ids : [...prev, ...ids.filter((id) => !prev.includes(id))];
+    }
+  }
+  return { generatedAt, commit, graphs };
+}
+
 function kindRows(entries: readonly NodeKindEntry[]): string[] {
   return [...entries]
     .sort((a, b) => (a.graph < b.graph ? -1 : a.graph > b.graph ? 1 : a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0))
@@ -179,7 +249,7 @@ function issueLines(label: string, issues: readonly GraphParseIssue[]): string[]
 /**
  * 마크다운 한 장. 파일을 쓰지 않는다. graphsRoot · commit · generatedAt 만 읽는다.
  */
-export function renderGraphAnatomy(input: RenderGraphAnatomyInput): string {
+export function renderGraphAnatomy(input: RenderGraphAnatomyInput, yesterday?: string): string {
   const scanned = scanGraphDirs(input.graphsRoot);
   const templates: { dir: string; fileLabel: string; template: GraphTemplateSpec }[] = [];
   for (const { dir, result } of scanned) {
@@ -207,6 +277,7 @@ export function renderGraphAnatomy(input: RenderGraphAnatomyInput): string {
     `- scannedDirs: ${scanned.length}`,
     `- templates: ${templates.length}`,
     '',
+    ...(yesterday === undefined ? [] : [yesterday.trimEnd(), '']),
     '## 표 1 노드 종류',
     '',
     '원천: `src/graph-kinds/registry.ts` — `HARNESS_CORE_KINDS` · `WORKFLOW_CORE_KINDS` · `listNodeKinds()`.',
@@ -292,23 +363,74 @@ function repoRootFromHere(): string {
   return join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 }
 
-function readCommit(repoRoot: string): string {
-  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+/** git 트리가 아니면 죽지 않는다. 설치본은 package.json version 으로 적는다. */
+export function readCommit(repoRoot: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    let version = 'unknown';
+    try {
+      const raw = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { version?: unknown };
+      if (typeof raw.version === 'string' && raw.version.length > 0) version = raw.version;
+    } catch { /* 설치본인데 package.json 도 없으면 unknown */ }
+    return `(설치본 v${version})`;
+  }
 }
 
 export function defaultOutputPath(repoRoot: string): string {
   return join(repoRoot, 'docs', 'generated', 'graph-anatomy.md');
 }
 
+/** 옆 파일 이름. `a.md` → `a.md.json`. */
+export function snapshotPathOf(out: string): string {
+  return `${out}.json`;
+}
+
+function isSnapshot(value: unknown): value is AnatomySnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.generatedAt !== 'string' || typeof record.commit !== 'string') return false;
+  if (!record.graphs || typeof record.graphs !== 'object' || Array.isArray(record.graphs)) return false;
+  return Object.values(record.graphs as Record<string, unknown>).every((nodes) => Array.isArray(nodes) && nodes.every((node) => typeof node === 'string'));
+}
+
+/** 쓰기 전의 옆 파일. 없거나 깨졌으면 null(첫 생성). 파일을 쓰지 않는다. */
+export function readPreviousSnapshot(out: string): AnatomySnapshot | null {
+  const path = snapshotPathOf(out);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    return isSnapshot(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseFlag(argv: readonly string[], name: string): string | undefined {
+  const index = argv.indexOf(name);
+  const value = index >= 0 ? argv[index + 1] : undefined;
+  if (index >= 0 && (value === undefined || value.startsWith('--'))) throw new Error(`${name} 에는 경로가 필요하다`);
+  return value;
+}
+
+export function parseOutArg(argv: readonly string[], fallback: string): string {
+  return parseFlag(argv, '--out') ?? fallback;
+}
+
 function main(): void {
   const repoRoot = repoRootFromHere();
-  const graphsRoot = join(repoRoot, 'graphs');
+  const argv = process.argv.slice(2);
+  const graphsRoot = parseFlag(argv, '--graphs') ?? join(repoRoot, 'graphs');
   const generatedAt = new Date().toISOString();
-  const commit = readCommit(repoRoot);
-  const markdown = renderGraphAnatomy({ graphsRoot, commit, generatedAt });
-  const out = defaultOutputPath(repoRoot);
+  const commit = readCommit(parseFlag(argv, '--repo') ?? repoRoot);
+  const out = parseOutArg(argv, defaultOutputPath(repoRoot));
+  const scanned = scanGraphDirs(graphsRoot);
+  const next = snapshotOf(scanned, commit, generatedAt);
+  const prev = readPreviousSnapshot(out);
+  const markdown = renderGraphAnatomy({ graphsRoot, commit, generatedAt }, renderYesterdaySection(prev, next));
   mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, markdown);
+  writeFileSync(snapshotPathOf(out), `${JSON.stringify(next, null, 2)}\n`);
   process.stdout.write(`${out}\n`);
 }
 

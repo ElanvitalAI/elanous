@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import '../acp/client.js';
-import { asideBackend, codexBackend, claudeBackend, geminiBackend, grokBackend, resolveBackend, resolveBackendSpawn, agentBackendNames, type AgentBackend } from './driver.js';
+import { asideBackend, codexBackend, claudeBackend, geminiBackend, grokBackend, refuseNestedElanousOnBackend, resolveBackend, resolveBackendSpawn, agentBackendNames, type AgentBackend } from './driver.js';
+import { CODEX_NESTED_DEPTH_CONFIG_KEY } from '../harness/nested-elanous-policy.js';
 
 describe('AgentBackend — agent-agnostic PTY 추상화', () => {
   it('codexBackend = codex --yolo·구독 스크럽·trust=1', () => {
@@ -8,6 +9,55 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     expect(codexBackend.cmd).toBe('codex');
     expect(codexBackend.args).toEqual(['--yolo', '-c', 'check_for_update_on_startup=false']);   // 09-26: 자식이 업데이트 창에서 스스로 brew upgrade 를 돌렸다
     expect(codexBackend.scrubEnv).toContain('OPENAI_API_KEY');
+  });
+
+  it('codex spawn 인자에 자식 깊이 표지가 실린다 (inherit=core 가 env 를 버려도 argv 로 간다)', () => {
+    const prev = process.env.ELANOUS_NEST_DEPTH;
+    delete process.env.ELANOUS_NEST_DEPTH;
+    try {
+      const spawn = resolveBackendSpawn(codexBackend, { PATH: '/usr/bin' });
+      expect(spawn.args).toContain('-c');
+      expect(spawn.args).toContain(`${CODEX_NESTED_DEPTH_CONFIG_KEY}=1`);
+    } finally {
+      if (prev === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = prev;
+    }
+  });
+
+  it('codex 가 아닌 백엔드는 깊이 표지 인자를 싣지 않는다', () => {
+    for (const backend of [claudeBackend, geminiBackend, grokBackend, asideBackend]) {
+      const spawn = resolveBackendSpawn(backend, { PATH: '/usr/bin' });
+      expect(spawn.args.some((arg) => arg.includes('ELANOUS_NESTED_DEPTH'))).toBe(false);
+    }
+  });
+
+  it('표지를 못 싣는 백엔드는 중첩 발사를 요청했을 때만 거부하고 일반 스폰은 막지 않는다', () => {
+    const unset = {};
+    for (const backend of [claudeBackend, geminiBackend, grokBackend, asideBackend]) {
+      const ordinary = refuseNestedElanousOnBackend({
+        backendName: backend.name,
+        nestedLaunchRequested: false,
+        env: unset,
+      });
+      expect(ordinary.refused).toBe(false);
+      expect(ordinary.depth).toBe(0);
+      const requested = refuseNestedElanousOnBackend({
+        backendName: backend.name,
+        nestedLaunchRequested: true,
+        allow: true,
+        env: unset,
+      });
+      expect(requested.refused).toBe(true);
+      expect(requested.reason).toBe('depth-unknown');
+    }
+    const codex = refuseNestedElanousOnBackend({
+      backendName: 'codex',
+      nestedLaunchRequested: true,
+      allow: true,
+      env: unset,
+    });
+    expect(codex.refused).toBe(false);
+    expect(codex.depth).toBe(0);
   });
 
   it('U3: claudeBackend = claude --dangerously-skip-permissions·ANTHROPIC 키 스크럽', () => {
@@ -60,7 +110,9 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
   });
 
   it('resolveBackend — 미지정 → 디폴트 codex, codex 명시 → codex', () => {
-    expect(resolveBackend().name).toBe('codex');   // 미지정 = 디폴트(대표 허용)
+    // 미지정은 기본 경로다. 기본 체인이면 codex 이고, codex 가 소진돼 체인이 grok 으로
+    // 넘기면 grok 이다(resolveDefaultBackend). 이름을 명시한 쪽은 그 백엔드 그대로다.
+    expect([codexBackend.name, grokBackend.name]).toContain(resolveBackend().name);
     expect(resolveBackend('codex').name).toBe('codex');
   });
 
@@ -88,7 +140,7 @@ describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U
 
   it('선택된 backend 의 cmd/args 가 spawn 파라미터로 전달', () => {
     const cases: Array<[AgentBackend, string, string[]]> = [
-      [codexBackend, 'codex', ['--yolo', '-c', 'check_for_update_on_startup=false']],
+      [codexBackend, 'codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}`]],
       [claudeBackend, 'claude', ['--dangerously-skip-permissions']],
       [geminiBackend, 'agy', ['--dangerously-skip-permissions']],
       [grokBackend, 'grok', ['--always-approve']],
@@ -188,7 +240,7 @@ describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U
     // resolveBackend(레지스트리)와 resolveBackendSpawn(spawn 구성)을 합성해 검증 →
     // AGENT_BACKENDS 의 name→cmd/args 매핑이 어긋나면(오배선) 여기서 실패.
     const expected: Record<string, [string, string[]]> = {
-      codex: ['codex', ['--yolo', '-c', 'check_for_update_on_startup=false']],
+      codex: ['codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}`]],
       claude: ['claude', ['--dangerously-skip-permissions']],
       // ⭐ 이름 gemini → 실행체 agy (2026-08-18 대표 결정 · 죽은 CLI 로 되돌아가면 여기서 잡힌다)
       gemini: ['agy', ['--dangerously-skip-permissions']],

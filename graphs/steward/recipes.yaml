@@ -6,7 +6,8 @@ steward-triage:
   timeout_ms: 600000
 steward-schedule:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" schedule'
-  timeout_ms: 120000
+  # One working-backwards draft is a 70-100 s LLM call (10-05 measured) — 120 s left no room for the rest of the stage.
+  timeout_ms: 300000
 steward-report:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" report'
   timeout_ms: 120000

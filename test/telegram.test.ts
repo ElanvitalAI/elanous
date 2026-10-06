@@ -102,11 +102,18 @@ type Call = { url: string; body: any };
 
 function makeStubFetch(responder: (call: Call) => any): { fetchImpl: typeof fetch; calls: Call[] } {
   const calls: Call[] = [];
+  let sendSeq = 0;
   const fetchImpl: any = async (url: string, init: any) => {
     const body = init?.body ? JSON.parse(init.body as string) : {};
     const call: Call = { url, body };
     calls.push(call);
     const result = responder(call);
+    // context-now 서문이 답 앞에 한 번 더 sendMessage 를 친다. 스텁이 매번
+    // 같은 message_id 를 돌려주면 플레이스홀더 편집이 서문을 가리킨다.
+    if (url.endsWith('/sendMessage') && result && typeof result === 'object' && typeof result.message_id === 'number') {
+      sendSeq += 1;
+      return { json: async () => ({ ok: true, result: { ...result, message_id: result.message_id + sendSeq - 1 } }) };
+    }
     return {
       json: async () => ({ ok: true, result }),
     };
@@ -413,11 +420,12 @@ describe('TelegramBot', () => {
     await bot.start();
 
     expect(gotTexts).toEqual(['hello']);
-    // First outbound sendMessage is the placeholder (user sees
-    // acknowledgement while we wait for the handler to resolve).
-    const placeholder = calls.find(c => c.url.endsWith('/sendMessage'));
+    // context-now 서문이 답 앞에 한 메시지. 그 다음 sendMessage 가
+    // 플레이스홀더(사용자에게 핸들러 대기 중임을 보여 준다).
+    const sends = calls.filter(c => c.url.endsWith('/sendMessage'));
+    const placeholder = sends.find(c => c.body.text === '⏳ Working…');
     expect(placeholder).toBeDefined();
-    expect(placeholder!.body.text).toBe('⏳ Working…');
+    expect(sends[0]!.body.text).not.toBe('⏳ Working…');
     expect(placeholder!.body.reply_to_message_id).toBe(1);
     // Final reply rides on editMessageText (in-place replacement of
     // the placeholder). onMessage returned plain "echo: hello"; after
@@ -425,7 +433,7 @@ describe('TelegramBot', () => {
     const edit = calls.find(c => c.url.endsWith('/editMessageText'));
     expect(edit).toBeDefined();
     expect(edit!.body.text).toBe('echo: hello');
-    expect(edit!.body.message_id).toBe(777);
+    expect(edit!.body.message_id).toBe(778);
   });
 
   // Telegram does NOT push-notify on message EDITS. A long turn (a /cc
@@ -459,8 +467,10 @@ describe('TelegramBot', () => {
     await bot.start();
 
     const sends = calls.filter(c => c.url.endsWith('/sendMessage'));
-    // Placeholder still posted first…
-    expect(sends[0]!.body.text).toBe('⏳ Working…');
+    // context-now 서문 다음이 플레이스홀더.
+    const placeholder = sends.find(c => c.body.text === '⏳ Working…');
+    expect(placeholder).toBeDefined();
+    expect(sends.indexOf(placeholder!)).toBeGreaterThan(0);
     // …then collapsed to a POINTER via edit (the '결과 ↓' text only appears
     // on the notify path — distinguishes it from a plain edit).
     const edit = calls.find(c => c.url.endsWith('/editMessageText'));
@@ -469,9 +479,9 @@ describe('TelegramBot', () => {
     // "✓ 승인됨" ack, so "완료" here would read as done-before-approved.
     expect(edit!.body.text).not.toContain('완료');
     // …and the RESULT rides on a FRESH sendMessage (which DOES notify),
-    // NOT on the edit.
-    expect(sends).toHaveLength(2);
-    expect((sends[1]!.body.text ?? '')).toContain('리드미갱신완료');
+    // NOT on the edit. 서문 + 플레이스홀더 + 결과.
+    expect(sends).toHaveLength(3);
+    expect((sends[sends.length - 1]!.body.text ?? '')).toContain('리드미갱신완료');
   });
 
   test('short turn keeps the quiet edit-in-place (result on the edit, no extra send)', async () => {
@@ -499,7 +509,9 @@ describe('TelegramBot', () => {
     await bot.start();
 
     const sends = calls.filter(c => c.url.endsWith('/sendMessage'));
-    expect(sends).toHaveLength(1); // only the placeholder — no fresh result msg
+    // 서문 + 플레이스홀더. 짧은 턴은 결과를 새 메시지로 보내지 않는다.
+    expect(sends.filter(c => c.body.text === '⏳ Working…')).toHaveLength(1);
+    expect(sends.some(c => (c.body.text ?? '').includes('빠른 답'))).toBe(false);
     const edit = calls.find(c => c.url.endsWith('/editMessageText'));
     expect(edit!.body.text).toContain('빠른 답'); // result carried by the edit
   });
@@ -1096,12 +1108,13 @@ describe('TelegramBot', () => {
     });
     await bot.start();
 
-    const placeholder = calls.find(c => c.url.endsWith('/sendMessage'));
+    const sends = calls.filter(c => c.url.endsWith('/sendMessage'));
+    const placeholder = sends.find(c => c.body.text === '⏳ Working…');
     expect(placeholder?.body.text).toBe('⏳ Working…');
     const edits = calls.filter(c => c.url.endsWith('/editMessageText'));
     expect(edits.length).toBeGreaterThan(0);
-    // Every edit points at the placeholder.
-    expect(edits.every(e => e.body.message_id === 555)).toBe(true);
+    // 서문이 555, 플레이스홀더가 556. 편집은 전부 플레이스홀더를 가리킨다.
+    expect(edits.every(e => e.body.message_id === 556)).toBe(true);
     // Final edit carries the final answer.
     const finalEdit = edits[edits.length - 1]!;
     expect(finalEdit.body.text).toBe('final answer');
@@ -1324,7 +1337,8 @@ describe('TelegramBot', () => {
     const edits = calls.filter(c => c.url.endsWith('/editMessageText'));
     expect(edits.length).toBe(1);
     expect(edits[0]!.body.text).toBe('Error: boom');
-    expect(edits[0]!.body.message_id).toBe(99);
+    // 서문이 99, 플레이스홀더가 100. 에러는 플레이스홀더를 고친다.
+    expect(edits[0]!.body.message_id).toBe(100);
   });
 });
 

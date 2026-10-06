@@ -3,6 +3,7 @@ import { appendFileSync, mkdirSync, readFileSync, rmdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
+import { oldDoorInternalEnv } from '../self-dev/old-door.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { TrackAgentDecision, TrackAgentInput, TrackAgentResult } from './track-agent.js';
 
@@ -128,7 +129,7 @@ export async function launchTrackAgentShadow(input: TrackAgentInput, options: Sh
       const instanceRoot = effectiveInstanceRoot();
       const { stdout } = await exec('bun', ['bin/elanous.mjs', '--config-dir', instanceRoot, ...values], {
         cwd: process.env.ELANOUS_TOOL_CWD?.trim() || resolve(import.meta.dir, '../..'),
-        env: { ...process.env, ELANOUS_STATE_DIR: instanceRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(instanceRoot) },
+        env: { ...process.env, ELANOUS_STATE_DIR: instanceRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(instanceRoot), ...oldDoorInternalEnv('self-orchestrate') },
         encoding: 'utf8', maxBuffer: 1024 * 1024,
       });
       return { stdout };

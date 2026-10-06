@@ -10,6 +10,9 @@ orchestrator-place:
 orchestrator-delegate:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" delegate'
   timeout_ms: 120000
+orchestrator-launch:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" launch'
+  timeout_ms: 120000
 orchestrator-reconcile:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/orchestrator/tick.ts" reconcile'
   timeout_ms: 120000

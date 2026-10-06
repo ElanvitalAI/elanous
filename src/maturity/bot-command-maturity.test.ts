@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { FEATURE_MATURITY } from './feature-maturity.js';
 import { botCommandVisible, filterBotCommands, readBotAudience } from './bot-command-maturity.js';
-import { defaultTelegramCommands, parseTelegramSlash } from '../telegram-commands.js';
+import { buildUnknownSlashReply, defaultTelegramCommands, dispatchTelegramSlash, parseTelegramSlash } from '../telegram-commands.js';
 import { TelegramBot } from '../telegram.js';
 import { ELANOUS_SLASH_COMMANDS, buildDiscordSlashWire } from '../discord-slash-wire.js';
 import { SLASH_COMMANDS } from '../chat/index.js';
@@ -93,6 +93,18 @@ describe('MAT1d bot menu grades', () => {
     expect(parseTelegramSlash('/skill demo', tg)).toMatchObject({ kind: 'match', cmd: { name: 'skill' }, args: ['demo'] });
   });
 
+  test('Telegram replies on TUI-only commands and keeps supported and unknown dispatch unchanged', async () => {
+    const commands = [{ name: 'ping', description: 'ping', handler: async () => 'pong' }];
+    const opts = { allCommands: commands, userConfig: audienceConfig('telegram', 'general') };
+    const ctx = (text: string) => ({ text, chatId: 1, userId: 1, messageId: 1, attachments: [], isDm: true } as unknown as Parameters<typeof dispatchTelegramSlash>[0]);
+    expect(await dispatchTelegramSlash(ctx('/model'), opts)).toEqual({ handled: true, reply: '/model은(는) 텔레그램에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.' });
+    expect(buildUnknownSlashReply('run-skill', commands)).toBe('/run-skill은(는) 텔레그램에서 아직 지원되지 않습니다. TUI에서 /run-skill을(를) 사용하세요.');
+    expect(await dispatchTelegramSlash(ctx('/ping'), opts)).toEqual({ handled: true, reply: 'pong' });
+    expect(await dispatchTelegramSlash(ctx('hello'), opts)).toEqual({ handled: false });
+    expect(buildUnknownSlashReply('mystery', commands)).toContain('Unknown command: /mystery');
+    expect(buildUnknownSlashReply('system-only', commands)).toContain('Unknown command: /system-only');
+  });
+
   test('Telegram publishes only general commands, logs totals, yet retains hidden slash parsing', async () => {
     const calls: { method: string; body: any }[] = [];
     const fetchImpl = (async (url: string, opts: RequestInit) => {
@@ -180,6 +192,7 @@ describe('MAT1d bot menu grades', () => {
         const fallbackContent = (fallback.data as { content: string }).content;
         expect(fallbackContent).toContain('/fork은(는) 디스코드에서 아직 지원되지 않습니다.');
         expect(fallbackContent.includes('\n')).toBe(false);
+        expect((await runtime.router.dispatchToBody(interaction('status'))).data).toMatchObject({ content: expect.stringContaining('elanous status') });
         expect(body.find((c) => c.name === 'relay')?.default_member_permissions).toBe('0');
         expect(observed).toContainEqual({ category: 'discord.command', event: 'menu-filtered', data: { total: expectedNames.length, shown: byGrade('discord', body, ['stable', 'beta']).length, role: 'general', showBeta: true } });
         expect(runtime.router.schemas().some((schema) => schema.name === 'relay')).toBe(true);

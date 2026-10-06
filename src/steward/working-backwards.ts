@@ -57,7 +57,22 @@ export async function recordWorkingBackwardsOnCards(
       debug.log('steward.working-backwards', 'skipped-launched-before-draft', { issueId: issue.identifier });
       continue;
     }
-    const draft = await draftWorkingBackwards(issue, ask);
+    // An invalid draft for the same issue text is not re-asked every tick — each ask is a 70-100 s LLM call (10-05 ELA-29 timed the schedule stage out 3×).
+    const invalidKey = `hitl:draft-invalid-${createHash('sha256').update(JSON.stringify({ title: issue.title, body: issue.body ?? '' })).digest('hex').slice(0, 16)}`;
+    if (card.sections.some(section => section.key === invalidKey)) {
+      debug.log('steward.working-backwards', 'skipped-known-invalid', { issueId: issue.identifier });
+      throw new InvalidWorkingBackwardsDraft();
+    }
+    let draft: WorkingBackwardsDraft;
+    try { draft = await draftWorkingBackwards(issue, ask); }
+    catch (error) {
+      if (error instanceof InvalidWorkingBackwardsDraft) {
+        // The memo is best-effort — failing to write it must not replace the invalid-draft error the caller routes to hitl.
+        try { store.appendSection(card.id, { key: invalidKey, owner: 'steward', content: 'working-backwards draft invalid for this issue text — not re-asked until the issue changes' }); }
+        catch (memoError) { debug.log('steward.working-backwards', 'invalid-memo-failed', { issueId: issue.identifier, error: memoError instanceof Error ? memoError.message : String(memoError) }); }
+      }
+      throw error;
+    }
     for (const [section, content] of [['prfaq', draft.prfaq], ['manual', draft.manual]] as const) {
       const key = `${section}:${createHash('sha256').update(content).digest('hex')}`;
       if (!card.sections.some(item => item.key === key)) store.appendSection(card.id, { key, owner: 'steward', content });

@@ -10,7 +10,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  aggregateListEvents, buildQuery, collectObservedEventNames, effectiveLogLimit, eventCategoryWarning, eventNameDistance, eventNameHint, eventNameVerdict, EVENT_NAME_HINT_SHOWN, EVENT_NAME_HINT_WINDOW_MS, formatLogInstance, formatLogLine, formatRemoteLogLine, grepPhraseWarning, isNameLikeEvent, limitReachedHint, limitReachedJsonMeta, limitReachedStderrSignal, matchesReworkRecurrenceDisagreement, multiSurfaceDuplicateJsonMeta, otherInstanceHint, rankNearbyEventNames, renderLogJsonLine, renderRemoteLogJsonLine,
+  aggregateListEvents, buildQuery, collectObservedEventNames, effectiveLogLimit, eventCategoryWarning, eventNameDistance, eventNameHint, eventNameVerdict, EVENT_NAME_HINT_SHOWN, EVENT_NAME_HINT_WINDOW_MS, formatLogInstance, formatLogLine, formatRemoteLogLine, grepPhraseWarning, isNameLikeEvent, limitReachedHint, limitReachedJsonMeta, limitReachedStderrSignal, matchesReworkRecurrenceDisagreement, multiSurfaceDuplicateJsonMeta, otherInstanceHint, otherInstanceMajorityWarning, rankNearbyEventNames, renderLogJsonLine, renderRemoteLogJsonLine,
   probeOtherInstanceMatches, quoteShellArg, resolveLogTargets, resolveLogsRemoteFlag, renderAxisExplanation, renderLogAxisDiscovery, runCoverageHint, UNCLASSIFIED_PREVIEW, renderGatedHint, runLogsCli, nonCurrentScopeNames, zeroResultFilterRelaxationWarning, type LogTarget,
   liveFetchRemoteLogs, podObservationGapNotice,
   runLogsLevel,
@@ -478,6 +478,18 @@ describe('0건 인스턴스 · 상한 힌트 — 구조적 판정', () => {
       '  ↳ 다른 인스턴스에는 있다 — test:monad-agent 12건 · test:foo 3건\n'
       + "    전체를 보려면: elanous logs --all --include-test --category 'self-implement' --since '1h' --limit '20'",
     );
+  });
+
+  it('POD-OBS: 결과가 0이 아니어도 다른 우주에 더 많으면 경고하고, 적거나 같으면 침묵한다', () => {
+    const opts = { event: 'pre-pr-sync', since: '24h' };
+    expect(otherInstanceMajorityWarning(0, [{ name: 'test:a', count: 5 }], opts)).toBeNull();
+    expect(otherInstanceMajorityWarning(3, [{ name: 'test:a', count: 3 }], opts)).toBeNull();
+    expect(otherInstanceMajorityWarning(3, [], opts)).toBeNull();
+    const warning = otherInstanceMajorityWarning(1, [
+      { name: 'test:a', count: 2 }, { name: 'test:b', count: 200 }, { name: 'test:c', count: 70 }, { name: 'test:d', count: 4 },
+    ], opts);
+    expect(warning).toContain('여기 1건 · 다른 우주에 276건이 더 있다 — test:b 200건 · test:c 70건 · test:d 4건 외 1곳');
+    expect(warning).toContain("elanous logs --all --include-test --event 'pre-pr-sync' --since '24h'");
   });
 
   it('재조회 명령은 공백·와일드카드·따옴표가 있는 필터도 POSIX 한 인자로 보존한다', () => {

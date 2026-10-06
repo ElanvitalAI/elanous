@@ -109,8 +109,10 @@ describe('runEntrancesAction', () => {
     expect(planDeclared?.verification).toBeDefined();
     expect(structured.launchEntrances.declarations.find((entrance: { id: string }) => entrance.id === 'cli-harness-plan'))
       .toMatchObject({ status: 'live', verification: planDeclared?.verification, imprintEvidence: 'CLI_HARNESS_PLAN_ENTRANCE' });
+    // OLD-DOOR-CLOSE: the outside `dev --ask` door is closed; the registry status flows through as declared.
     expect(structured.launchEntrances.declarations.find((entrance: { id: string }) => entrance.id === 'cli-dev-ask'))
-      .toMatchObject({ status: 'live' });
+      .toMatchObject({ status: ENTRANCE_REGISTRY.find((entrance) => entrance.id === 'cli-dev-ask')?.status });
+    expect(ENTRANCE_REGISTRY.find((entrance) => entrance.id === 'cli-dev-ask')?.status).toBe('closed');
     expect(structured.launchEntrances.declarations.find((entrance: { id: string }) => entrance.id === 'cli-dev-ask').modelExposed)
       .toBeUndefined();
     expect(humanOutput[0]).toContain(

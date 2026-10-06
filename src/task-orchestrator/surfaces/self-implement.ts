@@ -19,6 +19,7 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { oldDoorInternalEnv } from '../../self-dev/old-door.js';
 import { selfDevRunsDir } from '../../self-dev/run-store.js';
 import { debug } from '../../debug/log.js';
 import { join, resolve } from 'node:path';
@@ -356,6 +357,7 @@ export function defaultSelfImplementSpawn(): SelfImplementJobSpawn {
             ...childNestEnv(),
             ...harnessSpaceEnv('self-implement', input.spaceId),
             ...executorRoleEnv(),   // ⭐ 세포 role 분화 — 자식은 executor(실행자)로 자기인지.
+            ...oldDoorInternalEnv('self-implement'),
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         });

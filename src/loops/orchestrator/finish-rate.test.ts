@@ -117,7 +117,7 @@ test('recent startless ledger reports a lower bound while an old one is excluded
     expect(metrics.landingRate).toBe(0.5);
     expect(metrics.reasons.launched).toContain('1개 원장 시작 줄 없음(하한값)');
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-      directories: 1, launched: 2, childLedgers: 0, unreadable: 1,
+      directories: 1, launched: 2, launchOnly: 0, childLedgers: 0, unreadable: 1,
     });
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-ledger-unreadable', {
       count: 1, sample: [{ runId: ids[2], reason: 'pod-ledger-incomplete' }],
@@ -135,7 +135,7 @@ test('recent startless ledger reports a lower bound while an old one is excluded
       log.mockClear();
       const clean = measureFinish({ runGh, ledgerTargets: [{ name: 'clean', dbPath: join(cleanRoot, 'logs', 'logs.db') }] }, now);
       expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-        directories: 1, launched: 2, childLedgers: 0, unreadable: 0,
+        directories: 1, launched: 2, launchOnly: 0, childLedgers: 0, unreadable: 0,
       });
       expect(clean.launched).toBe(2);
       expect(clean).not.toHaveProperty('launchedUnreadable');
@@ -163,7 +163,7 @@ test('unreadable directory aliases count once after realpath resolution', () => 
     expect(metrics.reasons.launched).toBe('원장 폴더 1개 못 읽음(하한값)');
     expect(metrics.reasons.landingRate).toBe('launched lower bound is zero — launch population unknown: 원장 폴더 1개 못 읽음(하한값)');
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-      directories: 1, launched: 0, childLedgers: 0, unreadable: 0,
+      directories: 1, launched: 0, launchOnly: 0, childLedgers: 0, unreadable: 0,
     });
   } finally {
     log.mockRestore();
@@ -204,7 +204,7 @@ test('federated launch population deduplicates runs and child ledgers and refuse
     expect(four.landingRate).toBeCloseTo(0.667, 2);
     expect(four.reasons.launched).toContain('1개 원장 시작 줄 없음(하한값)');
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-      directories: 3, launched: 6, childLedgers: 2, unreadable: 1,
+      directories: 3, launched: 6, launchOnly: 0, childLedgers: 2, unreadable: 1,
     });
     const nine = measureFinish({ ledgerTargets: targets, runGh: runGh(9) }, now);
     expect(nine).toMatchObject({ launched: 6, launchedUnreadable: 1, landed: 9, landingRate: null });
@@ -223,4 +223,51 @@ test('federated launch population deduplicates runs and child ledgers and refuse
     log.mockRestore();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('Pod-dispatched launch ledgers (launch-quota-policy · author-on-pod-receipt, no start) count as launches, not unreadable', () => {
+  // 10-06 real ledgers: 162/400 began with launch-quota-policy and 21 with author-on-pod-receipt (no timestamp) — 447 were «unreadable».
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-rate-launch-')));
+  const dir = join(root, 'run-ledger');
+  mkdirSync(dir);
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const a = 'run-00000000-0000-4000-8000-0000000000a1';
+  const b = 'run-00000000-0000-4000-8000-0000000000b2';
+  try {
+    writeFileSync(join(dir, `${a}.jsonl`), JSON.stringify({ runId: a, event: 'launch-quota-policy', timestamp: '2026-10-04T15:30:00Z', data: {} }) + '\n');
+    writeFileSync(join(dir, `${b}.jsonl`), JSON.stringify({ runId: b, event: 'author-on-pod-receipt', data: { authorOnPod: true } }) + '\n');
+    utimesSync(join(dir, `${a}.jsonl`), now, now);
+    utimesSync(join(dir, `${b}.jsonl`), new Date('2026-10-04T15:45:00Z'), new Date('2026-10-04T15:45:00Z'));
+    const runGh = deps(0, 0, [], [pr(1, { mergeable: 'MERGEABLE' })]).runGh;
+    const metrics = measureFinish({ runGh, ledgerTargets: [{ name: 'launch', dbPath: join(root, 'logs', 'logs.db') }] }, now);
+    expect(metrics.launched).toBe(2);
+    expect(metrics.launchedUnreadable).toBeUndefined();
+    expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
+      directories: 1, launched: 2, launchOnly: 2, childLedgers: 0, unreadable: 0,
+    });
+  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the same runId with a host launch record and a Pod start in two directories counts once, start time wins (ACP must-fix)', () => {
+  const host = realpathSync(mkdtempSync(join(tmpdir(), 'finish-rate-host-')));
+  const pod = realpathSync(mkdtempSync(join(tmpdir(), 'finish-rate-pod-')));
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const id = 'run-00000000-0000-4000-8000-0000000000c3';
+  try {
+    for (const [root, line] of [
+      [host, { runId: id, event: 'launch-quota-policy', timestamp: '2026-10-03T15:00:00Z', data: {} }],
+      [pod, { runId: id, event: 'start', timestamp: '2026-10-04T15:30:00Z', data: {} }],
+    ] as const) {
+      mkdirSync(join(root, 'run-ledger'));
+      writeFileSync(join(root, 'run-ledger', `${id}.jsonl`), JSON.stringify(line) + '\n');
+      utimesSync(join(root, 'run-ledger', `${id}.jsonl`), now, now);
+    }
+    const runGh = deps(0, 0, [], [pr(1, { mergeable: 'MERGEABLE' })]).runGh;
+    for (const order of [[host, pod], [pod, host]]) {
+      log.mockClear();
+      const metrics = measureFinish({ runGh, ledgerTargets: order.map((root, i) => ({ name: `t${i}`, dbPath: join(root, 'logs', 'logs.db') })) }, now);
+      expect(metrics.launched).toBe(1);
+      expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', expect.objectContaining({ launched: 1, launchOnly: 0 }));
+    }
+  } finally { log.mockRestore(); rmSync(host, { recursive: true, force: true }); rmSync(pod, { recursive: true, force: true }); }
 });

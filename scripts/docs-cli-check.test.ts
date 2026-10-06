@@ -14,6 +14,23 @@ const help: HelpRunner = (args) => {
 };
 
 describe('docs-cli-check — 문서의 elanous 호출을 실제 CLI 에 대조', () => {
+  test('bun bin/elanous.mjs 접두도 elanous 와 같은 명령으로 읽는다', () => {
+    const md = ['`bun bin/elanous.mjs doctor --fix`', '```bash', 'bun bin/elanous.mjs harness say "x"', '```'].join('\n');
+    expect(extractElanousCommands('x.md', md).map((r) => [r.cmd, r.sub ?? null, r.flags])).toEqual([
+      ['doctor', null, ['--fix']],
+      ['harness', 'say', []],
+    ]);
+  });
+
+  test('a flag token with regex metacharacters is reported, not thrown (doc-rot real run: SyntaxError unmatched parentheses)', () => {
+    const md = ['```', 'elanous doctor --fix(x --yes', 'elanous doctor --a+b', '```'].join('\n');
+    const f = checkCommands(extractElanousCommands('x.md', md), help);
+    expect(f.map((x) => [x.kind, x.detail.split(' ')[0]])).toEqual([
+      ['unknown-flag', '--fix(x'],
+      ['unknown-flag', '--a+b'],
+    ]);
+  });
+
   test('코드 블록·인라인 코드에서 뽑는다 · 자리표와 주석은 인자로 본다 · && 로 이어진 두 호출을 둘로', () => {
     const md = ['Run `elanous doctor --fix --yes`.', '```bash', 'elanous harness say "add a flag"   # one line', 'elanous --version && elanous doctor', '```', 'elanous outside a fence is prose'].join('\n');
     const refs = extractElanousCommands('x.md', md);

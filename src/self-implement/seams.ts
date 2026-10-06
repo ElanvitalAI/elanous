@@ -24,6 +24,9 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { forkSessionById, HARNESS_SESSION_ORIGIN, isHarnessSessionOrigin } from '../session/index.js';
 import { configuredWorktreeRoot, getUserConfig, resolveRoleLlm } from '../user-config.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { addHarnessQueue } from '../harness/harness-queue.js';
+import { readFollowUpMode } from './follow-up-goals.js';
 import { getProviderForConfig } from '../llm.js';
 import { createWorktree, DEFAULT_BRANCH_WORKTREE_BASE, linkWorktreeDependencies, removeWorktree, resolveDefaultBranchBase, resolveMainRepoRoot } from '../git-fs/worktree.js';
 import { isWorktreeInUse, listActiveTerminalDirectories } from '../harness/harness-clean.js';
@@ -77,7 +80,8 @@ import { tscEnv, assessTypecheckExecution, classifyTypecheckErrors, diffTypechec
 import { nestCapReached, childNestEnv, nestInfo } from '../agent/nest-depth.js';
 import { harnessBoundaryEnv, harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv, harnessSpaceEnv, getHarnessSpace, normalizeSpaceId, getHarnessRunId, resolveRunIdentity } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
-import { RELEASE_PATH_HOLD_MARKER, RELEASE_PATH_LABEL, releasePathHoldShouldPost, releasePathHoldCommentsArgs, releasePrFilePaths } from '../self-dev/release-path-guard.js';
+import { RELEASE_PATH_HOLD_MARKER, RELEASE_PATH_LABEL, releasePathHoldShouldPost, releasePathHoldCommentsArgs } from '../self-dev/release-path-guard.js';
+import { readPrFilesWithRateLimitFallback, runGhApp } from './app-api-budget.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { gateDecision, reviewDecision, mergeDecision } from './decision-events.js';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -110,6 +114,10 @@ declare module './orchestrator.js' {
     /** PR close(+브랜치 삭제). 기본 구성은 PrManager.closePr 위임(같은 인자·같은 반환).
      *  오케스트레이터는 아직 부르지 않는다 — 그 배선은 조각 ②다. */
     closePr?: (prUrl: string, comment?: string) => boolean;
+    /** Find an issue comment on this PR by its body marker; absence is distinct from a failed lookup. */
+    findPrComment?: (opts: { number: number; marker: string; cwd: string; comments?: unknown }) => Promise<{ id: number; body: string } | undefined>;
+    /** Replace an existing PR issue comment by ID, using the same GitHub App identity as postPrComment. */
+    editPrComment?: (opts: { id: number; body: string; cwd: string }) => Promise<void>;
   }
 }
 import { harnessPolicyEnv } from './harness-policy.js';
@@ -1415,6 +1423,11 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const { supersedeMergedGoalDrafts } = await import('../harness/harness-cli-command.js');
       await supersedeMergedGoalDrafts(number, cwd);
     },
+    followUp: {
+      mode: readFollowUpMode(),
+      stateRoot: elanousStateRoot(),
+      enqueue: (item) => addHarnessQueue({ seat: item.seat, say: item.say, idempotencyKey: item.idempotencyKey }),
+    },
     lineageSupersede: {
       listOpenDrafts: () => listOpenDraftsForLineage(),
       readRunLedger: (runId) => {
@@ -2394,46 +2407,62 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     postPrComment: async ({ number, body, cwd }) => {
       // Round comments go out as the GitHub App like the PR itself — a personal `gh` login made the owner a
       // participant and mailed them on merge (#22089).
-      if (body.startsWith(RELEASE_PATH_HOLD_MARKER)) {
+        if (body.startsWith(RELEASE_PATH_HOLD_MARKER)) {
         // Several merge surfaces may hold the same PR; post the release-path hold comment once.
         let history: unknown;
         try {
-          history = JSON.parse((await execFileAsync('gh', releasePathHoldCommentsArgs(number), {
+          history = JSON.parse((await runGhApp('post-pr-comment-history', releasePathHoldCommentsArgs(number), {
             cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
           })).stdout);
         } catch { history = undefined; }
         if (!releasePathHoldShouldPost(() => history)) return;
       }
-      await execFileAsync('gh', ['pr', 'comment', String(number), '--body', body], {
+      await runGhApp('post-pr-comment', ['pr', 'comment', String(number), '--body', body], {
+        cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
+      });
+    },
+
+    findPrComment: async ({ number, marker, cwd, comments }) => {
+      const pages: unknown = comments ?? JSON.parse((await runGhApp('find-pr-comment', releasePathHoldCommentsArgs(number), {
+        cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
+      })).stdout);
+      if (!Array.isArray(pages)) throw new Error('gh api PR comments returned an invalid list');
+      const entries = pages.flatMap((page: unknown) => Array.isArray(page) ? page : [page]);
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object' || !('body' in entry) || typeof entry.body !== 'string'
+          || !('id' in entry) || typeof entry.id !== 'number' || !Number.isSafeInteger(entry.id) || entry.id <= 0) {
+          throw new Error('gh api PR comments returned an invalid comment');
+        }
+      }
+      return entries.find((entry: { id: number; body: string }) => entry.body.includes(marker));
+    },
+
+    editPrComment: async ({ id, body, cwd }) => {
+      await runGhApp('edit-pr-comment', ['api', '--method', 'PATCH', `repos/{owner}/{repo}/issues/comments/${id}`, '-f', `body=${body}`], {
         cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
       });
     },
 
     addPrLabel: async ({ number, label, cwd }) => {
       if (label === RELEASE_PATH_LABEL) {
-        const existing = await execFileAsync('gh', ['label', 'list', '--search', label, '--json', 'name'], {
+        const existing = await runGhApp('add-pr-label-list', ['label', 'list', '--search', label, '--json', 'name'], {
           cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
         });
         const names: unknown = JSON.parse(existing.stdout);
         if (!Array.isArray(names)) throw new Error('gh label list returned an invalid list');
         if (!names.some((item: unknown) => !!item && typeof item === 'object' && 'name' in item && item.name === label)) {
-          await execFileAsync('gh', ['label', 'create', label, '--color', 'D93F0B', '--description', 'Release path requires OP approval'], {
+          await runGhApp('add-pr-label-create', ['label', 'create', label, '--color', 'D93F0B', '--description', 'Release path requires OP approval'], {
             cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
           });
         }
       }
-      await execFileAsync('gh', ['pr', 'edit', String(number), '--add-label', label], {
+      await runGhApp('add-pr-label', ['pr', 'edit', String(number), '--add-label', label], {
         cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
       });
     },
-    readPrFiles: async ({ number, cwd }) => {
-      // Paginate the PR file API: a single `gh pr view --json files` can omit files after the first page.
-      const { stdout } = await execFileAsync('gh', [
-        'api', '--paginate', '--slurp', '--method', 'GET', '-f', 'per_page=100',
-        `repos/{owner}/{repo}/pulls/${number}/files`,
-      ], { cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env) });
-      return releasePrFilePaths(JSON.parse(stdout));
-    },
+    readPrFiles: async ({ number, cwd, base }) => readPrFilesWithRateLimitFallback({
+      number, cwd, env: ghAutomationEnv(process.env), ...(base ? { base } : {}),
+    }),
 
     ...(o.approvePr ? { approvePr: o.approvePr } : {}),
 

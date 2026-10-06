@@ -591,6 +591,8 @@ describe('release run CLI', () => {
       const tip = git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4').split('\t')[0];
       expect(tip).toMatch(/^[0-9a-f]{40}$/);
       expect(lines).toEqual([`release/0.2.4: ${base} + ${pick}`, `release/0.2.4 → ${tip}`]);
+      const help = cli.commands.find((c) => c.name() === 'release')!.commands.find((c) => c.name() === 'cut-branch')!.helpInformation();
+      expect(help).toContain('--append');
     } finally { process.chdir(previous); output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 

@@ -94,6 +94,10 @@ export interface RunOriginData extends Record<string, unknown> {
   substrate: string;
   instance: string;
   elanousVersion: string;
+  /** install.json version. 못 읽으면 «unknown». */
+  installedVersion: string;
+  /** install.json commit. 못 읽으면 «unknown». */
+  installedCommit: string;
   podName?: string;
   nodeName?: string;
   podNamespace?: string;

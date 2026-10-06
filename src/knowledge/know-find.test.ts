@@ -1,0 +1,67 @@
+import { describe, expect, spyOn, test } from 'bun:test';
+import { knowFind, type KnowFindDeps } from './know-find.js';
+import { debug } from '../debug/log.js';
+import type { DirectiveRow } from '../directives/directive-index.js';
+import type { DecisionEntry } from '../decisions/decision-ledger.js';
+import type { LessonRow } from '../lessons/lesson-ledger.js';
+
+const at = '2026-10-01T00:00:00.000Z';
+const directive: DirectiveRow = { ts: at, agent: 'elanous', session_id: 'session', cwd: null, track: null,
+  released: null, dev: null, codename: null, text: 'AUTHOR-POD 기본 꺼짐', source_file: '/tmp/ask.md', line_no: 8 };
+const decision = (id: string, status: DecisionEntry['status'], title: string): DecisionEntry => ({
+  id, title, category: 'scope', scqa: { s: 'AUTHOR-POD 상황', c: '기본 꺼짐', a: '기준 유지' },
+  options: [], recommendation: { skipped: true, reason: '미상' }, raisedBy: { agent: 'owner' },
+  status, raisedAt: at, history: [],
+});
+const lesson: LessonRow = { id: 'L1', incident: 'AUTHOR-POD 장애', cause: '기본 꺼짐', remedy: '확인',
+  enforced_by: '', disproof: null, owner: 'TC', status: 'candidate', created_at: at, updated_at: at, occurrence_count: 2 };
+
+function sources(): KnowFindDeps {
+  return {
+    directives: () => [directive], decisions: () => [decision('D-open', 'open', 'AUTHOR-POD 열린 결정'),
+      decision('D-closed', 'decided', 'AUTHOR-POD 닫힌 결정')],
+    checklist: (version) => ({ version, released: '1.0.0', dev: '1.0.1', history: [],
+      items: version === '1.0.0' ? [{ id: 'K1', title: 'AUTHOR-POD 칸', status: 'yellow', updatedAt: at, updatedBy: 'TC' }] : [] }),
+    lessons: () => [lesson], versions: () => ['1.0.0', '1.0.1'], now: () => new Date('2026-10-05T00:00:00Z'),
+  };
+}
+
+describe('knowFind', () => {
+  test('returns five rows across four existing readers with current entries before closed decisions', () => {
+    const calls: string[] = [];
+    const deps = sources();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const found = knowFind('AUTHOR-POD', {
+        ...deps, directives: (query) => { calls.push(`directive:${query}`); return deps.directives(query); },
+        decisions: () => { calls.push('decision'); return deps.decisions(); },
+        checklist: (version) => { calls.push(`checklist:${version}`); return deps.checklist(version); },
+        lessons: (query) => { calls.push(`lesson:${query}`); return deps.lessons(query); },
+      });
+      expect(calls).toEqual(['directive:AUTHOR-POD', 'decision', 'checklist:1.0.0', 'checklist:1.0.1', 'lesson:AUTHOR-POD']);
+      expect(found.rows).toHaveLength(5);
+      expect(found.unavailable).toEqual([]);
+      expect(found.rows.map(row => row.source)).toEqual(expect.arrayContaining(['directive', 'decision', 'checklist', 'lesson']));
+      const closed = found.rows.findIndex(row => row.id === 'D-closed');
+      expect(found.rows.findIndex(row => row.id === 'D-open')).toBeLessThan(closed);
+      expect(found.rows.findIndex(row => row.id === 'K1')).toBeLessThan(closed);
+      expect(found.rows.find(row => row.id === 'L1')).toMatchObject({ current: true, ref: 'lesson show L1' });
+      expect(log).toHaveBeenCalledWith('knowledge.know', 'query', {
+        query: 'AUTHOR-POD', counts: { directive: 1, decision: 2, checklist: 1, lesson: 1 }, unavailable: [],
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  test('lesson reader failure retains the other four rows and its reason instead of treating it as zero matches', () => {
+    const found = knowFind('AUTHOR-POD', { ...sources(), lessons: () => { throw new Error('lesson offline'); } });
+    expect(found.rows).toHaveLength(4);
+    expect(found.unavailable).toEqual([{ source: 'lesson', reason: 'lesson offline' }]);
+  });
+
+  test('matches decision SCQA and checklist id by question words; stale directives do not count as current', () => {
+    const deps = sources();
+    const found = knowFind('AUTHOR-POD', { ...deps, directives: () => [{ ...directive, ts: '2026-08-01T00:00:00Z' }] });
+    expect(found.rows.find(row => row.source === 'directive')?.current).toBe(false);
+    expect(found.rows.find(row => row.id === 'D-closed')?.current).toBe(false);
+  });
+});

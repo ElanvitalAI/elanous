@@ -139,8 +139,19 @@ if (import.meta.main) {
       // 명시적 그림자 기록에서만 추가 PR 조회와 헬퍼 원장 쓰기를 수행한다(발사 0).
       const { recordRepairShadows } = await import('./helper-repair.js');
       const { effectiveInstanceRoot } = await import('../instance/resolve.js');
-      const shadows = await recordRepairShadows(rows, { runGh, root: effectiveInstanceRoot() });
-      if (shadows.length) console.log(`수리 골 그림자 ${shadows.length}건 → helper/repairs.jsonl`);
+      const { getUserConfig } = await import('../user-config.js');
+      const root = effectiveInstanceRoot();
+      const config = getUserConfig();
+      const live = config.harness?.helper?.repair === 'live';
+      const shadows = await recordRepairShadows(rows, {
+        runGh, root, config,
+        // live 만 대기열에 넣는다. 실제 발사는 기존 대기열 틱이 한다(새 발사 경로 0).
+        ...(live ? { enqueue: async (input) => {
+          const { addHarnessQueue } = await import('./harness-queue.js');
+          return addHarnessQueue(input, { root });
+        } } : {}),
+      });
+      if (shadows.length) console.log(live ? `수리 골 ${shadows.length}건 → helper/repairs.jsonl` : `수리 골 그림자 ${shadows.length}건 → helper/repairs.jsonl`);
     }
     if (json) console.log(JSON.stringify(rows, null, 2));
     else for (const row of rows) {

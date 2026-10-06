@@ -4,7 +4,7 @@ import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, spyOn, test } from 'bun:test';
+import { describe, expect, it, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
 import { setUserConfigOverlay } from '../user-config.js';
@@ -87,6 +87,60 @@ const MEASURED_PS_EWW_OWNERSHIP = {
 };
 
 describe('harness CLI command', () => {
+  it('depth >= 1 ignores --nested-elanous allow and the launch stays refused', async () => {
+    const program = new Command().exitOverride();
+    const seen: Array<string | undefined> = [];
+    installHarnessCliCommand(program, {
+      registerSink: async () => {},
+      resolveSurface: async () => 'harness',
+      say: async (_words, opts) => { seen.push(opts.nestedElanous); },
+      launchGate: { readBudget: async () => ({ action: 'proceed', reasons: ['within budget'] }), activeRuns: () => [] },
+    });
+    const prev = process.env.ELANOUS_NESTED_DEPTH;
+    const logs: Array<{ category: string; event: string; data: unknown }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data?: unknown) => {
+      logs.push({ category, event, data });
+    }) as typeof debug.log;
+    process.env.ELANOUS_NESTED_DEPTH = '1';
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await program.parseAsync(['harness', 'say', 'hello', '--nested-elanous', 'allow'], { from: 'user' });
+      expect(seen).toEqual([]);
+      expect(logs).toContainEqual({ category: 'agent-mission.nested', event: 'allow-ignored', data: { depth: 1 } });
+      expect(errors.some((line) => line.includes('allow-ignored'))).toBe(true);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      console.error = originalError;
+      debug.log = originalLog;
+      process.exitCode = undefined;
+      if (prev === undefined) delete process.env.ELANOUS_NESTED_DEPTH;
+      else process.env.ELANOUS_NESTED_DEPTH = prev;
+    }
+  });
+
+  it('depth 0 keeps --nested-elanous allow on the launch options', async () => {
+    const program = new Command().exitOverride();
+    const seen: Array<string | undefined> = [];
+    installHarnessCliCommand(program, {
+      registerSink: async () => {},
+      resolveSurface: async () => 'harness',
+      say: async (_words, opts) => { seen.push(opts.nestedElanous); },
+      launchGate: { readBudget: async () => ({ action: 'proceed', reasons: ['within budget'] }), activeRuns: () => [] },
+    });
+    const prev = process.env.ELANOUS_NESTED_DEPTH;
+    delete process.env.ELANOUS_NESTED_DEPTH;
+    try {
+      await program.parseAsync(['harness', 'say', 'hello', '--nested-elanous', 'allow'], { from: 'user' });
+      expect(seen).toEqual(['allow']);
+    } finally {
+      if (prev === undefined) delete process.env.ELANOUS_NESTED_DEPTH;
+      else process.env.ELANOUS_NESTED_DEPTH = prev;
+    }
+  });
+
   function install(
     ask?: Parameters<typeof installHarnessCliCommand>[1]['ask'],
     say?: Parameters<typeof installHarnessCliCommand>[1]['say'],

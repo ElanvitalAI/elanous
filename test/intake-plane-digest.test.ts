@@ -40,56 +40,75 @@ test('그날 흡수·갈래가 끝난 것만 · 축별로 묶고 노트의 한 �
   expect(md).toContain('- [[A]] — 하니스는 그래프다.');
   expect(md).toContain('🔴 엘라누스에 없는 것 — 골 후보 (1)');
   expect(d.review).toEqual([{ fact: 'elanous 의 `y` 가 같은 것인가', note: '/v/A.md' }]);
-  expect(md).toContain('### 🟡 사람이 가를 것 — 판단 필요 (1)');
-  expect(md).toContain('- elanous 의 `y` 가 같은 것인가 · [[A]]');
-  expect(renderDigestTelegram(d)).not.toContain('사람이 가를 것');
-  expect(d.absorbed.find((e) => e.id === a)?.impact).toEqual({ fact: 'elanous 에 `x` 가 없다', current: '0건', action: '없는 기능의 골 후보를 세운다' });
+  expect(md).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
+  expect(md).not.toContain('사람이 가를 것');
+  expect(renderDigestTelegram(d)).toBe('흡수 2 → 우리에게 닿는 것 0');
+  expect(d.absorbed.find((e) => e.id === a)?.impact).toBeUndefined();
   expect(buildIntakeDigest(r, '2026-09-25', (p) => files[p]).absorbed).toHaveLength(0);
 });
 
-test('텔레그램 흡수 12 · 닿는 것 5 — 최대 세 건만 네 줄, 나머지는 닿지 않은 수', () => {
-  const absorbed = Array.from({ length: 12 }, (_, n) => ({
-    id: String(n), sources: ['youtube'], axis: 'x', oneLiner: `외부 사실 ${n}`,
-    ...(n < 5 ? { impact: { fact: `대조 사실 ${n}`, current: `우리 상태 ${n}`, action: '보강한다' } } : {}),
-    ...(n === 0 ? {} : { url: `https://example.org/${n}` }),
-  }));
-  const t = renderDigestTelegram({ day: '2026-09-26', grounding: 0, release: 0, manual: 0, absorbed, goals: [] });
-  expect(t.split('\n')[0]).toBe('흡수 12 → 우리에게 닿는 것 5');
-  expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
-  expect(t.match(/^C 우리에게 왜:/gm)).toHaveLength(3);
-  expect(t.match(/^A 그래서 무엇을 하나:/gm)).toHaveLength(3);
-  expect(t.match(/^🔗 원문 링크:/gm)).toHaveLength(3);
-  expect(t).toContain('S 무엇: 대조 사실 0\nC 우리에게 왜: 우리 상태 0\nA 그래서 무엇을 하나: 보강한다\n🔗 원문 링크: 링크 없음');
-  expect(t).toContain('🔗 원문 링크: 링크 없음');
-  expect(t).toContain('🔗 원문 링크: https://example.org/1');
-  expect(t).not.toContain('외부 사실 3');
-  expect(t).toContain('그 밖 7건 · 닿지 않음');
-  expect(t).not.toContain('사람이 가를 것');
-});
-
-test('실제 갈래의 없음·판단 필요·있음 대조만 닿는 항목으로 센다 — 체크 없는 흡수는 세지 않는다', () => {
+test('렌즈 판정 3 · 참고 2 — 노트 S, 우리 맥락 C, 판정별 A 와 마크다운 원장', () => {
   const r = root();
-  const at = '2026-09-26T03:00:00.000Z';
-  ingestIntakeItems(r, 'youtube', Array.from({ length: 12 }, (_, n) => ({ url: `https://example.org/${n}` })), at, quiet);
+  const at = '2026-10-05T03:00:00.000Z';
+  ingestIntakeItems(r, 'youtube', Array.from({ length: 5 }, (_, n) => ({ url: `https://example.org/${n}` })), at, quiet);
   const ids = listIntakeItems(r).map((i) => i.id);
+  const notes = ids.map((_, n) => `## 한줄 결론\n외부 도구 ${n}은 새로운 방법을 제시한다.\n`);
   for (const [n, id] of ids.entries()) {
     markIntakeItem(r, id, { status: 'absorbed', output: { kind: 'note', ref: `/v/${n}.md` } }, at);
-    if (n < 5) routeIntakeItem(r, id, { items: [{
-      fact: `elanous 의 기능 ${n}`,
-      current: `대조 ${n}`,
-      verdict: n === 0 ? '없음' : n === 1 ? '판단 필요' : '있음',
-      ...(n > 1 ? { evidence: [{ axis: 'repo', repoKind: 'behavior', path: 'src/feature.ts', summary: '구현' }] } : {}),
-    }] }, { lastCommitOf: () => 'sha' }, at);
   }
-  const d = buildIntakeDigest(r, '2026-09-26', (p) => `## 한줄 결론\n${p}에 대한 외부 소식이다.\n`);
+  const out = join(r, 'intake', 'outbox', 'lens');
+  mkdirSync(out, { recursive: true });
+  writeFileSync(join(out, '2026-10-05.jsonl'), [
+    { id: ids[0], fact: 'elanous 의 `video-gen` 은 python 으로 합성한다', current: 'catalog/resources.yaml', lensVerdict: '대체 후보', why: 'video-gen 의 유료 렌더링 의존을 줄일 가능성이 있어 현장 비교가 필요하다.', target: 'video-gen' },
+    { id: ids[1], fact: '우리 기능을 설명한 문장', current: 'src/feature.ts', lensVerdict: '보강', why: '영상 자동화 칸의 품질 소구점에 재현 근거가 부족하다.', target: 'VIDEO-2' },
+    { id: ids[2], fact: '우리 기능을 설명한 문장', current: 'src/feature.ts', lensVerdict: '경쟁 대조', why: '경쟁 도구와 편집 시간 차이를 같은 조건에서 대조해야 한다.', target: 'video-gen' },
+    { id: ids[3], fact: 'elanous 설명만 있음', current: 'src/feature.ts' },
+    { id: ids[4], fact: '근거만 있음', current: 'src/feature.ts', lensVerdict: '보강', why: 'src/feature.ts', target: 'VIDEO-3' },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const d = buildIntakeDigest(r, '2026-10-05', (p) => notes[Number(p.match(/\d+/)?.[0])]);
   const t = renderDigestTelegram(d);
-  expect(t.split('\n')[0]).toBe('흡수 12 → 우리에게 닿는 것 5');
+  expect(t.split('\n')[0]).toBe('흡수 5 → 우리에게 닿는 것 3');
   expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
-  expect(t.match(/^C 우리에게 왜:/gm)).toHaveLength(3);
-  expect(t.match(/^A 그래서 무엇을 하나:/gm)).toHaveLength(3);
-  expect(t.match(/^🔗 /gm)).toHaveLength(3);
-  expect(t).toContain('그 밖 7건 · 닿지 않음');
-  expect(t).not.toContain('사람이 가를 것');
+  expect(t.match(/^🔗 원문 링크:/gm)).toHaveLength(3);
+  expect(t.match(/^S 무엇: (.*)$/gm)?.map((line) => line.slice('S 무엇: '.length))).toEqual(notes.slice(0, 3).map((note) => noteOneLiner(note)!));
+  const contexts = t.match(/^C 우리에게 왜: (.*)$/gm) ?? [];
+  expect(contexts).toHaveLength(3);
+  expect(contexts.every((line) => !/^C 우리에게 왜: (?:[\w.-]+\/)+[\w.-]+(?::\d+)?$/.test(line))).toBe(true);
+  const actions = t.match(/^A 그래서 무엇을 하나: (.*)$/gm) ?? [];
+  expect(actions).toEqual([
+    'A 그래서 무엇을 하나: video-gen lite Pod 실증 제안',
+    'A 그래서 무엇을 하나: 칸 VIDEO-2 에 근거 추가',
+    'A 그래서 무엇을 하나: video-gen 비교표 갱신',
+  ]);
+  expect(new Set(actions).size).toBe(actions.length);
+  expect(t).not.toContain('elanous 의 `video-gen` 은 python 으로 합성한다');
+  expect(t).toContain('그 밖 2건 · 참고');
+  const md = renderDigestMarkdown(d);
+  expect(md).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
+  expect(md).not.toContain('사람이 가를 것');
+});
+
+test('체크 대조 fact/current 는 렌즈 판정이 아니다 — 경로만 있거나 노트 요지가 없으면 참고', () => {
+  const r = root();
+  const at = '2026-09-26T03:00:00.000Z';
+  ingestIntakeItems(r, 'youtube', [{ url: 'https://example.org/a' }, { url: 'https://example.org/b' }], at, quiet);
+  const ids = listIntakeItems(r).map((i) => i.id);
+  for (const id of ids) markIntakeItem(r, id, { status: 'absorbed', output: { kind: 'note', ref: `/v/${id}.md` } }, at);
+  routeIntakeItem(r, ids[0], { items: [{ fact: 'elanous 의 video-gen', current: 'src/feature.ts', verdict: '판단 필요' }] }, {}, at);
+  const d = buildIntakeDigest(r, '2026-09-26', () => undefined);
+  expect(renderDigestTelegram(d)).toBe('흡수 2 → 우리에게 닿는 것 0');
+  expect(renderDigestMarkdown(d)).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
+});
+
+test('닿는 것 4여도 텔레그램에는 최대 세 건만 낸다', () => {
+  const absorbed = Array.from({ length: 4 }, (_, n) => ({
+    id: String(n), sources: ['youtube'], axis: 'x', oneLiner: `외부 사실 ${n}`,
+    impact: { verdict: '보강' as const, why: `소구점 ${n}에 근거가 부족하다.`, target: `VIDEO-${n}` },
+  }));
+  const t = renderDigestTelegram({ day: '2026-10-05', grounding: 0, release: 0, manual: 0, absorbed, goals: [] });
+  expect(t.split('\n')[0]).toBe('흡수 4 → 우리에게 닿는 것 4');
+  expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
+  expect(t).not.toContain('외부 사실 3');
 });
 
 test('닿는 것 0이면 머리 한 줄만 — 침묵·옵시디언 주소도 덧붙이지 않는다', () => {
@@ -111,4 +130,40 @@ test('저장된 메시지 새 글이 이틀 넘게 없으면 노트에 경고 ·
   expect(d.savedSilence).toEqual({ days: 2, lastNewAt: '2026-09-28T22:07:49.773Z' });
   expect(renderDigestMarkdown(d)).toContain('새 글을 2일째 못 받았다(마지막 새 글 수집 2026-09-29)');
   expect(renderDigestTelegram(d)).toBe('흡수 0 → 우리에게 닿는 것 0');
+});
+
+test('lens file drives the digest: same verdict+target repeats collapse to one A, and a header over three says how many more (ACP must-fix)', () => {
+  const r = root();
+  const at = '2026-10-05T03:00:00.000Z';
+  ingestIntakeItems(r, 'youtube', Array.from({ length: 6 }, (_, n) => ({ url: `https://example.org/m${n}` })), at, quiet);
+  const ids = listIntakeItems(r).map((i) => i.id);
+  for (const [n, id] of ids.entries()) markIntakeItem(r, id, { status: 'absorbed', output: { kind: 'note', ref: `/v/m${n}.md` } }, at);
+  const lens = join(r, 'intake', 'outbox', 'lens');
+  mkdirSync(lens, { recursive: true });
+  writeFileSync(join(lens, '2026-10-05.jsonl'), [
+    { id: ids[0], at, lensVerdict: '보강', why: '첫째 근거가 칸을 보강한다.', target: 'VIDEO-2' },
+    { id: ids[1], at, lensVerdict: '보강', why: '둘째도 같은 칸을 보강한다.', target: 'VIDEO-2' },
+    { id: ids[2], at, lensVerdict: '대체 후보', why: '유료 의존을 줄일 수 있다.', target: 'video-gen' },
+    { id: ids[3], at, lensVerdict: '경쟁 대조', why: '편집 시간을 같은 조건에서 비교해야 한다.', target: 'editor' },
+    { id: ids[4], at, lensVerdict: '보강', why: '다른 칸을 보강한다.', target: 'VIDEO-3' },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const read = (p: string) => p.endsWith('.md') ? `## 한줄 결론\n${p} 의 결론이다.\n` : undefined;
+  const d = buildIntakeDigest(r, '2026-10-05', read);
+  const text = renderDigestTelegram(d);
+  expect(text.split('\n')[0]).toBe('흡수 6 → 우리에게 닿는 것 5');
+  const actions = text.match(/^A 그래서 무엇을 하나: .+$/gm) ?? [];
+  expect(new Set(actions).size).toBe(actions.length);
+  expect(actions.filter((a) => a.includes('칸 VIDEO-2 에 근거 추가')).length).toBe(2);
+  expect(text.match(/^S 무엇: /gm)?.length).toBe(3);
+  // Each block keeps S, C, A and its link together.
+  expect(text).toMatch(/S 무엇: [^\n]+\nC 우리에게 왜: [^\n]+\nA 그래서 무엇을 하나: [^\n]+\n🔗 원문 링크: /);
+  expect(text).toContain('닿는 것 2건 더');
+});
+
+test('a lens «why» that only names paths, even behind a label, is not shown as C (ACP must-fix)', async () => {
+  const { pathOnly } = await import('../src/intake-plane/digest.js');
+  expect(pathOnly('경로: catalog/resources.yaml')).toBe(true);
+  expect(pathOnly('`src/feature.ts:12`, scripts/x.ts')).toBe(true);
+  expect(pathOnly('file: src/a.ts')).toBe(true);
+  expect(pathOnly('video-gen 의 유료 렌더링 의존을 줄일 가능성이 있다.')).toBe(false);
 });

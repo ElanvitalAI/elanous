@@ -66,6 +66,7 @@ const baseDeps = {
   queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
   runExportLeakCheck: () => ({ measured: true, hits: [] }),
+  runExportImportCheck: () => ({ measured: true, hits: [], unseen: 0 }),
   // The PWA gate builds for real when a change reaches the bundle — scripts/ci-pwa-build-gate.test.ts owns its behaviour.
   runPwaGate: () => true,
   isInteractive: () => false,

@@ -518,6 +518,9 @@ describe('orchestrateSelfDev (S1 · parallel self-dev driver)', () => {
       }) };
     };
     setSelfOrchestrateSpawnForTesting(spawn);
+    // OLD-DOOR-CLOSE: this drives self orchestrate as the harness does, so it carries the internal stamp.
+    const previousEntrance = process.env.ELANOUS_HARNESS_ENTRANCE;
+    process.env.ELANOUS_HARNESS_ENTRANCE = 'harness-say';
     try {
       const run = program.parseAsync(['node', 'elanous', 'self', 'orchestrate', text, text, otherText, '--concurrency', '3', '--no-supervise', '--json']);
       for (let i = 0; i < 100 && releases.size < 2; i++) await Bun.sleep(10);
@@ -534,6 +537,7 @@ describe('orchestrateSelfDev (S1 · parallel self-dev driver)', () => {
       for (const space of active) releases.get(space)!();
       await run;
     } finally { for (const release of releases.values()) release(); setSelfOrchestrateSpawnForTesting(undefined); off(); }
+      if (previousEntrance === undefined) delete process.env.ELANOUS_HARNESS_ENTRANCE; else process.env.ELANOUS_HARNESS_ENTRANCE = previousEntrance;
   });
 
   test('goalId fallback serializes matching jobs without a plan branch', async () => {

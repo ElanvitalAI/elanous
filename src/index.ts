@@ -27,10 +27,12 @@ import { installDevCompletionGuard } from './self-dev/dev-completion-guard.js';
 import { buildOrchestrateDecomposePrepareArgs, normalizeOrchestrateRequest, splitOrchestrateGoalTexts } from './self-dev/self-orchestrate-runtime.js';
 import { CLI_ENTRANCE_BASELINE, evaluateCommandEntranceBaseline } from './self-dev/entrance-baseline.js';
 import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describeEntranceCommand, listEntrancesWithModelExposure, renderLaunchEntrances, summarizeEntrances, type EntranceId } from './self-dev/entrance-registry.js';
+import { isOldDoorInternalCall, refuseOldDoor } from './self-dev/old-door.js';
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
 import { registerPrivateLedgerCommands } from './cli/private-ledger-commands.js';
+import { registerKnowCommand } from './cli/know-cli.js';
 import { registerSeatRequestsCommands } from './cli/seat-requests-cli.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
@@ -53,6 +55,7 @@ export { runSchedule, scheduleCreatePlan } from './cli/schedule-cli.js';
 export type { ScheduleDispatch } from './cli/schedule-cli.js';
 import { registerReviewLoopOptions, buildReviewLoopOpts } from './agent-mission/review-loop-cli.js';
 import { registerCapabilitiesCommand } from './agent-mission/capabilities-cli.js';
+import { registerSupervisorMetricsCommand } from './agent-mission/supervisor-metrics-cli.js';
 import { agentBackendNames } from './agent-mission/driver.js';
 import { registerWhereCommand } from './cli/where-cli.js';
 import { registerShadowCommand } from './cli/shadow-cli.js';
@@ -70,6 +73,7 @@ import { registerFlowCommands } from './cli/flow-cli.js';
 import { registerModelWatchCommand } from './cli/model-watch-cli.js';
 import { registerIntakeCommands } from './cli/intake-cli.js';
 import { registerTasksCommands } from './cli/tasks-cli.js';
+import { registerBriefCommands } from './cli/brief-cli.js';
 import { registerLabelsCommands } from './cli/labels-cli.js';
 import { registerMsgCommands } from './cli/msg-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
@@ -875,6 +879,7 @@ registerUsageCommand(program);
 registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
+registerKnowCommand(program);
 registerFreezeCommands(program);
 registerFlowCommands(program);
 // HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
@@ -893,30 +898,60 @@ hqCmd.command('host').description('이 머신의 HQ 호스트 이름 설정')
   });
 hqCmd.command('lease').argument('<action>', 'acquire|renew|status|release')
   .option('--host <name>', '이 호스트 이름(기본 ~/.elanous-hq/host · hq.hostName · os.hostname)')
+  .option('--expected-holder <name>', 'release CAS: 해제할 임대의 예상 소유자')
+  .option('--expected-generation <number>', 'release CAS: 해제할 임대의 예상 세대')
   .option('--json', 'JSON 출력')
-  .action(async (action: string, opts: { host?: string; json?: boolean }) => {
+  .action(async (action: string, opts: { host?: string; expectedHolder?: string; expectedGeneration?: string; json?: boolean }) => {
     try {
       if (!['acquire', 'renew', 'status', 'release'].includes(action)) throw new CliUserError(`hq lease: unknown action ${action}`, 'acquire|renew|status|release');
+      if ((opts.expectedHolder !== undefined || opts.expectedGeneration !== undefined) && action !== 'release')
+        throw new CliUserError('hq lease: expected holder/generation are only valid for release');
+      if ((opts.expectedHolder === undefined) !== (opts.expectedGeneration === undefined)
+        || (opts.expectedGeneration !== undefined && (!/^[1-9]\d*$/.test(opts.expectedGeneration) || !Number.isSafeInteger(Number(opts.expectedGeneration)))))
+        throw new CliUserError('hq lease release: supply both --expected-holder and --expected-generation (positive integer)');
       await hqSink();
       const { hqLease } = await import('./hq/hq.js');
-      const result = hqLease(action as 'acquire', {}, opts.host ? { host: opts.host } : {});
+      const result = hqLease(action as 'acquire', {}, {
+        ...(opts.host ? { host: opts.host } : {}),
+        ...(opts.expectedHolder !== undefined ? { expectedHolder: opts.expectedHolder, expectedGeneration: Number(opts.expectedGeneration) } : {}),
+      });
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
       else console.log(result.ok ? `hq lease ${action}: ok${'record' in result && result.record ? ` · holder ${result.record.holder} · generation ${result.record.generation}` : ''}` : `hq lease ${action}: refused — ${'reason' in result ? result.reason : ''}`);
       if (!result.ok) process.exitCode = 2;
     } catch (error) { if (error instanceof CliUserError) throw error; console.error(`hq lease: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 hqCmd.command('promote').description('HQ 승격 런북 (기본 dry-run · --apply 일 때만 변경)')
-  .requiredOption('--to <host>', '승격 대상 호스트')
-  .option('--apply', '대기 사본을 승격 우주에 반영하고 넥서스·rescue 실행')
+  .option('--to <host>', '기존 임대 취득 후 승격 대상 호스트 (생략하면 mbp → node-b 전환 포함)')
+  .option('--apply', '임대 이전 및 승격 실행 · 터미널 확인 필수 (기존 --to 경로는 임대 보유 필요)')
   .option('--json', 'JSON 출력')
   .action(async (opts: { to: string; apply?: boolean; json?: boolean }) => {
     try {
+      if (!opts.to) {
+        const { transferHq, formatTransfer } = await import('./hq/transfer.js');
+        const result = transferHq('promote', opts.apply === true);
+        if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+        else console.log(formatTransfer(result));
+        if (!result.ok) process.exitCode = 1;
+        return;
+      }
       const { promoteHq, formatPromote } = await import('./hq/promote.js');
       const result = promoteHq(opts.to, opts.apply === true);
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
       else console.log(formatPromote(result));
       if (!result.ok) process.exitCode = 1;
     } catch (error) { console.error(`hq promote: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('handback').description('node-b → mbp 임대·크론 울타리 복귀 (기본 읽기 전용)')
+  .option('--apply', '각 검사를 통과한 뒤 터미널 확인을 받고 이전 실행')
+  .option('--json', '단계별 결과·저널 경로 JSON 출력')
+  .action(async (opts: { apply?: boolean; json?: boolean }) => {
+    try {
+      const { transferHq, formatTransfer } = await import('./hq/transfer.js');
+      const result = transferHq('handback', opts.apply === true);
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else console.log(formatTransfer(result));
+      if (!result.ok) process.exitCode = 1;
+    } catch (error) { console.error(`hq handback: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 hqCmd.command('heartbeat').description('보유자는 갱신 · 아니면 대기(보유자에 닿는지 중재자에 보고)').option('--json', 'JSON 출력')
   .action(async (opts: { json?: boolean }) => {
@@ -967,9 +1002,59 @@ registerSeatRequestsCommands(seatCmd);
 seatCmd.command('answer <askId> <answer>').description('자리 질문에 답을 남기고 원래 표면으로 회신 예약')
   .action(async (askId: string, answer: string) => {
     try {
-      const { answerSeatAsk } = await import('./seat-dispatch/seat-ask.js');
+      try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('seat-answer'); } catch { /* file trail remains available */ }
+      const { debug } = await import('./debug/log.js');
+      const { answerSeatAsk, deliverSeatAnswers, seatAskDeliveryInProgress, seatAskReplyInfo } = await import('./seat-dispatch/seat-ask.js');
       answerSeatAsk(askId, answer);
+      const { origin, askedAt, answeredAt } = seatAskReplyInfo(askId);
       console.log(`자리 답변 기록: ${askId}`);
+      if (origin.channel !== 'telegram') {
+        debug.log('seat.ask', 'reply-no-target', { id: askId, via: origin.channel });
+        console.log(`전달 대상 없음: ${askId} (${origin.channel})`);
+        return;
+      }
+      const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+      const elapsedMs = askedAt === null ? null : Math.max(0, answeredAt - askedAt);
+      if (!token) {
+        debug.log('seat.ask', 'reply-failed', { id: askId, via: 'telegram', reason: 'token-missing', elapsedMs });
+        console.log(`텔레그램 토큰 없음 (TELEGRAM_BOT_TOKEN): ${askId} · 회신 대기`);
+        return;
+      }
+      const botId = token.split(':')[0];
+      if (origin.botId && origin.botId !== botId) {
+        debug.log('seat.ask', 'reply-no-target', { id: askId, via: 'telegram', reason: 'bot-mismatch' });
+        console.log(`전달 대상 없음: ${askId} (수신 봇 불일치) · 회신 대기`);
+        return;
+      }
+      try {
+        let sent = false;
+        await deliverSeatAnswers({ askId, channel: 'telegram', botId, send: async (target, text) => {
+          if (target.channel !== 'telegram') throw new Error('seat ask belongs to another surface');
+          const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chat_id: target.chatId, text, reply_to_message_id: target.messageId,
+              ...(target.threadId === undefined ? {} : { message_thread_id: target.threadId }) }),
+          });
+          const result = await response.json() as { ok?: boolean; description?: string };
+          if (!response.ok || result.ok !== true) throw new Error(result.description ?? `Telegram HTTP ${response.status}`);
+          sent = true;
+        } });
+        if (!sent) {
+          if (seatAskDeliveryInProgress(askId)) {
+            debug.log('seat.ask', 'reply-in-progress', { id: askId, via: 'telegram', reason: 'claimed-by-other-worker' });
+            console.log(`다른 작업자가 전달 중: ${askId}`);
+          } else {
+            debug.log('seat.ask', 'reply-no-target', { id: askId, via: 'telegram', reason: 'not-claimed' });
+            console.log(`전달 대상 없음: ${askId} (회신 대기)`);
+          }
+          return;
+        }
+        debug.log('seat.ask', 'reply-sent', { id: askId, via: 'telegram', elapsedMs });
+        console.log(`텔레그램 회신 전달: ${askId} · 지연 ${elapsedMs === null ? '미상' : `${elapsedMs}ms`}`);
+      } catch (error) {
+        debug.log('seat.ask', 'reply-failed', { id: askId, via: 'telegram', reason: error instanceof Error ? error.message : String(error), elapsedMs });
+        console.log(`텔레그램 회신 실패: ${askId} · 회신 대기`);
+      }
     } catch (error) { console.error(`seat answer: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 seatCmd.command('loop').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
@@ -1178,8 +1263,10 @@ program.command('self-update')
   .option('--keep <n>', '설치 뒤 남길 최근 판 수(설치본은 current·직전 판, 체크아웃은 current·데몬 판 보호 · 0 이면 정리 안 함)', '3')
   .option('--alert', '실패(exit≠0)를 알림으로도 보냄 — 크론(무인) 실행용')
   .option('--skip-pwa-build', '체크아웃 설치 전 PWA 빌드를 명시적으로 건너뜀')
+  .option('--dev', '판 사이 dev 빌드 설치 — versions/<판>-dev.<sha12> · install.json channel=dev · 이전 versionDir 보존 (사람 승인 · 자동 아님)')
+  .option('--rollback', 'install.json 의 이전 versionDir 로 current 를 되돌린다 (이전이 없으면 거부)')
   .option('--auto <on|off|status>', '자동 갱신 — macOS launchd · Linux systemd 타이머가 매일 04:17 에 `self-update --restart --alert` (크론이 이미 부르면 켜지 않는다)')
-  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; auto?: string }) => {
+  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; dev?: boolean; rollback?: boolean; auto?: string }) => {
     if (opts.auto !== undefined) {
       if (!['on', 'off', 'status'].includes(opts.auto)) { console.error(`--auto 는 on · off · status 중 하나: ${opts.auto}`); process.exitCode = 2; return; }
       const { runAutoUpdate } = await import('./cli/update-auto.js');
@@ -4259,6 +4346,12 @@ selfCmd
   .option('--supervise-rounds <n>', '슈퍼바이저 재개 라운드 상한 (기본 3 · 끄려면 --no-supervise)')
   .option('--json', '구조화 출력 {stage, ok, branch, worktree, prUrl?, merged?}')
   .action(async (parts: string[], opts: { featureFile?: string; base?: string; draft?: boolean; openPr?: boolean; autoMerge?: boolean; autoReview?: boolean; maxWait?: string; json?: boolean; plan?: boolean; enhance?: boolean; ground?: boolean; observeOnly?: boolean }) => {
+    if (!isOldDoorInternalCall('self-implement')) {
+      const refused = refuseOldDoor('self-implement');
+      debug.log('harness.entrance', 'old-door-refused', { door: refused.door, caller: refused.caller });
+      ui.error(refused.message);
+      process.exit(refused.exitCode);
+    }
     if (opts.featureFile && parts.length > 0) { ui.error('--feature-file 과 위치 인자 feature 는 함께 줄 수 없다'); process.exit(2); }
     let feature: string;
     try { feature = (opts.featureFile ? readFileSync(opts.featureFile, 'utf8') : parts.join(' ')).trim(); }
@@ -4418,6 +4511,12 @@ const selfOrchestrateCmd = selfCmd
   .option('--help-all', '모든 orchestrate 옵션 표시')
   .action(function (this: Command, parts: string[], opts: { goalFile?: string[]; concurrency?: string; autoMerge?: boolean; autoReview?: boolean; openPr?: boolean; base?: string; teardown?: boolean; resume?: string; board?: boolean; decompose?: boolean; fabricDecompose?: boolean; maxTasks?: string; supervise?: boolean; superviseRounds?: string; json?: boolean }) {
     return (async () => {
+    if (!isOldDoorInternalCall('self-orchestrate')) {
+      const refused = refuseOldDoor('self-orchestrate');
+      debug.log('harness.entrance', 'old-door-refused', { door: refused.door, caller: refused.caller });
+      ui.error(refused.message);
+      process.exit(refused.exitCode);
+    }
     // 위치 인자는 종전처럼 분리하고 파일 입력은 파일당 한 골이다.
     let inputGoals: ReturnType<typeof readSelfOrchestrateGoals>;
     try { inputGoals = readSelfOrchestrateGoals(parts, opts.goalFile); }
@@ -5943,6 +6042,7 @@ agentCmd.hook('preAction', async (_thisCommand, actionCommand) => {
 });
 
 registerCapabilitiesCommand(agentCmd);
+registerSupervisorMetricsCommand(agentCmd);
 
 agentCmd.command('install-from-docs <tool>')
   .description('공식 설치 문서를 읽고 안전한 설치 줄을 선택한다 — sudo는 사람에게 넘긴다')
@@ -6814,6 +6914,11 @@ const selfDevCmd = program
       // ⭐ `--ask`/`--say` — 발사 절차 넷을 «한 로직»으로. 저작 → 전제 검사 → 발사.
       //   ⛔ 여기서 저작한 골 파일을 아래 `--file` 자리에 그대로 넘긴다(새 실행 경로를 만들지 않는다).
       let askAuthoredFile: string | undefined;
+      if (opts.ask !== undefined && !isOldDoorInternalCall('dev-ask')) {
+        const refused = refuseOldDoor('dev-ask');
+        debug.log('harness.entrance', 'old-door-refused', { door: refused.door, caller: refused.caller });
+        throw new DevPipelineError(refused.message);
+      }
       const retirementInput = opts.ask !== undefined
         ? { kind: 'ask' as const, value: opts.ask }
         : opts.say !== undefined
@@ -7538,6 +7643,7 @@ missionCmd
   });
 
 registerTasksCommands(program);
+registerBriefCommands(program);
 registerLabelsCommands(program);
 registerMsgCommands(program);
 

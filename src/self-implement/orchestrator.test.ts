@@ -10588,7 +10588,16 @@ describe('runSelfImplement — rework budget judgment', () => {
     if (gatePasses) {
       s2.reviewDiff = async () => ({ verdict: 'fail', mustFix: ['남은 지적'], shouldFix: [], summary: 'r', reviewed: true });
     }
-    const r = await runSelfImplement({ feature: 'F', goalFile: budgetGoalFile(), writeGoalExecutionRecord: () => {}, maxReworkRounds: 2, seams: s2 });
+    // Host contract: inside a Pod (ELANOUS_SUBSTRATE=pod) review-blocked work becomes a draft instead.
+    const substrate = process.env.ELANOUS_SUBSTRATE;
+    delete process.env.ELANOUS_SUBSTRATE;
+    let r: Awaited<ReturnType<typeof runSelfImplement>>;
+    try {
+      r = await runSelfImplement({ feature: 'F', goalFile: budgetGoalFile(), writeGoalExecutionRecord: () => {}, maxReworkRounds: 2, seams: s2 });
+    } finally {
+      if (substrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+      else process.env.ELANOUS_SUBSTRATE = substrate;
+    }
 
     expect(r.stage).toBe(gatePasses ? 'pr-opened' : 'gate-failed');
     expect(order).toEqual(gatePasses ? ['preserve'] : ['preserve', 'launch']);
@@ -15416,6 +15425,14 @@ describe('blocked draft PR open failure body preservation', () => {
     expect(typeof defaultSeams().persistPrBodyArtifact).toBe('function');
   });
 
+  test('defaultSeams follow-up names a state root and the harness queue, and never writes them while the seam is only constructed', () => {
+    const followUp = defaultSeams().followUp;
+    expect(typeof followUp?.stateRoot).toBe('string');
+    expect(followUp?.stateRoot?.length).toBeGreaterThan(0);
+    expect(typeof followUp?.enqueue).toBe('function');
+    expect(followUp?.mode === 'shadow' || followUp?.mode === 'live').toBe(true);
+  });
+
   test('persists the assembled review verdict and must-fix body when opening the blocked draft PR fails', async () => {
     const persisted: Array<{ origin: string; body: string; originalChars: number }> = [];
     const progress: string[] = [];
@@ -15949,6 +15966,107 @@ describe('runSelfImplement — 예산 판정기는 must-fix 문장을 받는다'
       expect(budget!.note).toContain(finding.slice(0, 40));
     }
     expect(budget!.note).not.toMatch(/^`?[A-Za-z]+`?(\s·\s|$)/);
+  });
+});
+
+describe('runSelfImplement — follow-up draft after a merged PR', () => {
+  function followUpCapture(seed: import('./follow-up-goals.js').FollowUpDraftRecord[] = []) {
+    const drafts = [...seed];
+    const queued: Array<{ seat: string; say: string }> = [];
+    return {
+      drafts,
+      queued,
+      followUp: {
+        mode: 'shadow' as 'shadow' | 'live',
+        readDrafts: () => drafts,
+        appendDraft: (record: import('./follow-up-goals.js').FollowUpDraftRecord) => { drafts.push(record); },
+        enqueue: async (item: { seat: 'OP' | 'TC' | 'MK' | 'UX'; say: string }) => { queued.push(item); },
+        cellOwner: () => 'UX',
+      },
+    };
+  }
+
+  test('a merged result with one should-fix keeps its merge fields and writes one draft from the real review', async () => {
+    const should = '마지막 should-fix 원문';
+    const capture = followUpCapture();
+    const s = revSeams({ reviews: [{ verdict: 'warn', mustFix: [], shouldFix: [should], reviewed: true }] });
+    s.followUp = capture.followUp;
+    const result = await runSelfImplement({
+      feature: 'FOLLOWUP-LOOP 병합 뒤 연결골',
+      goalId: 'FOLLOWUP-LOOP',
+      autoMerge: true,
+      seams: s,
+    });
+    expect(result).toMatchObject({ ok: true, stage: 'merged', merged: true, prNumber: 9 });
+    expect(result).not.toHaveProperty('followUpDraft');
+    expect(result).not.toHaveProperty('followUpMustFix');
+    expect(capture.drafts).toHaveLength(1);
+    expect(capture.drafts[0]).toMatchObject({ prNumber: 9, cellId: 'FOLLOWUP-LOOP', depth: 1, kind: 'draft', queued: false });
+    expect(capture.drafts[0]!.remainings).toContain(should);
+    expect(capture.queued).toHaveLength(0);
+  });
+
+  test('the same merged PR is drafted once, and a depth-3 chain asks for an OP card instead of another draft', async () => {
+    const capture = followUpCapture([1, 2, 3].map((depth) => ({
+      prNumber: 100 + depth,
+      cellId: 'FOLLOWUP-LOOP',
+      depth,
+      draftHash: `prior-${depth}`,
+      kind: 'draft' as const,
+      originalAskFirstLine: 'FOLLOWUP-LOOP',
+      remainings: [`prior ${depth}`],
+      queued: false,
+    })));
+    const s = revSeams({ reviews: [{ verdict: 'warn', mustFix: [], shouldFix: ['깊이 넘는 should-fix'], reviewed: true }] });
+    s.followUp = capture.followUp;
+    const first = await runSelfImplement({ feature: 'FOLLOWUP-LOOP depth', goalId: 'FOLLOWUP-LOOP', autoMerge: true, seams: s });
+    const second = await runSelfImplement({ feature: 'FOLLOWUP-LOOP depth', goalId: 'FOLLOWUP-LOOP', autoMerge: true, seams: s });
+    expect(first).toMatchObject({ ok: true, stage: 'merged', merged: true, prNumber: 9 });
+    expect(second).toMatchObject({ ok: true, stage: 'merged', merged: true, prNumber: 9 });
+    expect(capture.drafts.filter((record) => record.prNumber === 9)).toHaveLength(1);
+    expect(capture.drafts.at(-1)).toMatchObject({ kind: 'op-card-required', depth: 4, note: 'OP 카드 필요', queued: false });
+    expect(capture.queued).toHaveLength(0);
+  });
+
+  test('live enqueues the merged follow-up once at the cell owner seat', async () => {
+    const capture = followUpCapture();
+    capture.followUp.mode = 'live';
+    const snapshots: Array<{ queued: boolean; queuedCalls: number }> = [];
+    const appendDraft = capture.followUp.appendDraft;
+    capture.followUp.appendDraft = (record) => { snapshots.push({ queued: record.queued, queuedCalls: capture.queued.length }); appendDraft(record); };
+    const s = revSeams({ reviews: [{ verdict: 'warn', mustFix: [], shouldFix: ['남은 should-fix'], reviewed: true }] });
+    s.followUp = capture.followUp;
+    const result = await runSelfImplement({ feature: 'FOLLOWUP-LOOP live', goalId: 'FOLLOWUP-LOOP', autoMerge: true, seams: s });
+    expect(result).toMatchObject({ stage: 'merged', merged: true, prNumber: 9 });
+    // 원장에 먼저 한 줄(대기 전), 대기열 확정 뒤 한 줄 더 — 행마다 쓰인 순간의 스냅샷으로 순서를 잰다.
+    expect(snapshots).toEqual([{ queued: false, queuedCalls: 0 }, { queued: true, queuedCalls: 1 }]);
+    expect(capture.drafts.at(-1)).toMatchObject({ prNumber: 9, queued: true, seat: 'UX' });
+    expect(capture.queued).toEqual([expect.objectContaining({ seat: 'UX' })]);
+  });
+
+  test('review-budget acceptance drafts the must-fix the review actually left unresolved (no carried seam)', async () => {
+    const capture = followUpCapture();
+    const s = revSeams({ reviews: [
+      { verdict: 'fail', mustFix: ['실제로 남은 must-fix 하나'] },
+      { verdict: 'fail', mustFix: ['실제로 남은 must-fix 하나'] },
+    ] });
+    s.openPr = async () => ({ url: 'https://pr/accepted', number: 88 });
+    s.followUp = capture.followUp;
+    const result = await runSelfImplement({ feature: 'FOLLOWUP-LOOP budget', goalId: 'FOLLOWUP-LOOP', autoMerge: true, maxReworkRounds: 1, seams: s });
+    expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: 'review-budget-follow-up-required', prNumber: 88 });
+    expect(capture.drafts).toHaveLength(1);
+    expect(capture.drafts[0]!.prNumber).toBe(88);
+    expect(capture.drafts[0]!.remainings).toContain('실제로 남은 must-fix 하나');
+  });
+
+  test('a merged result with nothing remaining writes no draft and does not change the merge result', async () => {
+    const capture = followUpCapture();
+    const s = revSeams({ reviews: [{ verdict: 'pass', mustFix: [], shouldFix: [], reviewed: true }] });
+    s.followUp = capture.followUp;
+    const result = await runSelfImplement({ feature: 'FOLLOWUP-LOOP empty', goalId: 'FOLLOWUP-LOOP', autoMerge: true, seams: s });
+    expect(result).toMatchObject({ ok: true, stage: 'merged', merged: true });
+    expect(capture.drafts).toHaveLength(0);
+    expect(capture.queued).toHaveLength(0);
   });
 });
 

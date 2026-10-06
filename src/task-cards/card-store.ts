@@ -32,7 +32,7 @@ export interface AppendSectionInput {
 type CardEvent =
   | { type: 'created'; id: string; goalId: string; title: string; createdAt: string }
   | { type: 'section'; key: string; owner: string; content: string; createdAt: string }
-  | { type: 'closed'; createdAt: string };
+  | { type: 'closed'; createdAt: string; reason?: string };
 
 /** RFC §3 (내부 문서 `RFC-execution-and-landing-loop-agents-parallel-first-2026-09-29`) — each card section has one owner.
  *  A key is `<section>` or `<section>:<idempotency key>`: the same section can be appended many times over a
@@ -197,13 +197,15 @@ export class CardStore {
     }).immediate();
   }
 
-  closeCard(id: string): TaskCard {
+  closeCard(id: string, reason?: string): TaskCard {
+    if (reason !== undefined && !reason.trim()) throw new Error('Close reason is required');
     return this.db.transaction(() => {
       this.reconcile();
       const card = this.readCard(id);
       if (!card) throw new Error(`Card not found: ${id}`);
       if (card.status === 'closed') return card;
-      this.append(id, { type: 'closed', createdAt: new Date().toISOString() });
+      this.append(id, { type: 'closed', createdAt: new Date().toISOString(),
+        ...(reason === undefined ? {} : { reason: redactSecrets(reason.trim()) }) });
       return { ...card, status: 'closed' as const };
     }).immediate();
   }

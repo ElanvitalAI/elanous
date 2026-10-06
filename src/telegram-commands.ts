@@ -233,6 +233,11 @@ export function parseTelegramSlash(text: string, commands: TgSlashCommand[]): Tg
  *  caller (handleIncoming) can send it directly without going through
  *  dispatchTelegramSlash when it already has the parse result. */
 export function buildUnknownSlashReply(name: string, commands: TgSlashCommand[]): string {
+  const unsupported = buildBotSlashCatalog({
+    surface: 'telegram', coreCommands: SLASH_COMMANDS, maturity: FEATURE_MATURITY,
+    handledCommands: commands,
+  }).unsupportedReply(name);
+  if (unsupported) return unsupported;
   const names = commands.map(c => `/${c.name}`).join(' ');
   return `Unknown command: /${name}\nAvailable: ${names}`;
 }

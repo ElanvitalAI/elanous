@@ -215,9 +215,26 @@ function landingClause(text: string): string {
   // A candidate with broken punctuation is not repaired by deleting its unmatched character.
   if (!balanced(text)) return '';
   // release/next.md lines lead with their kind («feat — …»); the headline is the change, not the kind.
-  const body = text.replace(/^-\s+/, '').replace(/^(feat|fix|internal|docs|test|perf|refactor|chore|ops|security|breaking)\s+[—–-]\s+/i, '');
-  const clause = firstClause(body);
+  const trimmed = text.replace(/^-\s+/, '');
+  // Release bookkeeping (version bumps, «release 0.2.14» notes) is never this release's headline (0.2.15 real note).
+  if (/^(?:version|release)\s*:/i.test(trimmed) || /^(?:docs|chore)(?:\([^)]*\))?\s*:\s*release\s+v?\d/i.test(trimmed)) return '';
+  // Commit subjects lead with a conventional prefix («docs(marketing): …»); the headline is the change itself.
+  const body = trimmed.replace(/^(feat|fix|internal|docs|test|perf|refactor|chore|ops|security|breaking)\s+[—–-]\s+/i, '')
+    .replace(/^[a-z]+(?:\([^)]*\))?!?:\s+/i, '');
+  const clause = shortClause(firstClause(body));
   return balanced(clause) ? clause : '';
+}
+
+/** A headline clause longer than 60 characters is cut at its first comma/semicolon, else at a word boundary with «…». */
+function shortClause(clause: string): string {
+  const chars = [...clause];
+  if (chars.length <= 60) return clause;
+  const head = chars.slice(0, 60).join('');
+  // The first comma/semicolon after a minimal 10-character lead ends the clause.
+  const stop = head.slice(10).search(/[,;，；]/);
+  if (stop >= 0) return head.slice(0, 10 + stop);
+  const space = head.lastIndexOf(' ');
+  return `${(space >= 20 ? head.slice(0, space) : head).trimEnd()}…`;
 }
 
 function versionKey(value: string): number[] | null {

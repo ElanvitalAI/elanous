@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { spawn, type SpawnOptions } from 'node:child_process';
 import { RequestError } from '@agentclientprotocol/sdk';
 import { AcpAgent, AcpAuthRequiredError } from './client.js';
 import { ACP_BACKENDS } from './backend-registry.js';
+import { claudeBackend } from '../agent-mission/driver.js';
 import { debug } from '../debug/log.js';
 
 // A real stdio ACP peer: exercises initialize, session/new, and the vendor notification.
@@ -83,6 +85,83 @@ async function startPeer(authRequired: boolean, authStage: 'session' | 'prompt' 
 }
 
 describe('Claude ACP subscription authentication', () => {
+  test('spawn injection receives a key-free Claude environment and one value-free auth-source event', async () => {
+    const billingKeys = claudeBackend.scrubEnv!;
+    expect(billingKeys).toEqual(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']);
+    const before = Object.fromEntries(billingKeys.map(key => [key, process.env[key]]));
+    const secret = 'billing-secret-should-never-be-logged';
+    const calls: Array<{ command: string; env: NodeJS.ProcessEnv }> = [];
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const spawnChild = ((command: string, _args: readonly string[], options: SpawnOptions) => {
+      calls.push({ command, env: { ...options.env } });
+      return spawn(process.execPath, ['-e', peer], { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
+    }) as typeof spawn;
+    for (const key of billingKeys) process.env[key] = secret;
+    logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      events.push({ category, event, data });
+    });
+    const agent = new AcpAgent({ backendId: 'claude', cwd: process.cwd(), spawnChild, log: () => {} });
+    try {
+      await agent.start();
+      expect(await agent.newSession()).toBe('logged-in-session');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.command).toContain('claude');
+      for (const key of billingKeys) expect(calls[0]!.env).not.toHaveProperty(key);
+      expect(events.filter(entry => entry.category === 'acp.claude' && entry.event === 'auth-source'))
+        .toEqual([{ category: 'acp.claude', event: 'auth-source',
+          data: { apiKeyPresent: false, source: 'subscription' } }]);
+      expect(JSON.stringify(events)).not.toContain(secret);
+    } finally {
+      await agent.stop();
+      for (const key of billingKeys) {
+        if (before[key] === undefined) delete process.env[key];
+        else process.env[key] = before[key];
+      }
+    }
+  });
+
+  test('injected post-scrub billing authentication refuses launch; test mode records but does not block', async () => {
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorTestHome = process.env.ELANOUS_TEST_HOME;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    let launches = 0;
+    const spawnChild = ((_command: string, _args: readonly string[], options: SpawnOptions) => {
+      launches++;
+      return spawn(process.execPath, ['-e', peer], { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
+    }) as typeof spawn;
+    logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      events.push({ category, event, data });
+    });
+    const agent = new AcpAgent({ backendId: 'claude', cwd: process.cwd(), spawnChild, log: () => {} });
+    Object.assign(agent, { env: { ANTHROPIC_AUTH_TOKEN: 'post-scrub-injected-secret' } });
+    try {
+      delete process.env.NODE_ENV;
+      delete process.env.ELANOUS_TEST_HOME;
+      await expect(agent.start()).rejects.toThrow('ACP Claude refused: billing authentication environment remains after scrub');
+      expect(launches).toBe(0);
+      expect(events.filter(entry => entry.category === 'acp.claude' && entry.event === 'auth-source'))
+        .toEqual([{ category: 'acp.claude', event: 'auth-source',
+          data: { apiKeyPresent: true, source: 'billing-env' } }]);
+      expect(JSON.stringify(events)).not.toContain('post-scrub-injected-secret');
+
+      process.env.NODE_ENV = 'test';
+      await agent.start();
+      expect(launches).toBe(1);
+      await agent.stop();
+      delete process.env.NODE_ENV;
+      process.env.ELANOUS_TEST_HOME = '/tmp/acp-claude-test-home';
+      await agent.start();
+      expect(launches).toBe(2);
+      expect(events.filter(entry => entry.category === 'acp.claude' && entry.event === 'auth-source')).toHaveLength(3);
+    } finally {
+      await agent.stop();
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+      if (priorTestHome === undefined) delete process.env.ELANOUS_TEST_HOME;
+      else process.env.ELANOUS_TEST_HOME = priorTestHome;
+    }
+  });
   test('auth-required session/new ends with a login hint, without calling authenticate', async () => {
     const { agent, logs, events } = await startPeer(true);
     try {

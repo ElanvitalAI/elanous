@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve, join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, readFileSync, lstatSync, readlinkSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { childPath, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
+import { childPath, liveRestartBlocked, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
 import type { RestartNeededResult } from './nexus-restart-needed.js';
 
 const checkout = resolve(import.meta.dir, '../..');
@@ -31,6 +31,7 @@ function fixture(decision: RestartNeededResult = { exitCode: 11, verdict: 'resta
     alert: (text) => { calls.push(`alert ${text.slice(0, 20)}`); },
     os: 'darwin',
     uid: 501,
+    allowLiveRestart: true,
     out: { log: (s) => lines.push(s), error: (s) => lines.push(s) },
   };
   return { deps, calls, lines, setDirty: () => { dirty = true; }, failInstall: () => { installFails = true; } };
@@ -686,7 +687,151 @@ describe('self-update — relay (T5 · 2026-09-24)', () => {
   });
 });
 
+import { debug } from '../debug/log.js';
 import { formatUpdateNotice } from './self-update.js';
+describe('self-update --dev and --rollback (temp install root only)', () => {
+  const sha12 = sha.slice(0, 12);
+  function devRoot() {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-dev-install-'));
+    mkdirSync(join(root, 'versions', '0.2.15-aaaaaaaaaaaa', 'node_modules', 'elanous', 'bin'), { recursive: true });
+    writeFileSync(join(root, 'versions', '0.2.15-aaaaaaaaaaaa', 'node_modules', 'elanous', 'bin', 'elanous.mjs'), '// entry\n');
+    symlinkSync('versions/0.2.15-aaaaaaaaaaaa', join(root, 'current'));
+    writeFileSync(join(root, 'install.json'), JSON.stringify({
+      version: '0.2.15', versionDir: 'versions/0.2.15-aaaaaaaaaaaa', source: checkout, installedAt: '2026-10-01T00:00:00.000Z', commit: 'aaaaaaaaaaaa',
+    }));
+    return root;
+  }
+  // The fake installer behaves like scripts/install.sh: lays down versions/<ver>-<sha12> (with or without content), moves current, writes install.json.
+  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean } = {}): SelfUpdateDeps => ({
+    ...fixture().deps,
+    installRoot: root,
+    packageVersion: () => '0.2.16-dev.0',
+    allowLiveRestart: false,
+    run: (cmd) => {
+      if (cmd !== 'bash') return { status: 0, stderr: '' };
+      const name = `0.2.16-dev.0-${sha12}`;
+      mkdirSync(join(root, 'versions', name, 'node_modules', 'elanous', 'bin'), { recursive: true });
+      if (!opts.empty) writeFileSync(join(root, 'versions', name, 'node_modules', 'elanous', 'bin', 'elanous.mjs'), '// entry\n');
+      rmSync(join(root, 'current'), { force: true });
+      symlinkSync(`versions/${name}`, join(root, 'current'));
+      // install.sh moves current first (ln -sfn) and can fail afterwards, before writing install.json.
+      if (opts.failAfterRelink) return { status: 1, stderr: 'package.json unreadable' };
+      writeFileSync(join(root, 'install.json'), JSON.stringify({ version: '0.2.16-dev.0', versionDir: `versions/${name}`, source: checkout, installedAt: '2026-10-06T00:00:00.000Z', commit: sha12 }));
+      return { status: 0, stderr: '' };
+    },
+  });
+
+  test('--dev installs versions/<ver>-dev.<sha12>, moves current, and keeps channel=dev plus previous', async () => {
+    const root = devRoot();
+    try {
+      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root));
+      expect(result).toMatchObject({ exitCode: 0, channel: 'dev', current: `versions/0.2.16-dev.0-${sha12}`, previous: 'versions/0.2.15-aaaaaaaaaaaa', restarted: false });
+      expect(readlinkSync(join(root, 'current'))).toBe(`versions/0.2.16-dev.0-${sha12}`);
+      expect(lstatSync(join(root, 'versions', `0.2.16-dev.0-${sha12}`, 'node_modules', 'elanous', 'bin', 'elanous.mjs')).isFile()).toBe(true);
+      const record = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8')) as { channel?: string; previous?: string; versionDir?: string; commit?: string };
+      expect(record).toMatchObject({ channel: 'dev', previous: 'versions/0.2.15-aaaaaaaaaaaa', versionDir: `versions/0.2.16-dev.0-${sha12}`, commit: sha12 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('--dev refuses an empty install: current and install.json stay on the previous version (10-06 05:30 incident)', async () => {
+    const root = devRoot();
+    try {
+      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { empty: true }));
+      expect(result.exitCode).toBe(1);
+      expect(result.reason).toContain('빈 판');
+      expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+      expect(JSON.parse(readFileSync(join(root, 'install.json'), 'utf8'))).toMatchObject({ versionDir: 'versions/0.2.15-aaaaaaaaaaaa', commit: 'aaaaaaaaaaaa' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('--dev restores current and install.json when the installer moves current and then fails (rc≠0)', async () => {
+    const root = devRoot();
+    try {
+      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { empty: true, failAfterRelink: true }));
+      expect(result.exitCode).toBe(1);
+      expect(result.reason).toContain('설치기 실패');
+      expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+      expect(JSON.parse(readFileSync(join(root, 'install.json'), 'utf8'))).toMatchObject({ versionDir: 'versions/0.2.15-aaaaaaaaaaaa', commit: 'aaaaaaaaaaaa' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('current is never relinked to a version directory without its entry file', async () => {
+    const { relinkInstallCurrent } = await import('./self-update.js');
+    const root = devRoot();
+    try {
+      mkdirSync(join(root, 'versions', '0.2.16-bbbbbbbbbbbb'), { recursive: true });
+      expect(() => relinkInstallCurrent(root, '0.2.16-bbbbbbbbbbbb')).toThrow('빈 판');
+      expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('--rollback returns current to previous; omitting previous makes rollback fail', async () => {
+    const root = devRoot();
+    try {
+      await runSelfUpdate({ dev: true, from: checkout }, devDeps(root));
+      const back = await runSelfUpdate({ rollback: true }, devDeps(root));
+      expect(back.exitCode).toBe(0);
+      expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+      expect(back.reason).toContain('0.2.15-aaaaaaaaaaaa');
+      // EDGE-RAIL-VERIFY: rollback metadata matches the restored version (05:30 incident left commit=0010… after rollback).
+      expect(JSON.parse(readFileSync(join(root, 'install.json'), 'utf8'))).toMatchObject({ version: '0.2.15', commit: 'aaaaaaaaaaaa', versionDir: 'versions/0.2.15-aaaaaaaaaaaa' });
+      const wiped = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8')) as { previous?: string };
+      delete wiped.previous;
+      writeFileSync(join(root, 'install.json'), JSON.stringify(wiped));
+      const refused = await runSelfUpdate({ rollback: true }, devDeps(root));
+      expect(refused.exitCode).toBe(2);
+      expect(refused.reason).toContain('rollback 거부');
+      expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a release update over a dev channel logs dev-replaced and the test guard performs zero live restarts', async () => {
+    const prefix = mkdtempSync(join(tmpdir(), 'elanous-dev-replaced-'));
+    const packageRoot = join(prefix, 'versions', '0.2.16-dev.0-dev.abcdef123456', 'node_modules', 'elanous');
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(join(prefix, 'install.json'), JSON.stringify({
+      version: '0.2.16-dev.0', versionDir: 'versions/0.2.16-dev.0-dev.abcdef123456', commit: sha12, channel: 'dev', previous: 'versions/0.2.15-aaaaaaaaaaaa',
+      source: 'https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz',
+    }));
+    const seen: Array<Record<string, unknown>> = [];
+    const original = debug.log.bind(debug);
+    debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'self-update' && event === 'dev-replaced') seen.push({ ...(data ?? {}) });
+      return undefined;
+    }) as typeof debug.log;
+    const calls: string[] = [];
+    try {
+      const result = await runReleaseUpdate({ restart: true }, {
+        packageRoot,
+        fetchInstaller: async () => 'echo installer',
+        run: (command) => {
+          calls.push(command);
+          if (command === 'bash') {
+            writeFileSync(join(prefix, 'install.json'), JSON.stringify({ version: '0.2.16', versionDir: 'versions/0.2.16', commit: 'bbbbbbbbbbbb' }));
+          }
+          return { status: 0, stderr: '' };
+        },
+        os: 'darwin', uid: 501,
+        out: { log: () => {}, error: () => {} },
+      });
+      expect(seen).toEqual([{ from: 'versions/0.2.16-dev.0-dev.abcdef123456', to: 'versions/0.2.16' }]);
+      expect(result.exitCode).toBe(0);
+      expect(calls).toContain('bash');
+    } finally {
+      debug.log = original;
+      rmSync(prefix, { recursive: true, force: true });
+    }
+    expect(liveRestartBlocked({ ...process.env, NODE_ENV: 'test' })).toBe(true);
+    expect(liveRestartBlocked({ ...process.env, NODE_ENV: 'production', ELANOUS_TEST_HOME: '/tmp/elanous-test-home' })).toBe(true);
+    const guarded = fixture();
+    delete guarded.deps.allowLiveRestart;
+    const guardedResult = await runSelfUpdate({ restart: true }, guarded.deps);
+    expect(guardedResult.restarted).toBe(false);
+    expect(guardedResult.reason).toContain('실물 재시작 0');
+    expect(guarded.calls.some((call) => call.startsWith('launchctl') || call.startsWith('systemctl'))).toBe(false);
+  });
+});
+
 test('판올림 알림 — 재시작이면 «새로고침» 두 줄 · 판이 없으면 null', () => {
   const t = formatUpdateNotice({ installedVersion: '0.2.4-dev.0-abc', restarted: true, decision: null })!;
   expect(t).toContain('0.2.4-dev.0-abc');

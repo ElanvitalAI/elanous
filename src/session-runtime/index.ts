@@ -66,6 +66,8 @@ export {
 export {
   fetchApiWithRetry,
   ApiHttpError,
+  OverloadFailoverError,
+  recordLlmCallOutcome,
   type FetchApiWithRetryOpts,
 } from './retry-api.js';
 

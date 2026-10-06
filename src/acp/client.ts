@@ -302,7 +302,7 @@ const ACP_FORCED_BILLING_ENV_BY_BACKEND: Readonly<Record<string, Readonly<Record
 };
 
 function scrubAcpBillingEnv(spec: AcpBackendSpec, env: NodeJS.ProcessEnv): AcpBillingEnvScrubObservation {
-  const billingEnvScrubEnabled = getUserConfig().acp.scrubBillingEnv !== false;
+  const billingEnvScrubEnabled = spec.id === 'claude' || getUserConfig().acp.scrubBillingEnv !== false;
   const scrubbedBillingEnv: string[] = [];
   const forcedBillingEnv: string[] = [];
   if (billingEnvScrubEnabled) {
@@ -378,6 +378,8 @@ export interface AcpAgentOpts {
   /** Extra env vars to pass to the subprocess. Inherits from
    *  process.env unless overridden. */
   env?: Record<string, string>;
+  /** Test seam: replace the child process without launching Claude. */
+  spawnChild?: typeof spawn;
   /** Session-scoped Codex app-server configuration arguments. Ignored by
    *  non-Codex ACP backends. */
   codexArgs?: readonly string[];
@@ -419,6 +421,7 @@ export class AcpAgent {
   private readonly spec: AcpBackendSpec;
   private readonly cwd: string;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly spawnChild: typeof spawn;
   private readonly billingEnvScrub: AcpBillingEnvScrubObservation;
   private readonly log: (msg: string) => void;
   private readonly onCapabilities: ((capabilities: ElanousCapabilities) => void) | undefined;
@@ -461,6 +464,7 @@ export class AcpAgent {
     }
     this.billingEnvScrub = scrubAcpBillingEnv(this.spec, cleanEnv);
     this.env = cleanEnv;
+    this.spawnChild = opts.spawnChild ?? spawn;
     this.log = opts.log ?? ((m) => console.error(`[acp:${this.spec.id}] ${m}`));
     this.onCapabilities = opts.onCapabilities;
     this.permissionApprover = opts.permissionApprover ?? null;
@@ -501,7 +505,18 @@ export class AcpAgent {
       throw new Error(`acp spawn: cwd does not exist: ${this.cwd}`);
     }
 
-    const child = spawn(resolvedBin.path, this.spec.args, {
+    if (this.spec.id === 'claude') {
+      const remaining = (claudeBackend.scrubEnv ?? []).filter(key => key in this.env);
+      debug.log('acp.claude', 'auth-source', {
+        apiKeyPresent: remaining.length > 0,
+        source: remaining.length > 0 ? 'billing-env' : 'subscription',
+      });
+      if (remaining.length > 0 && process.env.NODE_ENV !== 'test' && !process.env.ELANOUS_TEST_HOME) {
+        throw new Error('ACP Claude refused: billing authentication environment remains after scrub');
+      }
+    }
+
+    const child = this.spawnChild(resolvedBin.path, this.spec.args, {
       cwd: this.cwd,
       env: this.env,
       stdio: ['pipe', 'pipe', 'pipe'],

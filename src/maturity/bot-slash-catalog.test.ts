@@ -26,7 +26,7 @@ describe('buildBotSlashCatalog', () => {
     expect(telegram.commands.some((entry) => entry.name === 'nonexistent')).toBe(false);
     expect(telegram.commands.some((entry) => entry.name === 'run-skill')).toBe(false); // Telegram cannot register hyphenated names.
     expect(telegram.commands.some((entry) => entry.name === 'model')).toBe(false);
-    expect(telegram.unsupportedReply('model')).toBeNull();
+    expect(telegram.unsupportedReply('model')).toBe('/model은(는) 텔레그램에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.');
     expect(telegram.unsupportedReply('not-in-registry')).toBeNull();
     const unsupportedTelegram = buildBotSlashCatalog({
       surface: 'telegram', coreCommands: [{ name: 'harness', description: 'Core harness' }], maturity,
@@ -48,7 +48,7 @@ describe('buildBotSlashCatalog', () => {
       expect(discord.unsupportedReply(name)).toBeNull();
     }
     expect(discord.commands.some((entry) => entry.name === 'run-skill')).toBe(false);
-    expect(discord.unsupportedReply('run-skill')).toBeNull();
+    expect(discord.unsupportedReply('run-skill')).toBe('/run-skill은(는) 디스코드에서 아직 지원되지 않습니다. TUI에서 /run-skill을(를) 사용하세요.');
     const unsupportedDiscord = buildBotSlashCatalog({
       surface: 'discord', coreCommands: [{ name: 'persona', description: 'Core persona' }], maturity,
       handledCommands: [],
@@ -83,6 +83,20 @@ describe('buildBotSlashCatalog', () => {
       expect(catalog.commands.find((entry) => entry.name === name)?.supported).toBe(true);
     }
     expect(catalog.commands.filter((entry) => entry.name === 'status')).toHaveLength(1);
-    expect(catalog.unsupportedReply('model')).toBeNull();
+    expect(catalog.unsupportedReply('model')).toBe('/model은(는) 텔레그램에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.');
+    const privateCommand = buildBotSlashCatalog({
+      surface: 'telegram', coreCommands: [{ name: 'system-only', description: 'Private' }],
+      maturity: { tuiSlash: { 'system-only': 'system' }, telegramCommand: {}, discordCommand: {} },
+      handledCommands: [],
+    });
+    expect(privateCommand.unsupportedReply('system-only')).toBeNull();
+    expect(privateCommand.commands).toEqual([]);
+    const privateDiscordCommand = buildBotSlashCatalog({
+      surface: 'discord', coreCommands: [{ name: 'system-only', description: 'Private' }],
+      maturity: { tuiSlash: { 'system-only': 'system' }, telegramCommand: {}, discordCommand: {} },
+      handledCommands: [],
+    });
+    expect(privateDiscordCommand.unsupportedReply('system-only')).toBeNull();
+    expect(privateDiscordCommand.commands).toEqual([]);
   });
 });

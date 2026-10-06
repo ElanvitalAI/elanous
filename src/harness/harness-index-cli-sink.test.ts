@@ -2,6 +2,7 @@ import { setDefaultTimeout, beforeAll, describe, expect, mock, test } from 'bun:
 import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import * as orchestrateCli from '../self-dev/orchestrate-cli.js';
+import { OLD_DOOR_STAMP_ENV } from '../self-dev/old-door.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -67,7 +68,16 @@ describe('production harness CLI sink wiring', () => {
     orchestrateInputs.length = 0;
     const args = ['objective', '--concurrency', '4', '--auto-review', '--json'];
     await program.parseAsync(['node', 'elanous', 'harness', 'orchestrate', ...args]);
-    await program.parseAsync(['node', 'elanous', 'self', 'orchestrate', ...args]);
+    // `self orchestrate` is closed to outside callers (OLD-DOOR-CLOSE) and exits the process; the harness stamp keeps
+    // this in-process call on the internal entrance so the test runner survives.
+    const stamp = process.env[OLD_DOOR_STAMP_ENV];
+    process.env[OLD_DOOR_STAMP_ENV] = 'cli-self-orchestrate';
+    try {
+      await program.parseAsync(['node', 'elanous', 'self', 'orchestrate', ...args]);
+    } finally {
+      if (stamp === undefined) delete process.env[OLD_DOOR_STAMP_ENV];
+      else process.env[OLD_DOOR_STAMP_ENV] = stamp;
+    }
 
     expect(orchestrateInputs).toHaveLength(2);
     for (const input of orchestrateInputs) {

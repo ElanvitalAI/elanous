@@ -38,7 +38,10 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 /** 자식 컨테이너 «요청» — 🩸 2026-09-27: limits 만 두면 k8s 가 requests=limits(cpu 4)로 잡아, 32코어 노드에
  *  «자리 요청»이 88% 차서 잡이 Pending 인데 실사용은 14%였다(풀 25 자리 중 ~8 만 떴다). 상한(limits)은 그대로 두고
  *  예약만 실사용에 맞춘다. */
-export const POD_CHILD_REQUESTS = { cpu: '1', memory: '4Gi' } as const;
+// POD-DIET (10-06 03:47~05:18 · node-b goal Pods · 89 one-minute samples · 42 Pods): per-Pod observed max median 4.6Gi ·
+// p75 6.2Gi · p90 11.7Gi — 23/42 went above the old 4Gi request, so the scheduler over-packed. 6Gi ≈ p75; limits stay.
+// Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
+export const POD_CHILD_REQUESTS = { cpu: '1', memory: '6Gi' } as const;
 import type { PodPoolMember, PodPoolScheduler } from './pod-pool.js';
 import { measurePoolLease, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, LEASE_KUBECTL_MAX_BUFFER } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
@@ -63,6 +66,7 @@ import { declaredGoalType, type GoalType as DeclaredGoalType } from '../../self-
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
 import { getUserConfig } from '../../user-config.js';
 import { extractPodFailureReason } from './pod-failure-reason.js';
+import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
@@ -70,7 +74,9 @@ export type Kubectl = (args: readonly string[], input?: string) => { status: num
 // still the credential source for gh and setup-git's helper. Install it privately
 // on that failure; rename keeps concurrent readers from seeing a partial token.
 const APP_GH_CONFIG_PATH = '$HOME/.config/gh';
-const APP_GH_AUTH_SCRIPT = 'const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const token=fs.readFileSync(0,"utf8").trim();if(!/^[A-Za-z0-9_]+$/.test(token))process.exit(1);const dir=process.env.GH_CONFIG_DIR||path.join(process.env.HOME,".config/gh");fs.mkdirSync(dir,{recursive:true,mode:0o700});const dest=path.join(dir,"hosts.yml"),temp=path.join(dir,".hosts.yml."+crypto.randomUUID());try{fs.writeFileSync(temp,"github.com:\\n    oauth_token: "+token+"\\n    git_protocol: https\\n",{mode:0o600,flag:"wx"});fs.renameSync(temp,dest);fs.chmodSync(dest,0o600)}finally{try{fs.unlinkSync(temp)}catch{}}';
+// PODCRED2 (10-05) — GitHub App installation tokens now carry `.` and `-` (390 chars on node-b); the old
+// `[A-Za-z0-9_]+` check rejected every real token, so any transient `gh auth login` failure became exit 7.
+export const APP_GH_AUTH_SCRIPT = 'const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const token=fs.readFileSync(0,"utf8").replace(/\\r?\\n$/,"");if(!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(token))process.exit(1);const dir=process.env.GH_CONFIG_DIR||path.join(process.env.HOME,".config/gh");fs.mkdirSync(dir,{recursive:true,mode:0o700});const dest=path.join(dir,"hosts.yml"),temp=path.join(dir,".hosts.yml."+crypto.randomUUID());try{fs.writeFileSync(temp,"github.com:\\n    oauth_token: "+token+"\\n    git_protocol: https\\n",{mode:0o600,flag:"wx"});fs.renameSync(temp,dest);fs.chmodSync(dest,0o600)}finally{try{fs.unlinkSync(temp)}catch{}}';
 const APP_GH_AUTH_COMMAND = `bun -e '${APP_GH_AUTH_SCRIPT}'`;
 const APP_GH_EXEC = `unset GH_TOKEN GITHUB_TOKEN; GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}" exec "$@"`;
 
@@ -594,14 +600,15 @@ export function podChildLlmArgs(options: Pick<PodSpawnOptions, 'provider' | 'chi
   return ['--child-llm-provider', provider, ...(model ? ['--child-llm-model', model] : [])];
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean }): Record<string, unknown> {
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const goalPath = o.goalDoc ? `'${(o.goalDoc.startsWith('-') ? `./${o.goalDoc}` : o.goalDoc).replace(/'/g, `'\\''`)}'` : undefined;
-  const askBaseIndex = o.goalDoc ? o.args.indexOf('--base') : -1;
+  const delegated = Boolean(o.goalDoc) || o.authorSentence === true;
+  const askBaseIndex = delegated ? o.args.indexOf('--base') : -1;
   const quotedAsk = (askBaseIndex >= 0 && o.args[askBaseIndex + 1]
     ? ` '--base' '${o.args[askBaseIndex + 1]!.replace(/'/g, `'\\''`)}'`
-    : '') + (o.goalDoc && o.args.includes('--merge-by-host') ? ' --merge-by-host' : o.goalDoc && o.args.includes('--open-pr') && !o.args.includes('--auto-merge') ? ' --no-auto-merge' : '')
-    + (o.goalDoc && o.args.includes('--no-supervise') ? ' --no-supervise' : '');
+    : '') + (delegated && o.args.includes('--merge-by-host') ? ' --merge-by-host' : delegated && o.args.includes('--open-pr') && !o.args.includes('--auto-merge') ? ' --no-auto-merge' : '')
+    + (delegated && o.args.includes('--no-supervise') ? ' --no-supervise' : '');
   const script = [
     'set -u',
     o.grokCredential === 'subscription'
@@ -609,7 +616,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
       : o.grokCredential === 'api_key'
         ? 'mkdir -p ~/.grok && install -m 600 /creds/grok-api-key ~/.grok/api-key && export XAI_API_KEY="$(cat ~/.grok/api-key)" && export ELANOUS_LLM_PROVIDER=grok'
         : o.codexAccounts ? podCodexAccountScript(o.codexAccounts) : `mkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json\n${podQuotaPolicyExport()}`,
-    o.appCredential ? `unset GH_TOKEN GITHUB_TOKEN; export GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}"; mkdir -p "$GH_CONFIG_DIR" && chmod 700 "$GH_CONFIG_DIR" && { gh auth login --with-token < /creds/gh-token >/dev/null 2>&1 || ${APP_GH_AUTH_COMMAND} < /creds/gh-token; } && chmod 600 "$GH_CONFIG_DIR/hosts.yml" && chmod 700 "$GH_CONFIG_DIR" || exit 7` : 'export GH_TOKEN="$(cat /creds/gh-token)"',
+    o.appCredential ? `unset GH_TOKEN GITHUB_TOKEN; export GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}"; mkdir -p "$GH_CONFIG_DIR" && chmod 700 "$GH_CONFIG_DIR" && { (umask 077; gh auth login --with-token < /creds/gh-token >"$HOME/.gh-login.log" 2>&1) || ${APP_GH_AUTH_COMMAND} < /creds/gh-token; } && chmod 600 "$GH_CONFIG_DIR/hosts.yml" && chmod 700 "$GH_CONFIG_DIR" || { echo "[pod] gh-login-failed: $(head -c 300 "$HOME/.gh-login.log" 2>/dev/null | tr '\\n' ' ' | sed -E 's/(gh[a-z]_|github_pat_)[A-Za-z0-9_.-]+/\\1***/g')"; exit 7; }` : 'export GH_TOKEN="$(cat /creds/gh-token)"',
     // 🔑 스킬 키(.env) — 이미지엔 없다. 이 런의 Secret 에서 각 스킬 폴더로 0600 복사(값은 로그에 안 나온다).
     ...(o.skillEnvs?.length ? [`for n in ${o.skillEnvs.join(' ')}; do [ -d ~/.claude/skills/$n ] && install -m 600 /creds/skillenv-$n ~/.claude/skills/$n/.env; done; echo "[pod] skill env: ${o.skillEnvs.join(',')}"`] : []),
     'git config --global user.name "elanous pod child" && git config --global user.email "noreply@anthropic.com" && gh auth setup-git',
@@ -622,9 +629,11 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
     ...(o.appCredential ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
-    goalPath
+    o.authorSentence
+      ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); elanous harness say --substrate local --json${quotedAsk} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1; rc=$?; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
+      : goalPath
       ? `elanous harness ask ${goalPath} --json${quotedAsk} > /tmp/si.out 2>&1; rc=$?; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
-      : `elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1; rc=$?`,
+      : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1; rc=$?`,
     'cat /tmp/si.out',
     '[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo "ELANOUS_USAGE_ROLLUP {\"measured\":false,\"reason\":\"no rollup script\"}"',
     // A long run's log export can pass the 5MB artifact limit; skipping it whole left no window into why a
@@ -1224,7 +1233,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         debug.log('self-implement.pod', 'memory-request', { spaceId: input.spaceId, job: name,
           tier: oomRetried ? retryTier : memoryTier, reason: oomRetried ? 'OOMKilled' : memoryReason,
           memoryLimit, memoryRequest });
-        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
         releaseAdmission?.applied?.(name, context, namespace);

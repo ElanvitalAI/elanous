@@ -922,6 +922,8 @@ export interface TelegramConfig {
   fieldDefaultEvent?: string;
   /** `#현장` 영상의 기본 렌더 모드. 미지정 시 standard, 캡션의 `즉석`/`instant` 가 우선. */
   fieldReelMode?: 'standard' | 'instant';
+  /** 대화를 처음 열거나 6시간 이상 쉰 뒤 첫 말 앞에 `/v1/context/now` 요약을 한 메시지로 보낸다. 기본 켬. `false` 만 끈다. */
+  contextFirst?: boolean;
 }
 
 const TELEGRAM_DEFAULTS: TelegramConfig = { enabled: false, allowedUsers: [] };
@@ -1096,6 +1098,8 @@ export const DEFAULT_BUDGET_GATE_MAX_USED_PERCENT: BudgetGateMaxUsedPercent = {
   'openai-codex': 95,
   grok: 48,
 };
+/** 발사 관문이 grok 주간 사용률에 실제로 적용하는 상한. `elanous usage` 와 같은 수를 이 값 미만으로만 통과시킨다. */
+export const LAUNCH_GROK_USED_PERCENT_CAP = 80;
 
 export interface HarnessBudgetGateConfig {
   /** 0~100. 기본 15. 범위 밖이면 경고와 함께 기본. */
@@ -1140,7 +1144,9 @@ export interface SelfImplementToolConfig {
   decompositionShadow: SelfImplementDecompositionShadowConfig;
   /** Opt-in delivery of authored goal clarifications from unattended dev runs. */
   clarificationEscalation: SelfImplementClarificationEscalationConfig;
-  /** 사용자 자식 모델 선호. 없으면 해석기가 auto + fallbackChain 으로 만든다. */
+  /** 사용자 자식 모델 선호. 없으면 해석기가 auto + fallbackChain 으로 만든다.
+   *  Overload failover (OVERLOAD-FAILOVER) may move an unpinned codex child to
+   *  grok. A pinned codex provider is never moved. */
   childLlm?: ChildLlmPreferenceConfig;
   /** ⭐ PR-open 사전 승인 (2026-07-26 · 대표 결정 "오토 선호 · 기본 ON").
    *
@@ -3538,6 +3544,8 @@ export interface SeatLoopConfig {
   reportPr?: number;
   /** Parent routing and age limits for checklist stalls; omitted values use findStalls defaults. */
   stall?: { parents?: Record<string, string>; redMinutes?: number; blockedMinutes?: number };
+  /** Unlanded attempts of the same seat cell before the loop stops relaunching and asks a person. Absent or invalid means 3. */
+  repeatStop?: number;
 }
 
 export type EventSeat = 'OP' | 'TC' | 'MK' | 'UX';
@@ -3610,7 +3618,12 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean };
+  harness?: { revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>> }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
+  nestedElanous?: 'allow' | 'refuse';
+  /** Follow-up goal after a merged harness PR. Omitted and anything but `live` record only. */
+  followUp?: 'shadow' | 'live';
+};
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
   pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number };
   skillRouter: SkillRouterConfig;
@@ -4009,7 +4022,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { revertGuard: { depth: 50 }, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false },
+    harness: { revertGuard: { depth: 50 }, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, followUp: 'shadow' },
     grounding: { sources: [] },
     raw: {},
   };
@@ -4526,6 +4539,8 @@ function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
         ...(minutes(raw.blockedMinutes) ? { blockedMinutes: raw.blockedMinutes } : {}),
       } };
     })(),
+    ...(typeof values.repeatStop === 'number' && Number.isSafeInteger(values.repeatStop) && values.repeatStop > 0
+      ? { repeatStop: values.repeatStop } : {}),
   };
 }
 
@@ -4749,7 +4764,20 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         ? { defaultRepo: harness.defaultRepo } : {}),
       ...(typeof harness.repo === 'string' && harness.repo.trim()
         ? { repo: harness.repo.trim() } : {}),
+      helper: (() => {
+        const helper = harness.helper && typeof harness.helper === 'object' && !Array.isArray(harness.helper)
+          ? harness.helper as Record<string, unknown> : {};
+        const repairPerDay = helper.repairPerDay;
+        return {
+          repair: helper.repair === 'live' ? 'live' as const : 'shadow' as const,
+          repairPerDay: typeof repairPerDay === 'number' && Number.isSafeInteger(repairPerDay) && repairPerDay >= 0
+            ? repairPerDay : 3,
+        };
+      })(),
       ...(harness.authorOnPod === true ? { authorOnPod: true } : {}),
+      ...(harness.nestedElanous === 'allow' || harness.nestedElanous === 'refuse'
+        ? { nestedElanous: harness.nestedElanous } : {}),
+      followUp: harness.followUp === 'live' ? 'live' : 'shadow',
       budgetGate: parseHarnessBudgetGate(
         rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness)
           ? (rawObj.harness as Record<string, unknown>).budgetGate
@@ -4887,6 +4915,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ...(normalizeKindRoles(tg.kindRoles) ? { kindRoles: normalizeKindRoles(tg.kindRoles)! } : {}),
       ...(str(tg.fieldDefaultEvent) ? { fieldDefaultEvent: str(tg.fieldDefaultEvent)! } : {}),
       ...(tg.fieldReelMode === 'instant' || tg.fieldReelMode === 'standard' ? { fieldReelMode: tg.fieldReelMode } : {}),
+      ...(tg.contextFirst === false ? { contextFirst: false } : {}),
     },
     discord: {
       enabled: dc.enabled === true,
@@ -5997,7 +6026,9 @@ export function saveUserConfig(
       substrate: cfg.harness?.substrate,
       podPool: cfg.harness?.podPool,
       authorOnPod: cfg.harness?.authorOnPod === true ? true : undefined,
+      followUp: cfg.harness?.followUp === 'live' ? 'live' : undefined,
       queue: cfg.harness?.queue ?? rawHarness.queue,
+      helper: cfg.harness?.helper ?? rawHarness.helper,
     }),
     ...rawRest,
     ...(cfg.loops ? { loops: {
@@ -6012,6 +6043,8 @@ export function saveUserConfig(
         podPool: cfg.loops.seat.podPool ?? 'pool-node-b@node-b:8',
         ...(cfg.loops.seat.neighbors ? { neighbors: cfg.loops.seat.neighbors } : {}),
         ...(cfg.loops.seat.reportPr === undefined ? {} : { reportPr: cfg.loops.seat.reportPr }),
+        ...(cfg.loops.seat.stall ? { stall: cfg.loops.seat.stall } : {}),
+        ...(cfg.loops.seat.repeatStop === undefined ? {} : { repeatStop: cfg.loops.seat.repeatStop }),
       } } : {}),
     } } : {}),
     ...(cfg.autopilot ? { autopilot: {

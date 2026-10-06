@@ -40,7 +40,7 @@ const selfImplementNameExports = exportedConstNames('../boot/daemon-tools/self-i
 const unknownVerification = { actualMission: 'unknown', legacyParity: 'unknown' } as const;
 
 test('declares live shared ask-flow entrances, live harness ask/say/orchestrate/plan, and the RFC-retired harness run entrance', () => {
-  expect(CLI_DEV_ASK_ENTRANCE).toEqual({ id: 'cli-dev-ask', surface: 'cli', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'unknown' } });
+  expect(CLI_DEV_ASK_ENTRANCE).toEqual({ id: 'cli-dev-ask', surface: 'cli', status: 'closed', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'unknown' } });
   expect(TUI_SLASH_ASK_ENTRANCE).toEqual({ id: 'tui-slash-ask', surface: 'slash', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'verified' } });
   expect(CLI_HARNESS_RUN_ENTRANCE).toEqual({ id: 'cli-harness-run', surface: 'cli', status: 'retired', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: unknownVerification });
   expect(DAEMON_HARNESS_ASK_ENTRANCE).toEqual({ id: 'daemon-harness-ask', surface: 'daemon', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: unknownVerification });
@@ -56,14 +56,18 @@ test('declares live shared ask-flow entrances, live harness ask/say/orchestrate/
   expect(retiredEntranceNotice(CLI_HARNESS_RUN_ENTRANCE))
     .toBe('[ask] ⚠️ 이 발사 입구는 은퇴했다: cli-harness-run');
   expect(retiredEntranceNotice(CLI_DEV_ASK_ENTRANCE)).toBeUndefined();
+  expect(renderLaunchEntrances()).toContain('닫힘');
+  expect(renderLaunchEntrances()).toContain('cli-dev-ask');
+  expect(renderLaunchEntrances()).toContain('cli-self-implement');
+  expect(renderLaunchEntrances()).toContain('cli-self-orchestrate');
 });
 
 test('registers harness orchestrate and plan while preserving all existing sixteen entrance values', () => {
   const existingSixteen: readonly EntranceDeclaration[] = [
-    { id: 'cli-dev-ask', surface: 'cli', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'unknown' } },
+    { id: 'cli-dev-ask', surface: 'cli', status: 'closed', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'unknown' } },
     { id: 'cli-drive', surface: 'cli', status: 'live', stampability: 'structurally-unstampable', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
-    { id: 'cli-self-implement', surface: 'cli', status: 'live', stampability: 'unknown', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
-    { id: 'cli-self-orchestrate', surface: 'cli', status: 'live', stampability: 'unknown', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
+    { id: 'cli-self-implement', surface: 'cli', status: 'closed', stampability: 'unknown', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
+    { id: 'cli-self-orchestrate', surface: 'cli', status: 'closed', stampability: 'unknown', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
     { id: 'cli-harness-ask', surface: 'cli', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'verified' } },
     { id: 'cli-harness-say', surface: 'cli', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: { actualMission: 'verified', legacyParity: 'verified' } },
     { id: 'cli-harness-run', surface: 'cli', status: 'retired', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/self-dev/entrance-registry.ts', verification: unknownVerification },
@@ -89,7 +93,7 @@ test('registers harness orchestrate and plan while preserving all existing sixte
   }
   const driveEntrance = lookupEntrance('cli-drive');
   expect(ENTRANCE_REGISTRY.some((entrance) => entrance === driveEntrance)).toBe(true);
-  expect(summarizeEntrances()).toMatchObject({ total: 19, live: 14, retired: 5 });
+  expect(summarizeEntrances()).toMatchObject({ total: 19, live: 11, retired: 5, closed: 3 });
   expect(summarizeEntrances().bySurface.find((surface) => surface.surface === 'cli')).toEqual({ surface: 'cli', total: 10, retired: 2 });
 });
 
@@ -102,7 +106,7 @@ test('⭐ 표면별 집계를 «코드가» 낸다 — 문서가 표를 손으�
   const summary = summarizeEntrances();
   // ⛔ 수를 여기 박지 않는다 — 입구가 늘면 이 시험이 «막아서는» 안 된다.
   //   대신 «불변식»을 문다: 합이 맞고, 표면별 합이 전체와 같고, 은퇴가 전체를 안 넘는다.
-  expect(summary.live + summary.retired).toBe(summary.total);
+  expect(summary.live + summary.retired + summary.closed).toBe(summary.total);
   expect(summary.bySurface.reduce((n, s) => n + s.total, 0)).toBe(summary.total);
   expect(summary.retired).toBeLessThanOrEqual(summary.total);
   // ⭐ 그리고 «은퇴가 하나 이상» 있어야 한다 — 은퇴 축이 살아 있다는 증거
@@ -120,10 +124,10 @@ test('catalog-backed model exposure keeps missing distinct from false and preser
   expect(declarations.find((entrance) => entrance.id === 'cli-self-implement')?.imprintEvidence).toBe('unknown');
   expect(declarations.map(({ id, status, surface, stampabilityEvidenceSource, stampabilityEvidenceSourceFilePath, evidenceSourceFilePath, modelExposed }) => ({ id, status, surface, stampabilityEvidenceSource, stampabilityEvidenceSourceFilePath, evidenceSourceFilePath, modelExposed })))
     .toEqual([
-      { id: 'cli-dev-ask', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
+      { id: 'cli-dev-ask', surface: 'cli', status: 'closed', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
       { id: 'cli-drive', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'structural-absence', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
-      { id: 'cli-self-implement', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'unverified', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
-      { id: 'cli-self-orchestrate', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'unverified', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
+      { id: 'cli-self-implement', surface: 'cli', status: 'closed', stampabilityEvidenceSource: 'unverified', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
+      { id: 'cli-self-orchestrate', surface: 'cli', status: 'closed', stampabilityEvidenceSource: 'unverified', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
       { id: 'cli-harness-ask', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
       { id: 'cli-harness-say', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
       { id: 'cli-harness-orchestrate', surface: 'cli', status: 'live', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
@@ -300,7 +304,8 @@ test('runEntrancesAction consumes the registry that now renders harness ask and 
     .toMatchObject({ id: 'cli-harness-plan', verification: { actualMission: 'verified', legacyParity: 'unknown' }, imprintEvidence: 'CLI_HARNESS_PLAN_ENTRANCE' });
 
   const rendered = renderLaunchEntrances();
-  expect(rendered).toContain('launch entrances: 19 (live 14 · retired 5)');
+  expect(rendered).toContain('launch entrances: 19 (live 11 · retired 5 · closed 3)');
+  expect(rendered).toContain('닫힘');
   expect(rendered).toContain('cli-drive (structurally-unstampable)');
   // ⭐ 2026-08-22: ask/say 두 입구가 «자기 이름을» 각인하게 됐다(#11462 가 인자를 열고 #11470 이 넘겼다).
   //   2026-08-23: 등기 착지가 orchestrate/plan 입구도 별도 각인 가능 항목으로 세운다.

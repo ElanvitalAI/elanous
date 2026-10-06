@@ -46,6 +46,31 @@ export function registerCardCommand(program: Command, deps: CardCliDeps = {}): C
       }
     });
 
+  card.command('close <id>')
+    .description('Close a task card with a reason (owner operation)')
+    .requiredOption('--reason <text>', 'One-line close reason')
+    .action((id: string, options: { reason: string }) => {
+      const store = createStore();
+      try {
+        const reason = options.reason.trim();
+        if (!reason || /[\r\n]/.test(options.reason)) throw new Error('Close reason must be one line');
+        const existing = store.getCard(id);
+        if (!existing) {
+          process.stderr.write(`Card not found: ${id}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        if (existing.status === 'closed') {
+          write(`이미 닫힘: ${id}\n`);
+          return;
+        }
+        store.closeCard(id, reason);
+        write(`닫힘: ${id}\n`);
+      } finally {
+        store.close();
+      }
+    });
+
   card.command('list')
     .description('List task cards')
     .option('--open', 'Only show open cards')

@@ -73,20 +73,13 @@ describe('AcpAgent billing environment scrub', () => {
     expect(JSON.stringify({ spawn, logs })).not.toContain(SECRET);
   });
 
-  test('config opt-out preserves Claude API authentication and reports billing-env mode', async () => {
+  test('config opt-out does not apply to Claude — Claude ACP is subscription-only (CLAUDESUB1)', async () => {
     writeConfig({ scrubBillingEnv: false });
     const logs: string[] = [];
     const spawn = await captureSpawn('claude', { ANTHROPIC_API_KEY: SECRET }, logs);
 
-    expect(spawn).toMatchObject({
-      backendId: 'claude',
-      billingEnvScrubEnabled: false,
-      scrubbedBillingEnv: [],
-      authEnvPresent: true,
-      authEnvName: 'ANTHROPIC_API_KEY',
-      success: false,
-    });
-    expect(logs[0]).toContain('billing-env=billing-env preserved');
+    expect(spawn).toMatchObject({ backendId: 'claude', billingEnvScrubEnabled: true });
+    expect(spawn.scrubbedBillingEnv).toContain('ANTHROPIC_API_KEY');
     expect(JSON.stringify({ spawn, logs })).not.toContain(SECRET);
   });
 
@@ -106,13 +99,9 @@ describe('AcpAgent billing environment scrub', () => {
     writeConfig({ scrubBillingEnv: false });
     const spawn = await captureSpawn('claude', { ANTHROPIC_API_KEY: SECRET, CLAUDECODE: '1' });
 
-    expect(spawn).toMatchObject({
-      billingEnvScrubEnabled: false,
-      scrubbedBillingEnv: [],
-      authEnvPresent: true,
-      authEnvName: 'ANTHROPIC_API_KEY',
-    });
+    expect(spawn).toMatchObject({ billingEnvScrubEnabled: true });
     expect(JSON.stringify(spawn)).not.toContain('CLAUDECODE');
+    expect(JSON.stringify(spawn)).not.toContain(SECRET);
   });
 
   test('forces Grok API-key authentication off only under the shared subscription policy', () => {

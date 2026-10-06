@@ -7,6 +7,7 @@ import { addHarnessQueue, harnessQueueOutcome, harnessQueuePath, harnessQueueRec
 import { runHarnessQueueChild } from '../harness/harness-queue-child.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { askSeat } from '../seat-dispatch/seat-questions.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { buildUserConfig } from '../user-config.js';
 import { runSeatLoopOnce, seatLedgerPath, type SeatDeps, type SeatEntry } from './seat-loop.js';
 
@@ -14,6 +15,8 @@ const now = new Date('2026-10-04T03:00:00Z');
 const fixture = (title: string) => {
   const root = mkdtempSync(join(tmpdir(), 'seat-live-safe-'));
   const deps: SeatDeps = { root, repo: root, now: () => now, versions: () => ['0.2.9'],
+    // Fixed card version: the default resolver runs `git reflog` on the real repo (≈10 s · MAIN-RED 10-06).
+    resolveDecisionVersion: () => ({ released: '0.2.8', dev: '0.2.9', codename: null }),
     schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }],
     checklistItems: () => [{ id: 'K1', title, owner: 'TC', status: 'yellow' }],
     stallChecklist: () => ({ version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [], items: [] }) };
@@ -285,6 +288,99 @@ test('live-safe keeps seat questions shadow-only even if question delivery is co
       .toMatchObject({ seat: 'TC', action: 'seat-question' });
     expect(f.ledger()).toHaveLength(1);
   } finally { spy.mockRestore(); f.close(); }
+});
+
+test('three unlanded attempts of the same cell stop the fourth launch and raise one person card', async () => {
+  const f = fixture('구현');
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    let n = 0;
+    const enqueued: string[] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+      enqueue: async () => { n += 1; const id = `hq-00000000-0000-4000-8000-${String(n).padStart(12, '0')}`; enqueued.push(id); return { id }; },
+      queueOutcome: () => 'retryable',
+      queueItems: () => [] };
+    for (let i = 0; i < 3; i++) expect((await runSeatLoopOnce('TC', deps)).status).toBe('queued');
+    const fourth = await runSeatLoopOnce('TC', deps) as SeatEntry;
+    expect(fourth.status).toBe('held');
+    expect(fourth.reason).toBe('같은 칸 3회 착지 0 — 사람 판단');
+    expect(enqueued).toHaveLength(3);
+    const cards = new DecisionLedger({ stateDir: f.root }).list({ status: 'open' });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.title).toContain('K1');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'repeat-stopped')).toHaveLength(1);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(enqueued).toHaveLength(3);
+    expect(new DecisionLedger({ stateDir: f.root }).list({ status: 'open' })).toHaveLength(1);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('two unlanded attempts still launch, and a landed cell is not stopped', async () => {
+  const f = fixture('구현');
+  try {
+    let n = 0;
+    const base: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+      enqueue: async () => { n += 1; return { id: `hq-00000000-0000-4000-8000-${String(n).padStart(12, '0')}` }; },
+      queueItems: () => [] };
+    expect((await runSeatLoopOnce('TC', { ...base, queueOutcome: () => 'retryable' })).status).toBe('queued');
+    expect((await runSeatLoopOnce('TC', { ...base, queueOutcome: () => 'retryable' })).status).toBe('queued');
+    expect(n).toBe(2);
+    const landed = fixture('구현');
+    try {
+      let launches = 0;
+      const deps: SeatDeps = { ...landed.deps, config: { mode: 'live-safe', seats: ['TC'] },
+        run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+        enqueue: async () => { launches += 1; return { id: `hq-10000000-0000-4000-8000-${String(launches).padStart(12, '0')}` }; },
+        queueOutcome: () => 'succeeded',
+        queueItems: () => [] };
+      for (let i = 0; i < 4; i++) expect((await runSeatLoopOnce('TC', deps)).status).toBe(i === 0 ? 'queued' : 'skipped-empty');
+      expect(launches).toBe(1);
+      expect(new DecisionLedger({ stateDir: landed.root }).list({ status: 'all' })).toHaveLength(0);
+    } finally { landed.close(); }
+  } finally { f.close(); }
+});
+
+test('repeatStop config changes the unlanded attempt limit', async () => {
+  const f = fixture('구현');
+  try {
+    const path = join(f.root, 'config.json');
+    writeFileSync(path, JSON.stringify({ loops: { seat: { mode: 'live-safe', repeatStop: 2 } } }));
+    expect(buildUserConfig(path).loops?.seat?.repeatStop).toBe(2);
+    writeFileSync(path, JSON.stringify({ loops: { seat: { mode: 'live-safe', repeatStop: 0 } } }));
+    expect(buildUserConfig(path).loops?.seat?.repeatStop).toBeUndefined();
+    let n = 0;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'], repeatStop: 2 },
+      run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+      enqueue: async () => { n += 1; return { id: `hq-20000000-0000-4000-8000-${String(n).padStart(12, '0')}` }; },
+      queueOutcome: () => 'retryable',
+      queueItems: () => [] };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('queued');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('queued');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('held');
+    expect(n).toBe(2);
+  } finally { f.close(); }
+});
+
+test('a person reopening the held cell allows one more launch', async () => {
+  const f = fixture('구현');
+  try {
+    let n = 0;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+      enqueue: async () => { n += 1; return { id: `hq-30000000-0000-4000-8000-${String(n).padStart(12, '0')}` }; },
+      queueOutcome: () => 'retryable',
+      queueItems: () => [] };
+    for (let i = 0; i < 3; i++) await runSeatLoopOnce('TC', deps);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('held');
+    const ledger = new DecisionLedger({ stateDir: f.root, now: () => new Date('2026-10-04T04:00:00Z'), resolveVersion: f.deps.resolveDecisionVersion });
+    const card = ledger.list({ status: 'open' })[0]!;
+    ledger.decide(card.id, 'a', { kind: 'human' }, '다시 연다');
+    const again = await runSeatLoopOnce('TC', { ...deps, now: () => new Date('2026-10-04T05:00:00Z') });
+    expect(again.status).toBe('queued');
+    expect(n).toBe(4);
+  } finally { f.close(); }
 });
 
 test('live-safe cannot silently retry when AUTOQ outcome is unknown', async () => {

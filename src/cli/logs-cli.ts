@@ -715,7 +715,7 @@ export function podObservationGapNotice(
     .some((prefix) => category.startsWith(prefix));
   const categories = [...(query.categories ?? []), ...(query.exactCategories ?? [])];
   if (!categories.some(childCategory) && !(categories.length === 0 && (query.events?.length ?? 0) > 0)) return null;
-  return `안내: 이 창에 Pod 에서 돈 런 ${podRuns}개 — Pod 자식의 관측은 이 logs.db 에 수집되지 않는다(POD-OBS). 원장으로 본다: elanous self run-ledger <runId>`;
+  return `안내: 이 창에 Pod 에서 돈 런 ${podRuns}개 — Pod 자식의 관측은 «발사한 트리의 파생 우주» logs.db 로 회수된다(POD-OBS) — 전체: elanous logs --all --include-test · 런 하나: elanous self run-ledger <runId>`;
 }
 
 /** Select ledger roots independently of DB existence; --all includes registered roots with no logs.db. */
@@ -1036,6 +1036,24 @@ export function otherInstanceHint(matches: readonly { name: string; count: numbe
   const found = matches.map((match) => `${match.name} ${match.count}건`).join(' · ');
   const filters = requeryFilterArgs(opts);
   return `  ↳ 다른 인스턴스에는 있다 — ${found}\n    전체를 보려면: elanous logs --all --include-test${filters ? ` ${filters}` : ''}`;
+}
+
+/** POD-OBS(10-06): 결과가 «0이 아닌데 적을 때»도 조용하지 않게 — 다른 우주에 더 많으면 경고한다.
+ *  실측: 24h `pre-pr-sync` 운영 1건 vs 발사 트리 파생 우주 276건(Pod 자식 재방출은 부모 하니스의 우주에 쌓인다). */
+export function otherInstanceMajorityWarning(
+  shown: number,
+  matches: readonly { name: string; count: number }[],
+  opts: LogsCliOpts,
+): string | null {
+  const elsewhere = matches.reduce((sum, match) => sum + match.count, 0);
+  if (shown <= 0 || elsewhere <= shown) return null;
+  const top = [...matches].sort((a, b) => b.count - a.count);
+  const named = top.slice(0, 3).map((match) => `${match.name} ${match.count}건`).join(' · ');
+  const more = top.length > 3 ? ` 외 ${top.length - 3}곳` : '';
+  const filters = requeryFilterArgs(opts);
+  return `⚠ 여기 ${shown}건 · 다른 우주에 ${elsewhere}건이 더 있다 — ${named}${more}\n`
+    + '    (Pod 자식 관측은 발사한 트리의 파생 우주에 쌓인다 · 이 수만 보고 «적다»로 읽지 말 것)\n'
+    + `    전체를 보려면: elanous logs --all --include-test${filters ? ` ${filters}` : ''}`;
 }
 
 export function buildQuery(opts: LogsCliOpts): { query: LogQuery; error?: string } {
@@ -1789,6 +1807,30 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
       }
       const coverageHint = runCoverageHint(out.map(({ row }) => row));
       if (coverageHint) console.error(coverageHint);
+      // 좁힌 조회(이벤트·카테고리)만 — 넓은 조회까지 매번 전 우주를 열지 않는다.
+      if (out.length > 0 && ((query.events?.length ?? 0) > 0 || (query.categories?.length ?? 0) > 0
+        || (query.exactCategories?.length ?? 0) > 0)) {
+        const matches = probeOtherInstanceMatches(opts, query, resolved.targets.map((target) => target.dbPath));
+        // 표시 상한(--limit)이 아니라 «여기» 실제 일치 수와 비교한다(상한 100 을 «100건»으로 말하지 않는다).
+        let here: number | null = null;
+        try {
+          here = Math.max(out.length, (deps.countMatching ?? ((candidate: LogQuery) => opened.reduce(
+            (count, { store }) => count + store.countMatching(candidate), 0)))(query));
+        } catch (error) {
+          // 셈을 못 했으면 경고하지 않는다 — 잘린 표시 수를 «여기 N건»으로 말하지 않는다.
+          debug.log('logs.cli', 'other-instance-count-failed', { shown: out.length, error: error instanceof Error ? error.message : String(error) });
+        }
+        const majority = here === null ? null : otherInstanceMajorityWarning(here, matches, opts);
+        if (majority) {
+          console.error(majority);
+          debug.log('logs.cli', 'other-instance-majority', {
+            shown: out.length,
+            here,
+            elsewhere: matches.reduce((sum, match) => sum + match.count, 0),
+            instances: matches.length,
+          });
+        }
+      }
       if (out.length === 0) {
         console.error('(일치하는 로그 없음)');
         const instanceHint = otherInstanceHint(

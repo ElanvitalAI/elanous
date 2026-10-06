@@ -1,6 +1,7 @@
 import type { SlashCommand } from '../chat/index.js';
 import type { Maturity } from './feature-maturity.js';
 import type { BotSurface } from './bot-command-maturity.js';
+import { botUnavailableSlashReply, deriveTuiSlashAvailability, formatBotUnavailableSlashReply } from './tui-slash-availability.js';
 
 export interface BotSlashCatalogEntry {
   name: string;
@@ -56,11 +57,19 @@ export function buildBotSlashCatalog(options: {
     commands.push({ name, description: `${description.slice(0, 100 - suffix.length)}${suffix}`, supported: false });
     seen.add(name);
   }
-  const unsupported = new Set(commands.filter((command) => !command.supported).map((command) => command.name));
+  const handled = new Set(handledCommands.map(({ name }) => name));
+  const unsupported = new Set(commands.filter(({ supported }) => !supported).map(({ name }) => name));
+  const availability = new Map(deriveTuiSlashAvailability(
+    coreCommands.filter(({ name }) => Object.hasOwn(maturity.tuiSlash, name)), maturity,
+  ).map((entry) => [entry.name, entry]));
   return {
     commands,
     unsupportedReply(name) {
-      return unsupported.has(name) ? `/${name}은(는) ${surface === 'telegram' ? '텔레그램' : '디스코드'}에서 아직 지원되지 않습니다. TUI에서 /${name}을(를) 사용하세요.` : null;
+      if (handled.has(name)) return null;
+      const entry = availability.get(name);
+      if (entry?.maturity === 'system') return null;
+      if (unsupported.has(name)) return formatBotUnavailableSlashReply(name, surface);
+      return botUnavailableSlashReply(entry, surface);
     },
   };
 }

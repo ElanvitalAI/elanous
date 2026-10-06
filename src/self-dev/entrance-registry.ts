@@ -1,6 +1,6 @@
 import { findNativeTool, isNativeToolModelExposed } from '../native-tool-catalog.js';
 
-export type EntranceStatus = 'live' | 'retired';
+export type EntranceStatus = 'live' | 'retired' | 'closed';
 
 export type EntranceStampability = 'stampable' | 'structurally-unstampable' | 'unknown';
 
@@ -181,12 +181,14 @@ const ENTRANCE_DECLARATIONS = [
   //       `dev --ask` 와 ***같은*** `runAskLaunchFlow` 를 탄다. 두 문의 차이는 `entrance` 태그뿐이다.
   //     ⇒ 판정값이 `'verified' | 'unknown'` 둘뿐이라 「구조적 부재」를 적을 칸이 없다. `unknown` 으로 둔다.
   //     ⛔ 그러니 이 `unknown` 을 「미완」으로 읽지 마라 — 그 구분은 이 주석이 canonical 이다.
-  { id: 'cli-dev-ask', surface: 'cli', status: 'live', verification: { actualMission: 'verified', legacyParity: 'unknown' } },
+  // OLD-DOOR-CLOSE — a direct `dev --ask` from a terminal or seat session refuses.
+  // Harness-internal calls still pass, marked with the ONEDOOR-1 entrance stamp.
+  { id: 'cli-dev-ask', surface: 'cli', status: 'closed', verification: { actualMission: 'verified', legacyParity: 'unknown' } },
   // `elanous drive` 는 `elanous dev` 의 Commander alias 로 살아 있고, buildDriveAliasDevSpec 이 entrance 를
   // `cli-drive` 로 넘기며 completion 을 `worktree-only` 로 못 박는다. 그래서 별도 무인 권한 축이 아니다.
   { id: 'cli-drive', surface: 'cli', status: 'live' },
-  { id: 'cli-self-implement', surface: 'cli', status: 'live' },
-  { id: 'cli-self-orchestrate', surface: 'cli', status: 'live' },
+  { id: 'cli-self-implement', surface: 'cli', status: 'closed' },
+  { id: 'cli-self-orchestrate', surface: 'cli', status: 'closed' },
   // ⭐ 2026-08-22 · 🅣 — ***사람이 «돌려 보고» 적은 판정***이다(⛔ 도구가 추측한 값이 아니다).
   //   actualMission: 그 입구로 실제 골을 «끝까지» 돌렸다 — 17발 · 자동 병합 5 · 회수 착지 7.
   //     📏 원장 각인이 그것을 말한다: `"entrance":"cli-harness-ask"` (아침엔 0건이었다).
@@ -331,6 +333,7 @@ export function summarizeEntrances(registry: readonly EntranceDeclaration[] = EN
   readonly total: number;
   readonly live: number;
   readonly retired: number;
+  readonly closed: number;
   readonly bySurface: ReadonlyArray<{ surface: EntranceSurface; total: number; retired: number }>;
 } {
   const surfaces = [...new Set(registry.map((e) => e.surface))];
@@ -338,6 +341,7 @@ export function summarizeEntrances(registry: readonly EntranceDeclaration[] = EN
     total: registry.length,
     live: registry.filter((e) => e.status === 'live').length,
     retired: registry.filter((e) => e.status === 'retired').length,
+    closed: registry.filter((e) => e.status === 'closed').length,
     bySurface: surfaces.map((surface) => ({
       surface,
       total: registry.filter((e) => e.surface === surface).length,
@@ -350,12 +354,12 @@ export function summarizeEntrances(registry: readonly EntranceDeclaration[] = EN
 export function renderLaunchEntrances(registry: readonly EntranceDeclaration[] = ENTRANCE_REGISTRY): string {
   const summary = summarizeEntrances(registry);
   const rows = listEntrancesWithModelExposure(registry)
-    .map((e) => `  ${e.status === 'retired' ? '🪦' : '✅'} ${e.surface.padEnd(7)} ${e.id} (${e.stampability}) verification=actualMission:${e.verification.actualMission},legacyParity:${e.verification.legacyParity} imprintEvidence=${e.imprintEvidence} evidenceSource=${e.stampabilityEvidenceSource} evidenceSourceFilePath=${e.evidenceSourceFilePath ?? 'missing'} modelExposed=${e.modelExposed ?? 'missing'}`);
+    .map((e) => `  ${e.status === 'retired' ? '🪦' : e.status === 'closed' ? '닫힘' : '✅'} ${e.surface.padEnd(7)} ${e.id} (${e.stampability}) verification=actualMission:${e.verification.actualMission},legacyParity:${e.verification.legacyParity} imprintEvidence=${e.imprintEvidence} evidenceSource=${e.stampabilityEvidenceSource} evidenceSourceFilePath=${e.evidenceSourceFilePath ?? 'missing'} modelExposed=${e.modelExposed ?? 'missing'}`);
   const surfaces = summary.bySurface
     .map((s) => `${s.surface}=${s.total}${s.retired > 0 ? `(은퇴 ${s.retired})` : ''}`)
     .join(' · ');
   return [
-    `launch entrances: ${summary.total} (live ${summary.live} · retired ${summary.retired})`,
+    `launch entrances: ${summary.total} (live ${summary.live} · retired ${summary.retired} · closed ${summary.closed})`,
     `  표면별: ${surfaces}`,
     ...rows,
   ].join('\n');

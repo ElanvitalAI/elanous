@@ -66,6 +66,7 @@ import { localOcrText } from './telegram-card-followup.js';
 import type { runGraph } from './graph-runner/runner.js';
 import { readSlashContextNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
 import type { ContextNowDeps } from './context-bus/context-now.js';
+import { botUnavailableSlashReply, deriveTuiSlashAvailability, type TuiSlashAvailability } from './maturity/tui-slash-availability.js';
 
 const SLASH_FOCUS_TURNS_DEFAULT = 8;
 
@@ -142,6 +143,8 @@ export interface DiscordSelfMessageDeps {
   log?: (msg: string) => void;
   cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: typeof runGraph; rootDir?: () => string };
   nowDeps?: ContextNowDeps;
+  /** Override the TUI slash projection for isolated message-path tests. */
+  tuiSlashAvailability?: readonly TuiSlashAvailability[];
 }
 
 /** Compose the full discord self+interweave onMessage handler. */
@@ -398,6 +401,12 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
     if (sessionReply !== null) {
       log(`session cmd: ${ctx.text.trim().slice(0, 40)}`);
       return sessionReply;
+    }
+    const slashName = /^\/([a-z0-9_-]{1,32})(?:\s|$)/i.exec(ctx.text.trim())?.[1]?.toLowerCase();
+    if (slashName) {
+      const entry = (deps.tuiSlashAvailability ?? deriveTuiSlashAvailability()).find(({ name }) => name === slashName);
+      const unavailable = botUnavailableSlashReply(entry, 'discord');
+      if (unavailable) return unavailable;
     }
     log(`◀ ${ctx.userName ?? ctx.userId}: ${ctx.text.slice(0, 80)}${ctx.attachments.length ? ` (+첨부 ${ctx.attachments.length})` : ''}`);
     debug.log('discord.self.turn', 'inbound', { channelId: ctx.channelId, chars: ctx.text.length, attachments: ctx.attachments.length });

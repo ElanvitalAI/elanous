@@ -25,6 +25,8 @@ import {
   decideRetry,
   DoomLoopTracker,
   fingerprintError,
+  llmCallOutcomeKind,
+  type LlmCallOutcomeKind,
   type RetryAction,
 } from './retry-policy.js';
 
@@ -75,6 +77,35 @@ export interface FetchApiWithRetryOpts {
    *  row" pattern within a single request. Pass a session-scoped
    *  tracker if you want cross-request doom detection. */
   doomTracker?: DoomLoopTracker;
+  /** Fallbacks still unused. When > 0, k consecutive overload-class
+   *  failures throw OverloadFailoverError before another retry sleep. */
+  remainingFallbacks?: number;
+}
+
+/** Raised when overload repeats k times and a fallback is still unused.
+ *  The caller switches provider; this is not a retry exhaustion. */
+export class OverloadFailoverError extends Error {
+  readonly provider: string;
+  readonly status: number;
+  readonly kind: LlmCallOutcomeKind;
+  readonly streak: number;
+  readonly cause: unknown;
+
+  constructor(opts: {
+    provider: string;
+    status: number;
+    kind: LlmCallOutcomeKind;
+    streak: number;
+    cause: unknown;
+  }) {
+    super(`overload failover after ${opts.streak} ${opts.kind} from ${opts.provider} (status ${opts.status})`);
+    this.name = 'OverloadFailoverError';
+    this.provider = opts.provider;
+    this.status = opts.status;
+    this.kind = opts.kind;
+    this.streak = opts.streak;
+    this.cause = opts.cause;
+  }
 }
 
 /** POST a fetch with the standard retry policy. On 2xx returns the
@@ -91,13 +122,17 @@ export async function fetchApiWithRetry(
 ): Promise<Response> {
   const maxAttempts = opts.maxAttempts ?? 4;
   const tracker = opts.doomTracker ?? new DoomLoopTracker();
+  const remainingFallbacks = opts.remainingFallbacks ?? 0;
   let attempt = 0;
+  let overloadStreak = 0;
   let lastErr: unknown;
   while (attempt < maxAttempts) {
     let response: Response | null = null;
     try {
       response = await fetch(url, init);
       if (response.ok) {
+        recordLlmCallOutcome(opts.provider, response.status, 'ok');
+        overloadStreak = 0;
         return response;
       }
       // Drain body so the error can carry the API's explanation. We
@@ -136,6 +171,11 @@ export async function fetchApiWithRetry(
       // would couple the helper to the caller's signal.
       if (isAbortLike(err)) throw err;
 
+      const status = err instanceof ApiHttpError ? err.status : 0;
+      const kind = llmCallOutcomeKind(status, err instanceof Error ? err.message : String(err));
+      recordLlmCallOutcome(opts.provider, status, kind);
+      if (kind === 'overloaded' || kind === '5xx' || kind === 'rate-limit') overloadStreak += 1;
+      else overloadStreak = 0;
       const fp = fingerprintError(err, `api:${opts.provider}`);
       const doomStatus = tracker.record(fp);
       const retryAfter = err instanceof ApiHttpError ? err.retryAfter : undefined;
@@ -143,6 +183,8 @@ export async function fetchApiWithRetry(
         attempt,
         doomStatus,
         retryAfter,
+        remainingFallbacks,
+        overloadStreak,
       });
       debug.log('llm.retry', decisionEvent(decision.action), {
         provider: opts.provider,
@@ -151,7 +193,19 @@ export async function fetchApiWithRetry(
         reason: decision.reason,
         delayMs: decision.delayMs,
         status: err instanceof ApiHttpError ? err.status : undefined,
+        kind,
+        overloadStreak,
+        remainingFallbacks,
       });
+      if (decision.action === 'switch-provider') {
+        throw new OverloadFailoverError({
+          provider: opts.provider,
+          status,
+          kind,
+          streak: overloadStreak,
+          cause: err,
+        });
+      }
       if (decision.action !== 'retry') {
         throw err;
       }
@@ -170,6 +224,39 @@ export async function fetchApiWithRetry(
   // Unreachable — the loop always either returns or throws — but
   // satisfies the type checker.
   throw lastErr ?? new Error(`${opts.errorPrefix}: retry loop terminated unexpectedly`);
+}
+
+type OutcomeWriter = (row: { provider: string; status: number; kind: LlmCallOutcomeKind }) => void;
+
+let outcomeWriterForTesting: OutcomeWriter | undefined;
+
+/** Test seam. Production uses the log store. `undefined` restores it. */
+export function setLlmCallOutcomeWriterForTesting(writer: OutcomeWriter | undefined): void {
+  outcomeWriterForTesting = writer;
+}
+
+/** The one event launch failover is allowed to read.
+ *  Category `llm.call`, event `outcome`, payload {provider,status,kind}.
+ *  Written straight to the log store — `debug.log` drops the row when no
+ *  sink is armed, which is the normal launch path. */
+export function recordLlmCallOutcome(provider: string, status: number, kind: LlmCallOutcomeKind): void {
+  const data = { provider, status, kind };
+  // Trace only — a store sink would otherwise write a second `llm.call`/`outcome` row and halve the streak threshold.
+  debug.log('llm.call', 'outcome-trace', data);
+  if (outcomeWriterForTesting) {
+    outcomeWriterForTesting(data);
+    return;
+  }
+  if (process.env.NODE_ENV === 'test') return;
+  try {
+    const { getDefaultLogStore } = require('../mss/logging/log-store.js') as typeof import('../mss/logging/log-store.js');
+    getDefaultLogStore()?.insertBatch([{
+      rec: { ts: new Date().toISOString(), category: 'llm.call', event: 'outcome', data },
+      surface: 'llm',
+    }]);
+  } catch {
+    // A failed observation must not fail the call. Launch then sees no sample.
+  }
 }
 
 function decisionEvent(action: RetryAction): string {

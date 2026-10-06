@@ -15,6 +15,8 @@ import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { startPty, mintPtyId, onPtyEvent, type PtyHandle, type StartOpts } from '../pty-shell/registry.js';
 import { withChildPtyIdentity } from '../agent/pty-identity.js';
 import { NESTED_AGENT_ENV_BLOCKLIST } from '../agent/nested-agent-env.js';
+import { getNestDepth } from '../agent/nest-depth.js';
+import { gateNestedElanousLaunch, nestedDepthCodexArgs, readNestedElanousDepth } from '../harness/nested-elanous-policy.js';
 import { createWorktree, resolveMainRepoRoot, type CreateWorktreeOpts } from '../git-fs/worktree.js';
 import { configuredWorktreeRoot } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
@@ -321,7 +323,36 @@ export function resolveBackendSpawn(
   // 지운 키 이름 — PTY 합성이 로그인 셸 캡처본에서 되살리지 않게 그대로 넘긴다(강제 env 로 다시 넣은 키는 뺀다).
   //   ⚠️ 과금 스크럽 키만 — 중첩 표지는 정체성 allowlist 가 다시 싣는 키가 있어 이 PR 의 범위 밖이다.
   const unsetEnv = [...new Set(backend.scrubEnv ?? [])].filter((k) => !(k in env));
-  return { cmd: backend.cmd, args: [...backend.args], env, unsetEnv, nestedEnvRemovedCount, forcedEnv };
+  // Codex drops parent env under shell_environment_policy inherit=core, so the nested-depth
+  // marker rides on argv (`-c shell_environment_policy.set.ELANOUS_NESTED_DEPTH=<child>`).
+  // Backends that cannot carry it are refused only when a nested elanous launch was requested.
+  const args = [...backend.args, ...nestedDepthCodexArgs(backend.name, getNestDepth() + 1)];
+  return { cmd: backend.cmd, args, env, unsetEnv, nestedEnvRemovedCount, forcedEnv };
+}
+
+/**
+ * Refuse a requested nested elanous launch when this backend cannot carry the depth marker.
+ * Unset depth is 0. A normal mission spawn (`nestedLaunchRequested: false`) is never refused here.
+ */
+export function refuseNestedElanousOnBackend(input: {
+  readonly backendName: string;
+  readonly nestedLaunchRequested: boolean;
+  readonly allow?: boolean;
+  readonly configAllow?: boolean;
+  readonly env?: Record<string, string | undefined>;
+}): { readonly refused: boolean; readonly reason?: string; readonly depth: number } {
+  const depth = readNestedElanousDepth(input.env);
+  const decision = gateNestedElanousLaunch({
+    backendName: input.backendName,
+    depth,
+    nestedLaunchRequested: input.nestedLaunchRequested,
+    ...(input.allow === true ? { allow: true } : {}),
+    ...(input.configAllow === true ? { configAllow: true } : {}),
+  });
+  if (input.nestedLaunchRequested && !decision.allowed) {
+    return { refused: true, reason: decision.reason, depth };
+  }
+  return { refused: false, depth };
 }
 
 /** Build the mission PTY options after identity is preallocated for child env propagation. */
@@ -491,6 +522,12 @@ export interface AgentMissionSpec {
   memory?: boolean;
   /** PTY 닉네임(휴먼 리더블·goto 로 나중 접근). 기본 branch. */
   nickname?: string;
+  /**
+   * True only when this mission is itself a nested elanous launch.
+   * A backend that cannot carry the depth marker is then refused.
+   * Absent means an ordinary mission spawn — never refused for a missing marker.
+   */
+  nestedElanousLaunch?: boolean;
   /** Concurrent missions may share one decision stream alias without sharing a PTY or worktree. */
   decisionMissionId?: string;
   /** ⭐⭐ 그 브랜치를 이미 쥔 «소유» 워크트리가 있으면 지우지 말고 그대로 재사용하라고 요청한다
@@ -1534,6 +1571,19 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   // 구독 모드 — backend 지정 env 키 스크럽 후 강제 env까지 적용해 cmd·args·env를 순수 seam으로 구성한다.
   // forcedEnv 이름의 후속 로깅은 이 착지의 의도적 경계이며, spawn에는 같은 seam의 env가 그대로 흐른다.
   const spawnParams = resolveBackendSpawn(backend, process.env);
+  const nestedRefusal = refuseNestedElanousOnBackend({
+    backendName: backend.name,
+    nestedLaunchRequested: spec.nestedElanousLaunch === true,
+    env: process.env,
+  });
+  if (nestedRefusal.refused) {
+    debug.log('agent-mission.nested', 'refused', { agent: backend.name, depth: nestedRefusal.depth, reason: nestedRefusal.reason });
+    return {
+      ok: false, worktree: spec.workdir ?? '', branch: spec.branch ?? null, rounds: 0,
+      evidencePath: null, committed: false, usedOmniCrawl: false,
+      detail: `nested elanous refused (${nestedRefusal.reason})`,
+    };
+  }
   const env = spawnParams.env;
   if (backend.name === 'claude') {
     const status = (deps.checkClaudeSubscription ?? checkClaudeSubscription)({ env });

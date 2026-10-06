@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { fillMissingGateFacts, markDeletedUnverified, mergeHealSignatures, triageFailure } from './heal-triage.js';
+import { classifyReworkCapExhaustion, fillMissingGateFacts, markDeletedUnverified, mergeHealSignatures, triageFailure } from './heal-triage.js';
 
 test('환경 주장은 verify-evidence 전까지만 environment-claimed', () => {
   const signature = { environmentClaim: '할당량 소진', failedTests: 0 };
@@ -68,6 +68,26 @@ test('L2 이후 인용이 있으면 재작업, 없거나 빈 목록이면 종전
   });
   expect(triageFailure({ failedTests: 1, citations: [] }, visited).outcome).toBe('exhausted');
   expect(triageFailure({ failedTests: 1 }, visited).outcome).toBe('exhausted');
+});
+
+test('수리 한도 소진은 도입 실패면 코드 결함·재발사, 골 지적이면 골 결함·카드, 아니면 시험 결함·수확', () => {
+  expect(classifyReworkCapExhaustion({
+    introduced: ['src/other.ts introduced 1'],
+    mustFix: ['fix the assertion'],
+  })).toEqual({
+    defectClass: 'code-defect',
+    nextAction: 'relaunch',
+    evidence: ['gate introduced: src/other.ts introduced 1', 'review must-fix: fix the assertion'],
+  });
+  expect(classifyReworkCapExhaustion({ mustFix: ['수용 기준이 모순이다'] })).toMatchObject({
+    defectClass: 'goal-defect', nextAction: 'card',
+  });
+  expect(classifyReworkCapExhaustion({ mustFix: ['assertion does not fail before the fix'] })).toMatchObject({
+    defectClass: 'test-defect', nextAction: 'harvest',
+  });
+  expect(classifyReworkCapExhaustion({})).toEqual({
+    defectClass: 'test-defect', nextAction: 'harvest', evidence: [],
+  });
 });
 
 test('모호하면 방문 수로 해상도를 올린다', () => {

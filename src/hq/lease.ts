@@ -39,8 +39,8 @@ export const leaseExpired = (record: LeaseRecord, now: number): boolean => recor
 /** acquire: only when there is no lease or it has expired; a new holder gets the next generation. */
 export function decideAcquire(record: LeaseRecord | null, me: string, now: number, ttlSeconds = DEFAULT_TTL_SECONDS):
   { ok: true; next: LeaseRecord } | { ok: false; reason: string } {
-  if (record && record.holder === me && !leaseExpired(record, now)) return { ok: true, next: { ...record, renewedAt: now, ttlSeconds } };
-  if (record && !leaseExpired(record, now)) return { ok: false, reason: `held by ${record.holder} (generation ${record.generation})` };
+  if (record && record.renewedAt !== 0 && record.holder === me && !leaseExpired(record, now)) return { ok: true, next: { ...record, renewedAt: now, ttlSeconds } };
+  if (record && record.renewedAt !== 0 && !leaseExpired(record, now)) return { ok: false, reason: `held by ${record.holder} (generation ${record.generation})` };
   return { ok: true, next: { holder: me, generation: (record?.generation ?? 0) + 1, acquiredAt: now, renewedAt: now, ttlSeconds, views: {}, dualUnreachableStreak: 0 } };
 }
 
@@ -52,8 +52,10 @@ export function decideRenew(record: LeaseRecord | null, me: string, generation: 
   return { ok: true, next: { ...record, renewedAt: now, dualUnreachableStreak: 0 } };
 }
 
-export function decideRelease(record: LeaseRecord | null, me: string): { ok: true; next: LeaseRecord } | { ok: false; reason: string } {
+export function decideRelease(record: LeaseRecord | null, me: string, expected?: { holder: string; generation: number }): { ok: true; next: LeaseRecord } | { ok: false; reason: string } {
   if (!record || record.holder !== me) return { ok: false, reason: record ? `held by ${record.holder}` : 'no lease' };
+  if (expected && (record.holder !== expected.holder || record.generation !== expected.generation))
+    return { ok: false, reason: `lease changed: expected ${expected.holder} generation ${expected.generation}, observed ${record.holder} generation ${record.generation}` };
   return { ok: true, next: { ...record, renewedAt: 0 } };
 }
 

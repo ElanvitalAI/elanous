@@ -2,7 +2,7 @@
 // 공개 문서에 적힌 `elanous …` 명령·하위 명령·플래그가 «실제 CLI» 에 있나 — 문서가 실제와 어긋나는 1순위 원인을 잡는다.
 //   bun scripts/docs-cli-check.ts [--json] [files…]      (기본 = release/public/내부 문서 `*` ⊕ README.md)
 // 🩸 계기(2026-09-25 🅢 RFC 피드백 ③): README·install.md 가 거짓이 된 원인이 전부 «설치기·doctor 가 바뀌었는데 문서가 모름»이었다.
-// 자 = `bun bin/elanous.mjs <cmd> [<sub>] [<subsub>] --help` 산출(원천) — 문서의 코드 블록과 인라인 코드에서 `elanous ` 로 시작하는 것만 본다.
+// 자 = `bun bin/elanous.mjs <cmd> [<sub>] [<subsub>] --help` 산출(원천) — 문서의 코드 블록과 인라인 코드에서 `elanous ` 또는 `bun bin/elanous.mjs ` 로 시작하는 것만 본다.
 // ⛔ 못 본 것은 «없다»로 적지 않는다: `--help` 가 실패하면 그 명령은 `unmeasured` 로 따로 센다.
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
@@ -21,10 +21,10 @@ export function extractElanousCommands(file: string, text: string): DocCommand[]
     if (/^\s*(```|~~~)/.test(raw)) { inFence = !inFence; return; }
     const candidates: string[] = [];
     if (inFence) candidates.push(raw.replace(/#.*$/, ''));
-    for (const m of raw.matchAll(/`(elanous [^`]+)`/g)) candidates.push(m[1]!);
+    for (const m of raw.matchAll(/`((?:bun bin\/elanous\.mjs |elanous )[^`]+)`/g)) candidates.push(m[1]!);
     for (const c of candidates) {
       for (const seg of c.split(/&&|\|\||;|\|/)) {
-        const m = /^(?:(?:\$\s+|>\s+|sudo\s+|[A-Za-z_][A-Za-z0-9_]*=\S+\s+))*elanous\s+(.+)$/.exec(seg.trim());
+        const m = /^(?:(?:\$\s+|>\s+|sudo\s+|[A-Za-z_][A-Za-z0-9_]*=\S+\s+))*(?:bun bin\/elanous\.mjs |elanous\s+)(.+)$/.exec(seg.trim());
         if (!m) continue;
         const tokens = m[1]!.trim().split(/\s+/).filter(Boolean);
         const cmd = tokens[0];
@@ -86,7 +86,7 @@ export function checkCommands(refs: readonly DocCommand[], help: HelpRunner = de
       }
     }
     for (const f of ref.flags) {
-      if (!new RegExp(`(^|[\\s,])${f}(\\b|[\\s,=<\\[])`, 'm').test(flagsHelp)) findings.push({ kind: 'unknown-flag', ref, detail: `${f} (${flagsPath})` });
+      if (!new RegExp(`(^|[\\s,])${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\b|[\\s,=<\\[])`, 'm').test(flagsHelp)) findings.push({ kind: 'unknown-flag', ref, detail: `${f} (${flagsPath})` });
     }
   }
   return findings;

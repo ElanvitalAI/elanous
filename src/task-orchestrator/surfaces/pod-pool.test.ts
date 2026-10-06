@@ -46,16 +46,16 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(resolvePodPoolSpec(undefined, { ELANOUS_POD_POOL: 'b:1' }, () => 'c:1')).toBe('b:1');
   });
 
-  test('fills the first node to capacity before spilling to the next; release reopens a slot', async () => {
+  test('fills members in proportion to their capacity (free share), ties keep spec order; release reopens a slot', async () => {
     const pool = new PodPoolScheduler(parsePodPool('first:2,second:1'), { occupancy: () => ({}) });
     const got = [await pool.tryAcquire(), await pool.tryAcquire(), await pool.tryAcquire(), await pool.tryAcquire()].map((m) => m?.context ?? null);
-    expect(got).toEqual(['first', 'first', 'second', null]);
+    expect(got).toEqual(['first', 'second', 'first', null]);
     pool.release(pool.members[0]!);
     expect((await pool.tryAcquire())?.context).toBe('first');
     expect(pool.snapshot()).toEqual({ first: 2, second: 1 });
   });
 
-  test('picks the member with the most real free slots, not the first one', async () => {
+  test('picks the member with the largest real free share, not the biggest or the first one', async () => {
     const events: Array<Record<string, unknown>> = [];
     const original = debug.log.bind(debug);
     debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
@@ -66,20 +66,30 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       const full: Record<string, MemberOccupancy> = { node-b: { occupied: 20 }, node-c: { occupied: 0 } };
       const fullPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => full });
       expect((await fullPool.tryAcquire())?.context).toBe('node-c');
-      expect(events.at(-1)).toEqual({ member: 'node-c', free: { node-b: 0, node-c: 4 }, measured: { node-b: true, node-c: true } });
+      expect(events.at(-1)).toEqual({ member: 'node-c', free: { node-b: 0, node-c: 4 }, measured: { node-b: true, node-c: true }, share: { node-b: 0, node-c: 1 } });
 
       const both: Record<string, MemberOccupancy> = { node-b: { occupied: 10 }, node-c: { occupied: 1 } };
       const bothPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => both });
-      expect((await bothPool.tryAcquire())?.context).toBe('node-b');
+      // POOL-SPREAD: node-b 10/20 free (50%) vs node-c 3/4 free (75%) — the small member is no longer left idle.
+      expect((await bothPool.tryAcquire())?.context).toBe('node-c');
 
-      const tied: Record<string, MemberOccupancy> = { node-b: { occupied: 16 }, node-c: { occupied: 0 } };
-      const tiedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => tied });
-      expect((await tiedPool.tryAcquire())?.context).toBe('node-b');
+      const mostlyFull: Record<string, MemberOccupancy> = { node-b: { occupied: 16 }, node-c: { occupied: 0 } };
+      const mostlyFullPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => mostlyFull });
+      expect((await mostlyFullPool.tryAcquire())?.context).toBe('node-c');
+      const evenPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => ({ node-b: { occupied: 10 }, node-c: { occupied: 2 } }) });
+      expect((await evenPool.tryAcquire())?.context).toBe('node-b');
 
       const failed: Record<string, MemberOccupancy> = { node-b: { occupied: 0 }, node-c: { occupied: null, reason: 'timeout' } };
       const failedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => failed });
       expect((await failedPool.tryAcquire())?.context).toBe('node-b');
       expect(events.at(-1)?.measured).toEqual({ node-b: true, node-c: false });
+      // An unanswered node must not win on a 100% share while a measured node still has room.
+      const busyFailed: Record<string, MemberOccupancy> = { node-b: { occupied: 15 }, node-c: { occupied: null, reason: 'timeout' } };
+      const busyFailedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => busyFailed });
+      expect((await busyFailedPool.tryAcquire())?.context).toBe('node-b');
+      const fullFailed: Record<string, MemberOccupancy> = { node-b: { occupied: 20 }, node-c: { occupied: null, reason: 'timeout' } };
+      const fullFailedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => fullFailed });
+      expect((await fullFailedPool.tryAcquire())?.context).toBe('node-c');
 
       const picked: string[] = [];
       for (let n = 0; n < 10; n++) {

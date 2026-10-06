@@ -23,6 +23,7 @@ import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
+import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
@@ -110,6 +111,8 @@ export interface HarnessAskSayOptions {
   supervisorSource?: HarnessSupervisorSource;
   goalType?: GoalType;
   correlation?: string;
+  /** Depth 0 only. At depth >= 1 this flag is ignored and the launch stays refused. */
+  nestedElanous?: 'allow';
 }
 
 export interface ResolvedHarnessSupervisor {
@@ -174,7 +177,8 @@ function registerHarnessCommonOptions(command: Command): Command {
     .option('--merge-by-host', 'Pod: merge-ready 까지 실행하고 병합은 발사 호스트가 재게이트')
     .option('--observe-only', 'elanous: child boot부터 SelfImplement 호출을 기록만 한다')
     .addOption(new Option('--no-supervise', 'self: supervisor 재개를 끔').hideHelp())
-    .option('--dry-run', '변경 없이 발사 계획만 출력');
+    .option('--dry-run', '변경 없이 발사 계획만 출력')
+    .addOption(new Option('--nested-elanous <policy>', '깊이 0만: 중첩 elanous 발사를 허용(allow). 깊이 1 이상은 무시되고 거부가 유지된다').choices(['allow']));
 }
 
 type HarnessDryRunOpts = { dryRun?: boolean };
@@ -299,7 +303,31 @@ function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSa
     ...(opts.observeOnly ? { observeOnly: true } : {}),
     ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
     ...resolveHarnessSupervisor(opts),
+    ...resolveNestedElanousOption(opts),
   };
+}
+
+export class NestedElanousRefused extends Error {
+  constructor(readonly depth: number) {
+    super(`nested elanous refused (allow-ignored, depth ${depth})`);
+    this.name = 'NestedElanousRefused';
+  }
+}
+
+/**
+ * Depth 0 may keep `--nested-elanous allow`.
+ * Depth >= 1 cannot flip the refusal: the flag is ignored, logged, and the launch stops.
+ * No flag means an ordinary launch — unset depth is 0 and nothing is refused here.
+ */
+export function resolveNestedElanousOption(
+  opts: Pick<HarnessAskSayOptions, 'nestedElanous'>,
+  env: Record<string, string | undefined> = process.env,
+): { nestedElanous?: 'allow' } {
+  if (opts.nestedElanous !== 'allow') return {};
+  const decision = decideNestedElanousLaunch({ depth: readNestedElanousDepth(env), allow: true });
+  if (decision.reason === 'allow-ignored') throw new NestedElanousRefused(decision.depth);
+  if (!decision.allowed) return {};
+  return { nestedElanous: 'allow' };
 }
 
 function normalizeHarnessAskSayOptions(opts: HarnessAskSayChildLlmOptions): HarnessAskSayChildLlmOptions {
@@ -704,7 +732,13 @@ async function dispatchHarnessAskSay(
     const podSeat = resolved.substrate === 'pod' && ['OP', 'TC', 'MK', 'UX'].includes(inheritedSeat ?? '')
       ? inheritedSeat as QueueSeat : undefined;
     const stampedSeat = resolved.substrate === 'pod' ? opts.seat ?? queueSeat ?? podSeat ?? assigned : assigned;
-    const stampedOpts = stampedSeat ? { ...opts, seat: stampedSeat } : opts;
+    // Depth >= 1 cannot re-allow. Drop the flag here so the launch sees the refusal, not the raw argv.
+    const nested = resolveNestedElanousOption(opts);
+    const stampedOpts = {
+      ...opts,
+      ...(stampedSeat ? { seat: stampedSeat } : {}),
+      ...(nested.nestedElanous ? { nestedElanous: nested.nestedElanous } : { nestedElanous: undefined }),
+    };
     const launch = async () => {
       const previous = process.env.ELANOUS_HARNESS_SEAT;
       if (stampedSeat) process.env.ELANOUS_HARNESS_SEAT = stampedSeat;

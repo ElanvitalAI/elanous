@@ -43,7 +43,7 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
+export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off'; modeDowngradeReason?: string };
 
 export function seatLoopTickLine(result: SeatLoopResult): string {
@@ -53,6 +53,8 @@ export function seatLoopTickLine(result: SeatLoopResult): string {
 }
 export type PersonaShadowEntry = { personaId: string; ts: string; status: 'shadow' | 'skipped-empty'; todo: PersonaTodo | null; action?: 'decision' | 'harness' | 'wait'; what?: string };
 export type SeatDeps = {
+  /** Version stamp for decision cards the seat loop raises. Default = the ledger's resolver (`git reflog` on the repo, up to 10 s) — tests inject a fixed one. */
+  resolveDecisionVersion?: (at: string) => { released: string | null; dev: string | null; codename: string | null };
   personaConfig?: PersonaLoopConfig;
   personaRegistry?: PersonaRegistry;
   personaDir?: string;
@@ -256,6 +258,59 @@ function queueKey(seat: string, item: SeatItem): string {
   return `seat-loop:${seat}:${createHash('sha256').update(handledItemKey(item)).digest('hex')}`;
 }
 
+/** A decision ledger that raises cards — forwards the injected version resolver so tests never run the repo's `git reflog`. */
+function cardLedger(root: string, deps: SeatDeps, now?: Date): DecisionLedger {
+  return new DecisionLedger({ stateDir: root, ...(now ? { now: () => now } : {}), ...(deps.resolveDecisionVersion ? { resolveVersion: deps.resolveDecisionVersion } : {}) });
+}
+
+const DEFAULT_REPEAT_STOP = 3;
+
+function repeatStopLimit(config: SeatLoopConfig): number {
+  const value = config.repeatStop;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_REPEAT_STOP;
+}
+
+/** A finished attempt that never landed (no merged-PR evidence). `attempting` is the intent row of the same launch. A `refused` row whose reason is the AUTOQ retry note is the reconcile of a queued row, not a second try. */
+function unlandedAttempt(entry: SeatEntry): boolean {
+  if (!entry.item || entry.action === 'seat-question' || entry.action === 'seat-answer' || entry.inquiry) return false;
+  if (entry.status === 'launched' || entry.status === 'hitl' || entry.status === 'held' || entry.status === 'attempting') return false;
+  if (entry.status === 'refused' && entry.reason === 'AUTOQ failed or cancelled; eligible for retry') return false;
+  return entry.status === 'queued' || entry.status === 'refused' || entry.status === 'outcome-unknown';
+}
+
+function repeatStopReason(attempts: number): string {
+  return `같은 칸 ${attempts}회 착지 0 — 사람 판단`;
+}
+
+function personReopened(ledger: readonly SeatEntry[], seat: string, item: SeatItem, root: string): boolean {
+  const key = handledItemKey(item);
+  const lastHold = [...ledger].reverse().find((entry) => entry.seat === seat && entry.item && handledItemKey(entry.item) === key && entry.status === 'held');
+  if (!lastHold) return false;
+  const heldAt = Date.parse(lastHold.at || lastHold.ts || '');
+  if (!Number.isFinite(heldAt)) return false;
+  const ref = decisionRef(seat, item);
+  return new DecisionLedger({ stateDir: root }).list({ status: 'all' }).some((card) => {
+    if (!card.refs?.includes(ref) || card.status !== 'decided' || !card.decidedAt) return false;
+    const decidedAt = Date.parse(card.decidedAt);
+    return Number.isFinite(decidedAt) && decidedAt > heldAt;
+  });
+}
+
+/** Prior attempts of this seat and handled item that finished without a landing. A queued row whose queue is still retryable has not finished. Queue rows with the same key count when the ledger has no receipt. */
+function unlandedAttemptCount(seat: string, item: SeatItem, ledger: readonly SeatEntry[], root: string, deps: SeatDeps): number {
+  const key = handledItemKey(item);
+  const idem = queueKey(seat, item);
+  const outcome = deps.queueOutcome ?? ((id: string, stateRoot: string) => harnessQueueOutcome(id, { root: stateRoot }));
+  const finished = (entry: SeatEntry) => unlandedAttempt(entry) && !(entry.status === 'queued' && entry.queueId && outcome(entry.queueId, root) === 'retryable');
+  const fromLedger = ledger.filter((entry) => entry.seat === seat && entry.item && handledItemKey(entry.item) === key && finished(entry));
+  const seen = new Set(fromLedger.flatMap((entry) => entry.queueId ? [entry.queueId] : []));
+  let rows: ReturnType<typeof listHarnessQueue> = [];
+  try { rows = (deps.queueItems ?? ((stateRoot: string) => listHarnessQueue({ root: stateRoot })))(root); }
+  catch (error) { observe('repeat-stop-queue-unreadable', { seat, item: item.id, error: String(error).slice(0, 200) }); }
+  const fromQueue = rows.filter((row) => row.seat === seat && row.idempotencyKey === idem && row.status === 'finished' && !seen.has(row.id));
+  return fromLedger.length + fromQueue.length;
+}
+
 /** A crash (or a failed write) between AUTOQ enqueue and the `queued` row leaves an `attempting`/`outcome-unknown` row with no queue id. Find its queue row by the
  *  seat-loop idempotency key so the outcome below (retry · launched · still queued) applies to it too (LOOP-LIVE1 review must-fix). */
 function recoverAttemptingQueueIds(ledger: readonly SeatEntry[], root: string, deps: SeatDeps): SeatEntry[] {
@@ -338,7 +393,7 @@ function handledKeys(ledger: readonly SeatEntry[], shadow: boolean, root?: strin
     || (entry.status === 'shadow' && entry.candidate?.kind === 'other-seat-cell-defect')
     || (entry.status === 'hitl' && (!entry.inquiry || (!!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))))
     || (entry.inquiry?.to === 'CEO' && !!root && !!entry.item && !!decisionReceipt(root, entry.seat, entry.item))
-    || (!inquiryRow(entry) && (entry.status === 'queued' || entry.status === 'outcome-unknown'))
+    || (!inquiryRow(entry) && (entry.status === 'queued' || entry.status === 'outcome-unknown' || (entry.status === 'held' && !personReopened(ledger, entry.seat, entry.item!, root ?? ''))))
     || (!inquiryRow(entry) && entry.status === 'attempting' && !(entry.item?.source === 'checklist' && ledger.slice(index + 1).some((later) =>
       later.seat === entry.seat && later.status === 'launched' && later.item?.source === 'checklist'
       && later.item.version === entry.item?.version && later.item.id === entry.item?.id
@@ -881,7 +936,7 @@ function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps
       if (judgment.state === 'absent') {
         if (config.mode === 'live-safe' && judgment.action?.action === 'escalate' && isRescueAllowedAction('decision-card')) {
           const ref = `seat-loop:neighbor:${seat}:${neighbor.id}:${lastSeenAt}`;
-          new DecisionLedger({ stateDir: root, now: () => now }).raiseOnce({ title: `${seat}: 이웃 ${neighbor.id} 결측`, category: 'other',
+          cardLedger(root, deps, now).raiseOnce({ title: `${seat}: 이웃 ${neighbor.id} 결측`, category: 'other',
             scqa: { s: `${seat} 이웃 ${neighbor.id}의 마지막 맥락 버스 사건: ${lastSeenAt}.`,
               c: `설정한 heartbeat ${neighbor.heartbeat.everyMinutes}분 × ${neighbor.heartbeat.missedTicks}회 동안 새 사건이 없다.`,
               q: '결측 이웃의 업무를 어떻게 처리할까?' },
@@ -1403,6 +1458,38 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       return entry;
     }
     if (config.mode === 'live-safe') {
+      const limit = repeatStopLimit(config);
+      const attempts = unlandedAttemptCount(seat, item, ledger, stateRoot, deps);
+      if (attempts >= limit && !personReopened(ledger, seat, item, stateRoot)) {
+        const reason = repeatStopReason(attempts);
+        entry.status = 'held';
+        entry.reason = reason;
+        const ref = decisionRef(seat, item);
+        const prior = new DecisionLedger({ stateDir: stateRoot }).list({ status: 'all' }).find((card) => card.refs?.includes(ref) && card.status === 'open');
+        if (!prior) {
+          cardLedger(stateRoot, deps, now).raiseOnce({
+            title: `${seat}: ${item.id} 반복 착지 0`,
+            category: 'other',
+            scqa: {
+              s: `${seat} 칸 ${item.id} 가 착지 없이 ${attempts}회 끝났다.`,
+              c: '같은 칸을 다시 발사하지 않고 사람 판단을 기다린다.',
+              q: '이 칸을 계속할까, 멈출까?',
+            },
+            options: [
+              { key: 'a', label: '다시 연다', consequence: '결정 뒤에 자리 루프가 한 번 더 시도할 수 있다' },
+              { key: 'b', label: '멈춘다', consequence: '같은 칸은 다시 발사하지 않는다' },
+            ],
+            recommendation: { skipped: true, reason: '착지 없는 반복만으로 계속할지 자동 결정하지 않는다' },
+            raisedBy: { agent: 'seat-loop' },
+            refs: [ref],
+            raisedAt: now.toISOString(),
+            crossCheckSkipped: '반복 정지는 사람 판단',
+          }, ref);
+        }
+        append(path, entry);
+        observe('repeat-stopped', { seat, item: item.id, attempts, lastQueueId: [...ledger].reverse().find((row) => row.seat === seat && row.item && handledItemKey(row.item) === handledItemKey(item) && row.queueId)?.queueId ?? null });
+        return entry;
+      }
       let queued: { id: string };
       try {
         queued = await (deps.enqueue ?? ((assigned, text, root, idempotencyKey) => addHarnessQueue({ seat: assigned, say: text, idempotencyKey }, { root })))(seat, action.text, stateRoot, queueKey(seat, item));

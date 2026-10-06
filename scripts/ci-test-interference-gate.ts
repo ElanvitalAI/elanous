@@ -2,6 +2,7 @@
 import {
   detectTestInterference,
   formatIsolatedFailureSummary,
+  runBunTest,
   type InterferenceReport,
   type TestRunner,
 } from './detect-test-interference.js';
@@ -11,6 +12,8 @@ const TEST_FILE = /\.test\.tsx?$/;
 
 export type TestInterferenceGateIo = {
   args?: readonly string[];
+  /** Landing tree. `bun test` of the changed files runs here, not in process.cwd(). */
+  cwd?: string;
   log?: (message: string) => void;
   detect?: (files: readonly string[], runner?: TestRunner) => Promise<InterferenceReport>;
   runner?: TestRunner;
@@ -36,6 +39,7 @@ export function selectedTestFiles(files: readonly string[]): string[] {
 export async function runTestInterferenceGate(io: TestInterferenceGateIo = {}): Promise<number> {
   const args = io.args ?? process.argv.slice(2);
   const log = io.log ?? console.log;
+  const cwd = io.cwd ?? process.cwd();
   const changed = parseChangedFiles(args);
   const tests = selectedTestFiles(changed ?? []);
   if (tests.length < 2) {
@@ -48,7 +52,7 @@ export async function runTestInterferenceGate(io: TestInterferenceGateIo = {}): 
   const capNotice = omitted > 0 ? ` · 상한 ${MAX_INSPECTED_TEST_FILES}개 적용, ${omitted}개 미검사.` : '';
   let report: InterferenceReport;
   try {
-    report = await (io.detect ?? detectTestInterference)(inspected, io.runner);
+    report = await (io.detect ?? detectTestInterference)(inspected, io.runner ?? ((files) => runBunTest(files, undefined, cwd)));
   } catch {
     log(`[test-interference-gate] 경고: 측정 불가 — 판정기 실행 실패, 간섭 없음으로 처리하지 않음.${capNotice}`);
     return 0;

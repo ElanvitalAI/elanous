@@ -36,7 +36,7 @@ import {
   type ProviderFallbackAttempt,
   type ProviderFallbackTerminalVerdict,
 } from './session-runtime/retry-policy.js';
-import { fetchApiWithRetry } from './session-runtime/retry-api.js';
+import { fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
 import { reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
@@ -407,6 +407,10 @@ export interface LLMOpts {
       background?: 'transparent' | 'opaque' | 'auto';
     };
   };
+  /** Unused configured fallbacks. The HTTP retry layer switches provider
+   *  after k consecutive overload responses before spending those retries.
+   *  Callers that already pinned a provider omit this (0). */
+  remainingFallbacks?: number;
 }
 
 export interface LLMProvider {
@@ -1310,6 +1314,20 @@ export async function* parseOpenAISSELines(
  *  the request URL. The OpenAI streamer is shared by openai/grok/local
  *  endpoints — all three pass through here. The string lands in the
  *  `llm.retry` debug snapshot and the `ApiHttpError.provider` field. */
+/** Retries still left for this HTTP call. Callers that already know a
+ *  fallback remains pass it so overload switches before those retries. */
+function retryOptsFor(
+  provider: string,
+  errorPrefix: string,
+  remainingFallbacks?: number,
+): FetchApiWithRetryOpts {
+  return {
+    provider,
+    errorPrefix,
+    ...(remainingFallbacks !== undefined && remainingFallbacks > 0 ? { remainingFallbacks } : {}),
+  };
+}
+
 function inferOpenAIProviderName(url: string): string {
   if (url.includes('x.ai')) return 'grok';
   if (url.includes('openai.com')) return 'openai';
@@ -1326,6 +1344,7 @@ async function* streamOpenAIEvents(
    *  `x-grok-client-version` 이 빠지면 HTTP 426 으로 거절된다(실측).
    *  ⛔ 생략하면 종전과 «바이트 동일** — 기존 호출자 무회귀. */
   extraHeaders?: Record<string, string>,
+  remainingFallbacks?: number,
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -1353,10 +1372,7 @@ async function* streamOpenAIEvents(
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     },
-    {
-      provider: inferOpenAIProviderName(url),
-      errorPrefix: 'LLM API',
-    },
+    retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks),
   );
 
   debug.log('llm.response.status', `${response.status} ${response.statusText || ''}`.trim(), {
@@ -2030,6 +2046,8 @@ export async function* streamCodexResponsesEvents(
      *  call. Best-effort; null/undefined if the backend skips the
      *  event. */
     onResponseCreated?: (id: string) => void;
+    /** Unused configured fallbacks. Overload k times switches before retries. */
+    remainingFallbacks?: number;
   } = {},
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const startedAt = Date.now();
@@ -2118,10 +2136,7 @@ export async function* streamCodexResponsesEvents(
       }),
       signal,
     },
-    {
-      provider: 'codex',
-      errorPrefix: 'Codex API',
-    },
+    retryOptsFor('codex', 'Codex API', extra.remainingFallbacks),
   );
   debug.log('llm.response.status', `codex ${response.status}`, {
     url, status: response.status, elapsedMs: Date.now() - startedAt,
@@ -3103,6 +3118,7 @@ async function* streamAnthropicEvents(
   apiKey: string,
   body: any,
   signal?: AbortSignal,
+  remainingFallbacks?: number,
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   // Wave 6 (2026-05-04) — Anthropic beta headers from
   // ref/opencode `provider/provider.ts:181-185` analysis.
@@ -3139,10 +3155,7 @@ async function* streamAnthropicEvents(
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     },
-    {
-      provider: 'anthropic',
-      errorPrefix: 'Anthropic API',
-    },
+    retryOptsFor('anthropic', 'Anthropic API', remainingFallbacks),
   );
 
   try {
@@ -4507,7 +4520,11 @@ export async function streamLLM(
     const consumed = await consumeProviderText(
       activeProvider,
       messages,
-      { ...opts, model: activeModel },
+      {
+        ...opts,
+        model: activeModel,
+        remainingFallbacks: opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length,
+      },
       onChunk,
     );
     const full = consumed.full;
@@ -4528,6 +4545,22 @@ export async function streamLLM(
     }
 
     const err: any = consumed.error;
+    if (err instanceof OverloadFailoverError && !opts.provider) {
+      const switched = providerByName('grok');
+      if (switched && !attemptedProviders.has(switched.name) && switched.available() && full.length === 0) {
+        debug.log('llm.router', 'overload-failover', {
+          blockedProvider: activeProvider.name,
+          fallbackProvider: switched.name,
+          streak: err.streak,
+          status: err.status,
+          kind: err.kind,
+        }, { level: 'warn' });
+        activeProvider = switched;
+        modelOverride = undefined;
+        attemptedProviders.add(activeProvider.name);
+        continue;
+      }
+    }
     const reason = sanitizeProviderFailureReason(err?.message || String(err));
     debug.log('llm.router.error', 'streamLLM', {
       provider: activeProvider.name,
@@ -8350,9 +8383,11 @@ export async function streamLLMWithTools(
     // `tools: activeTools` (not opts.tools) so mid-loop hydration reaches the
     // provider on the next turn. turn-0 keeps opts.toolChoice; later turns
     // revert to auto (see above).
-    const buildTurnOpts = () => turn === 0
-      ? { ...opts, model: activeModel, tools: activeTools }
-      : { ...opts, model: activeModel, tools: activeTools, toolChoice: undefined };
+    const buildTurnOpts = () => {
+      const remainingFallbacks = opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length;
+      const base = { ...opts, model: activeModel, tools: activeTools, remainingFallbacks };
+      return turn === 0 ? base : { ...base, toolChoice: undefined };
+    };
     let turnOpts = buildTurnOpts();
     // reasoning-heavy family(codex/claude/gemini/grok/local)는 침묵 추론 구간이 길어 idle watchdog 를
     // family-aware 로 상향(2026-07-19 goal-exec → 아크4 전-family). fast/mini(gpt·other)만 45s 유지.
@@ -8390,6 +8425,26 @@ export async function streamLLMWithTools(
         ]);
       } catch (err) {
         if (idleTimer) clearTimeout(idleTimer);
+        if (err instanceof OverloadFailoverError && !opts.provider) {
+          const switched = providerByName('grok');
+          if (switched && !attemptedProviders.has(switched.name) && switched.available() && evCount === 0) {
+            debug.log('llm.router', 'overload-failover', {
+              turn,
+              blockedProvider: activeProvider.name,
+              fallbackProvider: switched.name,
+              streak: err.streak,
+              status: err.status,
+              kind: err.kind,
+            }, { level: 'warn' });
+            const finalized = finalizeStreamingProviderModel(switched, switched.defaultModel);
+            activeProvider = finalized.provider;
+            activeModel = finalized.model;
+            attemptedProviders.add(activeProvider.name);
+            turnOpts = buildTurnOpts();
+            streamIter = undefined;
+            continue;
+          }
+        }
         // 명시 provider 선택만 폴백 대상이 아니다 — `streamLLM` 과 같은 계약으로
         // «원본 오류»를 그대로 올린다. 모델만 전달된 호출은 다음 provider의 기본 모델로 재시도한다.
         if (opts.provider) throw err;
@@ -10958,6 +11013,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           // lastResponseId stays undefined and we fall back to full
           // input on the next turn (safe — just no token savings).
           onResponseCreated: useStore ? (id) => { lastResponseId = id; } : undefined,
+          remainingFallbacks: opts.remainingFallbacks,
         });
         // Snapshot full input AFTER the stream completes so the next
         // call's delta computation uses what the backend actually has
@@ -10991,7 +11047,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         ...openAiTemperatureField(apiKeyModel, opts.temperature ?? 0.3),
         ...openAiOutputTokenField(apiKeyModel, opts.maxTokens ?? 2048),
         ...(tools ? { tools } : {}),
-      }, opts.signal);
+      }, opts.signal, undefined, opts.remainingFallbacks);
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
   };
@@ -11085,7 +11141,7 @@ function makeAnthropicProvider(cfg: UCLLMConfig): LLMProvider {
         ...(effort ? { thinking: { type: 'adaptive' }, output_config: { effort } } : {}),
         ...anthropicTemperatureField(anthropicModel, thinkingActive, opts.temperature),
         ...(tools ? { tools } : {}),
-      }, opts.signal);
+      }, opts.signal, opts.remainingFallbacks);
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
   };

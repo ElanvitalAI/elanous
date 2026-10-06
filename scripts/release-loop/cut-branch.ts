@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 
-export interface CutBranchOptions { version: string; base: string; pick: string[]; dryRun?: boolean; repoRoot?: string; log?: (line: string) => void }
+export interface CutBranchOptions { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; repoRoot?: string; log?: (line: string) => void }
 
 // git-spawn-allow: release branch operations happen only in an isolated temporary worktree; main is never checked out or changed.
 function git(repo: string, args: string[]): string {
@@ -23,8 +23,8 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
   const repo = resolve(opts.repoRoot ?? process.cwd());
   const branch = `release/${opts.version}`;
   const log = opts.log ?? console.log;
-  const report = (event: 'created' | 'refused' | 'conflict', reason?: string, commit?: string) =>
-    debug.log('release-loop.cut-branch', event, { version: opts.version, branch, ...(commit ? { commit } : {}), ...(reason ? { reason } : {}) });
+  const report = (event: 'created' | 'refused' | 'conflict' | 'appended', reason?: string, commit?: string, extra?: Record<string, string | string[]>) =>
+    debug.log('release-loop.cut-branch', event, { version: opts.version, branch, ...(commit ? { commit } : {}), ...(reason ? { reason } : {}), ...extra });
   try {
     if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(opts.version)) throw new Error(`invalid release version: ${opts.version}`);
     if (!opts.pick.length) throw new Error('at least one --pick commit is required');
@@ -37,18 +37,31 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
     for (const sha of picks) if (ancestor(repo, sha, base)) throw new Error(`pick ${sha} is already in base ${base}`);
     if (new Set(picks).size !== picks.length) throw new Error('duplicate --pick commit');
     for (const sha of picks) if (git(repo, ['rev-list', '--parents', '-n', '1', sha]).split(' ').length !== 2) throw new Error(`pick ${sha} must have exactly one parent`);
-    if (git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`])) throw new Error(`${branch} already exists on origin`);
+    const remoteLine = git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]);
+    if (remoteLine && !opts.append) throw new Error(`${branch} already exists on origin — use --append to fast-forward more picks onto it`);
+    if (!remoteLine && opts.append) throw new Error(`${branch} does not exist on origin — omit --append to create it`);
     if (spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repo }).status === 0) throw new Error(`${branch} already exists locally`);
-    const pkg = JSON.parse(git(repo, ['show', `${base}:package.json`])) as { version?: unknown };
-    if (pkg.version !== opts.version) throw new Error(`base package.json version ${pkg.version} is not ${opts.version}`);
-    log(`${branch}: ${base} + ${picks.join(' + ')}${opts.dryRun ? ' (dry-run)' : ''}`);
+    let remoteTip: string | undefined;
+    if (opts.append) {
+      const advertised = remoteLine.split(/\s+/)[0] ?? '';
+      if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} remote tip is not a commit SHA`);
+      git(repo, ['fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+      remoteTip = git(repo, ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+      if (advertised !== remoteTip) throw new Error(`${branch} remote tip moved — fast-forward refused (no force push)`);
+      for (const sha of picks) if (ancestor(repo, sha, remoteTip)) throw new Error(`pick ${sha} is already in ${branch}`);
+    }
+    const versionAt = remoteTip ?? base;
+    const pkg = JSON.parse(git(repo, ['show', `${versionAt}:package.json`])) as { version?: unknown };
+    if (pkg.version !== opts.version) throw new Error(`${opts.append ? 'release branch' : 'base'} package.json version ${pkg.version} is not ${opts.version}`);
+    const start = remoteTip ?? base;
+    log(`${branch}: ${start} + ${picks.join(' + ')}${opts.append ? ' (append)' : ''}${opts.dryRun ? ' (dry-run)' : ''}`);
     if (opts.dryRun) return { branch, commit: null, dryRun: true };
     const temp = mkdtempSync(join(tmpdir(), 'release-cut-branch-'));
     const tree = join(temp, 'tree');
     let added = false;
     let commit: string | undefined;
     try {
-      git(repo, ['worktree', 'add', '--detach', tree, base]);
+      git(repo, ['worktree', 'add', '--detach', tree, start]);
       added = true;
       for (const sha of picks) {
         try { git(tree, ['cherry-pick', sha]); }
@@ -68,13 +81,30 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
       } finally { rmSync(temp, { recursive: true, force: true }); }
     }
     if (!commit) throw new Error('cherry-pick produced no commit');
-    const push = git(repo, ['push', '--porcelain', `--force-with-lease=refs/heads/${branch}:`, 'origin', `${commit}:refs/heads/${branch}`]);
-    const newBranch = push.split('\n').some((line) => {
+    const lease = opts.append ? remoteTip! : '';
+    let push: string;
+    try {
+      push = git(repo, ['push', '--porcelain', `--force-with-lease=refs/heads/${branch}:${lease}`, 'origin', `${commit}:refs/heads/${branch}`]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.append && /stale info|rejected|non-fast-forward|failed to push/i.test(message)) {
+        throw new Error(`${branch} remote tip moved — fast-forward refused (no force push)`);
+      }
+      throw error;
+    }
+    const landed = push.split('\n').some((line) => {
       const [flag, ref, summary] = line.split('\t');
-      return flag === '*' && ref?.endsWith(`:refs/heads/${branch}`) && summary === '[new branch]';
+      if (flag !== ' ' && flag !== '*') return false;
+      if (!ref?.endsWith(`:refs/heads/${branch}`)) return false;
+      if (!opts.append) return flag === '*' && summary === '[new branch]';
+      const range = summary?.match(/^([0-9a-f]+)\.\.([0-9a-f]+)$/i);
+      return flag === ' ' && !!range && remoteTip!.startsWith(range[1]!) && commit.startsWith(range[2]!);
     });
-    if (!newBranch) throw new Error(`${branch} already exists on origin (push did not create a new branch)`);
-    report('created', undefined, commit);
+    if (!landed) throw new Error(opts.append
+      ? `${branch} remote tip moved — fast-forward refused (no force push)`
+      : `${branch} already exists on origin (push did not create a new branch)`);
+    if (opts.append) report('appended', undefined, commit, { from: remoteTip!, to: commit, picks });
+    else report('created', undefined, commit);
     log(`${branch} → ${commit}`);
     return { branch, commit, dryRun: false };
   } catch (error) {

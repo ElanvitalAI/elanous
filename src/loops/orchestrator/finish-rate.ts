@@ -6,6 +6,8 @@ import { loadRunLedger, resolveFederatedRunLedgerTargets } from '../../self-impl
 import type { LogTarget } from '../../cli/logs-cli.js';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+/** Host-side records a Pod-dispatched launch leaves when its run starts inside the Pod. */
+const LAUNCH_ONLY_EVENTS = new Set(['launch-quota-policy', 'author-on-pod-receipt']);
 const GH_LIMIT = 1000;
 
 export type FinishMetric = 'launched' | 'landed' | 'landingRate' | 'staleDrafts' | 'conflictRatio' | 'unknownMergeable';
@@ -38,6 +40,7 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
   const childLedgers = new Set<string>();
   let unreadableDirectories = 0;
   let unresolvedDirectories = 0;
+  const launchOnlyIds = new Set<string>();
   for (const { ledgerDirectory } of resolveFederatedRunLedgerTargets({ includeTest: true, ...(targets ? { targets } : {}) })) {
     let dir: string;
     try {
@@ -68,16 +71,24 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
         continue;
       }
       const start = entries.find(entry => entry.event === 'start');
-      if (!start?.timestamp) {
+      // A Pod-dispatched launch leaves only a host launch record (launch-quota-policy · author-on-pod-receipt) — the run
+      // itself starts inside the Pod. That is still a launch: its time is the record's timestamp, else the ledger mtime.
+      const launchRecord = !start ? entries.find(entry => LAUNCH_ONLY_EVENTS.has(entry.event)) : undefined;
+      const startedAt = start?.timestamp ?? (launchRecord ? (launchRecord.timestamp ?? new Date(statSync(path).mtimeMs).toISOString()) : undefined);
+      if (!startedAt) {
         if (!starts.has(runId)) unreadable.set(runId, { runId, reason: entries[0]?.event ?? 'start missing' });
         continue;
       }
-      starts.set(runId, { runId, startedAt: start.timestamp });
+      // One runId can leave a host launch record in one directory and a Pod `start` in another: a real `start`
+      // always wins and is never overwritten by a launch record, whatever order the directories are read in.
+      if (launchRecord && starts.has(runId)) continue;
+      if (launchRecord) launchOnlyIds.add(runId); else launchOnlyIds.delete(runId);
+      starts.set(runId, { runId, startedAt });
       unreadable.delete(runId);
     }
   }
   debug.log('loop.orchestrator', 'finish-launch-population', {
-    directories: directories.size + unresolvedDirectories, launched: starts.size, childLedgers: childLedgers.size, unreadable: unreadable.size,
+    directories: directories.size + unresolvedDirectories, launched: starts.size, launchOnly: launchOnlyIds.size, childLedgers: childLedgers.size, unreadable: unreadable.size,
   });
   return { starts: [...starts.values()], unreadable: [...unreadable.values()], unreadableDirectories };
 }

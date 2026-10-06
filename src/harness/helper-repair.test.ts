@@ -89,5 +89,181 @@ test('repair shadow records one authored goal per stopped review-budget PR and n
     expect(goal).toContain('표 접기');
     expect(goal).toContain('`summaryText`는 첫 번째 표만 요약합니다.');
     expect(calls.every((args) => args[0] === 'pr' && args[1] === 'view')).toBe(true);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ mode: 'shadow', result: 'shadow' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('live with an injected queue and a cap of 2 launches two, records the third as capped, labels only launched PRs, holds a release-path PR, and shadow launches nothing', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { recordRepairShadows } = await import('./helper-repair.js');
+  const root = mkdtempSync(join(tmpdir(), 'helper-repair-live-'));
+  const bodyFor = (request: string) => `## 요청\n${request}\n\n## 마지막 리뷰 must-fix\n- Keep the assertion.`;
+  const filesFor = (pr: number) => pr === 30
+    ? [{ filename: 'graphs/release/loop.yaml' }]
+    : [{ filename: 'src/harness/widget.ts' }];
+  const calls: string[][] = [];
+  const runGh = (args: readonly string[]) => {
+    calls.push([...args]);
+    const pr = Number(args[2] ?? /pulls\/(\d+)/.exec(args.join('\n'))?.[1]);
+    if (args[0] === 'api') return JSON.stringify(filesFor(Number(/pulls\/(\d+)/.exec(args.join('\n'))?.[1])));
+    if (args[1] === 'view' && args.includes('labels')) return JSON.stringify({ labels: pr === 11 ? [{ name: 'elanous:seat-TC' }] : [] });
+    if (args[1] === 'view') return JSON.stringify({ body: bodyFor(`request ${pr}`) });
+    return '';
+  };
+  const row = (pr: number) => ({ pr, category: 'review-budget' as const, headRefName: 'self-impl/x', isDraft: true } as never);
+  const enqueued: { seat: string; say: string }[] = [];
+  const enqueue = async (input: { seat: string; say: string }) => {
+    enqueued.push(input);
+    return { id: `hq-repair-${enqueued.length}` };
+  };
+  const live = { repair: 'live' as const, repairPerDay: 2 };
+  try {
+    await recordRepairShadows([row(10), row(11), row(12), row(30)], {
+      runGh, root, now: new Date('2026-10-05T06:00:00Z'), enqueue,
+      config: { harness: { helper: live } } as never,
+    });
+    const lines = readFileSync(join(root, 'helper', 'repairs.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines.map((line) => [line.pr, line.mode, line.result, line.queueId, line.reason])).toEqual([
+      [10, 'live', 'launched', 'hq-repair-1', undefined],
+      [11, 'live', 'launched', 'hq-repair-2', undefined],
+      [12, 'live', 'cap', undefined, '상한'],
+      [30, 'live', 'needs-human', undefined, '사람 승인 필요'],
+    ]);
+    expect(enqueued.map((item) => item.seat)).toEqual(['MK', 'TC']);
+    expect(enqueued).toHaveLength(2);
+    const labelled = calls.filter((args) => args[1] === 'edit' || args[1] === 'comment').map((args) => [args[1], args[2], args.at(-1)]);
+    expect(labelled).toEqual([
+      ['edit', '10', 'elanous:superseded'],
+      ['comment', '10', '수리 대기열 항목 hq-repair-1 로 대체(런은 대기열 틱에서 시작)'],
+      ['edit', '11', 'elanous:superseded'],
+      ['comment', '11', '수리 대기열 항목 hq-repair-2 로 대체(런은 대기열 틱에서 시작)'],
+    ]);
+    expect(calls.some((args) => args.includes('30') && (args[1] === 'edit' || args[1] === 'comment'))).toBe(false);
+
+    const shadowRoot = mkdtempSync(join(tmpdir(), 'helper-repair-shadow-'));
+    const shadowCalls: string[][] = [];
+    try {
+      const written = await recordRepairShadows([row(10)], {
+        runGh: (args) => { shadowCalls.push([...args]); return JSON.stringify({ body: bodyFor('request 10') }); },
+        root: shadowRoot, enqueue, config: { harness: { helper: { repair: 'shadow', repairPerDay: 2 } } } as never,
+      });
+      expect(written).toHaveLength(1);
+      expect(enqueued).toHaveLength(2);
+      expect(shadowCalls.every((args) => args[1] === 'view')).toBe(true);
+      expect(JSON.parse(readFileSync(join(shadowRoot, 'helper', 'repairs.jsonl'), 'utf8'))).toMatchObject({ mode: 'shadow', result: 'shadow' });
+    } finally { rmSync(shadowRoot, { recursive: true, force: true }); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a failed launch writes the failure reason and never labels or comments the PR', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { recordRepairShadows } = await import('./helper-repair.js');
+  const root = mkdtempSync(join(tmpdir(), 'helper-repair-fail-'));
+  const calls: string[][] = [];
+  const body = '## 요청\nrequest\n\n## 마지막 리뷰 must-fix\n- Keep it.';
+  try {
+    await recordRepairShadows([{ pr: 7, category: 'review-budget', headRefName: 'self-impl/x', isDraft: true } as never], {
+      runGh: (args) => {
+        calls.push([...args]);
+        if (args[1] === 'view' && args.includes('labels')) return JSON.stringify({ labels: [] });
+        if (args[1] === 'view') return JSON.stringify({ body });
+        if (args[0] === 'api') return JSON.stringify([{ filename: 'src/x.ts' }]);
+        return '';
+      },
+      root, enqueue: () => { throw new Error('queue down'); },
+      config: { harness: { helper: { repair: 'live', repairPerDay: 3 } } } as never,
+    });
+    const line = JSON.parse(readFileSync(join(root, 'helper', 'repairs.jsonl'), 'utf8'));
+    expect(line).toMatchObject({ pr: 7, mode: 'live', result: 'launch-failed' });
+    expect(line.reason).toContain('발사 실패');
+    expect(line.reason).toContain('queue down');
+    expect(calls.some((args) => args[1] === 'edit' || args[1] === 'comment')).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ACP must-fix: a label failure after enqueue stays launched (no second enqueue); shadow then live launches; a cap retries the next day', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { recordRepairShadows } = await import('./helper-repair.js');
+  const body = '## 요청\nrequest\n\n## 마지막 리뷰 must-fix\n- Keep it.';
+  const row = (pr: number) => ({ pr, category: 'review-budget' as const, headRefName: 'self-impl/x', isDraft: true } as never);
+  const gh = (failEdit: boolean) => (args: readonly string[]) => {
+    if (args[1] === 'view' && args.includes('labels')) return JSON.stringify({ labels: [] });
+    if (args[1] === 'view') return JSON.stringify({ body });
+    if (args[0] === 'api') return JSON.stringify([{ filename: 'src/x.ts' }]);
+    if (failEdit && args[1] === 'edit') throw new Error('label api down');
+    return '';
+  };
+  const lines = (root: string) => readFileSync(join(root, 'helper', 'repairs.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const live = (perDay: number) => ({ harness: { helper: { repair: 'live', repairPerDay: perDay } } }) as never;
+
+  const a = mkdtempSync(join(tmpdir(), 'helper-repair-mf-a-'));
+  let enqueued = 0;
+  const enqueue = async () => ({ id: `hq-${++enqueued}` });
+  try {
+    await recordRepairShadows([row(1)], { runGh: gh(true), root: a, enqueue, config: live(3), now: new Date('2026-10-05T06:00:00Z') });
+    await recordRepairShadows([row(1)], { runGh: gh(false), root: a, enqueue, config: live(3), now: new Date('2026-10-05T07:00:00Z') });
+    expect(enqueued).toBe(1);
+    expect(lines(a)[0]).toMatchObject({ pr: 1, result: 'launched', queueId: 'hq-1' });
+    expect(lines(a)[0].reason).toContain('label api down');
+    // The second (live) scan repairs the failed label without a second enqueue.
+    expect(lines(a).at(-1)).toMatchObject({ pr: 1, result: 'launched', queueId: 'hq-1', reason: '후속 복구' });
+  } finally { rmSync(a, { recursive: true, force: true }); }
+
+  const legacy = mkdtempSync(join(tmpdir(), 'helper-repair-mf-legacy-'));
+  try {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(legacy, 'helper'), { recursive: true });
+    writeFileSync(join(legacy, 'helper', 'repairs.jsonl'), JSON.stringify({ pr: 4, category: 'review-budget', goalHash: 'x', at: '2026-10-04T00:00:00Z', mode: 'shadow', goal: 'g' }) + '\n');
+    const written = await recordRepairShadows([row(4)], { runGh: gh(false), root: legacy, enqueue, config: { harness: { helper: { repair: 'shadow' } } } as never });
+    expect(written).toHaveLength(0);
+  } finally { rmSync(legacy, { recursive: true, force: true }); }
+
+  const b = mkdtempSync(join(tmpdir(), 'helper-repair-mf-b-'));
+  enqueued = 0;
+  try {
+    await recordRepairShadows([row(2)], { runGh: gh(false), root: b, enqueue, config: { harness: { helper: { repair: 'shadow' } } } as never });
+    await recordRepairShadows([row(2)], { runGh: gh(false), root: b, enqueue, config: live(3) });
+    expect(lines(b).map((line) => line.result)).toEqual(['shadow', 'launched']);
+  } finally { rmSync(b, { recursive: true, force: true }); }
+
+  const c = mkdtempSync(join(tmpdir(), 'helper-repair-mf-c-'));
+  enqueued = 0;
+  try {
+    await recordRepairShadows([row(3)], { runGh: gh(false), root: c, enqueue, config: live(0), now: new Date('2026-10-05T06:00:00Z') });
+    await recordRepairShadows([row(3)], { runGh: gh(false), root: c, enqueue, config: live(0), now: new Date('2026-10-05T09:00:00Z') });
+    await recordRepairShadows([row(3)], { runGh: gh(false), root: c, enqueue, config: live(3), now: new Date('2026-10-06T06:00:00Z') });
+    expect(lines(c).map((line) => [line.result, line.at.slice(0, 10)])).toEqual([['cap', '2026-10-05'], ['launched', '2026-10-06']]);
+  } finally { rmSync(c, { recursive: true, force: true }); }
+});
+
+test('ACP must-fix: an unreadable PR file list holds for the day and is retried the next day, never a permanent needs-human', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { recordRepairShadows } = await import('./helper-repair.js');
+  const root = mkdtempSync(join(tmpdir(), 'helper-repair-files-'));
+  const body = '## 요청\nrequest\n\n## 마지막 리뷰 must-fix\n- Keep it.';
+  const gh = (filesDown: boolean) => (args: readonly string[]) => {
+    if (args[1] === 'view' && args.includes('labels')) return JSON.stringify({ labels: [] });
+    if (args[1] === 'view') return JSON.stringify({ body });
+    if (args[0] === 'api') { if (filesDown) throw new Error('502'); return JSON.stringify([{ filename: 'src/x.ts' }]); }
+    return '';
+  };
+  const row = { pr: 9, category: 'review-budget', headRefName: 'self-impl/x', isDraft: true } as never;
+  const config = { harness: { helper: { repair: 'live', repairPerDay: 3 } } } as never;
+  let n = 0;
+  const enqueue = async () => ({ id: `hq-${++n}` });
+  try {
+    await recordRepairShadows([row], { runGh: gh(true), root, enqueue, config, now: new Date('2026-10-05T06:00:00Z') });
+    await recordRepairShadows([row], { runGh: gh(false), root, enqueue, config, now: new Date('2026-10-06T06:00:00Z') });
+    const lines = readFileSync(join(root, 'helper', 'repairs.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines.map((line) => line.result)).toEqual(['launch-failed', 'launched']);
+    expect(lines[0].reason).toContain('변경 파일 조회 실패');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

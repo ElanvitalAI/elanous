@@ -1863,9 +1863,9 @@ async function observeDevTaskDispatch(spec: DevPipelineSpec, plan: ResolvedDevPl
   }
 }
 
-async function inspectReleasePathBeforeMerge(seams: SelfImplementSeams, number: number, cwd: string): Promise<string | undefined> {
+async function inspectReleasePathBeforeMerge(seams: SelfImplementSeams, number: number, cwd: string, base?: string): Promise<string | undefined> {
   if (!seams.readPrFiles) throw new Error('release-path inspection unavailable — automatic merge refused');
-  const files = await seams.readPrFiles({ number, cwd });
+  const files = await seams.readPrFiles({ number, cwd, ...(base ? { base } : {}) });
   if (!Array.isArray(files) || !files.every((path) => typeof path === 'string')) throw new Error('invalid PR file list — automatic merge refused');
   const path = releasePathHold(files);
   if (!path) return undefined;
@@ -2107,10 +2107,11 @@ async function runDevPipelineDispatch(
       ...assembledSeams,
       ...(assembledSeams.mergePr ? { mergePr: async (input) => {
         let path: string | undefined;
-        try { path = await inspectReleasePathBeforeMerge(assembledSeams, input.number, input.cwd); }
+        try { path = await inspectReleasePathBeforeMerge(assembledSeams, input.number, input.cwd, plan.base); }
         catch (error) {
-          debug.log('self-dev.merge', 'release-path-inspection-failed', { number: input.number, error: String(error) });
-          return { merged: false, detail: `automatic merge refused: ${String(error)}` };
+          const rateLimited = error instanceof Error && (error as { rateLimited?: boolean }).rateLimited === true;
+          debug.log('self-dev.merge', 'release-path-inspection-failed', { number: input.number, error: String(error), ...(rateLimited ? { rateLimit: true } : {}) });
+          return { merged: false, detail: rateLimited ? `automatic merge refused: rate-limit: ${String(error)}` : `automatic merge refused: ${String(error)}` };
         }
         if (path) return { merged: false, detail: `OP approval required: ${path}` };
         return assembledSeams.mergePr!(input);

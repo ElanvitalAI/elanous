@@ -364,7 +364,61 @@ export function decideProviderFallback(input: {
   return { action: 'advance', nextProvider, category, attempts };
 }
 
-export type RetryAction = 'retry' | 'abort' | 'ask-user' | 'auto-undo';
+/** Consecutive overload/5xx/rate-limit outcomes that switch the child off codex
+ *  before the same provider spends its remaining retries. Other errors (400)
+ *  never count. Recovery is this many later non-overload outcomes. */
+export const OVERLOAD_FAILOVER_STREAK = 3;
+
+export type LlmCallOutcomeKind = 'ok' | 'overloaded' | '5xx' | 'rate-limit' | 'other';
+
+/** One finished LLM call. Launch failover reads only this shape. */
+export interface LlmCallOutcome {
+  readonly provider: string;
+  readonly status: number;
+  readonly kind: LlmCallOutcomeKind;
+}
+
+const CODEX_CALL_PROVIDERS = new Set(['codex', 'openai-codex']);
+
+export function llmCallOutcomeKind(status: number, message = ''): LlmCallOutcomeKind {
+  if (status >= 200 && status < 300) return 'ok';
+  const msg = message.toLowerCase();
+  if (status === 429 || msg.includes('rate limit') || msg.includes('too many requests')) return 'rate-limit';
+  if (
+    status === 500 || status === 502 || status === 503 || status === 504 ||
+    msg.includes('overloaded') || msg.includes('server_busy') || msg.includes('server_error')
+  ) {
+    return status >= 500 ? '5xx' : 'overloaded';
+  }
+  if (msg.includes('overloaded')) return 'overloaded';
+  return 'other';
+}
+
+export function isOverloadOutcomeKind(kind: LlmCallOutcomeKind): boolean {
+  return kind === 'overloaded' || kind === '5xx' || kind === 'rate-limit';
+}
+
+/** True when the newest `limit` codex outcomes are all overload-class.
+ *  A non-codex row or a non-overload row breaks the streak. Empty input is false. */
+export function codexOverloadStreakReached(
+  outcomes: readonly LlmCallOutcome[],
+  limit = OVERLOAD_FAILOVER_STREAK,
+): boolean {
+  if (limit < 1 || outcomes.length < limit) return false;
+  const tail = outcomes.slice(-limit);
+  return tail.every((row) => CODEX_CALL_PROVIDERS.has(row.provider) && isOverloadOutcomeKind(row.kind));
+}
+
+/** True when the newest `limit` outcomes are successful (any provider). */
+export function overloadRecovered(
+  outcomes: readonly LlmCallOutcome[],
+  limit = OVERLOAD_FAILOVER_STREAK,
+): boolean {
+  if (limit < 1 || outcomes.length < limit) return false;
+  return outcomes.slice(-limit).every((row) => row.kind === 'ok');
+}
+
+export type RetryAction = 'retry' | 'abort' | 'ask-user' | 'auto-undo' | 'switch-provider';
 
 export interface RetryDecision {
   action: RetryAction;
@@ -417,6 +471,16 @@ export interface RetryContext {
   /** Optional: retry-after header string from a 429 response (ms or
    *  seconds or HTTP date). decideRetry parses it. */
   retryAfter?: string;
+  /** Configured fallbacks still unused. When > 0, an overload-class
+   *  failure that has already repeated `overloadStreak` times switches
+   *  provider instead of spending another retry on the same one.
+   *  Omitted or 0 keeps the historical retry-until-exhausted behaviour. */
+  remainingFallbacks?: number;
+  /** Consecutive overload-class failures already seen for this call,
+   *  including the one under decision. Default threshold is
+   *  OVERLOAD_FAILOVER_STREAK. */
+  overloadStreak?: number;
+  overloadStreakLimit?: number;
 }
 
 /** Classify an error into a RetryCategory without making an action
@@ -519,10 +583,42 @@ export function classifyError(err: unknown): RetryCategory {
   return 'unknown';
 }
 
+function isOverloadSwitchCandidate(msg: string, code: string | null): boolean {
+  return (
+    code === '429' || code === '500' || code === '502' || code === '503' || code === '504' ||
+    msg.includes('rate limit') || msg.includes('too many requests') ||
+    msg.includes('overloaded') || msg.includes('server_busy') || msg.includes('server_error')
+  );
+}
+
+function overloadSwitchDecision(ctx: RetryContext): RetryDecision | undefined {
+  const remaining = ctx.remainingFallbacks ?? 0;
+  if (remaining <= 0) return undefined;
+  const limit = ctx.overloadStreakLimit ?? OVERLOAD_FAILOVER_STREAK;
+  const streak = ctx.overloadStreak ?? 1;
+  if (streak < limit) return undefined;
+  return {
+    action: 'switch-provider',
+    category: 'overloaded',
+    reason: `overload streak ${streak} with ${remaining} fallback(s) left; switch before spending retries`,
+  };
+}
+
 /** Pure verdict. Caller sleeps + retries or aborts per the returned
  *  action. Exponential backoff baseline: 500ms * 2^attempt, clamped
  *  to [500, 30_000]. */
 export function decideRetry(err: unknown, ctx: RetryContext): RetryDecision {
+  const msg = extractMessage(err).toLowerCase();
+  const code = extractErrorCode(err);
+
+  // Overload with a fallback still unused switches before the doom
+  // window (k === 3) turns the same 503 into auto-undo. A 400 is not
+  // a candidate. Doom still wins for every other repeated failure.
+  if (isOverloadSwitchCandidate(msg, code)) {
+    const switched = overloadSwitchDecision(ctx);
+    if (switched) return switched;
+  }
+
   // Doom-loop always wins — even a technically-retryable error
   // becomes auto-undo after N identical failures. The caller may
   // still degrade to ask-user when plan mode is active or when the
@@ -534,9 +630,6 @@ export function decideRetry(err: unknown, ctx: RetryContext): RetryDecision {
       reason: `same error fingerprint repeated ${DEFAULT_WINDOW_SIZE} times; stop retrying and auto-revert the last turn before entering repair mode`,
     };
   }
-
-  const msg = extractMessage(err).toLowerCase();
-  const code = extractErrorCode(err);
 
   // Context window exhausted — never retry (the next call will also
   // be over-sized). Abort and surface the error to the caller; upstream
@@ -589,8 +682,16 @@ export function decideRetry(err: unknown, ctx: RetryContext): RetryDecision {
     };
   }
 
-  // Overloaded / server busy.
-  if (msg.includes('overloaded') || msg.includes('server_busy') || code === '503') {
+  // Overloaded / server busy / 5xx.
+  if (
+    msg.includes('overloaded') ||
+    msg.includes('server_busy') ||
+    msg.includes('server_error') ||
+    code === '500' ||
+    code === '502' ||
+    code === '503' ||
+    code === '504'
+  ) {
     return {
       action: 'retry',
       delayMs: backoffMs(ctx.attempt),

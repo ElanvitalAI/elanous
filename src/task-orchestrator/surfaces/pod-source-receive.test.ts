@@ -17,6 +17,44 @@ describe('podSourceScript', () => {
     expect(script).toContain("printf 'ELANOUS_POD_SOURCE default %s\\n'");
   });
 
+  test('non-main clone base starts at its remote commit via mirror and fallback; missing base is refused before launch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-src-base-'));
+    try {
+      const origin = join(root, 'origin');
+      const mirror = join(root, 'mirror.git');
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'README'), 'main\n');
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'main']);
+      const main = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      execFileSync('git', ['-C', origin, 'checkout', '-qb', 'bench/sample']);
+      writeFileSync(join(origin, 'README'), 'bench\n');
+      execFileSync('git', ['-C', origin, 'commit', '-qam', 'bench']);
+      const bench = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', origin, 'checkout', '-q', 'main']);
+      const source: PodSource = { kind: 'default', base: 'bench/sample' };
+      for (const [name, path, via] of [['mirror', mirror, 'mirror'], ['fallback', join(root, 'absent'), 'github']] as const) {
+        const cwd = join(root, name);
+        execFileSync('mkdir', ['-p', cwd]);
+        const script = podSourceScript(source, origin, path);
+        const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+        expect(result.exitCode, result.stderr.toString()).toBe(0);
+        expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA ${via}\nELANOUS_POD_SOURCE default ${bench}`);
+        expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(bench);
+        expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8' }).trim()).toBe('bench/sample');
+      }
+      expect(execFileSync('git', ['-C', mirror, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(main);
+      expect(podSourceScript({ kind: 'default', base: 'main' }, origin, mirror)).toBe(podSourceScript({ kind: 'default' }, origin, mirror));
+      expect(() => podSourceScript({ kind: 'default', base: 'bench/missing' }, origin, mirror)).toThrow('Pod base ref not found on origin: bench/missing');
+      expect(() => podSourceScript({ kind: 'default', base: 'bench/sample;echo wrong' }, origin, mirror)).toThrow('invalid Pod base ref');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('rejects a non-40-hex sha and a non-positive PR before interpolation', () => {
     expect(() => podSourceScript({ kind: 'commit', sha: 'abc;rm -rf /' }, 'https://github.com/o/r')).toThrow(/40 hex/);
     expect(() => podSourceScript({ kind: 'pr', number: Number('1;x') }, 'https://github.com/o/r')).toThrow(/positive integer/);

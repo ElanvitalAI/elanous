@@ -413,6 +413,9 @@ test('remote command transport starts in /tmp, not the caller checkout', async (
   }
   const call = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[]; cwd: string };
   expect(call.argv).toEqual(['test-host', "PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd '/tmp' && 'mktemp' '-d' '/tmp/release-gate-XXXXXXXX'"]);
+  // macOS resolves the /tmp symlink, so the child reports /private/tmp; Linux reports /tmp. Same directory either way.
+  expect(['/tmp', '/private/tmp']).toContain(call.cwd);
+  expect(realpathSync(call.cwd)).toBe(realpathSync('/tmp'));
   expect(call.cwd).not.toBe(repo);
 });
 

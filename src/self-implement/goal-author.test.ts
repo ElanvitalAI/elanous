@@ -662,6 +662,58 @@ console.log(result.authored.document);`;
     }
   });
 
+  test('persists a summary beside phase-end for a fake LLM authoring run', async () => {
+    const originalLevel = debug.level();
+    debug.setLevel('trail');
+    try {
+      const authored = await authorGoal('Create a test goal with a fake LLM response.', {
+        ...deps,
+        enhance: async (raw) => ({ original: raw, checklist: ['preserve the exact ask'], verbatimPreserved: true, enhancedBy: 'llm' }),
+      });
+      debug.flush();
+      const rows = readFileSync(debug.path(), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
+        category: string; event: string; data?: { authorRunId?: string; phase?: string; elapsedMs?: number; goalChars?: number; sectionChars?: Record<string, number> };
+      }).filter((row) => row.category === 'goal-author' && row.data?.authorRunId === authored.authorRunId);
+      expect(rows.filter((row) => row.event === 'phase-end' && row.data?.phase === 'lint')).toHaveLength(1);
+      const summaries = rows.filter((row) => row.event === 'summary');
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.data).toMatchObject({
+        authorRunId: authored.authorRunId,
+        elapsedMs: expect.any(Number),
+        goalChars: [...authored.document].length,
+        sectionChars: expect.objectContaining({ PROBLEM: expect.any(Number), 'WHAT TO BUILD': expect.any(Number) }),
+      });
+    } finally {
+      debug.setLevel(originalLevel);
+    }
+  });
+
+  test('persists summary when a fake LLM goal fails lint after phase-end', async () => {
+    const originalLevel = debug.level();
+    debug.setLevel('trail');
+    const ask = 'Generate a goal with an invalid extra heading.';
+    debug.flush();
+    const logStart = existsSync(debug.path()) ? readFileSync(debug.path(), 'utf8').length : 0;
+    try {
+      await expect(authorGoal(ask, {
+        ...deps,
+        enhance: async (raw) => ({ original: raw, checklist: ['line one\n## EXTRA\nline two'], verbatimPreserved: true, enhancedBy: 'llm' }),
+      })).rejects.toThrow(/required blocks are not contiguous and ordered/);
+      debug.flush();
+      const rows = readFileSync(debug.path(), 'utf8').slice(logStart).trim().split('\n').map((line) => JSON.parse(line) as {
+        category: string; event: string; data?: { authorRunId?: string; phase?: string; outcome?: string; elapsedMs?: number; goalChars?: number; sectionChars?: Record<string, number> };
+      }).filter((row) => row.category === 'goal-author');
+      const lintEnds = rows.filter((row) => row.event === 'phase-end' && row.data?.phase === 'lint');
+      expect(lintEnds.length).toBeGreaterThan(0);
+      const authorRunId = lintEnds.at(-1)?.data?.authorRunId;
+      const summaries = rows.filter((row) => row.event === 'summary' && row.data?.authorRunId === authorRunId);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.data).toMatchObject({ authorRunId, outcome: 'lint-failed', elapsedMs: expect.any(Number), goalChars: expect.any(Number), sectionChars: expect.objectContaining({ PROBLEM: expect.any(Number) }) });
+    } finally {
+      debug.setLevel(originalLevel);
+    }
+  });
+
   test('attributes reported enhancement usage to its phase and reconciles summary characters with the unchanged document', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
     try {

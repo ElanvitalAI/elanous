@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
@@ -19,6 +19,7 @@ import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
 import { runPublicLeakGate } from '../../scripts/ci-public-leak-gate.js';
 import { exportLeakCheck, publicExportChangedFiles, type ExportLeakCheck } from '../../scripts/ci-public-export-leak-gate.js';
+import { exportImportCheck, type ExportImportCheck } from '../../scripts/ci-public-export-import-gate.js';
 import { checkCommands, extractElanousCommands, type Finding as DocsCliFinding } from '../../scripts/docs-cli-check.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { isGoalDocumentFileName } from '../self-implement/goal-document.js';
@@ -111,6 +112,8 @@ export interface PrLandDeps {
   runPublicLeakGate?: (changedFiles: readonly string[], out: { log: (message: string) => void; error: (message: string) => void }) => number;
   /** Test seam — the post-transform export leak check on changed files. */
   runExportLeakCheck?: (changedFiles: readonly string[], cwd: string) => ExportLeakCheck;
+  /** Test seam — included files must not import a module the public export excludes. */
+  runExportImportCheck?: (changedFiles: readonly string[], cwd: string) => ExportImportCheck | Promise<ExportImportCheck>;
   /** 공개 문서의 `elanous …` 호출 ↔ 실제 `--help` 대조(경고 전용) — 바뀐 공개 문서 경로를 받아 어긋남 목록을 돌려준다. */
   runDocsCliCheck?: (docFiles: readonly string[]) => DocsCliFinding[];
   /** 변경 시험 파일 간 간섭 검사 심(시험 주입용). */
@@ -231,14 +234,14 @@ export async function decideOverlapLanding(input: {
 
 const liveOut = { log: (message: string) => console.log(message), error: (message: string) => console.error(message) };
 
-function runPrLandTypecheckGate(out: { log: (message: string) => void; error: (message: string) => void }): boolean {
+function runPrLandTypecheckGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string = process.cwd()): boolean {
   let failed = false;
   const exit = ((code: number): never => {
     failed = code !== 0;
     throw new Error(`ci-typecheck-changed exited ${code}`);
   });
   try {
-    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit });
+    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd });
   } catch (error) {
     if (!failed) throw error;
   }
@@ -290,7 +293,67 @@ export function runPrLandExportLeakCheck(changedFiles: readonly string[], cwd: s
   return exportLeakCheck(changedFiles, top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd);
 }
 
+/** Included files importing an excluded module — scripts/ci-public-export-import-gate.ts. cwd is the tree being landed. */
+export function runPrLandExportImportCheck(changedFiles: readonly string[], cwd: string): Promise<ExportImportCheck> {
+  const top = runGitCommand(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf-8' });
+  return exportImportCheck(changedFiles, top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd);
+}
+
+/** Blocks the landing when a changed public file imports a module the public export excludes. */
+export async function exportImportBlock(
+  changedFiles: readonly string[] | undefined,
+  check: () => ExportImportCheck | Promise<ExportImportCheck>,
+  out: { log: (message: string) => void; error: (message: string) => void },
+): Promise<boolean> {
+  if (!changedFiles || changedFiles.length === 0) return true;
+  let result: ExportImportCheck;
+  try { result = await check(); } catch { result = { measured: false, hits: [], unseen: 0, detail: '검사 실행 실패' }; }
+  const blocked = !result.measured || result.hits.length > 0;
+  record('public-export-import', !blocked, { measured: result.measured, hits: result.hits.length, unseen: result.unseen });
+  debug.log('pr.land', 'import-gate', { blocked, hits: result.hits.map(({ file, target }) => ({ file, target })), measured: result.measured, unseen: result.unseen });
+  if (!result.measured) {
+    out.error(`✗ public-export-import: 못 쟀다 — 막는다(${result.detail ?? '?'})`);
+    return false;
+  }
+  if (result.unseen > 0) out.log(`⚠ public-export-import: 비리터럴 지정자 ${result.unseen}곳은 못 봄`);
+  if (result.hits.length === 0) {
+    out.log('✓ public-export-import: 바뀐 공개 파일이 공개 내보내기에서 제외된 모듈을 import 하지 않는다.');
+    return true;
+  }
+  out.error(`✗ public-export-import: 공개 파일이 공개 내보내기에서 제외된 모듈을 import 한다 (${result.hits.length}곳) — 공개본 빌드가 여기서 깨진다:`);
+  for (const hit of result.hits.slice(0, 20)) out.error(`   ${hit.file}:${hit.line} → ${hit.target}`);
+  if (result.hits.length > 20) out.error(`   … 외 ${result.hits.length - 20}곳`);
+  return false;
+}
+
 /** Blocks changed public files that leak or cannot be measured. */
+/**
+ * MARKER-GUARD — a changed file that still holds merge-conflict markers is refused before landing.
+ * A file counts only when it has both a `<<<<<<< ` and a `>>>>>>> ` line (`=======` alone is a Markdown underline).
+ * 10-06 02:4x: a hand landing put three marker lines into release/next.md on main (hotfix #24333).
+ */
+export function conflictMarkerFiles(changedFiles: readonly string[] | undefined, cwd: string, read: (path: string) => string | undefined = (path) => {
+  // No size cutoff: a large file with markers must still be refused (ACP must-fix). A deleted file reads as undefined.
+  try { const full = resolve(cwd, path); return existsSync(full) && statSync(full).isFile() ? readFileSync(full, 'utf8') : undefined; }
+  catch { return undefined; }
+}): string[] {
+  return (changedFiles ?? []).filter((path) => {
+    const text = read(path);
+    return text !== undefined && /^<{7} /m.test(text) && /^>{7} /m.test(text);
+  });
+}
+
+export function conflictMarkerBlock(changedFiles: readonly string[] | undefined, cwd: string,
+  out: { log: (message: string) => void; error: (message: string) => void }, read?: (path: string) => string | undefined): boolean {
+  const hits = read ? conflictMarkerFiles(changedFiles, cwd, read) : conflictMarkerFiles(changedFiles, cwd);
+  if (hits.length) {
+    debug.log('pr.land', 'conflict-markers-blocked', { files: hits });
+    out.error(`✗ conflict-markers: 충돌 표시(<<<<<<< · >>>>>>>)가 남은 파일 ${hits.length}개 — ${hits.join(', ')} · 표시를 풀고 다시 착지하라`);
+    return false;
+  }
+  return true;
+}
+
 export function exportLeakBlock(
   changedFiles: readonly string[] | undefined,
   check: () => ExportLeakCheck,
@@ -401,8 +464,10 @@ function runPrLandDocsCliCheck(root: string): (docFiles: readonly string[]) => D
   return (docFiles) => checkCommands(docFiles.flatMap((f) => extractElanousCommands(f, readFileSync(join(root, f), 'utf8'))));
 }
 
-function runPrLandMockModuleRestoreGate(out: { log: (message: string) => void; error: (message: string) => void }): boolean {
-  return runMockModuleRestoreGate({ args: [], log: out.log, error: out.error }) === 0;
+function runPrLandMockModuleRestoreGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string = process.cwd()): boolean {
+  const top = runGitCommand(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf-8', env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_COMMON_DIR: undefined } as NodeJS.ProcessEnv });
+  const root = top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd;
+  return runMockModuleRestoreGate({ args: [], cwd: root, log: out.log, error: out.error }) === 0;
 }
 
 // 🚨 안드로이드 축 — `bun test` 우주 «밖»이라 다른 게이트가 원리상 못 본다.
@@ -415,8 +480,9 @@ function runPrLandMockModuleRestoreGate(out: { log: (message: string) => void; e
 function runPrLandAndroidGate(
   out: { log: (message: string) => void; error: (message: string) => void },
   changedFiles: readonly string[] = [],
+  cwd: string = process.cwd(),
 ): boolean {
-  return runAndroidUnitTestGate({ args: ['--changed-files', ...changedFiles], log: out.log, error: out.error }) === 0;
+  return runAndroidUnitTestGate({ args: ['--changed-files', ...changedFiles], cwd, log: out.log, error: out.error }) === 0;
 }
 
 /** ⛔ 보호는 «호출부»에 둔다 — 주입된 게이트가 던져도 같은 계약이 서야 한다.
@@ -1320,7 +1386,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
   }
 
-  const typecheckOk = (deps.runTypecheckGate ?? runPrLandTypecheckGate)(out);
+  const typecheckOk = (deps.runTypecheckGate ?? ((o) => runPrLandTypecheckGate(o, cwd)))(out);
   record('typecheck', typecheckOk);
   if (!typecheckOk) {
     // ⛔⭐ 「왜 막혔나」를 «단정하지 않는다» — 이 게이트는 불리언만 돌려주므로 여기서는 이유를 모른다.
@@ -1347,7 +1413,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.log('✓ isolation-gate: scripts/ci-isolation-hardcode-gate.ts PASS — no new homedir+.elanous hardcoding.');
   }
 
-  const mockModuleRestore = gateVerdict('mock-module-restore-gate', deps.runMockModuleRestoreGate ?? runPrLandMockModuleRestoreGate, out);
+  const mockModuleRestore = gateVerdict('mock-module-restore-gate', deps.runMockModuleRestoreGate ?? ((o) => runPrLandMockModuleRestoreGate(o, cwd)), out);
   record('mock-module-restore-gate', mockModuleRestore.ok, { measured: mockModuleRestore.measured });
   if (!mockModuleRestore.ok) {
     out.error('✗ mock-module-restore-gate: scripts/ci-mock-module-restore-gate.ts blocked pr land because changed tests introduce mock.module without R-TST23 restoration.');
@@ -1361,7 +1427,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   //   근본은 훈계가 아니라 ***분포***였다: 스크립트에 박힌 이름 중 «가장 흔한» 것이 ***낡은 것***이라
   //   옆 파일을 베끼면 낡은 이름을 물려받는다. ⇒ 이 자가 «신규»만 막는다(ratchet).
   //   ⚠️ `.github/workflows` 가 없어 `pr land` 가 «유일한» 강제점이다.
-  const modelHardcode = gateVerdict('model-hardcode-gate', deps.runModelHardcodeGate ?? ((o) => runModelHardcodeGate({ log: o.log, error: o.error, args: [] }) === 0), out);
+  const modelHardcode = gateVerdict('model-hardcode-gate', deps.runModelHardcodeGate ?? ((o) => runModelHardcodeGate({ log: o.log, error: o.error, args: [], cwd }) === 0), out);
   record('model-hardcode-gate', modelHardcode.ok, { measured: modelHardcode.measured });
   if (!modelHardcode.ok) {
     out.error('✗ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts blocked pr land because changed files hardcode a model id — derive it from tierModel()/config instead.');
@@ -1382,15 +1448,17 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
 
   const changedPaths = currentChangePaths(run, cwd, staged, base, out);
   nextMdWarning(body ?? '', changedPaths, out);
+  if (!conflictMarkerBlock(changedPaths, cwd, out)) return 1;
   publicLeakWarning(changedPaths, deps.runPublicLeakGate ?? ((files, sink) => runPrLandPublicLeakGate(files, sink, cwd, base)), out);
   if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out, cwd)) return 1;
+  if (!await exportImportBlock(changedPaths, () => (deps.runExportImportCheck ?? runPrLandExportImportCheck)(changedPaths ?? [], cwd), out)) return 1;
   if (publicDocPaths(changedPaths, () => true).length > 0) {
     const top = run('git', ['rev-parse', '--show-toplevel'], { cwd });
     const docsRoot = top.ok && top.out.trim() ? top.out.trim() : cwd;
     docsCliWarning(publicDocPaths(changedPaths, (f) => existsSync(join(docsRoot, f))), deps.runDocsCliCheck ?? runPrLandDocsCliCheck(docsRoot), out);
   }
   const testInterference = await testInterferenceGateVerdict(
-    deps.runTestInterferenceGate ?? ((o, files) => runTestInterferenceGate({ args: ['--changed-files', ...files], log: o.log })),
+    deps.runTestInterferenceGate ?? ((o, files) => runTestInterferenceGate({ args: ['--changed-files', ...files], log: o.log, cwd })),
     changedPaths,
     out,
   );
@@ -1400,7 +1468,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     'android-gate',
     deps.runAndroidGate
       ? (o) => deps.runAndroidGate!(o, changedPaths)
-      : (o) => runPrLandAndroidGate(o, changedPaths),
+      : (o) => runPrLandAndroidGate(o, changedPaths, cwd),
     out,
   );
   record('android-gate', androidGate.ok, { measured: androidGate.measured });
@@ -1418,7 +1486,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     'ios-gate',
     deps.runIosGate
       ? (o) => deps.runIosGate!(o, changedPaths)
-      : (o) => runIosUnitTestGate({ args: ['--changed-files', ...changedPaths], log: o.log, error: o.error }) === 0,
+      : (o) => runIosUnitTestGate({ args: ['--changed-files', ...changedPaths], cwd, log: o.log, error: o.error }) === 0,
     out,
   );
   record('ios-gate', iosGate.ok, { measured: iosGate.measured });

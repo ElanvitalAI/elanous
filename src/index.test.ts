@@ -1,9 +1,12 @@
-import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerOpsCommands } from './cli/ops-cli.js';
 import { setUserConfigOverlay } from './user-config.js';
 import * as podDispatch from './harness/harness-pod-dispatch.js';
 import { registerPublishCommands } from './cli/publish-cli.js';
+import { registerKnowCommand } from './cli/know-cli.js';
+import { program } from './index.js';
+import type { KnowFindDeps } from './knowledge/know-find.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -21,6 +24,38 @@ setDefaultTimeout(60_000);
 
 afterEach(() => {
   process.exitCode = 0;
+});
+
+describe('know CLI entry', () => {
+  test('index registers know in the root command list', () => {
+    expect(program.commands.map(command => command.name())).toContain('know');
+  });
+
+  test('elanous know AUTHOR-POD --json routes injected readers through the Commander action', async () => {
+    const root = new Command();
+    const queries: string[] = [];
+    const deps: Partial<KnowFindDeps> = {
+      directives: (query) => { queries.push(query); return []; },
+      decisions: () => [], lessons: () => [], versions: () => ['1.0.0'],
+      checklist: (version) => ({ version, released: '', dev: '', history: [], items: [
+        { id: 'K1', title: 'AUTHOR-POD', status: 'yellow', updatedAt: '2026-10-05T00:00:00Z', updatedBy: 'TC' },
+      ] }),
+    };
+    registerKnowCommand(root, deps);
+    const output: string[] = [];
+    const write = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      output.push(String(chunk));
+      callback?.();
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await root.parseAsync(['node', 'elanous', 'know', 'AUTHOR-POD', '--json']);
+      expect(queries).toEqual(['AUTHOR-POD']);
+      expect(JSON.parse(output.join(''))).toEqual({ rows: [{ source: 'checklist', id: 'K1', title: 'AUTHOR-POD',
+        status: 'yellow', at: '2026-10-05T00:00:00Z', current: true, ref: 'release checklist status --version 1.0.0' }], unavailable: [] });
+    } finally { process.stdout.write = write; }
+  });
 });
 
 describe('Codex account CLI log sink', () => {
@@ -240,7 +275,16 @@ describe('self send superseded explicit target protection', () => {
   }, 20_000);
 });
 
+// OLD-DOOR-CLOSE: these blocks drive dev --ask / self implement / self orchestrate as the harness does,
+// so they carry the internal stamp; the outside refusal itself is covered in src/self-dev/old-door.test.ts.
+function asHarnessInternalCaller(): void {
+  let previous: string | undefined;
+  beforeAll(() => { previous = process.env.ELANOUS_HARNESS_ENTRANCE; process.env.ELANOUS_HARNESS_ENTRANCE = 'harness-say'; });
+  afterAll(() => { if (previous === undefined) delete process.env.ELANOUS_HARNESS_ENTRANCE; else process.env.ELANOUS_HARNESS_ENTRANCE = previous; });
+}
+
 describe('root command help dispatch', () => {
+  asHarnessInternalCaller();
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
   const decode = (output: Uint8Array | undefined) => new TextDecoder().decode(output);
@@ -249,6 +293,8 @@ describe('root command help dispatch', () => {
     return Bun.spawnSync({
       cmd: [process.execPath, elanous, '--test', ...args],
       cwd,
+      // Bun spawn without env uses the start-up environment — pass the live one so the internal stamp reaches the child.
+      env: { ...process.env },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -514,6 +560,7 @@ describe('agent-mission backend help', () => {
 });
 
 describe('harness ask production entry wiring', () => {
+  asHarnessInternalCaller();
   const originalElanousRunId = process.env.ELANOUS_RUN_ID;
   afterEach(() => {
     if (originalElanousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
@@ -2607,6 +2654,7 @@ describe('dev and drive Commander option-source wiring', () => {
 });
 
 describe('self orchestrate CLI decomposer selection wiring', () => {
+  asHarnessInternalCaller();
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
@@ -2662,6 +2710,7 @@ describe('self orchestrate CLI decomposer selection wiring', () => {
     const result = Bun.spawnSync({
       cmd: [process.execPath, elanous, '--test', 'self', 'orchestrate', 'goal', '--fabric-decompose'],
       cwd,
+      env: { ...process.env },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -3330,6 +3379,7 @@ describe('dev CLI help tiers', () => {
 });
 
 describe('file-backed self CLI entrances', () => {
+  asHarnessInternalCaller();
   test('self implement CLI reads --feature-file and passes its contents to the implementation core', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'implement-feature-cli-'));
     const featurePath = join(dir, 'feature.md');

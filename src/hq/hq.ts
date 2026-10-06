@@ -206,7 +206,7 @@ function mutate(r: Resolved, decide: (record: LeaseRecord | null, now: number) =
 }
 
 export type LeaseAction = 'acquire' | 'renew' | 'status' | 'release';
-export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: string } = {}) {
+export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: string; expectedHolder?: string; expectedGeneration?: number } = {}) {
   const r0 = resolve(deps);
   const r = opts.host ? { ...r0, me: opts.host } : r0;
   if (action === 'status') {
@@ -215,9 +215,15 @@ export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: s
     noteSeen(r, record);
     return { ok: true as const, action, record, ageSeconds: record ? now - record.renewedAt : null, expired: record ? leaseExpired(record, now) : null };
   }
+  if (action === 'release' && ((opts.expectedHolder === undefined) !== (opts.expectedGeneration === undefined)
+    || (opts.expectedGeneration !== undefined && (!Number.isSafeInteger(opts.expectedGeneration) || opts.expectedGeneration < 1))
+    || (opts.expectedHolder !== undefined && !opts.expectedHolder)))
+    throw new Error('hq lease release: expected holder and positive generation must be supplied together');
   const local = readLocal(r.localPath);
+  const expected = opts.expectedHolder !== undefined && opts.expectedGeneration !== undefined
+    ? { holder: opts.expectedHolder, generation: opts.expectedGeneration } : undefined;
   const result = mutate(r, (record, now) => action === 'acquire' ? decideAcquire(record, r.me, now, r.ttl)
-    : action === 'renew' ? decideRenew(record, r.me, local.generation, now) : decideRelease(record, r.me));
+    : action === 'renew' ? decideRenew(record, r.me, local.generation, now) : decideRelease(record, r.me, expected));
   noteSeen(r, result.record);
   if (result.ok && action !== 'release') writeLocal(r.localPath, { holder: result.record.holder, generation: result.record.generation, confirmedAt: r.now(), ttlSeconds: result.record.ttlSeconds });
   if (result.ok && action === 'release') writeLocal(r.localPath, { ...local, holder: undefined, confirmedAt: undefined });

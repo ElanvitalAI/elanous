@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, readlinkSync, readdirSync, statSync, rmSync, symlinkSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, readlinkSync, readdirSync, statSync, rmSync, symlinkSync, renameSync, writeFileSync, lstatSync } from 'node:fs';
 import { resolve, join, basename, dirname } from 'node:path';
 import { homedir, platform, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -18,6 +18,10 @@ export interface SelfUpdateOptions {
   skipPwaBuild?: boolean;
   /** 설치된 릴리스에서만 사용한다. 체크아웃 갱신에는 적용하지 않는다. */
   version?: string;
+  /** 판 사이 dev 빌드 설치 — versions/<판>-dev.<sha12> · install.json channel:'dev'. 사람 승인 명령. */
+  dev?: boolean;
+  /** install.json 의 이전 versionDir 로 current 를 되돌린다. 이전이 없으면 거부. */
+  rollback?: boolean;
 }
 
 export interface SelfUpdateDeps {
@@ -45,6 +49,15 @@ export interface SelfUpdateDeps {
   out?: { log: (s: string) => void; error: (s: string) => void };
   /** 판올림 성공 알림(주입 안 하면 sendOutbound 'report' · 시험에선 안 보냄). */
   notice?: (text: string) => void;
+  /**
+   * 설치 루트(versions · current · install.json). 주입하지 않으면 ~/.local/share/elanous.
+   * 시험은 임시 루트만 넘긴다 — 실물 심링크·재시작을 만지지 않는다.
+   */
+  installRoot?: string;
+  /** 패키지 버전(package.json). 주입하지 않으면 체크아웃 package.json. */
+  packageVersion?: (checkout: string) => string;
+  /** 재시작을 실제로 호출해도 되는지. NODE_ENV=test · ELANOUS_TEST_HOME 이면 기본 false. */
+  allowLiveRestart?: boolean;
 }
 
 export interface SelfUpdateResult {
@@ -63,6 +76,12 @@ export interface SelfUpdateResult {
   prune?: VersionPruneOutcome;
   /** 재시작 뒤 건강 — ok · rolled-back(직전 판으로 되돌려 회복) · rollback-failed · no-rollback-target. */
   health?: 'ok' | 'rolled-back' | 'rollback-failed' | 'no-rollback-target' | 'unmeasured';
+  /** --dev 설치 또는 --rollback 이 옮긴 current 대상(versions/<name>). */
+  current?: string;
+  /** install.json channel. dev 설치면 'dev'. */
+  channel?: string;
+  /** --dev 가 남긴 이전 versionDir. */
+  previous?: string;
   rolledBackTo?: string;
   /** relay(`com.elanous.openai-relay`) 판정 — 넥서스와 «따로» 본다(T5 · 2026-09-24). */
   relay?: RelayUpdateOutcome;
@@ -181,6 +200,142 @@ export function rollbackTarget(versions: readonly string[], daemonSha: string, i
 }
 
 const VERSIONS_DIR = () => join(homedir(), '.local/share/elanous/versions');
+
+/** 시험·ELANOUS_TEST_HOME 에서는 실물 재시작을 호출하지 않는다. */
+export function liveRestartBlocked(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_ENV === 'test' || Boolean(env.ELANOUS_TEST_HOME?.trim());
+}
+
+export interface InstallRecord {
+  version?: string;
+  versionDir?: string;
+  source?: string;
+  installedAt?: string;
+  commit?: string;
+  channel?: string;
+  previous?: string;
+}
+
+export function defaultInstallRoot(): string {
+  return join(homedir(), '.local/share/elanous');
+}
+
+export function readInstallRecord(root: string): InstallRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    return parsed as InstallRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** install.json 의 version·commit. 못 읽으면 둘 다 «unknown». */
+export function readInstalledIdentity(root: string = defaultInstallRoot()): { installedVersion: string; installedCommit: string } {
+  const record = readInstallRecord(root);
+  const version = typeof record?.version === 'string' && record.version.trim() ? record.version.trim() : '';
+  const commit = typeof record?.commit === 'string' && record.commit.trim() ? record.commit.trim() : '';
+  return { installedVersion: version || 'unknown', installedCommit: commit || 'unknown' };
+}
+
+const VERSION_DIR_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function versionDirName(versionDir: string | undefined): string | null {
+  if (typeof versionDir !== 'string') return null;
+  if (!/^versions\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(versionDir) || versionDir.includes('..')) return null;
+  return basename(versionDir);
+}
+
+/** 판 디렉터리에 실행 진입 파일이 있나(설치기가 실제로 내용을 깔았나). */
+export function installEntryExists(root: string, versionName: string): boolean {
+  return existsSync(join(root, 'versions', versionName, 'node_modules', 'elanous', 'bin', 'elanous.mjs'));
+}
+
+/** 판 이름 «<판>-<커밋12>» · «<판>-dev.<커밋12>» 에서 판·커밋을 읽는다(되돌림 메타 일치용). */
+export function parseVersionDirName(name: string): { version: string; commit: string } | null {
+  const m = /^(.+?)-(?:dev\.)?([0-9a-f]{12})(?:-dirty)?$/.exec(name);
+  return m ? { version: m[1]!, commit: m[2]! } : null;
+}
+
+/** current 심링크를 versions/<name> 으로 원자적으로 옮긴다. 대상 폴더가 없으면 거부. */
+export function relinkInstallCurrent(root: string, versionName: string): void {
+  if (!VERSION_DIR_NAME.test(versionName) || versionName.includes('..')) throw new Error(`잘못된 판 이름: ${versionName}`);
+  if (!existsSync(join(root, 'versions', versionName))) throw new Error(`판 디렉터리 없음: ${versionName}`);
+  // EDGE-RAIL-VERIFY(10-06 05:30 사고): 진입 파일이 없는 판으로는 current 를 옮기지 않는다(빈 판 → 전역 elanous·크론 전부 실패).
+  if (!installEntryExists(root, versionName)) throw new Error(`빈 판(진입 파일 없음): ${versionName} — current 를 옮기지 않는다`);
+  const tmp = join(root, `.current-dev-${process.pid}`);
+  rmSync(tmp, { force: true });
+  symlinkSync(`versions/${versionName}`, tmp);
+  renameSync(tmp, join(root, 'current'));
+}
+
+function checkoutPackageVersion(checkout: string): string {
+  const parsed = JSON.parse(readFileSync(join(checkout, 'package.json'), 'utf8')) as { version?: unknown };
+  if (typeof parsed.version !== 'string' || !parsed.version.trim()) throw new Error('package.json version 없음');
+  return parsed.version.trim();
+}
+
+/**
+ * 판 사이 dev 빌드 — versions/<판>-dev.<sha12> 를 만들고 current 를 옮긴다.
+ * install.json 에 channel:'dev' 와 이전 versionDir(previous) 를 남긴다. 실제 설치기·재시작은 부르지 않는다.
+ */
+export function installDevBuild(checkout: string, commit: string, deps: Pick<SelfUpdateDeps, 'installRoot' | 'packageVersion'> & { runInstaller?: () => { status: number | null; stderr: string } } = {}): { versionName: string; versionDir: string; previous: string; record: InstallRecord } {
+  const sha12 = commit.trim().toLowerCase().slice(0, 12);
+  if (!/^[0-9a-f]{12}$/.test(sha12)) throw new Error(`dev 설치 커밋이 12자가 아님: ${commit}`);
+  const root = deps.installRoot ?? defaultInstallRoot();
+  const prior = readInstallRecord(root);
+  const previous = versionDirName(prior?.versionDir) ? prior!.versionDir! : (typeof prior?.previous === 'string' ? prior.previous : '');
+  // EDGE-RAIL-VERIFY: 빈 디렉터리를 만들고 current 만 옮기던 길(10-06 05:30 사고)을 버리고, 정식 길과 같은 설치기로 내용을 깐다.
+  if (!deps.runInstaller) throw new Error('dev 설치기 없음 — 빈 판을 깔지 않는다');
+  // install.sh 는 current 를 «먼저» 옮기고 뒤에서 실패할 수 있다 — 실패·빈 판 어느 쪽이든 이전 판·install.json 으로 되돌린다.
+  const restore = (why: string, versionName: string | null): never => {
+    const previousName = versionDirName(previous);
+    if (previousName && installEntryExists(root, previousName)) relinkInstallCurrent(root, previousName);
+    if (prior) writeFileSync(join(root, 'install.json'), `${JSON.stringify(prior, null, 2)}\n`);
+    try { debug.log('self-update', 'dev-install-refused', { why, versionName, kept: previousName ?? null }); } catch { /* 관측 실패가 막지 않는다 */ }
+    throw new Error(`${why}: ${versionName ?? '?'} — current 를 이전 판(${previousName ?? '없음'})으로 유지`);
+  };
+  let result: { status: number | null; stderr: string };
+  try { result = deps.runInstaller(); }
+  catch (error) { return restore(`설치기 예외(${String(error).slice(0, 200)})`, null); }
+  const after = readInstallRecord(root);
+  const versionName = versionDirName(after?.versionDir);
+  if (result.status !== 0) return restore(`설치기 실패(rc=${result.status}: ${result.stderr.slice(0, 200)})`, versionName);
+  if (!versionName || !installEntryExists(root, versionName)) return restore('빈 판(진입 파일 없음)', versionName);
+  const versionDir = `versions/${versionName}`;
+  const record: InstallRecord = {
+    ...(after ?? {}),
+    versionDir,
+    channel: 'dev',
+    ...(previous && previous !== versionDir ? { previous } : {}),
+  };
+  writeFileSync(join(root, 'install.json'), `${JSON.stringify(record, null, 2)}\n`);
+  return { versionName, versionDir, previous, record };
+}
+
+/** install.json.previous 의 판으로 current 를 되돌린다. previous 가 없으면 거부(exit 2). */
+export function rollbackDevInstall(deps: Pick<SelfUpdateDeps, 'installRoot'> = {}): { ok: true; versionName: string; record: InstallRecord } | { ok: false; reason: string } {
+  const root = deps.installRoot ?? defaultInstallRoot();
+  const prior = readInstallRecord(root);
+  const previousName = versionDirName(prior?.previous);
+  if (!prior || !previousName) return { ok: false, reason: '이전 판(install.json previous)이 없다 — rollback 거부' };
+  if (!existsSync(join(root, 'versions', previousName))) return { ok: false, reason: `이전 판 디렉터리 없음: ${previousName}` };
+  const currentName = versionDirName(prior.versionDir);
+  relinkInstallCurrent(root, previousName);
+  const parsed = parseVersionDirName(previousName);
+  const record: InstallRecord = {
+    ...prior,
+    ...(parsed ? { version: parsed.version, commit: parsed.commit } : {}),
+    versionDir: `versions/${previousName}`,
+    channel: prior.channel === 'dev' ? undefined : prior.channel,
+    previous: currentName ? `versions/${currentName}` : undefined,
+    installedAt: new Date().toISOString(),
+  };
+  if (!record.channel) delete record.channel;
+  if (!record.previous) delete record.previous;
+  writeFileSync(join(root, 'install.json'), `${JSON.stringify(record, null, 2)}\n`);
+  return { ok: true, versionName: previousName, record };
+}
 
 /** `unmeasured` = 건강을 «잴 수» 없었다(REST 주소를 한 번도 못 얻음) — 「건강하지 않다」와 다르다. 되돌리지 않는다. */
 export interface VerifyRestartResult { ok: boolean; daemonSha?: string; reason?: string; unmeasured?: boolean }
@@ -399,9 +554,14 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
   }
   let previous = '';
   let previousBuild = '';
+  let replacedDev: { from: string; to: string } | null = null;
   try {
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
     previousBuild = installedBuild(metadata);
+    if (typeof metadata === 'object' && metadata !== null && (metadata as { channel?: unknown }).channel === 'dev') {
+      const fromDir = typeof (metadata as { versionDir?: unknown }).versionDir === 'string' ? (metadata as { versionDir: string }).versionDir : '';
+      replacedDev = { from: fromDir, to: '' };
+    }
     if (typeof metadata === 'object' && metadata !== null && 'versionDir' in metadata && typeof metadata.versionDir === 'string') {
       const dir = metadata.versionDir;
       if (/^versions\/[a-zA-Z0-9._-]+$/.test(dir) && !dir.includes('..')) previous = basename(dir);
@@ -418,6 +578,12 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     const installedVersion = typeof metadata === 'object' && metadata !== null && 'version' in metadata && typeof metadata.version === 'string'
       ? metadata.version : null;
     if (!installedVersion) return fail(1, '설치판 확인 실패: install.json version 없음');
+    if (replacedDev) {
+      const toDir = typeof metadata === 'object' && metadata !== null && typeof (metadata as { versionDir?: unknown }).versionDir === 'string'
+        ? (metadata as { versionDir: string }).versionDir : installedVersion;
+      replacedDev = { from: replacedDev.from, to: toDir };
+      try { debug.log('self-update', 'dev-replaced', replacedDev); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+    }
     const internalRevision = isTailnet(source) && version?.match(/^(.*)-([0-9a-f]{12})$/);
     if (version && installedVersion !== version && (!internalRevision || installedVersion !== internalRevision[1])) {
       return fail(1, `설치판 버전 불일치: 요청 ${version}, 설치 ${installedVersion}`);
@@ -491,6 +657,9 @@ export async function runUpdateForInstallation(
     out.log(options.json ? JSON.stringify(result) : `self-update: ${result.reason}`);
     return result;
   }
+  if (options.dev || options.rollback) {
+    return runSelfUpdate(options, { cliRoot, ...deps.checkout });
+  }
   if (options.version !== undefined) {
     const result: SelfUpdateResult = { exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: '--version 은 릴리스 설치본에서만 사용 가능' };
     const out = deps.checkout?.out ?? console;
@@ -537,6 +706,15 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     return result;
   };
   const reject = (reason: string): SelfUpdateResult => emit({ exitCode: 2, installedVersion: null, decision: null, restarted: false, reason });
+  if (options.rollback) {
+    const rolled = rollbackDevInstall(deps);
+    if (!rolled.ok) return reject(rolled.reason);
+    return emit({
+      exitCode: 0, installedVersion: rolled.versionName, decision: null, restarted: false,
+      current: `versions/${rolled.versionName}`, previous: rolled.record.previous, channel: rolled.record.channel,
+      reason: `rollback: current → ${rolled.versionName}`,
+    });
+  }
   try {
     if (!existsSync(join(checkout, 'scripts/install.sh'))) return reject(`체크아웃 없음 또는 설치기 없음: ${checkout}`);
     const root = git(checkout, ['rev-parse', '--show-toplevel']);
@@ -545,6 +723,24 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     if (head.status !== 0 || !head.stdout.trim()) return reject(`체크아웃 HEAD 확인 실패: ${checkout}`);
     const dirty = git(checkout, ['diff', '--quiet', 'HEAD', '--']);
     if (dirty.status !== 0) return reject(dirty.status === 1 ? '추적 파일 변경: 체크아웃이 더러움' : `git diff 실패: ${dirty.stderr}`);
+
+    if (options.dev) {
+      try {
+        const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path'], checkout) });
+        return emit({
+          exitCode: 0,
+          installedVersion: installed.versionName,
+          decision: null,
+          restarted: false,
+          current: installed.versionDir,
+          channel: 'dev',
+          previous: installed.previous || undefined,
+          reason: `dev 설치: current → ${installed.versionName}`,
+        });
+      } catch (error) {
+        return emit({ exitCode: 1, installedVersion: null, decision: null, restarted: false, reason: `dev 설치 실패: ${error instanceof Error ? error.message : String(error)}` });
+      }
+    }
 
     const silence = { log: (_s: string) => {}, error: (_s: string) => {} };
     let decision: RestartNeededResult;
@@ -628,6 +824,9 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     const os = deps.os ?? platform();
     const command = os === 'darwin' ? 'launchctl' : os === 'linux' ? 'systemctl' : null;
     if (!command) return emit({ exitCode: 1, installedVersion, decision, restarted: false, prune, reason: `지원하지 않는 플랫폼: ${os}` });
+    if (deps.allowLiveRestart === false || (deps.allowLiveRestart !== true && liveRestartBlocked())) {
+      return emit({ exitCode: 0, installedVersion, decision, restarted: false, prune, reason: '테스트 가드: 실물 재시작 0' });
+    }
     const args = os === 'darwin' ? ['kickstart', '-k', `gui/${deps.uid ?? process.getuid?.() ?? userInfo().uid}/com.elanous.nexus`] : ['--user', 'restart', 'elanous-nexus'];
     try {
       const restarted = run(command, args, checkout);

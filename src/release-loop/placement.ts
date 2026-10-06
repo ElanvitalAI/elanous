@@ -10,7 +10,7 @@ import { move, releasedVersion } from './feature-store.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 
 export type PlacementPriority = 'P0' | 'P1' | 'P2';
-export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string }
+export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }
 export interface PlacementDecision { id: string; from: string | null; version: string; reason: string; displaced: Array<{ id: string; from: string; to: string; reason: string }> }
 export interface RebalanceResult {
   decisions: PlacementDecision[];
@@ -122,6 +122,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   validateCeoLoad(input);
   const seat = parseOwner(input.owner).seat;
   if (!['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
+  if (input.accelerator !== undefined && input.accelerator !== true && input.accelerator !== false) throw new CliUserError('가속 등급은 true 이거나 생략한다');
   const now = (deps.now ?? new Date()).getTime();
   const schedules = [...(deps.schedules ?? listSchedules())].sort((a, b) => versionOrder(a.version, b.version));
   const released = deps.released ?? releasedVersion();
@@ -142,6 +143,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   if (from && released && versionOrder(from, released) <= 0) throw new CliUserError(`이미 발행된 판의 칸은 배치하지 않는다: ${input.id}`);
   if (existing?.status === 'done') throw new CliUserError(`끝난 칸은 배치하지 않는다: ${input.id}`);
   if (existing && (existing.title !== input.title || existing.owner !== input.owner)) throw new CliUserError(`기존 칸 제목·담당 불일치: ${input.id}`);
+  const accelerator = input.accelerator === true || (input.accelerator === undefined && existing?.accelerator === true);
   const load = { id: input.id, ceoMinutes: input.ceoMinutes ?? existing?.ceoMinutes, ceoDate: input.ceoDate ?? existing?.ceoDate };
   const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
   const predecessors = input.predecessors.map((id) => {
@@ -170,6 +172,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   let chosen: ReleaseSchedule | undefined;
   let loadIssue: string | null = null;
   const feasible = candidates.filter((row) => !dependencyViolation(snapshots, locations, new Map([[input.id, row.version]]), input));
+  // 판은 «마감 안 가장 이른 판»부터 본다(기존 불변식). 가속 등급은 그 판이 찼을 때 같은 우선순위 비가속 칸을 밀 수 있게만 한다.
   for (const row of feasible) {
     const placement = new Map([[input.id, row.version]]);
     const items = occupied(row.version);
@@ -180,11 +183,15 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
       chosen = row;
       break;
     }
-    if (input.priority !== 'P1' || from === row.version) { loadIssue ??= directIssue; continue; }
+    const mayDisplace = input.priority === 'P1' ? from !== row.version : accelerator && from !== row.version;
+    if (!mayDisplace) { loadIssue ??= directIssue; continue; }
     const next = open.find((later) => versionOrder(later.version, row.version) > 0);
     if (!next || items.length - 1 >= capacity(row)) { loadIssue ??= directIssue; continue; }
+    const victimOk = (priority: PlacementPriority | undefined) => (input.priority === 'P1' && priority === 'P2')
+      || (accelerator && priority === input.priority);
     const p2 = [...items].reverse().find((item) => {
-      if (item.priority !== 'P2' || dependencyViolation(snapshots, locations, new Map([...placement, [item.id, next.version]]), input)) return false;
+      if (item.accelerator === true) return false;
+      if (!victimOk(item.priority) || dependencyViolation(snapshots, locations, new Map([...placement, [item.id, next.version]]), input)) return false;
       if (item.deadlineVersion && versionOrder(next.version, item.deadlineVersion) > 0) return false;
       if (items.length < capacity(row) && !(seatItems.length >= seatLimit && ownerMatches(item.owner, seat))) return false;
       if (!item.owner) return false;
@@ -202,22 +209,24 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
       return true;
     });
     if (p2) {
-      displaced.push({ id: p2.id, from: row.version, to: next.version, reason: `P1 ${input.id} 마감 판 ${row.version} 용량 확보를 위해 P2 이월` });
+      displaced.push({ id: p2.id, from: row.version, to: next.version, reason: accelerator
+        ? `가속 등급 ${input.id} 를 같은 우선순위 안에서 먼저 두기 위해 ${p2.priority ?? 'P2'} ${p2.id} 이월`
+        : `P1 ${input.id} 마감 판 ${row.version} 용량 확보를 위해 P2 이월` });
       chosen = row;
       break;
     }
     loadIssue ??= directIssue;
   }
   if (!chosen) throw new CliUserError(loadIssue ?? `${input.id} 배치할 판이 없다 — 용량·선행·마감·동결을 확인하라`);
-  const reason = `${input.priority} ${input.priority === 'P0' ? '사고·회귀·발행 막음: 다음 판' : input.priority === 'P1' ? `지시·행사 마감 판 ${deadlineVersion}` : '착지 마감 내 가장 이른 여유 판'} · PR/24h ${rate} · 용량 ${capacity(chosen)} · 자리 ${seatLimit}`;
+  const reason = `${accelerator ? '가속 등급 · ' : ''}${input.priority} ${input.priority === 'P0' ? '사고·회귀·발행 막음: 다음 판' : input.priority === 'P1' ? `지시·행사 마감 판 ${deadlineVersion}` : '착지 마감 내 가장 이른 여유 판'}${accelerator ? ' · 같은 우선순위 안에서 가속 등급을 먼저' : ''} · PR/24h ${rate} · 용량 ${capacity(chosen)} · 자리 ${seatLimit}`;
   const decision = { id: input.id, from, version: chosen.version, reason, displaced };
   if (!deps.dryRun) {
     const by = deps.by ?? 'OP';
     for (const shifted of displaced) move(shifted.id, shifted.from, shifted.to, by, undefined, undefined, shifted.reason);
     if (from && from !== chosen.version) move(input.id, from, chosen.version, by, undefined, undefined, reason);
-    if (from && (existing?.priority !== input.priority || JSON.stringify(existing.predecessors ?? []) !== JSON.stringify(input.predecessors) || (input.deadlineVersion !== undefined && existing.deadlineVersion !== input.deadlineVersion) || (input.ceoMinutes !== undefined && existing.ceoMinutes !== input.ceoMinutes) || (input.ceoDate !== undefined && existing.ceoDate !== input.ceoDate)))
-      setItem(chosen.version, input.id, { priority: input.priority, predecessors: input.predecessors, ...(input.deadlineVersion ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}) }, by);
-    if (!from) addItem(chosen.version, { id: input.id, title: input.title, owner: input.owner, priority: input.priority, predecessors: input.predecessors, deadlineVersion, ...(load.ceoMinutes !== undefined ? { ceoMinutes: load.ceoMinutes } : {}), ...(load.ceoDate !== undefined ? { ceoDate: load.ceoDate } : {}) });
+    if (from && (existing?.priority !== input.priority || JSON.stringify(existing.predecessors ?? []) !== JSON.stringify(input.predecessors) || (input.deadlineVersion !== undefined && existing.deadlineVersion !== input.deadlineVersion) || (input.ceoMinutes !== undefined && existing.ceoMinutes !== input.ceoMinutes) || (input.ceoDate !== undefined && existing.ceoDate !== input.ceoDate) || (input.accelerator !== undefined && (existing?.accelerator === true) !== (input.accelerator === true))))
+      setItem(chosen.version, input.id, { priority: input.priority, predecessors: input.predecessors, ...(input.deadlineVersion ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator !== undefined ? { accelerator: input.accelerator === true ? true : null } : {}) }, by);
+    if (!from) addItem(chosen.version, { id: input.id, title: input.title, owner: input.owner, priority: input.priority, predecessors: input.predecessors, deadlineVersion, ...(load.ceoMinutes !== undefined ? { ceoMinutes: load.ceoMinutes } : {}), ...(load.ceoDate !== undefined ? { ceoDate: load.ceoDate } : {}), ...(accelerator ? { accelerator: true } : {}) });
   }
   return decision;
 }

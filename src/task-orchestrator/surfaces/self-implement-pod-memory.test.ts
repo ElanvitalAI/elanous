@@ -137,7 +137,7 @@ describe('POD7 measured per-kind requests', () => {
   ]));
   const advice = advisePodMemory(measurePodMemoryByGoal(rows, now, 'fixture.db'));
 
-  test('measured p95 reserves per kind; absent, sparse, or unknown kinds retain 4Gi and report the fallback', () => {
+  test('measured p95 reserves per kind; absent, sparse, or unknown kinds retain the 6Gi default and report the fallback', () => {
     const defaults: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-request-default-test', emit: (record) => {
       if (record.category === 'pod.memory' && record.event === 'request-default') {
@@ -150,18 +150,18 @@ describe('POD7 measured per-kind requests', () => {
       expect(podMemoryRequestFor('test', advice)).toBe('5Gi');
       expect(podMemoryRequestFor('docs', advice)).toBe('3Gi');
       expect(podMemoryRequestFor('pwa-build', advice)).toBe('15Gi');
-      expect(podMemoryRequestFor('code')).toBe('4Gi');
+      expect(podMemoryRequestFor('code')).toBe('6Gi');
       const sparse = advisePodMemory(measurePodMemoryByGoal(rows.slice(0, 3), now, 'fixture.db'));
-      expect(podMemoryRequestFor('code', sparse)).toBe('4Gi');
+      expect(podMemoryRequestFor('code', sparse)).toBe('6Gi');
       const lowCoverage = advisePodMemory(measurePodMemoryByGoal([
         ...rows,
         ...[4, 5, 6, 7].map((n) => ({ ts_ms: now - n * 1000, category: 'self-implement.pod', event: 'memory-limit', data: JSON.stringify({ spaceId: `code-${n}`, goalType: 'code', memoryLimit: '16Gi' }) })),
       ], now, 'fixture.db'));
-      expect(podMemoryRequestFor('code', lowCoverage)).toBe('4Gi');
+      expect(podMemoryRequestFor('code', lowCoverage)).toBe('6Gi');
       const noPeak = { ...advice, byGoalType: advice.byGoalType.map((entry) => entry.goalType === 'code'
         ? { ...entry, evidence: { ...entry.evidence, peakMiB: { ...entry.evidence.peakMiB, p95: null } } } : entry) };
-      expect(podMemoryRequestFor('code', noPeak)).toBe('4Gi');
-      expect(podMemoryRequestFor(null, advice)).toBe('4Gi');
+      expect(podMemoryRequestFor('code', noPeak)).toBe('6Gi');
+      expect(podMemoryRequestFor(null, advice)).toBe('6Gi');
       expect(defaults).toEqual([
         { kind: 'code', reason: 'no-advice' },
         { kind: 'code', reason: 'insufficient-sample' },
@@ -172,7 +172,7 @@ describe('POD7 measured per-kind requests', () => {
     } finally { off(); }
   });
 
-  test('unavailable advice logs the reason and retains the 4Gi request and 16Gi limit in the Job', async () => {
+  test('unavailable advice logs the reason and retains the 6Gi default request and 16Gi limit in the Job', async () => {
     const jobs: any[] = [];
     const defaults: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-request-unavailable-test', emit: (record) => {
@@ -192,7 +192,7 @@ describe('POD7 measured per-kind requests', () => {
       const spawn = podSelfImplementSpawn({ kubectl, memoryAdvice: () => { throw new Error('unavailable'); }, credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }) });
       expect((await spawn({ spaceId: 'request-no-advice', feature: '코드 구현' }).done).exitCode).toBe(0);
       expect(jobs[0].spec.template.spec.containers[0].resources).toEqual({
-        requests: { cpu: '1', memory: '4Gi' }, limits: { cpu: '4', memory: '16Gi' },
+        requests: { cpu: '1', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' },
       });
       expect(defaults).toEqual([{ kind: 'code', reason: 'no-advice' }]);
     } finally { off(); }
@@ -248,7 +248,7 @@ describe('POD7 measured per-kind requests', () => {
         { requests: { cpu: '1', memory: '9Gi' }, limits: { cpu: '4', memory: '32Gi' } },
         { requests: { cpu: '1', memory: '15Gi' }, limits: { cpu: '4', memory: '32Gi' } },
         { requests: { cpu: '1', memory: '5Gi' }, limits: { cpu: '4', memory: '16Gi' } },
-        { requests: { cpu: '1', memory: '4Gi' }, limits: { cpu: '4', memory: '16Gi' } },
+        { requests: { cpu: '1', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' } },
         { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
       ]);
       expect(kinds).toEqual(['code', 'code', 'pwa-build', 'test', null, 'code']);
@@ -340,7 +340,7 @@ describe('POD7 measured advice launch opt-in', () => {
       await launch('launch-line', `${goal}\nPod 메모리: lite`);
       await launch('launch-code', '코드 구현');
       expect(jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['16Gi', '32Gi', '16Gi', '2Gi', '16Gi']);
-      expect(jobs.map((job) => job.spec.template.spec.containers[0].resources.requests.memory)).toEqual(['4Gi', '4Gi', '4Gi', '2Gi', '9Gi']);
+      expect(jobs.map((job) => job.spec.template.spec.containers[0].resources.requests.memory)).toEqual(['6Gi', '6Gi', '6Gi', '2Gi', '9Gi']);
       expect(events.map(({ memoryLimit, source, tier }) => ({ memoryLimit, source, tier }))).toEqual([
         { memoryLimit: '16Gi', source: 'default', tier: 'standard' },
         { memoryLimit: '32Gi', source: 'advise', tier: 'high' },

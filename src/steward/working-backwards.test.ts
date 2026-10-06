@@ -138,6 +138,22 @@ test('missing capability verdict proceeds without a draft (triage is not blocked
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an invalid draft is not re-asked on the next tick for the same issue text; a changed issue is asked again', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-invalid-memo-'));
+  const store = new CardStore(root);
+  const row = { issue: 'ELA-29', rung: 4 as const, why: 'new', capability: 'new-capability' as const, priority: 0, dependsOn: [], disposition: 'now' as const };
+  const issue: TriageIssue = { identifier: 'ELA-29', ref: 'r', title: 'new-action', body: '새 능력 소원' };
+  let asks = 0;
+  const ask: StewardAsk = async () => { asks++; return 'not json'; };
+  try {
+    await expect(recordWorkingBackwardsOnCards([row], [issue], store, ask)).rejects.toThrow('Invalid working-backwards draft');
+    await expect(recordWorkingBackwardsOnCards([row], [issue], store, ask)).rejects.toThrow('Invalid working-backwards draft');
+    expect(asks).toBe(1);
+    await expect(recordWorkingBackwardsOnCards([row], [{ ...issue, body: '고친 소원' }], store, ask)).rejects.toThrow('Invalid working-backwards draft');
+    expect(asks).toBe(2);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a draft that is not JSON stops the steward report like any invalid draft', async () => {
   const root = mkdtempSync(join(tmpdir(), 'steward-nonjson-draft-'));
   const issue: TriageIssue = { identifier: 'ELA-505', ref: 'e', title: 'new-action request', body: '새 명령 소원' };

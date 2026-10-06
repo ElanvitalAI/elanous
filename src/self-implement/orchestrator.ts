@@ -66,9 +66,11 @@ import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunCha
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
 import { recordFailureEvent } from './heal-intake.js';
+import { classifyReworkCapExhaustion, type ReworkCapHealDecision } from './heal-triage.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { reworkDecision } from './decision-events.js';
@@ -101,6 +103,26 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge, owningRepoRoot } from './frozen-merges.js';
+import { recordFollowUpOnMerge, type FollowUpMergeInput, type FollowUpSeams } from './follow-up-goals.js';
+
+/** Merge result and exit stay untouched: a draft failure is one debug line. */
+async function draftFollowUpAfterMerge(input: FollowUpMergeInput, followUp: FollowUpSeams | undefined): Promise<void> {
+  try {
+    await recordFollowUpOnMerge(input, {
+      ...(followUp ? {
+        ...(followUp.mode ? { mode: followUp.mode } : {}),
+        ...(followUp.readDrafts ? { readDrafts: followUp.readDrafts } : {}),
+        ...(followUp.appendDraft ? { appendDraft: followUp.appendDraft } : {}),
+        ...(followUp.enqueue ? { enqueue: followUp.enqueue } : {}),
+        ...(followUp.cellOwner ? { cellOwner: followUp.cellOwner } : {}),
+        ...(followUp.stateRoot ? { stateRoot: followUp.stateRoot } : {}),
+      } : {}),
+      log: (category, event, data) => { debug.log(category, event, data); },
+    });
+  } catch (error) {
+    debug.log('self-implement.follow-up', 'draft-failed', { prNumber: input.prNumber, error: error instanceof Error ? error.message : String(error) });
+  }
+}
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
@@ -1056,7 +1078,7 @@ export interface SelfImplementSeams {
   /** PR 생성 뒤 런의 라운드 대화를 게시한다. 실패는 PR 개설을 되돌리지 않는다. */
   postPrComment?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
   addPrLabel?: (opts: { number: number; label: string; cwd: string }) => Promise<void>;
-  readPrFiles?: (opts: { number: number; cwd: string }) => Promise<string[]>;
+  readPrFiles?: (opts: { number: number; cwd: string; base?: string }) => Promise<string[]>;
   /** PR의 base/head SHA와 관측된 PR base를 한 응답에서 고정한다. 미주입·실패·빈 SHA면 검사 대상을 증명할 수 없어 fail-closed로 PR을 열어 둔다. */
   readPrCommitShas?: (opts: { number: number; cwd: string }) => Promise<{ baseCommit: string; headCommit: string; baseRefName?: string }>;
   /** 고정한 base/head SHA 쌍의 unified diff. 가변 PR 조회를 다시 사용하면 ABA head 변경에 안전하지 않으므로 두 SHA는 필수 입력이다. */
@@ -1090,6 +1112,12 @@ export interface SelfImplementSeams {
     readRunLedger?: (runId: string) => RunLedgerEntry[] | null | Promise<RunLedgerEntry[] | null>;
     closeDraft: (input: { number: number; comment: string }) => void | Promise<void>;
   };
+  /**
+   * FOLLOWUP-LOOP① — after a successful merge, leftover findings become one follow-up draft.
+   * Tests inject every store. Omission writes nothing (no operational ledger, no queue).
+   * Production `defaultSeams` fills the state-root ledger and, only in `live`, the harness queue.
+   */
+  followUp?: FollowUpSeams;
   /** ⑥ HITL 게이트 — PR open 전 승인. ★fail-closed: 생략/false 면 PR 안 열림(자동 승인 없음). review 동봉
    *  (2026-07-21) — HITL 이 리뷰 verdict 를 보고 판단, auto 모드는 verdict 로 자동 결정. */
   approvePr?: (summary: { branch: string; gateLog?: string; implSummary: string; review?: SelfImplementReview }) => Promise<boolean>;
@@ -3394,7 +3422,26 @@ function mergeDecisionEvidenceCoverage(evidenceCoverage: {
     : { evidenceCoverageMeasured: false };
 }
 
+function installedBuildForOrigin(env: NodeJS.ProcessEnv): { installedVersion: string; installedCommit: string } {
+  const root = env.ELANOUS_TEST_HOME?.trim()
+    ? join(env.ELANOUS_TEST_HOME.trim(), '.local/share/elanous')
+    : join(homedir(), '.local/share/elanous');
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null) return { installedVersion: 'unknown', installedCommit: 'unknown' };
+    const version = (parsed as { version?: unknown }).version;
+    const commit = (parsed as { commit?: unknown }).commit;
+    return {
+      installedVersion: typeof version === 'string' && version.trim() ? version.trim() : 'unknown',
+      installedCommit: typeof commit === 'string' && commit.trim() ? commit.trim() : 'unknown',
+    };
+  } catch {
+    return { installedVersion: 'unknown', installedCommit: 'unknown' };
+  }
+}
+
 function runOriginData(env: NodeJS.ProcessEnv = process.env): RunOriginData {
+  const installed = installedBuildForOrigin(env);
   return {
     hostId: resolveHostId(env),
     hostname: hostname(),
@@ -3403,6 +3450,8 @@ function runOriginData(env: NodeJS.ProcessEnv = process.env): RunOriginData {
     substrate: env.ELANOUS_SUBSTRATE || 'host',
     instance: resolveInstanceName(),
     elanousVersion: (JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version: string }).version,
+    installedVersion: installed.installedVersion,
+    installedCommit: installed.installedCommit,
     ...(env.ELANOUS_POD_NAME ? { podName: env.ELANOUS_POD_NAME } : {}),
     ...(env.ELANOUS_NODE_NAME ? { nodeName: env.ELANOUS_NODE_NAME } : {}),
     ...(env.ELANOUS_POD_NAMESPACE ? { podNamespace: env.ELANOUS_POD_NAMESPACE } : {}),
@@ -3616,6 +3665,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     },
   } satisfies LogSink);
   let traversalFinalized = false;
+  reworkCapProceed = false;
   const progressDelivery = { delivered: 0, unwired: 0, callbackFailed: 0 };
   let capturedPrNumber: number | undefined;
   let openPrInvoked = false;
@@ -4179,10 +4229,31 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     const terminalStage = terminalResult?.stage ?? 'crashed';
     try {
       const mappedStatus = mapStageToRunStatus(terminalStage)?.runStatus;
-      if (!terminalResult || mappedStatus === 'failed' || (mappedStatus === undefined && terminalResult.ok === false) || signalIncompleteState(roundClassifications).latestSignalIncomplete) {
+      const reworkCapStop = terminalResult?.stage === 'pr-opened' && (
+        terminalResult.outcome === 'budget-exhausted'
+        || (terminalResult.outcome === 'completed' && reworkCapProceed)
+      );
+      if (!terminalResult || mappedStatus === 'failed' || (mappedStatus === undefined && terminalResult.ok === false) || signalIncompleteState(roundClassifications).latestSignalIncomplete || reworkCapStop) {
+        const reworkCap = reworkCapStop ? classifyReworkCapExhaustion({
+          introduced: terminalResult?.gate?.reflectGateFacts?.introduced
+            ? [`introduced=${terminalResult.gate.reflectGateFacts.introduced}`]
+            : [],
+          mustFix: terminalResult?.review?.mustFix ?? terminalResult?.mustFix,
+          summary: terminalResult?.review?.summary,
+        }) : undefined;
+        if (reworkCap) {
+          observeOuter('rework-cap-heal', {
+            stage: terminalStage,
+            defectClass: reworkCap.defectClass,
+            nextAction: reworkCap.nextAction,
+            evidence: reworkCap.evidence,
+          });
+        }
         recordFailureEvent({
-          source: 'harness-run', kind: terminalStage, ref: runId,
-          summary: opts.feature.split(/\r?\n/, 1)[0]?.trim() || `Harness run ${runId} failed`,
+          source: 'harness-run', kind: reworkCapStop ? 'rework-cap-exhausted' : terminalStage, ref: runId,
+          summary: reworkCap
+            ? reworkCapFailureSummary(opts.feature, reworkCap)
+            : opts.feature.split(/\r?\n/, 1)[0]?.trim() || `Harness run ${runId} failed`,
           at: new Date().toISOString(),
         });
       }
@@ -4542,6 +4613,14 @@ function observeRunRollup(
     ...(result.reviewReflectRejectedCount !== undefined ? { reviewReflectRejectedCount: result.reviewReflectRejectedCount } : {}),
     prNumber: rollupPrNumber(result, capturedPrNumber, openPrInvoked),
   }, effectiveOutcome.runStatus === 'failed' ? { level: 'warn' } : undefined);
+}
+
+let reworkCapProceed = false;
+
+function reworkCapFailureSummary(feature: string, decision: ReworkCapHealDecision): string {
+  const title = feature.split(/\\r?\\n/, 1)[0]?.trim() || 'rework cap exhausted';
+  const evidence = decision.evidence.length ? decision.evidence.join(' | ') : 'no gate introduced list and no review finding';
+  return `${title} [${decision.defectClass} → ${decision.nextAction}] ${evidence}`;
 }
 
 async function runSelfImplementInner(
@@ -5030,6 +5109,8 @@ async function runSelfImplementInner(
   } | undefined;
   let gate!: SelfImplementGateResult;
   let review: SelfImplementReview | undefined;
+  /** Review-budget leftovers and the body that carried them, so a later merge drafts from the same text. */
+  let preparedReviewBudgetPrBody: string | undefined;
   const reviewMustFixCountHistory: number[] = [];
   const reviewMustFixTrend = (): string => {
     if (reviewMustFixCountHistory.length < 2) return '아직 못 잰다';
@@ -5364,6 +5445,23 @@ async function runSelfImplementInner(
     if (!s.postPrComment) {
       observe('pr.comment.seam-missing', { number: pr.number, buffered: prCommentBuffer.length }, { level: 'warn' });
       return;
+    }
+    const marker = '<!-- elanous:run-status -->';
+    if (s.findPrComment && s.editPrComment) {
+      try {
+        const existing = await s.findPrComment({ number: pr.number, marker, cwd: wt.path });
+        const history = prCommentBuffer.join('\n\n');
+        const body = existing
+          ? existing.body.includes('</details>')
+            ? existing.body.replace(/<\/details>(?![\s\S]*<\/details>)/, `\n\n${history}\n</details>`)
+            : `${existing.body}\n\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`
+          : `${marker}\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`;
+        if (existing) await s.editPrComment({ id: existing.id, body, cwd: wt.path });
+        else await s.postPrComment({ number: pr.number, body, cwd: wt.path });
+      } catch (error) {
+        // Unknown lookup/edit outcome is not proof of absence: never create a second status comment.
+        observe('pr.comment.status-failed', { number: pr.number, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+      }
     }
     for (const body of prCommentBuffer) {
       try {
@@ -5798,6 +5896,7 @@ async function runSelfImplementInner(
       'self-implement-review-budget-pr',
       followUpMustFix,
     );
+    preparedReviewBudgetPrBody = preparedPrBody.body;
     const pr = await withStepTimeout(s.openPr({
       title: prTitle(opts.feature),
       body: preparedPrBody.body,
@@ -6211,6 +6310,7 @@ async function runSelfImplementInner(
           if (budgetDecision.stop) {
             if (budgetDecision.exit === 'proceed') {
               finalizeSupervisorDeliveries('supervisor-rework-proceed');
+              if (round > effectiveMax) reworkCapProceed = true;
               break;
             }
             finalizeSupervisorDeliveries('supervisor-rework-blocked');
@@ -6271,12 +6371,25 @@ async function runSelfImplementInner(
       if (isReviewRework(reworkKind)) {
         if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
         const reason = `review must-fix unresolved after ${round - 1} rework round(s)`;
+        // Pod keeps review-blocked work as a labelled draft (or aborts with the preserved branch) instead of
+        // accepting the review budget into a non-draft PR — restored after #24341 (0.2.16 gate shard 5).
         if (!podReviewBlockedDraft) {
           const acceptance = await acceptReviewBudget(
             review?.mustFix ?? [],
             reworkParts.some((part) => part.source === 'supervisor'),
           );
           if (acceptance.decision.action === 'accept') {
+            if (acceptance.pr) {
+              await draftFollowUpAfterMerge({
+                prNumber: acceptance.pr.number,
+                followUpMustFix: acceptance.decision.unresolvedMustFix,
+                shouldFix: review?.shouldFix,
+                prBody: preparedReviewBudgetPrBody,
+                feature: opts.feature,
+                ...(opts.goalId ? { cellId: opts.goalId } : {}),
+                ...(opts.goalFile ? { goalFile: opts.goalFile } : {}),
+              }, s.followUp);
+            }
             return {
               ok: true,
               stage: 'pr-opened',
@@ -7523,11 +7636,15 @@ async function runSelfImplementInner(
   let releasePathInspectionError: string | undefined;
   if (s.readPrFiles) {
     try {
-      const files = await withStepTimeout(s.readPrFiles({ number: pr.number, cwd: wt.path }), T.pr, 'pr');
+      // Rate-limit recovery may wait up to 15 minutes for X-RateLimit-Reset; the PR step cap must not cut that wait.
+      const files = await s.readPrFiles({ number: pr.number, cwd: wt.path, ...(opts.base ? { base: opts.base } : {}) });
       if (!Array.isArray(files) || !files.every((path) => typeof path === 'string')) throw new Error('invalid PR file list');
       releaseHoldPath = releasePathHold(files);
     } catch (error) {
-      releasePathInspectionError = safeErrorDescription(error);
+      const rateLimited = error instanceof Error && (error as { rateLimited?: boolean }).rateLimited === true;
+      releasePathInspectionError = rateLimited
+        ? `rate-limit: ${safeErrorDescription(error)}`
+        : safeErrorDescription(error);
     }
   } else if (canAuto || labels?.includes(AUTO_REVIEW_LABEL)) {
     releasePathInspectionError = 'readPrFiles seam unavailable';
@@ -7566,7 +7683,9 @@ async function runSelfImplementInner(
   if (releasePathInspectionError && (canAuto || labels?.includes(AUTO_REVIEW_LABEL))) {
     observe('release-path-inspection-failed', { number: pr.number, error: releasePathInspectionError }, { level: 'error' });
     canAuto = false;
-    mergeSkipReason = mergeReason = 'release-path-inspection-failed';
+    mergeSkipReason = mergeReason = releasePathInspectionError.startsWith('rate-limit:')
+      ? 'release-path-inspection-failed: rate-limit'
+      : 'release-path-inspection-failed';
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): PR 경로 조회 실패`);
     return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, prUrl: pr.url, prNumber: pr.number };
@@ -7700,6 +7819,18 @@ async function runSelfImplementInner(
         prNumber: pr.number,
         openedAt: openedAtFromLedger(mergedLedger, new Date().toISOString()),
       }, observe);
+      // FOLLOWUP-LOOP① — leftover findings become one follow-up draft. Failure is a log line only;
+      // this return (stage, merged, exit via ok) stays the merge result.
+      await draftFollowUpAfterMerge({
+        prNumber: pr.number,
+        // 정상 병합은 리뷰를 통과한 뒤라 미해결 must-fix 가 없다 — 남은 것은 should-fix ⊕ PR 본문 «남은 조각».
+        // 미해결 must-fix 는 리뷰 예산 수락 경로가 직접 넘긴다(위 acceptance 분기).
+        shouldFix: review?.shouldFix,
+        prBody: [preparedReviewBudgetPrBody, preparedPrBody.body].filter(Boolean).join('\n'),
+        feature: opts.feature,
+        ...(opts.goalId ? { cellId: opts.goalId } : {}),
+        ...(opts.goalFile ? { goalFile: opts.goalFile } : {}),
+      }, s.followUp);
       return { ok: true, stage: 'merged', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), merged: true, ...(mergedBase ? { mergedBase } : {}), prUrl: pr.url, prNumber: pr.number };
     }
     progress('pr-opened', `병합 실패 — PR 개설됨(#${pr.number}·수동 병합). ${m.detail ?? ''}`);

@@ -631,7 +631,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (!opts.dryRun && !mayWriteLedger('release place', false, scheduleLedgerRoot())) return;
       const priority = opts.priority ?? item.priority;
       if (!priority) throw new CliUserError(`우선순위가 없는 칸: ${id} — --priority P0|P1|P2 를 지정하라`);
-      const result = placeCell({ id, title: item.title, owner: item.owner, priority: priority as PlacementPriority, predecessors: item.predecessors ?? [], deadlineVersion: item.deadlineVersion, ceoMinutes: item.ceoMinutes, ceoDate: item.ceoDate }, { schedules: rows, dryRun: opts.dryRun, by: who ?? 'cli' });
+      const result = placeCell({ id, title: item.title, owner: item.owner, priority: priority as PlacementPriority, predecessors: item.predecessors ?? [], deadlineVersion: item.deadlineVersion, ceoMinutes: item.ceoMinutes, ceoDate: item.ceoDate, ...(item.accelerator === true ? { accelerator: true } : {}) }, { schedules: rows, dryRun: opts.dryRun, by: who ?? 'cli' });
       console.log(`${opts.dryRun ? '· 드라이런' : '✅'} ${id} ${result.from ?? '-'} → ${result.version} · ${result.reason}${result.displaced.length ? ` · P2 이월 ${result.displaced.map((row) => row.id).join(', ')}` : ''}`);
     });
   release.command('rebalance').description('마감 2시간 전 미시작 칸을 다음 판으로')
@@ -740,11 +740,12 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD (없으면 판 착지일 KST)')
+    .option('--accelerator', '가속 등급 — 다른 칸의 처리량을 올리는 칸(자율성·효율성·동시성). 생략하면 등급 없음')
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
-    .action((id: string, title: string, opts: { owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; allowDuplicateId?: boolean }, cmd: Command) => {
+    .action((id: string, title: string, opts: { owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
-    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
+    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
@@ -752,13 +753,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
-    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string }, cmd: Command) => {
+    .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
+    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
-      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date 중 하나');
+      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
       if (!mayWrite(cmd)) return;
-      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       const item = data.items.find((entry) => entry.id === id);
       const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
       if (why) {
@@ -897,13 +899,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(renderReleaseNotes(draftReleaseNotes(readLandedCommits(o.from, o.to), o.from, o.to)));
     });
   release.command('cut-branch')
-    .description('원래 컷에 main 의 수리 커밋만 얹은 release/<v> 가지를 만들고 push')
+    .description('원래 컷에 main 의 수리 커밋만 얹은 release/<v> 가지를 만들고 push. --append 는 이미 있는 가지에 fast-forward 로만 더 얹는다')
     .requiredOption('--version <v>', '릴리스 판(x.y.z)')
     .requiredOption('--base <sha>', '원래 컷 SHA')
     .requiredOption('--pick <sha...>', '차례로 얹을 main 커밋 SHA')
+    .option('--append', '이미 있는 release/<v> 를 출발점으로 fast-forward push(강제 push 없음)')
     .option('--dry-run', '가지·worktree·push 없이 계획만 출력')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { version: string; base: string; pick: string[]; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
   const runAction = async (o: { version: string; cutCommit?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {

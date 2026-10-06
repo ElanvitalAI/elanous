@@ -311,6 +311,44 @@ test('seat move rejects deadline, capacity, and dependent constraints before wri
   expect(checklistHistory('flex').filter((row) => row.field === 'move')).toHaveLength(0);
 });
 
+test('same priority places the accelerator cell first by displacing an unmarked peer', () => {
+  setup();
+  addItem('0.2.14', { ...cell('ordinary'), title: '일반 칸' });
+  const decision = placeCell({ ...cell('accel'), title: '스마트 머지', accelerator: true }, { ...deps(), seatCap: { TC: 1 }, merged24h: 2 });
+  expect(decision.version).toBe('0.2.14');
+  expect(decision.displaced.map((row) => row.id)).toEqual(['ordinary']);
+  expect(decision.reason).toContain('가속 등급');
+  expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['accel']);
+  expect(listChecklist('0.2.14').items[0]?.accelerator).toBe(true);
+  expect(checklistHistory('ordinary').at(-1)).toMatchObject({ field: 'move', reason: expect.stringContaining('가속 등급 accel') });
+});
+
+test('an accelerator cell still takes the earliest version with room and displaces nobody', () => {
+  setup();
+  const decision = placeCell({ ...cell('accel'), accelerator: true }, { ...deps(), seatCap: { TC: 2 }, merged24h: 2 });
+  expect(decision.version).toBe('0.2.14');
+  expect(decision.displaced).toEqual([]);
+  expect(listChecklist('0.2.14').items[0]?.accelerator).toBe(true);
+});
+
+test('a P1 accelerator keeps the P1 rule of pushing a P2 cell', () => {
+  setup();
+  addItem('0.2.14', { ...cell('low', 'P2'), title: 'low' });
+  const decision = placeCell({ ...cell('accel', 'P1'), deadlineVersion: '0.2.14', accelerator: true }, { ...deps(), seatCap: { TC: 1 }, merged24h: 2 });
+  expect(decision.version).toBe('0.2.14');
+  expect(decision.displaced.map((row) => row.id)).toEqual(['low']);
+});
+
+test('the accelerator flag round-trips on the ledger and can be cleared', () => {
+  setup();
+  addItem('0.2.16', { id: 'X', title: 'x', owner: 'TC', priority: 'P2' });
+  setItem('0.2.16', 'X', { accelerator: true }, 'OP');
+  expect(listChecklist('0.2.16').items[0]?.accelerator).toBe(true);
+  expect(checklistHistory('X').find((row) => row.field === 'accelerator')).toMatchObject({ from: null, to: true, by: 'OP' });
+  setItem('0.2.16', 'X', { accelerator: null }, 'OP');
+  expect(listChecklist('0.2.16').items[0]?.accelerator).toBeUndefined();
+});
+
 test('rebalance moves only unstarted yellow cells in two-hour pre-deadline window', () => {
   setup();
   addItem('0.2.14', { id: 'new', title: 'new', owner: 'TC' });

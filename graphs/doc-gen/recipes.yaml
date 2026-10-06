@@ -1,0 +1,3 @@
+generate:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/docs/generate-graph-anatomy.ts" --out "$HOME/.elanous/generated/graph-anatomy.md"'
+  timeout_ms: 120000

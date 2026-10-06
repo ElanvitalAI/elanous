@@ -1,8 +1,10 @@
 /** Pod Job 원천 단계 — default clone · 커밋 · PR · 호스트 번들.
  *  sha·PR·커밋은 형식 검사 전에 스크립트에 넣지 않는다(셸 주입 차단). */
 
+import { execFileSync } from 'node:child_process';
+
 export type PodSource =
-  | { kind: 'default' }
+  | { kind: 'default'; base?: string }
   | { kind: 'commit'; sha: string }
   | { kind: 'pr'; number: number }
   | { kind: 'bundle'; bundlePath: string; sha256: string; sizeBytes: number; headCommit: string };
@@ -29,6 +31,27 @@ function assertSize(value: number): number {
   return value;
 }
 
+/** Check the requested branch on origin before creating a Pod Job, not in the launched job. */
+function assertRemoteBase(repoUrl: string, base: string): void {
+  if (base.startsWith('-') || base === 'HEAD') throw new Error(`invalid Pod base ref: ${base}`);
+  try {
+    execFileSync('git', ['check-ref-format', '--branch', base], { stdio: 'pipe' });
+  } catch {
+    throw new Error(`invalid Pod base ref: ${base}`);
+  }
+  try {
+    const advertised = execFileSync('git', ['ls-remote', '--exit-code', '--heads', repoUrl, `refs/heads/${base}`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    const [sha, ref] = advertised.split('\t');
+    if (!/^[0-9a-f]{40,64}$/.test(sha ?? '') || ref !== `refs/heads/${base}`) {
+      throw new Error('origin did not advertise the requested branch');
+    }
+  } catch {
+    throw new Error(`Pod base ref not found on origin: ${base}`);
+  }
+}
+
 /** Job 스크립트의 원천 단계. 성공 갈래는 `ELANOUS_POD_SOURCE <kind> <HEAD>` 로 끝난다. */
 export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath = '/host-mirror'): string {
   const quotedUrl = `'${repoUrl.replace(/'/g, `'\\''`)}'`;
@@ -48,6 +71,19 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'cd repo || exit 5',
   ];
   if (source.kind === 'default') {
+    if (source.base && source.base !== 'main') {
+      assertRemoteBase(repoUrl, source.base);
+      const base = source.base;
+      const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+      const quotedTrackingRef = quote(`refs/remotes/origin/${base}`);
+      return [
+        ...start,
+        `git fetch --depth 50 origin ${quote(`+refs/heads/${base}:refs/remotes/origin/${base}`)} || exit 5`,
+        `git checkout -q -B ${quote(base)} ${quotedTrackingRef} || exit 5`,
+        'head=$(git rev-parse HEAD)',
+        "printf 'ELANOUS_POD_SOURCE default %s\\n' \"$head\"",
+      ].join('\n');
+    }
     return [
       ...start,
       'if [ "$source_via" = mirror ]; then',

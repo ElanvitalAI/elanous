@@ -1,0 +1,24 @@
+graph_id: doc-gen-daily
+loop:
+  title: 그래프 아나토미 매일 생성
+  description: 설치본에서 그래프 아나토미를 내고 어제 대비 더해진·빠진 노드를 적는다
+  trigger:
+    cron: '40 4 * * *'
+version: 1
+entry_node: generate
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: generate
+    kind: agent
+    recipe: cmd:generate
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: generate
+    on: outcome
+    map: { ok: done, fail: failed, error: failed }

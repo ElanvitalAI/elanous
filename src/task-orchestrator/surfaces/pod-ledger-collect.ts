@@ -3,6 +3,7 @@ import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
 import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { ledgerLineToLogEvent } from './pod-ledger-events.js';
+import { defaultPodReemit } from './pod-ledger-prod-sink.js';
 
 type Ledger = { runId: string; jsonl: string };
 type Incomplete = { runId: string; reason: string };
@@ -94,7 +95,7 @@ export function parsePodLedgerChunks(logs: string): ParseResult {
  *  except a ledger that THIS run's live follower created (`replace`): that one is a partial copy and the final is complete. */
 export function collectPodLedgers(
   logs: string,
-  { dir = runLedgerDir(), log = (c, e, d) => debug.log(c, e, d), emit = (c, e, d) => debug.log(c, e, d), replace = new Set<string>() }: {
+  { dir = runLedgerDir(), log = defaultPodReemit(), emit = defaultPodReemit(), replace = new Set<string>() }: {
     dir?: string;
     log?: (category: string, event: string, data: Record<string, unknown>) => void;
     emit?: Emit;
@@ -146,8 +147,8 @@ export function createPodLedgerFollower(opts: {
   onStall?: (message: string) => void;
 }): { poll(): void; readonly owned: boolean } {
   const dir = opts.dir ?? runLedgerDir();
-  const log = opts.log ?? ((c, e, d) => debug.log(c, e, d));
-  const emit: Emit = opts.emit ?? ((c, e, d) => debug.log(c, e, d));
+  const log = opts.log ?? defaultPodReemit();
+  const emit: Emit = opts.emit ?? defaultPodReemit();
   const now = opts.now ?? Date.now;
   const stallMinutes = opts.stallMinutes ?? 30;
   if (!Number.isFinite(stallMinutes) || stallMinutes <= 0) throw new RangeError('stallMinutes must be positive');

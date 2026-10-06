@@ -11,6 +11,7 @@
 // ⛔ 종료(`process.exit`)는 여기가 «안» 한다 — 호출자가 자기 표면에 맞게 끝낸다.
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
 import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { recordAuthoredGoal } from './authored-goal-trace.js';
 import { retiredEntranceNotice, type EntranceDeclaration } from './entrance-registry.js';
 import {
   classifyConcurrentAuthoring,
@@ -58,7 +59,7 @@ function resolveSelfResolveClarifications(explicit: boolean | undefined): Resolv
 /** 저작기 산출 — `runGoalAuthorCli` 의 반환에서 이 흐름이 «실제로 쓰는» 것만. */
 export interface AskAuthoredGoal {
   readonly path: string;
-  readonly authored?: { readonly document?: string; readonly grounded?: boolean | null } | null;
+  readonly authored?: { readonly document?: string; readonly grounded?: boolean | null; readonly authorRunId?: string } | null;
 }
 
 export type LaunchingTreeProbe =
@@ -158,6 +159,8 @@ export interface AskLaunchFlowDeps {
   /** ⛔ 못 얻으면 `null` — 같은 이유. */
   recentAuthoringSamples(): RecentAuthoringSample[] | null;
   authorGoal(args: readonly string[], options: Record<string, unknown>): Promise<AskAuthoredGoal>;
+  /** AUTHOR-TRACE seam (tests). */
+  recordAuthoredGoal?: typeof recordAuthoredGoal;
   /** Pod launches reserve a host slot before goal authoring begins. */
   beforeAuthoring?(): Promise<void>;
   /** 발사 전 권고용 분해 seam. 생략하면 전용 관측명을 준 기존 분해기를 쓴다. */
@@ -861,6 +864,24 @@ export async function runAskLaunchFlow(
       selfResolveClarifications: selfResolveClarifications.value,
     });
     deps.print(`[ask] 저작됨: ${authored.path}`);
+    // AUTHOR-TRACE: the authored goal file can be cleaned up later — keep path ⊕ sha256 ⊕ size in the run ledger and
+    // archive the body, so authoring length is measurable after the fact (GOAL-BENCH · AUTHOR-LITE).
+    const traceIds = {
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(authored.authored?.authorRunId === undefined ? {} : { authorRunId: authored.authored.authorRunId }),
+    };
+    if (authored.authored?.document !== undefined && (traceIds.runId !== undefined || traceIds.authorRunId !== undefined)) {
+      try {
+        const trace = (deps.recordAuthoredGoal ?? recordAuthoredGoal)(traceIds, authored.path, authored.authored.document);
+        deps.log('goal-authored-trace', { ...traceIds, ...trace }, 'info');
+      } catch (error) {
+        deps.log('goal-authored-trace-failed', { ...traceIds, error: error instanceof Error ? error.message : String(error) }, 'warn');
+      }
+    } else {
+      deps.log('goal-authored-trace-skipped', {
+        reason: authored.authored?.document === undefined ? 'no-authored-document' : 'no-run-or-author-id', path: authored.path,
+      }, 'warn');
+    }
     const markerCounts = authored.authored?.document === undefined
       ? null
       : countMissingAuthoredConstraintMarkers(input.askText, authored.authored.document);

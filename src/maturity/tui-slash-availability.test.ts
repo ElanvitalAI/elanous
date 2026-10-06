@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { SLASH_COMMANDS } from '../chat/index.js';
 import { FEATURE_MATURITY } from './feature-maturity.js';
-import { deriveTuiSlashAvailability } from './tui-slash-availability.js';
+import { botUnavailableSlashReply, deriveTuiSlashAvailability, formatBotUnavailableSlashReply } from './tui-slash-availability.js';
 import { slashMaturity, slashVisibleFor } from './tui-slash-maturity.js';
 
 describe('deriveTuiSlashAvailability', () => {
@@ -19,6 +19,17 @@ describe('deriveTuiSlashAvailability', () => {
       expect(entries.filter((entry) => entry[surface]).map(({ name }) => name).sort())
         .toEqual(SLASH_COMMANDS.filter(({ name }) => graded.has(name)).map(({ name }) => name).sort());
     }
+  });
+
+  test('formats the existing per-surface reply while hiding system and available entries', () => {
+    const entry = { name: 'model', maturity: 'stable', telegram: false, discord: false } as const;
+    expect(formatBotUnavailableSlashReply('model', 'telegram'))
+      .toBe('/model은(는) 텔레그램에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.');
+    expect(botUnavailableSlashReply(entry, 'discord'))
+      .toBe('/model은(는) 디스코드에서 아직 지원되지 않습니다. TUI에서 /model을(를) 사용하세요.');
+    expect(botUnavailableSlashReply({ ...entry, maturity: 'system' }, 'discord')).toBeNull();
+    expect(botUnavailableSlashReply({ ...entry, discord: true }, 'discord')).toBeNull();
+    expect(botUnavailableSlashReply(undefined, 'discord')).toBeNull();
   });
 
   test('preserves existing TUI grade lookup and audience visibility', () => {

@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExternalTaskEvent } from '../connectors/types.js';
 import { registerCardCommand, type CardCliDeps } from './card-cli.js';
-import { CardStore } from './card-store.js';
+import { CardStore, cardEventsPath } from './card-store.js';
 
 const roots: string[] = [];
 function fixture(deps: Pick<CardCliDeps, 'getApiKey' | 'fetchIssues'> = {}) {
@@ -21,7 +21,7 @@ function fixture(deps: Pick<CardCliDeps, 'getApiKey' | 'fetchIssues'> = {}) {
     ...deps,
   });
   const run = (...args: string[]) => program.parse(['node', 'elanous', 'card', ...args]);
-  return { store, output, run, runAsync: (...args: string[]) => program.parseAsync(['node', 'elanous', 'card', ...args]) };
+  return { root, store, output, run, runAsync: (...args: string[]) => program.parseAsync(['node', 'elanous', 'card', ...args]) };
 }
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -299,6 +299,63 @@ test('card list --open filters closed cards in both text and JSON; unfiltered li
   run('list');
   expect(output.join('')).toContain(closed.id);
   store.close();
+});
+
+test('card close records one reason event, is idempotent, and removes the card from --open', () => {
+  const { root, store, output, run } = fixture();
+  const card = store.createCard({ goalId: 'goal-close', title: 'Close me' });
+  const exitCode = process.exitCode;
+  try {
+    run('close', card.id, '--reason', 'Done after review');
+    expect(output.pop()).toBe(`닫힘: ${card.id}\n`);
+    expect(store.getCard(card.id)?.status).toBe('closed');
+    run('list', '--open', '--json');
+    expect(JSON.parse(output.pop()!)).toEqual([]);
+    run('close', card.id, '--reason', 'Different reason');
+    expect(output.pop()).toBe(`이미 닫힘: ${card.id}\n`);
+    expect(process.exitCode).toBe(exitCode);
+    const events = readFileSync(cardEventsPath(card.id, root), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(events.filter(event => event.type === 'closed')).toMatchObject([{ reason: 'Done after review' }]);
+  } finally { process.exitCode = exitCode ?? 0; store.close(); }
+});
+
+test('card close redacts secret-shaped substrings from the reason event', () => {
+  const { root, store, run } = fixture();
+  const card = store.createCard({ goalId: 'goal-secret-close', title: 'Close safely' });
+  const secret = 'sk-abcdefghijklmnopqrstuvwxyz0123';
+  try {
+    run('close', card.id, '--reason', `Reviewed ${secret}`);
+    const events = readFileSync(cardEventsPath(card.id, root), 'utf8');
+    expect(events).not.toContain(secret);
+    expect(JSON.parse(events.trim().split('\n').at(-1)!)).toMatchObject({ type: 'closed', reason: 'Reviewed <redacted>' });
+  } finally { store.close(); }
+});
+
+test('card close rejects blank and multi-line reasons without closing the card', () => {
+  const { root, store, run } = fixture();
+  const card = store.createCard({ goalId: 'goal-reason', title: 'Keep open' });
+  try {
+    expect(() => run('close', card.id, '--reason', '   ')).toThrow('Close reason must be one line');
+    expect(() => run('close', card.id, '--reason', 'first\nsecond')).toThrow('Close reason must be one line');
+    expect(() => run('close', card.id, '--reason', 'first\n')).toThrow('Close reason must be one line');
+    expect(store.getCard(card.id)?.status).toBe('open');
+    expect(readFileSync(cardEventsPath(card.id, root), 'utf8').trim().split('\n')).toHaveLength(1);
+  } finally { store.close(); }
+});
+
+test('card close missing id exits 1 without writing a card', () => {
+  const { store, output, run } = fixture();
+  const lines: string[] = [];
+  const original = process.stderr.write;
+  const exitCode = process.exitCode;
+  process.stderr.write = ((text: string) => { lines.push(text); return true; }) as typeof process.stderr.write;
+  try {
+    run('close', 'missing', '--reason', 'Not needed');
+    expect(lines).toEqual(['Card not found: missing\n']);
+    expect(process.exitCode).toBe(1);
+    expect(output).toEqual([]);
+    expect(store.listCards()).toEqual([]);
+  } finally { process.stderr.write = original; process.exitCode = exitCode ?? 0; store.close(); }
 });
 
 test('missing card fails rather than displaying an invented card', () => {

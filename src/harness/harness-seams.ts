@@ -727,10 +727,13 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
       let inspectionError: string | undefined;
       try {
         if (!deps.seams.readPrFiles) throw new Error('readPrFiles seam unavailable');
-        const prFiles = await deps.seams.readPrFiles({ number: pr.number, cwd });
+        const prFiles = await deps.seams.readPrFiles({ number: pr.number, cwd, ...(deps.base ? { base: deps.base } : {}) });
         if (!Array.isArray(prFiles) || !prFiles.every((path) => typeof path === 'string')) throw new Error('invalid PR file list');
         holdPath = releasePathHold(prFiles);
-      } catch (error) { inspectionError = String(error); }
+      } catch (error) {
+        const rateLimited = error instanceof Error && (error as { rateLimited?: boolean }).rateLimited === true;
+        inspectionError = rateLimited ? `rate-limit: ${String(error)}` : String(error);
+      }
       if (holdPath) {
         const protectedPath = holdPath;
         const prCwd = cwd;
@@ -745,7 +748,14 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
         observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: false, mergeReason: 'release-path-hold' });
       } else if (inspectionError) {
         observe('release-path-inspection-failed', { number: pr.number, error: inspectionError });
-        observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: false, mergeReason: 'release-path-inspection-failed' });
+        observe('deployed-pr', {
+          number: pr.number,
+          url: pr.url,
+          autoReview: false,
+          mergeReason: inspectionError.startsWith('rate-limit:')
+            ? 'release-path-inspection-failed: rate-limit'
+            : 'release-path-inspection-failed',
+        });
       } else {
         let autoReviewLabeled = false;
         if (labels?.includes(AUTO_REVIEW_LABEL)) {

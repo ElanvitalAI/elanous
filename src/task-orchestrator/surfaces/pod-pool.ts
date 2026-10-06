@@ -8,7 +8,7 @@
  *   - 컨텍스트  kubectl 컨텍스트 이름(이 맥의 kubeconfig)
  *   - @ssh호스트 원격 클러스터면 그 기계 — 이미지 판 대조·반입(`docker load` ⊕ `k3d image import`)에 쓴다
  *   - 상한      이 노드에 동시에 둘 Job 수(기본 2)
- * Job 마다 앞 순위부터 «진행 중 < 상한»인 노드를 고른다. 다 차면 자리가 날 때까지 기다린다.
+ * Job 마다 «빈 자리 비율»이 가장 큰 노드를 고른다(동률은 앞 순위 · 측정 실패 노드는 측정된 노드가 다 찼을 때만). 다 차면 자리가 날 때까지 기다린다.
  * 노드 선택의 진행 중 수는 로컬 프로세스 기준이다. 발사 허가는 별도의 lease 측정으로
  * 다른 호스트의 Running/Pending 및 메모리 예약까지 고려한다.
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
@@ -271,7 +271,9 @@ export class PodPoolScheduler {
     return this.admission.snapshot();
   }
   /**
-   * Pick the member with the most free slots: capacity − measured cluster occupancy − this process's inflight.
+   * Pick the member with the largest free share: (capacity − measured cluster occupancy − this process's inflight) / capacity.
+   * POOL-SPREAD (10-06): comparing absolute free slots always picked the big member (node-b 25 vs node-c 4), so the small
+   * member idled until the big one was full. Comparing the free share fills members in proportion to their capacity.
    * A member whose occupancy could not be read falls back to inflight-only (never treated as zero occupied).
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
@@ -284,7 +286,12 @@ export class PodPoolScheduler {
     }
     const free: Record<string, number> = {};
     const measured: Record<string, boolean> = {};
-    let best: { member: PodPoolMember; slots: number } | null = null;
+    let best: { member: PodPoolMember; slots: number; measured: boolean } | null = null;
+    // A measured member always beats an unmeasured one (its share would read 100% and draw every Job to a node
+    // that did not answer); unmeasured members compete only when no measured member has a free slot.
+    const better = (cand: { member: PodPoolMember; slots: number; measured: boolean }) => !best
+      || (cand.measured !== best.measured ? cand.measured
+        : cand.slots / cand.member.capacity > best.slots / best.member.capacity);
     for (const m of this.members) {
       const inflight = this.inflight.get(m.context) ?? 0;
       const row = reading[m.context];
@@ -294,11 +301,13 @@ export class PodPoolScheduler {
       const slots = m.capacity - occupied - inflight;
       free[m.context] = slots;
       if (slots <= 0) continue;
-      if (!best || slots > best.slots) best = { member: m, slots };
+      const cand = { member: m, slots, measured: ok };
+      if (better(cand)) best = cand;
     }
     if (!best) return null;
     this.inflight.set(best.member.context, (this.inflight.get(best.member.context) ?? 0) + 1);
-    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured });
+    const share = Object.fromEntries(this.members.map((m) => [m.context, Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100]));
+    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured, share });
     return best.member;
   }
   release(member: PodPoolMember): void {

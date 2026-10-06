@@ -24,6 +24,10 @@ nodes:
     kind: agent
     recipe: cmd:orchestrator-delegate
     max_visits: 1
+  - node_id: launch
+    kind: agent
+    recipe: cmd:orchestrator-launch
+    max_visits: 1
   - node_id: reconcile
     kind: agent
     recipe: cmd:orchestrator-reconcile
@@ -49,6 +53,9 @@ edges:
     on: outcome
     map: { ok: delegate, fail: failed }
   - from: delegate
+    on: outcome
+    map: { ok: launch, fail: failed }
+  - from: launch
     on: outcome
     map: { ok: reconcile, fail: failed }
   - from: reconcile

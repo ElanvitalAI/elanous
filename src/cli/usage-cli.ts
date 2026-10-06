@@ -10,6 +10,7 @@ import type { Command } from 'commander';
 import { collectUnifiedUsage, formatUnifiedUsage } from '../budget/unified-usage.js';
 import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
 import { rollupRunUsage, type RunUsageInput } from '../budget/run-usage-rollup.js';
+import { formatUsageOutcomes, outcomeTableHasCodexGrokUnknown, queryUsageOutcomes, type UsageOutcomesDeps, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
 import { formatCodexCreditPlan, type CodexCreditPlan } from '../budget/codex-credit-plan.js';
@@ -28,6 +29,9 @@ export interface UsageCliDeps {
   /** 계정 이름 → CODEX_HOME. ⛔ 여기 없는 이름은 «거부»한다(모르는 곳에 쓰지 않는다). */
   readonly homes?: Readonly<Record<string, string>>;
   readonly exit?: (code: number) => never;
+  /** 런 원장 결과 표. 시험은 디렉터리를 주입한다. */
+  readonly outcomes?: (sinceDays: number) => UsageOutcomesReport;
+  readonly outcomeDeps?: UsageOutcomesDeps;
 }
 
 /** 계정 이름 → CODEX_HOME 기본 표.
@@ -134,6 +138,28 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
   //   🩸 그래서 ⑴ `--yes` 없이는 «안 쓴다» ⑵ 쓰기 «전»에 남은 수를 보여 준다
   //      ⑶ 쓴 «뒤»에도 다시 조회해 「줄었나」를 값으로 낸다.
   //   📏 2026-09-24 현황 예: default 100%·team 100%·third 46% ⇒ third 에 쓰면 54% 가 버려진다.
+  const outcomes = deps.outcomes ?? ((sinceDays: number) => queryUsageOutcomes(sinceDays, deps.outcomeDeps));
+  usage
+    .command('outcomes')
+    .description('프로바이더별 무인 착지율 · 라운드 수 · 막힘 사유 분포 (런 원장 childProvider · 미기록은 불명)')
+    .option('--days <n>', '최근 N일', '2')
+    .option('--json', 'JSON 출력')
+    .action((opts: { days?: string; json?: boolean }, command: Command) => {
+      const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
+      const days = Number(opts.days);
+      if (!Number.isFinite(days) || days <= 0) {
+        out.log(`⛔ --days 는 양의 수: '${opts.days}'`);
+        exit(2);
+        return;
+      }
+      const report = outcomes(days);
+      if (json) {
+        out.log(JSON.stringify({ ...report, hasCodexGrokUnknown: outcomeTableHasCodexGrokUnknown(report) }, null, 2));
+        return;
+      }
+      out.log(formatUsageOutcomes(report));
+    });
+
   const list = deps.list ?? listCodexResetCredits;
   const consume = deps.consume ?? consumeCodexResetCredits;
   const homes = deps.homes ?? defaultHomes();

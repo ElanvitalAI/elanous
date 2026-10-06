@@ -15,9 +15,18 @@ import {
 import { debug } from '../src/debug/log.js';
 import { tscEnv } from '../src/typecheck-ratchet.js';
 
+/** Inherited GIT_DIR / GIT_WORK_TREE would make `--cwd <other tree>` still read the launcher's repo. */
+function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  return env;
+}
+
 /** git 조회용 — 명령 실패는 호출자가 빈 출력과 구분할 수 있게 전파한다. */
-function sh(cmd: string): string {
-  return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+function sh(cmd: string, cwd = process.cwd()): string {
+  return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd, env: gitEnv() });
 }
 
 export type TscRun = { out: string; ran: boolean; why?: string };
@@ -59,13 +68,15 @@ export type ChangedTsFiles = {
   failures?: { command: string; why: string }[];
 };
 
-/** 선택한 base와 파일 수를 함께 보존한다. 0개도 base 기준 관측값이다. */
-export function changedTsFiles(run = sh, env: NodeJS.ProcessEnv = process.env): ChangedTsFiles {
+/** 선택한 base와 파일 수를 함께 보존한다. 0개도 base 기준 관측값이다.
+ *  `cwd` 는 착지 트리다 — `pr land --cwd` 가 프로세스 cwd 가 아니라 그 트리를 재게 한다. */
+export function changedTsFiles(run: (cmd: string) => string = sh, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd(), baseRef?: string): ChangedTsFiles {
   let base: string;
   let baseSource: string;
-  if (env.TSC_BASE_REF) {
-    base = env.TSC_BASE_REF;
-    baseSource = 'TSC_BASE_REF';
+  const pinned = baseRef ?? env.TSC_BASE_REF;
+  if (pinned) {
+    base = pinned;
+    baseSource = baseRef ? 'baseRef' : 'TSC_BASE_REF';
   } else if (env.GITHUB_BASE_REF) {
     base = `origin/${env.GITHUB_BASE_REF}`;
     baseSource = 'GITHUB_BASE_REF';
@@ -108,8 +119,10 @@ export function changedTsFiles(run = sh, env: NodeJS.ProcessEnv = process.env): 
         if (!file) continue;
         const ts = /\.tsx?$/.test(file);
         // A deleted .ts is not a compile candidate, so it must not count as «should have been collected».
-        if (!ts || existsSync(file)) diffFiles.add(file);
-        if (ts && existsSync(file)) files.add(file);
+        // existsSync is bound to the landing tree — process.cwd() would count the launcher's files.
+        const present = existsSync(join(cwd, file));
+        if (!ts || present) diffFiles.add(file);
+        if (ts && present) files.add(file);
       }
     } catch (cause) {
       failures.push({ command, why: cause instanceof Error ? cause.message : String(cause) });
@@ -766,7 +779,7 @@ export function readMergeBaseDiagnostics(base: string, command: string, cwd = pr
   const workspace = mkdtempSync(join(tmpdir(), 'ci-typecheck-baseline-'));
   const worktree = join(workspace, 'base');
   try {
-    execFileSync('git', ['worktree', 'add', '--detach', worktree, base], { cwd, stdio: 'pipe' });
+    execFileSync('git', ['worktree', 'add', '--detach', worktree, base], { cwd, stdio: 'pipe', env: gitEnv() });
     const modules = join(cwd, 'node_modules');
     if (!existsSync(modules)) return { unavailable: `기준 worktree 의존성을 재사용할 수 없다(${modules} 없음)` };
     symlinkSync(modules, join(worktree, 'node_modules'));
@@ -780,7 +793,7 @@ export function readMergeBaseDiagnostics(base: string, command: string, cwd = pr
   } catch (error) {
     return { unavailable: error instanceof Error ? error.message : String(error) };
   } finally {
-    try { execFileSync('git', ['worktree', 'remove', '--force', worktree], { cwd, stdio: 'pipe' }); }
+    try { execFileSync('git', ['worktree', 'remove', '--force', worktree], { cwd, stdio: 'pipe', env: gitEnv() }); }
     catch { /* acquisition failure is rendered by the caller */ }
     rmSync(workspace, { recursive: true, force: true });
   }
@@ -792,6 +805,10 @@ export type GateIo = {
   literalUnionMembers?: (changed: ReadonlySet<string>, base: string) => LiteralUnionMember[] | LiteralUnionMemberCheck;
   readBaselineDiagnostics?: (base: string, command: string) => BaselineDiagnostics;
   runTscCmd: (cmd: string) => TscRun;
+  /** Landing tree. Git, existsSync, tsc, and the test baseline are measured here — not in process.cwd(). */
+  cwd?: string;
+  /** Explicit base revision. Same rule as TSC_BASE_REF, without reading the process environment. */
+  baseRef?: string;
   log: (message: string) => void;
   warn: (message: string) => void;
   error: (message: string) => void;
@@ -861,8 +878,10 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
 }
 
 export function runGate(io: Partial<GateIo> = {}): void {
-  const { changedTsFiles: getChanged = changedTsFiles, runTscCmd = (cmd: string) => runTsc(cmd), log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
-  const readBaselineDiagnostics = io.readBaselineDiagnostics ?? ((base: string, command: string) => readMergeBaseDiagnostics(base, command));
+  const cwd = io.cwd ?? process.cwd();
+  const defaultChanged = () => changedTsFiles((cmd) => sh(cmd, cwd), process.env, cwd, io.baseRef);
+  const { changedTsFiles: getChanged = defaultChanged, runTscCmd = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: gitEnv() })) as typeof execSync), log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
+  const readBaselineDiagnostics = io.readBaselineDiagnostics ?? ((base: string, command: string) => readMergeBaseDiagnostics(base, command, cwd));
   // Set 주입은 기존 테스트 심이며 기준 revision이 없다. 실제 ChangedTsFiles 경로만 Git 관측을 요구한다.
   const requiredExportFields = io.requiredExportFields ?? ((changed: ReadonlySet<string>, base: string) => base === 'injected test seam'
     ? { fields: [], removedSymbols: [], parameterIncreases: [] }
@@ -966,8 +985,8 @@ export function runGate(io: Partial<GateIo> = {}): void {
   }, { level: 'info' });
   log(`[tsc-gate] root 설정 범위 ${rootScope.size}개 관측 (apps/pwa/** 제외).`);
   if (runsPwa) log(`[tsc-gate] PWA 설정 범위 ${pwaScope.size}개 관측.`);
-  const tscBin = existsSync('node_modules/.bin/tsc') ? 'node_modules/.bin/tsc' : 'npx tsc';
-  const baseline = readTestTypecheckBaseline(process.cwd());
+  const tscBin = existsSync(join(cwd, 'node_modules/.bin/tsc')) ? 'node_modules/.bin/tsc' : 'npx tsc';
+  const baseline = readTestTypecheckBaseline(cwd);
   const rootCommand = `${tscBin} --noEmit -p ${TYPECHECK_GATE_CONFIG}`;
   const pwaCommand = `${tscBin} --noEmit -p apps/pwa/tsconfig.json`;
   const pwaEnvCommand = `${tscBin} --noEmit -p tsconfig.pwa-env.json`;
