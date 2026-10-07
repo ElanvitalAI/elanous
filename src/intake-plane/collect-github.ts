@@ -6,14 +6,18 @@ import { execFileSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { ingestIntakeItems, intakeLedgerDir, type IngestResult, type RawIntakeItem } from './items.js';
 
-/** 한 판에 열 번 안쪽 — 검색 API 비율 제한(인증 시 분당 30회)을 시험 밖에서 상수로 묶는다. */
+/** 한 판에 열 번 이하 — 검색 API 비율 제한(인증 시 분당 30회)을 시험 밖에서 상수로 묶는다. */
 export const GITHUB_STAR_QUERIES = [
   'topic:ai-agents',
-  'topic:llm-agent',
   'topic:coding-agent',
   'topic:mcp',
   'topic:video-generation',
-  '"ai agent" in:name,description',
+  'topic:agent-framework',
+  'topic:computer-use',
+  'topic:local-llm',
+  'topic:claude-code',
+  'topic:codex',
+  'topic:agent-memory',
 ] as const;
 
 /** `--days` 기본. 최근 이 일수 안에 만들어졌거나 푸시된 저장소만 받는다. */
@@ -32,6 +36,7 @@ export interface GithubStarRepo {
   stars: number;
   createdAt: string;
   pushedAt: string;
+  license?: string;
 }
 
 /** 질의 하나 → 저장소 목록. 실제 구현은 `gh api` · 시험은 가짜. */
@@ -43,6 +48,7 @@ export interface GithubStarSignals {
   stars: number;
   starsDelta?: number;
   starsPerDay?: number;
+  baselineDays?: number;
 }
 
 export interface CollectGithubQueryCount { query: string; received: number }
@@ -55,6 +61,8 @@ export interface CollectGithubRepoRow {
   stars: number;
   starsDelta?: number;
   starsPerDay?: number;
+  baselineDays?: number;
+  license?: string;
 }
 
 export interface CollectGithubResult {
@@ -99,6 +107,17 @@ export function precedingSnapshot(snaps: readonly StarSnapshot[], repo: string, 
   return best;
 }
 
+/** 7일 전 또는 그 이전 중 가장 가까운 스냅숏; 없으면 직전 스냅숏. */
+export function surgeBaseline(snaps: readonly StarSnapshot[], repo: string, day: string): StarSnapshot | undefined {
+  const cutoff = new Date(Date.parse(`${day}T00:00:00.000Z`) - 7 * 86_400_000).toISOString().slice(0, 10);
+  let best: StarSnapshot | undefined;
+  for (const s of snaps) {
+    if (s.repo !== repo || s.day > cutoff) continue;
+    if (!best || s.day > best.day) best = s;
+  }
+  return best ?? precedingSnapshot(snaps, repo, day);
+}
+
 function utcDay(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return '';
@@ -128,7 +147,7 @@ export function signalsFromSnapshot(stars: number, prev: StarSnapshot | undefine
   if (!prev) return { stars };
   const span = Math.max(1, daysBetween(prev.day, day));
   const starsDelta = stars - prev.stars;
-  return { stars, starsDelta, starsPerDay: starsDelta / span };
+  return { stars, starsDelta, starsPerDay: starsDelta / span, baselineDays: span };
 }
 
 export function appendGithubStarSnapshots(root: string, rows: StarSnapshot[]): void {
@@ -154,13 +173,13 @@ export interface CollectGithubOpts {
   /** 스냅숏·비교의 «오늘». 생략하면 UTC 날짜. */
   day?: string;
   now?: () => Date;
-  /** 등록 원천이 질의 하나만 수집할 때; 생략 시 기존 관심 질의 전부. */
+  /** 등록 원천이 질의 하나만 수집할 때; 생략 시 관심 질의 전부 (최대 10개). */
   queries?: readonly string[];
 }
 
 /**
  * 관심 주제 질의마다 별 순 검색을 부르고, 최근 창 안의 저장소만 남긴 뒤 질의 사이에서 중복을 없앤다.
- * 저장소마다 오늘 별 수 스냅숏을 덧붙이고, 직전 스냅숏과 비교한 신호를 원장에 넣는다.
+ * 저장소마다 오늘 별 수 스냅숏을 덧붙이고, 7일 기준(없으면 직전) 스냅숏과 비교한 신호를 원장에 넣는다.
  * dryRun 이면 스냅숏·원장을 바꾸지 않는다.
  */
 export async function collectGithubStars(
@@ -175,7 +194,7 @@ export async function collectGithubStars(
   const found: GithubStarRepo[] = [];
   // «급상승»은 최근에 생긴 저장소 중 별 순이다 — 전체 기간 별 순이면 활발한 거대 저장소가 매일 같은 목록으로 나온다(2026-09-26 검토).
   const windowStart = new Date(Date.parse(`${day}T00:00:00.000Z`) - days * 86_400_000).toISOString().slice(0, 10);
-  for (const query of opts.queries ?? GITHUB_STAR_QUERIES) {
+  for (const query of (opts.queries ?? GITHUB_STAR_QUERIES).slice(0, 10)) {
     const rows = await search(`${query} created:>=${windowStart}`, perQuery);
     const recent = rows.filter((r) => isRecentRepo(r, day, days));
     queries.push({ query, received: recent.length });
@@ -186,20 +205,24 @@ export async function collectGithubStars(
   const repos: CollectGithubRepoRow[] = unique.map((repo) => {
     const prev = precedingSnapshot(prior, repo.fullName, day);
     const signals = signalsFromSnapshot(repo.stars, prev, day);
+    const surge = signalsFromSnapshot(repo.stars, surgeBaseline(prior, repo.fullName, day), day);
     return {
       repo: repo.fullName,
       url: repo.url,
       title: repo.fullName,
       text: repo.description,
       stars: signals.stars,
+      ...(repo.license !== undefined ? { license: repo.license } : {}),
       ...(signals.starsDelta !== undefined ? { starsDelta: signals.starsDelta } : {}),
-      ...(signals.starsPerDay !== undefined ? { starsPerDay: signals.starsPerDay } : {}),
+      ...(surge.starsPerDay !== undefined ? { starsPerDay: surge.starsPerDay } : {}),
+      ...(surge.baselineDays !== undefined ? { baselineDays: surge.baselineDays } : {}),
     };
-  });
+  }).sort((a, b) => (b.starsPerDay ?? -Infinity) - (a.starsPerDay ?? -Infinity) || b.stars - a.stars);
   const raws: RawIntakeItem[] = repos.map((row) => ({
     url: row.url,
     title: row.title,
-    text: row.text,
+    // 모든 행 첫 줄에 라이선스: SPDX · 확인된 부재는 «없음» · 응답이 알려 주지 않으면 «미상»(없음으로 읽지 않는다).
+    text: `라이선스: ${row.license ?? '미상'}\n${row.text}`,
     signals: {
       stars: row.stars,
       ...(row.starsDelta !== undefined ? { starsDelta: row.starsDelta } : {}),
@@ -226,6 +249,29 @@ interface GhSearchItem {
   stargazers_count?: number;
   created_at?: string;
   pushed_at?: string;
+  license?: { spdx_id?: string | null } | null;
+}
+
+export function reposFromGhSearchItems(items: GhSearchItem[], perQuery: number): GithubStarRepo[] {
+  if (!Array.isArray(items)) return [];
+  const repos: GithubStarRepo[] = [];
+  for (const item of items) {
+    if (!item.full_name || !item.html_url) continue;
+    repos.push({
+      fullName: item.full_name,
+      url: item.html_url,
+      description: item.description ?? '',
+      stars: Number(item.stargazers_count ?? 0),
+      createdAt: item.created_at ?? '',
+      pushedAt: item.pushed_at ?? '',
+      ...(item.license === null
+        ? { license: '없음' }
+        : typeof item.license?.spdx_id === 'string' && item.license.spdx_id
+          ? { license: item.license.spdx_id }
+          : {}),
+    });
+  }
+  return repos.slice(0, perQuery);
 }
 
 /** `gh api search/repositories` 를 `sort=stars` 로 한 번 부른다. */
@@ -242,19 +288,5 @@ export const ghApiSearchRepos: SearchGithubRepos = async (query, perQuery) => {
     '-f', `per_page=${perPage}`,
     '--jq', '.items',
   ], { encoding: 'utf8', timeout: 30_000 });
-  const items = JSON.parse(out) as GhSearchItem[];
-  if (!Array.isArray(items)) return [];
-  const repos: GithubStarRepo[] = [];
-  for (const item of items) {
-    if (!item.full_name || !item.html_url) continue;
-    repos.push({
-      fullName: item.full_name,
-      url: item.html_url,
-      description: item.description ?? '',
-      stars: Number(item.stargazers_count ?? 0),
-      createdAt: item.created_at ?? '',
-      pushedAt: item.pushed_at ?? '',
-    });
-  }
-  return repos.slice(0, perQuery);
+  return reposFromGhSearchItems(JSON.parse(out) as GhSearchItem[], perQuery);
 };

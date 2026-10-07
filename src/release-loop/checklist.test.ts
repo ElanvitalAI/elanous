@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, claimItem, checklistGate, checklistHistory, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, devVersion, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -14,6 +15,51 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('refs: --ref adds real repo documents once, rejects missing paths, and stays absent on cells without refs', () => {
+    root();
+    addItem('0.2.18', { id: 'R1', title: 'refs cell', refs: ['package.json'] });
+    addItem('0.2.18', { id: 'R0', title: 'no refs' });
+    setItem('0.2.18', 'R1', { refs: ['package.json', 'src/release-loop/checklist.ts#normalizeRefs', 'src/release-loop/checklist.ts#normalizeRefs'] }, 'MK');
+    expect(listChecklist('0.2.18').items.find((item) => item.id === 'R1')?.refs).toEqual(['package.json', 'src/release-loop/checklist.ts#normalizeRefs']);
+    expect(listChecklist('0.2.18').history.filter((entry) => entry.id === 'R1' && entry.field === 'refs')).toHaveLength(1);
+    const before = JSON.stringify(listChecklist('0.2.18').items.find((item) => item.id === 'R1'));
+    expect(() => setItem('0.2.18', 'R1', { refs: ['docs/no-such-doc.md'] }, 'MK')).toThrow(CliUserError);
+    expect(() => setItem('0.2.18', 'R1', { refs: ['../outside.md'] }, 'MK')).toThrow(CliUserError);
+    expect(() => setItem('0.2.18', 'R1', { refs: ['src/../package.json'] }, 'MK')).toThrow(CliUserError);
+    expect(() => setItem('0.2.18', 'R1', { refs: ['src'] }, 'MK')).toThrow(CliUserError);
+    expect(JSON.stringify(listChecklist('0.2.18').items.find((item) => item.id === 'R1'))).toBe(before);
+    expect(Object.keys(listChecklist('0.2.18').items.find((item) => item.id === 'R0')!)).not.toContain('refs');
+  });
+
+  test('cellsReferencingDoc derives one row per citing cell across versions, matches #section exactly, and never writes', () => {
+    root();
+    addItem('0.2.18', { id: 'A', title: 'a', refs: ['package.json#§1'] });
+    addItem('0.2.19', { id: 'B', title: 'b', refs: ['package.json'] });
+    addItem('0.2.18', { id: 'C', title: 'c' });
+    addItem('0.2.18', { id: 'D', title: 'd', refs: ['src/release-loop/checklist.ts'] });
+    const historyBefore = listChecklist('0.2.18').history.length;
+    const snapshots = () => [listChecklist('0.2.18'), listChecklist('0.2.19')];
+    const keys = (rows: ReturnType<typeof cellsReferencingDoc>) => rows.map(({ version, id, section }) => [version, id, section]);
+    const rows = cellsReferencingDoc('package.json', snapshots());
+    expect(keys(rows)).toEqual([['0.2.18', 'A', '§1'], ['0.2.19', 'B', null]]);
+    expect(rows[0]).toMatchObject({ title: 'a', status: 'yellow', owner: null });
+    expect(keys(cellsReferencingDoc('package.json#§1', snapshots()))).toEqual([['0.2.18', 'A', '§1']]);
+    expect(cellsReferencingDoc('docs/no-such-doc.md', snapshots())).toEqual([]);
+    const lines = renderRefsStatus(rows).split('\n');
+    expect(lines[0]).toBe('| 판 | 칸 | 상태 | 절 | 제목 |');
+    expect(lines.slice(2)).toEqual(['| 0.2.18 | A | yellow | §1 | a |', '| 0.2.19 | B | yellow | - | b |']);
+    expect(listChecklist('0.2.18').history.length).toBe(historyBefore);
+  });
+
+  test('cellsReferencingDoc keeps one row per cell when a cell cites several sections of the same document', () => {
+    root();
+    addItem('0.2.18', { id: 'M', title: 'multi', refs: ['package.json#§1', 'package.json#§2', 'src/release-loop/checklist.ts'] });
+    addItem('0.2.18', { id: 'W', title: 'whole', refs: ['package.json#§3', 'package.json'] });
+    const rows = cellsReferencingDoc('package.json', [listChecklist('0.2.18')]);
+    expect(rows.map(({ id, section }) => [id, section])).toEqual([['M', '§1 · §2'], ['W', null]]);
+    expect(cellsReferencingDoc('package.json#§2', [listChecklist('0.2.18')]).map(({ id, section }) => [id, section])).toEqual([['M', '§2']]);
+  });
+
   test('checklistHistory unifies cross-version moves, timestamps and reasons without mixing ids', () => {
     const dir = root();
     expect(checklistHistory('K1')).toEqual([]);
@@ -309,4 +355,19 @@ describe('release checklist ledger', () => {
       expect(listChecklist('9.9.9').items).toEqual([]);
     } finally { spy.mockRestore(); }
   });
+});
+
+// DOC-REFS(10-07): 설치본 트리에는 docs/ 가 없다 — 저장소 안에서 부른 설치본도 저장소 문서를 인용한다.
+test('normalizeRefs finds a document in any root, and refRoots adds the git root of the working directory', () => {
+  const install = mkdtempSync(join(tmpdir(), 'refs-install-'));
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'refs-repo-')));
+  try {
+    mkdirSync(join(repo, 'docs', 'sub'), { recursive: true });
+    writeFileSync(join(repo, 'docs', 'RFC-x.md'), '# x\n');
+    expect(() => normalizeRefs(['docs/RFC-x.md#A5'], [install])).toThrow('없는 문서');
+    expect(normalizeRefs(['docs/RFC-x.md#A5'], [install, repo])).toEqual(['docs/RFC-x.md#A5']);
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    expect(refRoots(join(repo, 'docs', 'sub'))).toContain(repo);
+    expect(refRoots(install).length).toBe(1);
+  } finally { rmSync(install, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); }
 });

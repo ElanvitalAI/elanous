@@ -5,7 +5,7 @@ import { awaitGlobalPersonaLoad, getGlobalPersonaRegistry } from '../persona/glo
 import type { PersonaSource } from '../persona/mention-parser.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../seat-dispatch/ceo-commands.js';
 import { ceoTaskDeps, classifyCeoIntent } from '../seat-dispatch/ceo-intent.js';
-import { askSeat, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-ask.js';
+import { askSeat, askSeatAs, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-ask.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { answerAsSeat } from './seat-answer.js';
@@ -110,7 +110,13 @@ export async function handleDiscordSeatWork(
     const seatId = canonicalSeatId(seats[0].seat.id);
     if (auth && ['OP', 'TC', 'MK', 'UX'].includes(seatId)) {
       const intent = classifyCeoIntent(body);
-      if (intent === 'task') return sendTask(seatId, body, auth.cfg, auth.id);
+      if (intent === 'task') {
+        if (deps.askDeps) return askSeatAs(seatId as 'OP' | 'TC' | 'MK' | 'UX', body,
+          { channel: 'discord', channelId: msg.channelId, messageId: msg.messageId,
+            ...(msg.threadId ? { threadId: msg.threadId } : {}) },
+          deps.commandDeps ?? ceoTaskDeps(auth.cfg, auth.id), deps.askDeps);
+        return sendTask(seatId, body, auth.cfg, auth.id);
+      }
       const answer = await (deps.answer ?? answerAsSeat)(seats[0].name, body);
       debug.log('seat.dispatch', 'intent', { seat: seatId, intent, via: 'discord', outcome: answer ? 'answered' : 'intake' });
       if (answer) return answer.text;

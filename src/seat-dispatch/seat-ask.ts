@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { openMsgStore, type MsgStore } from '../msg/msg-store.js';
-import { dispatchCeoTask, type CeoCommandDeps } from './ceo-commands.js';
+import { CEO_SEAT_COMMANDS, dispatchCeoTask, type CeoCommandDeps } from './ceo-commands.js';
 import type { SeatId } from './seat-questions.js';
 
 export type AskOrigin =
@@ -23,7 +23,7 @@ function createTable(store: MsgStore): void {
     answer TEXT, answered_at INTEGER, asked_at INTEGER
   ); CREATE TABLE IF NOT EXISTS seat_ask_outbox (
     id TEXT PRIMARY KEY, origin TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-    claim_until INTEGER NOT NULL DEFAULT 0, claim_token TEXT
+    claim_until INTEGER NOT NULL DEFAULT 0, claim_token TEXT, sent_at INTEGER
   )`);
   const askColumns = store.db.query('PRAGMA table_info(seat_asks)').all() as Array<{ name: string }>;
   if (!askColumns.some(({ name }) => name === 'answer')) store.db.exec('ALTER TABLE seat_asks ADD COLUMN answer TEXT');
@@ -32,6 +32,7 @@ function createTable(store: MsgStore): void {
   const columns = store.db.query('PRAGMA table_info(seat_ask_outbox)').all() as Array<{ name: string }>;
   if (!columns.some(({ name }) => name === 'claim_until')) store.db.exec('ALTER TABLE seat_ask_outbox ADD COLUMN claim_until INTEGER NOT NULL DEFAULT 0');
   if (!columns.some(({ name }) => name === 'claim_token')) store.db.exec('ALTER TABLE seat_ask_outbox ADD COLUMN claim_token TEXT');
+  if (!columns.some(({ name }) => name === 'sent_at')) store.db.exec('ALTER TABLE seat_ask_outbox ADD COLUMN sent_at INTEGER');
 }
 
 export interface SeatAskShadow {
@@ -77,10 +78,24 @@ export interface SeatAskDeps {
   botId?: string;
 }
 
-/** Persist the return address before delivering through the /cto channel and seat inbox. */
-export async function askSeat(text: string, origin: AskOrigin, command: CeoCommandDeps, deps: SeatAskDeps): Promise<string> {
+const seatTitle = (seat: SeatId): string => Object.entries(CEO_SEAT_COMMANDS)
+  .find(([, id]) => id === seat)![0]!.toUpperCase();
+
+/** Persist the return address before delivering through the coordination channel and seat inbox. */
+export function askSeatAs(seat: SeatId, body: string, origin: AskOrigin, command: CeoCommandDeps, deps: SeatAskDeps,
+  kind: 'task' | 'question' = 'task'): Promise<string> {
+  return recordAndDispatchSeatAsk(seat, body, origin, command, deps, kind);
+}
+
+/** Preserve the CTO question form and its original receipt. */
+export function askSeat(text: string, origin: AskOrigin, command: CeoCommandDeps, deps: SeatAskDeps): Promise<string> {
   const body = parseSeatAsk(text);
   if (!body) throw new Error('not a CTO ask');
+  return askSeatAs('TC', body, origin, command, deps, 'question');
+}
+
+async function recordAndDispatchSeatAsk(seat: SeatId, body: string, origin: AskOrigin, command: CeoCommandDeps, deps: SeatAskDeps,
+  kind: 'task' | 'question'): Promise<string> {
   const id = randomUUID();
   const timeout = deps.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Error('invalid seat ask timeout');
@@ -90,13 +105,14 @@ export async function askSeat(text: string, origin: AskOrigin, command: CeoComma
     createTable(store);
     const askedAt = (deps.now ?? Date.now)();
     store.db.query('INSERT INTO seat_asks (id, seat, origin, deadline, timeout_minutes, status, asked_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(id, 'TC', JSON.stringify(origin), askedAt + timeout, minutes, 'pending', askedAt);
+      .run(id, seat, JSON.stringify(origin), askedAt + timeout, minutes, 'pending', askedAt);
   } finally { store.close(); }
   try {
-    const result = await (deps.dispatch ?? dispatchCeoTask)('TC', `질문: ${body}\n답장 요청: ${id}\n회신: elanous seat answer ${id} "<답>"`, command,
+    const result = await (deps.dispatch ?? dispatchCeoTask)(seat, `${kind === 'question' ? '질문' : '일'}: ${body}\n답장 요청: ${id}\n회신: elanous seat answer ${id} "<답>"`, command,
       { via: origin.channel, ref: `ask:${id}` });
-    debug.log('seat.ask', 'sent', { seat: 'TC', id, via: origin.channel, channel: result.channel });
-    return `CTO에게 물었습니다. 답을 기다립니다 (최대 ${minutes}분). 요청: ${id}${result.channel === 'failed' ? ` · 조율 채널 전송 실패: ${result.channelError}` : ''}`;
+    debug.log('seat.ask', 'sent', { seat, id, via: origin.channel, channel: result.channel });
+    const title = seatTitle(seat);
+    return `${kind === 'question' ? `${title}에게 물었습니다. 답을 기다립니다` : `${title}에게 맡겼습니다. 결과를 이 대화로 돌려드립니다`} (최대 ${minutes}분). 요청: ${id}${result.channel === 'failed' ? ` · 조율 채널 전송 실패: ${result.channelError}` : ''}`;
   } catch (error) {
     const failed = (deps.open ?? openMsgStore)();
     try { createTable(failed); failed.db.query('DELETE FROM seat_asks WHERE id = ?').run(id); }
@@ -114,10 +130,11 @@ export function answerSeatAsk(id: string, text: string, deps: Pick<SeatAskDeps, 
     createTable(store);
     const now = (deps.now ?? Date.now)();
     const updated = store.db.query(`UPDATE seat_asks SET answer = ?, answered_at = ?
-      WHERE id = ? AND seat = 'TC' AND status = 'pending' AND answer IS NULL AND deadline > ?`)
+      WHERE id = ? AND status = 'pending' AND answer IS NULL AND deadline > ?`)
       .run(answer, now, id, now);
     if (updated.changes !== 1) throw new Error(`seat ask not pending or deadline passed: ${id}`);
-    debug.log('seat.ask', 'reply-recorded', { seat: 'TC', id });
+    const row = store.db.query('SELECT seat FROM seat_asks WHERE id = ?').get(id) as { seat: string };
+    debug.log('seat.ask', 'reply-recorded', { seat: row.seat, id });
   } finally { store.close(); }
 }
 
@@ -130,6 +147,49 @@ export function seatAskReplyInfo(id: string, open: () => MsgStore = openMsgStore
       .get(id) as { origin: string; asked_at: number | null; answered_at: number } | null;
     if (!row) throw new Error(`seat ask answer not recorded: ${id}`);
     return { origin: JSON.parse(row.origin) as AskOrigin, askedAt: row.asked_at, answeredAt: row.answered_at };
+  } finally { store.close(); }
+}
+
+export interface SeatAskRoundTrip {
+  id: string;
+  surface: AskOrigin['channel'];
+  askedAt: number | null;
+  answeredAt: number | null;
+  deliveredAt: number | null;
+  roundTripMs: number | null;
+  verdict: '10분 안' | '10분 넘음' | '미답' | '답 대기' | '전달 대기' | '시각 미상';
+}
+
+/** Read one row per CTO question, including undelivered and legacy rows. since is an epoch-millisecond lower bound. */
+export function listSeatAskRoundTrips({ since, now = Date.now(), open = openMsgStore }: {
+  since: number; now?: number; open?: () => MsgStore;
+}): SeatAskRoundTrip[] {
+  if (!Number.isFinite(since) || !Number.isFinite(now)) throw new Error('invalid seat ask time window');
+  const store = open();
+  try {
+    createTable(store);
+    const rows = store.db.query(`SELECT a.id, a.origin, a.asked_at, a.answered_at, a.deadline, a.status,
+      a.answer IS NOT NULL AS has_answer, o.status AS outbox_status, o.sent_at
+      FROM seat_asks a LEFT JOIN seat_ask_outbox o ON o.id = a.id
+      WHERE a.seat = 'TC' AND a.status != 'shadow'
+        AND COALESCE(a.asked_at, a.deadline - a.timeout_minutes * 60000) >= ?
+      ORDER BY COALESCE(a.asked_at, a.deadline - a.timeout_minutes * 60000) DESC, a.id DESC`)
+      .all(since) as Array<{ id: string; origin: string; asked_at: number | null; answered_at: number | null;
+        deadline: number; status: string; has_answer: number; outbox_status: string | null; sent_at: number | null }>;
+    return rows.map(row => {
+      const surface = (JSON.parse(row.origin) as AskOrigin).channel;
+      const deliveredAt = row.outbox_status === 'sent' ? row.sent_at : null;
+      const roundTripMs = row.answered_at === null || row.asked_at === null || deliveredAt === null ? null : deliveredAt - row.asked_at;
+      const verdict: SeatAskRoundTrip['verdict'] = row.asked_at === null ? '시각 미상'
+        : row.status === 'expired' || (!row.has_answer && row.status === 'pending' && now >= row.deadline) ? '미답'
+        : row.status === 'answered' || row.has_answer ? row.outbox_status === 'sent' && deliveredAt === null ? '시각 미상'
+          : deliveredAt === null ? '전달 대기'
+          : row.answered_at === null || roundTripMs === null ? '시각 미상'
+          : roundTripMs <= 600_000 ? '10분 안' : '10분 넘음'
+          : '답 대기';
+      return { id: row.id, surface, askedAt: row.asked_at, answeredAt: row.answered_at,
+        deliveredAt, roundTripMs, verdict };
+    });
   } finally { store.close(); }
 }
 
@@ -150,9 +210,11 @@ export async function deliverSeatAnswers(deps: SeatAskDeps & { askId?: string })
         : reply && Date.parse(reply.created_at) < ask.deadline ? reply.body.slice(id.length + 2).trim() : '';
       const status = answer ? 'answered' : now >= ask.deadline ? 'expired' : null;
       if (!status) return null;
-      const text = status === 'answered' ? `CTO 답변 (${id}): ${answer}`
-        : `CTO 미답 (${id}): 아직 답 없음 (${ask.timeout_minutes}분 경과).`;
-      const updated = store.db.query("UPDATE seat_asks SET status = ? WHERE id = ? AND status = 'pending'").run(status, id);
+      const title = seatTitle(ask.seat as SeatId);
+      const text = status === 'answered' ? `${title} 답변 (${id}): ${answer}`
+        : `${title} 미답 (${id}): 아직 답 없음 (${ask.timeout_minutes}분 경과).`;
+      const updated = store.db.query("UPDATE seat_asks SET status = ?, answered_at = COALESCE(answered_at, ?) WHERE id = ? AND status = 'pending'")
+        .run(status, status === 'answered' && reply ? Date.parse(reply.created_at) : null, id);
       if (updated.changes !== 1) return null;
       store.db.query('INSERT INTO seat_ask_outbox (id, origin, text) VALUES (?, ?, ?)').run(id, ask.origin, text);
       return status;
@@ -184,7 +246,8 @@ export async function deliverSeatAnswers(deps: SeatAskDeps & { askId?: string })
       if (claimed.changes !== 1) continue;
       try {
         await deps.send(origin, item.text);
-        store.db.query("UPDATE seat_ask_outbox SET status = 'sent', claim_token = NULL WHERE id = ? AND claim_token = ?").run(item.id, token);
+        store.db.query("UPDATE seat_ask_outbox SET status = 'sent', sent_at = ?, claim_token = NULL WHERE id = ? AND claim_token = ?")
+          .run((deps.now ?? Date.now)(), item.id, token);
       } catch (error) {
         store.db.query('UPDATE seat_ask_outbox SET claim_until = 0, claim_token = NULL WHERE id = ? AND claim_token = ?').run(item.id, token);
         throw error;
@@ -209,7 +272,7 @@ export function acknowledgeSeatAnswers(clientId: string, ids: string[], open: ()
   const store = open();
   try {
     createTable(store);
-    const ack = store.db.query("UPDATE seat_ask_outbox SET status = 'sent' WHERE id = ? AND origin = ? AND status = 'pending'");
-    for (const id of ids) ack.run(id, JSON.stringify({ channel: 'pwa', clientId }));
+    const ack = store.db.query("UPDATE seat_ask_outbox SET status = 'sent', sent_at = ? WHERE id = ? AND origin = ? AND status = 'pending'");
+    for (const id of ids) ack.run(Date.now(), id, JSON.stringify({ channel: 'pwa', clientId }));
   } finally { store.close(); }
 }

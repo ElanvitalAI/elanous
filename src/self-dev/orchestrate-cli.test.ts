@@ -480,6 +480,36 @@ describe('런 슈퍼바이저 — 중앙 심이 스위치를 «소유»한다', 
     expect(carried![0]!.goalPlanRevision).toEqual({ status: 'read', attempted: 2, applied: 1, failureReasons: ['expected-text-not-found'] });
   });
 
+  it('DRAFT-TRIAGE — each supervisor rework round supersedes the previous round\'s draft of the same goal; other goals untouched', async () => {
+    const pr = (n: number) => `https://github.com/acme/repo/pull/${n}`;
+    const rounds: SelfDevJobResult[][] = [
+      [{ ...unlanded, prUrl: pr(101) }, { ...unlanded, taskId: 'y', feature: 'y', prUrl: pr(200) }],
+      [{ ...unlanded, taskId: 'x2', prUrl: pr(102) }, { ...unlanded, taskId: 'y', feature: 'y', prUrl: pr(200) }],
+      [{ ...landed, taskId: 'x3', prUrl: pr(103) }, { ...landed, taskId: 'y', feature: 'y', prUrl: pr(200) }],
+    ];
+    let call = 0;
+    const executeReroute = (async () => ({ results: rounds[Math.min(call++, rounds.length - 1)]!, exitCode: 1 })) as OrchestrateCliDeps['executeReroute'];
+    const writes: string[] = [];
+    await runSelfOrchestrateCliCommand(
+      { goals: [{ feature: 'x' }, { feature: 'y' }], runtime: {}, supervise: { rounds: 3 } },
+      { executeReroute, readProposals: () => ({
+        proposals: new Map(), goalPlanRevisions: new Map(),
+        readFailure: { status: 'read-failed', reason: 'directory-missing', scannedFiles: 0, unreadableFiles: 0, ledgerDirectory: '/absent' },
+        scannedFiles: 0, unreadableFiles: 0, directoryMissing: true, ledgerDirectory: '/absent',
+      }), roundPrAdapters: {
+        view: () => ({ state: 'OPEN', isDraft: true, labels: [], comments: [] }),
+        addLabel: (ref, label) => { writes.push(`label#${ref.number}:${label}`); return true; },
+        comment: (ref, body) => { writes.push(`comment#${ref.number}:${/#(\d+) \(/.exec(body)?.[1]}`); return true; },
+        close: (ref) => { writes.push(`close#${ref.number}`); return true; },
+      } },
+    );
+    expect(call).toBe(3);
+    expect(writes).toEqual([
+      'label#101:elanous:superseded', 'comment#101:102', 'close#101',
+      'label#102:elanous:superseded', 'comment#102:103', 'close#102',
+    ]);
+  });
+
   it('⛔ 전부 착지하면 «한 번»에 선다 — 다시 걸 것이 없다', async () => {
     const cap = capture(0, [landed]);
     await runSelfOrchestrateCliCommand(

@@ -2,6 +2,8 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { handleDiscordSeatWork } from './discord-seat-work.js';
 import { DiscordBot } from '../discord.js';
+import { MsgStore } from '../msg/msg-store.js';
+import { answerSeatAsk, deliverSeatAnswers, type AskOrigin } from '../seat-dispatch/seat-ask.js';
 import type { UserConfig } from '../user-config.js';
 import type { PersonaProfile } from '../persona/types.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
@@ -187,6 +189,50 @@ describe('Discord owner intent', () => {
     });
     expect(reply).toBe('받음 — TC에 전했습니다.');
     expect(calls).toEqual([['TC', '결제 화면 오타 고쳐 줘', { via: 'discord' }]]);
+  });
+
+  test('owner @cmo task records its Discord return address and delivers the MK answer once', async () => {
+    const store = new MsgStore(':memory:');
+    store.close = () => {};
+    const lines: string[] = [];
+    const sent: Array<{ origin: AskOrigin; text: string }> = [];
+    const askDeps = { open: () => store, now: () => 0, channel: 'discord' as const,
+      send: async (origin: AskOrigin, text: string) => { sent.push({ origin, text }); } };
+    const commandDeps = { ownerId: '11111', replyTarget: 'acme/repo#42',
+      runGh: async (_args: string[], stdin: string) => { lines.push(stdin); return 0; },
+      append: (message: Parameters<MsgStore['append']>[0]) => store.append(message) };
+    try {
+      const reply = await handleDiscordSeatWork('@cmo 행사 후기 초안 써 줘',
+        { channelId: 'dm-111', messageId: 'm1', userId: '11111', isDm: true, threadId: 't9' },
+        { config, commandDeps, askDeps });
+      expect(reply).toContain('CMO에게 맡겼습니다');
+      expect(reply).toContain('요청: ');
+      const id = /요청: ([\w-]+)/.exec(reply!)![1]!;
+      const inbox = store.list('MK');
+      expect(inbox).toHaveLength(1);
+      expect(inbox[0]!.body).toContain(`답장 요청: ${id}`);
+      expect(inbox[0]!.body).toContain(`요청: ask:${id}`);
+      expect(store.list('TC')).toHaveLength(0);
+      expect(lines).toHaveLength(1);
+      answerSeatAsk(id, '초안 링크 여기', askDeps);
+      await deliverSeatAnswers(askDeps);
+      expect(sent).toEqual([{ origin: { channel: 'discord', channelId: 'dm-111', messageId: 'm1', threadId: 't9' },
+        text: `CMO 답변 (${id}): 초안 링크 여기` }]);
+      await deliverSeatAnswers(askDeps);
+      expect(sent).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  test('without ask dependencies the owner @cmo task retains its one-shot dispatch', async () => {
+    const calls: unknown[] = [];
+    const reply = await handleDiscordSeatWork('@cmo 행사 후기 초안 써 줘', OWNER, { config,
+      dispatch: async (seat, text, _deps, extra) => {
+        calls.push([seat, text, extra]); return { reply: '받음 — MK에 전했습니다.', channel: 'posted' };
+      },
+      submit: async () => { throw Error('should not submit'); },
+    });
+    expect(calls).toEqual([['MK', '행사 후기 초안 써 줘', { via: 'discord' }]]);
+    expect(reply).toBe('받음 — MK에 전했습니다.');
   });
 
   test('real C2 dispatch writes one CEO message and one channel line', async () => {

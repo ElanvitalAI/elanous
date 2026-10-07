@@ -6,6 +6,7 @@ import { parseGraphTemplateYaml } from '../../src/self-implement/graph-yaml.js';
 import { listLoops } from '../../src/loops/registry.js';
 import type { DecisionEvent } from '../../src/live/detail-switch.js';
 import { classifyReviewRounds, matchMustFix } from './must-fix-match.js';
+import { format } from '../../src/agent-substrate/pr-comment-meta.js';
 import { runMission } from './run-mission.js';
 
 const root = join(import.meta.dir, '../..');
@@ -26,6 +27,25 @@ test('#21953 reviewer rounds classify each bullet by later reviewer round in the
   expect(classifyReviewRounds([rounds.comments[1]!, { body: otherRun }]).map((item) => item.verdict)).toEqual(['open', 'open', 'open']);
   expect(classifyReviewRounds([{ body: '<!-- elanous-pr-comment v1 role=reviewer -->\nmust-fix:\n- old' },
     { body: '<!-- elanous-pr-comment v1 role=author round=2 run=run-x -->\n- not reviewer' }])).toEqual([]);
+});
+
+test('status details preserve reviewer rounds and rereview verdicts in landing-heal', () => {
+  const first = `${format({ role: 'reviewer', round: 0, run: 'run-status' })}\nRound 0: reviewer requested 1 must-fix change(s).\n\n- fix first`;
+  const second = `${format({ role: 'reviewer', round: 1, run: 'run-status' })}\nRound 1: reviewer requested 1 must-fix change(s).\n\n- fix second`;
+  const status = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n\n${first}\n\n${second}\n</details>`;
+  expect(classifyReviewRounds([{ body: status }])).toEqual([
+    { text: 'fix first', run: 'run-status', round: 0, verdict: 'rereviewed' },
+    { text: 'fix second', run: 'run-status', round: 1, verdict: 'open' },
+  ]);
+  expect(classifyReviewRounds([{ body: status.replace('<!-- elanous:run-status -->', 'Human comment') }])).toEqual([]);
+  const collect = { prs: [{ number: 42, state: 'MERGED', files: [] }] };
+  const result = runMission('must-fix-match', { outputs: { collect } }, (args) =>
+    args[1] === 'view' ? JSON.stringify({ comments: [{ body: status }], reviews: [] })
+      : args[0] === 'api' ? '[[]]' : '');
+  expect(result.matches).toEqual([
+    { pr: 42, text: 'fix first', run: 'run-status', round: 0, verdict: 'rereviewed' },
+    { pr: 42, text: 'fix second', run: 'run-status', round: 1, verdict: 'open' },
+  ]);
 });
 
 test('#21953 must-fix-match and report expose open vs rereviewed without changing legacy totals', () => {

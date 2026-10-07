@@ -1,0 +1,7 @@
+# bun 설정 — 테스트 격리 계약 전용(PLAN 1-A 3층).
+# [test].preload 는 `bun test` 에만 적용된다 — 프로덕션 `bun`/`elanous` 실행엔 무영향.
+# preload 가 ELANOUS_STATE_DIR 미설정 시에만 격리 tmp 를 강제해, test→운영 스토어
+# 누출(PTY #5246·세션 #5252·conatus #5262 4회 반복)을 프로세스 전역에서 근본 차단한다.
+[test]
+# bun test loads preload-isolation first, then preload-child-env for child command PATH resolution.
+preload = ["./test/preload-isolation.ts", "./test/preload-child-env.ts"]

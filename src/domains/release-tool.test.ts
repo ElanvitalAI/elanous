@@ -66,6 +66,13 @@ test('missing schedule is not an error; omitted version reads development and ne
   expect(parseElanousCard(result.text)[0]?.items.map(item => item.due)).toEqual([null, null]);
 });
 
+test('a release-branch dev version (0.2.18-dev.0) reads the 0.2.18 and 0.2.19 checklists, not a version the checklist rejects', () => {
+  const read: string[] = [];
+  dispatchReleaseStatus({}, { devVersion: () => '0.2.18-dev.0', schedule: () => null,
+    checklist: (version) => { read.push(version); return { version, released: '', dev: version, history: [], items: [] }; }, latestRun: () => null });
+  expect(read).toEqual(['0.2.18', '0.2.19']);
+});
+
 test('missing schedule in the real ledger returns 컷 미정 without an error', () => {
   fixture();
   const result = dispatchReleaseStatus({ version: '0.2.14' }, { latestRun: () => null });

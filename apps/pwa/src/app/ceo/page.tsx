@@ -6,6 +6,7 @@ import { loopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopSchedule } from '@/
 import { listOpenDecisions } from '@/lib/decisions-api';
 import { getSeats, type OpsSeats } from '@/lib/ops-api';
 import type { DaemonClient } from '@/lib/daemon-client';
+import type { GridData } from '../../../../../src/nexus/api/grid';
 
 type Risk = { id: string; kind: string; title: string; at: string };
 type SchedulesResult = { summary: Record<string, number>; risks: Risk[] };
@@ -17,9 +18,10 @@ type Snapshot = {
   decisions: number | null;
   merged: number | null;
   risks: Risk[] | null;
+  grid: GridData | null;
 };
 
-const empty: Snapshot = { release: null, loops: null, decisions: null, merged: null, risks: null };
+const empty: Snapshot = { release: null, loops: null, decisions: null, merged: null, risks: null, grid: null };
 const validTime = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -127,20 +129,41 @@ function releaseFromSeats(board: OpsSeats): Snapshot['release'] {
   };
 }
 
+async function readGrid(client: DaemonClient): Promise<GridData | null> {
+  try {
+    const response = await client.fetchResponse('/v1/grid');
+    if (!response.ok) return null;
+    const body: unknown = await response.json();
+    if (!object(body) || !object(body.hq) || !Array.isArray(body.members)
+      || (body.poolReason !== null && typeof body.poolReason !== 'string')) return null;
+    const hq = body.hq;
+    if ((hq.record !== null && (!object(hq.record) || typeof hq.record.holder !== 'string'))
+      || (hq.ageSeconds !== null && (typeof hq.ageSeconds !== 'number' || !Number.isFinite(hq.ageSeconds)))
+      || (hq.expired !== null && typeof hq.expired !== 'boolean')
+      || (hq.reason !== null && typeof hq.reason !== 'string')
+      || !body.members.every((row: unknown) => object(row) && typeof row.context === 'string'
+        && typeof row.capacity === 'number' && Number.isFinite(row.capacity)
+        && (row.occupied === null || (typeof row.occupied === 'number' && Number.isFinite(row.occupied))))) return null;
+    return body as unknown as GridData;
+  } catch { return null; }
+}
+
 async function readSnapshot(client: DaemonClient): Promise<Snapshot> {
   const now = Date.now();
-  const [seats, loops, loopFailures, decisions, runs] = await Promise.all([
+  const [seats, loops, loopFailures, decisions, runs, grid] = await Promise.all([
     getSeats(client),
     readSchedules(client),
     readLoopFailures(client),
     readDecisions(client, now),
     readRuns(client, new Date(now)),
+    readGrid(client),
   ]);
   return {
     release: seats.kind === 'ready' ? releaseFromSeats(seats.data) : null,
     loops: loops?.summary ?? null,
     decisions: decisions?.count ?? null,
     merged: runs.merged,
+    grid,
     risks: loops && loopFailures && decisions && runs.risks ? [...new Map(
       [...loops.risks, ...loopFailures, ...decisions.risks, ...runs.risks]
         .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
@@ -175,7 +198,7 @@ export default function CeoPage() {
       <Card title="루프 판정">{snapshot.loops === null ? '못 읽음' : Object.keys(snapshot.loops).length === 0
         ? '등록 0' : <div className="flex flex-wrap gap-1 text-xs font-medium">{Object.entries(snapshot.loops).map(([verdict, count]) =>
           <span key={verdict} className="rounded-full bg-muted px-2 py-1">{verdict} {count}</span>)}</div>}</Card>
-      <Card title="결정 대기 카드">{snapshot.decisions ?? '못 읽음'}</Card>
+      <Card title="결정 대기 카드"><a href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions ?? '못 읽음'}</a></Card>
       <Card title="오늘 병합 PR">{snapshot.merged ?? '못 읽음'}</Card>
     </div>
     <div className="mt-2 grid min-w-0 grid-cols-2 gap-2 sm:mt-4 sm:gap-4" aria-label="위험과 그리드 카드">
@@ -190,8 +213,28 @@ export default function CeoPage() {
       </section>
       <section aria-label="그리드" className="min-w-0 rounded-xl border border-border bg-card p-2 sm:p-4">
         <h2 className="text-xs font-medium text-muted-foreground sm:text-sm">그리드</h2>
-        {/* No daemon API serves machine heartbeats or slot use yet — say so instead of a read failure. */}
-        <p className="mt-2 text-sm">준비 중</p>
+        {snapshot.grid === null ? <p className="mt-2 text-sm">못 읽음</p> : <div className="mt-2 space-y-2 text-xs">
+          <p className="min-w-0 break-words">본부 · {snapshot.grid.hq.reason ? '본부 못 읽음'
+            : snapshot.grid.hq.record ? <><span title={snapshot.grid.hq.record.holder}>{snapshot.grid.hq.record.holder}</span>
+              {snapshot.grid.hq.ageSeconds !== null && <> · {Math.floor(snapshot.grid.hq.ageSeconds / 60)}분 전</>}
+              {snapshot.grid.hq.expired && <span className="ml-1 font-semibold text-red-600">만료</span>}</>
+              : '임대 없음'}</p>
+          {snapshot.grid.poolReason && <p className="break-words text-amber-700" title={snapshot.grid.poolReason}>풀 못 읽음 · {snapshot.grid.poolReason.slice(0, 40)}</p>}
+          <ul className="space-y-1">{snapshot.grid.members.map((member) => <li key={member.context} className="min-w-0">
+            <div className="flex min-w-0 items-center justify-between gap-1">
+              <span className="min-w-0 truncate" title={member.context}>{member.context}</span>
+              <span className="shrink-0 tabular-nums">{member.occupied === null ? '측정 불가' : `${member.occupied}/${member.capacity}`}</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-muted" role="meter" aria-label={`${member.context} 칸 사용`}
+              aria-valuemin={0} aria-valuemax={Math.max(member.capacity, member.occupied ?? 0, 1)}
+              {...(member.occupied === null ? {} : { 'aria-valuenow': member.occupied })}>
+              {member.occupied !== null && <div className="h-full rounded-full bg-emerald-600"
+                style={{ width: `${member.capacity > 0 ? Math.min(100, Math.max(0, member.occupied / member.capacity * 100)) : 0}%` }} />}
+            </div>
+          </li>)}</ul>
+          <p className="font-medium tabular-nums">칸 사용 {snapshot.grid.poolReason || snapshot.grid.members.some((member) => member.occupied === null)
+            ? '측정 불가' : snapshot.grid.members.reduce((sum, member) => sum + member.occupied!, 0)}/{snapshot.grid.members.reduce((sum, member) => sum + member.capacity, 0)}</p>
+        </div>}
       </section>
     </div>
   </main>;

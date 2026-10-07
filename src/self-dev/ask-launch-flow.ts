@@ -12,6 +12,7 @@
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
 import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { recordAuthoredGoal } from './authored-goal-trace.js';
+import { findAskPathCandidates, type AskPathCandidateOptions } from './ask-path-candidates.js';
 import { retiredEntranceNotice, type EntranceDeclaration } from './entrance-registry.js';
 import {
   classifyConcurrentAuthoring,
@@ -164,6 +165,8 @@ export interface AskLaunchFlowDeps {
   /** ⛔ 못 얻으면 `null` — 같은 이유. */
   recentAuthoringSamples(): RecentAuthoringSample[] | null;
   authorGoal(args: readonly string[], options: Record<string, unknown>): Promise<AskAuthoredGoal>;
+  /** Code-search seam for the one automatic no-target-paths retry. */
+  findPathCandidates?: (askText: string, options: AskPathCandidateOptions) => ReturnType<typeof findAskPathCandidates>;
   /** AUTHOR-TRACE seam (tests). */
   recordAuthoredGoal?: typeof recordAuthoredGoal;
   /** Pod launches reserve a host slot before goal authoring begins. */
@@ -849,7 +852,7 @@ export async function runAskLaunchFlow(
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
 
   await deps.beforeAuthoring?.();
-  const authorAndPreflight = async (): Promise<{
+  const authorAndPreflight = async (authorAskText: string = input.askText): Promise<{
     readonly goalFile: string;
     readonly decision: ReturnType<typeof decideAskPreflight>;
   }> => {
@@ -868,7 +871,7 @@ export async function runAskLaunchFlow(
     };
     // ⭐ RFC §5 5단계 — 확인된 implement 저작만 활성 구현 그래프에 이름을 잇는다.
     observeFrontNodeEntry('author', { ...frontObservation, provenance: 'authoring-start' });
-    const authored = await deps.authorGoal([input.askText], {
+    const authored = await deps.authorGoal([authorAskText], {
       cwd: deps.cwd(),
       ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
       ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
@@ -1011,8 +1014,26 @@ export async function runAskLaunchFlow(
     const first = authored;
     reauthored = true;
     deps.print('[ask] ⑴ ⚠️ 대상 경로를 못 찾아 자동 재저작 한 번을 시도한다');
-    authored = await authorAndPreflight();
+    let candidates: ReturnType<typeof findAskPathCandidates> = { tokens: [], paths: [] };
+    if (parseAskTargetPathHintsResult(input.askText).labelMissing) {
+      try {
+        candidates = (deps.findPathCandidates ?? findAskPathCandidates)(input.askText, { cwd: deps.cwd() });
+      } catch (error) {
+        candidates = { tokens: [], paths: [], error: error instanceof Error ? error.message : String(error) };
+      }
+      deps.log('ask-auto-target-candidates', {
+        tokens: candidates.tokens, paths: candidates.paths,
+        ...(candidates.error === undefined ? {} : { error: candidates.error }),
+      }, candidates.error === undefined ? 'info' : 'warn');
+    }
+    if (candidates.paths.length > 0) {
+      deps.print(`[ask] ⑴ 코드에서 후보 경로 ${candidates.paths.length}개를 찾아 넣고 다시 저작한다: ${candidates.paths.join(' · ')}`);
+    }
+    authored = await authorAndPreflight(candidates.paths.length > 0
+      ? `대상 경로: ${candidates.paths.join(' · ')}\n${input.askText}`
+      : input.askText);
     deps.log('ask-auto-reauthor', {
+      candidatePathCount: candidates.paths.length,
       firstGoalFile: first.goalFile,
       secondGoalFile: authored.goalFile,
       firstPathCount: first.decision.result.paths.length,

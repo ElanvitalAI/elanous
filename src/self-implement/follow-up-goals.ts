@@ -12,7 +12,7 @@ import { addHarnessQueue, type QueueSeat } from '../harness/harness-queue.js';
 import { debug } from '../debug/log.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { devVersion, listChecklist, parseOwner } from '../release-loop/checklist.js';
+import { checklistDevVersion, listChecklist, parseOwner } from '../release-loop/checklist.js';
 import { getUserConfig } from '../user-config.js';
 
 export const FOLLOW_UP_DEPTH_LIMIT = 3;
@@ -193,7 +193,7 @@ function defaultAppendDraft(stateRoot: string, record: FollowUpDraftRecord): voi
 
 function defaultCellOwner(cellId: string): string | undefined {
   try {
-    return listChecklist(devVersion()).items.find((item) => item.id === cellId)?.owner;
+    return listChecklist(checklistDevVersion()).items.find((item) => item.id === cellId)?.owner;
   } catch {
     return undefined;
   }

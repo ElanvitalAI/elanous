@@ -33,7 +33,7 @@ import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDep
 import { getUserConfig } from '../user-config.js';
 import { resolveRepositoryName } from './repository-name.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
-import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps, type QueueItem, type QueueSeat } from './harness-queue.js';
+import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem, type QueueSeat } from './harness-queue.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
@@ -2548,11 +2548,19 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
       console.log(`${row.id} ${row.seat} ${row.kind} queued`);
     }));
   queue.command('list').description('대기·발사 원장 조회').action(() => queueAction(async () => {
-    for (const row of listHarnessQueue(queueDeps)) console.log(`${row.id} ${row.seat} ${row.status} ${row.kind} ${row.input}${row.waitingReason ? ` · ${row.waitingReason}` : ''}`);
+    for (const row of listHarnessQueue(queueDeps)) console.log(`${row.id} ${row.seat} ${row.status} ${row.kind} ${row.input}${row.priority === undefined ? '' : ` · prio ${row.priority}`}${row.waitingReason ? ` · ${row.waitingReason}` : ''}`);
   }));
   queue.command('remove <id>').description('대기 중 또는 종료 확인된 항목 제거').action((id: string) => queueAction(async () => {
     if (!await removeHarnessQueue(id, queueDeps)) throw new Error(`queue item active or not found: ${id}`);
     console.log(`${id} removed`);
+  }));
+  queue.command('prio <id> <n>').description('대기 중 항목의 우선순위 재조정(클수록 먼저 · 다음 tick 부터)').action((id: string, n: string) => queueAction(async () => {
+    const value = Number(n);
+    if (!n.trim() || !Number.isFinite(value)) throw new Error(`harness queue prio: 수가 아니다 — ${n}`);
+    // A CLI call is the actor here; a seat or track that drives it names itself through the environment.
+    const by = process.env.ELANOUS_TRACK || process.env.ELANOUS_HARNESS_SEAT || 'cli';
+    const row = await setHarnessQueuePriority(id, value, by, queueDeps);
+    console.log(`${row.id} prio ${row.priority}`);
   }));
   queue.command('reconcile <id>').description('불확정 발사를 확인하고 종료 또는 미발사 증거가 있으면 예약 해소').action((id: string) => queueAction(async () => {
     console.log(`${id} ${await reconcileHarnessQueue(id, queueDeps)}`);

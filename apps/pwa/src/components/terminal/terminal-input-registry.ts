@@ -1,5 +1,6 @@
 import { debugLog } from '@/lib/debug';
 import type { Terminal } from '@xterm/xterm';
+import type { ModifierState } from '@/lib/key-sequences';
 
 export type TerminalHistoryView = Pick<Terminal, 'buffer' | 'modes' | 'scrollPages'>;
 
@@ -29,6 +30,41 @@ export function subscribeTerminalHistoryView(listener: () => void): () => void {
 type TerminalInput = (data: string) => void;
 
 const senders = new Map<string, { sender: TerminalInput }>();
+const stickyModifiers = new Map<string, ModifierState>();
+const stickyListeners = new Map<string, Set<() => void>>();
+
+function notifyStickyModifiers(terminalId: string): void {
+  stickyListeners.get(terminalId)?.forEach((listener) => listener());
+}
+
+/** Arms Ctrl/Alt for the next input on this terminal; an idle state disarms it. */
+export function setStickyModifiers(terminalId: string, mods: ModifierState): void {
+  if (mods.ctrl || mods.alt) stickyModifiers.set(terminalId, { ctrl: mods.ctrl, alt: mods.alt });
+  else stickyModifiers.delete(terminalId);
+}
+
+/** Returns the armed modifiers once, clearing them before notifying subscribers. */
+export function takeStickyModifiers(terminalId: string): ModifierState | null {
+  const mods = stickyModifiers.get(terminalId) ?? null;
+  if (mods) {
+    stickyModifiers.delete(terminalId);
+    notifyStickyModifiers(terminalId);
+  }
+  return mods;
+}
+
+export function subscribeStickyModifiers(terminalId: string, listener: () => void): () => void {
+  let listeners = stickyListeners.get(terminalId);
+  if (!listeners) {
+    listeners = new Set();
+    stickyListeners.set(terminalId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && stickyListeners.get(terminalId) === listeners) stickyListeners.delete(terminalId);
+  };
+}
 
 /** Returns a cleanup that only removes this registration, even when callbacks are reused. */
 export function registerTerminalInput(terminalId: string, sender: TerminalInput): () => void {

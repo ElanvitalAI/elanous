@@ -67,8 +67,10 @@ export interface LlmMergeOutcome {
   testDeclarationUnmeasured?: string[];
   /** 해결기 응답이 LLM 공급자 오류 문구였다 — 파일 내용이 아니다(🅢 2026-09-27 #21086: 세 파일이 통째로 그 문구가 됐다). */
   providerFailure?: string[];
-  /** LLM 입력 상한 초과: 사람 수확으로 넘긴다. 원래 브랜치는 abort 후 보존된다. */
-  reason?: 'conflict-input-too-large' | 'conflict-resolver-interrupted';
+  /** 충돌 미해결의 원인. 기존 두 원인에 마커 잔존·파일 읽기 실패를 추가한다. */
+  reason?: 'conflict-input-too-large' | 'conflict-resolver-interrupted' | 'conflict-markers-remain' | 'conflict-file-unreadable';
+  /** 해결이 멎은 충돌 파일(worktree 상대 경로). */
+  failedFile?: string;
   inputChars?: number;
   /** 병합 결과가 양쪽 판 중 작은 쪽의 절반 아래로 줄었다 — 통째로 날린 것으로 보고 해결 실패로 친다. */
   sizeCollapse?: Array<{ file: string; ours: number; theirs: number; merged: number }>;
@@ -107,6 +109,20 @@ function addSizeChange(size: LlmMergeSizeChange, file: string, before: string, a
 
 export function formatLlmMergeOutcome(outcome: LlmMergeOutcome): string {
   const files = outcome.resolvedFiles?.length ? ` (LLM 종합 ${outcome.resolvedFiles.length}파일: ${outcome.resolvedFiles.join(', ')})` : '';
+  if (outcome.status === 'conflict-unresolved') {
+    // ⛔ reason·failedFile 은 «선택» 칸이다 — 공급자 오류·시험 선언 유실·크기 붕괴 출구는 계약상 reason 이 없다.
+    //   있는 칸만 싣고, 그 출구들은 자기 실제 결과(어느 판정이 멈췄나)를 싣는다 — 「사유 undefined」 금지.
+    const parts = [
+      ...(outcome.reason ? [`사유 ${outcome.reason}`] : []),
+      ...(outcome.failedFile ? [`파일 ${outcome.failedFile}`] : []),
+      ...(outcome.providerFailure?.length ? [`공급자 오류 문구 ${outcome.providerFailure.join(', ')}`] : []),
+      ...(outcome.testDeclarationLoss?.length
+        ? [`시험 선언 유실 ${outcome.testDeclarationLoss.map((l) => `${l.file} ${l.ours}/${l.theirs}→${l.merged}`).join(', ')}`] : []),
+      ...(outcome.sizeCollapse?.length
+        ? [`크기 붕괴 ${outcome.sizeCollapse.map((c) => `${c.file} ${c.ours}/${c.theirs}→${c.merged}줄`).join(', ')}`] : []),
+    ];
+    return `${outcome.status}${files}${parts.length ? `; ${parts.join(' · ')}` : ''}`;
+  }
   if (outcome.status !== 'llm-resolved') return `${outcome.status}${files}`;
   const size = outcome.sizeChange;
   if (size === undefined) return `${outcome.status}${files}; 규모 변화: 못 쟀다`;
@@ -211,6 +227,10 @@ export async function mergeMainWithLlmResolve(
     ...outcome,
     ...(testDeclarationUnmeasured.length ? { testDeclarationUnmeasured } : {}),
   });
+  const unresolved = (outcome: LlmMergeOutcome & { status: 'conflict-unresolved'; failedFile: string }): LlmMergeOutcome => {
+    debug.log('self-dev.merge', 'conflict-unresolved', { reason: outcome.reason, failedFile: outcome.failedFile, resolvedCount: resolvedFiles.length });
+    return measuredOutcome(outcome);
+  };
   for (const f of files) {
     const abs = join(worktreePath, f);
     let conflicted: string;
@@ -219,7 +239,7 @@ export async function mergeMainWithLlmResolve(
       conflicted = git.readFile(abs);
     } catch {
       git.abort(worktreePath);
-      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
+      return unresolved({ status: 'conflict-unresolved', reason: 'conflict-file-unreadable', failedFile: f, resolvedFiles });
     }
     try {
       // release/next.md: concurrent landings each append a line — keep both without asking the LLM (REL7c).
@@ -227,7 +247,7 @@ export async function mergeMainWithLlmResolve(
       merged = deterministic ?? await resolve(f, conflicted);
     } catch (error) {
       git.abort(worktreePath); // LLM 예외 → base 유지
-      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles,
+      return unresolved({ status: 'conflict-unresolved', resolvedFiles, failedFile: f,
         ...(error instanceof MergeConflictInputTooLarge
           ? { reason: 'conflict-input-too-large' as const, inputChars: error.inputChars }
           : { reason: 'conflict-resolver-interrupted' as const }),
@@ -235,11 +255,11 @@ export async function mergeMainWithLlmResolve(
     }
     if (PROVIDER_FAILURE_TEXT.test(merged)) {
       git.abort(worktreePath); // 해결기가 공급자 오류 문구를 «내용»으로 돌려줬다 → base 유지
-      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles, providerFailure: [f] });
+      return unresolved({ status: 'conflict-unresolved', resolvedFiles, failedFile: f, providerFailure: [f] });
     }
     if (hasConflictMarkers(merged)) {
       git.abort(worktreePath); // LLM 이 종합 못 함(마커 잔존) → base 유지
-      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
+      return unresolved({ status: 'conflict-unresolved', reason: 'conflict-markers-remain', failedFile: f, resolvedFiles });
     }
     try {
       const ours = countTestDeclarations(git.readIndexStage(worktreePath, 2, f));
@@ -248,7 +268,7 @@ export async function mergeMainWithLlmResolve(
       if (mergedDeclarations < Math.min(ours, theirs)) {
         const testDeclarationLoss = [{ file: f, ours, theirs, merged: mergedDeclarations }];
         git.abort(worktreePath);
-        return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles, testDeclarationLoss });
+        return unresolved({ status: 'conflict-unresolved', resolvedFiles, failedFile: f, testDeclarationLoss });
       }
     } catch {
       testDeclarationUnmeasured.push(f);
@@ -260,7 +280,7 @@ export async function mergeMainWithLlmResolve(
       const smaller = Math.min(ours, theirs);
       if (smaller >= SIZE_COLLAPSE_MIN_LINES && mergedLines * 2 < smaller) {
         git.abort(worktreePath); // 양쪽 판 모두보다 절반 넘게 작다 → 통째로 날렸다 → base 유지
-        return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles, sizeCollapse: [{ file: f, ours, theirs, merged: mergedLines }] });
+        return unresolved({ status: 'conflict-unresolved', resolvedFiles, failedFile: f, sizeCollapse: [{ file: f, ours, theirs, merged: mergedLines }] });
       }
     } catch {
       /* 한쪽 판이 없는 충돌(삭제·추가) — 크기 비교 대상이 아니다 */

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, test, setDefaultTimeout } from 'bun:test';
 import { mkdtempSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -6,7 +6,10 @@ import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
 import { emitSessionEvent } from './session-events.js';
 import { recordExternalEvent } from './external-events.js';
 import { recordCoordEvent } from './coord-events.js';
-import { contextDay, contextDayHours, renderContextDay } from './context-day.js';
+import { contextDay, contextDayHours, contextDayTimeline, renderContextDay, renderContextDayTimeline } from './context-day.js';
+
+// The CLI test spawns `bin/elanous.mjs` three times; under gate load that passed Bun's 5 s default once (10-06 export run).
+setDefaultTimeout(60_000);
 
 const now = '2026-10-04T12:00:00.000Z';
 
@@ -63,6 +66,77 @@ test('missing bus remains absent and does not create a store; invalid windows fa
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('timeline orders five events from seat, channel and external sources in KST, and filters TC', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-day-timeline-'));
+  const path = join(dir, 'events.db');
+  const db = openSurfaceEventsDb(path);
+  try {
+    recordExternalEvent({ origin: 'claude-code', kind: 'claimed', summary: 'external work', source: 'elanous://work/1', at: '2026-10-04T09:00:00.000Z' }, { db });
+    emitSessionEvent({ seat: 'TC', kind: 'asked', text: 'question', ref: 'item-1', at: '2026-10-04T07:00:00.000Z' }, { db });
+    recordCoordEvent({ seat: 'OP', kind: '요청', headline: 'coord request', recipients: [], all: false, slot: null, deadline: null, url: 'https://example.org/coord', at: '2026-10-04T08:00:00.000Z' }, { db });
+    emitSessionEvent({ seat: 'TC', kind: 'task-done', text: 'completed', at: '2026-10-04T10:00:00.000Z' }, { db });
+    recordEvent(db, { surface: 'context:session', direction: 'outbound', kind: 'unrecognized', text: 'PRIVATE TEXT', summary: 'public summary', refs: JSON.stringify({ seat: 'MK', url: 'file:///private' }), ts: '2026-10-04T11:00:00.000Z' });
+    const before = db.prepare('SELECT count(*) AS n, sum(recall_count) AS recalls FROM events').get();
+    const report = contextDayTimeline('24h', { now: () => new Date(now), dbPath: path });
+    expect(report).toEqual({ since: '2026-10-03T12:00:00.000Z', until: now, events: [
+      { at: '2026-10-04T07:00:00.000Z', source: 'TC', kind: 'asked', summary: 'question', link: 'elanous://context/ref/item-1' },
+      { at: '2026-10-04T08:00:00.000Z', source: 'OP', kind: 'asked', summary: 'coord request', link: 'https://example.org/coord' },
+      { at: '2026-10-04T09:00:00.000Z', source: 'claude-code', kind: 'task-claimed', summary: 'external work', link: 'elanous://work/1' },
+      { at: '2026-10-04T10:00:00.000Z', source: 'TC', kind: 'done', summary: 'completed', link: null },
+      { at: '2026-10-04T11:00:00.000Z', source: 'MK', kind: 'other', summary: 'public summary', link: null },
+    ] });
+    const rendered = renderContextDayTimeline(report, path);
+    expect(rendered).toContain('2026-10-03 21:00 KST ~ 2026-10-04 21:00 KST');
+    expect(rendered).toContain('16:00 KST · TC · asked · question · elanous://context/ref/item-1');
+    expect(rendered).toContain('5건 · 출처 4곳');
+    expect(rendered.split('\n').slice(1, -1).map(line => line.slice(0, 11))).toEqual([
+      '16:00 KST ·', '17:00 KST ·', '18:00 KST ·', '19:00 KST ·', '20:00 KST ·',
+    ]);
+    expect(rendered).not.toContain('PRIVATE TEXT');
+    expect(contextDayTimeline('24h', { now: () => new Date(now), dbPath: path, seat: 'TC' }).events).toEqual([report.events[0], report.events[3]]);
+    expect(db.prepare('SELECT count(*) AS n, sum(recall_count) AS recalls FROM events').get()).toEqual(before);
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('timeline renders control characters in a journal summary as one event line without changing its JSON value', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-day-summary-'));
+  const path = join(dir, 'events.db');
+  const db = openSurfaceEventsDb(path);
+  try {
+    const summary = 'first\nsecond\rthird\tpart\u0000end\u007fmore\u0085next\u2028last\u2029done';
+    recordEvent(db, { surface: 'context:session', direction: 'outbound', kind: 'asked', text: 'PRIVATE TEXT',
+      summary, refs: JSON.stringify({ seat: 'TC' }), ts: '2026-10-04T09:00:00.000Z' });
+    const report = contextDayTimeline('24h', { now: () => new Date(now), dbPath: path });
+    expect(report.events).toHaveLength(1);
+    expect(report.events[0]?.summary).toBe(summary);
+    const rendered = renderContextDayTimeline(report, path);
+    expect(rendered.split('\n')).toHaveLength(3);
+    expect(rendered.split('\n')[1]).toBe('18:00 KST · TC · asked · first second third part end more next last done · —');
+    expect(rendered).toEndWith('1건 · 출처 1곳');
+    expect(rendered).not.toContain('PRIVATE TEXT');
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('external events never become seat events and missing store renders its inspected path', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-day-timeline-empty-'));
+  const path = join(dir, 'missing.db');
+  try {
+    const empty = contextDayTimeline('24h', { now: () => new Date(now), dbPath: path });
+    expect(empty.events).toEqual([]);
+    expect(renderContextDayTimeline(empty, path)).toContain(`이 창에 사건 0건 — 원장 경로: ${path}`);
+    expect(existsSync(path)).toBe(false);
+    const db = openSurfaceEventsDb(path);
+    try {
+      recordEvent(db, { surface: 'context:external', direction: 'outbound', kind: 'asked', text: 'secret', summary: 'external only', refs: JSON.stringify({ seat: 'TC', origin: 'claude-code' }), ts: '2026-10-04T09:00:00.000Z' });
+      recordEvent(db, { surface: 'context:external', direction: 'outbound', kind: 'asked', text: 'secret', summary: 'false seat', refs: JSON.stringify({ seat: 'TC', origin: 'TC' }), ts: '2026-10-04T09:01:00.000Z' });
+      recordEvent(db, { surface: 'context:session', direction: 'outbound', kind: 'asked', text: 'secret', summary: 'false external', refs: JSON.stringify({ seat: 'claude-code', origin: 'claude-code' }), ts: '2026-10-04T09:02:00.000Z' });
+      expect(contextDayTimeline('24h', { now: () => new Date(now), dbPath: path, seat: 'TC' }).events).toEqual([]);
+      expect(contextDayTimeline('24h', { now: () => new Date(now), dbPath: path }).events.map(event => event.summary)).toEqual(['external only']);
+      expect(() => contextDayTimeline('24h', { now: () => new Date(now), dbPath: path, seat: 'unknown' as 'TC' })).toThrow('unknown --seat: unknown');
+    } finally { db.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('CLI JSON reads an isolated fake bus without altering its store', () => {
   const dir = mkdtempSync(join(tmpdir(), 'context-day-cli-'));
   const path = join(dir, 'surface_events.db');
@@ -90,4 +164,34 @@ test('CLI exposes the context day options in the real command tree', () => {
   expect(output).toContain('Usage: elanous context day [options]');
   expect(output).toContain('--since <hours>');
   expect(output).toContain('--json');
+  expect(output).toContain('--timeline');
+  expect(output).toContain('--seat <source>');
+});
+
+test('CLI timeline JSON filters one source and rejects unknown seats with exit 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-day-timeline-cli-'));
+  const path = join(dir, 'surface_events.db');
+  const db = openSurfaceEventsDb(path);
+  try {
+    emitSessionEvent({ seat: 'TC', kind: 'asked', text: 'ask' }, { db });
+    recordExternalEvent({ origin: 'claude-code', kind: 'claimed', summary: 'work', source: 'elanous://work/1' }, { db });
+    const root = resolve(import.meta.dir, '../..');
+    const invoke = (...args: string[]) => Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'context', 'day', ...args], {
+      cwd: root, env: { ...process.env, ELANOUS_STATE_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const result = invoke('--timeline', '--seat', 'TC', '--json');
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(new TextDecoder().decode(result.stdout)) as ReturnType<typeof contextDayTimeline>;
+    expect(Object.keys(report)).toEqual(['since', 'until', 'events']);
+    expect(report.events.map(event => [event.source, event.kind, event.summary])).toEqual([['TC', 'asked', 'ask']]);
+    const human = invoke('--timeline', '--seat', 'TC');
+    expect(human.exitCode).toBe(0);
+    const humanText = new TextDecoder().decode(human.stdout);
+    expect(humanText).toContain('KST · TC · asked · ask · —');
+    expect(humanText).toContain('1건 · 출처 1곳');
+    expect(humanText).not.toContain('claude-code');
+    const unknown = invoke('--timeline', '--seat', 'unrecognized');
+    expect(unknown.exitCode).toBe(2);
+    expect(new TextDecoder().decode(unknown.stderr)).toContain('unknown --seat: unrecognized');
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
 });

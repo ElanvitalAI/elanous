@@ -2,7 +2,7 @@ import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { debug } from '../debug/log.js';
 import { requestConfirmation, type ConfirmOpts, type ConfirmResult } from '../hitl/confirm.js';
-import { devVersion, listChecklist, summarizeChecklist, type Checklist } from '../release-loop/checklist.js';
+import { devVersion, checklistDevVersion, listChecklist, summarizeChecklist, type Checklist } from '../release-loop/checklist.js';
 import { add, move, validateVersion } from '../release-loop/feature-store.js';
 import { formatKst, getSchedule, setSchedule, type ReleaseSchedule } from '../release-loop/release-schedule.js';
 import { latestGraphRun, type GraphRunState } from '../graph-runner/runner.js';
@@ -64,7 +64,7 @@ function dDay(days: number): string {
 export function dispatchReleaseStatus(args: Record<string, unknown>, deps: ReleaseToolDeps = {}): { text: string; structured: Record<string, unknown> } {
   const requested = args.version;
   if (requested !== undefined && (typeof requested !== 'string' || !requested.trim())) throw new Error('판 이름이 필요합니다');
-  const version = requested ? null : (deps.devVersion?.() ?? devVersion());
+  const version = requested ? null : checklistDevVersion(deps.devVersion?.() ?? devVersion());
   const versions = requested ? [requested as string] : [version!, nextVersion(version!)];
   const now = deps.now ?? new Date();
   const run = (deps.latestRun ?? latestGraphRun)('release-loop');

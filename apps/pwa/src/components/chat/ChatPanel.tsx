@@ -16,6 +16,7 @@ import { getSessionsService } from '@/lib/sessions-service';
 import { resolveChatSessionSync } from '@/lib/workspace/session-sync';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { useCompactMode } from '@/lib/compact-mode';
+import { useShellActivity } from '@/components/shell/use-shell-activity';
 
 export interface ChatPanelProps {
   /** workspace 탭이 명시 attach 한 세션. 미지정 시 DaemonProvider 의
@@ -26,10 +27,14 @@ export interface ChatPanelProps {
   tabId?: string;
   /** Only the standalone /chat page shows its conversation navigation. */
   showConversationList?: boolean;
+  /** Standalone /chat uses the phone-density header; workspace panels stay unchanged. */
+  mobileSimple?: boolean;
 }
 
 export function ChatPanel(props: ChatPanelProps = {}) {
   const { compact } = useCompactMode();
+  const mobileSimple = !!props.mobileSimple && compact;
+  const mobileActivity = useShellActivity();
   const ws = useWorkspaceOptional();
   const { client, sessionId, setSessionId } = useDaemon();
   const [conversationKey, setConversationKey] = useState(sessionId || 'default');
@@ -98,7 +103,8 @@ export function ChatPanel(props: ChatPanelProps = {}) {
       // Only a selected session remounts; daemon adoption keeps the live turn.
       key={conversationKey}
       onSessionAdopt={(issued) => { adoptedSessionRef.current = issued; }}
-      {...(props.showConversationList && compact ? { leading: conversationButton } : {})}
+      {...(props.showConversationList && compact && !mobileSimple ? { leading: conversationButton } : {})}
+      {...(mobileSimple ? { mobileSimple, mobileActivity, conversationButton } : {})}
       {...(onAttachRequest ? { onAttachRequest } : {})}
       {...(onForgetRequest ? { onForgetRequest } : {})}
       {...(props.tabId ? { tabId: props.tabId } : {})}

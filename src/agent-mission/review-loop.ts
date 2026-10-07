@@ -22,7 +22,7 @@ import { budgetReviewerContext } from '../agent-substrate/pr-reviewer.js';
 import { DEFAULT_REVIEW_BACKEND } from '../agent-substrate/acp-reviewer.js';
 import { loadReviewerContext } from '../agent-substrate/self-review-cli.js';
 import { createRepositoryReferencedFileReader, type ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import { parse as parsePrCommentMeta } from '../agent-substrate/pr-comment-meta.js';
+import { expandRecords, parse as parsePrCommentMeta } from '../agent-substrate/pr-comment-meta.js';
 
 export type ReviewVerdict = 'ok' | 'reinforce' | 'reject' | 'ambiguous';
 export type ReviewClassificationSource = 'llm' | 'llm-call-failure' | 'empty-review' | 'injected';
@@ -310,9 +310,10 @@ function analyzeAppliedReviewItems(comments: readonly NonNullable<LatestReviewSo
   const items: string[] = [];
   const seen = new Set<string>();
   let headlineComments = 0;
-  const newestFirst = [...comments].sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
+  const newestFirst = comments.flatMap((comment) => expandRecords(comment.body ?? '').map((body) => ({ ...comment, body })))
+    .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
   for (const comment of newestFirst) {
-    const lines = (comment.body ?? '').split('\n');
+    const lines = comment.body.split('\n');
     const headlineIndex = parsePrCommentMeta(lines[0] ?? '') ? 1 : 0;
     const headline = lines[headlineIndex]?.trim() ?? '';
     if (!headline.startsWith(REVIEW_REINFORCEMENT_HEADLINE) && !headline.startsWith(ACP_REWORK_HEADLINE)) continue;

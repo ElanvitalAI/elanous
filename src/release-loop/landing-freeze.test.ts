@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prodInstanceRoot } from '../instance/resolve.js';
@@ -15,7 +15,7 @@ test('landing-freeze.json records reason, start, end and actor; expires automati
   try {
     const state = enableLandingFreeze({ reason: 'drill', until: '2026-10-04T07:00:00+00:00', by: 'MK' }, root, at);
     expect(JSON.parse(readFileSync(landingFreezePath(root), 'utf8'))).toEqual(state);
-    expect(state).toEqual({ reason: 'drill', startedAt: at.toISOString(), until: '2026-10-04T07:00:00.000Z', by: 'MK' });
+    expect(state).toEqual({ reason: 'drill', startedAt: at.toISOString(), until: '2026-10-04T07:00:00.000Z', by: 'MK', holdLaunches: false });
     expect(readLandingFreeze(root, new Date('2026-10-04T06:59:59Z'))).toEqual(state);
     expect(readLandingFreeze(root, new Date('2026-10-04T07:00:00Z'))).toBeNull();
     expect(existsSync(landingFreezePath(root))).toBe(true); // expired reads as off; only `freeze off` removes the file
@@ -23,6 +23,26 @@ test('landing-freeze.json records reason, start, end and actor; expires automati
     disableLandingFreeze(root);
     expect(readLandingFreeze(root)).toBeNull();
     expect(() => enableLandingFreeze({ until: '2026-10-04T05:00:00Z' }, root, at)).toThrow('--until must be a future ISO timestamp with timezone');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('holdLaunches persists when opted in; legacy missing field reads false and invalid values are rejected', () => {
+  const root = mkdtempSync(join(tmpdir(), 'landing-freeze-hold-'));
+  try {
+    const held = enableLandingFreeze({ reason: 'hold', by: 'OP', holdLaunches: true }, root, at);
+    expect(held.holdLaunches).toBe(true);
+    expect(JSON.parse(readFileSync(landingFreezePath(root), 'utf8')).holdLaunches).toBe(true);
+    expect(readLandingFreeze(root, at)?.holdLaunches).toBe(true);
+
+    const legacy = { reason: 'landing only', startedAt: at.toISOString(), until: null, by: 'OP' };
+    writeFileSync(landingFreezePath(root), JSON.stringify(legacy));
+    expect(readLandingFreeze(root, at)).toEqual({ ...legacy, holdLaunches: false });
+    const guard = beginLandingMerge(root, at, root);
+    expect(guard.frozen).toEqual({ ...legacy, holdLaunches: false });
+    for (const invalid of [null, 0, 'true', {}, []]) {
+      writeFileSync(landingFreezePath(root), JSON.stringify({ ...legacy, holdLaunches: invalid }));
+      expect(() => readLandingFreeze(root, at)).toThrow('invalid landing freeze');
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -38,7 +58,14 @@ test('freeze status --json reads the isolated state folder', async () => {
     registerFreezeCommands(cli);
     await cli.parseAsync(['freeze', 'on', '--reason', 'drill', '--until', '2099-01-01T00:00:00Z'], { from: 'user' });
     await cli.parseAsync(['freeze', 'status', '--json'], { from: 'user' });
-    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ frozen: true, freeze: { reason: 'drill', until: '2099-01-01T00:00:00.000Z' } });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ frozen: true, freeze: { reason: 'drill', until: '2099-01-01T00:00:00.000Z', holdLaunches: false } });
+    await cli.parseAsync(['freeze', 'status'], { from: 'user' });
+    expect(lines.at(-1)).toContain('launch 보류 아니오');
+    await cli.parseAsync(['freeze', 'on', '--reason', 'hold', '--hold-launches'], { from: 'user' });
+    await cli.parseAsync(['freeze', 'status', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ frozen: true, freeze: { reason: 'hold', holdLaunches: true } });
+    await cli.parseAsync(['freeze', 'status'], { from: 'user' });
+    expect(lines.at(-1)).toContain('launch 보류 예');
     await cli.parseAsync(['freeze', 'off'], { from: 'user' });
     await cli.parseAsync(['freeze', 'status', '--json'], { from: 'user' });
     expect(JSON.parse(lines.at(-1)!)).toEqual({ frozen: false, freeze: null, pendingMerges: 0 });

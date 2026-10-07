@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandResult, type CommandRunner } from './node-verdict.js';
+import { prereleaseKind } from './release-version.js';
 
 interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
 /** Where the internal feed is packed from: a checkout of the release tag, never the run's working tree. */
@@ -199,6 +200,12 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
 
 if (import.meta.main) {
   let version = '';
-  try { version = readGraphContext().input.version; process.exitCode = finishNode('ops-upgrade', version, runOpsUpgrade()); }
+  try {
+    version = readGraphContext().input.version;
+    // RELEASE-REHEARSAL-RC: a prerelease never lands docs on main or upgrades the operating hosts.
+    process.exitCode = finishNode('ops-upgrade', version, prereleaseKind(version) !== null
+      ? { outcome: 'ok', verdict: 'pass', summary: `ops-upgrade skipped — ${version} is a prerelease`, skipped: 'prerelease' }
+      : runOpsUpgrade());
+  }
   catch (error) { process.exitCode = finishNode('ops-upgrade', version, errorResult(error)); }
 }

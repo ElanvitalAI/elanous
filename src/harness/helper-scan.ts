@@ -81,9 +81,16 @@ export function classifyStoppedPr({ body, comments }: { body: string; comments: 
     action = '증거 재측 — 인용된 판정 명령을 호스트에서 다시 돌려 결과를 PR 에 남김; 코드 수정 아님';
   } else if (/review-budget/i.test(stopEvidence) || basis === 'must-fix-reported') {
     // Real supervisor bodies (UNCONVERGEABLE · implementation-deficit) carry `classificationBasis: must-fix-reported` instead of the RFC word.
-    if (basis === 'must-fix-reported') signals.push('classificationBasis=must-fix-reported → review-budget');
-    category = 'review-budget';
-    action = latest?.count ? '헬퍼 자식 spawn — must-fix 원문과 기존 시험 설계로 한 라운드' : '하지 않음 — must-fix 0 또는 미관측; 수리 자식 대상 아님';
+    const previous = latest && reviews.find((review) => review.round === latest.round - 1);
+    if (latest && previous && latest.round >= 2 && latest.count > 0 && latest.count >= previous.count) {
+      category = 'review-oscillation';
+      signals.push(`must-fix ${previous.count}→${latest.count} (round ${previous.round}→${latest.round}) → review-oscillation`);
+      action = '헬퍼 자식 spawn — 기존 시험 설계 보존 후 한 라운드';
+    } else {
+      if (basis === 'must-fix-reported') signals.push('classificationBasis=must-fix-reported → review-budget');
+      category = 'review-budget';
+      action = latest?.count ? '헬퍼 자식 spawn — must-fix 원문과 기존 시험 설계로 한 라운드' : '하지 않음 — must-fix 0 또는 미관측; 수리 자식 대상 아님';
+    }
   } else if (/no-progress/i.test(stopEvidence) || basis === 'no-must-fix-without-clean-worktree-or-completed-without-changes') {
     if (basis === 'no-must-fix-without-clean-worktree-or-completed-without-changes') signals.push(`classificationBasis=${basis} → no-progress`);
     category = 'no-progress';

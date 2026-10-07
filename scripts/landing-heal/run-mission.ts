@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { githubAutomationToken } from '../../src/auth/github-app-token.js';
 import { debug } from '../../src/debug/log.js';
 import { emitDecision } from '../../src/live/detail-switch.js';
-import { parse } from '../../src/agent-substrate/pr-comment-meta.js';
+import { expandRecords, parse } from '../../src/agent-substrate/pr-comment-meta.js';
 import { classifyReviewRounds, matchMustFix, type MustFixVerdict } from './must-fix-match.js';
 import { verifyCleanCheckout, type CheckoutResult } from './clean-checkout.js';
 
@@ -116,7 +116,8 @@ export function runMission(mission: string, ctx: GraphContext, run: RunCommand =
         const pages = JSON.parse(run(['api', `repos/{owner}/{repo}/pulls/${pr.number}/comments`, '--paginate', '--slurp'])) as Array<Array<{ body?: string }>>;
         if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error(`invalid review comments for PR #${pr.number}`);
         const inline = pages.flat();
-        const comments = [...(details.reviews ?? []), ...(details.comments ?? []), ...inline];
+        const comments = [...(details.reviews ?? []), ...(details.comments ?? []), ...inline]
+          .flatMap((comment) => comment.body ? expandRecords(comment.body).map((body) => ({ ...comment, body })) : [comment]);
         const reviewRounds = comments.filter(({ body }) => {
           const meta = body ? parse(body) : null;
           return meta?.role === 'reviewer' && !!meta.run && meta.round !== undefined;

@@ -834,11 +834,96 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
 
   test('fetch 실패에 status·signal·stdout·stderr 가 남고 stderr 가 비어도 사유가 비지 않는다', () => {
     expect(() => syncBaseWithRemote('/r', 'feat', false, runner({
-      fetch: { status: null, signal: 'SIGTERM', stdout: 'fetch interrupted\n', stderr: '' },
-    }))).toThrow('fetch failed: status=null, signal=SIGTERM, stdout="fetch interrupted", stderr=""');
+      fetch: { status: null, signal: 'SIGKILL', stdout: 'fetch interrupted\n', stderr: '' },
+    }))).toThrow('fetch failed: status=null, signal=SIGKILL, stdout="fetch interrupted", stderr=""');
     expect(() => syncBaseWithRemote('/r', 'feat', false, runner({
       fetch: { status: 128, stdout: '', stderr: '' },
     }))).toThrow('fetch failed: status=128, signal=none, stdout="", stderr=""');
+  });
+
+  /** `rev-parse --is-shallow-repository` 만 덮어 얕은/깊은 저장소를 흉내 낸다 — 나머지는 기본 대역. */
+  function shallowRunner(shallow: string | null, seen: string[][], over: Parameters<typeof runner>[0] = {}): GitRunner {
+    const base = runner(over);
+    return (args) => {
+      seen.push([...args]);
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return shallow === null ? fail('probe') : ok(`${shallow}\n`);
+      return base(args);
+    };
+  }
+
+  test('⭐ 얕은 저장소면 base fetch 에 --depth=50 을 붙인다 (Pod --depth 50 클론 · 무제한이면 SIGTERM)', () => {
+    const seen: string[][] = [];
+    const r = syncBaseWithRemote('/r', 'feat', false, shallowRunner('true', seen));
+    expect(r).toEqual({ checkout: REMOTE, freshness: 'remote-synced' });
+    expect(seen.filter((a) => a[0] === 'fetch')).toEqual([['fetch', '--depth=50', 'origin', 'refs/heads/feat']]);
+  });
+
+  test('얕지 않은 저장소는 종전 인자 그대로다 (main·로컬 경로 불변)', () => {
+    for (const probe of ['false', null, 'garbage']) {
+      const seen: string[][] = [];
+      expect(syncBaseWithRemote('/r', 'feat', false, shallowRunner(probe, seen)).freshness).toBe('remote-synced');
+      expect(seen.filter((a) => a[0] === 'fetch')).toEqual([['fetch', 'origin', 'refs/heads/feat']]);
+    }
+  });
+
+  test('⛔ SIGTERM(timeout) 은 「timed out」 으로 말한다 — 실패와 갈린다', () => {
+    expect(() => syncBaseWithRemote('/r', 'feat', false, shallowRunner('true', [], {
+      fetch: { status: null, signal: 'SIGTERM', stdout: '', stderr: '' },
+    }))).toThrow('origin/feat exists but fetch timed out after 30s (shallow=true, depth=50): status=null, signal=SIGTERM, stdout="", stderr=""');
+    expect(() => syncBaseWithRemote('/r', 'feat', false, shallowRunner('false', [], {
+      fetch: { status: null, signal: 'SIGTERM', stdout: '', stderr: '' },
+    }))).toThrow('fetch timed out after 30s (shallow=false): status=null');
+  });
+
+  test('base.fetch 관측에 base·shallow·depth·ms·ok 가 남는다', () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      syncBaseWithRemote('/r', 'feat', false, shallowRunner('true', []));
+      const call = spy.mock.calls.find((c) => c[0] === 'git-fs.worktree' && c[1] === 'base.fetch');
+      expect(call?.[2]).toMatchObject({ base: 'feat', shallow: true, depth: 50, ok: true });
+      expect(typeof (call?.[2] as { ms?: unknown }).ms).toBe('number');
+      spy.mockClear();
+      syncBaseWithRemote('/r', 'feat', false, shallowRunner('garbage', []));
+      const unknown = spy.mock.calls.find((c) => c[0] === 'git-fs.worktree' && c[1] === 'base.fetch');
+      expect(unknown?.[2]).toMatchObject({ shallow: 'unknown', depth: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('실 git: 얕은 file:// 클론에서 다른 브랜치를 base 로 동기화하고 그 base 로 워크트리를 만든다', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'wt-shallow-base-'));
+    try {
+      const src = join(tmp, 'src');
+      git(tmp, 'init', '-q', '-b', 'main', 'src');
+      git(src, 'config', 'user.email', 't@t.t');
+      git(src, 'config', 'user.name', 't');
+      for (let i = 0; i < 3; i++) git(src, 'commit', '--allow-empty', '-qm', `m${i}`);
+      git(src, 'checkout', '-q', '-b', 'feat');
+      for (let i = 0; i < 3; i++) git(src, 'commit', '--allow-empty', '-qm', `f${i}`);
+      const featTip = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: src, encoding: 'utf8' }).stdout.trim();
+      git(src, 'checkout', '-q', 'main');
+      git(tmp, 'clone', '-q', '--depth', '1', '--branch', 'main', `file://${src}`, 'clone');
+      const clone = join(tmp, 'clone');
+      expect(spawnSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: clone, encoding: 'utf8' }).stdout.trim()).toBe('true');
+      const fetches: string[][] = [];
+      setGitCommandRunnerForTesting((cwd, args, options) => {
+        if (args[0] === 'fetch') fetches.push([...args]);
+        const result = spawnSync('git', args, { ...options, cwd });
+        return { status: result.status, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') };
+      });
+      try {
+        expect(syncBaseWithRemote(clone, 'feat', false)).toEqual({ checkout: featTip, freshness: 'remote-synced' });
+      } finally {
+        setGitCommandRunnerForTesting(undefined);
+      }
+      expect(fetches).toEqual([['fetch', '--depth=50', 'origin', 'refs/heads/feat']]);
+      const created = createWorktree({ repoRoot: clone, branch: 'child', worktreeRoot: join(tmp, 'wts'), base: 'feat' });
+      expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: created.path, encoding: 'utf8' }).stdout.trim()).toBe(featTip);
+      expect(spawnSync('git', ['merge-base', 'HEAD', featTip], { cwd: created.path, encoding: 'utf8' }).stdout.trim()).toBe(featTip);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   function remoteRepo(): { repo: string; dispose: () => void } {

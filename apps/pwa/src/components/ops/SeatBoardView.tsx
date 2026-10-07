@@ -1,8 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import { getSeats, type OpsResult, type OpsSeat, type OpsSeats } from '@/lib/ops-api';
+import { getReleaseRuns, getSeats, type OpsResult, type OpsSeat, type OpsSeats, type ReleaseRun } from '@/lib/ops-api';
+import { ReleaseStrip } from './ReleaseStrip';
 import { maskPublicRefs, seatLineIsPublicSafe, seatNowLine } from '@/lib/seat-public';
 
 const ORDER = [
@@ -58,8 +60,8 @@ function SeatCard({ seat, role, publicCapture, identifiers }: { seat?: OpsSeat; 
   </article>;
 }
 
-export function SeatBoardContent({ result, refreshedAt, publicCapture = false }: {
-  result: OpsResult<OpsSeats> | null; refreshedAt: string | null; publicCapture?: boolean;
+export function SeatBoardContent({ result, refreshedAt, publicCapture = false, releaseStrip }: {
+  result: OpsResult<OpsSeats> | null; refreshedAt: string | null; publicCapture?: boolean; releaseStrip?: React.ReactNode;
 }): React.ReactNode {
   if (result?.kind === 'forbidden') return <p>운영자만 볼 수 있습니다</p>;
   const seats = result?.kind === 'ready' ? result.data.seats : [];
@@ -73,6 +75,7 @@ export function SeatBoardContent({ result, refreshedAt, publicCapture = false }:
     return String(seats.reduce((sum, entry) => sum + (field === 'pendingDecisions' ? entry.pendingDecisions! : entry[field]!.length), 0));
   };
   return <main className={`mx-auto w-full max-w-[1920px] space-y-6 p-4 text-foreground md:p-8 ${publicCapture ? 'flex min-h-screen flex-col text-base' : ''}`}>
+    {!publicCapture && releaseStrip}
     <header><p className="text-muted-foreground">운영 / 자리 현황</p><h1 className="text-3xl font-bold">자리 현황</h1></header>
     <section aria-label="오늘 합계" className="flex flex-wrap items-center gap-x-8 gap-y-3 rounded-2xl border bg-card p-5">
       {(['landed', 'blocked', 'pendingDecisions'] as const).map((field) => {
@@ -92,6 +95,8 @@ export function SeatBoardContent({ result, refreshedAt, publicCapture = false }:
 
 export function SeatBoardView(): React.ReactNode {
   const { client } = useDaemon();
+  const router = useRouter();
+  const [releaseRuns, setReleaseRuns] = useState<OpsResult<ReleaseRun[]> | null>(null);
   const [result, setResult] = useState<OpsResult<OpsSeats> | null>(null);
   const [refreshedAt, setRefreshedAt] = useState<string | null>(null);
   const [publicCapture, setPublicCapture] = useState<boolean | null>(null);
@@ -119,6 +124,29 @@ export function SeatBoardView(): React.ReactNode {
     document.addEventListener('visibilitychange', visible);
     return () => { active = false; window.clearInterval(interval); document.removeEventListener('visibilitychange', visible); };
   }, [client]);
+  useEffect(() => {
+    if (publicCapture !== false || result?.kind === 'forbidden') return;
+    let active = true;
+    let busy = false;
+    let forbidden = false;
+    const refresh = async () => {
+      if (!active || busy || forbidden || document.hidden) return;
+      busy = true;
+      const next = await getReleaseRuns(client);
+      busy = false;
+      if (!active) return;
+      setReleaseRuns(next);
+      if (next.kind === 'forbidden') forbidden = true;
+    };
+    setReleaseRuns(null);
+    void refresh();
+    const interval = window.setInterval(() => { void refresh(); }, 10_000);
+    const visible = () => { if (!document.hidden) void refresh(); };
+    document.addEventListener('visibilitychange', visible);
+    return () => { active = false; window.clearInterval(interval); document.removeEventListener('visibilitychange', visible); };
+  }, [client, publicCapture, result?.kind === 'forbidden']);
   if (publicCapture === null) return null;
-  return <SeatBoardContent result={result} refreshedAt={refreshedAt} publicCapture={publicCapture} />;
+  const openReleaseRun = (run: ReleaseRun) => router.push(`/ops/release?run=${encodeURIComponent(run.runId)}`);
+  return <SeatBoardContent result={result} refreshedAt={refreshedAt} publicCapture={publicCapture}
+    releaseStrip={<ReleaseStrip result={releaseRuns} onSelect={openReleaseRun} />} />;
 }

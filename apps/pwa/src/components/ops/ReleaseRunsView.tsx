@@ -3,14 +3,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getReleaseNodeLog, getReleaseRuns, type OpsResult, type ReleaseRun } from '@/lib/ops-api';
+import { ReleaseStrip } from './ReleaseStrip';
 
 export function currentNodeId(run: ReleaseRun): string | undefined {
   const current = run.path.find((id) => run.nodes.find((node) => node.nodeId === id)?.ok === null);
   return current ?? run.path.at(-1);
 }
 
-export function ReleaseRunsContent({ result, version, versions = [], selectedRunId, openedNodeId, log, onVersion, onRun, onNode }: {
+export function ReleaseRunsContent({ result, version, versions = [], selectedRunId, openedNodeId, log, onVersion, onRun, onNode, releaseStrip }: {
   result: OpsResult<ReleaseRun[]> | null;
+  releaseStrip?: React.ReactNode;
   version: string;
   versions?: string[];
   selectedRunId: string | null;
@@ -28,6 +30,7 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
   if (version && !choices.includes(version)) choices.push(version);
   const current = selected && currentNodeId(selected);
   return <main className="mx-auto w-full min-w-0 max-w-4xl space-y-6 overflow-x-hidden px-4 py-6 text-foreground">
+    {releaseStrip}
     <header className="space-y-1"><p className="text-sm text-muted-foreground">운영 / 릴리스</p><h1 className="text-2xl font-semibold">릴리스</h1></header>
     <label className="block space-y-2 text-sm font-medium">판
       <input aria-label="판" list="ops-release-versions" className="block w-full max-w-xs rounded-md border bg-background p-2" value={version} onChange={(event) => onVersion(event.target.value)} placeholder="전체 판" />
@@ -71,6 +74,7 @@ export function ReleaseRunsView(): React.ReactNode {
   const [versions, setVersions] = useState<string[]>([]);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [result, setResult] = useState<OpsResult<ReleaseRun[]> | null>(null);
+  const [allRuns, setAllRuns] = useState<OpsResult<ReleaseRun[]> | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [openedNode, setOpenedNode] = useState<{ runId: string; nodeId: string } | null>(null);
   const [log, setLog] = useState<{ runId: string; nodeId: string; result: OpsResult<{ log: string }> } | null>(null);
@@ -81,11 +85,16 @@ export function ReleaseRunsView(): React.ReactNode {
   const latestRuns = useRef<ReleaseRun[]>([]);
   const priorClient = useRef(client);
   useEffect(() => {
+    const runId = new URLSearchParams(window.location?.search ?? '').get('run');
+    if (runId) setSelectedRunId(runId);
+  }, []);
+  useEffect(() => {
     let active = true;
     if (priorClient.current !== client) {
       priorClient.current = client;
       permissionDenied.current = false;
       setDenied(false);
+      setAllRuns(null);
       setVersions([]);
       newestVersion.current = null;
       setLatestVersion(null);
@@ -100,12 +109,14 @@ export function ReleaseRunsView(): React.ReactNode {
     void getReleaseRuns(client, version || undefined).then((next) => {
       if (!active || permissionDenied.current) return;
       setResult(next);
-      if (next.kind === 'forbidden') { permissionDenied.current = true; setDenied(true); }
+      if (next.kind === 'forbidden') { permissionDenied.current = true; setAllRuns(null); setDenied(true); }
       if (next.kind === 'ready') {
+        if (version === null) setAllRuns(next);
         latestRuns.current = next.data;
         setVersions((previous) => [...new Set([...previous, ...next.data.map((run) => run.version).filter((v): v is string => !!v)])]);
         if (version === null && newestVersion.current === null) {
-          newestVersion.current = next.data[0]?.version ?? null;
+          const requestedRunId = new URLSearchParams(window.location?.search ?? '').get('run');
+          newestVersion.current = next.data.find((run) => run.runId === requestedRunId)?.version ?? next.data[0]?.version ?? null;
           setLatestVersion(newestVersion.current);
         }
       }
@@ -127,7 +138,7 @@ export function ReleaseRunsView(): React.ReactNode {
       busy = false;
       if (active && !permissionDenied.current) {
         setResult(next);
-        if (next.kind === 'ready') latestRuns.current = next.data;
+        if (next.kind === 'ready') { latestRuns.current = next.data; if (version === null) setAllRuns(next); }
         if (next.kind === 'forbidden') { permissionDenied.current = true; setDenied(true); }
       }
     };
@@ -154,6 +165,10 @@ export function ReleaseRunsView(): React.ReactNode {
     setVersion(next); setSelectedRunId(null); setOpenedNode(null); setLog(null);
   }, [version, latestVersion]);
   const selectRun = (runId: string) => { logRequest.current++; setSelectedRunId(runId); setOpenedNode(null); setLog(null); };
+  const selectStripRun = (run: ReleaseRun) => {
+    if (run.version !== activeVersion) { setVersion(run.version ?? ''); setLatestVersion(null); }
+    selectRun(run.runId);
+  };
   const selectNode = (nodeId: string) => {
     if (!selected || result?.kind !== 'ready') return;
     const request = ++logRequest.current;
@@ -170,5 +185,6 @@ export function ReleaseRunsView(): React.ReactNode {
   const visibleNode = openedNode && openedNode.runId === selectedId ? openedNode.nodeId : null;
   const visibleLog = log && log.runId === selectedId && log.nodeId === visibleNode ? log.result : null;
   return <ReleaseRunsContent result={result} version={effectiveVersion} versions={versions} selectedRunId={selectedRunId} openedNodeId={visibleNode}
-    log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode} />;
+    log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode}
+    releaseStrip={<ReleaseStrip result={allRuns ?? result} onSelect={selectStripRun} />} />;
 }

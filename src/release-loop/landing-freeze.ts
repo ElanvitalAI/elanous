@@ -8,6 +8,7 @@ export interface LandingFreeze {
   startedAt: string;
   until: string | null;
   by: string;
+  holdLaunches?: boolean;
 }
 
 export function landingFreezePath(root = effectiveInstanceRoot()): string {
@@ -25,21 +26,22 @@ export function readLandingFreeze(root = effectiveInstanceRoot(), now = new Date
   const freeze = record as Partial<LandingFreeze>;
   if (typeof freeze.reason !== 'string' || typeof freeze.by !== 'string' ||
       typeof freeze.startedAt !== 'string' || !Number.isFinite(Date.parse(freeze.startedAt)) ||
-      !(freeze.until === null || (typeof freeze.until === 'string' && Number.isFinite(Date.parse(freeze.until))))) {
+      !(freeze.until === null || (typeof freeze.until === 'string' && Number.isFinite(Date.parse(freeze.until)))) ||
+      (freeze.holdLaunches !== undefined && typeof freeze.holdLaunches !== 'boolean')) {
     throw new Error(`invalid landing freeze: ${path}`);
   }
   // An expired freeze reads as «off». The file is left alone: deleting it here could race a concurrent `freeze on`
   // that just wrote a new one (only `freeze off` removes it; the next `freeze on` overwrites it).
   if (freeze.until && Date.parse(freeze.until) <= now.getTime()) return null;
-  return freeze as LandingFreeze;
+  return { ...freeze, holdLaunches: freeze.holdLaunches ?? false } as LandingFreeze;
 }
 
-export function enableLandingFreeze(opts: { reason?: string; until?: string; by?: string }, root = effectiveInstanceRoot(), now = new Date()): LandingFreeze {
+export function enableLandingFreeze(opts: { reason?: string; until?: string; by?: string; holdLaunches?: boolean }, root = effectiveInstanceRoot(), now = new Date()): LandingFreeze {
   const until = opts.until === undefined ? null : opts.until;
   if (until !== null && (!/^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d)$/.test(until) || !Number.isFinite(Date.parse(until)) || Date.parse(until) <= now.getTime())) {
     throw new Error('--until must be a future ISO timestamp with timezone');
   }
-  const freeze: LandingFreeze = { reason: opts.reason?.trim() || 'operator freeze', startedAt: now.toISOString(), until: until === null ? null : new Date(until).toISOString(), by: opts.by?.trim() || process.env.ELANOUS_TRACK || process.env.USER || 'cli' };
+  const freeze: LandingFreeze = { reason: opts.reason?.trim() || 'operator freeze', startedAt: now.toISOString(), until: until === null ? null : new Date(until).toISOString(), by: opts.by?.trim() || process.env.ELANOUS_TRACK || process.env.USER || 'cli', holdLaunches: opts.holdLaunches ?? false };
   const path = landingFreezePath(root);
   mkdirSync(root, { recursive: true });
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;

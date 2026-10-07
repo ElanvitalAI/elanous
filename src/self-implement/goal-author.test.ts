@@ -107,6 +107,13 @@ describe('goal author grade', () => {
     expect(resolveGoalAuthorGrade()).toEqual({ grade: 'full', source: 'default' });
   });
 
+  test('AUTHOR-LITE2-POD: env ELANOUS_AUTHOR_GRADE sits between flag and config; invalid env is ignored', () => {
+    expect(resolveGoalAuthorGrade(undefined, 'full', 'lite')).toEqual({ grade: 'lite', source: 'env' });
+    expect(resolveGoalAuthorGrade('full', 'lite', 'lite')).toEqual({ grade: 'full', source: 'flag' });
+    expect(resolveGoalAuthorGrade(undefined, 'lite', undefined)).toEqual({ grade: 'lite', source: 'config' });
+    expect(resolveGoalAuthorGrade(undefined, undefined, 'bogus')).toEqual({ grade: 'full', source: 'default' });
+  });
+
   test('same ask: lite omits three phases and retains falsifiable signal and pointers; default full runs them', async () => {
     const sentence = '대상 경로: src/example.ts · 체크리스트 칸 AUTHOR-LITE2. 판정선(반증): output contains signal.';
     const run = async (grade?: 'lite' | 'full') => {

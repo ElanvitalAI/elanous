@@ -387,6 +387,154 @@ test.skipIf(!CHROMIUM)('fresh exported /inside renders scene ①② at 375px, 14
   }
 }, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
 
+if (!CHROMIUM) console.warn('[skip] fold approximation /inside browser check — no Chromium/Chrome found');
+test.skipIf(!CHROMIUM)('fresh exported /inside scenes 1–6 at approximate folded outer 344px, unfolded inner 884px, and 1920px stay inside the viewport in Chromium', async () => {
+  const pwaDir = join(import.meta.dir, '../../..');
+  if (!exportedInsideIsFresh(pwaDir)) {
+    const build = spawnSync('bun', ['run', 'build'], { cwd: pwaDir, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 10_000_000 });
+    expect(build.status, build.error?.message || build.stderr || build.stdout).toBe(0);
+  }
+  const out = join(pwaDir, 'out');
+  expect(existsSync(join(out, 'inside/index.html'))).toBe(true);
+  const server = Bun.serve({ port: 0, fetch: (request) => {
+    const pathname = new URL(request.url).pathname;
+    const relative = pathname.replace(/^\/app\//, '').replace(/\/$/, '/index.html') || 'index.html';
+    if (!pathname.startsWith('/app/') || relative.includes('..')) return new Response('not found', { status: 404 });
+    const path = join(out, relative);
+    if (!existsSync(path)) return new Response('not found', { status: 404 });
+    const type = path.endsWith('.html') ? 'text/html' : path.endsWith('.css') ? 'text/css'
+      : path.endsWith('.js') ? 'application/javascript' : path.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
+    return new Response(Bun.file(path), { headers: { 'content-type': type } });
+  } });
+  const profile = mkdtempSync(join(tmpdir(), 'inside-fold-browser-'));
+  const browser = spawn(CHROMIUM!, ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: 'ignore' });
+  let socket: WebSocket | undefined;
+  try {
+    let debuggerUrl = '';
+    for (let attempt = 0; attempt < 100 && !debuggerUrl; attempt++) {
+      if (!browser.pid || browser.exitCode !== null) throw Error('Chromium exited before exposing CDP');
+      if (existsSync(join(profile, 'DevToolsActivePort'))) {
+        const port = readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0];
+        try {
+          const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as Array<{ type: string; webSocketDebuggerUrl?: string }>;
+          debuggerUrl = tabs.find((tab) => tab.type === 'page')?.webSocketDebuggerUrl ?? '';
+        } catch { /* CDP endpoint not ready yet. */ }
+      }
+      if (!debuggerUrl) await Bun.sleep(100);
+    }
+    expect(debuggerUrl).not.toBe('');
+    socket = new WebSocket(debuggerUrl);
+    await new Promise<void>((resolve, reject) => { socket!.onopen = () => resolve(); socket!.onerror = () => reject(Error('CDP connection failed')); });
+    let id = 0;
+    const pending = new Map<number, (result: { result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }) => void>();
+    socket.onmessage = (event) => {
+      const reply = JSON.parse(String(event.data)) as { id?: number; result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown };
+      if (reply.id && pending.has(reply.id)) { pending.get(reply.id)!(reply); pending.delete(reply.id); }
+    };
+    const send = (method: string, params: object = {}) => new Promise<{ result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }>((resolve) => {
+      const next = ++id;
+      pending.set(next, resolve);
+      socket!.send(JSON.stringify({ id: next, method, params }));
+    });
+    await send('Page.enable');
+    await send('Runtime.enable');
+    const url = `http://127.0.0.1:${server.port}/app/inside/?demo=0`;
+    for (const width of [344, 884, 1920]) {
+      await send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false });
+      await send('Page.navigate', { url });
+      for (const scene of [1, 2, 3, 4, 5, 6]) {
+        let measured: { scrollWidth: number; clientWidth: number; navLeft: number; navRight: number; navVisible: boolean; contentVisible: boolean; clipped: string[] } | undefined;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const response = await send('Runtime.evaluate', { expression: `(() => {
+            const stage = document.querySelector('[data-inside-page]');
+            const buttons = stage?.querySelector('nav')?.querySelectorAll('button');
+            const active = stage?.querySelector('[data-inside-scene="${scene}"]');
+            if (location.pathname !== '/app/inside/' || buttons?.length !== 6 ||
+                !active || active.hidden || buttons[${scene - 1}].getAttribute('aria-current') !== 'page') return null;
+            const nav = stage.querySelector('nav');
+            const box = nav.getBoundingClientRect();
+            const anchors = {
+              1: ['[data-architecture-scene] h2', '[data-architecture-scene] details summary'],
+              2: ['[aria-label="라이브 트레이스"] p'],
+              3: ['[aria-label="루프 에이전트 보기"] button', '[aria-label="루프 에이전트 활동"] article', '[aria-label="지금 도는 런"] p'],
+              4: ['[aria-label="그래프 편집 모드"] button', '[aria-label="실행 그래프 목록"]', '[aria-label="실행 그래프 캔버스"]'],
+              5: ['[aria-label="마법사 → 마켓"] p', '[aria-label="마법사 → 마켓"] code'],
+              6: ['[aria-label="PTY 인텔리전스"] h2', '[aria-label="PTY 인텔리전스"] p'],
+            }[${scene}];
+            const viewport = document.documentElement.clientWidth;
+            const clipped = [];
+            let contentVisible = true;
+            for (const selector of anchors) {
+              const items = [...active.querySelectorAll(selector)];
+              if (!items.length) { contentVisible = false; clipped.push('missing ' + selector); continue; }
+              for (const item of items) {
+                const rect = item.getBoundingClientRect();
+                const style = getComputedStyle(item);
+                if (!item.getClientRects().length || style.visibility !== 'visible' || style.display === 'none' ||
+                    (selector !== '[aria-label="실행 그래프 캔버스"]' && !item.textContent.trim()) ||
+                    rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.left >= viewport) {
+                  contentVisible = false;
+                  clipped.push('invisible ' + selector);
+                  continue;
+                }
+                let left = 0, right = viewport;
+                let scrollable = false;
+                for (let parent = item.parentElement; parent; parent = parent.parentElement) {
+                  const overflow = getComputedStyle(parent).overflowX;
+                  if (!['hidden', 'clip', 'auto', 'scroll'].includes(overflow)) continue;
+                  const bounds = parent.getBoundingClientRect();
+                  if ((overflow === 'auto' || overflow === 'scroll') && parent.scrollWidth > parent.clientWidth) {
+                    if (bounds.left < right && bounds.right > left) scrollable = true;
+                    continue;
+                  }
+                  left = Math.max(left, bounds.left);
+                  right = Math.min(right, bounds.right);
+                }
+                if ((rect.left < left - 1 || rect.right > right + 1) && !scrollable)
+                  clipped.push(selector + ' ' + Math.round(rect.left) + '..' + Math.round(rect.right) + ' outside ' + Math.round(left) + '..' + Math.round(right));
+                if (scrollable && selector === '[aria-label="실행 그래프 캔버스"]') {
+                  const panel = item.closest('[role="tabpanel"]');
+                  const old = panel.scrollLeft;
+                  panel.scrollLeft = panel.scrollWidth;
+                  if (panel.scrollLeft <= old) clipped.push('editor content cannot be scrolled into view');
+                  panel.scrollLeft = old;
+                }
+              }
+            }
+            return { scrollWidth: document.documentElement.scrollWidth, clientWidth: viewport,
+              navLeft: box.left, navRight: box.right, navVisible: box.width > 0 && box.height > 0, contentVisible, clipped };
+          })()`, returnByValue: true });
+          expect(response.error).toBeUndefined();
+          expect(response.result?.exceptionDetails).toBeUndefined();
+          measured = response.result?.result?.value as typeof measured;
+          if (measured) break;
+          await Bun.sleep(100);
+        }
+        if (!measured) {
+          const diagnostic = await send('Runtime.evaluate', { expression: `({ href: location.href, text: document.body.innerText.slice(0, 400), stage: !!document.querySelector('[data-inside-page]'), active: !!document.querySelector('[data-inside-scene="${scene}"]'), buttons: [...document.querySelectorAll('[data-inside-page] nav button')].map(button => button.getAttribute('aria-current')) })`, returnByValue: true });
+          throw Error(`browser scene ${scene} at ${width}: ${JSON.stringify(diagnostic.result?.result?.value)}`);
+        }
+        const label = `scene ${scene} at ${width}px: scrollWidth ${measured.scrollWidth}`;
+        expect(measured.clientWidth, label).toBe(width);
+        expect(measured.scrollWidth, label).toBeLessThanOrEqual(measured.clientWidth);
+        expect(measured.navVisible && measured.navLeft >= 0 && measured.navRight <= measured.clientWidth, label).toBe(true);
+        expect(measured.contentVisible, `${label}: ${measured.clipped.join('; ')}`).toBe(true);
+        expect(measured.clipped, label).toEqual([]);
+        if (scene < 6) {
+          const click = await send('Runtime.evaluate', { expression: `document.querySelectorAll('[data-inside-page] nav button')[${scene}].click()` });
+          expect(click.error, label).toBeUndefined();
+          expect(click.result?.exceptionDetails, label).toBeUndefined();
+        }
+      }
+    }
+  } finally {
+    socket?.close();
+    browser.kill();
+    server.stop(true);
+    rmSync(profile, { recursive: true, force: true });
+  }
+}, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
+
 test('architecture cells expand to show documented paths with at least 18px base text', async () => {
   await render();
   const stage = host.querySelector('main')!;

@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
 import { pickRange } from './lib.js';
 
@@ -117,6 +117,67 @@ export function fixedCountAssertions(testPath: string, root: string): Array<{ li
   };
   visit(source);
   return assertions.sort((a, b) => a.line - b.line);
+}
+
+// Read module specifiers from syntax, not from comments or strings; re-exports count for non-test importers.
+function directImports(file: string, includeReexports = false): string[] {
+  const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+  const imports: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) imports.push(node.moduleSpecifier.text);
+    if (includeReexports && ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier))
+      imports.push(node.moduleSpecifier.text);
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0]!)) imports.push(node.arguments[0]!.text);
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return imports;
+}
+
+/** Directly imported repository modules with no direct, tracked, non-test importer. */
+export function unreachableImports(testPath: string, root: string, deps: {
+  importers?: (modulePath: string, root: string) => string[];
+} = {}): string[] {
+  const repo = realpathSync(resolve(root));
+  const inside = (path: string) => path !== repo && !relative(repo, path).startsWith(`..${sep}`)
+    && relative(repo, path) !== '..' && !isAbsolute(relative(repo, path));
+  const validFile = (path: string) => inside(path) && existsSync(path) && realpathSync(path) === path && statSync(path).isFile();
+  const isTest = (path: string) => path.endsWith('.test.ts') || path === 'test' || path.startsWith(`test${sep}`);
+  const testFile = resolve(repo, testPath);
+  if (!validFile(testFile)) throw new Error('test path outside repository or symlinked');
+  const resolveImport = (from: string, specifier: string): string | undefined => {
+    if (!/^\.{1,2}\//.test(specifier)) return undefined;
+    const base = resolve(dirname(from), specifier);
+    const candidates = base.endsWith('.js')
+      ? [base.replace(/\.js$/, '.ts'), base, `${base}.ts`, join(base, 'index.ts')]
+      : [base, `${base}.ts`, join(base, 'index.ts')];
+    return candidates.find(validFile);
+  };
+  const importers = deps.importers ?? ((modulePath: string, rootPath: string): string[] => {
+    const stem = basename(modulePath).replace(/\.[^.]+$/, '');
+    const needles = stem === 'index' ? [stem, basename(dirname(modulePath))] : [stem];
+    const matches = new Set<string>();
+    for (const needle of needles) {
+      const found = spawnSync('git', ['-C', rootPath, 'grep', '-l', '-F', '--', needle], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      if (found.error || (found.status !== 0 && found.status !== 1)) throw new Error(`importer lookup failed: ${found.error?.message ?? found.stderr}`);
+      for (const file of found.stdout.split('\n').filter(Boolean)) matches.add(file);
+    }
+    return [...matches];
+  });
+  const sources = new Set(directImports(testFile).map((specifier) => resolveImport(testFile, specifier))
+    .filter((path): path is string => path !== undefined && !isTest(relative(repo, path))));
+  const unreachable: string[] = [];
+  for (const source of sources) {
+    const modulePath = relative(repo, source);
+    const used = importers(modulePath, repo).some((candidate) => {
+      const path = resolve(repo, candidate);
+      if (!validFile(path) || isTest(relative(repo, path)) || path === source) return false;
+      return directImports(path, true).some((specifier) => resolveImport(path, specifier) === source);
+    });
+    if (!used) unreachable.push(modulePath.split(sep).join('/'));
+  }
+  return unreachable.sort();
 }
 
 export function mutationProbe(file: string, deps: { root: string; run?: (root: string, file: string) => number | null; baselineStable?: boolean }): Mutation {

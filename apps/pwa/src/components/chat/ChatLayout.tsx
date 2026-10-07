@@ -3,12 +3,15 @@
 import { HideInPublicCapture } from '@/lib/public-capture';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from 'react';
 import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
+import Link from 'next/link';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { NowSpeakButton } from './NowSpeakButton';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
+import { MobileChatStatus } from './MobileChatStatus';
+import type { ShellActivitySnapshot } from '@/components/shell/activity-snapshot';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
@@ -73,11 +76,17 @@ export interface ChatLayoutProps {
   tabId?: string;
   /** Compact header's conversation navigation, supplied by the standalone chat panel. */
   leading?: ReactNode;
+  mobileSimple?: boolean;
+  mobileActivity?: ShellActivitySnapshot;
+  conversationButton?: ReactNode;
 }
 
 export function ChatLayout(props: ChatLayoutProps = {}) {
   const { compact } = useCompactMode();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [approvalCount, setApprovalCount] = useState(0);
+  const [decisionCount, setDecisionCount] = useState(0);
   const moreRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!moreOpen) return;
@@ -1150,7 +1159,28 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   return (
     <div className="relative flex h-full flex-col" onPaste={handlePaste} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} onDragOver={handleDragOver} onDrop={handleDrop}>
       {dropOverlay.visible && <ChatDropOverlay />}
-      {compact ? (
+      {props.mobileSimple && compact && <MobileChatStatus activity={props.mobileActivity ?? { kind: 'loading' }} decisions={decisionCount} menu={
+        <div ref={moreRef} className="relative shrink-0">
+          <button type="button" aria-label="채팅 메뉴" aria-expanded={moreOpen} aria-controls="chat-mobile-menu" onClick={() => setMoreOpen((open) => !open)} className="rounded-lg p-1 hover:bg-muted">
+            <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
+          </button>
+          {moreOpen && <div id="chat-mobile-menu" className="absolute right-0 top-full z-50 mt-2 flex max-h-[70dvh] w-[min(19rem,calc(100vw-1rem))] flex-col gap-2 overflow-y-auto rounded-lg border border-border bg-popover p-3 shadow-lg">
+            <nav aria-label="채팅 이동" className="flex gap-3 text-sm">
+              <Link href="/" className="rounded px-2 py-1 hover:bg-muted">홈</Link>
+              <Link href="/workspace" className="rounded px-2 py-1 hover:bg-muted">워크스페이스</Link>
+              <Link href="/settings" className="rounded px-2 py-1 hover:bg-muted">설정</Link>
+            </nav>
+            {props.conversationButton}
+            <SessionPill sessionId={sessionId} {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})} {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})} />
+            <ChatCurrentProject compact />
+            <NowSpeakButton />
+            <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
+            <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
+            {voiceButton}
+          </div>}
+        </div>
+      } />}
+      {compact && !props.mobileSimple ? (
         <div data-elanous-chat-compact-header="" className="flex h-11 max-h-11 min-w-0 shrink-0 items-center gap-2 border-b border-border bg-background px-3 whitespace-nowrap">
           {props.leading && <div className="shrink-0">{props.leading}</div>}
           <div className="min-w-0 flex-1 [&>div]:min-w-0 [&>div]:max-w-full [&>div>div:first-child]:min-w-0 [&>div>div:first-child]:max-w-full [&>div>div:first-child]:overflow-hidden [&>div>div:first-child>span:last-child]:shrink-0 [&>div>div:first-child_span]:min-w-0 [&>div>div:first-child_span]:truncate [&>div>div[role=menu]]:max-w-[calc(100vw-4rem)]">
@@ -1175,7 +1205,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             )}
           </div>
         </div>
-      ) : (
+      ) : !(props.mobileSimple && compact) ? (
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-4 py-2">
           <div className="flex items-center gap-2">
             <SessionPill
@@ -1188,19 +1218,30 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           </div>
           <div className="flex min-w-0 items-center gap-2"><ChatCurrentProject /><NowSpeakButton />{voiceButton}</div>
         </div>
+      ) : null}
+      {!(props.mobileSimple && compact) && <SeatsNowStrip />}
+      {props.mobileSimple && compact && (approvalCount + decisionCount > 0) && (
+        <div className="shrink-0 px-3 py-1.5">
+          <button type="button" aria-expanded={actionsOpen} aria-controls="chat-mobile-actions" onClick={() => setActionsOpen((open) => !open)} className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium">
+            승인·결정 {approvalCount + decisionCount}
+          </button>
+        </div>
       )}
-      <SeatsNowStrip />
-      <ChatApprovalsChip />
-      <ChatDecisionsChip />
+      {props.mobileSimple && compact ? (
+        <div id="chat-mobile-actions">
+          <ChatApprovalsChip mobileOpen={actionsOpen} onCount={setApprovalCount} />
+          <ChatDecisionsChip mobileOpen={actionsOpen} onCount={setDecisionCount} />
+        </div>
+      ) : <><ChatApprovalsChip /><ChatDecisionsChip /></>}
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}
-      <ChatHud />
+      {!(props.mobileSimple && compact) && <ChatHud />}
       {/* Phase 3 (voice 일원화) — relative + flex column wrapper 가
           VoiceOverlay 의 absolute positioning 컨텍스트 + ChatHistory 의
           flex-1 sizing 을 동시에 만족. voice 활성 시 overlay 가 fade-in. */}
       <div className="relative flex flex-1 min-h-0 flex-col">
-        <ChatHistory messages={messages} pending={pending} {...(props.tabId ? { tabId: props.tabId } : {})} />
+        <ChatHistory messages={messages} pending={pending} mobileSimple={!!(props.mobileSimple && compact)} {...(props.tabId ? { tabId: props.tabId } : {})} />
         {turnBusyBanner && (
           <div
             role="alert"

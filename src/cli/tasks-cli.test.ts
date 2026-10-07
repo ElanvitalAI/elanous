@@ -126,7 +126,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['list', 'show', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['list', 'hand', 'advance', 'show', 'approve']);
 });
 
 test('an isolated universe without an acp-token still lists — no Authorization header is sent', async () => {

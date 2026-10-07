@@ -15,6 +15,7 @@ import { afterAll, describe, expect, mock, test } from 'bun:test';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
 import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import type { DaemonTerminalRenameResult, DaemonTerminalSummary } from '@/lib/daemon-client';
+import { takeStickyModifiers } from './terminal-input-registry';
 
 const require = createRequire(import.meta.url);
 // ⛔ The `react` module is NOT mocked — see react-hook-harness.ts. Hooks are driven
@@ -41,7 +42,8 @@ mock.module('sonner', () => ({ toast: {
 } }));
 const debugEvents: string[] = [];
 mock.module('@/lib/debug', () => ({ debugLog: (event: string) => { debugEvents.push(event); } }));
-mock.module('@/lib/use-pointer-capability', () => ({ usePointerCapability: () => ({ isCoarsePointer: false }) }));
+let coarsePointer = false;
+mock.module('@/lib/use-pointer-capability', () => ({ usePointerCapability: () => ({ isCoarsePointer: coarsePointer }) }));
 mock.module('@/lib/secure-context-guard', () => ({ checkSecureContext: () => ({ isSecure: true }) }));
 let onVoiceTranscript: ((text: string) => void) | undefined;
 mock.module('@/voice/use-voice-controller', () => ({
@@ -161,6 +163,38 @@ async function selectTheOnlyRow(): Promise<string> {
   await harness.settle();
   return text;
 }
+
+describe('TerminalPanel · modifier bar placement', () => {
+  test('coarse-pointer bar targets the selected shell terminal, including after a tab switch', async () => {
+    coarsePointer = true;
+    const priorDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { addEventListener() {}, removeEventListener() {} } });
+    try {
+      listed = [LOCAL];
+      await renderPanel();
+      const { ModifierBar } = await import('./ModifierBar');
+      const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+      harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('sticky-shell-a'));
+      await harness.settle();
+      expect(harness.find((element) => element.type === ModifierBar).props.terminalId).toBe('sticky-shell-a');
+      harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('sticky-shell-b'));
+      await harness.settle();
+      const selectedId = harness.find((element) => element.type === ModifierBar).props.terminalId as string;
+      expect(selectedId).toBe('sticky-shell-b');
+      harness.unmount();
+      harness.render(() => ModifierBar({ terminalId: selectedId }));
+      click(harness.find((element) => element.props['data-testid'] === 'modbar-ctrl'));
+      expect(takeStickyModifiers('sticky-shell-a')).toBeNull();
+      expect(takeStickyModifiers(selectedId)).toEqual({ ctrl: true, alt: false });
+      expect(harness.find((element) => element.props['data-testid'] === 'modbar-ctrl').props['aria-pressed']).toBe(false);
+    } finally {
+      coarsePointer = false;
+      harness.unmount();
+      if (priorDocument) Object.defineProperty(globalThis, 'document', priorDocument);
+      else delete (globalThis as { document?: unknown }).document;
+    }
+  });
+});
 
 describe('TerminalPanel · voice controls input', () => {
   test('sends trimmed dictation plus a space through the selected terminal\'s registered input sender', async () => {

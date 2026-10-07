@@ -3,7 +3,7 @@ import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { createRequire } from 'node:module';
 
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
-import { sendToTerminal } from './terminal-input-registry';
+import { sendToTerminal, setStickyModifiers, takeStickyModifiers } from './terminal-input-registry';
 import { COMPACT_MAX_WIDTH } from '@/lib/compact-mode';
 import { TERM_FOCUS_DISABLED_KEY } from '@/lib/term-focus';
 
@@ -311,6 +311,52 @@ describe('XtermView terminal input routing', () => {
       { data: 'keyboard', sessionId: 's1' },
     ]);
     harness.unmount();
+  });
+
+  test('onData consumes this terminal modifier once immediately before sending and leaves other terminal armed', async () => {
+    resetState();
+    const sent: string[] = [];
+    sendInput = async (data) => { sent.push(data); return {}; };
+    render('terminal-a');
+    await harness.settle();
+    try {
+      setStickyModifiers('terminal-a', { ctrl: true, alt: false });
+      setStickyModifiers('terminal-b', { ctrl: false, alt: true });
+      onTerminalData?.('c');
+      onTerminalData?.('d');
+      await harness.settle();
+      expect(sent).toEqual(['\x03', 'd']);
+      expect(takeStickyModifiers('terminal-a')).toBeNull();
+      expect(takeStickyModifiers('terminal-b')).toEqual({ ctrl: false, alt: true });
+      expect(logs.filter(({ event }) => event === 'webterm.modbar.sticky-applied')).toEqual([
+        { event: 'webterm.modbar.sticky-applied', details: { ctrl: true, alt: false, bytes: 1 } },
+      ]);
+    } finally {
+      setStickyModifiers('terminal-a', { ctrl: false, alt: false });
+      setStickyModifiers('terminal-b', { ctrl: false, alt: false });
+      harness.unmount();
+    }
+  });
+
+  test('a focus report or paste does not consume the armed modifier; the next typed key does', async () => {
+    resetState();
+    const sent: string[] = [];
+    sendInput = async (data) => { sent.push(data); return {}; };
+    render('terminal-a');
+    await harness.settle();
+    try {
+      setStickyModifiers('terminal-a', { ctrl: true, alt: false });
+      onTerminalData?.('\x1b[I');
+      onTerminalData?.('pasted text');
+      onTerminalData?.('c');
+      onTerminalData?.('c');
+      await harness.settle();
+      expect(sent).toEqual(['\x1b[I', 'pasted text', '\x03', 'c']);
+      expect(takeStickyModifiers('terminal-a')).toBeNull();
+    } finally {
+      setStickyModifiers('terminal-a', { ctrl: false, alt: false });
+      harness.unmount();
+    }
   });
 
   test('queues routed input before ACP connects and drains it in order', async () => {

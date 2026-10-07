@@ -20,6 +20,9 @@ import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 
 const GIT_TIMEOUT_MS = 30_000;
+/** 얕은 클론(Pod `git clone --depth 50` · docker/harness/job.yaml)에서 base 를 가져올 깊이 — 클론과 같은 값.
+ *  ⛔ 깊이 없이 얕은 저장소로 다른 브랜치를 fetch 하면 그 브랜치의 «전 이력»을 받는다(실측 193s vs 4s · 30s 에 SIGTERM). */
+const SHALLOW_BASE_FETCH_DEPTH = 50;
 const WORKTREE_ADD_TIMEOUT_MS = 5 * 60_000;
 
 export interface WorktreeAddDeps {
@@ -439,14 +442,31 @@ export function syncBaseWithRemote(
   // 원격이 "그런 브랜치 없다" 고 답했다 ⇒ 축약 hex 여도 모호하지 않다.
   if (!hasRemote) return asSha(false) ?? { checkout: base, freshness: 'local-only' };
 
+  // ⭐ 얕은 저장소면 깊이를 묶는다 — 아니면 그 브랜치의 전 이력을 받느라 GIT_TIMEOUT_MS 를 넘긴다
+  //    (Pod 클론은 `--depth 50` · 비-main base 런이 전부 여기서 SIGTERM 으로 죽었다). 받은 tip 에서 갈리므로
+  //    이후 merge-base(HEAD ↔ 그 tip)는 tip 자체라 깊이 50 으로 족하다. 얕지 않으면 종전 인자 그대로다.
+  //    probe 를 못 읽으면 종전 경로로 간다(값은 'unknown' 으로 관측에 남긴다).
+  const shallowProbe = git('rev-parse', '--is-shallow-repository');
+  const shallowAnswer = shallowProbe.status === 0 ? (shallowProbe.stdout || '').trim() : '';
+  const shallow: boolean | 'unknown' = shallowAnswer === 'true' ? true : shallowAnswer === 'false' ? false : 'unknown';
+  const depth = shallow === true ? SHALLOW_BASE_FETCH_DEPTH : null;
+  const fetchArgs = depth === null ? ['fetch', 'origin', wanted] : ['fetch', `--depth=${depth}`, 'origin', wanted];
+  const fetchStartedAt = Date.now();
   // Only the no-runner fallback joins the shared retry seam; injected runners remain
   // an exact test/caller seam with their prior command count.
   const fetched = runner
-    ? git('fetch', 'origin', wanted)
-    : runGitCommand(repoRoot, ['fetch', 'origin', wanted], { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
+    ? git(...fetchArgs)
+    : runGitCommand(repoRoot, fetchArgs, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
+  const fetchMs = Date.now() - fetchStartedAt;
+  debug.log('git-fs.worktree', 'base.fetch', { base, shallow, depth, ms: fetchMs, ok: fetched.status === 0, signal: fetched.signal ?? null }, fetched.status === 0 ? undefined : { level: 'warn' });
   if (fetched.status !== 0) {
     // origin 에 있는 것을 확인했는데 못 가져왔다 ⇒ 낡은 로컬로 진행하면 조용히 틀린다.
-    throw new Error(`git worktree base sync failed — origin/${remoteBranch} exists but fetch failed: status=${fetched.status}, signal=${fetched.signal ?? 'none'}, stdout=${JSON.stringify((fetched.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((fetched.stderr || '').trim().slice(0, 200))}`);
+    // spawnSync 의 timeout 은 SIGTERM 으로 끝난다 — 「실패」와 「시간 초과」를 문면에서 가른다.
+    const timedOut = fetched.status === null && fetched.signal === 'SIGTERM';
+    const what = timedOut
+      ? `fetch timed out after ${GIT_TIMEOUT_MS / 1000}s (shallow=${shallow}${depth === null ? '' : `, depth=${depth}`})`
+      : 'fetch failed';
+    throw new Error(`git worktree base sync failed — origin/${remoteBranch} exists but ${what}: status=${fetched.status}, signal=${fetched.signal ?? 'none'}, stdout=${JSON.stringify((fetched.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((fetched.stderr || '').trim().slice(0, 200))}`);
   }
   // ⭐ **가져온 것**에서 갈린다(리뷰 must-fix ②) — ls-remote 로 먼저 읽은 SHA 를 쓰면 그 사이 원격이
   //    전진했을 때 "원격 tip" 계약이 깨진다. FETCH_HEAD 가 방금 받은 tip 이다.

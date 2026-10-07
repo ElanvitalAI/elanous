@@ -10,6 +10,7 @@ import * as childProcess from 'node:child_process';
 import type { SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { parsePodArtifactChunks } from './pod-artifact-return.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { enableLandingFreeze } from '../../release-loop/landing-freeze.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
@@ -684,6 +685,17 @@ describe('pod memory evidence', () => {
     expect(script).not.toContain('--author-grade');
   });
 
+  test('AUTHOR-LITE2-POD: authorOnPod carries the grade as ELANOUS_AUTHOR_GRADE, never as a flag; absent grade emits no env', () => {
+    const base = { name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, authorSentence: true } as const;
+    type Manifest = { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+    const withGrade = (podJobManifest({ ...base, authorGrade: 'lite' }) as Manifest).spec.template.spec.containers[0]!.args[0]!;
+    expect(withGrade).toContain('ELANOUS_AUTHOR_GRADE=lite');
+    expect(withGrade).toContain('ELANOUS_AUTHOR_GRADE=lite elanous harness say --substrate local --json');
+    expect(withGrade).not.toContain('--author-grade');
+    const withoutGrade = (podJobManifest(base) as Manifest).spec.template.spec.containers[0]!.args[0]!;
+    expect(withoutGrade.split('ELANOUS_AUTHOR_GRADE').length - 1).toBe(0);
+  });
+
   test('sampler follows setup, precedes both harness routes, redacts argv and leaves exit unchanged', () => {
     for (const goalDoc of [undefined, 'GOAL.md']) {
       const manifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, ...(goalDoc ? { goalDoc } : {}) }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
@@ -1005,6 +1017,55 @@ describe('podSelfImplementSpawn', () => {
     expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
   });
 
+  describe('FREEZE-POD: the host is the only merger of a Pod run, so its landing freeze holds Pod runs', () => {
+    const head = 'a'.repeat(40); const base = 'c'.repeat(40);
+    const regateDeps = (ghCalls: string[]) => ({
+      command: (bin: string, args: readonly string[]) => {
+        const call = `${bin} ${args.join(' ')}`; ghCalls.push(call);
+        if (call === 'gh pr view 9 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false }), stderr: '' };
+        if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: ghCalls.at(-2) === 'git fetch origin refs/heads/main' ? base : head, stderr: '' };
+        if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
+        if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
+        if (call.startsWith('git merge-base')) return { status: 0, stdout: 'b'.repeat(40), stderr: '' };
+        if (call.startsWith('git diff --name-only')) return { status: 0, stdout: 'src/x.ts\n', stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      makeTemp: () => mkdtempSync(join(tmpdir(), 'pod-freeze-regate-')), removeTemp: (path: string) => rmSync(path, { recursive: true, force: true }), acquire: async () => () => {}, interference: async () => ({ passed: true }), log: () => {},
+    });
+    const runFrozen = async (when: 'at-spawn' | 'mid-run') => {
+      const { runHostRegate } = await import('../../self-implement/host-regate.js');
+      const freezeRoot = mkdtempSync(join(tmpdir(), 'pod-freeze-root-'));
+      const prodFreezeRoot = mkdtempSync(join(tmpdir(), 'pod-freeze-prod-'));
+      if (when === 'at-spawn') enableLandingFreeze({ reason: 'drill', by: 'OP' }, freezeRoot);
+      const ghCalls: string[] = [];
+      const events: Array<{ event: string; data: unknown }> = [];
+      const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => { if (category === 'self-implement.pod') events.push({ event, data }); }) as typeof debug.log);
+      try {
+        const json = JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 9, checkedHeadCommit: head });
+        const { k, calls } = fakeKubectl(['Complete'], `${json}\n`);
+        const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, hostRegate: (request) => {
+          if (when === 'mid-run') enableLandingFreeze({ reason: 'drill', by: 'OP' }, freezeRoot);
+          return runHostRegate(request, { ...regateDeps(ghCalls), freezeRoot, prodFreezeRoot });
+        } })({ feature: `freeze ${when}`, spaceId: `pod-freeze-${when}`, autoMerge: true }).done;
+        const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!))[1];
+        return { r, ghCalls, events, script: job.spec.template.spec.containers[0].args[0] as string };
+      } finally {
+        spy.mockRestore();
+        rmSync(freezeRoot, { recursive: true, force: true }); rmSync(prodFreezeRoot, { recursive: true, force: true });
+      }
+    };
+
+    for (const when of ['at-spawn', 'mid-run'] as const) {
+      test(`freeze ${when}: the Pod child is routed to host merge and the host keeps the PR open (no gh merge)`, async () => {
+        const { r, ghCalls, events, script } = await runFrozen(when);
+        expect(script).toContain("'--merge-by-host'");
+        expect(ghCalls.some((c) => c.startsWith('gh pr merge'))).toBe(false);
+        expect(r.disposition).toMatchObject({ stage: 'pr-opened', merged: false, hostRegate: { status: 'frozen' } });
+        expect(events.filter((e) => e.event === 'merge-blocked-by-freeze')).toEqual([{ event: 'merge-blocked-by-freeze', data: expect.objectContaining({ pr: 9, reason: 'landing-freeze' }) }]);
+      });
+    }
+  });
+
   test('frozen host regate keeps ready PR open without treating it as merged or failed', async () => {
     const headCommit = 'b'.repeat(40);
     const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 8, checkedHeadCommit: headCommit }));
@@ -1159,6 +1220,53 @@ describe('podSelfImplementSpawn', () => {
         expect(command.includes('--no-supervise')).toBe(hostSupervised !== false);
       }
     } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // POD-NORESULT ⓑ (10-07): si-task-71f68d57f6b7 printed its {kind:"self"} result, then `[graph] collect …` on stderr;
+  // the last-line-only flatten skipped it and the host kept ok:false with no stage or PR number.
+  test('a failed harness ask whose result line is followed by stderr still ends with the flat result the host reads', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-noresult-'));
+    const out = mkdtempSync(join(tmpdir(), 'pod-noresult-out-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/ASK-noresult.md';
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), '# goal');
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal } })({ feature: 'goal', spaceId: 'pod-noresult' }).done;
+      const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+      const command = (job.spec.template.spec.containers[0].args[0] as string).split('\n').find((line) => line.startsWith('elanous harness ask '))!;
+      const outputFile = join(out, 'si.out');
+      const bin = join(out, 'bin');
+      mkdirSync(bin);
+      const entry = join(out, 'run-ask.ts');
+      writeFileSync(entry, `import { program, setRunDevAskFromGoalFileDepsForTesting } from ${JSON.stringify(import.meta.dir + '/../../index.ts')};\n`
+        + `setRunDevAskFromGoalFileDepsForTesting({\n`
+        + `  loadDevCli: async () => ({ assertDevCliPathOptions: () => {}, selectDevAuthorInput: (_args: unknown, opts: { ask: string }) => ({ kind: 'ask', value: opts.ask }), buildDevCliSpec: (input: unknown) => ({ input }), startDraftTriage: () => {} }),\n`
+        + `  runAskFileLaunchFlow: async () => ({ kind: 'launch', goalFile: ${JSON.stringify(goal)} }),\n`
+        + `  loadDevPipeline: async () => ({ runDevPipeline: async () => ({ kind: 'self', result: { ok: false, stage: 'review-blocked', node: 'rework', outcome: 'budget-exhausted', prNumber: 24563, prUrl: 'https://github.com/o/r/pull/24563' }, plan: {} }), devResultOk: () => false }),\n`
+        + `  setExitCode: (code: number) => { process.exitCode = code; },\n`
+        + `});\nawait program.parseAsync(['node', 'elanous', ...process.argv.slice(2)]);\n`
+        + `console.error('[graph] collect start (0.00s)');\nconsole.error('[graph] collect fail (9.07s)');\n`);
+      writeFileSync(join(bin, 'elanous'), `#!/bin/sh\nexec bun ${JSON.stringify(entry)} "$@"\n`);
+      chmodSync(join(bin, 'elanous'), 0o755);
+      const launched = Bun.spawnSync(['bash', '-c', `${command.replaceAll('/tmp/si.out', outputFile)}\nexit $rc`], { cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ELANOUS_STATE_DIR: out, ELANOUS_CONFIG_DIR: out } });
+      expect(launched.exitCode).toBe(2);
+      const jobLog = readFileSync(outputFile, 'utf8');
+      const lines = jobLog.trimEnd().split('\n');
+      expect(lines.filter((line) => line.includes('"kind":"self"'))).toHaveLength(1);
+      expect(lines.indexOf('[graph] collect fail (9.07s)')).toBeGreaterThan(lines.findIndex((line) => line.includes('"kind":"self"')));
+      const last = JSON.parse(lines.at(-1)!);
+      expect(last).toMatchObject({ ok: false, stage: 'review-blocked', prNumber: 24563, prUrl: 'https://github.com/o/r/pull/24563' });
+      expect(Object.hasOwn(last, 'kind')).toBe(false);
+      expect(lines.filter((line) => line.startsWith('{"ok":false,"stage":"review-blocked"'))).toHaveLength(1);
+      const { k: failedKubectl } = fakeKubectl(['Failed'], jobLog);
+      const failed = await podSelfImplementSpawn({ kubectl: failedKubectl, credentials: CREDS, env: {} })({ feature: 'goal', spaceId: 'pod-noresult-host' }).done;
+      expect(failed.exitCode).toBe(1);
+      expect(failed.disposition).toMatchObject({ ok: false, stage: 'review-blocked', prNumber: 24563, prUrl: 'https://github.com/o/r/pull/24563' });
+    } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); rmSync(out, { recursive: true, force: true }); }
   });
 
   test('goal-doc spawn preserves the top-level ask but runs distinct shards by their feature', async () => {
@@ -1680,9 +1788,31 @@ describe('podSelfImplementSpawn', () => {
     } });
     try {
       const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'last-result-line' }).done;
-      expect(result.error?.message).toContain('childError=no-result-line');
+      // POD-NORESULT: the last result row was read (stage merged) — it is «result without error», not a missing line.
+      expect(result.error?.message).toContain('childStage=merged');
+      expect(result.error?.message).not.toContain('no-result-line');
       expect(result.error?.message).not.toContain('earlier failure');
-      expect(finished[0]).toMatchObject({ childError: 'no-result-line' });
+      expect(finished[0]).toMatchObject({ childStage: 'merged', childError: 'result-without-error' });
+    } finally { off(); }
+  });
+
+  test('POD-NORESULT: a failed Job whose result row names a stage and PR without error text reports them instead of «unreadable»', async () => {
+    // The real shape (run-111041d1 · 10-06): the child's result row names a stage and PR but carries no error text,
+    // so lastPodChildFailure finds nothing and the old reason fell back to «사유 못 읽음».
+    const row = JSON.stringify({ stage: 'review-blocked', ok: false, prUrl: 'https://github.com/o/r/pull/24496', prNumber: 24496 });
+    const { k } = fakeKubectl(['Failed'], `progress line\n${row}\n`);
+    const reasons: string[] = [];
+    const off = debug.registerSink({ name: 'pod-noresult-ledger-reason', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'failure-reason') reasons.push(String((record.data as Record<string, unknown>).reason));
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'noresult-ledger' }).done;
+      expect(result.exitCode).toBe(1);
+      expect(result.disposition?.prUrl).toBe('https://github.com/o/r/pull/24496');
+      expect(reasons).toEqual(['수확 가능(review-blocked) · PR #24496']);
+      expect(result.error?.message).toContain('childStage=review-blocked · reason=수확 가능(review-blocked) · PR #24496');
+      expect(result.error?.message).not.toContain('no-result-line');
+      expect(result.error?.message ?? '').not.toContain('사유 못 읽음');
     } finally { off(); }
   });
 

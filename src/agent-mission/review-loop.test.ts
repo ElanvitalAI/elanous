@@ -3,6 +3,7 @@ import { debug } from '../debug/log.js';
 import * as llm from '../llm.js';
 import { buildReworkMission, classifyReview, extractAppliedReviewItems, fetchAppliedReviewItemsForBranch, fetchLatestReview, judgeAndFinalize, prepareReviewLoopContext, runReviewLoop, runReworkMission, type LatestReviewSource } from './review-loop.js';
 import { buildJudgePrompt, type AcpJudgeResult } from './acp-judge.js';
+import { format } from '../agent-substrate/pr-comment-meta.js';
 import type { AgentMissionResult, AgentMissionSpec } from './driver.js';
 
 const source = (overrides: Partial<LatestReviewSource> = {}): LatestReviewSource => ({ headRefName: 'fix/review-loop', reviews: [], comments: [], ...overrides });
@@ -255,6 +256,17 @@ describe('extractAppliedReviewItems review-context carryover', () => {
     ]);
 
     expect(items).toEqual(['direct item', 'header item']);
+  });
+
+  test('status details carry applied review items alongside ordinary comments in parent timestamp order', () => {
+    const status = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n\n${format({ role: 'author', run: 'run-x', round: 0 })}\n${reinforcementHeadline}\n- first\n\n${format({ role: 'author', run: 'run-x', round: 1 })}\n${reinforcementHeadline}\n- second\n</details>`;
+    const comments = [
+      { createdAt: '2026-08-08T01:00:00Z', body: `${reinforcementHeadline}\n- old` },
+      { createdAt: '2026-08-08T02:00:00Z', body: status },
+      { createdAt: '2026-08-08T03:00:00Z', body: `${reinforcementHeadline}\n- newest` },
+    ];
+    expect(extractAppliedReviewItems(comments)).toEqual(['newest', 'first', 'second', 'old']);
+    expect(extractAppliedReviewItems([{ createdAt: '2026-08-08T02:00:00Z', body: status.replace('<!-- elanous:run-status -->', 'human') }])).toEqual([]);
   });
 
   test('reports a recognized headline with no bullets separately from a missing headline', () => {

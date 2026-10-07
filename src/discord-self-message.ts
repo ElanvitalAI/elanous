@@ -65,7 +65,9 @@ import { detectCard, runCardFollowup, NotACardError } from './card-followup/core
 import { localOcrText } from './telegram-card-followup.js';
 import type { runGraph } from './graph-runner/runner.js';
 import { readSlashContextNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
-import type { ContextNowDeps } from './context-bus/context-now.js';
+import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
+import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
+import { telegramLoopsStatus, type LoopsSources } from './telegram-loops-command.js';
 import { botUnavailableSlashReply, deriveTuiSlashAvailability, type TuiSlashAvailability } from './maturity/tui-slash-availability.js';
 
 const SLASH_FOCUS_TURNS_DEFAULT = 8;
@@ -143,6 +145,9 @@ export interface DiscordSelfMessageDeps {
   log?: (msg: string) => void;
   cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: typeof runGraph; rootDir?: () => string };
   nowDeps?: ContextNowDeps;
+  /** Override the clock for the context-first gate in isolated message-path tests. */
+  contextFirstNow?: () => number;
+  loopsSources?: LoopsSources;
   /** Override the TUI slash projection for isolated message-path tests. */
   tuiSlashAvailability?: readonly TuiSlashAvailability[];
 }
@@ -151,6 +156,15 @@ export interface DiscordSelfMessageDeps {
 export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessageHandler {
   const log = deps.log ?? ((): void => {});
   const cfg = deps.userConfig;
+  const contextFirstGate = createContextFirstGate({ now: deps.contextFirstNow ?? Date.now });
+  const maybeSendContextFirst = async (channelId: string): Promise<void> => {
+    if (!contextFirstGate.take(channelId) || cfg.discord?.contextFirst === false) return;
+    try {
+      await deps.getBot()?.sendMessage(channelId, renderContextFirst(contextNow, deps.nowDeps, renderTelegramNow));
+    } catch (err) {
+      log(`discord context-first failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
   // C2+ (2026-07-12 dogfood): 디스코드 첨부는 메시지 단위라 "사진 먼저,
   // !cdx 명령은 다음 메시지" 패턴에서 위임 턴이 빈손이 된다. 채널별로
   // 마지막 첨부를 기억해 두고, 첨부 없는 위임 명령이 2분 내 같은
@@ -359,6 +373,7 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
 
   return async (ctx, streamer) => {
     if (deps.channelScope && ctx.channelId !== deps.channelScope) return undefined;
+    contextFirstGate.note(ctx.channelId);
     // Voice text commands pass the guild gate for the voice adapter's
     // sake — never route them into the LLM turn (legacy behavior).
     if (/^\/voice-(join|leave|status)\b/.test(ctx.text.trim())) return undefined;
@@ -367,6 +382,8 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
       const args = nowCommand[1]?.trim().split(/\s+/).filter(Boolean) ?? [];
       return renderTelegramNow(readSlashContextNow(args, deps.nowDeps));
     }
+    if (/^[/!]loops$/.test(ctx.text.trim())) return telegramLoopsStatus([], deps.loopsSources);
+    if (/^[/!]loops\s+\S/.test(ctx.text.trim())) return telegramLoopsStatus(['extra'], deps.loopsSources);
     if (!ctx.text.trim() && ctx.attachments.length === 1 && ctx.attachments[0]!.contentType?.startsWith('image/')) {
       const photo = ctx.attachments[0]!;
       if (detectCard({ width: photo.width, height: photo.height, ocrText: null }).decision !== 'skip') {
@@ -408,6 +425,8 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
       const unavailable = botUnavailableSlashReply(entry, 'discord');
       if (unavailable) return unavailable;
     }
+    const cmd = parseDiscordAcpCommand(ctx.text);
+    if (!cmd && !/^[!/]/.test(ctx.text.trim())) await maybeSendContextFirst(ctx.channelId);
     log(`◀ ${ctx.userName ?? ctx.userId}: ${ctx.text.slice(0, 80)}${ctx.attachments.length ? ` (+첨부 ${ctx.attachments.length})` : ''}`);
     debug.log('discord.self.turn', 'inbound', { channelId: ctx.channelId, chars: ctx.text.length, attachments: ctx.attachments.length });
     // C2+ — 첨부 기억(사진만 먼저 올리는 패턴 지원). 명령 여부와 무관.
@@ -416,7 +435,6 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
     const delegationKey = delegationChatKey('dc', ctx.channelId);
 
     // 1) Explicit text commands — /cc·/cdx·/gem delegate, /brain exits.
-    const cmd = parseDiscordAcpCommand(ctx.text);
     if (cmd?.kind === 'brain') {
       clearActiveDelegation(delegationKey);
       return '🧠 브레인 모드로 복귀했습니다 (active delegation 해제).';

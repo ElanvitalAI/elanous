@@ -74,6 +74,7 @@ import { registerModelWatchCommand } from './cli/model-watch-cli.js';
 import { registerIntakeCommands } from './cli/intake-cli.js';
 import { registerTasksCommands } from './cli/tasks-cli.js';
 import { registerBriefCommands } from './cli/brief-cli.js';
+import { registerNotifyCommand } from './cli/notify-cli.js';
 import { registerLabelsCommands } from './cli/labels-cli.js';
 import { registerMsgCommands } from './cli/msg-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
@@ -135,6 +136,7 @@ import type { ReviewResult } from './agent-substrate/pr-reviewer.js';
 import type { ReviewVerdict } from './agent-mission/review-loop.js';
 import type { SyncMode } from './types.js';
 import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, needsFirstRun, handleOnboardingRefusal, type OnboardingStepId } from './onboarding.js';
+import { firstChatGate } from './onboarding/first-chat-gate.js';
 import {
   getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
   backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
@@ -888,6 +890,7 @@ registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
 registerKnowCommand(program);
+registerNotifyCommand(program);
 registerFreezeCommands(program);
 registerFlowCommands(program);
 // HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
@@ -985,6 +988,37 @@ hqCmd.command('seen').description('이 호스트가 본 가장 높은 임대 세
     process.exitCode = result.seen ? 0 : 3;
   });
 registerHqMovePlanCommand(hqCmd);
+hqCmd.command('init').description('한 저장소의 bare 미러와 집 원장을 만들고 5분 fetch 크론 줄만 출력')
+  .option('--root <dir>', 'HQ 폴더 (기본 ~/elanous-hq)')
+  .action(async (opts: { root?: string }) => {
+    try {
+      const { hqInit } = await import('./hq/seats.js');
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      const result = hqInit({ ...opts, home: getElanousConfigDir() });
+      console.log(`hq init: ${result.created ? 'created' : 'already exists'} ${result.root}\n# OP installs this line; nothing was installed:\n${result.cron}`);
+    } catch (error) { console.error(`hq init: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+hqCmd.command('seat <role>').description('OP|MK|TC|UX 자리 워크트리 (깨끗할 때만 갱신)')
+  .option('--refresh', 'origin/main으로 깨끗한 자리만 최신화')
+  .option('--root <dir>', 'HQ 폴더')
+  .action(async (role: string, opts: { refresh?: boolean; root?: string }) => {
+    try {
+      const { hqSeat } = await import('./hq/seats.js');
+      const result = hqSeat(role, opts);
+      if (result.outcome === 'dirty') console.warn(`hq seat ${role}: dirty — refresh skipped; move edits to hq work new`);
+      else console.log(`hq seat ${role}: ${result.outcome} ${result.path}`);
+    } catch (error) { console.error(`hq seat: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+const hqWorkCmd = hqCmd.command('work').description('고칠 때만 작업 워크트리를 만들고 병합 후 회수');
+for (const action of ['new', 'done'] as const) hqWorkCmd.command(`${action} <role> <name>`)
+  .option('--root <dir>', 'HQ 폴더')
+  .action(async (role: string, name: string, opts: { root?: string }) => {
+    try {
+      const { hqWork } = await import('./hq/seats.js');
+      const result = hqWork(action, role, name, opts);
+      console.log(`hq work ${action}: ${result.outcome} ${result.path}`);
+    } catch (error) { console.error(`hq work ${action}: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 const fenceWrapperCmd = hqCmd.command('fence-wrapper').description('설치본 HQ 울타리 크론 래퍼');
 fenceWrapperCmd.command('install').description('래퍼 제안 또는 백업 후 원자적 설치')
   .option('--dry-run', '변경 내용만 출력 (기본)')
@@ -1042,6 +1076,40 @@ hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 
   });
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
 registerSeatRequestsCommands(seatCmd);
+seatCmd.command('asks').description('최근 CTO 되묻기 왕복과 10분 판정')
+  .option('--since <duration>', '조회 창 (예: 24h)', '24h')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { since: string; json?: boolean }) => {
+    try {
+      const duration = /^(\d+)([mhd])$/.exec(opts.since);
+      if (!duration || !Number.isSafeInteger(Number(duration[1]))) throw new Error('--since: 24h, 30m, 7d 형식 필요');
+      const ms = Number(duration[1]) * ({ m: 60_000, h: 3_600_000, d: 86_400_000 }[duration[2]!] ?? 0);
+      if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error('--since: 양의 시간 필요');
+      const { defaultMsgStorePath } = await import('./msg/msg-store.js');
+      const path = defaultMsgStorePath();
+      if (!(await import('node:fs')).existsSync(path)) {
+        if (opts.json) await writeStdoutJson('[]\n');
+        else console.log(`원장 없음 — ${path}`);
+        return;
+      }
+      const { listSeatAskRoundTrips } = await import('./seat-dispatch/seat-ask.js');
+      const now = Date.now();
+      const rows = listSeatAskRoundTrips({ since: now - ms, now });
+      if (!rows.length) {
+        if (opts.json) await writeStdoutJson('[]\n');
+        else console.log('이 창에 되묻기 0건');
+        return;
+      }
+      if (opts.json) { await writeStdoutJson(`${JSON.stringify(rows)}\n`); return; }
+      const clock = (value: number | null) => value === null ? '-' : new Intl.DateTimeFormat('ko-KR', {
+        timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).format(value);
+      console.log('id · 표면 · 물음 HH:MM KST · 답 · 도착 · 왕복 분 · 판정');
+      for (const row of rows) console.log(`${row.id} · ${row.surface} · ${clock(row.askedAt)} KST · ${clock(row.answeredAt)} · ${clock(row.deliveredAt)} · ${row.roundTripMs === null ? '-' : (row.roundTripMs / 60_000).toFixed(1)}분 · ${row.verdict}`);
+      const count = (verdict: string) => rows.filter(row => row.verdict === verdict).length;
+      console.log(`10분 안 ${count('10분 안')} / 넘음 ${count('10분 넘음')} / 미답 ${count('미답')} / 대기 ${count('답 대기') + count('전달 대기')} / 미상 ${count('시각 미상')}`);
+    } catch (error) { console.error(`seat asks: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 seatCmd.command('answer <askId> <answer>').description('자리 질문에 답을 남기고 원래 표면으로 회신 예약')
   .action(async (askId: string, answer: string) => {
     try {
@@ -3299,11 +3367,20 @@ contextCmd.command('day')
   .description('자리 넷과 외부 세션의 최근 맥락 이벤트 수·마지막 시각 (읽기 전용)')
   .option('--since <hours>', '최근 시간 창 (예: 24h)', '24h')
   .option('--json', '구조화된 JSON 출력')
-  .action(async (opts: { since: string; json?: boolean }) => {
+  .option('--timeline', '시간순 사건 한 줄씩 (KST)')
+  .option('--seat <source>', '한 출처만 (OP|TC|MK|UX|claude-code|codex-agent-mission|harness-child)')
+  .action(async (opts: { since: string; json?: boolean; timeline?: boolean; seat?: string }) => {
     try {
-      const { contextDay, renderContextDay } = await import('./context-bus/context-day.js');
-      const report = contextDay(opts.since);
-      await writeStdoutJson(`${opts.json ? JSON.stringify(report) : renderContextDay(report)}\n`);
+      const { contextDay, contextDayTimeline, renderContextDay, renderContextDayTimeline, CONTEXT_DAY_SOURCES } = await import('./context-bus/context-day.js');
+      if (opts.seat && !CONTEXT_DAY_SOURCES.some(source => source === opts.seat)) throw new Error(`unknown --seat: ${opts.seat}`);
+      if (opts.seat && !opts.timeline) throw new Error('--seat requires --timeline');
+      if (opts.timeline) {
+        const report = contextDayTimeline(opts.since, { seat: opts.seat as typeof CONTEXT_DAY_SOURCES[number] | undefined });
+        await writeStdoutJson(`${opts.json ? JSON.stringify(report) : renderContextDayTimeline(report)}\n`);
+      } else {
+        const report = contextDay(opts.since);
+        await writeStdoutJson(`${opts.json ? JSON.stringify(report) : renderContextDay(report)}\n`);
+      }
     } catch (error) {
       console.error(`context day: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;
@@ -4337,16 +4414,52 @@ selfCmd
   .option('--base <ref>', '커밋됐지만 PR 없는 변경의 비교 기준(ref...HEAD)')
   .option('--pr <number>', '열린 PR 번호에서 gh pr view files로 변경 파일을 읽는다')
   .option('--shards [number]', '메모리 예산에 맞춰 시험을 별도 프로세스로 분할한다 (기본 2)')
-  .action((opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean }) => {
+  .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
+  .option('--local', '원격 자동 분배(로컬 1분 부하 > gateRemote.loadThreshold=20)를 끄고 로컬에서 돌린다')
+  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; remote?: string | boolean; local?: boolean }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
+    // The root strips `--local` from argv anywhere (remote-bookmark attach · src/cli/remote-resolve.ts) before Commander
+    // sees it, so this subcommand reads it from the untouched process.argv.
+    opts.local = !!opts.local || process.argv.slice(2).includes('--local');
+    if (opts.remote !== undefined && opts.local) { ui.error('self gate: --remote and --local cannot be combined'); process.exitCode = 2; return; }
+    if (typeof opts.remote === 'string') {
+      const { isValidGateHost } = await import('./self-implement/gate-remote.js');
+      if (!isValidGateHost(opts.remote)) { ui.error(`self gate: invalid --remote host: ${opts.remote}`); process.exitCode = 2; return; }
+    }
+    const shards = opts.shards === undefined ? undefined : opts.shards === true ? 2 : Number(opts.shards);
+    const runLocal = () => {
+      try {
+        const { runSelfGateCli } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
+        const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards });
+        console.log(result.lines.join('\n'));
+        return result.exitCode;
+      } catch (error) {
+        ui.error(`self gate failed: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+    };
     try {
-      const { runSelfGateCli } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-      const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards: opts.shards === undefined ? undefined : opts.shards === true ? 2 : Number(opts.shards) });
-      console.log(result.lines.join('\n'));
-      process.exitCode = result.exitCode;
+      const { dispatchHeavyCheck } = await import('./self-implement/gate-remote.js');
+      const { execFileSync } = await import('node:child_process');
+      const repo = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+      // Only a committed --base range is reproducible on another host: the default mode measures uncommitted files, --pr
+      // reads files through gh on this host, and the remote checkout runs from the repository root — those stay local.
+      const { realpathSync } = await import('node:fs');
+      const localOnlyReason = opts.pr ? 'self gate --pr reads PR files through gh on this host'
+        : !opts.base ? 'self gate without --base measures uncommitted files on this host'
+        : realpathSync(repo) !== realpathSync(process.cwd()) ? 'self gate run from a sub-directory' : undefined;
+      // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
+      const remoteArgv = (sha: (ref: string) => string) => ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', ...(opts.changed ? ['--changed'] : []),
+        ...(opts.base ? ['--base', opts.base === 'origin/main' ? opts.base : sha(opts.base)] : []), ...(shards !== undefined ? ['--shards', String(shards)] : [])];
+      process.exitCode = await dispatchHeavyCheck({
+        tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [],
+        localOnlyReason,
+        flags: { remote: typeof opts.remote === 'string' ? opts.remote : opts.remote ? true : undefined, local: !!opts.local },
+        runLocal,
+      });
     } catch (error) {
-      ui.error(`self gate failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
+      ui.error(`self gate dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = runLocal();
     }
   });
 
@@ -8599,10 +8712,15 @@ program
     }
     if (opts.tools) announceChatToolsCompatibility();
     const cfg = getUserConfig();
-    if (needsOnboarding(cfg)) {
-      if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
-      if (!await runFirstSetupForCli(cfg, true)) return;
-    }
+    if (await firstChatGate(cfg, {
+      isTTY: process.stdin.isTTY === true,
+      runFirstRun: async (deps) => (await import('./onboarding/first-run.js')).runFirstRun(deps),
+      runInteractive: () => {
+        if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
+        return runFirstSetupForCli(cfg, true);
+      },
+      print: (line) => console.log(line),
+    }) === 'stop') return;
     const refreshed = reloadUserConfig();
     // ★ 관측갭 수리(2026-07-21·제1원칙·트랙A) — self-implement 자식 goal-loop(`chat --goal-loop`)은 데몬과
     //   별개 독립 프로세스라 nexus StoreSink 를 상속 안 한다. 부모 `self implement`(위 self 커맨드)는 sink 를

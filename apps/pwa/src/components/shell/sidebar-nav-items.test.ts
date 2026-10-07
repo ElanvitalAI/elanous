@@ -30,6 +30,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/bots',
   '/ceo',
   '/chat',
+  '/decisions',
   '/consult',
   '/control',
   '/design-check',

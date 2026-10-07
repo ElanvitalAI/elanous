@@ -96,3 +96,20 @@ describe('extractPodFailureReason', () => {
     expect(reason.length).toBeLessThanOrEqual(240);
   });
 });
+
+test('POD-NORESULT: no readable log line but a parsed result stage → reports the stage and PR, not «unreadable»', () => {
+  const logs = '{"kind":"progress","note":"x"}\nELANOUS_RUN_LEDGER chunk\nplain progress line\n';
+  expect(extractPodFailureReason({ logs, jobReason: 'BackoffLimitExceeded', containerReason: 'Error', result: { stage: 'review-blocked', prUrl: 'https://github.com/o/r/pull/24496' } }))
+    .toBe('수확 가능(review-blocked) · PR https://github.com/o/r/pull/24496');
+  expect(extractPodFailureReason({ logs, result: { stage: 'review-blocked', prUrl: 'https://x/pull/7', prNumber: 7 } }))
+    .toBe('수확 가능(review-blocked) · PR #7');
+  expect(extractPodFailureReason({ logs, jobReason: 'BackoffLimitExceeded', result: { stage: 'aborted', prUrl: null } }))
+    .toBe('수렴 못 함(단계 aborted)');
+});
+
+test('POD-NORESULT: a readable error line still wins over the result row, and no result keeps «unreadable»', () => {
+  expect(extractPodFailureReason({ logs: 'Error: tests failed in foo.test.ts\n', result: { stage: 'review-blocked', prUrl: null } })).toBe('Error: tests failed in foo.test.ts');
+  expect(extractPodFailureReason({ logs: 'plain progress line\n', result: null })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+  expect(extractPodFailureReason({ logs: 'plain progress line\n', result: { stage: '  ', prUrl: 'https://x' } })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+  expect(extractPodFailureReason({ logs: '', containerReason: 'OOMKilled', result: { stage: 'review-blocked' } })).toBe('OOMKilled: 컨테이너 메모리 한도 초과');
+});

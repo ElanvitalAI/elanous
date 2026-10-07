@@ -1,9 +1,12 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { intakeToTasksMessages, registerIntakeCommands, renderIntakeToTasksResult, runIntakeDigestCli, runIntakeToTasksCli } from './intake-cli.js';
+import { intakeToTasksMessages, registerIntakeCommands, renderIntakeToTasksResult, runIntakeCandidatesCli, runIntakeDigestCli, runIntakeToTasksCli } from './intake-cli.js';
+import type { DirectiveRow } from '../directives/directive-index.js';
+import type { IntakeItem } from '../intake-plane/items.js';
+import type { TaskCard } from '../task-cards/card-store.js';
 
 test('registers the complete intake command tree on a fresh Command with its help and options', () => {
   const program = new Command().name('elanous');
@@ -14,12 +17,13 @@ test('registers the complete intake command tree on a fresh Command with its hel
   expect(intake!.description()).toBe('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
   expect(intake!.helpInformation()).toContain('elanous intake');
   expect(intake!.commands.map((command) => command.name())).toEqual([
-    'source', 'check', 'collect-pod', 'ingest', 'items', 'mark', 'digest', 'route',
+    'source', 'check', 'candidates', 'collect-pod', 'ingest', 'items', 'mark', 'digest', 'route',
     'grounding-sync', 'queue', 'to-tasks', 'collect-telegram-saved', 'collect-github',
   ]);
 
   const expected: Record<string, { help: string; options: string[] }> = {
     check: { help: '사실 목록·문서 경로·URL·표준입력을 elanous 현재와 대조한다. 구멍/낡음은 골 초안만 쓴다.', options: ['--file', '--url', '--fact', '--json', '--author', '--author-max'] },
+    candidates: { help: '지시·흡수·소원에서 읽기 전용 요구 후보를 모은다', options: ['--json', '--limit'] },
     'collect-pod': { help: 'Pod 흡수 산출을 볼트에 안전하게 수집하고 흡수 원장에 표시한다', options: ['--id', '--vault', '--dry-run', '--json'] },
     ingest: { help: '수집기 산출(JSONL · 한 줄 = {url,title,text,kind,signals,…})을 흡수 원장에 모양 맞춰 넣는다 — 같은 항목은 합친다', options: ['--source', '--file', '--json'] },
     items: { help: '흡수 원장 항목 보기 (최근 본 순)', options: ['--status', '--source', '--seat', '--limit', '--json'] },
@@ -45,6 +49,73 @@ test('registers the complete intake command tree on a fresh Command with its hel
   expect(check.helpInformation()).toContain('--author-max <n>');
   expect(intake!.commands.find((command) => command.name() === 'to-tasks')!.helpInformation()).toContain('--limit <n>');
   expect(intake!.commands.find((command) => command.name() === 'to-tasks')!.helpInformation()).toContain('골 줄·아이디어 노트 상한');
+});
+
+test('intake candidates --json reads three injected sources, limits only after sorting and leaves them unchanged', async () => {
+  const input: { directives: DirectiveRow[]; intakeItems: IntakeItem[]; cards: TaskCard[] } = {
+    directives: [{ ts: '', agent: 'claude-code', session_id: 's1', cwd: null, track: null, released: null, dev: null, codename: null,
+      text: '요구 깔때기 만들어 루브릭: A3 E2 R2 D1 M1 B1 S1 X0', source_file: '', line_no: 7 }],
+    intakeItems: [{ id: 'ix1', title: 'repo X', text: '루브릭 없음', source: 'github', sources: ['github'], kind: 'repo',
+      observedAt: '', lastSeenAt: '', signals: {}, privacy: 'public', status: 'new', outputs: [] },
+      { id: 'ix2', source: 'github', sources: ['github'], kind: 'repo', observedAt: '', lastSeenAt: '', signals: {}, privacy: 'public', status: 'discarded', outputs: [] }],
+    cards: [{ id: 'c1', goalId: 'wish:linear:ENG-12', title: '소원 하나', status: 'open', createdAt: '', sections: [] },
+      { id: 'c2', goalId: 'goal:x', title: '다른 카드', status: 'open', createdAt: '', sections: [] },
+      { id: 'c3', goalId: 'wish:pwa:9', title: '닫힌 카드', status: 'closed', createdAt: '', sections: [] }],
+  };
+  const before = structuredClone(input);
+  const calls: string[] = [];
+  const output: string[] = [];
+  const deps = {
+    directives: () => { calls.push('directives'); return input.directives; },
+    intakeItems: () => { calls.push('intake'); return input.intakeItems; },
+    cards: () => { calls.push('cards'); return input.cards; },
+    write: async (text: string) => { output.push(text); },
+  };
+  const program = new Command().name('elanous').exitOverride();
+  registerIntakeCommands(program, deps);
+  await program.parseAsync(['intake', 'candidates', '--json'], { from: 'user' });
+  const parsed = JSON.parse(output.pop()!) as { candidates: Array<{ id: string }> };
+  expect(parsed.candidates).toHaveLength(3);
+  expect(parsed.candidates[0]!.id).toBe('s1:7');
+  expect(calls).toEqual(['directives', 'intake', 'cards']);
+  await program.parseAsync(['intake', 'candidates', '--json', '--limit', '1'], { from: 'user' });
+  expect(JSON.parse(output.pop()!).candidates).toHaveLength(1);
+  expect(input).toEqual(before);
+  expect(runIntakeCandidatesCli({ limit: '-1' }, deps)).rejects.toThrow('--limit');
+});
+
+test('intake candidates --limit validates the raw string: blank, negative and fractional are rejected, 2 is accepted', async () => {
+  const deps = {
+    directives: () => [1, 2, 3].map((line_no) => ({ ts: '', session_id: 's1', track: null, text: `요구 ${line_no}`, source_file: '', line_no })),
+    intakeItems: () => [],
+    cards: () => [],
+  };
+  for (const raw of ['', '  ', '-1', '1.5']) {
+    const output: string[] = [];
+    await expect(runIntakeCandidatesCli({ json: true, limit: raw }, { ...deps, write: async (text) => { output.push(text); } }))
+      .rejects.toThrow('--limit 는 0 이상의 정수여야 한다');
+    expect(output).toEqual([]);
+
+    const errors: string[] = [];
+    const errorSpy = spyOn(console, 'error').mockImplementation((message?: unknown) => { errors.push(String(message)); });
+    const previousExitCode = process.exitCode;
+    try {
+      const cliOutput: string[] = [];
+      const program = new Command().name('elanous').exitOverride();
+      registerIntakeCommands(program, { ...deps, write: async (text) => { cliOutput.push(text); } });
+      await program.parseAsync(['intake', 'candidates', '--json', '--limit', raw], { from: 'user' });
+      expect(process.exitCode).toBe(2);
+      expect(cliOutput).toEqual([]);
+      expect(errors).toEqual([`--limit 는 0 이상의 정수여야 한다: ${JSON.stringify(raw)}`]);
+    } finally {
+      errorSpy.mockRestore();
+      process.exitCode = previousExitCode;
+    }
+  }
+
+  const output: string[] = [];
+  await runIntakeCandidatesCli({ json: true, limit: '2' }, { ...deps, write: async (text) => { output.push(text); } });
+  expect(JSON.parse(output.pop()!).candidates).toHaveLength(2);
 });
 
 test('to-tasks classify prompt receives only goal-line or note content, not ledger fields', () => {

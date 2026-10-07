@@ -25,8 +25,10 @@ function requiredGit(args: string[]): string {
 }
 
 function versionParts(value: string): number[] | null {
-  if (!/^\d+\.\d+\.\d+$/.test(value)) return null;
-  return value.split('.').map(Number);
+  // A prerelease (0.2.18-rc.0) is placed by its base version — earlier stable tags are its baseline.
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-(?:rc|alpha|beta)\.\d+)?$/.exec(value);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 function compareVersions(a: number[], b: number[]): number {

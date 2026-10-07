@@ -7,7 +7,7 @@ export const DEFAULT_COST_SECS = 10;
 export const SLOW_SECS = 60;
 export const HEAVY_MB = 2048;
 
-export interface Effectiveness { flake: 'stable' | 'flaky' | 'failing'; mutation: 'caught' | 'survived' | 'n/a'; fixedCounts?: number }
+export interface Effectiveness { flake: 'stable' | 'flaky' | 'failing'; mutation: 'caught' | 'survived' | 'n/a'; fixedCounts?: number; unreachable?: number }
 export interface Measurement { file: string; secs: number; rssMb: number | null; rc: number | null; pass: number | null; fail: number | null; reason?: string; effectiveness?: Effectiveness }
 export type Verdict = 'keep' | 'failing' | 'review';
 export type Proposal = 'delete' | 'shrink' | 'rewrite-cheap' | 'move-out-of-gate' | 'investigate';

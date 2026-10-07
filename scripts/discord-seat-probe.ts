@@ -56,7 +56,8 @@ export async function probeDiscordSeatWork(text: string, options: ProbeOptions =
       open: () => { const db = new Database(':memory:'); return { db, close: () => db.close() } as unknown as MsgStore; },
       dispatch: async (seatId, forwarded) => {
         capture('ask', seatId, forwarded);
-        return { channel: 'unknown', reply: '마른 실행 — 질문을 맡기지 않았습니다.' };
+        // Since #24523 a seat *task* also travels this ask path (so the answer can come back) — the wording covers both.
+        return { channel: 'unknown', reply: `마른 실행 — ${seatId}에 맡길 예정 (실제 맡김 없음).` };
       },
       send: async () => { throw new Error('dry Discord delivery unavailable'); },
     },
@@ -76,7 +77,7 @@ export async function probeDiscordSeatWork(text: string, options: ProbeOptions =
       ...options.liveDeps?.askDeps,
       dispatch: async (seatId, forwarded, deps, extra) => {
         capture('ask', seatId, forwarded);
-        return (options.liveDeps?.askDeps?.dispatch ?? dispatchCeoTask)(seatId, forwarded, deps, extra);
+        return (options.liveDeps?.askDeps?.dispatch ?? options.liveDeps?.dispatch ?? dispatchCeoTask)(seatId, forwarded, deps, extra);
       },
       // This CLI has no Discord transport: even live mode must not post to Discord.
       send: async () => { throw new Error('probe does not send Discord messages'); },

@@ -792,6 +792,7 @@ describe('OB8 — inside the daemon, deliver never curls its own /v1/outbound', 
   });
 
   it('in-process accepted send records only after asynchronous delivery succeeds', async () => {
+    setSystemTime(new Date('2026-10-01T03:00:00Z')); // KST 12:00 — outside quiet hours, which would defer instead of sending
     let complete!: (ok: boolean) => void;
     setInProcessOutbound((_text, _kind, source, deferFailure) => {
       expect(source).toBe('src/domains/outbound-alert.test.ts');

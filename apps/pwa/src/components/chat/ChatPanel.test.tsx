@@ -55,18 +55,22 @@ async function mount(show: boolean, entries: Array<{ id: string; title: string; 
   return { root: tree!.root, getSelected: () => selected, calls, getProject: () => projectId };
 }
 
-test('/chat has a fixed desktop column and a mobile button opening a dismissible drawer without replacing chat', async () => {
-  const { root } = await mount(true);
+test('/chat keeps desktop column and moves the mobile drawer button into the status menu without replacing chat', async () => {
+  const { root } = await mount(true, [], 390);
   const desktop = root.findAllByType('aside')[0]!;
   expect(desktop.props.className).toBe('hidden');
   expect(desktop.findAllByType(ChatConversationList)).toHaveLength(1);
   expect(root.findAllByType(ChatLayout)).toHaveLength(1);
   const chat = root.findByType(ChatLayout);
-  const toggle = root.findAllByType('button').find((b) => b.props['aria-controls'] === 'chat-conversation-drawer')!;
-  const compactHeader = root.findByProps({ 'data-elanous-chat-compact-header': '' });
-  expect(compactHeader.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
-  expect(compactHeader.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(1);
+  const status = root.findByProps({ 'data-elanous-mobile-chat-status': '' });
+  expect(status.props.className).toContain('h-10 min-h-10');
+  expect(status.findAllByProps({ 'aria-label': '채팅 메뉴' })).toHaveLength(1);
+  expect(root.findByType(ChatLayout).props.mobileSimple).toBe(true);
+  expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
+  await act(async () => status.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
+  expect(root.findByProps({ id: 'chat-mobile-menu' }).findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
   expect(root.findAllByType('button').filter((b) => b.props['aria-controls'] === 'chat-conversation-drawer')).toHaveLength(1);
+  const toggle = root.findByProps({ 'aria-controls': 'chat-conversation-drawer' });
   expect(toggle.props.className).toBeTruthy();
   await act(async () => toggle.props.onClick());
   const drawer = root.findByProps({ id: 'chat-conversation-drawer' });
@@ -81,6 +85,7 @@ test('/chat has a fixed desktop column and a mobile button opening a dismissible
 
 test('mobile drawer selection switches the chat and closes the drawer', async () => {
   const { root, getSelected } = await mount(true, [{ id: 'older', title: '이전 대화', preview: '본문', updatedAt: new Date().toISOString(), messageCount: 2, source: 'cli', active: false, createdAt: '' }]);
+  await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
   await act(async () => root.findAllByType('button').find((b) => b.props['aria-controls'] === 'chat-conversation-drawer')!.props.onClick());
   const drawer = root.findByProps({ id: 'chat-conversation-drawer' });
   const before = root.findByType(ChatLayout);
@@ -88,6 +93,16 @@ test('mobile drawer selection switches the chat and closes the drawer', async ()
   expect(getSelected()).toBe('older');
   expect(root.findAllByProps({ id: 'chat-conversation-drawer' })).toHaveLength(0);
   expect(root.findByType(ChatLayout)).not.toBe(before);
+});
+
+test('1024px standalone chat retains the original header and controls', async () => {
+  const { root } = await mount(true, [], 1024);
+  expect(root.findAllByProps({ 'data-elanous-mobile-chat-status': '' })).toHaveLength(0);
+  expect(root.findAllByProps({ 'aria-label': '채팅 메뉴' })).toHaveLength(0);
+  expect(root.findAllByType(ChatCurrentProject)).toHaveLength(1);
+  expect(root.findAllByType('aside')).toHaveLength(1);
+  expect(root.findByType(ChatLayout).props.mobileSimple).toBeUndefined();
+  expect(root.findByType(ChatLayout).props.mobileActivity).toBeUndefined();
 });
 
 test('wide standalone chat preserves its fixed left list and original header', async () => {

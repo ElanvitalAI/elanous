@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { composeDaily, main, collectGrid, collectLoops, collectRelease, collectLandings, type DailyDeps, type DailyParts } from './daily.js';
+import { composeDaily, main, runDaily, collectGrid, collectLoops, collectRelease, collectLandings, type DailyDeps, type DailyParts, type DailySendRequest } from './daily.js';
 import { devVersion, listChecklist } from '../../src/release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
@@ -387,6 +387,97 @@ test('PROACT1-LITE production collect proposes a waiting decision stored in the 
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000); // 실제 수집 경로(주입 없음)는 하위 프로세스를 띄워 수십 초 걸린다.
+
+test('daily review sends a separate three-article news message once with its own receipt and ledger row', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-news-send-'));
+  const requests: DailySendRequest[] = [];
+  const news = [
+    { title: 'A', url: 'https://a.example/1', implication: '시사 A' },
+    { title: 'B', url: 'https://b.example/2', implication: '시사 B' },
+  ];
+  const deps: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => news,
+    send: request => { requests.push(request); return { chatId: 42, messageId: requests.length }; }, log: () => {},
+  };
+  try {
+    const first = await runDaily({}, deps);
+    expect(first).toMatchObject({ sent: true, deliveryState: 'sent', status: 'ok', sendError: null });
+    expect(first.deliveryLine).toContain('news=sent');
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.text).toEndWith('RHYTHM-DAILY:2026-10-05');
+    expect(requests[0]!.text).not.toContain('https://a.example/1');
+    expect(requests[1]).toMatchObject({ channel: 'telegram', chatId: 42, botToken: 't', kind: 'ops-report' });
+    expect(requests[1]!.text).toBe('## 외부 동향\n- A — https://a.example/1\n  시사점: 시사 A\n- B — https://b.example/2\n  시사점: 시사 B\nRHYTHM-DAILY:2026-10-05-news');
+    const db = new Database(join(root, 'rhythm', 'daily', 'delivery.sqlite'), { readonly: true });
+    try { expect(db.prepare('SELECT day, state, chat_id, message_id FROM deliveries ORDER BY day').all()).toEqual([
+      { day: '2026-10-05', state: 'sent', chat_id: '42', message_id: '1' },
+      { day: '2026-10-05-news', state: 'sent', chat_id: '42', message_id: '2' },
+    ]); } finally { db.close(); }
+    const repeated = await runDaily({}, deps);
+    expect(repeated.deliveryState).toBe('already-sent');
+    expect(repeated.deliveryLine).toContain('news=already-sent');
+    expect(requests).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('unreadable news skips the second send; five articles show only the first three in staged delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-news-stage-'));
+  const requests: DailySendRequest[] = [];
+  const deps: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [],
+    news: async () => { throw new Error('crawl unavailable'); },
+    send: request => { requests.push(request); return { chatId: 42, messageId: requests.length }; }, log: () => {},
+  };
+  try {
+    const unreadable = await runDaily({}, deps);
+    expect(unreadable.sections.news).toBe('unreadable');
+    expect(requests).toHaveLength(1);
+    const next = new Date(now.getTime() + 86_400_000);
+    const five = Array.from({ length: 5 }, (_, i) => ({ title: `기사 ${i}`, url: `https://news.example/${i}`, implication: `시사 ${i}` }));
+    await runDaily({ stage: 'collect' }, { ...deps, now: () => next, news: async () => five });
+    const delivered = await runDaily({ stage: 'deliver' }, { ...deps, now: () => next,
+      news: async () => { throw new Error('deliver must read collected report'); } });
+    expect(delivered.deliveryLine).toContain('news=sent');
+    expect(requests).toHaveLength(3);
+    const newsText = requests[2]!.text;
+    expect(newsText.match(/^- .* — https:\/\/news\.example\/\d+$/gm)).toHaveLength(3);
+    for (let i = 0; i < 3; i++) expect(newsText).toContain(`https://news.example/${i}\n  시사점: 시사 ${i}`);
+    expect(newsText).not.toContain('https://news.example/3');
+    expect(newsText).not.toContain('https://news.example/4');
+    expect((await runDaily({ stage: 'deliver' }, { ...deps, now: () => next })).deliveryLine).toContain('news=already-sent');
+    expect(requests).toHaveLength(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('news send failure leaves the first confirmed delivery unchanged and requires a news receipt before retry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-news-unknown-'));
+  const requests: DailySendRequest[] = [];
+  const receiptKeys: string[] = [];
+  const deps: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [],
+    news: async () => [{ title: 'A', url: 'https://a.example/1', implication: '시사 A' }],
+    send: request => { requests.push(request); return requests.length === 1 ? { chatId: 42, messageId: 1 } : null; },
+    receipt: key => { receiptKeys.push(key); return 'unknown'; }, log: () => {},
+  };
+  try {
+    const first = await runDaily({}, deps);
+    expect(first).toMatchObject({ sent: true, status: 'ok', deliveryState: 'sent', sendError: null });
+    expect(first.deliveryLine).toContain('news=unknown');
+    const repeated = await runDaily({}, deps);
+    expect(repeated).toMatchObject({ sent: false, status: 'ok', deliveryState: 'already-sent', sendError: null });
+    expect(repeated.deliveryLine).toContain('news=unknown');
+    expect(requests).toHaveLength(2);
+    expect(receiptKeys).toEqual(['2026-10-05-news']);
+    const receiptSent = await runDaily({}, { ...deps, receipt: key => {
+      expect(key).toBe('2026-10-05-news'); return { chatId: 42, messageId: 2 };
+    } });
+    expect(receiptSent.deliveryLine).toContain('news=receipt-sent');
+    expect(requests).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('graph collect → compose → deliver reads one report and sends at most once', async () => {
   const root = mkdtempSync(join(tmpdir(), 'rhythm-graph-'));

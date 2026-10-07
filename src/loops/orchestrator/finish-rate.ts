@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { readdirSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { loadRunLedger, resolveFederatedRunLedgerTargets } from '../../self-implement/run-ledger.js';
+import { withFileLockSync } from '../../storage/file-lock.js';
 import type { LogTarget } from '../../cli/logs-cli.js';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -23,6 +24,77 @@ export type FinishMetrics = {
 };
 export type FinishAdvice = { finishSlots: number; launchSlots: number; state: 'healthy' | 'backlogged' | 'unknown'; reasons: string[] };
 export type FinishThresholds = { landingRate?: number; staleDrafts?: number; conflictRatio?: number };
+
+export type FinishTrend = 'worsening' | 'improving' | 'flat' | 'unknown';
+export type FinishTrendInput = Pick<FinishMetrics, 'landingRate' | 'staleDrafts' | 'conflictRatio'>;
+export type FinishHistoryRow = {
+  hour: string; at: string; launched: number | null; landed: number | null;
+  landingRate: number | null; staleDrafts: number | null; conflictRatio: number | null; trend: FinishTrend;
+};
+
+/** FINISH-RATE 추세 — landingRate 는 내려가면 나쁨 · staleDrafts·conflictRatio 는 올라가면 나쁨.
+ *  양쪽 다 유한한 숫자인 지표만 비교한다(못 잰 값은 좋음도 나쁨도 아니다) · 임의 임계 없음.
+ *  나쁨 수 > 좋음 수 = worsening · 작으면 improving · 같으면 flat · 비교한 지표가 0 이면 unknown. */
+export function finishTrend(previous: FinishTrendInput | null, current: FinishTrendInput): FinishTrend {
+  if (!previous) return 'unknown';
+  let compared = 0, worse = 0, better = 0;
+  for (const key of ['landingRate', 'staleDrafts', 'conflictRatio'] as const) {
+    const before = previous[key], after = current[key];
+    if (typeof before !== 'number' || !Number.isFinite(before) || typeof after !== 'number' || !Number.isFinite(after)) continue;
+    compared++;
+    const delta = key === 'landingRate' ? before - after : after - before;
+    if (delta > 0) worse++;
+    else if (delta < 0) better++;
+  }
+  if (compared === 0) return 'unknown';
+  return worse > better ? 'worsening' : worse < better ? 'improving' : 'flat';
+}
+
+export function finishHistoryPath(root: string): string {
+  return join(root, 'harness', 'finish-history.jsonl');
+}
+
+/** «한 시간 한 줄» 이력 — 같은 UTC 시간 줄이 이미 있으면 안 쓴다(null) · trend 는 지금보다 이른 가장 최근 시간 줄 대비.
+ *  읽을 수 없는 줄은 건너뛴다(이력 한 줄이 깨졌다고 측정을 멈추지 않는다). 쓰기 실패는 호출자에게 던진다. */
+export function recordFinishHistory(root: string, metrics: FinishMetrics, now: Date): FinishHistoryRow | null {
+  const path = finishHistoryPath(root);
+  const hour = now.toISOString().slice(0, 13);
+  mkdirSync(join(root, 'harness'), { recursive: true });
+  // 확인과 덧붙이기를 한 잠금 안에서 — 같은 root 를 쓰는 두 틱이 같은 시간에 둘 다 «없음»을 보고 두 줄을 쓰지 않게.
+  const row = withFileLockSync(`${path}.lock`, (): FinishHistoryRow | null => {
+    const rows: FinishHistoryRow[] = [];
+    let text = '';
+    if (existsSync(path)) {
+      text = readFileSync(path, 'utf8');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line) as FinishHistoryRow;
+          if (parsed && typeof parsed.hour === 'string') rows.push(parsed);
+        } catch { /* a broken line is skipped */ }
+      }
+    }
+    if (rows.some((existing) => existing.hour === hour)) return null;
+    // 앞 시간 = 지금보다 이른 줄 중 «가장 최근 UTC 시간»(파일 순서가 아니다 — 늦게 덧붙은 옛 시간 줄이 있을 수 있다) · 같은 시간이면 마지막 줄.
+    let previous: FinishHistoryRow | null = null;
+    for (const existing of rows) if (existing.hour < hour && (!previous || existing.hour >= previous.hour)) previous = existing;
+    const next: FinishHistoryRow = {
+      hour, at: now.toISOString(), launched: metrics.launched, landed: metrics.landed,
+      landingRate: metrics.landingRate, staleDrafts: metrics.staleDrafts, conflictRatio: metrics.conflictRatio,
+      trend: finishTrend(previous, metrics),
+    };
+    // 부분 쓰기로 끝 개행이 없으면 먼저 보정한다 — 새 줄이 깨진 꼬리에 붙어 둘 다 못 읽게 되지 않게.
+    appendFileSync(path, `${text && !text.endsWith('\n') ? '\n' : ''}${JSON.stringify(next)}\n`);
+    return next;
+  });
+  if (!row) return null;
+  try {
+    debug.log('loop.orchestrator', 'finish-history', {
+      hour, trend: row.trend, landingRate: row.landingRate, staleDrafts: row.staleDrafts, conflictRatio: row.conflictRatio,
+    });
+  } catch { /* the row is written; observation is fail-soft */ }
+  return row;
+}
 
 type Start = { runId: string; startedAt: string };
 type StartObservation = { starts: readonly Start[]; unreadable: readonly { runId: string; reason: string }[]; unreadableDirectories?: number };

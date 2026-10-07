@@ -63,7 +63,9 @@ async function capture(mods: Mods): Promise<string> {
   mkdirSync(join(uroot, 'release/0.2.3'), { recursive: true });
   writeFileSync(join(uroot, 'release/0.2.3/release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
   let graphInput: unknown = null;
-  const un = await mods.runUnattendedRelease({ version: '0.2.4' }, { freezeRoot: uroot, ledgerRoot: uroot, config: { gatePodPool: 'pool' }, checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }), graph: async (_p: string, o: { input: unknown }) => { graphInput = o.input; return { status: 'done' } as never; } } as never);
+  // RELEASE-BRANCH (10-06) made the branch cut the default; the pinned legacy path is the main cut (`mainCut`, ignored by
+  // the pre-freeze base), so both sides still run the same scenario.
+  const un = await mods.runUnattendedRelease({ version: '0.2.4', mainCut: true } as never, { freezeRoot: uroot, ledgerRoot: uroot, config: { gatePodPool: 'pool' }, checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }), graph: async (_p: string, o: { input: unknown }) => { graphInput = o.input; return { status: 'done' } as never; } } as never);
     return JSON.stringify(norm({ gate, gateCalls: calls, publish: pub, publishCalls: pcalls, unattended: un, graphInput }));
   } finally {
     if (env.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = env.state;

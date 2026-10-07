@@ -197,3 +197,18 @@ test('REL3: a resume in another universe publishes the archive prepare built and
     expect(result.outcome).toBe('ok');
   } finally { rmSync(other, { recursive: true, force: true }); rmSync(prod, { recursive: true, force: true }); rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test('RELEASE-REHEARSAL-RC: a prerelease publishes to dist-tag next and waits for next, never latest', async () => {
+  const f = fixture({ archiveVersion: '0.2.18-rc.0' });
+  f.context.input.version = '0.2.18-rc.0';
+  let polls = 0;
+  f.deps.registry = async (url) => url.endsWith('/0.2.18-rc.0')
+    ? { status: polls++ > 0 ? 200 : 404, body: { name: 'elanous', version: '0.2.18-rc.0' } }
+    : { status: 200, body: { 'dist-tags': { latest: '0.2.17', next: polls > 1 ? '0.2.18-rc.0' : '0.2.17' } } };
+  f.context.input.npmWaitMinutes = 1;
+  try {
+    expect(await runNpmPublish(f.context, f.deps)).toMatchObject({ outcome: 'ok', npm: 'published', summary: 'npm 0.2.18-rc.0 visible with next tag' });
+    expect(f.commands[1]).toContain('--tag next');
+    expect(f.commands.join('\n')).not.toContain('--tag latest');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});

@@ -88,3 +88,50 @@ test('dry run reports input but never invokes the checklist or graph; execution 
     await expect(runUnattendedRelease({ version: '0.2.4', dryRun: true }, { ...deps, config: {} })).rejects.toThrow('release.loop.gatePodPool');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('RELEASE-BRANCH: the default run cuts a release branch; --cut-commit and --main-cut keep the main path; a freeze stays the emergency stop', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-branch-'));
+  try {
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    const inputs: unknown[] = [];
+    const deps = { freezeRoot: root, ledgerRoot: root, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async (_p: string, o: { input: unknown }) => { inputs.push(o.input); return { status: 'done' } as never; } };
+    await runUnattendedRelease({ version: '0.2.4' }, deps);
+    await runUnattendedRelease({ version: '0.2.4', cutCommit: 'abc1234' }, deps);
+    await runUnattendedRelease({ version: '0.2.4', mainCut: true }, deps);
+    expect(inputs).toEqual([
+      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
+      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
+      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3' },
+    ]);
+    enableLandingFreeze({ reason: 'emergency', by: 'OP' }, root);
+    await expect(runUnattendedRelease({ version: '0.2.4' }, deps)).rejects.toThrow('동결 중 · emergency');
+    expect(inputs).toHaveLength(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the checklist and never allows a main cut', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rc-'));
+  try {
+    record(root, '0.2.17', { version: '0.2.17', publishedAt: 'now' });
+    record(root, '0.2.18-rc.0', { version: '0.2.18-rc.0', publishedAt: 'now' });
+    let checklists = 0;
+    const inputs: Array<Record<string, unknown>> = [];
+    const asked: string[] = [];
+    const deps = { ledgerRoot: root, config: { gatePodPool: 'pool' },
+      releaseRefs: (base: string, kind: string) => { asked.push(`${base}/${kind}`); return ['refs/heads/release/0.2.18-rc.0', 'refs/tags/v0.2.18-rc.1', 'refs/tags/v0.2.18-rc.1^{}', 'refs/heads/release/0.2.18-rc.x', 'refs/heads/release/0.2.19-rc.7']; },
+      checklist: () => { checklists++; return { ok: false, red: ['K1'], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+      graph: async (_p: string, o: { input: unknown }) => { inputs.push(o.input as Record<string, unknown>); return { status: 'done' } as never; } };
+    const preview = await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', dryRun: true }, deps);
+    expect(preview.input).toEqual({ gatePodPool: 'pool', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
+    await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc' }, deps);
+    expect(inputs[0]!.version).toBe('0.2.18-rc.2');
+    expect(checklists).toBe(0);
+    expect(asked).toEqual(['0.2.18/rc', '0.2.18/rc']);
+    await expect(runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', mainCut: true }, deps)).rejects.toThrow('never bump main');
+    await expect(runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', cutCommit: 'abc1234' }, deps)).rejects.toThrow('never bump main');
+    await expect(runUnattendedRelease({ version: '0.2.18-rc.0', prerelease: 'rc', dryRun: true }, deps)).rejects.toThrow('base version x.y.z');
+    expect(inputs).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

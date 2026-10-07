@@ -33,7 +33,7 @@ const walWait = new Int32Array(new SharedArrayBuffer(4));
 const SCHEMA_COLUMNS: Record<string, readonly string[]> = {
   imported_versions: ['json_hash', 'imported_at'],
   events: ['reason'],
-  assignments: ['priority', 'predecessors', 'deadline_version', 'ceo_minutes', 'ceo_date', 'accelerator'],
+  assignments: ['priority', 'predecessors', 'deadline_version', 'ceo_minutes', 'ceo_date', 'accelerator', 'refs'],
   release_schedules: ['freeze_from', 'freeze_until'],
 };
 function schemaCurrent(db: Database): boolean {
@@ -75,7 +75,7 @@ function open(root = releaseLedgerRoot()): Database {
       if (!(db.query('PRAGMA table_info(events)').all() as Array<{ name: string }>).some((column) => column.name === 'reason')) db.exec('ALTER TABLE events ADD COLUMN reason TEXT');
       db.exec('CREATE TABLE IF NOT EXISTS release_schedules (version TEXT PRIMARY KEY, cut_at TEXT NOT NULL, land_by TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)');
       const assignmentColumns = db.query('PRAGMA table_info(assignments)').all() as Array<{ name: string }>;
-      for (const [name, sql] of [['priority', 'TEXT'], ['predecessors', 'TEXT'], ['deadline_version', 'TEXT'], ['ceo_minutes', 'INTEGER'], ['ceo_date', 'TEXT'], ['accelerator', 'INTEGER']] as const) {
+      for (const [name, sql] of [['priority', 'TEXT'], ['predecessors', 'TEXT'], ['deadline_version', 'TEXT'], ['ceo_minutes', 'INTEGER'], ['ceo_date', 'TEXT'], ['accelerator', 'INTEGER'], ['refs', 'TEXT']] as const) {
         if (!assignmentColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE assignments ADD COLUMN ${name} ${sql}`);
       }
       const scheduleColumns = db.query('PRAGMA table_info(release_schedules)').all() as Array<{ name: string }>;
@@ -169,7 +169,7 @@ function evidenceRefs(db: Database, version: string, id: string): string[] {
   return (db.query('SELECT ref FROM evidence WHERE feature_id = ? AND version = ? ORDER BY rowid').all(id, version) as Array<{ ref: string }>).map((row) => row.ref);
 }
 function items(db: Database, version: string): ChecklistItem[] {
-  const rows = db.query(`SELECT f.id, COALESCE(a.title_override, f.title) AS title, a.owner, a.kind, a.priority, a.predecessors, a.deadline_version, a.ceo_minutes, a.ceo_date, a.accelerator, a.status, a.disposition, a.evidence, a.updated_at, a.updated_by
+  const rows = db.query(`SELECT f.id, COALESCE(a.title_override, f.title) AS title, a.owner, a.kind, a.priority, a.predecessors, a.deadline_version, a.ceo_minutes, a.ceo_date, a.accelerator, a.refs, a.status, a.disposition, a.evidence, a.updated_at, a.updated_by
     FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.version = ? ORDER BY a.rowid`).all(version) as Array<Record<string, string | number | null>>;
   return rows.map((r) => {
     const evidence = [r.evidence, ...evidenceRefs(db, version, r.id as string)].filter((value) => value !== null).join('\n');
@@ -179,6 +179,7 @@ function items(db: Database, version: string): ChecklistItem[] {
       ...(r.deadline_version !== null ? { deadlineVersion: r.deadline_version as string } : {}),
       ...(r.ceo_minutes !== null ? { ceoMinutes: r.ceo_minutes as number } : {}), ...(r.ceo_date !== null ? { ceoDate: r.ceo_date as string } : {}),
       ...(r.accelerator === 1 ? { accelerator: true as const } : {}),
+      ...(r.refs !== null && r.refs !== undefined ? { refs: JSON.parse(r.refs as string) as string[] } : {}),
       ...(r.evidence !== null || evidence ? { evidence } : {}), ...(r.disposition !== null ? { disposition: r.disposition as ChecklistItem['disposition'] } : {}),
       updatedAt: r.updated_at as string, updatedBy: r.updated_by as string };
   });
@@ -192,9 +193,9 @@ function putItem(db: Database, version: string, item: ChecklistItem): void {
   if (!feature) db.query('INSERT INTO features (id, title, owner, kind, created_at) VALUES (?, ?, ?, ?, ?)').run(item.id, item.title, item.owner ?? null, item.kind ?? null, item.updatedAt);
   // features.owner/kind follow the latest assignment so details() and the checklist never disagree after a set.
   else if (item.owner !== undefined || item.kind !== undefined) db.query('UPDATE features SET owner = COALESCE(?, owner), kind = COALESCE(?, kind) WHERE id = ?').run(item.owner ?? null, item.kind ?? null, item.id);
-  db.query(`INSERT INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, ceo_minutes, ceo_date, accelerator, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(feature_id, version) DO UPDATE SET status=excluded.status, disposition=excluded.disposition, evidence=excluded.evidence, owner=excluded.owner, kind=excluded.kind, priority=excluded.priority, predecessors=excluded.predecessors, deadline_version=excluded.deadline_version, ceo_minutes=excluded.ceo_minutes, ceo_date=excluded.ceo_date, accelerator=excluded.accelerator, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
-    .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, feature && feature.title !== item.title ? item.title : null, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.ceoMinutes ?? null, item.ceoDate ?? null, item.accelerator === true ? 1 : null, item.updatedAt, item.updatedBy);
+  db.query(`INSERT INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, ceo_minutes, ceo_date, accelerator, refs, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(feature_id, version) DO UPDATE SET status=excluded.status, disposition=excluded.disposition, evidence=excluded.evidence, owner=excluded.owner, kind=excluded.kind, priority=excluded.priority, predecessors=excluded.predecessors, deadline_version=excluded.deadline_version, ceo_minutes=excluded.ceo_minutes, ceo_date=excluded.ceo_date, accelerator=excluded.accelerator, refs=excluded.refs, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
+    .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, feature && feature.title !== item.title ? item.title : null, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.ceoMinutes ?? null, item.ceoDate ?? null, item.accelerator === true ? 1 : null, item.refs?.length ? JSON.stringify(item.refs) : null, item.updatedAt, item.updatedBy);
 }
 function jsonHash(contents: string | Buffer): string { return createHash('sha256').update(contents).digest('hex'); }
 
@@ -235,8 +236,8 @@ function importOnDb(db: Database, version: string): boolean {
       // Keep a legacy per-version title until an explicit retitle unifies the feature identity.
       if (!existing) putItem(db, version, item);
       else {
-        db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, ceo_minutes, ceo_date, accelerator, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.ceoMinutes ?? null, item.ceoDate ?? null, item.accelerator === true ? 1 : null, item.updatedAt, item.updatedBy);
+        db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, priority, predecessors, deadline_version, ceo_minutes, ceo_date, accelerator, refs, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.priority ?? null, item.predecessors ? JSON.stringify(item.predecessors) : null, item.deadlineVersion ?? null, item.ceoMinutes ?? null, item.ceoDate ?? null, item.accelerator === true ? 1 : null, item.refs?.length ? JSON.stringify(item.refs) : null, item.updatedAt, item.updatedBy);
       }
     }
     for (const entry of data.history) record(db, version, entry);
@@ -263,7 +264,7 @@ function importOnDb(db: Database, version: string): boolean {
       record(db, version, { at: new Date().toISOString(), by: item.updatedBy, id: item.id, field: 'reimport', from: null, to: item, released: data.released, dev: data.dev });
       continue;
     }
-    const fields = ['title', 'status', 'evidence', 'owner', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator'] as const;
+    const fields = ['title', 'status', 'evidence', 'owner', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const;
     const baseEvidence = (db.query('SELECT evidence FROM assignments WHERE feature_id = ? AND version = ?').get(item.id, version) as { evidence: string | null }).evidence ?? undefined;
     const preserveRefs = item.evidence === baseEvidence || item.evidence === current.evidence;
     const differs = fields.some((field) => field === 'evidence'

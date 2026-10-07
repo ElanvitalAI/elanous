@@ -14,6 +14,11 @@ import { BudgetPill } from './BudgetPill';
 import { VoiceCostPill } from './VoiceCostPill';
 import { SessionPill } from './SessionPill';
 import { ChatCurrentProject } from './ChatCurrentProject';
+import { MobileChatStatus } from './MobileChatStatus';
+import { SeatsNowStrip } from './SeatsNowStrip';
+import { ChatApprovalsChip } from './ChatApprovalsChip';
+import { ChatDecisionsChip } from './ChatDecisionsChip';
+import { ChatPendingDecision } from './ChatPendingDecision';
 import { HideInPublicCapture } from '@/lib/public-capture';
 import { SHARE_PREFILL_KEY } from '@/lib/share-prefill';
 import { MAX_CHAT_FILE_BYTES, MAX_CHAT_FILES } from '@/lib/chat-paste-drop';
@@ -50,7 +55,7 @@ function storage(): Storage {
   };
 }
 
-async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean }) {
+async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean }) {
   const sessionStorage = storage();
   const localStorage = storage();
   if (opts.prefill) sessionStorage.setItem(SHARE_PREFILL_KEY, opts.prefill);
@@ -96,6 +101,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     voiceWsUrl: () => '',
     voiceCost: async () => ({}),
     fetchJson: async () => ({ messages: [] }),
+    fetchResponse: async (path: string) => new Response(JSON.stringify(path === '/v1/decisions?status=open' ? { decisions: opts.actions ? [{ id: 'd1', title: '결정', situation: '상황', options: [{ id: 'yes', label: '진행' }], recommendation: { option: 'yes', why: '필요' } }] : [] } : { items: opts.actions ? [{ graphId: 'g', runId: 'r', nodeId: 'n', message: '승인', since: '', path: [], recent: [] }] : [] }), { status: 200 }),
     subscribeChatEvents: () => () => {},
     subscribeChatFeedbackEvents: () => () => {},
     promptStream: async (body: unknown, options?: { signal?: AbortSignal }) => {
@@ -114,7 +120,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     setConfig: () => {},
   };
   await act(async () => {
-    tree = create(<DaemonContext.Provider value={daemon}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>);
+    tree = create(<DaemonContext.Provider value={daemon}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/observatory' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>);
   });
   const input = tree!.root.findByType(ChatInput);
   return { requests, streams, turns, uploads, input, sessionStorage, receiveAsk: (payload: unknown) => inbound!(payload) };
@@ -297,6 +303,47 @@ test('compact header fits one 44px row with navigation, session, and expandable 
   expect(root.findAllByProps({ id: 'chat-header-more' })).toHaveLength(0);
 });
 
+test('390px standalone chat has one status row with live work and menu-only controls', async () => {
+  await mount({ acp: false, width: 390, mobileSimple: true });
+  const root = tree!.root;
+  const status = root.findByType(MobileChatStatus);
+  expect(root.findAllByProps({ 'data-elanous-mobile-chat-status': '' })).toHaveLength(1);
+  expect(root.findByProps({ 'data-elanous-mobile-chat-status': '' }).findAllByType('span').map((span) => span.children.join(''))).toEqual(['지금 도는 일 · 구현 중', '대기 결정 · 0']);
+  expect(status.props.activity.run.progressLine).toBe('구현 중');
+  expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
+  expect(root.findAllByType(SeatsNowStrip)).toHaveLength(0);
+  expect(root.findAllByProps({ 'aria-label': '채팅 메뉴' })).toHaveLength(1);
+  expect(root.findAllByType(SessionPill)).toHaveLength(0);
+  expect(root.findAllByType(ChatCurrentProject)).toHaveLength(0);
+  expect(root.findAllByType(NowSpeakButton)).toHaveLength(0);
+  await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
+  const menu = root.findByProps({ id: 'chat-mobile-menu' });
+  expect(menu.findAllByType(SessionPill)).toHaveLength(1);
+  expect(menu.findAllByType(ChatCurrentProject)).toHaveLength(1);
+  expect(menu.findAllByType(NowSpeakButton)).toHaveLength(1);
+  expect(menu.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
+  expect(menu.findByProps({ 'aria-label': '채팅 이동' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/', '/workspace', '/settings']);
+  expect(root.findByType(ChatApprovalsChip).props.mobileOpen).toBe(false);
+  expect(root.findByType(ChatDecisionsChip).props.mobileOpen).toBe(false);
+  expect(root.findByType(ChatHistory).props.mobileSimple).toBe(true);
+  expect(root.findAllByType(ChatPendingDecision)).toHaveLength(0);
+});
+
+test('390px approval and decision share one chip; opening reveals both actionable lists', async () => {
+  await mount({ acp: false, width: 390, mobileSimple: true, actions: true });
+  const root = tree!.root;
+  expect(root.findByType(MobileChatStatus).props.decisions).toBe(1);
+  expect(root.findAllByProps({ 'aria-controls': 'chat-mobile-actions' })).toHaveLength(1);
+  const chip = root.findByProps({ 'aria-controls': 'chat-mobile-actions' });
+  expect(chip.props['aria-expanded']).toBe(false);
+  expect(root.findAllByProps({ 'aria-controls': 'chat-approvals-panel' })).toHaveLength(0);
+  expect(root.findAllByProps({ 'aria-controls': 'chat-decisions-panel' })).toHaveLength(0);
+  await act(async () => chip.props.onClick());
+  expect(root.findByProps({ 'aria-controls': 'chat-mobile-actions' }).props['aria-expanded']).toBe(true);
+  expect(root.findAllByProps({ id: 'chat-approvals-panel' })).toHaveLength(1);
+  expect(root.findAllByProps({ id: 'chat-decisions-panel' })).toHaveLength(1);
+});
+
 test('public capture still hides both money pills in compact more menu', async () => {
   await mount({ acp: false, width: 412, capture: true });
   await act(async () => tree!.root.findByProps({ 'aria-label': '채팅 더보기' }).props.onClick());
@@ -306,12 +353,22 @@ test('public capture still hides both money pills in compact more menu', async (
   expect(popup.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(1);
 });
 
+test('390px standalone status menu still masks cost controls in public capture', async () => {
+  await mount({ acp: false, width: 390, mobileSimple: true, capture: true });
+  const root = tree!.root;
+  await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
+  expect(root.findByProps({ id: 'chat-mobile-menu' }).findAllByType(BudgetPill)).toHaveLength(0);
+  expect(root.findByProps({ id: 'chat-mobile-menu' }).findAllByType(VoiceCostPill)).toHaveLength(0);
+});
+
 test('wide header preserves the existing session, money pills, and voice button without compact controls', async () => {
   await mount({ acp: false, width: 1200, leading: true });
   const root = tree!.root;
   expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
+  expect(root.findByType(ChatHistory).props.mobileSimple).toBe(false);
+  expect(root.findAllByType(ChatPendingDecision)).toHaveLength(1);
   expect(root.findAllByType(SessionPill)).toHaveLength(1);
   expect(root.findAllByType(ChatCurrentProject)).toHaveLength(1);
   expect(root.findAllByProps({ 'aria-label': '현재 대화 프로젝트' })).toHaveLength(1);
@@ -451,7 +508,7 @@ test('mounted chat handles /help and unsupported slash locally, and leaves path-
   const { input, requests, streams } = await mount({ acp: true });
   await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/help' } }); });
   await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
-  expect(requests).toHaveLength(0);
+  expect(requests.filter((request) => request.method === 'session/prompt')).toHaveLength(0);
   expect(streams).toHaveLength(0);
   await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '/run-skill test' } }); });
   await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });

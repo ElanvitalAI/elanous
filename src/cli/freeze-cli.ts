@@ -7,8 +7,9 @@ import { pendingFrozenMerges, sweepFrozenMerges } from '../self-implement/frozen
 export function registerFreezeCommands(program: Command): void {
   const freeze = program.command('freeze').description('착지 동결 상태 on/off/status');
   freeze.command('on').option('--reason <text>', '동결 이유').option('--until <timestamp>', '끝 시각(타임존 포함 ISO)')
+    .option('--hold-launches', '착지와 함께 새 하니스 launch도 보류')
     .option('--wait-seconds <n>', '이미 동결 검사를 지난 병합이 끝나기를 기다릴 최대 초', '600')
-    .action(async (opts: { reason?: string; until?: string; waitSeconds: string }) => {
+    .action(async (opts: { reason?: string; until?: string; holdLaunches?: boolean; waitSeconds: string }) => {
       const waitSeconds = Number(opts.waitSeconds);
       if (!/^\d+$/.test(opts.waitSeconds.trim()) || !Number.isSafeInteger(waitSeconds) || waitSeconds > 86_400) {
         throw new CliUserError(`잘못된 --wait-seconds: ${opts.waitSeconds}`, '0 이상 86400 이하의 정수 초');
@@ -34,7 +35,7 @@ export function registerFreezeCommands(program: Command): void {
     const state = readLandingFreeze();
     const pending = pendingFrozenMerges();
     if (opts.json) console.log(JSON.stringify({ frozen: state !== null, freeze: state, pendingMerges: pending }));
-    else console.log(`${state ? landingFreezeMessage(state) : '동결 없음'} · 보류 병합 ${pending}건`);
+    else console.log(`${state ? landingFreezeMessage(state) : '동결 없음'} · launch 보류 ${state?.holdLaunches === true ? '예' : '아니오'} · 보류 병합 ${pending}건`);
   });
 }
 

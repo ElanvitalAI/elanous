@@ -2,7 +2,7 @@ import { dashboardLoops } from './domains/dashboard-data.js';
 import { readSchedulesInventory } from './nexus/api/schedules-read.js';
 import { loadLoopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH } from './loops/status-rows.js';
 
-interface LoopsSources {
+export interface LoopsSources {
   schedules: () => unknown;
   loops: () => unknown;
   now: () => number;

@@ -1,12 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { DaemonClient } from '@/lib/daemon-client';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
+import { ChatLayout } from './ChatLayout';
+import { SeatsNowStrip } from './SeatsNowStrip';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const originalFetch = globalThis.fetch;
@@ -20,6 +22,8 @@ afterEach(async () => {
   globalThis.fetch = originalFetch;
   if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
   else delete (globalThis as { document?: Document }).document;
+  if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+  else delete (globalThis as { window?: Window }).window;
 });
 
 const approval = (id: string) => ({ graphId: `graph/${id}`, runId: `run ${id}`, nodeId: 'publish', message: `게시 ${id}`, since: '', path: [], recent: [] });
@@ -167,7 +171,13 @@ test('switching clients hides old cards immediately and ignores a late old-clien
   expect(decisions).toEqual([]);
 });
 
-test('ChatLayout places the approvals chip immediately after SeatsNowStrip as a sibling', () => {
-  const source = readFileSync(new URL('./ChatLayout.tsx', import.meta.url), 'utf8');
-  expect(source).toMatch(/<SeatsNowStrip \/>\s*<ChatApprovalsChip \/>/);
+test('wide ChatLayout places the approvals chip after SeatsNowStrip without an extra wrapper', async () => {
+  const request = async (path: string) => json(path.includes('decisions') ? { decisions: [] } : { items: [] });
+  const daemon = { client: { fetchResponse: request, fetchJson: async () => ({ messages: [] }), voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } } as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: '', setConfig: () => {}, setSessionId: () => {} };
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: 1024, location: { search: '' }, sessionStorage: { getItem: () => null } }) });
+  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatLayout /></DaemonContext.Provider>); });
+  const children = tree!.root.findByType(ChatLayout).findByType('div').children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
+  const strip = children.findIndex(child => child.type === SeatsNowStrip);
+  expect(strip).toBeGreaterThanOrEqual(0);
+  expect(children[strip + 1]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
 });

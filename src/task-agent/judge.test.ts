@@ -56,7 +56,41 @@ describe('TASK-AGENT 판단부 — 종료 어휘 → 다음 한 수 (RFC §A2)',
     expect(card.stage).toBe('escalated');
   });
 
+  test('새 관측이 이긴다 — 지난 대안 실패가 남아도 병합 → green 제안 · 종료 미관측 → 대기', () => {
+    const stale = { alternative: 1, 'narrow-relaunch': 2 } as const;
+    const green = judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 77, failures: stale });
+    expect(green.move).toBe('propose-green');
+    expect(green.executorKind).toBe('green');
+    expect(judgeNextMove({ stopReason: 'no-progress', prState: 'MERGED', pr: 77, failures: { alternative: 3 } }).move).toBe('propose-green');
+    expect(judgeNextMove({ failures: stale }).move).toBe('wait');
+    expect(judgeNextMove({ stopReason: 'converged', prState: 'OPEN', pr: 1, failures: stale }).move).toBe('wait');
+    // 병합 근거는 같은 수 한도도 넘는다.
+    expect(judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 1, failures: { 'propose-green': 5 } }).move).toBe('propose-green');
+  });
+
+  test('대안 실패 → 결정 카드 승격은 같은 실패 흐름(재발사 계열·한도 소진 수)에서만', () => {
+    // 재발사 계열은 대안 실패가 있으면 카드.
+    expect(judgeNextMove({ stopReason: 'provider-exhausted', failures: { alternative: 1 } }).move).toBe('decision-card');
+    expect(judgeNextMove({ stopReason: 'handed-off-to-salvage', failures: { alternative: 1 } }).move).toBe('decision-card');
+    // 새로 관측된 리뷰 통과 → 착지 제안은 지난 대안 실패로 막히지 않는다.
+    expect(judgeNextMove({ stopReason: 'needs-human', review: 'pass', failures: { alternative: 1 } }).move).toBe('propose-land');
+    expect(judgeNextMove({ stopReason: 'needs-human', failures: { alternative: 1 } }).move).toBe('review');
+    // 리뷰가 한도만큼 실패하고 대안도 실패했으면 카드(무한 대안 반복 방지).
+    expect(judgeNextMove({ stopReason: 'needs-human', failures: { review: 2 } }).move).toBe('alternative');
+    expect(judgeNextMove({ stopReason: 'needs-human', failures: { review: 2, alternative: 1 } }).move).toBe('decision-card');
+  });
+
   test('대기는 실패 누적으로 대안이 되지 않는다', () => {
     expect(judgeNextMove({ failures: { wait: 5 } }).move).toBe('wait');
+  });
+});
+
+describe('§A9 G2 — 재발사 갈래가 실행부에 구분되어 넘어간다', () => {
+  test('narrow · wait · salvage · alternative 는 retry 이되 variant 가 다르다', () => {
+    expect(judgeNextMove({ stopReason: 'no-progress' }).executorVariant).toBe('narrow');
+    expect(judgeNextMove({ stopReason: 'provider-exhausted' }).executorVariant).toBe('wait');
+    expect(judgeNextMove({ stopReason: 'handed-off-to-salvage' }).executorVariant).toBe('salvage');
+    expect(judgeNextMove({ stopReason: 'no-progress', failures: { 'narrow-relaunch': 2 } }).executorVariant).toBe('alternative');
+    expect(judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 1 }).executorVariant).toBeUndefined();
   });
 });

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { WARNING_ONLY } from './auto-approve-node.js';
 import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
+import { prereleaseKind } from './release-version.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
 
 export function publicNotes(markdown: string, pages: { pages: Array<{ id: string; slug?: string; source?: string }> }): string {
@@ -18,6 +19,12 @@ export function publicNotes(markdown: string, pages: { pages: Array<{ id: string
     if (!page) throw new Error(`no public page for link: ${path}`);
     return `[${label}](https://docs.elanous.ai${(page.slug ?? `/${page.id}`).replace(/\/$/, '')})`;
   });
+}
+
+/** RELEASE-REHEARSAL-RC: prerelease notes open with a label, so nobody mistakes a rehearsal for the stable release. */
+export function labelPrerelease(version: string, body: string): string {
+  if (prereleaseKind(version) === null) return body;
+  return `> **Pre-release** — ${version} is a pre-release, not the latest version. Install it with \`npm i -g elanous@next\`; \`latest\` stays on the current stable release.\n\n${body}`;
 }
 
 /** Polls each release asset until it answers 200 (following redirects). Returns the names still missing. */
@@ -61,7 +68,7 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
   const registry = run('git', ['show', `${branch}:website/pages.json`]);
   if (doc.status !== 0 || registry.status !== 0) throw new Error(`docs branch missing notes or pages: ${branch}`);
   if (!doc.stdout.startsWith(`# ${version}\n`)) throw new Error('release notes version mismatch');
-  const body = publicNotes(doc.stdout, JSON.parse(registry.stdout));
+  const body = labelPrerelease(version, publicNotes(doc.stdout, JSON.parse(registry.stdout)));
   const dir = mkdtempSync(join(tmpdir(), 'release-publish-notes-'));
   try {
     const file = join(dir, 'notes.md');

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { format, parse, type PrCommentMeta } from './pr-comment-meta.js';
+import { expandRecords, format, parse, type PrCommentMeta } from './pr-comment-meta.js';
 
 describe('PR comment metadata', () => {
   test('format → parse round-trip encodes spaces, newlines, and closing angle brackets without early comment closure', () => {
@@ -39,5 +39,49 @@ describe('PR comment metadata', () => {
     expect(parse('<!-- elanous-pr-comment v1 run=run-1 -->')).toBeNull();
     expect(parse('<!-- elanous-pr-comment v1 role=author')).toBeNull();
     expect(parse('<!-- elanous-pr-comment v2 role=author -->')).toBeNull();
+  });
+
+  test('expands each round-headed record in a run-status details without including the summary', () => {
+    const first = `${format({ role: 'author', round: 0, run: 'run-1' })}\nRound 0\n\n- created`;
+    const second = `${format({ role: 'reviewer', round: 1, run: 'run-1' })}\nRound 1\n\n- fixed`;
+    const body = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n\n${first}\n\n${second}\n</details>`;
+    expect(expandRecords(body)).toEqual([first, second]);
+    expect(expandRecords(body).map(parse)).toEqual([
+      { role: 'author', round: 0, run: 'run-1' },
+      { role: 'reviewer', round: 1, run: 'run-1' },
+    ]);
+    expect(expandRecords(body.replaceAll('\n', '\r\n'))).toEqual([first.replaceAll('\n', '\r\n'), second.replaceAll('\n', '\r\n')]);
+  });
+
+  test('expands records across details blocks but ignores invalid or roundless headers', () => {
+    const first = `${format({ role: 'author', round: 0 })}\nFirst round`;
+    const second = `${format({ role: 'judge', round: 3 })}\nThird round`;
+    const body = [
+      '<!-- elanous:run-status -->',
+      '<details open>', '<summary>First</summary>',
+      '<!-- elanous-pr-comment v1 role=reviewer -->', first, '</details>',
+      '<details>', '<summary>Second</summary>',
+      '<!-- elanous-pr-comment v1 role=robot round=2 -->', second, '</details>',
+    ].join('\n');
+    expect(expandRecords(body)).toEqual([first, second]);
+  });
+
+  test('roundless author record after reviewer ends the reviewer body without being returned', () => {
+    const reviewer = `${format({ role: 'reviewer', round: 2 })}\n- reviewer must-fix`;
+    const author = `${format({ role: 'author' })}\n- author response is not a must-fix`;
+    const judge = `${format({ role: 'judge', round: 3 })}\nJudge conclusion`;
+    const body = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n${reviewer}\n\n${author}\n\n${judge}\n</details>`;
+    expect(expandRecords(body)).toEqual([reviewer, judge]);
+  });
+
+  test('leaves ordinary comments and status comments without round-headed records intact', () => {
+    const ordinary = `${format({ role: 'author', round: 0 })}\nIndividual comment`;
+    const human = 'A human comment with <details>\n<!-- elanous-pr-comment v1 role=reviewer round=2 -->\n</details>';
+    const similarMarker = '<!-- elanous:run-status --> extra\n<details>\n<!-- elanous-pr-comment v1 role=author round=1 -->\n</details>';
+    const emptyStatus = '<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n</details>';
+    expect(expandRecords(ordinary)).toEqual([ordinary]);
+    expect(expandRecords(human)).toEqual([human]);
+    expect(expandRecords(similarMarker)).toEqual([similarMarker]);
+    expect(expandRecords(emptyStatus)).toEqual([emptyStatus]);
   });
 });

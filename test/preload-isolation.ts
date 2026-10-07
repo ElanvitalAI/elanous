@@ -23,6 +23,12 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdirSync, rmSync } from 'node:fs';
+import { GIT_LOCATION_ENV_KEYS } from '../scripts/test-deterministic.js';
+import { debug } from '../src/debug/log.js';
+
+const clearedGitKeys = GIT_LOCATION_ENV_KEYS.filter((key) => Object.hasOwn(process.env, key));
+for (const key of clearedGitKeys) delete process.env[key];
+if (clearedGitKeys.length > 0) debug.log('test.preload', 'git-location-env-cleared', { keys: clearedGitKeys });
 
 // ⛔⭐⭐⭐ 2026-08-05 인시던트 — **이 그물이 «자격증명»을 안 덮고 있었다.**
 //   `saveTokens('openai-codex', …)` 은 «기본으로» 미러를 쓰고, 그 대상은 CODEX_HOME 미설정 시

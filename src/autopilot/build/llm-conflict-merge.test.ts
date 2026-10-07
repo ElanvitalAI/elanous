@@ -161,6 +161,7 @@ describe('mergeMainWithLlmResolve — LLM 지능형 충돌 해결', () => {
     expect(result).toEqual({
       status: 'conflict-unresolved',
       resolvedFiles: [],
+      failedFile: 'src/x.test.ts',
       testDeclarationLoss: [{ file: 'src/x.test.ts', ours: 3, theirs: 3, merged: 1 }],
     });
     expect(calls).toContain('abort');
@@ -182,6 +183,7 @@ describe('mergeMainWithLlmResolve — LLM 지능형 충돌 해결', () => {
     expect(result).toEqual({
       status: 'conflict-unresolved',
       resolvedFiles: ['src/unmeasured.test.ts'],
+      failedFile: 'src/lost.test.ts',
       testDeclarationLoss: [{ file: 'src/lost.test.ts', ours: 3, theirs: 3, merged: 1 }],
       testDeclarationUnmeasured: ['src/unmeasured.test.ts'],
     });
@@ -229,7 +231,7 @@ describe('mergeMainWithLlmResolve — LLM 지능형 충돌 해결', () => {
   test('미해결·오류 경로 shape 는 기존처럼 sizeChange 를 싣지 않는다', async () => {
     const unresolved = await mergeMainWithLlmResolve('/wt', 'main', async () => CONFLICTED, gitSeam({ mergeConflict: true }).git);
     const error = await mergeMainWithLlmResolve('/wt', 'main', async () => RESOLVED, gitSeam({ mergeOk: false, mergeConflict: false }).git);
-    expect(unresolved).toEqual({ status: 'conflict-unresolved', resolvedFiles: [] });
+    expect(unresolved).toEqual({ status: 'conflict-unresolved', reason: 'conflict-markers-remain', failedFile: 'src/a.ts', resolvedFiles: [] });
     expect(error).toEqual({ status: 'error', errorStep: 'merge' });
   });
 
@@ -249,10 +251,70 @@ describe('mergeMainWithLlmResolve — LLM 지능형 충돌 해결', () => {
     expect(calls).not.toContain('commit');   // 커밋 안 함
   });
 
+  test('마커 잔존은 reason·failedFile·단일 abort·단일 debug 로그를 남기고 포맷에도 싣는다', async () => {
+    const { git, calls } = gitSeam({ files: ['src/a.ts'] });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await mergeMainWithLlmResolve('/wt', 'main', async () => '<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n', git);
+      expect(result).toEqual({ status: 'conflict-unresolved', reason: 'conflict-markers-remain', failedFile: 'src/a.ts', resolvedFiles: [] });
+      expect(calls.filter((c) => c === 'abort')).toHaveLength(1);
+      expect(formatLlmMergeOutcome(result)).toContain('사유 conflict-markers-remain · 파일 src/a.ts');
+      expect(log.mock.calls.filter(([category, event]) => category === 'self-dev.merge' && event === 'conflict-unresolved')).toEqual([
+        ['self-dev.merge', 'conflict-unresolved', { reason: 'conflict-markers-remain', failedFile: 'src/a.ts', resolvedCount: 0 }],
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('둘째 파일에서 마커 잔존이면 앞 파일을 resolvedFiles로 남기고 둘째를 failedFile로 남긴다', async () => {
+    const { git, calls } = gitSeam({ files: ['src/ok.ts', 'src/b.ts'] });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await mergeMainWithLlmResolve('/wt', 'main', async (file) => file === 'src/b.ts' ? CONFLICTED : RESOLVED, git);
+      expect(result).toEqual({ status: 'conflict-unresolved', reason: 'conflict-markers-remain', failedFile: 'src/b.ts', resolvedFiles: ['src/ok.ts'] });
+      expect(calls.filter((c) => c === 'abort')).toHaveLength(1);
+      expect(log.mock.calls.filter(([category, event]) => category === 'self-dev.merge' && event === 'conflict-unresolved')).toEqual([
+        ['self-dev.merge', 'conflict-unresolved', { reason: 'conflict-markers-remain', failedFile: 'src/b.ts', resolvedCount: 1 }],
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('충돌 파일을 읽지 못하면 파일별 reason과 failedFile을 남기고 abort한다', async () => {
+    const { git, calls } = gitSeam({ files: ['src/a.ts'] });
+    git.readFile = () => { throw new Error('unreadable'); };
+    const result = await mergeMainWithLlmResolve('/wt', 'main', async () => RESOLVED, git);
+    expect(result).toEqual({ status: 'conflict-unresolved', reason: 'conflict-file-unreadable', failedFile: 'src/a.ts', resolvedFiles: [] });
+    expect(calls.filter((c) => c === 'abort')).toHaveLength(1);
+    expect(calls).not.toContain('commit');
+  });
+
+  test('reason 이 없는 기존 출구(공급자 오류·시험 선언 유실·크기 붕괴)는 포맷에 undefined 를 싣지 않고 실제 결과를 싣는다', async () => {
+    const bigLines = (n: number, tag = 'x') => Array.from({ length: n }, (_, i) => `const ${tag}${i} = ${i};`).join('\n');
+    const provider = await mergeMainWithLlmResolve('/wt', 'main', async () => '[LLM PROVIDER BLOCKED] fallback candidates exhausted\n', gitSeam({ mergeConflict: true, files: ['src/p.ts'] }).git);
+    const lossSeam = gitSeam({ mergeConflict: true, files: ['src/x.test.ts'], indexStageContents: {
+      ':2:src/x.test.ts': "test('a', () => {});\ntest('b', () => {});\ntest('c', () => {});\n",
+      ':3:src/x.test.ts': "test('a', () => {});\ntest('b', () => {});\ntest('d', () => {});\n",
+    } });
+    const loss = await mergeMainWithLlmResolve('/wt', 'main', async () => "test('a', () => {});\n", lossSeam.git);
+    const collapseSeam = gitSeam({ mergeConflict: true, files: ['src/big.ts'], indexStageContents: { ':2:src/big.ts': bigLines(400, 'a'), ':3:src/big.ts': bigLines(420, 'b') } });
+    const collapse = await mergeMainWithLlmResolve('/wt', 'main', async () => `${bigLines(3)}\n`, collapseSeam.git);
+    for (const outcome of [provider, loss, collapse]) {
+      expect(outcome.status).toBe('conflict-unresolved');
+      expect(outcome.reason).toBeUndefined();
+      expect(formatLlmMergeOutcome(outcome)).not.toContain('undefined');
+    }
+    expect(provider.providerFailure).toEqual(['src/p.ts']);
+    expect(formatLlmMergeOutcome(provider)).toBe('conflict-unresolved; 파일 src/p.ts · 공급자 오류 문구 src/p.ts');
+    expect(formatLlmMergeOutcome(loss)).toBe('conflict-unresolved; 파일 src/x.test.ts · 시험 선언 유실 src/x.test.ts 3/3→1');
+    expect(formatLlmMergeOutcome(collapse)).toBe('conflict-unresolved; 파일 src/big.ts · 크기 붕괴 src/big.ts 400/420→3줄');
+    expect(formatLlmMergeOutcome({ status: 'conflict-unresolved', resolvedFiles: [] })).toBe('conflict-unresolved');
+  });
+
   test('★ LLM 예외 → conflict-unresolved·abort', async () => {
     const { git, calls } = gitSeam({ mergeConflict: true });
     const r = await mergeMainWithLlmResolve('/wt', 'main', async () => { throw new Error('llm fail'); }, git);
     expect(r.status).toBe('conflict-unresolved');
+    expect(r.reason).toBe('conflict-resolver-interrupted');
+    expect(r.failedFile).toBe('src/a.ts');
     expect(calls).toContain('abort');
   });
 
@@ -372,6 +434,7 @@ describe('defaultLlmResolve intent modes', () => {
       const oversizedGit = gitSeam({ fileContents: { '/wt/src/a.ts': CONFLICTED.repeat(40) } });
       const tooLarge = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { mode: 'off', stream }), oversizedGit.git);
       expect(tooLarge.reason).toBe('conflict-input-too-large');
+      expect(tooLarge.failedFile).toBe('src/a.ts');
       expect(tooLarge.status).toBe('conflict-unresolved');
       expect(typeof tooLarge.inputChars).toBe('number');
       expect(tooLarge.inputChars).toBeGreaterThan(600);
@@ -595,7 +658,7 @@ describe('해결본이 파일이 아닐 때 — 공급자 오류 문구 · 크�
   test('해결기가 공급자 오류 문구를 돌려주면 abort 하고 쓰지도 commit 하지도 않는다', async () => {
     const { git, calls, written } = gitSeam({ mergeConflict: true, files: ['src/dashboard/index.ts'] });
     const result = await mergeMainWithLlmResolve('/wt', 'main', async () => PROVIDER_TEXT, git);
-    expect(result).toMatchObject({ status: 'conflict-unresolved', resolvedFiles: [], providerFailure: ['src/dashboard/index.ts'] });
+    expect(result).toMatchObject({ status: 'conflict-unresolved', resolvedFiles: [], failedFile: 'src/dashboard/index.ts', providerFailure: ['src/dashboard/index.ts'] });
     expect(calls).toContain('abort');
     expect(calls).not.toContain('commit');
     expect(written['/wt/src/dashboard/index.ts']).toBeUndefined();
@@ -604,7 +667,7 @@ describe('해결본이 파일이 아닐 때 — 공급자 오류 문구 · 크�
   test('양쪽 판보다 절반 넘게 작아지면 abort 한다 — 50줄 미만 파일은 판정하지 않는다', async () => {
     const big = gitSeam({ mergeConflict: true, files: ['src/big.ts'], indexStageContents: { ':2:src/big.ts': lines(400, 'a'), ':3:src/big.ts': lines(420, 'b') } });
     const collapsed = await mergeMainWithLlmResolve('/wt', 'main', async () => `${lines(3)}\n`, big.git);
-    expect(collapsed).toMatchObject({ status: 'conflict-unresolved', sizeCollapse: [{ file: 'src/big.ts', ours: 400, theirs: 420, merged: 3 }] });
+    expect(collapsed).toMatchObject({ status: 'conflict-unresolved', failedFile: 'src/big.ts', sizeCollapse: [{ file: 'src/big.ts', ours: 400, theirs: 420, merged: 3 }] });
     expect(big.calls).not.toContain('commit');
 
     const ok = gitSeam({ mergeConflict: true, files: ['src/big.ts'], indexStageContents: { ':2:src/big.ts': lines(400, 'a'), ':3:src/big.ts': lines(420, 'b') } });

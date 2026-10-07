@@ -981,6 +981,8 @@ export interface DiscordConfig {
   /** Standalone `elanous discord-test` scope — same token, dedicated
    *  channel, isolated state. See DiscordTestChannel. */
   testChannel?: DiscordTestChannel;
+  /** 첫 말·6시간 쉼 뒤 일반 답 앞에 맥락 요약을 보낸다. 기본 켬, false 만 끈다. */
+  contextFirst?: boolean;
 }
 
 const DISCORD_DEFAULTS: DiscordConfig = { enabled: false, allowedUsers: [] };
@@ -3495,6 +3497,11 @@ export interface OrchestratorLoopConfig {
   idleRequest?: 'off' | 'shadow' | 'live';
   /** FINISH-RATE — the queue tick reads finish metrics before launching; shadow logs the hold only, on holds (default shadow). */
   finishGate?: 'off' | 'shadow' | 'on';
+  /** ORCH-TA-HAND — the delegate node hands its picked cell to TASK-AGENT (`handTask`). Absent = off · shadow = card only ·
+   *  live = launch (only when the tick mode is live too; a live hand skips the seat journal so the cell launches once). */
+  handToTaskAgent?: 'off' | 'shadow' | 'live';
+  /** Demo: hand only this cell id (others keep the seat path). Absent = every delegatable cell. */
+  handToTaskAgentCell?: string;
 }
 
 export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
@@ -3523,7 +3530,9 @@ export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfi
   return { mode, seatTrees, seatCaps, ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
     trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow',
     idleRequest: value.idleRequest === 'off' || value.idleRequest === 'live' ? value.idleRequest : 'shadow',
-    finishGate: value.finishGate === 'off' || value.finishGate === 'on' ? value.finishGate : 'shadow' };
+    finishGate: value.finishGate === 'off' || value.finishGate === 'on' ? value.finishGate : 'shadow',
+    ...(value.handToTaskAgent === 'shadow' || value.handToTaskAgent === 'live' ? { handToTaskAgent: value.handToTaskAgent } : {}),
+    ...(typeof value.handToTaskAgentCell === 'string' && value.handToTaskAgentCell.trim() ? { handToTaskAgentCell: value.handToTaskAgentCell.trim() } : {}) };
 }
 
 export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
@@ -3597,8 +3606,40 @@ export interface HqConfig {
   probeTimeoutSeconds?: number;
 }
 
+/** GATE-REMOTE (10-06): heavy pre-landing checks (self gate · changed-file tsc · public-export test run) on a remote host at the same commit. */
+export interface GateRemoteConfig {
+  /** Auto-dispatch when the local 1-min load exceeds the threshold (default true). `--remote`/`--local` flags always win. */
+  enabled?: boolean;
+  /** ssh host (default node-b). */
+  host?: string;
+  /** Local 1-min load average above which checks go remote (default 20). */
+  loadThreshold?: number;
+  /** Concurrent heavy checks per remote host (default and ceiling 2 — config may only lower it). */
+  hostCap?: number;
+  /** Bare mirror on the host (default ~/mirror/elanous-agent.git — shared with the release gate). */
+  mirror?: string;
+  /** Seconds to wait for a free host slot before running locally (default 600). */
+  slotWaitSeconds?: number;
+}
+
+export function parseGateRemoteConfig(raw: unknown): GateRemoteConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: GateRemoteConfig = {};
+  if (typeof r.enabled === 'boolean') out.enabled = r.enabled;
+  for (const key of ['host', 'mirror'] as const) if (typeof r[key] === 'string' && (r[key] as string).trim()) out[key] = (r[key] as string).trim();
+  for (const key of ['loadThreshold', 'slotWaitSeconds'] as const) {
+    const v = r[key];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) out[key] = v;
+  }
+  if (typeof r.hostCap === 'number' && Number.isSafeInteger(r.hostCap) && r.hostCap > 0 && r.hostCap <= 2) out.hostCap = r.hostCap;
+  return Object.keys(out).length ? out : undefined;
+}
+
 export interface UserConfig {
   events?: EventsConfig;
+  /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
+  gateRemote?: GateRemoteConfig;
   /** Explicit HTTPS destination for doctor diagnostics; absent means no upload. */
   diagnostics?: { uploadUrl?: string };
   /** HQ lease (본부 임대 · 10-04 HQ-HB/HQ-FENCE): arbiter host over ssh, this host's name, per-role fail-open when the arbiter is unreachable (default: fail closed). */
@@ -3609,6 +3650,8 @@ export interface UserConfig {
   nexus?: { demoMode?: boolean };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
+  /** Deferred (quiet-hours) outbound queue. `deferredMaxAttempts`: failed flushes before an item is quarantined; absent = env ELANOUS_OUTBOUND_DEFERRED_MAX_ATTEMPTS, else 5. */
+  outbound?: { deferredMaxAttempts?: number };
   coo?: { linearProject?: string };
   decisions?: { linearProjection: { enabled: boolean }; requireCrossCheck: boolean;
     crossCheckNeighbor: Record<EventSeat, EventSeat>; crossCheckWaitMinutes: number };
@@ -3618,7 +3661,7 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
   /** Maximum nested elanous depth; safe positive integer, default 2. */
@@ -4727,6 +4770,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
 
   const nexus = rawObj.nexus && typeof rawObj.nexus === 'object' && !Array.isArray(rawObj.nexus)
     ? rawObj.nexus as Record<string, unknown> : {};
+  const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
   return {
     nexus: { demoMode: nexus.demoMode === true },
     ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
@@ -4770,7 +4814,16 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ).filter(([seat, cap]) => /^(OP|TC|MK|UX)$/.test(seat) && typeof cap === 'number' && Number.isSafeInteger(cap) && cap > 0)),
       ...(harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
         && typeof (harness.queue as Record<string, unknown>).directSay === 'boolean'
-        ? { directSay: (harness.queue as { directSay: boolean }).directSay } : {}) },
+        ? { directSay: (harness.queue as { directSay: boolean }).directSay } : {}),
+      ...(() => {
+        const queue = harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
+          ? harness.queue as Record<string, unknown> : {};
+        const stale = queue.staleRunMinutes, unknownCap = queue.unknownSeatCap;
+        return {
+          ...(typeof stale === 'number' && Number.isSafeInteger(stale) && stale > 0 ? { staleRunMinutes: stale } : {}),
+          ...(typeof unknownCap === 'number' && Number.isSafeInteger(unknownCap) && unknownCap >= 0 ? { unknownSeatCap: unknownCap } : {}),
+        };
+      })() },
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
@@ -4951,6 +5004,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       homeChannel: typeof dc.homeChannel === 'string' ? dc.homeChannel
         : typeof dc.homeChannel === 'number' ? String(dc.homeChannel) : undefined,
       testChannel: normalizeDiscordTestChannel((dc as Record<string, unknown>).testChannel),
+      ...(dc.contextFirst === false ? { contextFirst: false } : {}),
       ...(Array.isArray(dc.chatChannels)
         ? { chatChannels: (dc.chatChannels as unknown[]).map(v => String(v).trim()).filter(Boolean) }
         : {}),
@@ -5439,7 +5493,13 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       && typeof (rawObj.hitl as Record<string, unknown>).executionDeadlineMinutes === 'number'
       ? { hitl: { executionDeadlineMinutes: (rawObj.hitl as { executionDeadlineMinutes: number }).executionDeadlineMinutes } }
       : {}),
+    ...(rawObj.outbound && typeof rawObj.outbound === 'object' && !Array.isArray(rawObj.outbound)
+      && Number.isSafeInteger((rawObj.outbound as Record<string, unknown>).deferredMaxAttempts)
+      && ((rawObj.outbound as { deferredMaxAttempts: number }).deferredMaxAttempts) > 0
+      ? { outbound: { deferredMaxAttempts: (rawObj.outbound as { deferredMaxAttempts: number }).deferredMaxAttempts } }
+      : {}),
     ...(parseHqConfig(rawObj.hq) ? { hq: parseHqConfig(rawObj.hq)! } : {}),
+    ...(gateRemoteConfig ? { gateRemote: gateRemoteConfig } : {}),
     cli: { helpRole: parseCliHelpRole(rawObj.cli) },
     coo: { linearProject: typeof (rawObj.coo as { linearProject?: unknown } | undefined)?.linearProject === 'string' && (rawObj.coo as { linearProject: string }).linearProject.trim()
       ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },

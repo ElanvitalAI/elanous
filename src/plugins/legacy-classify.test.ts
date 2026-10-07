@@ -390,7 +390,7 @@ describe('legacy plugin classifier', () => {
       rmSync(dataDir, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
     }
-  });
+  }, 60_000); // real host lifecycle: >5s under release-gate load (0.2.18 gate introduced)
 
   test('botlab schedule output keeps unmeasured access distinct from an empty measured schedule', () => {
     expect(renderBotlabCron(parseBotlabCron(null))).toContain('못 물었다');

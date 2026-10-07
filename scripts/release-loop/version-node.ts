@@ -5,12 +5,17 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { emitNodeResult } from './node-verdict.js';
 import { debug } from '../../src/debug/log.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
+import { landingFreezeMessage, readLandingFreeze, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
+import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from './release-version.js';
 
 type Kind = 'release' | 'dev-bump';
-type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string };
+type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
+  /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
+  branch?: string; base?: string; existing?: boolean; skipped?: string };
 
 export function nextDevVersion(version: string): string {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(isReleaseVersion(version) ? baseVersion(version) : version);
   if (!match) throw new Error(`invalid release version: ${version}`);
   return `${match[1]}.${match[2]}.${BigInt(match[3]!) + 1n}-dev.0`;
 }
@@ -64,9 +69,136 @@ function shippedNextMdLines(repo: string, cut: string | undefined): { lines: Set
   return { lines: new Set(shown.stdout.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('- '))) };
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false): Output {
+/** Rewrite the version in package.json, server.json, the ACP agent card and the bun.lock root; returns the files touched. */
+function writeVersionBump(worktree: string, current: string, target: string): string[] {
+  const path = join(worktree, 'package.json');
+  const text = readFileSync(path, 'utf8');
+  const old = `"version": "${current}"`;
+  if (!text.includes(old)) throw new Error(`package.json version field not found: ${current}`);
+  writeFileSync(path, text.replace(old, `"version": "${target}"`));
+  const files = ['package.json'];
+  const serverPath = join(worktree, 'server.json');
+  if (existsSync(serverPath)) {
+    const server = JSON.parse(readFileSync(serverPath, 'utf8')) as { version: string; packages: Array<{ version: string }> };
+    server.version = target;
+    server.packages[0]!.version = target;
+    writeFileSync(serverPath, `${JSON.stringify(server, null, 2)}\n`);
+    files.push('server.json');
+  }
+  const agentPath = join(worktree, 'integrations', 'acp-registry', 'elanous', 'agent.json');
+  if (existsSync(agentPath)) {
+    const agent = JSON.parse(readFileSync(agentPath, 'utf8')) as { version: string; distribution: { npx: { package: string } } };
+    agent.version = target;
+    agent.distribution.npx.package = `elanous@${target}`;
+    writeFileSync(agentPath, `${JSON.stringify(agent, null, 2)}\n`);
+    files.push('agent.json');
+  }
+  const lockPath = join(worktree, 'bun.lock');
+  const lock = readFileSync(lockPath, 'utf8');
+  const root = /"workspaces"\s*:\s*\{\s*""\s*:\s*\{([\s\S]*?)(?=\s*"(?:dependencies|devDependencies|optionalDependencies)"\s*:)/.exec(lock);
+  if (!root) throw new Error('bun.lock root workspace not found');
+  const lockedVersion = /"version"\s*:\s*"([^"]+)"/.exec(root[1]!);
+  if (lockedVersion) {
+    if (lockedVersion[1] !== current) throw new Error(`bun.lock root version ${lockedVersion[1]} is not ${current}`);
+    writeFileSync(lockPath, lock.replace(root[0], root[0].replace(lockedVersion[0], `"version": "${target}"`)));
+  }
+  return files;
+}
+
+export interface BranchCutDeps {
+  /** Runs `bun install --frozen-lockfile` in the bump worktree (the lock must accept the new version). */
+  install?: (worktree: string) => void;
+  /** The landing freeze in force (production root first, like a merge). */
+  freeze?: () => LandingFreeze | null;
+  /** `--force-freeze`: cut while a freeze is on (recorded). */
+  forceFreeze?: boolean;
+}
+
+function currentFreeze(): LandingFreeze | null {
+  const prod = prodInstanceRoot();
+  const root = effectiveInstanceRoot();
+  return readLandingFreeze(prod) ?? (root === prod ? null : readLandingFreeze(root));
+}
+
+/**
+ * RELEASE-BRANCH (대표 10-06 20:0x «0.2.18부터 브랜치 방식»): the release commit lives on `release/<v>`, never on main.
+ * An existing branch is reused as is (a resumed run, or a branch a repair appended to) — its tip is the release commit.
+ * Otherwise the branch is cut from origin/main and the version bump is committed on it; main keeps its -dev.N version
+ * until the post-publish dev bump.
+ */
+export function cutReleaseBranchForRun(repo: string, version: string, deps: BranchCutDeps = {}): Output {
+  if (!isReleaseVersion(version)) throw new Error(`invalid release version: ${version}`);
+  // The run does not need a freeze, but one that is on is the emergency stop: neither a new nor a reused cut passes it.
+  const frozen = (deps.freeze ?? currentFreeze)();
+  if (frozen) {
+    debug.log('release.run', deps.forceFreeze ? 'freeze-forced' : 'frozen', { version, reason: frozen.reason, until: frozen.until, node: 'version-release' });
+    if (!deps.forceFreeze) throw new Error(landingFreezeMessage(frozen));
+  }
+  fetchMain(repo);
+  const branch = `release/${version}`;
+  const advertised = git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/${branch}`).split(/\s+/)[0] ?? '';
+  if (advertised) {
+    // A prerelease number is used once: an existing rc branch is another run's cut, never this run's.
+    if (prereleaseKind(version) !== null) throw new Error(`${branch} already exists — ${version} was cut by another run; run again for the next free number`);
+    if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} remote tip is not a commit SHA`);
+    git(repo, 'fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`);
+    const tip = git(repo, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`);
+    if (tip !== advertised) throw new Error(`${branch} moved while it was read (${advertised} → ${tip})`);
+    const current = versionAt(repo, tip);
+    if (current !== version) throw new Error(`${branch} tip ${tip} package.json version ${current} is not ${version}`);
+    // The branch must be a cut of this release line: its fork point on main still carries <base>-dev.N (or <v>).
+    const fork = git(repo, 'merge-base', 'origin/main', tip);
+    const forkVersion = versionAt(repo, fork);
+    const stableLine = baseVersion(version);
+    if (forkVersion !== version && !new RegExp(`^${stableLine.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`).test(forkVersion)) {
+      throw new Error(`${branch} forks from main at ${fork} (version ${forkVersion}) — not a cut of ${stableLine}-dev.N`);
+    }
+    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit: tip, branch, existing: true });
+    return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true };
+  }
+  const base = git(repo, 'rev-parse', 'origin/main');
+  const current = versionAt(repo, base);
+  const stable = baseVersion(version);
+  const devOfStable = new RegExp(`^${stable.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`);
+  if (current !== version && !devOfStable.test(current)) throw new Error(`origin/main version ${current} is not ${stable}-dev.N (release ${version})`);
+  const temp = mkdtempSync(join(tmpdir(), 'release-branch-cut-'));
+  const worktree = join(temp, 'tree');
+  let added = false;
+  try {
+    git(repo, 'worktree', 'add', '--detach', worktree, base);
+    added = true;
+    const files = current === version ? [] : writeVersionBump(worktree, current, version);
+    if (files.length) {
+      (deps.install ?? ((tree: string) => { run('bun', ['install', '--frozen-lockfile'], tree); }))(worktree);
+      git(worktree, 'add', '-A');
+      git(worktree, 'commit', '-m', `release: ${version}`, '-m', `Cut from main ${base}.`);
+    }
+    const commit = git(worktree, 'rev-parse', 'HEAD');
+    // Create-only: an empty lease refuses to overwrite a branch someone else made meanwhile.
+    const push = git(repo, 'push', '--porcelain', `--force-with-lease=refs/heads/${branch}:`, 'origin', `${commit}:refs/heads/${branch}`);
+    const created = push.split('\n').some((line) => {
+      const [flag, ref, summary] = line.split('\t');
+      return flag === '*' && !!ref?.endsWith(`:refs/heads/${branch}`) && summary === '[new branch]';
+    });
+    if (!created) throw new Error(`${branch} was not created (push: ${push.replace(/\s+/g, ' ').trim() || 'no output'})`);
+    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit, branch, base, existing: false });
+    return { outcome: 'ok', kind: 'release', version, commit, pr: null, branch, base, files };
+  } finally {
+    try { if (added) git(repo, 'worktree', 'remove', '--force', worktree); }
+    finally { rmSync(temp, { recursive: true, force: true }); }
+  }
+}
+
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false): Output {
+  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze });
+  if (kind === 'dev-bump' && prereleaseKind(releaseVersion) !== null) {
+    // A prerelease (rehearsal) never moves main: the next stable release still owns this -dev line.
+    debug.log('release-loop.version-dev-bump', 'skipped', { version: releaseVersion, reason: 'prerelease' });
+    return { outcome: 'ok', kind, version: releaseVersion, commit: null, pr: null, skipped: 'prerelease' };
+  }
   const target = kind === 'release' ? releaseVersion : nextDevVersion(releaseVersion);
-  const source = kind === 'release' ? `${releaseVersion}-dev.N` : releaseVersion;
+  // With the release on its branch, main still carries <v>-dev.N when the dev bump runs.
+  const source = kind === 'release' ? `${releaseVersion}-dev.N` : branchCut ? `${releaseVersion}-dev.N` : releaseVersion;
   fetchMain(repo);
   if (kind === 'release' && cutCommit !== undefined) {
     if (!/^[0-9a-f]{7,40}$/i.test(cutCommit)) throw new Error(`invalid cut commit SHA: ${cutCommit}`);
@@ -107,7 +239,8 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
       return { outcome: 'ok', kind, version: current, commit: before, pr: null };
     }
   }
-  if (kind === 'release' ? !new RegExp(`^${releaseVersion.replaceAll('.', '\\.')}\\-dev\\.(0|[1-9][0-9]*)$`).test(current) : current !== source) {
+  const devOfRelease = new RegExp(`^${releaseVersion.replaceAll('.', '\\.')}\\-dev\\.(0|[1-9][0-9]*)$`);
+  if (kind === 'release' || branchCut ? !devOfRelease.test(current) && !(kind === 'dev-bump' && current === releaseVersion) : current !== source) {
     throw new Error(`origin/main version ${current} is not ${source} (target ${target})`);
   }
 
@@ -115,37 +248,7 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
   const worktree = join(temp, 'tree');
   try {
     git(repo, 'worktree', 'add', '-b', `release-version-${kind}-${Date.now()}-${process.pid}`, worktree, 'origin/main');
-    const path = join(worktree, 'package.json');
-    const text = readFileSync(path, 'utf8');
-    const old = `"version": "${current}"`;
-    if (!text.includes(old)) throw new Error(`package.json version field not found: ${current}`);
-    writeFileSync(path, text.replace(old, `"version": "${target}"`));
-    const files = ['package.json'];
-    const serverPath = join(worktree, 'server.json');
-    if (existsSync(serverPath)) {
-      const server = JSON.parse(readFileSync(serverPath, 'utf8')) as { version: string; packages: Array<{ version: string }> };
-      server.version = target;
-      server.packages[0]!.version = target;
-      writeFileSync(serverPath, `${JSON.stringify(server, null, 2)}\n`);
-      files.push('server.json');
-    }
-    const agentPath = join(worktree, 'integrations', 'acp-registry', 'elanous', 'agent.json');
-    if (existsSync(agentPath)) {
-      const agent = JSON.parse(readFileSync(agentPath, 'utf8')) as { version: string; distribution: { npx: { package: string } } };
-      agent.version = target;
-      agent.distribution.npx.package = `elanous@${target}`;
-      writeFileSync(agentPath, `${JSON.stringify(agent, null, 2)}\n`);
-      files.push('agent.json');
-    }
-    const lockPath = join(worktree, 'bun.lock');
-    const lock = readFileSync(lockPath, 'utf8');
-    const root = /"workspaces"\s*:\s*\{\s*""\s*:\s*\{([\s\S]*?)(?=\s*"(?:dependencies|devDependencies|optionalDependencies)"\s*:)/.exec(lock);
-    if (!root) throw new Error('bun.lock root workspace not found');
-    const lockedVersion = /"version"\s*:\s*"([^"]+)"/.exec(root[1]!);
-    if (lockedVersion) {
-      if (lockedVersion[1] !== current) throw new Error(`bun.lock root version ${lockedVersion[1]} is not ${current}`);
-      writeFileSync(lockPath, lock.replace(root[0], root[0].replace(lockedVersion[0], `"version": "${target}"`)));
-    }
+    const files = writeVersionBump(worktree, current, target);
     run('bun', ['install', '--frozen-lockfile'], worktree);
     if (kind === 'dev-bump') {
       const nextPath = join(worktree, 'release', 'next.md');
@@ -207,12 +310,13 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
   }
 }
 
-function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Output {
+export function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Output {
   let kind: Kind | null = null;
   let version: string | null = null;
   let cut: string | undefined;
   let cutCommit: string | undefined;
   let forceFreeze = false;
+  let branchCut = false;
   try {
     if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] [--cut-commit <sha>] --json');
     kind = args[0];
@@ -226,9 +330,10 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+        input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
       forceFreeze = context.input?.forceFreeze === true;
+      branchCut = context.input?.branchCut === true;
       if (kind === 'release' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
         if (typeof context.input.cutCommit !== 'string') throw new Error('cutCommit must be a commit SHA');
         cutCommit = context.input.cutCommit;
@@ -240,11 +345,11 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
-    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze);
+    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];
-    const outputVersion = kind === 'dev-bump' && version && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)
+    const outputVersion = kind === 'dev-bump' && version && isStableVersion(version)
       ? nextDevVersion(version) : version;
     return { outcome: 'error', kind, version: outputVersion,
       commit: null, pr: null, ...(worktree ? { worktree } : {}), error: message };

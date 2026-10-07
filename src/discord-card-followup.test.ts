@@ -31,7 +31,9 @@ function setup({ caption = '', width = 1600, height = 1000, ocr = CARD_TEXT, fai
     sendMessage: async (channel: string, text: string) => { sent.push({ channel, text }); return { id: 'reply' }; },
     fileSinkForChannel: () => ({ sendFile: () => {}, sendImage: () => {} }),
   } as unknown as DiscordBot;
-  const handler = buildDiscordSelfOnMessage({ userConfig: getUserConfig(), getBot: () => bot,
+  // Card follow-up is measured alone; the context-first summary has its own test (discord-context-first.test.ts).
+  const userConfig = getUserConfig();
+  const handler = buildDiscordSelfOnMessage({ userConfig: { ...userConfig, discord: { ...userConfig.discord, contextFirst: false } }, getBot: () => bot,
     runTurnImpl: (async () => { turns.push('normal'); return { text: 'normal reply' }; }) as never,
     cardFollowupDeps: { rootDir: () => root, ocrText: async () => { ocrCalls++; return ocr; },
       runGraph: async (_graph, options) => {

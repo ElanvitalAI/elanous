@@ -7,6 +7,7 @@ import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { routeSupervisorVerdict, type SupervisorNext } from './supervisor-verdict-edges.js';
+import { recordTaskAgentShadowMove, type TaskAgentShadowInput } from '../task-agent/shadow.js';
 
 export interface SupervisorRound {
   round: number;
@@ -461,6 +462,11 @@ export interface SuperviseRunOptions {
   runStore?: { runId?: string; operatorDir?: string; dir?: string; isolatedDir?: string };
   observe?: (event: string, data: Record<string, unknown>) => void;
   sweepPendingMerges?: typeof sweepFrozenMerges;
+  /**
+   * TASK-AGENT-SHADOW — 멈춤이 확정되면 판단부를 그림자로 부른다(기본 `recordTaskAgentShadowMove`).
+   * `false` 면 끈다. 던져도 런의 결말은 바뀌지 않는다(fail-soft).
+   */
+  taskAgentShadow?: ((input: TaskAgentShadowInput) => unknown) | false;
   observeDeliverables?: () => Promise<{
     readonly deployFindings: ReadonlyMap<string, { target: string; findings?: readonly DeployVerifyFinding[] | readonly unknown[] }>;
     readonly unmeasured: readonly unknown[];
@@ -613,6 +619,14 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
             ...storageObservation,
           });
         } catch { /* fail-open */ }
+      }
+      if (decision.stopReason && opts.taskAgentShadow !== false) {
+        // TASK-AGENT-SHADOW — 판단부를 그림자로 부른다(실행 0). 어떤 오류도 런의 결말을 바꾸지 않는다.
+        try {
+          await (opts.taskAgentShadow ?? recordTaskAgentShadowMove)({ runId, stopReason: decision.stopReason, results });
+        } catch (error) {
+          try { debug.log('task-agent', 'shadow-move-failed', { runId, stopReason: decision.stopReason, error: String(error) }); } catch { /* fail-open */ }
+        }
       }
       return results;
     }

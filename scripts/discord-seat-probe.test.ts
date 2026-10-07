@@ -28,10 +28,12 @@ describe('Discord seat probe', () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {
       const [result] = await runProbeCli(['--text', '@cmo 내일 행사 공지 써 줘', '--dm', '--json'], config);
-      expect(result?.route).toBe('dispatch');
+      // #24523: a seat task travels the seat-ask path (so the answer can come back), so the probe records `ask`.
+      expect(result?.route).toBe('ask');
       expect(result?.seat).toBe('MK');
-      expect(result?.body).toBe('내일 행사 공지 써 줘');
-      expect(result?.reply).toContain('실제 맡김 없음');
+      expect(result?.body).toStartWith('일: 내일 행사 공지 써 줘\n답장 요청: ');
+      // The seat-ask path writes its own receipt even in dry mode; «nothing really delegated» is held by the effects assertions below.
+      expect(result?.reply).toContain('결과를 이 대화로 돌려드립니다');
       expect(result?.ms).toBeGreaterThanOrEqual(0);
       const [ordinary] = await runProbeCli(['--text', '일반 글', '--json'], config);
       expect(['submit', 'none']).toContain(ordinary?.route);
@@ -103,12 +105,15 @@ describe('Discord seat probe', () => {
         return { channel: 'posted', reply: '받음 — MK에 전했습니다.' };
       } },
     });
-    expect(delivered).toEqual(['MK:내일 행사 공지 써 줘']);
-    expect(live.reply).toBe('받음 — MK에 전했습니다.');
+    expect(delivered).toHaveLength(1);
+    // The forwarded task now carries the reply request (#24523) after the original line.
+    expect(delivered[0]).toStartWith('MK:일: 내일 행사 공지 써 줘\n답장 요청: ');
+    // The seat-ask path answers with its own receipt (request id · result returns to this conversation).
+    expect(live.reply).toContain('결과를 이 대화로 돌려드립니다');
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {
       const [dry] = await runProbeCli(['--text', '@cmo 내일 행사 공지 써 줘', '--dm', '--json'], config);
-      expect(dry?.route).toBe('dispatch');
+      expect(dry?.route).toBe('ask');
       expect(dry?.seat).toBe('MK');
       expect(delivered).toHaveLength(1);
       expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual([dry]);

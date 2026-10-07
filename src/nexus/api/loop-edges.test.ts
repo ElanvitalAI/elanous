@@ -9,7 +9,8 @@ import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
 import { startNexusHttpServer } from './http-server.js';
-import { handleLoopEdgesGet } from './loop-edges.js';
+import { handleLoopEdgesGet, type LoopEdge } from './loop-edges.js';
+import type { SeatRequestRow } from '../../seat-dispatch/seat-request-ledger.js';
 
 const now = new Date().toISOString();
 const earlier = new Date(Date.now() - 60_000).toISOString();
@@ -49,6 +50,161 @@ test('three persisted sources yield only timestamp, kind, endpoints and referenc
       expect.objectContaining({ kind: 'card', from: 'TC', to: 'surface:pwa', ref: card.id }),
     ]));
     for (const edge of edges) expect(Object.keys(edge as object).sort()).toEqual(['at', 'from', 'kind', 'ref', 'to']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+async function placedRunFixture(options: { request?: boolean; key?: boolean; run?: boolean; merged?: boolean; wrongCell?: boolean }) {
+  const root = mkdtempSync(join(tmpdir(), 'loop-card-run-'));
+  const store = new CardStore(root);
+  const card = store.createCard({ goalId: 'wish:pwa:linked', title: 'PRIVATE-CARD-TITLE' });
+  store.appendSection(card.id, { key: 'flow:split:0', owner: 'flow', content: JSON.stringify({ cells: [{ id: 'FLOW-1', owner: 'TC' }] }) });
+  store.appendSection(card.id, { key: 'flow:placed:FLOW-1', owner: 'flow', content: JSON.stringify({ decision: { id: 'FLOW-1', version: '0.2.18', text: 'PRIVATE-PLACEMENT' } }) });
+  store.close();
+  const key = `orch:${card.id}:FLOW-1`;
+  const runId = 'run-12345678-1234-1234-1234-123456789abc';
+  const mergedAt = new Date(Date.parse(earlier) + 1_000).toISOString();
+  const requests: SeatRequestRow[] = options.request === false ? [] : [{
+    key, seat: 'TC', cell: options.wrongCell ? 'FLOW-2' : 'FLOW-1', source: 'orchestrator', status: 'queued',
+    text: 'PRIVATE-REQUEST-BODY', queuedAt: earlier,
+  }];
+  const dir = join(root, 'run-ledger');
+  mkdirSync(dir);
+  if (options.run !== false) {
+    writeFileSync(join(dir, `${runId}.jsonl`), [
+      { runId, event: 'start', timestamp: earlier, data: { seat: 'TC', feature: 'PRIVATE-RUN-BODY' } },
+      ...(options.merged ? [{ runId, event: 'merged', timestamp: mergedAt, data: { merged: true, number: 123, prose: 'PRIVATE-MERGE-BODY' } }] : []),
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+  }
+  const response = handleLoopEdgesGet(new Request(path), {
+    cardRoot: root, ledgerDir: dir, listCoord: () => [], listLoopOwners: () => [],
+    listSeatRequests: () => requests,
+    listOrchestratorLaunches: () => options.key === false ? [] : [{ key, runId }],
+  });
+  const raw = await response.text();
+  const edges = (JSON.parse(raw) as { edges: LoopEdge[] }).edges;
+  return { root, card, runId, mergedAt, raw, edges };
+}
+
+test('placed card, orchestrator request cell and key, and started run add a card-referenced launch edge', async () => {
+  const fixture = await placedRunFixture({});
+  try {
+    expect(fixture.edges).toContainEqual({ at: earlier, kind: 'card', from: 'TC', to: `loop:${fixture.runId}`, ref: fixture.card.id });
+    expect(fixture.edges).toContainEqual({ at: earlier, kind: 'run', from: 'TC', to: `loop:${fixture.runId}`, ref: fixture.runId });
+    expect(fixture.edges.some(edge => edge.from === `loop:${fixture.runId}` && edge.to.startsWith('landed:'))).toBe(false);
+    expect(fixture.edges).toContainEqual(expect.objectContaining({ from: `card:${fixture.card.id}`, to: 'loop:FLOW-1' }));
+    expect(fixture.raw).not.toContain('PRIVATE-');
+    for (const edge of fixture.edges) expect(Object.keys(edge).sort()).toEqual(['at', 'from', 'kind', 'ref', 'to']);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('confirmed merge adds a return edge only at the merged event time', async () => {
+  const fixture = await placedRunFixture({ merged: true });
+  try {
+    expect(fixture.edges).toContainEqual({ at: fixture.mergedAt, kind: 'card', from: `loop:${fixture.runId}`, to: 'landed:FLOW-1', ref: fixture.card.id });
+    expect(fixture.raw).not.toContain('PRIVATE-');
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('a run started before since still lands on its in-window merge without out-of-window launch edges', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'loop-card-late-merge-'));
+  try {
+    const store = new CardStore(root);
+    const card = store.createCard({ goalId: 'wish:pwa:late-merge', title: 'PRIVATE-CARD' });
+    store.appendSection(card.id, { key: 'flow:split:0', owner: 'flow', content: JSON.stringify({ cells: [{ id: 'FLOW-1', owner: 'TC' }] }) });
+    store.appendSection(card.id, { key: 'flow:placed:FLOW-1', owner: 'flow', content: JSON.stringify({ decision: { id: 'FLOW-1', version: '0.2.18' } }) });
+    store.close();
+    const key = `orch:${card.id}:FLOW-1`;
+    const runId = 'run-12345678-1234-1234-1234-123456789abc';
+    const startedAt = new Date(Date.parse(since) - 60_000).toISOString();
+    const dir = join(root, 'run-ledger');
+    mkdirSync(dir);
+    writeFileSync(join(dir, `${runId}.jsonl`), [
+      { runId, event: 'start', timestamp: startedAt, data: { seat: 'TC', text: 'PRIVATE-RUN-BODY' } },
+      { runId, event: 'merged', timestamp: earlier, data: { merged: true, text: 'PRIVATE-MERGE-BODY' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const raw = await handleLoopEdgesGet(new Request(path), {
+      cardRoot: root, ledgerDir: dir, listCoord: () => [], listLoopOwners: () => [],
+      listSeatRequests: () => [{ key, cell: 'FLOW-1', seat: 'TC', source: 'orchestrator', status: 'queued', text: 'PRIVATE-REQUEST', queuedAt: startedAt }],
+      listOrchestratorLaunches: () => [{ key, runId }],
+    }).text();
+    const edges = (JSON.parse(raw) as { edges: LoopEdge[] }).edges;
+    expect(edges).toContainEqual({ at: earlier, kind: 'card', from: `loop:${runId}`, to: 'landed:FLOW-1', ref: card.id });
+    expect(edges.some(edge => edge.to === `loop:${runId}`)).toBe(false);
+    expect(raw).not.toContain('PRIVATE-');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('missing key or mismatched request cell cannot link a card to a run', async () => {
+  for (const options of [{ key: false }, { request: false }, { wrongCell: true }]) {
+    const fixture = await placedRunFixture(options);
+    try {
+      expect(fixture.edges.filter(edge => edge.ref === fixture.card.id && edge.to === `loop:${fixture.runId}`)).toEqual([]);
+      expect(fixture.edges).toContainEqual({ at: earlier, kind: 'run', from: 'TC', to: `loop:${fixture.runId}`, ref: fixture.runId });
+    } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('only an actual merged=true event creates a landing edge', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'loop-card-merge-false-'));
+  try {
+    const store = new CardStore(root);
+    const card = store.createCard({ goalId: 'wish:pwa:failed-merge', title: 'PRIVATE-CARD' });
+    store.appendSection(card.id, { key: 'flow:split:0', owner: 'flow', content: JSON.stringify({ cells: [{ id: 'FLOW-1', owner: 'TC' }] }) });
+    store.appendSection(card.id, { key: 'flow:placed:FLOW-1', owner: 'flow', content: JSON.stringify({ decision: { id: 'FLOW-1', version: '0.2.18' } }) });
+    store.close();
+    const key = `orch:${card.id}:FLOW-1`;
+    const runId = 'run-12345678-1234-1234-1234-123456789abc';
+    const dir = join(root, 'run-ledger');
+    mkdirSync(dir);
+    writeFileSync(join(dir, `${runId}.jsonl`), [
+      { runId, event: 'start', timestamp: earlier, data: { seat: 'TC' } },
+      { runId, event: 'merged', timestamp: now, data: { merged: false, text: 'PRIVATE-MERGE-FAILED' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const raw = await handleLoopEdgesGet(new Request(path), {
+      cardRoot: root, ledgerDir: dir, listCoord: () => [], listLoopOwners: () => [],
+      listSeatRequests: () => [{ key, cell: 'FLOW-1', seat: 'TC', source: 'orchestrator', status: 'queued', text: 'PRIVATE-REQUEST', queuedAt: earlier }],
+      listOrchestratorLaunches: () => [{ key, runId }],
+    }).text();
+    const edges = (JSON.parse(raw) as { edges: LoopEdge[] }).edges;
+    expect(edges).toContainEqual({ at: earlier, kind: 'card', from: 'TC', to: `loop:${runId}`, ref: card.id });
+    expect(edges.some(edge => edge.to === 'landed:FLOW-1')).toBe(false);
+    expect(raw).not.toContain('PRIVATE-');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a key without a run-ledger start cannot invent launch or landing edges', async () => {
+  const fixture = await placedRunFixture({ run: false, merged: true });
+  try {
+    expect(fixture.edges.some(edge => edge.to === `loop:${fixture.runId}` || edge.from === `loop:${fixture.runId}`)).toBe(false);
+    expect(fixture.raw).not.toContain('PRIVATE-');
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('reads the actual seat-request cell/key and orchestrator launch key/runId from their journals', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'loop-card-journals-'));
+  try {
+    const store = new CardStore(root);
+    const card = store.createCard({ goalId: 'wish:pwa:journal', title: 'PRIVATE-CARD' });
+    store.appendSection(card.id, { key: 'flow:split:0', owner: 'flow', content: JSON.stringify({ cells: [{ id: 'FLOW-1', owner: 'TC' }] }) });
+    store.appendSection(card.id, { key: 'flow:placed:FLOW-1', owner: 'flow', content: JSON.stringify({ decision: { id: 'FLOW-1', version: '0.2.18' } }) });
+    store.close();
+    const key = `orch:${card.id}:FLOW-1`;
+    const runId = 'run-98765432-1234-1234-1234-123456789abc';
+    mkdirSync(join(root, 'seat-requests'));
+    writeFileSync(join(root, 'seat-requests', 'requests.jsonl'), `${JSON.stringify({ key, seat: 'TC', cell: 'FLOW-1', source: 'orchestrator', status: 'queued', text: 'PRIVATE-REQUEST', queuedAt: earlier })}\n`);
+    mkdirSync(join(root, 'loop', 'orchestrator'), { recursive: true });
+    writeFileSync(join(root, 'loop', 'orchestrator', 'tick.json'), JSON.stringify({ mode: 'live', cards: [{ title: 'PRIVATE-SNAPSHOT' }], launched: [{ key, runId, seat: 'TC', status: 'launched' }] }));
+    const dir = join(root, 'run-ledger');
+    mkdirSync(dir);
+    writeFileSync(join(dir, `${runId}.jsonl`), [
+      { runId, event: 'start', timestamp: earlier, data: { seat: 'TC', text: 'PRIVATE-RUN' } },
+      { runId, event: 'merged', timestamp: now, data: { merged: true, text: 'PRIVATE-MERGE' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const raw = await handleLoopEdgesGet(new Request(path), { cardRoot: root, ledgerDir: dir, listCoord: () => [], listLoopOwners: () => [] }).text();
+    const edges = (JSON.parse(raw) as { edges: LoopEdge[] }).edges;
+    expect(edges).toContainEqual({ at: earlier, kind: 'card', from: 'TC', to: `loop:${runId}`, ref: card.id });
+    expect(edges).toContainEqual({ at: now, kind: 'card', from: `loop:${runId}`, to: 'landed:FLOW-1', ref: card.id });
+    expect(raw).not.toContain('PRIVATE-');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

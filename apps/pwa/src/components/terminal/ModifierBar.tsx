@@ -26,7 +26,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { debugLog } from '@/lib/debug';
-import { getTerminalHistoryView, sendToTerminal, subscribeTerminalHistoryView } from './terminal-input-registry';
+import { getTerminalHistoryView, sendToTerminal, setStickyModifiers, subscribeStickyModifiers, subscribeTerminalHistoryView, takeStickyModifiers } from './terminal-input-registry';
 import { historyAction } from './touch-scroll';
 import {
   buildKeySequence,
@@ -50,6 +50,7 @@ interface ButtonSpec {
 const NAV_BUTTONS: ButtonSpec[] = [
   { key: 'esc', label: 'Esc', width: 'wide', title: 'Escape (vim normal mode)' },
   { key: 'tab', label: 'Tab', width: 'wide', title: 'Tab (autocomplete)' },
+  { key: 'shift-enter', label: '⇧⏎', width: 'wide', title: 'Shift+Enter (newline)' },
   { key: 'left', label: '←', width: 'narrow', title: 'Left arrow' },
   { key: 'down', label: '↓', width: 'narrow', title: 'Down arrow' },
   { key: 'up', label: '↑', width: 'narrow', title: 'Up arrow' },
@@ -103,6 +104,19 @@ export function ModifierBar({ terminalId }: Props) {
   altRef.current = alt;
 
   const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const release = useCallback(() => {
+    ctrlRef.current = false;
+    altRef.current = false;
+    setCtrl(false);
+    setAlt(false);
+    setStickyModifiers(terminalId, { ctrl: false, alt: false });
+    if (releaseTimerRef.current !== null) {
+      clearTimeout(releaseTimerRef.current);
+      releaseTimerRef.current = null;
+    }
+  }, [terminalId]);
+
+  useEffect(() => subscribeStickyModifiers(terminalId, release), [terminalId, release]);
 
   // Reset auto-release timer whenever a modifier is freshly engaged.
   // Toggling off mid-flight clears the timer outright.
@@ -113,19 +127,12 @@ export function ModifierBar({ terminalId }: Props) {
     }
     if (!nextCtrl && !nextAlt) return;
     releaseTimerRef.current = setTimeout(() => {
-      setCtrl(false);
-      setAlt(false);
-      releaseTimerRef.current = null;
+      release();
       debugLog('webterm.modbar.auto-release', {});
     }, MODIFIER_AUTO_RELEASE_MS);
-  }, []);
+  }, [release]);
 
-  useEffect(() => () => {
-    if (releaseTimerRef.current !== null) {
-      clearTimeout(releaseTimerRef.current);
-      releaseTimerRef.current = null;
-    }
-  }, []);
+  useEffect(() => () => { release(); }, [release]);
 
   const sendKey = useCallback((key: ModifierKey): void => {
     if (!sessionId) {
@@ -144,27 +151,30 @@ export function ModifierBar({ terminalId }: Props) {
     // Shift behaviour. The user can still click Ctrl again immediately
     // for a chain.
     if (mods.ctrl || mods.alt) {
-      setCtrl(false);
-      setAlt(false);
-      armAutoRelease(false, false);
+      takeStickyModifiers(terminalId);
+      release();
     }
-  }, [sessionId, terminalId, armAutoRelease]);
+  }, [sessionId, terminalId, release]);
 
   const toggleCtrl = useCallback((): void => {
     const next = !ctrlRef.current;
+    ctrlRef.current = next;
     setCtrl(next);
+    setStickyModifiers(terminalId, { ctrl: next, alt: altRef.current });
     armAutoRelease(next, altRef.current);
-  }, [armAutoRelease]);
+  }, [armAutoRelease, terminalId]);
 
   const toggleAlt = useCallback((): void => {
     const next = !altRef.current;
+    altRef.current = next;
     setAlt(next);
+    setStickyModifiers(terminalId, { ctrl: ctrlRef.current, alt: next });
     armAutoRelease(ctrlRef.current, next);
-  }, [armAutoRelease]);
+  }, [armAutoRelease, terminalId]);
 
   const navButtonClass = (width: 'narrow' | 'wide'): string =>
     [
-      'flex h-7 items-center justify-center rounded border border-border',
+      'flex h-7 shrink-0 items-center justify-center rounded border border-border',
       'bg-card font-mono text-[11px] text-muted-foreground',
       'hover:bg-muted hover:border-primary hover:text-foreground',
       'active:translate-y-px disabled:opacity-50',
@@ -173,7 +183,7 @@ export function ModifierBar({ terminalId }: Props) {
 
   const modifierButtonClass = (active: boolean): string =>
     [
-      'flex h-7 items-center justify-center rounded border font-mono text-[11px]',
+      'flex h-7 shrink-0 items-center justify-center rounded border font-mono text-[11px]',
       'px-2 min-w-[36px]',
       'active:translate-y-px disabled:opacity-50 transition-colors',
       active
@@ -193,7 +203,7 @@ export function ModifierBar({ terminalId }: Props) {
 
   return (
     <div
-      className="flex flex-wrap items-center gap-1 border-b border-border bg-background/60 px-2 py-1"
+      className="flex min-w-0 max-w-full flex-nowrap items-center gap-1 overflow-x-auto border-b border-border bg-background/60 px-2 py-1"
       data-testid="modifier-bar"
       role="toolbar"
       aria-label="Mobile keyboard modifiers"
@@ -223,7 +233,7 @@ export function ModifierBar({ terminalId }: Props) {
       >
         ⇡ 기록
       </button>
-      <span className="mx-1 text-[10px] text-muted-foreground/60" aria-hidden>·</span>
+      <span className="mx-1 shrink-0 text-[10px] text-muted-foreground/60" aria-hidden>·</span>
       <button
         type="button"
         className={modifierButtonClass(ctrl)}

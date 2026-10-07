@@ -5,7 +5,7 @@
  * 부작용이 없다(발사·리뷰·착지는 실행부 `actions.ts` 의 몫). 수확 원천 = run-c9ad6d6d `chooseTaskAction`.
  */
 import type { SupervisorStopReason } from '../self-dev/run-supervisor.js';
-import type { NextActionKind } from './actions.js';
+import type { NextActionKind, RetryVariant } from './actions.js';
 
 export type TaskMove =
   | 'propose-green'
@@ -35,6 +35,11 @@ export interface TaskJudgement {
   reason: string;
   /** 실행부(`executeNextAction`)가 바로 받는 수면 그 종류. 없으면 발사·대기 계열(실행부 밖). */
   executorKind?: NextActionKind;
+  /**
+   * 실행부 `retry` 의 갈래(§A9 G2). 좁혀 재발사 · 기다렸다 재시도 · 수확 이어 발사 · 다른 수가
+   * 같은 재발사로 접히지 않게 실행부에 넘긴다. retry 가 아닌 수에는 없다.
+   */
+  executorVariant?: RetryVariant;
 }
 
 /** 같은 수가 이 횟수만큼 실패하면 다른 수로 넘어간다(RFC §A2 «같은 수 2번 실패»). */
@@ -49,6 +54,13 @@ const EXECUTOR_KIND: Partial<Record<TaskMove, NextActionKind>> = {
   'salvage-relaunch': 'retry',
   alternative: 'retry',
   'decision-card': 'decision',
+};
+
+const EXECUTOR_VARIANT: Partial<Record<TaskMove, RetryVariant>> = {
+  'narrow-relaunch': 'narrow',
+  'wait-retry': 'wait',
+  'salvage-relaunch': 'salvage',
+  alternative: 'alternative',
 };
 
 function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
@@ -82,15 +94,29 @@ function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
   }
 }
 
-/** 종료 어휘·관측에서 다음 한 수를 고른다. 같은 수 2회 실패 → 다른 수 → 그것도 실패 → 결정 카드. */
+/** 재발사 계열 — 대안(alternative)이 실패한 «같은 실패 흐름»에 속하는 수. */
+const RETRY_FAMILY: ReadonlySet<TaskMove> = new Set<TaskMove>(['narrow-relaunch', 'wait-retry', 'salvage-relaunch']);
+
+/**
+ * 종료 어휘·관측에서 다음 한 수를 고른다. 같은 수 2회 실패 → 다른 수 → 그것도 실패 → 결정 카드.
+ *
+ * ⭐ 새 관측이 이긴다(사후 리뷰 must-fix · #24453): 병합된 PR(propose-green)·종료 미관측(wait)·표 밖 어휘(decision-card)는
+ * 실패 셈과 무관하게 그대로 간다. 「대안도 실패 → 결정 카드」 승격은 지금 수가 같은 실패 흐름일 때만 —
+ * 재발사 계열이거나, 그 수 자신이 이미 같은 수 한도만큼 실패했을 때다.
+ */
 export function judgeNextMove(input: TaskJudgeInput): TaskJudgement {
   const failures = input.failures ?? {};
   let judged = base(input);
-  if ((failures.alternative ?? 0) >= 1) {
+  const escalatable = judged.move !== 'wait' && judged.move !== 'decision-card' && judged.move !== 'propose-green';
+  const exhausted = escalatable && (failures[judged.move] ?? 0) >= SAME_MOVE_FAILURE_LIMIT;
+  const inFailingFlow = RETRY_FAMILY.has(judged.move) || exhausted;
+  if (escalatable && inFailingFlow && (failures.alternative ?? 0) >= 1) {
     judged = { move: 'decision-card', stage: 'escalated', reason: `대안도 실패 — 런·PR·must-fix 근거로 사람 결정 (직전: ${judged.move})` };
-  } else if (judged.move !== 'wait' && judged.move !== 'decision-card' && (failures[judged.move] ?? 0) >= SAME_MOVE_FAILURE_LIMIT) {
+  } else if (exhausted) {
     judged = { move: 'alternative', stage: 'repairing', reason: `같은 수 ${SAME_MOVE_FAILURE_LIMIT}회 실패 — 다른 수 선택 (${judged.move})` };
   }
   const executorKind = EXECUTOR_KIND[judged.move];
-  return executorKind ? { ...judged, executorKind } : judged;
+  const executorVariant = EXECUTOR_VARIANT[judged.move];
+  if (!executorKind) return judged;
+  return executorVariant ? { ...judged, executorKind, executorVariant } : { ...judged, executorKind };
 }

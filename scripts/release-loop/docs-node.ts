@@ -72,7 +72,7 @@ export function runDocs(
       }
       throw new Error(`unknown argument: ${arg}`);
     }
-    if (!version || !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) {
+    if (!version || !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:rc|alpha|beta)\.(?:0|[1-9]\d*))?$/.test(version)) {
       throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version): x.y.z');
     }
     root = resolve(root);

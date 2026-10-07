@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import type { TaskCard } from '../task-cards/card-store.js';
 import type { BudgetInputs } from '../self-implement/budget-gate.js';
+import { CONTEXT_CARD_SCREEN_CHARS } from '../context-card/index.js';
 import { budgetGate, memoryGate, placementGate, relationGate } from './gates.js';
 
 const card: TaskCard = {
@@ -138,6 +139,61 @@ describe('execution-loop gates', () => {
     });
     expect(measured.decision).toMatchObject({ preflightOverlaps: [], dependsOn: [], similarCards: [] });
     expect(measured.explanation).toContain('preflight=none; dependsOn=none; similar=none');
+  });
+
+  test('memory puts prior must-fix before recall and truncates to the screen code-point budget', async () => {
+    const goalIds: string[] = [];
+    const result = await memoryGate(card, {
+      recall: async (query) => { expect(query).toBe(card.title); return 'x'.repeat(3_000); },
+      priorAbandonment: () => undefined,
+      priorMustFix: (goalId) => { goalIds.push(goalId); return ['A 를 고쳐라', 'B 시험 추가']; },
+    });
+    expect(goalIds).toEqual([card.goalId]);
+    expect(result.decision.context.startsWith('앞선 must-fix:\n- A 를 고쳐라\n- B 시험 추가\n')).toBe(true);
+    expect([...result.decision.context].length).toBeLessThanOrEqual(CONTEXT_CARD_SCREEN_CHARS);
+    expect(result.explanation).toContain('truncated');
+    expect(result.explanation).toContain('chars=1600/1600');
+    expect(result.decision).toMatchObject({ action: 'record', fragmentIds: [] });
+    expect(result.decision).not.toHaveProperty('priorAbandonment');
+  });
+
+  test('memory keeps short recall unchanged without prior must-fix', async () => {
+    const result = await memoryGate(card, { recall: async () => 'r1', priorAbandonment: () => undefined });
+    expect(result.decision.context).toBe('r1');
+    expect(result.explanation).not.toContain('truncated');
+  });
+
+  test('memory keeps context empty when recall and prior must-fix are both empty', async () => {
+    const result = await memoryGate(card, {
+      recall: async () => '', priorAbandonment: () => undefined, priorMustFix: () => [],
+    });
+    expect(result.decision.context).toBe('');
+    expect(result.explanation).not.toContain('truncated');
+  });
+
+  test('memory keeps prior must-fix when recall is empty', async () => {
+    const result = await memoryGate(card, {
+      recall: async () => '', priorAbandonment: () => undefined, priorMustFix: () => ['previous fix', 'second fix'],
+    });
+    expect(result.decision.context).toBe('앞선 must-fix:\n- previous fix\n- second fix');
+    expect(result.explanation).toContain('memory=none or unavailable');
+    expect(result.explanation).not.toContain('truncated');
+  });
+
+  test('memory propagates a recall error instead of swallowing it', async () => {
+    await expect(memoryGate(card, {
+      recall: async () => { throw new Error('recall unavailable'); },
+      priorAbandonment: () => undefined, priorMustFix: () => ['previous fix'],
+    })).rejects.toThrow('recall unavailable');
+  });
+
+  test('memory truncates by code points without splitting a surrogate pair', async () => {
+    const result = await memoryGate(card, {
+      recall: async () => '🎯'.repeat(CONTEXT_CARD_SCREEN_CHARS + 1), priorAbandonment: () => undefined,
+    });
+    expect([...result.decision.context]).toHaveLength(CONTEXT_CARD_SCREEN_CHARS);
+    expect(result.decision.context).toBe('🎯'.repeat(CONTEXT_CARD_SCREEN_CHARS));
+    expect(result.explanation).toContain('truncated');
   });
 
   test('memory records recall and historical abandonment without modifying the goal', async () => {

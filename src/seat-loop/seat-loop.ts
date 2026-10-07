@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, universeLaunch } from '../autopilot/track-agent.js';
 import { debug } from '../debug/log.js';
-import { surfaceEventsDbPath } from '../domains/surface-events.js';
+import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
 import { judgeNeighbor } from '../loops/neighbors.js';
 import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
 import { isRescueAllowedAction } from '../steward/rescue.js';
@@ -68,7 +68,7 @@ export type SeatDeps = {
   now?: () => Date;
   read?: (path: string) => string;
   run?: (args: string[]) => Promise<string>;
-  enqueue?: (seat: string, text: string, root: string, idempotencyKey: string) => Promise<{ id: string }>;
+  enqueue?: (seat: string, text: string, root: string, idempotencyKey: string, item: SeatItem) => Promise<{ id: string }>;
   queueOutcome?: (id: string, root: string) => ReturnType<typeof harnessQueueOutcome>;
   queueItems?: (root: string) => ReturnType<typeof listHarnessQueue>;
   queueIdForKey?: (key: string, root: string) => string | undefined;
@@ -910,11 +910,11 @@ function neighborLastSeen(root: string, isolated: boolean, now: Date, wanted: Re
   if (!existsSync(path)) return last;
   const db = new Database(path, { readonly: true });
   try {
-    // Same outbound seat events and refs.seat as context day; unlike its 24h display window,
-    // look back across the whole journal so a genuinely old ACK can be judged absent.
+    // Read outbound seat context and loop heartbeats across the whole journal,
+    // unlike context day's 24h display window, so a genuinely old ACK can be judged absent.
     // Newest first and stop once every wanted seat has an ACK, so a long journal is not read and sorted in full each turn.
     const statement = db.prepare(`SELECT ts, refs FROM events
-      WHERE surface IN ('coord:channel', 'context:session') AND direction='outbound' AND ts<=? ORDER BY ts DESC`);
+      WHERE surface IN ('coord:channel', 'context:session', 'loop:heartbeat') AND direction='outbound' AND ts<=? ORDER BY ts DESC`);
     try {
       const events = statement.iterate(now.toISOString()) as Iterable<{ ts: string; refs: string | null }>;
       for (const event of events) {
@@ -996,6 +996,12 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const directory = dirname(path);
   return withSeatLock(directory, async () => {
   const stateRoot = deps.root ?? effectiveInstanceRoot();
+  try {
+    const db = openSurfaceEventsDb(deps.root ? join(stateRoot, 'surface_events.db') : surfaceEventsDbPath());
+    try { recordEvent(db, { surface: 'loop:heartbeat', direction: 'outbound', kind: 'heartbeat',
+      text: `seat loop ${seat} heartbeat`, refs: JSON.stringify({ seat }), ts: now.toISOString() }); }
+    finally { db.close(); }
+  } catch (error) { observe('heartbeat-write-failed', { seat, error: String(error).slice(0, 200) }); }
   const recorded = readSeatLedger(seat, deps, now);
   const ledger = config.mode === 'live-safe' ? reconciledQueueLedger(recorded, stateRoot, deps) : recorded;
   let turnError: unknown;
@@ -1556,7 +1562,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
       }
       let queued: { id: string };
       try {
-        queued = await (deps.enqueue ?? ((assigned, text, root, idempotencyKey) => addHarnessQueue({ seat: assigned, say: text, idempotencyKey }, { root })))(seat, action.text, stateRoot, queueKey(seat, item));
+        queued = await (deps.enqueue ?? ((assigned, text, root, idempotencyKey) => addHarnessQueue({ seat: assigned, say: text, idempotencyKey }, { root })))(seat, action.text, stateRoot, queueKey(seat, item), item);
       } catch (error) {
         // Same key, different task body: never adopt the other work. Refuse this turn; the key frees once that item finishes.
         if (!/idempotency key collision/.test(String(error))) throw error;

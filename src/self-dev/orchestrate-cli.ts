@@ -16,6 +16,7 @@ import { resolveOrchestrateConcurrency } from './orchestrate.js';
 import type { FailureClassification, SelfDevGoal, SelfDevJobResult } from './orchestrate.js';
 import { superviseRun, type SupervisorDecision } from './run-supervisor.js';
 import { readDecomposeProposals, applyDecomposeProposals } from './decompose-proposal.js';
+import { createRoundPrTracker, defaultRoundPrAdapters, type RoundPrAdapters } from './round-pr-supersede.js';
 import { createHash } from 'node:crypto';
 import { debug } from '../debug/log.js';
 
@@ -211,6 +212,8 @@ export interface OrchestrateCliDeps {
   pipelineDeps?: DevPipelineDeps;
   /** 분해 제안과 골 개정 시도 되채움 조회(테스트 주입). 기본 readDecomposeProposals(원장). */
   readProposals?: typeof readDecomposeProposals;
+  /** DRAFT-TRIAGE — gh seams for superseding the previous supervisor round's draft PR (tests). */
+  roundPrAdapters?: RoundPrAdapters;
 }
 
 /**
@@ -399,6 +402,23 @@ export async function runSelfOrchestrateCliCommand(
       };
       // ⭐ 루프는 «공용»이다(run-supervisor.superviseRun) — 단일 실행도 같은 자를 쓴다.
       //   ⛔ 여기가 아는 것은 「어떻게 다시 거나」뿐이고, 「걸까 말까」는 그 자가 안다.
+      // DRAFT-TRIAGE — a rework round of the same goal opens a new PR; the previous round's draft is superseded.
+      let roundPrTracker: ReturnType<typeof createRoundPrTracker> | undefined;
+      let supervisedRound = 0;
+      const recordRoundPrs = async (rs: readonly SelfDevJobResult[]): Promise<void> => {
+        try {
+          // Once a PR is tracked, every round runs — an unfinished supersede is retried even without a new PR.
+          if (!roundPrTracker && !rs.some((r) => r.prUrl)) return;
+          roundPrTracker ??= createRoundPrTracker({
+            runId: process.env.ELANOUS_RUN_ID ?? rs.find((r) => r.runId?.trim())?.runId ?? null,
+            adapters: deps.roundPrAdapters ?? await defaultRoundPrAdapters(),
+          });
+          roundPrTracker.record(rs, supervisedRound);
+        } catch (error) {
+          try { debug.log('self-dev.supervisor', 'round-pr-record-failed', { round: supervisedRound, error: String(error) }); } catch { /* fail-open */ }
+        }
+      };
+      await recordRoundPrs(results);
       results = await superviseRun({
         initial: results,
         limits,
@@ -467,6 +487,8 @@ export async function runSelfOrchestrateCliCommand(
           const resumeHold = currentDecision?.needsHuman ?? [];
           const next = await exec(spec, { ...baseRuntime, resumeFrom: [...previous], ...(resumeHold.length > 0 ? { resumeHold } : {}) }, pipelineDeps);
           exitCode = next.exitCode;
+          supervisedRound += 1;
+          await recordRoundPrs(next.results);
           return next.results;
         },
       });

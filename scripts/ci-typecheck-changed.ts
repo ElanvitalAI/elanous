@@ -1032,14 +1032,29 @@ export function runGate(io: Partial<GateIo> = {}): void {
 //   ⭐ 그래서 막는 자리는 «여기»뿐이다 — 인-프로세스 호출자(`pr-cli.ts`·`seams.ts`)는
 //      argv 를 안 넘기고, 만약 여기서 `process.argv` 를 «읽으면» 형제 게이트가 경고한 그 사고가 난다
 //      (`elanous pr land` 의 인자를 자기 인자로 읽는다 — `src/cli/pr-cli.ts` 의 `args: []` 주석).
-if (import.meta.main) {
-  const cliArgs = process.argv.slice(2);
-  if (cliArgs.length > 0) {
-    console.error(`[tsc-gate] ⛔ 이 게이트는 인자를 받지 않는다 — 준 인자 ${cliArgs.length}개를 «조용히 삼키지 않고» 막는다: ${cliArgs.join(' ')}`);
+if (import.meta.main) void (async () => {
+  // GATE-REMOTE (10-06): the only accepted arguments are the dispatch flags `--remote [host]` / `--local` — they choose
+  //   «where» the same commit is measured, never «what» (the base stays merge-base(origin/main) on both sides).
+  const { extractGateRemoteFlags, dispatchHeavyCheck } = await import('../src/self-implement/gate-remote.js');
+  const flags = extractGateRemoteFlags(process.argv.slice(2));
+  const cliArgs = flags.rest;
+  if (cliArgs.length > 0 || flags.error) {
+    if (flags.error) console.error(`[tsc-gate] ⛔ ${flags.error}`);
+    if (cliArgs.length > 0) console.error(`[tsc-gate] ⛔ 이 게이트는 인자를 받지 않는다(--remote/--local 제외) — 준 인자 ${cliArgs.length}개를 «조용히 삼키지 않고» 막는다: ${cliArgs.join(' ')}`);
     console.error('[tsc-gate]   기준은 언제나 merge-base(origin/main) 다. 다른 기준으로 재려면 «그 트리에 서서» 돌려라:');
     console.error('[tsc-gate]     git worktree add --detach <경로> <커밋> && cd <경로> && bun run scripts/ci-typecheck-changed.ts');
     console.error('[tsc-gate]   ⇒ 그러면 merge-base 가 그때와 «같아진다». 이것이 재현의 유일한 길이다.');
     process.exit(2);
   }
-  runGate();
-}
+  const repo = sh('git rev-parse --show-toplevel').trim();
+  const baseRef = process.env.TSC_BASE_REF;
+  const passEnv = (sha: (ref: string) => string) => (['NODE_OPTIONS', 'TSC_BASE_REF', 'TSC_HEAP_MB'] as const).filter((key) => process.env[key])
+    .map((key) => `${key}=${key === 'TSC_BASE_REF' && baseRef !== 'origin/main' ? sha(baseRef!) : process.env[key]}`);
+  // exitCode, not exit(): piped stdout/stderr drain before the process ends.
+  process.exitCode = await dispatchHeavyCheck({
+    tool: 'ci-typecheck-changed', repo, flags,
+    remoteArgv: (sha) => { const vars = passEnv(sha); return [...(vars.length ? ['env', ...vars] : []), 'bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local']; },
+    refs: baseRef ? [baseRef] : [],
+    runLocal: () => { runGate(); return 0; },
+  });
+})();

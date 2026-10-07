@@ -696,6 +696,88 @@ test('baseline isolated failure reclassifies the candidate as preexisting', asyn
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1 });
 });
 
+// GATE-BASELINE-CACHE (0.2.18) — the isolated baseline result of (commit, file) is measured once and reused.
+const baselineRuns = (calls: string[]) => calls.filter((call) => call.startsWith('bun run test:deterministic') && call.endsWith('/baseline'));
+test('baseline cache: a second gate on the same commit and files runs no baseline file and keeps the verdict', async () => {
+  const { instanceRoot, ledgerRoot, runner, calls } = fake([B], []);
+  const old = runner.command;
+  runner.command = async (cmd, args, cwd) => {
+    if (cmd === 'bun' && args[2] === './src/b.test.ts' && cwd.endsWith('/baseline')) { calls.push(`${cmd} ${args.join(' ')} @${cwd}`); return { rc: 1, output: runOutput([B]) }; }
+    return old(cmd, args, cwd);
+  };
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: unknown) => { events.push({ category, event, data }); });
+  try {
+    const first = await judgeGate(options(instanceRoot), runner);
+    expect(first).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1, baselineCache: { hits: 0, misses: 1 } });
+    expect(baselineRuns(calls)).toHaveLength(1);
+    const cache = readFileSync(join(ledgerRoot, 'gate-baseline-cache', `${BASE}.jsonl`), 'utf8');
+    expect(JSON.parse(cache.trim())).toEqual({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: [B], errors: [], missing: false });
+    calls.length = 0;
+    const second = await judgeGate(options(instanceRoot), runner);
+    expect(second).toMatchObject({ outcome: first.outcome, introduced: first.introduced, preexisting: first.preexisting, fixed: first.fixed, baselineCache: { hits: 1, misses: 0 } });
+    expect(baselineRuns(calls)).toHaveLength(0);
+    expect(calls.filter((call) => call.startsWith(`snapshot ${BASE}`))).toHaveLength(0);
+    expect(events.filter((e) => e.category === 'release.gate' && e.event === 'baseline-cache').map((e) => e.data))
+      .toEqual([{ hits: 0, misses: 1, commit: BASE }, { hits: 1, misses: 0, commit: BASE }]);
+  } finally { spy.mockRestore(); }
+});
+
+test('baseline cache: an introduced verdict is reproduced from the cache, and a missing baseline file is cached as missing', async () => {
+  const { instanceRoot, runner, calls } = fake([B], []);
+  const command = runner.command;
+  runner.command = async (cmd, args, cwd) => {
+    if (cmd === 'bun' && args[2] === './src/b.test.ts' && cwd.endsWith('/baseline')) {
+      calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+      return { rc: 1, output: 'Test filter "./src/b.test.ts" had no matches in --cwd="/tmp/baseline"\n' };
+    }
+    if (cmd === 'git' && args[0] === 'ls-tree') return { rc: 0, output: '' };
+    return command(cmd, args, cwd);
+  };
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], baselineCache: { hits: 0, misses: 1 } });
+  calls.length = 0;
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], baselineCache: { hits: 1, misses: 0 } });
+  expect(baselineRuns(calls)).toHaveLength(0);
+});
+
+test('baseline cache: a corrupt cache file is re-run, never read as a pass', async () => {
+  const valid = JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: [B], errors: [], missing: false });
+  for (const corrupt of ['{not json\n', JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: ['src/other.test.ts > X'], errors: [], missing: false }) + '\n',
+    `${valid}\n\n${valid}\n`, valid, '']) {
+    const { instanceRoot, ledgerRoot, runner, calls } = fake([B], []);
+    mkdirSync(join(ledgerRoot, 'gate-baseline-cache'), { recursive: true });
+    writeFileSync(join(ledgerRoot, 'gate-baseline-cache', `${BASE}.jsonl`), corrupt);
+    const result = await judgeGate(options(instanceRoot), runner);
+    expect(result).toMatchObject({ outcome: 'regression', introduced: [B], baselineCache: { hits: 0, misses: 1 } });
+    expect(baselineRuns(calls)).toHaveLength(1);
+  }
+});
+
+test('baseline cache: a different baseline commit or host is a miss; the cut result seeds the next gate', async () => {
+  const { instanceRoot, ledgerRoot, runner, calls } = fake([B], []);
+  mkdirSync(join(ledgerRoot, 'gate-baseline-cache'), { recursive: true });
+  const other = 'c'.repeat(40);
+  writeFileSync(join(ledgerRoot, 'gate-baseline-cache', `${other}.jsonl`), JSON.stringify({ commit: other, file: 'src/b.test.ts', host: 'local', failures: [B], errors: [], missing: false }) + '\n');
+  writeFileSync(join(ledgerRoot, 'gate-baseline-cache', `${BASE}.jsonl`), JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'other-host', failures: [B], errors: [], missing: false }) + '\n');
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], baselineCache: { hits: 0, misses: 1 } });
+  expect(baselineRuns(calls)).toHaveLength(1);
+  // The cut's isolated check of src/b.test.ts is stored under the cut commit — the next release's baseline.
+  const seeded = readFileSync(join(ledgerRoot, 'gate-baseline-cache', `${CUT}.jsonl`), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  expect(seeded).toEqual([{ commit: CUT, file: 'src/b.test.ts', host: 'local', failures: [B], errors: [], missing: false }]);
+});
+
+test('baseline cache: an isolated result the cache cannot hold skips the cache and keeps the verdict', async () => {
+  const { instanceRoot, ledgerRoot, runner } = fake([B], []);
+  const old = runner.command;
+  runner.command = async (cmd, args, cwd) => {
+    if (cmd === 'bun' && args[2] === './src/b.test.ts' && cwd.endsWith('/cut')) return { rc: 1, output: runOutput([B, 'src/other.test.ts > X']) };
+    return old(cmd, args, cwd);
+  };
+  expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], baselineCache: { hits: 0, misses: 1 } });
+  expect(existsSync(join(ledgerRoot, 'gate-baseline-cache', `${CUT}.jsonl`))).toBe(false);
+  expect(existsSync(join(ledgerRoot, 'gate-baseline-cache', `${BASE}.jsonl`))).toBe(true);
+});
+
 test('new test file missing from baseline is introduced only after cut isolation reproduces it', async () => {
   const { instanceRoot, runner, calls } = fake([B], []);
   const command = runner.command;

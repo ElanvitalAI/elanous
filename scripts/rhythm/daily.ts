@@ -301,8 +301,9 @@ function recipient(deps: DailyDeps): { chatId: number; botToken: string } | null
 function sendReview(file: string, text: string, target: { chatId: number; botToken: string },
   send: (request: DailySendRequest) => DailySendConfirmation | null,
   receipt: (key: string) => DeliveryReceipt,
-  recordDelivery?: (text: string, kind: 'ops-report') => void): DeliveryResult {
-  const key = file.slice(file.lastIndexOf('/') + 1).replace(/\.md$/, '');
+  recordDelivery?: (text: string, kind: 'ops-report') => void,
+  keySuffix = ''): DeliveryResult {
+  const key = file.slice(file.lastIndexOf('/') + 1).replace(/\.md$/, '') + keySuffix;
   const label = `telegram:${target.chatId}`;
   const db = new Database(join(dirname(file), 'delivery.sqlite'));
   try {
@@ -344,6 +345,21 @@ function sendReview(file: string, text: string, target: { chatId: number; botTok
     } catch (error) { return { sent: false, sendError: `발송 결과 불명 · ${shortReason(reasonOf(error))}`, deliveryState: 'unknown', target: 'unknown' }; }
   } catch (error) { return { sent: false, sendError: `발송 상태 못 읽음 · ${shortReason(reasonOf(error))}`, deliveryState: 'unknown', target: 'unknown' }; }
   finally { db.close(); }
+}
+
+function newsMessage(markdown: string): string | null {
+  const section = markdown.split('## ⑦ 외부 동향\n')[1]?.split('\n\n## ')[0];
+  if (!section || section.startsWith('못 읽음 ·')) return null;
+  const articles = [...section.matchAll(/^- (.+) — (https?:\/\/\S+)\n  시사점: (.*)$/gm)].slice(0, 3);
+  return articles.length ? `## 외부 동향\n${articles.map(article => article[0]).join('\n')}` : null;
+}
+
+function sendNewsAfterReview(delivery: DeliveryResult, file: string, markdown: string,
+  target: { chatId: number; botToken: string }, deps: DailyDeps): string | null {
+  if (!['sent', 'already-sent', 'receipt-sent'].includes(delivery.deliveryState)) return null;
+  const text = newsMessage(markdown);
+  if (!text) return null;
+  return sendReview(file, text, target, deps.send ?? sendTelegram, deps.receipt ?? (() => 'unknown'), deps.recordDelivery, '-news').deliveryState;
 }
 
 export type DailyDeps = { now?: () => Date; root?: string; vaultRoot?: string | null; sendEnabled?: boolean; repoRoot?: string; repoName?: string;
@@ -402,6 +418,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     let target = 'unknown';
     let sendError: string | null = null;
     let recordError: string | null = null;
+    let newsState: string | null = null;
     let enabled = deps.sendEnabled === true;
     if (deps.sendEnabled === undefined && options.stage === 'deliver' && !options.dryRun) {
       try { enabled = record(record(record(getUserConfig().raw.loops).rhythm).daily).send === true; }
@@ -420,12 +437,13 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
       sendError = sendError ?? delivery.sendError;
       recordError = delivery.recordError ?? null;
       deliveryState = delivery.deliveryState;
+      if (resolved) newsState = sendNewsAfterReview(delivery, file, markdown, resolved, deps);
     }
     tick.sent = sent;
     const status = vault.vaultFatal || Object.values(sections).includes('unreadable') ? 'degraded'
       : deliveryState === 'pending' ? 'pending'
       : ['sent', 'already-sent', 'receipt-sent'].includes(deliveryState) ? 'ok' : 'degraded';
-    const deliveryLine = `${options.stage} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}`;
+    const deliveryLine = `${options.stage} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}${newsState ? ` · news=${newsState}` : ''}`;
     if (options.stage === 'deliver') {
       Object.assign(tick, { status, deliveryState, target, chars, receiptKey, deliveryLine, recordError });
       if (!options.dryRun) {
@@ -526,6 +544,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
   }
   let sent = false;
   let recordError: string | null = null;
+  let newsState: string | null = null;
   let chars = 0;
   let target = 'unknown';
   if (!options.dryRun && options.stage !== 'collect' && enabled) {
@@ -541,11 +560,13 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     sendError = sendError ?? delivery.sendError;
     recordError = delivery.recordError ?? null;
     deliveryState = delivery.deliveryState;
+    if (resolved && parts.news.status === 'ok' && parts.news.value.length > 0)
+      newsState = sendNewsAfterReview(delivery, file, review.markdown, resolved, deps);
   }
   const status = vaultFatal || Object.values(review.sections).includes('unreadable') ? 'degraded'
     : deliveryState === 'pending' ? 'pending'
     : ['sent', 'already-sent', 'receipt-sent'].includes(deliveryState) ? 'ok' : 'degraded';
-  const deliveryLine = `${options.stage === 'collect' ? 'collect' : 'deliver'} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}`;
+  const deliveryLine = `${options.stage === 'collect' ? 'collect' : 'deliver'} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}${newsState ? ` · news=${newsState}` : ''}`;
   if (options.stage !== 'collect') {
     const tick = { sections: review.sections, risks: review.risks.length, sent, status, deliveryState, target, chars, receiptKey, deliveryLine, recordError };
     if (!options.dryRun) {

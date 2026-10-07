@@ -104,6 +104,32 @@ describe('OPS1 release runs', () => {
       Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
     }
   });
+  test('seat strip deep link opens the requested run even when its version is not the first run version', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { search: '?run=r1' }, setInterval: () => 1, clearInterval: () => {} } });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } });
+    const calls: string[] = [];
+    const other = { ...run, runId: 'older', version: '0.3.0' };
+    const client = { fetchResponse: async (path: string) => {
+      calls.push(path);
+      return new Response(JSON.stringify([other, run]), { status: 200 });
+    } };
+    const daemon = { config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, client: client as never, sessionId: 'test', setSessionId: () => {} };
+    let tree: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
+      expect(calls).toEqual(['/v1/ops/release/runs']);
+      expect(tree!.root.findByProps({ 'aria-label': '판' }).props.value).toBe('0.2.9');
+      expect(tree!.root.findAllByType('button').filter((button) => button.props['aria-pressed'] === true)).toHaveLength(1);
+      expect(JSON.stringify(tree!.toJSON())).toContain('진행 중');
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
+    }
+  });
   test('403 has exactly one visible sentence and no controls or run data', () => {
     expect(render({ kind: 'forbidden' })).toBe('<p>운영자만 볼 수 있습니다</p>');
     expect(render({ kind: 'ready', data: [run] }, 'waiting', { kind: 'forbidden' })).toBe('<p>운영자만 볼 수 있습니다</p>');

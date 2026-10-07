@@ -1,9 +1,10 @@
 import { expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import { finishAdvice, measureFinish, type MeasureFinishDeps } from './finish-rate.js';
+import { acquireLockSync } from '../../storage/file-lock.js';
+import { finishAdvice, finishHistoryPath, finishTrend, measureFinish, recordFinishHistory, type FinishMetrics, type MeasureFinishDeps } from './finish-rate.js';
 
 const now = new Date('2026-10-04T16:00:00Z');
 const start = (i: number, startedAt = '2026-10-04T15:00:00Z') => ({ runId: `run-${i}`, startedAt });
@@ -270,4 +271,83 @@ test('the same runId with a host launch record and a Pod start in two directorie
       expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', expect.objectContaining({ launched: 1, launchOnly: 0 }));
     }
   } finally { log.mockRestore(); rmSync(host, { recursive: true, force: true }); rmSync(pod, { recursive: true, force: true }); }
+});
+
+// FINISH-RATE 이력 조각(0.2.18): 추세는 다수결 · 한 시간 한 줄.
+const tri = (landingRate: number | null, staleDrafts: number | null, conflictRatio: number | null) => ({ landingRate, staleDrafts, conflictRatio });
+test('finishTrend: majority of compared metrics, missing values never count', () => {
+  expect(finishTrend(tri(0.3, 40, 0.1), tri(0.2, 45, 0.1))).toBe('worsening');
+  expect(finishTrend(tri(0.3, 40, 0.1), tri(0.4, 35, 0.2))).toBe('improving');
+  expect(finishTrend(tri(0.3, 40, 0.1), tri(0.3, 40, 0.1))).toBe('flat');
+  expect(finishTrend(tri(0.3, 40, 0.1), tri(0.4, 45, 0.1))).toBe('flat');
+  expect(finishTrend(tri(null, null, null), tri(0.3, 40, 0.1))).toBe('unknown');
+  expect(finishTrend(tri(0.3, 40, 0.1), tri(null, null, null))).toBe('unknown');
+  expect(finishTrend(null, tri(0.3, 40, 0.1))).toBe('unknown');
+  expect(finishTrend(tri(Number.NaN, 40, null), tri(0.1, 41, 0.9))).toBe('worsening');
+});
+
+test('recordFinishHistory writes one row per UTC hour and trends against the previous hour', () => {
+  const root = mkdtempSync(join(tmpdir(), 'finish-history-'));
+  const m = (landingRate: number, staleDrafts: number, conflictRatio: number): FinishMetrics => ({ launched: 10, landed: 3, landingRate, staleDrafts, conflictRatio, unknownMergeable: 0, reasons: {} });
+  const lines = () => existsSync(finishHistoryPath(root)) ? readFileSync(finishHistoryPath(root), 'utf8').trimEnd().split('\n') : [];
+  try {
+    expect(recordFinishHistory(root, m(0.3, 40, 0.1), new Date('2026-10-05T09:00:00Z'))?.trend).toBe('unknown');
+    expect(lines()).toHaveLength(1);
+    expect(recordFinishHistory(root, m(0.1, 90, 0.9), new Date('2026-10-05T09:40:00Z'))).toBeNull();
+    expect(lines()).toHaveLength(1);
+    const second = recordFinishHistory(root, m(0.2, 45, 0.1), new Date('2026-10-05T10:05:00Z'));
+    expect(lines()).toHaveLength(2);
+    expect(second).toMatchObject({ hour: '2026-10-05T10', trend: 'worsening', launched: 10, landed: 3 });
+    expect(JSON.parse(lines()[1]!)).toEqual(second);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('recordFinishHistory waits for the history lock: a peer that writes the hour while holding it leaves one row', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'finish-history-lock-'));
+  const path = finishHistoryPath(root);
+  const mod = join(import.meta.dir, 'finish-rate.ts');
+  const script = `import { recordFinishHistory } from ${JSON.stringify(mod)};
+    recordFinishHistory(${JSON.stringify(root)}, { launched: 1, landed: 1, landingRate: 1, staleDrafts: 0, conflictRatio: 0, unknownMergeable: 0, reasons: {} }, new Date('2026-10-05T09:30:00Z'));`;
+  mkdirSync(join(root, 'harness'), { recursive: true });
+  const release = acquireLockSync(`${path}.lock`);
+  let released = false;
+  try {
+    const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'ignore', stderr: 'pipe', env: { ...process.env } });
+    await Bun.sleep(1_500);
+    // Still blocked on the lock — a lock-free check-then-append would already have written its row.
+    expect(child.exitCode).toBeNull();
+    expect(existsSync(path)).toBe(false);
+    writeFileSync(path, `${JSON.stringify({ hour: '2026-10-05T09', at: '2026-10-05T09:10:00Z', launched: 1, landed: 1, landingRate: 1, staleDrafts: 0, conflictRatio: 0, trend: 'unknown' })}\n`);
+    release(); released = true;
+    expect(await child.exited).toBe(0);
+    expect(readFileSync(path, 'utf8').trimEnd().split('\n')).toHaveLength(1);
+  } finally {
+    if (!released) release();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('recordFinishHistory trends against the latest earlier hour, not the last line in the file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'finish-history-order-'));
+  const row = (hour: string, landingRate: number, staleDrafts: number) => JSON.stringify({ hour, at: `${hour}:00:00Z`, launched: 1, landed: 1, landingRate, staleDrafts, conflictRatio: 0.1, trend: 'unknown' });
+  try {
+    mkdirSync(join(root, 'harness'), { recursive: true });
+    // 10시 줄 뒤에 늦게 덧붙은 9시 줄 — 11시 추세는 10시(0.5·10) 대비여야 한다(9시 0.1·90 대비면 improving).
+    writeFileSync(finishHistoryPath(root), `${row('2026-10-05T10', 0.5, 10)}\n${row('2026-10-05T09', 0.1, 90)}\n`);
+    const m: FinishMetrics = { launched: 1, landed: 1, landingRate: 0.4, staleDrafts: 20, conflictRatio: 0.1, unknownMergeable: 0, reasons: {} };
+    expect(recordFinishHistory(root, m, new Date('2026-10-05T11:05:00Z'))?.trend).toBe('worsening');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('recordFinishHistory starts a new line after a partially written tail', () => {
+  const root = mkdtempSync(join(tmpdir(), 'finish-history-tail-'));
+  try {
+    mkdirSync(join(root, 'harness'), { recursive: true });
+    writeFileSync(finishHistoryPath(root), '{"hour":"2026-10-05T08","trend":"unk');
+    const m: FinishMetrics = { launched: 1, landed: 1, landingRate: 0.4, staleDrafts: 20, conflictRatio: 0.1, unknownMergeable: 0, reasons: {} };
+    const written = recordFinishHistory(root, m, new Date('2026-10-05T09:05:00Z'));
+    const lines = readFileSync(finishHistoryPath(root), 'utf8').trimEnd().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[1]!)).toEqual(written);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
 import { splitCard } from '../../flow-loop/split.js';
@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
-import { buildUserConfig } from '../../user-config.js';
+import { buildUserConfig, resetUserConfig } from '../../user-config.js';
 import { reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
 
@@ -523,3 +523,309 @@ describe('TC review must-fixes (ORCH1 #23638)', () => {
     expect(state.steps).toContainEqual(expect.objectContaining({ reason: 'seat-turn-other-request:MK' }));
   }));
 });
+
+// ORCH-TA-HAND (0.2.18 · 10-08 데모): 오케스트레이터가 고른 칸을 TASK-AGENT(handTask)로 넘긴다.
+describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => {
+  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+  const base: TickDeps = { mode: 'live', split, placeCell: () => ({ version: '0.2.18' }), loadAdapter: async () => undefined };
+  const requests = (root: string) => { const path = join(root, 'seat-requests', 'requests.jsonl'); return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []; };
+  // A delegate node that died mid-way is retried by the next invocation (its node mark is not «ok») — the real re-entry.
+  const retryDelegate = (root: string, runId: string, deps: TickDeps) => {
+    const path = join(root, 'loop', 'orchestrator', `${runId}.json`);
+    const state = JSON.parse(readFileSync(path, 'utf8'));
+    delete state.nodes.delegate;
+    writeFileSync(path, JSON.stringify(state));
+    return runOrchestratorNode('delegate', { root, runId, window: '08', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {}, ...deps });
+  };
+  const cards = (root: string) => { const path = join(root, 'task-agent-actions.json'); return existsSync(path) ? JSON.stringify(JSON.parse(readFileSync(path, 'utf8'))) : ''; };
+
+  test('config: absent or invalid = off; shadow/live and a cell id parse', async () => fixture(async (root) => {
+    const path = join(root, 'config.json');
+    expect(buildUserConfig(path).loops?.orchestrator?.handToTaskAgent).toBeUndefined();
+    writeFileSync(path, JSON.stringify({ loops: { orchestrator: { handToTaskAgent: 'nope', handToTaskAgentCell: ' ' } } }));
+    expect(buildUserConfig(path).loops?.orchestrator).not.toHaveProperty('handToTaskAgent');
+    expect(buildUserConfig(path).loops?.orchestrator).not.toHaveProperty('handToTaskAgentCell');
+    writeFileSync(path, JSON.stringify({ loops: { orchestrator: { handToTaskAgent: 'live', handToTaskAgentCell: ' C2 ' } } }));
+    expect(buildUserConfig(path).loops?.orchestrator).toMatchObject({ handToTaskAgent: 'live', handToTaskAgentCell: 'C2' });
+  }));
+
+  test('off: handTask is never called and the seat journal is unchanged', async () => fixture(async (root, id, logged) => {
+    let calls = 0;
+    const state = await invoke(root, 'off08', '08', { ...base, handToTaskAgent: 'off', handTask: async () => { calls++; throw new Error('must not run'); } }, logged);
+    expect(calls).toBe(0);
+    expect(state.handed).toBeUndefined();
+    expect(state.delegated).toBe(2);
+    expect(requests(root).map(row => row.key)).toEqual([`orch:${id}:C1`, `orch:${id}:C2`]);
+  }));
+
+  test('shadow: one card per cell, launch 0, seat path unchanged, and not handed twice', async () => fixture(async (root, id, logged) => {
+    const launches: string[][] = [];
+    const deps: TickDeps = { ...base, handToTaskAgent: 'shadow', taskLauncher: async (args) => { launches.push(args); } };
+    const state = await invoke(root, 'shadow08', '08', deps, logged);
+    expect(launches).toHaveLength(0);
+    expect(state.handed?.map(row => ({ cell: row.cell, mode: row.mode, launched: row.launched }))).toEqual([
+      { cell: 'C1', mode: 'shadow', launched: false }, { cell: 'C2', mode: 'shadow', launched: false }]);
+    expect(cards(root)).toContain('"checklistId":"C1"');
+    expect(state.delegated).toBe(2);
+    expect(logged.filter(row => row.event === 'hand-to-task-agent')).toHaveLength(2);
+    const before = cards(root);
+    const again = await retryDelegate(root, 'shadow08', deps);
+    expect(again.handed).toHaveLength(2);
+    expect(cards(root)).toBe(before);
+  }));
+
+  test('live: the real handTask launches once through the launcher (pod · merge-by-host) and the seat journal stays empty', async () => fixture(async (root, id, logged) => {
+    const launches: string[][] = [];
+    const deps: TickDeps = { ...base, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } };
+    const state = await invoke(root, 'live08', '08', deps, logged);
+    expect(launches).toHaveLength(2);
+    expect(launches[0]).toEqual(expect.arrayContaining(['harness', 'say', '--merge-by-host']));
+    expect(launches[0]!.join(' ')).toContain('pod');
+    expect(state.handed?.every(row => row.mode === 'live' && row.launched)).toBe(true);
+    expect(requests(root)).toEqual([]);
+    expect(state.delegated).toBe(0);
+    expect(cards(root)).toContain('"status":"launched"');
+    // A second delegate pass on the same cells never launches again.
+    await retryDelegate(root, 'live08', deps);
+    expect(launches).toHaveLength(2);
+    expect(requests(root)).toEqual([]);
+    // Turning the hand off (or filtering to another cell) never sends a live-handed cell down the seat path.
+    for (const later of [{ handToTaskAgent: 'off' as const }, { handToTaskAgent: 'live' as const, handToTaskAgentCell: 'C9' }]) {
+      const rerun = await retryDelegate(root, 'live08', { ...deps, ...later });
+      expect(rerun.delegated).toBe(0);
+      expect(requests(root)).toEqual([]);
+    }
+    expect(launches).toHaveLength(2);
+  }));
+
+  test('live hand under a shadow tick is card-only; a cell filter hands only that cell', async () => fixture(async (root, id, logged) => {
+    const launches: string[][] = [];
+    const shadowTick = await invoke(root, 'tickshadow08', '08', { ...base, mode: 'shadow', handToTaskAgent: 'live', handToTaskAgentCell: 'C2', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    expect(launches).toHaveLength(0);
+    expect(shadowTick.handed?.map(row => [row.cell, row.mode])).toEqual([['C2', 'shadow']]);
+    expect(logged.filter(row => row.event === 'hand-to-task-agent').map(row => row.reason)).toEqual([expect.stringContaining(`orch:${id}:C2:`)]);
+  }));
+
+  test('a failed live launch stays claimed: no seat fallback and no relaunch', async () => fixture(async (root, id, logged) => {
+    let attempts = 0;
+    const deps: TickDeps = { ...base, handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async () => { attempts++; throw new Error('spawn failed'); } };
+    const state = await invoke(root, 'fail08', '08', deps, logged);
+    expect(attempts).toBe(1);
+    expect(logged.some(row => row.event === 'hand-to-task-agent-failed' && row.reason.startsWith(`orch:${id}:C1:`))).toBe(true);
+    expect(requests(root).map(row => row.cell)).toEqual(['C2']);
+    expect(state.delegated).toBe(1);
+    await retryDelegate(root, 'fail08', deps);
+    expect(attempts).toBe(1);
+  }));
+});
+
+// Real processes: a delegate tick that dies mid-way, and two delegate ticks racing on one root.
+const TICK_MODULE = join(import.meta.dir, 'tick.ts');
+const childScript = (root: string) => {
+  const path = join(root, 'delegate-child.ts');
+  writeFileSync(path, `import { appendFileSync, existsSync } from 'node:fs';
+import { runOrchestratorNode } from ${JSON.stringify(TICK_MODULE)};
+const [root, runId, handCell, sleepMs, exitOn, signal = '-', waitFor = '-'] = process.argv.slice(2);
+await runOrchestratorNode('delegate', { root, runId, window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
+  handToTaskAgent: 'live', ...(handCell !== '-' ? { handToTaskAgentCell: handCell } : {}),
+  handTask: async (opts) => {
+    // File barriers: announce we are inside the hand, then wait for the peer — the race order is forced, not timed.
+    if (signal !== '-') appendFileSync(root + '/' + signal, 'x');
+    if (waitFor !== '-') { for (let i = 0; i < 400 && !existsSync(root + '/' + waitFor); i++) await Bun.sleep(25); }
+    await Bun.sleep(Number(sleepMs));
+    return { card: { id: 'card-' + runId + '-' + opts.checklistId }, move: { kind: 'launch' }, mode: 'live', launched: true }; },
+  observe: (event, data) => {
+    appendFileSync(root + '/obs-' + runId + '.jsonl', JSON.stringify({ event, reason: data.reason }) + '\\n');
+    if (exitOn !== '-' && event === exitOn) process.exit(137);
+  } });
+`);
+  return path;
+};
+const runChild = (script: string, args: string[]) => Bun.spawn([process.execPath, script, ...args], { stdout: 'ignore', stderr: 'pipe', env: { ...process.env } });
+const placedRun = async (root: string, runId: string) => {
+  for (const node of ['intake', 'split', 'place'] as const) await runOrchestratorNode(node, { root, runId, window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+    split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }], placeCell: () => ({ version: '0.2.18' }), loadAdapter: async () => undefined });
+};
+const ledgerRows = (root: string) => { const path = join(root, 'loop', 'orchestrator', 'handed.jsonl'); return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []; };
+const journalRows = (root: string) => { const path = join(root, 'seat-requests', 'requests.jsonl'); return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []; };
+
+test('ORCH-TA-HAND: a delegate process killed right after its hand is observed is restored from the ledger on re-entry', async () => fixture(async (root) => {
+  await placedRun(root, 'crash08');
+  const child = runChild(childScript(root), [root, 'crash08', 'C1', '0', 'hand-to-task-agent']);
+  expect(await child.exited).toBe(137);
+  const statePath = join(root, 'loop', 'orchestrator', 'crash08.json');
+  const leftover = JSON.parse(readFileSync(statePath, 'utf8'));
+  expect(leftover.nodes.delegate).toBeUndefined();
+  expect(leftover.handed).toBeUndefined();
+  expect(ledgerRows(root).filter(row => row.status === 'handed').map(row => row.cardId)).toEqual(['card-crash08-C1']);
+  let handCalls = 0;
+  const reentered = await runOrchestratorNode('delegate', { root, runId: 'crash08', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+    handToTaskAgent: 'live', handToTaskAgentCell: 'C1', handTask: async () => { handCalls++; throw new Error('must not hand again'); } });
+  expect(handCalls).toBe(0);
+  expect(reentered.handed?.map(row => row.cardId)).toEqual(['card-crash08-C1']);
+  expect(JSON.parse(readFileSync(statePath, 'utf8')).handed.map((row: { cardId: string }) => row.cardId)).toEqual(['card-crash08-C1']);
+}), 30_000);
+
+test('ORCH-TA-HAND: two real delegate ticks racing on C2 leave exactly one of a seat row and a live claim', async () => fixture(async (root) => {
+  // Tick B hands only C1 and is held inside that hand, so it reads the ledger before tick A live-claims C2 and reaches C2's seat append after it.
+  await placedRun(root, 'raceA');
+  // The same placed cells in a second run (a second tick of the same day) — the card is split once, so copy the placed state.
+  const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'raceA.json'), 'utf8'));
+  writeFileSync(join(root, 'loop', 'orchestrator', 'raceB.json'), JSON.stringify({ ...placed, runId: 'raceB' }));
+  const script = childScript(root);
+  // B reads the ledger, enters C1's hand and signals «b-in-hand», then waits for «a-handed».
+  const b = runChild(script, [root, 'raceB', 'C1', '0', '-', 'b-in-hand', 'a-handed']);
+  for (let i = 0; i < 400 && !existsSync(join(root, 'b-in-hand')); i++) await Bun.sleep(25);
+  expect(existsSync(join(root, 'b-in-hand'))).toBe(true);
+  // A live-claims C2 and signals «a-handed» from inside its hand — only then does B reach C2's seat append.
+  const a = runChild(script, [root, 'raceA', 'C2', '0', '-', 'a-handed', '-']);
+  expect([await a.exited, await b.exited]).toEqual([0, 0]);
+  const c2Claims = ledgerRows(root).filter(row => row.cell === 'C2' && row.status === 'claimed' && !String(row.key).startsWith('shadow:'));
+  const c2Seat = journalRows(root).filter(row => row.cell === 'C2');
+  // Both ticks really worked the same cells: B handed C1, and C2 went to exactly one path.
+  expect(ledgerRows(root).filter(row => row.status === 'handed').map(row => row.cardId)).toContain('card-raceB-C1');
+  expect(JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'raceB.json'), 'utf8')).cells.map((cell: { id: string }) => cell.id)).toEqual(['C1', 'C2']);
+  expect(c2Claims.length + c2Seat.length).toBe(1);
+  // B really reached C2's seat append and was suppressed inside the lock (not skipped by its early ledger read).
+  const bObs = readFileSync(join(root, 'obs-raceB.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(bObs.some(row => row.event === 'exchange' && String(row.reason).startsWith('seat-suppressed-handed:') && String(row.reason).endsWith(':C2'))).toBe(true);
+  expect(c2Claims).toHaveLength(1);
+  expect(c2Seat).toHaveLength(0);
+}), 30_000);
+
+test('ORCH-TA-HAND: a shadow hand whose seat row landed before the run state was saved is restored on re-entry', async () => fixture(async (root) => {
+  await placedRun(root, 'shadowcrash08');
+  const statePath = join(root, 'loop', 'orchestrator', 'shadowcrash08.json');
+  // Kill on the seat row's «queued» observation — the shadow hand and the seat append are both on disk, the state is not.
+  const script = join(root, 'shadow-child.ts');
+  writeFileSync(script, `import { runOrchestratorNode } from ${JSON.stringify(TICK_MODULE)};
+const [root] = process.argv.slice(2);
+await runOrchestratorNode('delegate', { root, runId: 'shadowcrash08', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
+  handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1',
+  handTask: async (opts) => ({ card: { id: 'card-shadow-' + opts.checklistId }, move: { kind: 'launch' }, mode: 'shadow', launched: false }),
+  observe: (event, data) => { if (event === 'exchange' && data.reason === 'queued') process.exit(137); } });
+`);
+  expect(await runChild(script, [root]).exited).toBe(137);
+  expect(JSON.parse(readFileSync(statePath, 'utf8')).handed).toBeUndefined();
+  expect(journalRows(root).map(row => row.cell)).toEqual(['C1']);
+  const reentered = await runOrchestratorNode('delegate', { root, runId: 'shadowcrash08', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+    handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask: async () => { throw new Error('must not hand again'); } });
+  expect(reentered.handed?.map(row => [row.cell, row.cardId, row.mode])).toEqual([['C1', 'card-shadow-C1', 'shadow']]);
+}), 30_000);
+
+test('ORCH-TA-HAND: an injected mode still honors the configured cell filter; shadow-before-placement then live launches; a seat-delegated cell stays on the seat path', async () => fixture(async (root, id, logged) => {
+  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+  const launches: string[][] = [];
+  setElanousConfigDir(root);
+  resetUserConfig();
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ loops: { orchestrator: { handToTaskAgentCell: 'C2' } } }));
+    resetUserConfig();
+    // ① shadow tick (no placement): only the configured cell C2 gets a shadow card.
+    const shadow = await invoke(root, 'mix08s', '08', { mode: 'shadow', split, loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    expect(shadow.handed?.map(row => [row.cell, row.mode])).toEqual([['C2', 'shadow']]);
+    expect(launches).toHaveLength(0);
+    // ② the same cells in a live tick: C2 (never seat-delegated) now launches through TASK-AGENT; C1 (outside the filter) takes the seat path.
+    const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'mix08s.json'), 'utf8'));
+    writeFileSync(join(root, 'loop', 'orchestrator', 'mix08l.json'), JSON.stringify({ ...placed, runId: 'mix08l', mode: 'live',
+      cells: placed.cells.map((cell: Record<string, unknown>) => ({ ...cell, version: '0.2.18' })), nodes: { intake: 'ok', split: 'ok', place: 'ok' }, handed: [] }));
+    const live = await runOrchestratorNode('delegate', { root, runId: 'mix08l', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } });
+    expect(launches).toHaveLength(1);
+    expect(live.handed?.filter(row => row.mode === 'live').map(row => row.cell)).toEqual(['C2']);
+    expect(journalRowsOf(root).map(row => row.cell)).toEqual(['C1']);
+    // ③ C1 is on the seat path now — switching the filter to C1 never launches it through TASK-AGENT as well.
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ loops: { orchestrator: { handToTaskAgentCell: 'C1' } } }));
+    resetUserConfig();
+    const again = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'mix08l.json'), 'utf8'));
+    delete again.nodes.delegate;
+    writeFileSync(join(root, 'loop', 'orchestrator', 'mix08l.json'), JSON.stringify(again));
+    await runOrchestratorNode('delegate', { root, runId: 'mix08l', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } });
+    expect(launches).toHaveLength(1);
+    expect(journalRowsOf(root).map(row => row.cell)).toEqual(['C1']);
+  } finally { resetElanousConfigDir(); resetUserConfig(); }
+}));
+const journalRowsOf = (root: string) => { const path = join(root, 'seat-requests', 'requests.jsonl'); return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []; };
+
+test('ORCH-TA-HAND: another run re-reading the ledger never claims a hand it did not make', async () => fixture(async (root) => {
+  await placedRun(root, 'ownA');
+  await runOrchestratorNode('delegate', { root, runId: 'ownA', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
+    handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async () => {} });
+  const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'ownA.json'), 'utf8'));
+  writeFileSync(join(root, 'loop', 'orchestrator', 'ownB.json'), JSON.stringify({ ...placed, runId: 'ownB', handed: undefined, nodes: { intake: 'ok', split: 'ok', place: 'ok' } }));
+  const b = await runOrchestratorNode('delegate', { root, runId: 'ownB', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {}, handToTaskAgent: 'off', handToTaskAgentCell: '-' });
+  expect(b.handed).toBeUndefined();
+  expect(journalRowsOf(root).map(row => row.cell)).toEqual(['C2']);
+}));
+
+const shadowPlaced = async (root: string, runId: string) => {
+  // Shadow tick: cells stay unplaced, so a re-entered delegate reaches the shadow hand again (no seat row is written).
+  const base = { root, runId, window: '08' as const, mode: 'shadow' as const, now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {} };
+  await runOrchestratorNode('intake', base);
+  await runOrchestratorNode('split', { ...base, split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }] });
+  await runOrchestratorNode('place', { ...base, loadAdapter: async () => undefined });
+  return async (handTask: TickDeps['handTask']) => {
+    const statePath = join(root, 'loop', 'orchestrator', `${runId}.json`);
+    if (existsSync(statePath)) { const saved = JSON.parse(readFileSync(statePath, 'utf8')); delete saved.nodes.delegate; writeFileSync(statePath, JSON.stringify(saved)); }
+    return runOrchestratorNode('delegate', { ...base, handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask });
+  };
+};
+const agentCards = (root: string) => {
+  const path = join(root, 'task-agent-actions.json');
+  const tasks = existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')).tasks ?? {}) : {};
+  return Object.values(tasks).filter((card) => (card as { checklistId?: string }).checklistId === 'C1');
+};
+
+test('ORCH-TA-HAND: a shadow hand that fails before its card releases the claim and the next tick writes exactly one real card', async () => fixture(async (root) => {
+  const delegate = await shadowPlaced(root, 'rel08');
+  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
+  let calls = 0;
+  const handTask: TickDeps['handTask'] = async (opts) => { calls++; if (calls === 1) throw new Error('card store busy'); return realHandTask(opts); };
+  expect((await delegate(handTask)).handed).toBeUndefined();
+  expect(agentCards(root)).toHaveLength(0);
+  const second = await delegate(handTask);
+  expect(calls).toBe(2);
+  expect(agentCards(root)).toHaveLength(1);
+  expect(second.handed?.map(row => row.cardId)).toEqual([(agentCards(root)[0] as { id: string }).id]);
+  expect(ledgerRows(root).map(row => row.status)).toEqual(['claimed', 'released', 'claimed', 'handed']);
+}));
+
+test('ORCH-TA-HAND: a released shadow claim is retried by the next run (a different runId), and a malformed task store keeps the claim', async () => fixture(async (root) => {
+  const delegate = await shadowPlaced(root, 'next08a');
+  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
+  let calls = 0;
+  const handTask: TickDeps['handTask'] = async (opts) => { calls++; if (calls === 1) throw new Error('card store busy'); return realHandTask(opts); };
+  await delegate(handTask);
+  const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'next08a.json'), 'utf8'));
+  writeFileSync(join(root, 'loop', 'orchestrator', 'next08b.json'), JSON.stringify({ ...placed, runId: 'next08b', nodes: { intake: 'ok', split: 'ok', place: 'ok' } }));
+  const next = await runOrchestratorNode('delegate', { root, runId: 'next08b', window: '08', mode: 'shadow', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {}, handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask });
+  expect(calls).toBe(2);
+  expect(agentCards(root)).toHaveLength(1);
+  expect(next.handed).toHaveLength(1);
+}));
+
+test('ORCH-TA-HAND: a malformed task store never reads as «no card» — the failed shadow claim is kept', async () => fixture(async (root) => {
+  const delegate = await shadowPlaced(root, 'bad08');
+  for (const malformed of ['{}', '{"tasks": []}', '{"tasks": {"x": 3}}']) {
+    writeFileSync(join(root, 'task-agent-actions.json'), malformed);
+    const before = ledgerRows(root).length;
+    await delegate(async () => { throw new Error('card store busy'); });
+    const added = ledgerRows(root).slice(before).map(row => row.status);
+    // The first pass claims (and keeps); later passes see the kept claim and never hand again.
+    expect(added.includes('released')).toBe(false);
+  }
+  expect(ledgerRows(root).map(row => row.status)).toEqual(['claimed']);
+}));
+
+test('ORCH-TA-HAND: a shadow hand that fails after writing its card keeps the claim — no second card', async () => fixture(async (root) => {
+  const delegate = await shadowPlaced(root, 'keep08');
+  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
+  let calls = 0;
+  const handTask: TickDeps['handTask'] = async (opts) => { calls++; await realHandTask(opts); throw new Error('after the card'); };
+  await delegate(handTask);
+  await delegate(handTask);
+  expect(calls).toBe(1);
+  expect(agentCards(root)).toHaveLength(1);
+  expect(ledgerRows(root).map(row => row.status)).toEqual(['claimed']);
+}));

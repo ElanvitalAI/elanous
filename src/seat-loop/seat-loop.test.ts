@@ -144,6 +144,62 @@ test('matching shadow and live-safe modes preserve the original tick line withou
   } finally { spy.mockRestore(); f.close(); }
 });
 
+test('seat heartbeat is an isolated ACK: present at five minutes, absent at twenty-one without another OP turn', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  const config = { ...neighborConfig('shadow'), seats: ['MK', 'OP'] };
+  const busPath = join(f.root, 'surface_events.db');
+  try {
+    const op: SeatDeps = { ...f.deps, config, now: () => now, versions: () => [], schedules: () => [], pendingDecisions: () => [] };
+    expect((await runSeatLoopOnce('OP', op)).status).toBe('shadow');
+    const atFive = new Date(now.getTime() + 5 * 60_000);
+    const mk: SeatDeps = { ...f.deps, config, now: () => atFive, versions: () => [], schedules: () => [] };
+    expect((await runSeatLoopOnce('MK', mk)).status).toBe('skipped-empty');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'shadow' }]);
+    const bus = openSurfaceEventsDb(busPath);
+    try {
+      const rows = bus.query('SELECT surface, direction, kind, refs, ts FROM events ORDER BY ts').all() as Array<{
+        surface: string; direction: string; kind: string; refs: string; ts: string;
+      }>;
+      expect(rows.filter((row) => row.surface === 'loop:heartbeat' && JSON.parse(row.refs).seat === 'OP'))
+        .toEqual([{ surface: 'loop:heartbeat', direction: 'outbound', kind: 'heartbeat', refs: JSON.stringify({ seat: 'OP' }), ts: now.toISOString() }]);
+      expect(rows.every((row) => !['coord:channel', 'context:session', 'context:external'].includes(row.surface))).toBe(true);
+    } finally { bus.close(); }
+    expect((await runSeatLoopOnce('MK', { ...mk, now: () => new Date(now.getTime() + 21 * 60_000) })).status).toBe('skipped-empty');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'present', action: null, plannedAction: null, mode: 'shadow' },
+        { seat: 'MK', neighbor: 'op-seat', state: 'absent', action: null, plannedAction: 'escalate', mode: 'shadow' }]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('off and excluded seats do not create a heartbeat or read inputs', async () => {
+  const f = fixture();
+  try {
+    const read = () => { throw Error('disabled seat read'); };
+    expect(await runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'off', seats: ['OP'] }, read }))
+      .toEqual({ seat: 'OP', status: 'skipped-off' });
+    expect(await runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'shadow', seats: ['MK'] }, read }))
+      .toEqual({ seat: 'OP', status: 'skipped-off' });
+    expect(existsSync(join(f.root, 'surface_events.db'))).toBe(false);
+    expect(existsSync(seatLedgerPath('OP', f.root, now))).toBe(false);
+  } finally { f.close(); }
+});
+
+test('heartbeat write failure is observed without stopping the seat turn', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    writeFileSync(join(f.root, 'surface_events.db'), 'not sqlite');
+    const result = await runSeatLoopOnce('MK', { ...f.deps, config: neighborConfig('shadow'), versions: () => [] });
+    expect(result.status).toBe('skipped-empty');
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'heartbeat-write-failed'))
+      .toEqual([['seat.loop', 'heartbeat-write-failed', { seat: 'MK', error: expect.any(String) }]]);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'loop.neighbors' && event === 'tick').map(([, , data]) => data))
+      .toEqual([{ seat: 'MK', neighbor: 'op-seat', state: 'unknown', action: null, plannedAction: null, mode: 'shadow' }]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
 test('seat tick judges stale context-bus neighbor in shadow without taking action', async () => {
   const f = fixture();
   const spy = spyOn(debug, 'log').mockImplementation(() => {});
@@ -459,18 +515,24 @@ test('an OP proposal cannot resolve an actual yellow MK release-ledger cell', as
   try {
     expect(importJson(version)).toBe(true);
     delete f.deps.checklistItems;
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1'))
+      .toMatchObject({ status: 'yellow', owner: 'MK', evidence: '검토 원장' });
     expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-xcheck');
     const op: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['OP'] },
       crossCheck: () => ({ agree: true, note: 'OP가 해결 가능', resolves: true }),
       run: async () => { throw Error('OP acted on checklist before cross-check'); } };
     expect((await runSeatLoopOnce('OP', op)).status).toBe('answered');
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1')?.status).toBe('yellow');
     expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('awaiting-resolution');
+    expect(f.ledger().at(-1)).toMatchObject({ status: 'awaiting-resolution', xcheckNote: 'OP가 해결 가능' });
     expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1')?.status).toBe('yellow');
     expect((await runSeatLoopOnce('MK', f.deps)).status).toBe('skipped-empty');
     expect(f.ledger().some((row) => row.status === 'resolved-by-neighbor')).toBe(false);
     expect(f.calls.filter((args) => args[0] === 'decisions')).toHaveLength(0);
     expect((await gatherSeatInputs('MK', f.deps)).checklist).toMatchObject([{ id: 'M1', status: 'yellow' }]);
     setItem(version, 'M1', { evidence: '이웃 제안 검토 근거' }, 'MK');
+    expect(listChecklist(version, f.root).items.find((item) => item.id === 'M1'))
+      .toMatchObject({ status: 'yellow', evidence: '이웃 제안 검토 근거' });
     const resumed = await runSeatLoopOnce('MK', { ...f.deps, inquire: () => null,
       run: async (args) => args[0] === 'harness' && args[1] === 'budget' ? '{"outcome":"wait-reset"}' : '' });
     expect(resumed).toMatchObject({ status: 'skipped-budget', item: { id: 'M1', evidence: '이웃 제안 검토 근거' } });
@@ -1709,7 +1771,7 @@ test('on: wait rechecks changed measurement evidence and then launches only once
     const calls: string[][] = [];
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'K2', owner: 'TC', title: '기기 검증', status, evidence }],
-      versions: () => ['0.2.9'],
+      versions: () => ['0.2.9'], running: () => [],
       run: async (args) => { calls.push(args); return args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]'; } };
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('wait');
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
@@ -1718,9 +1780,11 @@ test('on: wait rechecks changed measurement evidence and then launches only once
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('wait');
     expect(calls).toEqual([]);
     evidence = '실물 측정 완료';
+    expect((await gatherSeatInputs('TC', deps)).checklist).toMatchObject([{ id: 'K2', status: 'red', evidence }]);
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
     expect(calls.map((args) => args[1])).toEqual(['budget', 'say']);
+    expect(calls[1]?.[2]).toBe('[TC 자리 · 0.2.9 체크리스트 칸 K2 · 역할 docs/roles/TC.md] 기기 검증');
     expect(entries(f).map((entry) => entry.status)).toEqual(['wait', 'skipped-empty', 'wait', 'attempting', 'launched', 'skipped-empty']);
   } finally { f.close(); }
 });

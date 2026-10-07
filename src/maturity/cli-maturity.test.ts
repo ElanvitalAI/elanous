@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -19,12 +19,17 @@ const commands = program.commands;
 const grades = FEATURE_MATURITY.cliRoot;
 const names = commands.map(command => command.name());
 const system = ['repro', 'run-detached', 'dogfood', 'run'];
+// Private ledgers register only when their CLI module ships (release/public-export.yaml drops
+// src/cli/directives-cli.ts), so the public export keeps the grade without the command.
+const privateLedger = ['decisions', 'claims', 'lesson', 'directives'];
+const absentPrivateLedger = privateLedger.filter(name => !existsSync(join(import.meta.dir, `../cli/${name}-cli.ts`)) && !existsSync(join(import.meta.dir, `../cli/${name}-cli.js`)));
 
 describe('MAT1a CLI root maturity', () => {
   test('registered canonical names have exactly one grade and docs classify the stable set', () => {
     expect(new Set(names).size).toBe(names.length);
     for (const command of commands) expect(cliRootMaturity(command.name())).toBeDefined();
-    expect(Object.keys(grades).sort()).toEqual([...names, ...system.filter(name => !names.includes(name))].sort());
+    for (const name of absentPrivateLedger) expect(names).not.toContain(name);
+    expect(Object.keys(grades).sort()).toEqual([...names, ...system.filter(name => !names.includes(name)), ...absentPrivateLedger].sort());
     const doc = readFileSync(join(import.meta.dir, '../../release/public/docs/commands.md'), 'utf8');
     const documented = new Set([...doc.matchAll(/elanous ([a-z][a-z:-]*)/g)].map(match => match[1]));
     expect(documented.size).toBe(23);

@@ -554,6 +554,44 @@ export function codexAccessHoursLeft(accessToken: unknown, now: number = Date.no
   return typeof exp === 'number' ? Math.round(((exp * 1000 - now) / 3_600_000) * 10) / 10 : null;
 }
 
+/** PREREFRESH-LOCK (10-06 · post-review of #24449) — the per-account host refresh lock path.
+ *  🩸 Two Pod launches on one host picked the same expiring account at once: both refreshed, the server
+ *  rotated the refresh token under the second, its refresh failed and that run dropped the account.
+ *  The lock file sits NEXT TO the account's credential state (`<codexHome>/.elanous-prerefresh.lock`) —
+ *  ⛔ never inside a token file, and it carries only the holder's pid/nonce. null = no named home to lock. */
+export function codexAccountRefreshLockPath(name: string, storePath: string = authStorePath()): string | null {
+  if (name === DEFAULT_CODEX_ACCOUNT || !isValidAccountName(name)) return null;
+  const codexHome = loadTokens(codexStoreKey(name), storePath)?.codexHome;
+  return codexHome ? join(codexHome, '.elanous-prerefresh.lock') : null;
+}
+
+/** A refresh (network + rotate + atomic write + import) can take tens of seconds — wait up to ~90 s,
+ *  and treat a lock as stale only after 2 min (the async holder heartbeats its mtime meanwhile). */
+export const CODEX_REFRESH_LOCK_OPTS = { staleMs: 120_000, retryBusyMs: 100, maxTries: 900 } as const;
+
+/** The refresh lock could not be acquired (timeout · ENOENT · EACCES …) — `fn` never ran, so nothing was refreshed. */
+export class CodexRefreshLockUnavailableError extends Error {
+  constructor(readonly reason: 'lock-timeout' | 'lock-error', cause: unknown) {
+    super(`codex refresh lock unavailable (${reason}): ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'CodexRefreshLockUnavailableError';
+  }
+}
+
+/** Runs `fn` while holding the account's refresh lock (cross-process · same-process). null path = no lock.
+ *  Any failure to acquire the lock throws `CodexRefreshLockUnavailableError` (fn not run); fn's own errors pass through. */
+export async function withCodexAccountRefreshLock<T>(lockPath: string | null, fn: () => Promise<T>, opts: { staleMs?: number; retryBusyMs?: number; maxTries?: number } = CODEX_REFRESH_LOCK_OPTS): Promise<T> {
+  if (!lockPath) return fn();
+  const { acquireLockAsync } = await import('../storage/file-lock.js');
+  let handle: Awaited<ReturnType<typeof acquireLockAsync>>;
+  try { handle = await acquireLockAsync(lockPath, opts); }
+  catch (error) {
+    const timedOut = error instanceof Error && error.message.startsWith('acquireLockAsync: timed out');
+    throw new CodexRefreshLockUnavailableError(timedOut ? 'lock-timeout' : 'lock-error', error);
+  }
+  try { return await fn(); }
+  finally { handle.release(); }
+}
+
 export async function refreshCodexAccountHome(
   name: string,
   opts: {

@@ -1,5 +1,6 @@
 import { debug } from '../../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../../decisions/decision-ledger.js';
+import { isIrreversible } from '../../decisions/decision-cards.js';
 import { jsonResponse } from './json-response.js';
 
 export const DECISIONS_PATH = '/v1/decisions';
@@ -27,10 +28,19 @@ export async function handleDecisions(req: Request, deps: DecisionsRouteDeps = {
       id: entry.id,
       title: entry.title,
       situation: entry.scqa.s.slice(0, 200),
-      options: entry.options.map(option => ({ id: option.key, label: option.label })),
+      options: entry.options.map(option => ({ id: option.key, label: option.label, consequence: option.consequence })),
       recommendation: entry.recommendation,
       raisedAt: entry.raisedAt,
       dueAt: entry.dueAt,
+      scqa: entry.scqa,
+      category: entry.category,
+      irreversible: isIrreversible(entry),
+      raisedBy: { agent: entry.raisedBy.agent, ...(entry.raisedBy.track ? { track: entry.raisedBy.track } : {}) },
+      alternative: entry.alternative,
+      dissent: entry.dissent,
+      crossCheck: entry.crossCheck,
+      crossCheckSkipped: entry.crossCheckSkipped,
+      pendingQuestion: entry.pendingQuestion,
     }));
     debug.log('decisions.api', 'listed', { count: decisions.length });
     return jsonResponse({ decisions });

@@ -7,6 +7,7 @@ import { recordDocsFollow, type DocsFollowItem } from './release-docs.js';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { errorResult, finishNode, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { prereleaseKind } from './release-version.js';
 
 export function runDocsLand(run: CommandRunner = runCommand, stateRoot = effectiveInstanceRoot(), ledgerRoot = releaseLedgerRoot()) {
   const context = readGraphContext();
@@ -119,6 +120,12 @@ export function runDocsLand(run: CommandRunner = runCommand, stateRoot = effecti
 
 if (import.meta.main) {
   let version = '';
-  try { version = readGraphContext().input.version; process.exitCode = finishNode('docs-land', version, runDocsLand()); }
+  try {
+    version = readGraphContext().input.version;
+    // RELEASE-REHEARSAL-RC: a prerelease never lands docs on main or upgrades the operating hosts.
+    process.exitCode = finishNode('docs-land', version, prereleaseKind(version) !== null
+      ? { outcome: 'ok', verdict: 'pass', summary: `docs-land skipped — ${version} is a prerelease`, skipped: 'prerelease' }
+      : runDocsLand());
+  }
   catch (error) { process.exitCode = finishNode('docs-land', version, errorResult(error)); }
 }

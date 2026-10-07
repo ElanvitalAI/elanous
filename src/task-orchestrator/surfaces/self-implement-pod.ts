@@ -33,6 +33,13 @@ export const POD_CONTROL_INBOX_DIR = '/tmp/elanous-control.inbox';
 /** Newest pod log bytes returned when the export passes the 5MB artifact limit (headroom under it). */
 export const POD_LOGS_KEEP_BYTES = 4_500_000;
 
+/** Re-emit the child's `{kind:"self", ok, result}` line as one flat `{...result, ok}` line at the end of /tmp/si.out.
+ *  POD-NORESULT ⓑ (10-07 · 28 failed rc=2 Jobs read back): every child printed its result line, but one
+ *  (si-task-71f68d57f6b7, image 0.2.15) had stderr lines (`[graph] collect fail`) after it, so the old
+ *  «last line only» check skipped the flatten and the host kept `ok:false` with no stage or PR number.
+ *  Scan back to the newest child result line instead; still append exactly one line. */
+const POD_RESULT_FLATTEN = `bun -e 'const fs=require("fs");const p="/tmp/si.out";const lines=fs.readFileSync(p,"utf8").trimEnd().split("\\n");for(let i=lines.length-1;i>=0;i--){const l=lines[i].trim();if(!l.startsWith("{"))continue;let o;try{o=JSON.parse(l)}catch{continue}if(!o||o.kind!=="self")continue;if(o.result&&typeof o.result==="object"&&!Array.isArray(o.result))fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n");break}'`;
+
 export const POD_JOB_DEADLINE_SECONDS = 10_800;
 
 /** 자식 컨테이너 «요청» — 🩸 2026-09-27: limits 만 두면 k8s 가 requests=limits(cpu 4)로 잡아, 32코어 노드에
@@ -147,6 +154,8 @@ export interface PodSpawnOptions {
   credentials?: (account: string) => { elanousAuth: string; codexAuth: string; ghToken: string };
   /** POD-TOKEN-PREREFRESH 시험 심 — «3시간 안 만료» 계정의 호스트 선갱신(기본 refreshCodexAccountHome). */
   codexPrerefresh?: (account: string) => Promise<{ ok: true; beforeH: number | null; afterH: number | null } | { ok: false; kind: string; message: string }>;
+  /** PREREFRESH-LOCK 시험 심 — 계정별 갱신 잠금 파일 경로(기본 = 그 계정 codexHome 옆). */
+  codexPrerefreshLockPath?: (account: string) => string | null;
   /** 시험 심 — 이 호스트가 본부 임대 보유자인가(기본 HQ 펜스 · kubectl 주입 시험이면 false). */
   hqLeaseHolder?: () => boolean | Promise<boolean>;
   grokCredentials?: () => { grokAuth?: string; grokApiKey?: string; ghToken: string };
@@ -186,17 +195,29 @@ export class PodCodexExpiringError extends Error {
   }
 }
 
-export type PodCredentialPrerefreshOutcome = 'refreshed' | 'still-expiring' | 'refresh-failed' | 'no-lease';
+export type PodCredentialPrerefreshOutcome =
+  | 'refreshed' | 'still-expiring' | 'refresh-failed' | 'no-lease'
+  // PREREFRESH-LOCK (10-06): a peer refreshed it while we waited for the lock · a failed refresh's one re-check.
+  | 'refresh-skipped-already-fresh' | 'refresh-failed-recheck-ok' | 'refresh-failed-recheck-failed'
+  // 갱신을 «시도하지 않았다» — 잠금 자리를 못 구했거나 잠금을 못 잡았다(갱신 실패와 가른다 · reason = no-lock-path|lock-timeout|lock-error).
+  | 'lock-unavailable';
 
 /** POD-TOKEN-PREREFRESH (10-06) — «3시간 안 만료» 계정은 거부만 하지 말고 선갱신을 한 번 시도한다.
  *  🩸 05:3x team · 09:47 third: 거부만 하고 다음 계정으로 안 넘어가 그 계정으로 뽑힌 Pod 런이 전부 pod-error.
  *  ⛔ 갱신은 본부(HQ) 임대 보유자 한 곳에서만 — refresh 토큰은 갱신마다 회전해 두 곳이 갱신하면 로그아웃된다.
+ *  ⭐ PREREFRESH-LOCK (10-06 · #24449 사후 리뷰): 같은 호스트의 두 런이 같은 계정을 «동시에» 고르면 갱신이 둘이 돌아
+ *     뒤엣것이 회전된 refresh 토큰으로 실패하고 그 계정을 버렸다. ⇒ 계정별 파일 잠금 안에서 ⑴ 먼저 다시 읽어
+ *     이미 신선하면 갱신하지 않고 ⑵ 갱신이 실패해도 한 번 다시 읽어(동료가 갱신했을 수 있다) 신선하면 쓴다.
  *  null = 이 계정은 후보에서 뺀다(호출자가 다음 계정으로). 만료 아닌 다른 자격 오류는 그대로 던진다. */
 export async function podCodexCredentialWithPrerefresh(account: string, deps: {
   credentials: (account: string) => { elanousAuth: string; codexAuth: string; ghToken: string };
   refresh: (account: string) => Promise<{ ok: true; beforeH: number | null; afterH: number | null } | { ok: false; kind: string; message: string }>;
   isLeaseHolder: () => boolean | Promise<boolean>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** 계정별 갱신 잠금 파일(기본 = 그 계정 codexHome 옆 · `codexAccountRefreshLockPath`). null = 잠금 없음. */
+  lockPath?: (account: string) => string | null;
+  /** 잠금 대기 조정(시험 심) — 기본 CODEX_REFRESH_LOCK_OPTS. */
+  lockOpts?: { staleMs?: number; retryBusyMs?: number; maxTries?: number };
 }): Promise<{ elanousAuth: string; codexAuth: string; ghToken: string } | null> {
   const log = deps.log ?? ((category, event, data) => debug.log(category, event, data));
   try { return deps.credentials(account); }
@@ -209,17 +230,56 @@ export async function podCodexCredentialWithPrerefresh(account: string, deps: {
     let holder = false;
     try { holder = await deps.isLeaseHolder(); } catch { holder = false; }
     if (!holder) { observe('no-lease', null); return null; }
-    let refreshed: Awaited<ReturnType<typeof deps.refresh>>;
-    try { refreshed = await deps.refresh(account); }
-    catch { observe('refresh-failed', null, 'threw'); return null; }
-    if (!refreshed.ok) { observe('refresh-failed', null, refreshed.kind); return null; }
-    try {
-      const credential = deps.credentials(account);
+    /** One re-read: fresh credential, null when still expiring. Other credential errors throw. */
+    const reread = (): { elanousAuth: string; codexAuth: string; ghToken: string } | { expiringH: number } => {
+      try { return deps.credentials(account); }
+      catch (again) {
+        if (!(again instanceof PodCodexExpiringError)) throw again;
+        return { expiringH: again.hoursLeft };
+      }
+    };
+    const codex = await import('../../oauth/codex.js');
+    let lockPath: string | null = null;
+    let lockUnknown = false;
+    try { lockPath = (deps.lockPath ?? ((name: string) => codex.codexAccountRefreshLockPath(name)))(account); } catch { lockUnknown = true; }
+    // 이름 있는 계정인데 잠금 자리를 못 구하면 잠금 없이 갱신하지 않는다 — 막으려던 중복 갱신이 그 자리에서 재발한다.
+    // 갱신은 건너뛰고 한 번만 다시 읽는다(동료가 이미 갱신했으면 그대로 쓴다).
+    if (lockUnknown || (lockPath === null && account !== (await import('../../oauth/codex-account.js')).DEFAULT_CODEX_ACCOUNT)) {
+      const late = reread();
+      if (!('expiringH' in late)) { observe('refresh-skipped-already-fresh', null, 'no-lock-path'); return late; }
+      observe('lock-unavailable', null, 'no-lock-path');
+      return null;
+    }
+    const critical = async () => {
+      // ⑴ 잠금을 기다리는 사이 동료 런이 갱신했으면 그대로 쓴다 — 두 번째 갱신이 회전된 토큰으로 실패하는 자리.
+      const first = reread();
+      if (!('expiringH' in first)) { observe('refresh-skipped-already-fresh', null); return first; }
+      let refreshed: Awaited<ReturnType<typeof deps.refresh>> | null = null;
+      let failReason = 'threw';
+      try { refreshed = await deps.refresh(account); }
+      catch { refreshed = null; }
+      if (refreshed && !refreshed.ok) failReason = refreshed.kind;
+      if (!refreshed || !refreshed.ok) {
+        observe('refresh-failed', null, failReason);
+        // ⑵ 버리기 전에 한 번 다시 읽는다 — 다른 호스트 경로(사람 `account refresh`)가 방금 갱신했을 수 있다.
+        let recheck: ReturnType<typeof reread>;
+        try { recheck = reread(); } catch { observe('refresh-failed-recheck-failed', null, 'recheck-error'); return null; }
+        if (!('expiringH' in recheck)) { observe('refresh-failed-recheck-ok', null); return recheck; }
+        observe('refresh-failed-recheck-failed', recheck.expiringH);
+        return null;
+      }
+      const after = reread();
+      if ('expiringH' in after) { observe('still-expiring', after.expiringH); return null; }
       observe('refreshed', refreshed.afterH);
-      return credential;
-    } catch (again) {
-      if (!(again instanceof PodCodexExpiringError)) throw again;
-      observe('still-expiring', again.hoursLeft);
+      return after;
+    };
+    try { return await codex.withCodexAccountRefreshLock(lockPath, critical, deps.lockOpts ?? codex.CODEX_REFRESH_LOCK_OPTS); }
+    catch (lockError) {
+      if (!(lockError instanceof codex.CodexRefreshLockUnavailableError)) throw lockError;
+      // 잠금을 못 잡았다(대기 초과 · 잠금 파일 생성 실패) — 갱신은 하지 않고 한 번만 다시 읽는다.
+      const late = reread();
+      if (!('expiringH' in late)) { observe('refresh-skipped-already-fresh', null, lockError.reason); return late; }
+      observe('lock-unavailable', null, lockError.reason);
       return null;
     }
   }
@@ -688,11 +748,11 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     ...(o.appCredential ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
     // ⛔ `--author-grade` 는 Pod 안 `elanous`(이미지에 깔린 판)가 모를 수 있어 넘기지 않는다 — 10-06 «unknown option» 즉사(#24445 되돌림).
-    // lite 는 지금 로컬 저작 전용이다. Pod 저작은 설정·기본(full)을 따른다.
+    // AUTHOR-LITE2-POD — 등급은 환경변수 `ELANOUS_AUTHOR_GRADE` 로 싣는다(옛 Pod elanous 는 모르는 환경변수를 무시하고 full 로 돈다).
     o.authorSentence
-      ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); elanous harness say --substrate local --json${quotedAsk} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1; rc=$?; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
+      ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1; rc=$?; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
       : goalPath
-      ? `elanous harness ask ${goalPath} --json${quotedAsk} > /tmp/si.out 2>&1; rc=$?; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
+      ? `elanous harness ask ${goalPath} --json${quotedAsk} > /tmp/si.out 2>&1; rc=$?; ${POD_RESULT_FLATTEN}`
       : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1; rc=$?`,
     'cat /tmp/si.out',
     '[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo "ELANOUS_USAGE_ROLLUP {\"measured\":false,\"reason\":\"no rollup script\"}"',
@@ -1054,6 +1114,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           credentials: accountCredentials,
           refresh: options.codexPrerefresh ?? (async (name: string) => (await import('../../oauth/codex.js')).refreshCodexAccountHome(name)),
           isLeaseHolder: options.hqLeaseHolder ?? (options.kubectl ? () => false : defaultHqLeaseHolder),   // kubectl 주입(=시험)이면 본부 임대를 묻지 않는다
+          // PREREFRESH-LOCK: 시험(kubectl 주입)은 정본 스토어를 읽어 잠금 경로를 풀지 않는다 — 임시 디렉터리의 계정별 잠금.
+          // 잠금 자리는 주입 여부와 무관하게 계정 홈 옆 하나 — 시험은 codexPrerefreshLockPath 로 명시한다(같은 계정이 서로 다른 잠금을 쓰지 않게).
+          ...(options.codexPrerefreshLockPath ? { lockPath: options.codexPrerefreshLockPath } : {}),
         };
         const candidates = grok ? [] : plannedCodexAccounts ?? [plannedAccount];
         const usable: Array<{ name: string; credential: ReturnType<typeof accountCredentials> }> = [];
@@ -1552,12 +1615,15 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           const releaseHold = regate.failures[0]?.step === 'release-path-hold';
           const frozen = regate.status === 'frozen';
+          // FREEZE-POD: the host is the only merger of a Pod run, so its freeze check here is the one that holds it.
+          if (frozen) debug.log('self-implement.pod', 'merge-blocked-by-freeze', { job: name, runId: liveChildRunId, pr: prNumber ?? null, reason: 'landing-freeze' });
           disposition = { ...disposition, stage: frozen || releaseHold ? 'pr-opened' : regate.passed ? 'merged' : 'host-regate-failed', merged: regate.passed && !frozen, hostRegate: regate, ok: regate.passed || releaseHold || frozen };
         }
         const childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
           ? lastPodChildFailure(logs) : null;
         let noResultDiagnostic: string | null = null;
-        if (state === 'failed' && containerExitCode !== null && containerExitCode !== 0 && !disposition && !oomKilled && failedReason !== 'DeadlineExceeded' && failedReason !== 'BackoffLimitExceeded') {
+        // POD-NORESULT: the Job runs with backoffLimit 0, so any non-zero child exit is «BackoffLimitExceeded» — not a reason to skip the ledger.
+        if (state === 'failed' && containerExitCode !== null && containerExitCode !== 0 && !disposition && !oomKilled && failedReason !== 'DeadlineExceeded') {
           try { noResultDiagnostic = podNoResultDiagnostic(readFileSync(runLedgerPath(liveChildRunId, ledgerDir), 'utf8')); }
           catch { /* ledger not returned: do not invent a stage */ }
           noResultDiagnostic ??= 'child terminal result missing; last ledger stage=unknown; round=unknown; mustFix=unknown';
@@ -1568,7 +1634,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness,
           ...(state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
-            ? { ...(childFailure ? { childStage: childFailure.stage } : {}), childError: childFailure?.error ?? 'no-result-line' } : {}) },
+            ? { ...(childFailure ? { childStage: childFailure.stage } : disposition?.stage ? { childStage: disposition.stage } : {}),
+              // POD-NORESULT: a parsed result row without error text is not a missing result line (UX 10-07 01:01: 28 of 28 exit-2 Jobs printed one).
+              childError: childFailure?.error ?? (disposition?.stage ? 'result-without-error' : 'no-result-line') } : {}) },
           state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded' ? { compact: { stringMax: 500 } } : undefined);
         if (oomKilled && reattach && !oomRetried && (!reattachedMemoryLimit || memoryGi(reattachedMemoryLimit) === null)) {
           return { exitCode: 1, output: '', error: { code: 'pod-memory-unavailable', message: `Job ${name} 실제 메모리 한도를 확인할 수 없다` } };
@@ -1639,7 +1707,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           : disposition;
         const podExitCode = state === 'complete' && disposition?.stage !== 'host-regate-failed' && disposition?.ok !== false ? 0 : 1;
         // SCHED-CONTRACT: a failed child must say why outside the Pod, not «no error diagnostic».
-        const podReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds }) : undefined;
+        const podReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds, result: disposition ? { stage: disposition.stage, prUrl: disposition.prUrl ?? null, prNumber: disposition.prNumber ?? null } : null }) : undefined;
         if (podReason) debug.log('self-implement.pod', 'failure-reason', { job: name, reason: podReason });
         return {
           exitCode: podExitCode,
@@ -1651,7 +1719,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
                 ? { error: { code: 'pod-gh-login-failed', message: `Job ${name} GitHub 앱 로그인 실패 (container=${containerReason ?? 'unknown'}/7, attempt=${ghLoginRetried ? 2 : 1}) — 새 토큰으로 ${ghLoginRetried ? '1회 재시도했으나 다시 실패' : '재시도 불가'}` } }
               : oomKilled
                 ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})${oomRetried || (memoryGi(reattachedMemoryLimit ?? memoryLimit) ?? 0) >= (memoryGi(podMemoryLimitFor(input.feature, { ...env, ELANOUS_POD_MEMORY_TIER: 'high' }).limit) ?? Infinity) ? ` — OOM · ${oomRetried ? retryTier : 'high'} 에서도` : ''}\n${formatLastMemSample(samples.at(-1))}` } }
-                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}${childFailure ? ` — childStage=${childFailure.stage} · childError=${childFailure.error}` : ` — childError=no-result-line · reason=${podReason}`}${noResultDiagnostic ? ` · ${noResultDiagnostic}` : ''}` } }
+                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}${childFailure ? ` — childStage=${childFailure.stage} · childError=${childFailure.error}` : disposition?.stage ? ` — childStage=${disposition.stage} · reason=${podReason}` : ` — childError=no-result-line · reason=${podReason}`}${noResultDiagnostic ? ` · ${noResultDiagnostic}` : ''}` } }
               : podReason && !childFailure?.error ? { error: { code: 'pod-child-failed', message: podReason } } : {}),
           ...(finishedDisposition ? { disposition: finishedDisposition } : {}),
         };

@@ -7,7 +7,7 @@ import type { DaemonClient } from '@/lib/daemon-client';
 
 type DecisionState = { client: DaemonClient; items: OpenDecision[]; expanded: boolean; decided: Record<string, string>; busy: string | null };
 
-export function ChatDecisionsChip() {
+export function ChatDecisionsChip({ mobileOpen, onCount }: { mobileOpen?: boolean; onCount?: (count: number) => void } = {}) {
   const { client } = useDaemon();
   const [state, setState] = useState<DecisionState>({ client, items: [], expanded: false, decided: {}, busy: null });
   const currentClient = useRef(client);
@@ -71,21 +71,25 @@ export function ChatDecisionsChip() {
   };
 
   const pending = visible?.items.filter(item => !visible.decided[item.id]).length ?? 0;
+  useEffect(() => { onCount?.(pending); }, [onCount, pending]);
   if (!visible || (!pending && !(visible.expanded && visible.items.some(item => visible.decided[item.id])))) return null;
+  if (onCount && !mobileOpen) return null;
+  const decisions = <ul id="chat-decisions-panel" className="mt-2 max-h-[min(50vh,24rem)] space-y-2 overflow-y-auto rounded-lg border border-border p-3">
+    {visible.items.map(item => <li key={item.id} className="rounded-lg border border-border p-3">
+      <h3 className="font-semibold">{item.title}</h3>
+      <p className="truncate text-muted-foreground" title={item.situation}>{item.situation}</p>
+      {visible.decided[item.id] ? <p role="status">결정함 — {visible.decided[item.id]}</p> : <div className="mt-2 flex flex-wrap gap-2">
+        {item.options.map(option => <button key={option.id} type="button" disabled={!!visible.busy} onClick={() => { void choose(item, option); }} className="rounded-md border border-border px-2 py-1 hover:bg-muted disabled:opacity-50">
+          {option.label}{'option' in item.recommendation && item.recommendation.option === option.id && <span className="ml-1 text-primary">추천</span>}
+        </button>)}
+      </div>}
+    </li>)}
+  </ul>;
+  if (onCount) return decisions;
   return <div className="shrink-0 border-b border-border bg-background px-3 py-1.5 text-sm">
     <button type="button" aria-expanded={visible.expanded} aria-controls="chat-decisions-panel" onClick={() => setState(previous => previous.client === client ? { ...previous, expanded: !previous.expanded } : previous)} className="rounded-full border border-border bg-muted px-3 py-1 font-medium text-foreground hover:bg-muted/70">
       대표 결정 {pending}
     </button>
-    {visible.expanded && <ul id="chat-decisions-panel" className="mt-2 max-h-[min(50vh,24rem)] space-y-2 overflow-y-auto rounded-lg border border-border p-3">
-      {visible.items.map(item => <li key={item.id} className="rounded-lg border border-border p-3">
-        <h3 className="font-semibold">{item.title}</h3>
-        <p className="truncate text-muted-foreground" title={item.situation}>{item.situation}</p>
-        {visible.decided[item.id] ? <p role="status">결정함 — {visible.decided[item.id]}</p> : <div className="mt-2 flex flex-wrap gap-2">
-          {item.options.map(option => <button key={option.id} type="button" disabled={!!visible.busy} onClick={() => { void choose(item, option); }} className="rounded-md border border-border px-2 py-1 hover:bg-muted disabled:opacity-50">
-            {option.label}{'option' in item.recommendation && item.recommendation.option === option.id && <span className="ml-1 text-primary">추천</span>}
-          </button>)}
-        </div>}
-      </li>)}
-    </ul>}
+    {visible.expanded && decisions}
   </div>;
 }

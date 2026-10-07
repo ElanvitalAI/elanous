@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 import { ChatMessageView } from './ChatMessage';
 import type { ChatMessage } from '@/lib/chat-runtime';
@@ -216,6 +217,45 @@ describe('ChatMessageView — blocks renderer (Phase B-2)', () => {
     // when args are present.
     expect(html).not.toMatch(/secret\.txt/);
     expect(html).toMatch(/▸/);
+  });
+
+  it('tool sources stay inside the initially collapsed card and expand with its summary', () => {
+    const html = renderToStaticMarkup(<ChatMessageView mobileSimple message={makeMessage({ blocks: [{
+      kind: 'tool_use', id: 'call-source', name: 'Read', status: 'done', summary: 'one file',
+      sources: [{ label: 'sensitive file', source: '/tmp/private', ago: null }],
+    }] })} />);
+    expect(html).toContain('one file');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('sensitive file');
+    expect(html).toContain('▸');
+  });
+
+  it('tool card opens sources on click without changing its one-line default', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    let tree!: ReactTestRenderer;
+    await act(async () => { tree = create(<ChatMessageView mobileSimple message={makeMessage({ blocks: [{
+      kind: 'tool_use', id: 'call-source', name: 'Read', status: 'done', summary: 'one file',
+      sources: [{ label: 'source file', source: '/tmp/private', ago: null }],
+    }] })} />); });
+    try {
+      const card = tree.root.findByProps({ 'data-elanous-block-kind': 'tool_use' });
+      expect(card.findByType('button').props['aria-expanded']).toBe(false);
+      expect(card.findAllByProps({ 'aria-label': '출처' })).toHaveLength(0);
+      await act(async () => card.findByType('button').props.onClick());
+      expect(card.findByType('button').props['aria-expanded']).toBe(true);
+      expect(card.findByProps({ 'aria-label': '출처' }).findByType('li').children.join('')).toBe('source file');
+    } finally {
+      await act(async () => tree.unmount());
+    }
+  });
+
+  it('1024px tool sources keep the prior visible card below the pill', () => {
+    const html = renderToStaticMarkup(<ChatMessageView message={makeMessage({ blocks: [{
+      kind: 'tool_use', id: 'call-source', name: 'Read', status: 'done', summary: 'one file',
+      sources: [{ label: 'source file', source: '/tmp/private', ago: null }],
+    }] })} />);
+    expect(html).toContain('source file');
+    expect(html).not.toContain('aria-expanded="false"');
   });
 
   it('B-3: pill without args has no expand affordance (no triangle marker)', () => {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { releaseReadiness, type ReleaseReadinessDeps } from './release-readiness.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
+import { addItem, listChecklist } from '../../src/release-loop/checklist.js';
 import { debug } from '../../src/debug/log.js';
 import { spyOn } from 'bun:test';
 
@@ -79,5 +80,28 @@ test('해당 판 일정이 없으면 다른 판에 컷이 있어도 기존 판�
     setSchedule('0.2.7', { cutAt: '2099-10-03T08:00+09:00' }, 'OP');
     expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T22:59:00Z') })).toEqual({ ready: true, reason: 'ready', details: clear });
     expect(releaseReadiness(version, { ...deps, checklist: () => blocked })).toEqual({ ready: false, reason: 'checklist-blocked', details: blocked });
+  } finally { resetElanousConfigDir(); }
+}));
+
+test('GATE-ENTRY-ALIGN: past the landing deadline readiness lets non-P0 yellows through and blocks on P0 yellows', () => fixture((_dir, deps) => {
+  setElanousConfigDir(deps.ledgerRoot!);
+  try {
+    setSchedule(version, { cutAt: '2026-10-03T08:00+09:00', landBy: '2026-10-03T06:30+09:00' }, 'OP');
+    addItem(version, { id: 'LATE', title: 'Missed deadline', owner: 'TC', priority: 'P1' });
+    const real = { ledgerRoot: deps.ledgerRoot, now: () => new Date('2026-10-02T23:00:00Z') };
+    expect(releaseReadiness(version, real)).toMatchObject({ ready: true, reason: 'ready', details: { moved: ['LATE'], undecided: [] } });
+    addItem(version, { id: 'URGENT', title: 'P0 open', owner: 'TC', priority: 'P0' });
+    expect(releaseReadiness(version, real)).toMatchObject({ ready: false, reason: 'checklist-blocked', details: { blocked: ['URGENT'] } });
+    // Readiness only judges — nothing is carried to the next version.
+    expect(listChecklist(version).items.map((item) => item.id)).toEqual(['LATE', 'URGENT']);
+  } finally { resetElanousConfigDir(); }
+}));
+
+test('GATE-ENTRY-ALIGN: before the landing deadline an undecided non-P0 yellow still blocks readiness', () => fixture((_dir, deps) => {
+  setElanousConfigDir(deps.ledgerRoot!);
+  try {
+    setSchedule(version, { cutAt: '2026-10-03T06:00+09:00', landBy: '2026-10-03T08:30+09:00' }, 'OP');
+    addItem(version, { id: 'WAIT', title: 'Before deadline', priority: 'P1' });
+    expect(releaseReadiness(version, { ledgerRoot: deps.ledgerRoot, now: () => new Date('2026-10-02T22:00:00Z') })).toMatchObject({ ready: false, reason: 'checklist-blocked', details: { undecided: ['WAIT'] } });
   } finally { resetElanousConfigDir(); }
 }));

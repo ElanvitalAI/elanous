@@ -68,6 +68,21 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
     }
   });
 
+  it('FREEZE-POD: Pod 안 --merge-by-host 는 self.mergeByHost 로 무손실 전달된다 (#24478 — 예전엔 빠져 자식이 스스로 병합)', async () => {
+    const cap = capture();
+    const saved = { sub: process.env.ELANOUS_SUBSTRATE, name: process.env.ELANOUS_POD_NAME, ns: process.env.ELANOUS_POD_NAMESPACE };
+    process.env.ELANOUS_SUBSTRATE = 'pod'; process.env.ELANOUS_POD_NAME = 'si-x'; process.env.ELANOUS_POD_NAMESPACE = 'elanous-test';
+    try {
+      await runSelfImplementCliCommand('F', opts({ mergeByHost: true, openPr: true }), { resolveWantAutoReview: () => false, executeReroute: cap.executeReroute });
+      expect(cap.last().self!.mergeByHost).toBe(true);
+      expect(cap.last().completion).toBe('auto-merge');
+    } finally {
+      for (const [k, v] of [['ELANOUS_SUBSTRATE', saved.sub], ['ELANOUS_POD_NAME', saved.name], ['ELANOUS_POD_NAMESPACE', saved.ns]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
   it('--ground → self.ground true로 무손실 전달', async () => {
     const cap = capture();
     await runSelfImplementCliCommand('F', opts({ ground: true }), { resolveWantAutoReview: () => false, executeReroute: cap.executeReroute });

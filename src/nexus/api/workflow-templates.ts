@@ -4,6 +4,7 @@
 
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { debug } from '../../debug/log.js';
 import { jsonResponse } from './http-server.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 
@@ -47,6 +48,8 @@ export function listTemplateCatalog(dir = findTemplateDir()): WorkflowTemplateEn
   try {
     files = readdirSync(dir).filter((f) => f.endsWith('.yaml'));
   } catch {
+    // An installed package without this folder used to answer «No templates available» silently (10-06 · files list).
+    debug.log('nexus.workflow-templates', 'template-dir-missing', { dir });
     return [];
   }
   const out: WorkflowTemplateEntry[] = [];

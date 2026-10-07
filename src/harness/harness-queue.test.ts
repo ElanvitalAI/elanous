@@ -1,6 +1,6 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -8,13 +8,16 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { getUserConfig } from '../user-config.js';
-import { addHarnessQueue, HarnessQueueDuplicateError, queueCellId, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, readHarnessQueueProcesses, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
+import { addHarnessQueue, harnessQueueCountingLimits, queueLaunchTime, HarnessQueueDuplicateError, queueCellId, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, queuePodRunsFromJobs, queueRunLabelValue, readHarnessQueuePodRuns, readHarnessQueueProcesses, queueCellRubricPriority, QUEUE_CEO_PRIORITY_BONUS, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
 import { checkpointDependenciesForRun, loadSelfDevRun, processBirthId, saveSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
 import { bindOrchestrateRunLedger } from '../self-dev/self-orchestrate-runtime.js';
 import { debug } from '../debug/log.js';
+import { k8sLabelValue } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { runHarnessQueueChild } from './harness-queue-child.js';
 import { collectAuthorDepth, runAuthorDepthShadow } from '../loops/orchestrator/author-depth.js';
 import { AuthorLedger } from '../loops/orchestrator/author-ledger.js';
+import { setSchedule } from '../release-loop/release-schedule.js';
+import { disableLandingFreeze, enableLandingFreeze, landingFreezePath } from '../release-loop/landing-freeze.js';
 
 const roots: string[] = [];
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'harness-queue-')); roots.push(path); return path; };
@@ -25,6 +28,65 @@ function fixture(dir: string, launches: string[][], pool = { running: 0, pending
   return { root: dir, pool: () => pool, cap: () => 2, alive: () => true, processes: () => [],
     authorShadow: () => {}, idleRequest: () => {}, launch: async (_item, args) => { launches.push(args); return nextPid++; }, log: () => {} };
 }
+
+test('queue freeze holds launches only when requested, then releases queued rows when off or expired', async () => {
+  const dir = root(), launches: string[][] = [], events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const clock = new Date('2026-10-05T00:00:00Z');
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 }), now: () => clock,
+    log: (event, data) => { events.push({ event, data }); } };
+  const tc = await addHarnessQueue({ seat: 'TC', say: 'TC launch' }, deps);
+  const ux = await addHarnessQueue({ seat: 'UX', say: 'UX launch' }, deps);
+  enableLandingFreeze({ reason: 'landings only' }, dir, clock);
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: tc.id } });
+  enableLandingFreeze({ reason: 'operator hold', holdLaunches: true }, dir, clock);
+  const reason = '동결 — operator hold';
+  expect(await tickHarnessQueue(deps, ux.id)).toMatchObject({ outcome: 'waiting', item: { id: ux.id, waitingReason: reason }, reason });
+  expect(listHarnessQueue(deps).find(row => row.id === ux.id)).toMatchObject({ status: 'queued', waitingReason: reason });
+  expect(launches).toHaveLength(1);
+  expect(events.some(row => row.event === 'waiting' && row.data.id === ux.id && row.data.reason === reason)).toBe(true);
+  disableLandingFreeze(dir);
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: ux.id } });
+  const mk = await addHarnessQueue({ seat: 'MK', say: 'MK after expiry' }, deps);
+  enableLandingFreeze({ reason: 'brief hold', until: '2026-10-05T00:01:00Z', holdLaunches: true }, dir, clock);
+  expect(await tickHarnessQueue(deps, mk.id)).toMatchObject({ outcome: 'waiting', reason: '동결 — brief hold · ~2026-10-05T00:01:00.000Z' });
+  clock.setTime(Date.parse('2026-10-05T00:01:00Z'));
+  expect(await tickHarnessQueue(deps, mk.id)).toMatchObject({ outcome: 'launched', item: { id: mk.id } });
+  expect(launches).toHaveLength(3);
+});
+
+test('queue freeze held tick never invokes launch or lease, and unreadable freeze data fails closed', async () => {
+  const dir = root(), launches: string[][] = [];
+  const deps = fixture(dir, launches);
+  await addHarnessQueue({ seat: 'TC', say: 'first' }, deps);
+  enableLandingFreeze({ reason: 'emergency', holdLaunches: true }, dir);
+  const original = debug.log, held: unknown[] = [];
+  (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+    if (category === 'loop.orchestrator' && event === 'freeze-held-launch') held.push(data);
+  }) as typeof debug.log;
+  try {
+    const result = await tickHarnessQueue({ ...deps, pool: () => { throw Error('lease should not run'); },
+      launch: async () => { throw Error('launcher should not run'); } });
+    expect(result).toMatchObject({ outcome: 'waiting', reason: expect.stringContaining('emergency') });
+    expect(held).toEqual([{ reason: 'emergency', until: null, queued: 1, phase: 'tick-start' }]);
+    expect(launches).toHaveLength(0);
+    const data = JSON.parse(readFileSync(landingFreezePath(dir), 'utf8'));
+    writeFileSync(landingFreezePath(dir), JSON.stringify({ ...data, holdLaunches: 'true' }));
+    expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'waiting', reason: '동결 상태 읽기 실패' });
+    expect(launches).toHaveLength(0);
+    expect(held.at(-1)).toEqual({ reason: '동결 상태 읽기 실패', until: null, queued: 1, phase: 'tick-start' });
+  } finally { (debug as { log: typeof debug.log }).log = original; }
+});
+
+test('queue freeze turned on while the tick awaits (idle request) still holds the launch right before spawning', async () => {
+  const dir = root(), launches: string[][] = [];
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches),
+    idleRequest: async () => { enableLandingFreeze({ reason: 'late hold', holdLaunches: true }, dir); } };
+  const item = await addHarnessQueue({ seat: 'MK', say: 'late' }, deps);
+  const result = await tickHarnessQueue(deps);
+  expect(result).toMatchObject({ outcome: 'waiting', item: { id: item.id }, reason: '동결 — late hold' });
+  expect(launches).toHaveLength(0);
+  expect(listHarnessQueue(deps).find((row) => row.id === item.id)).toMatchObject({ status: 'queued', waitingReason: '동결 — late hold' });
+});
 
 test('queue admits only the FIFO head when seat cap and running+pending+reservations allow it', async () => {
   const dir = root(), launches: string[][] = [];
@@ -472,7 +534,10 @@ test('outside-queue authoring consumes the seat cap and queue PID is not counted
   await addHarnessQueue({ seat: 'TC', say: 'next goal' }, deps);
   expect((await tickHarnessQueue(deps)).reason).toBe('seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)');
   expect(launches).toHaveLength(0);
-  expect((await tickHarnessQueue({ ...deps, processes: () => [{ pid: 909 }] })).reason).toBe('seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)');
+  // SEAT-CAP-STALE: a seat-less process lives in the unknown-seat bucket and no longer charges TC.
+  const unknownOnly = { ...fixture(root(), []), cap: () => 1, processes: () => [{ pid: 909 }] };
+  await addHarnessQueue({ seat: 'TC', say: 'unknown does not charge' }, unknownOnly);
+  expect((await tickHarnessQueue(unknownOnly)).outcome).toBe('launched');
   expect(await tickHarnessQueue({ ...deps, processes: () => { throw new Error('ps unavailable'); } }))
     .toMatchObject({ outcome: 'waiting', reason: 'unknown-running: harness process inventory unavailable: Error: ps unavailable' });
   const other = { ...deps, processes: () => [{ pid: 909, seat: 'UX' as const }] };
@@ -484,7 +549,7 @@ test('outside-queue authoring consumes the seat cap and queue PID is not counted
   expect((await tickHarnessQueue({ ...other, processes: () => [{ pid: first.pid!, seat: 'UX' }] })).reason).toBe('seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)');
 });
 
-test('macOS ps/lsof attributes only the matching working tree, preserves unknown charges, and counts parent-child once', async () => {
+test('macOS ps/lsof attributes only the matching working tree, keeps unknown runs out of seat charges, and counts parent-child once', async () => {
   const dir = root(), launches: string[][] = [], events: Record<string, unknown>[] = [];
   const ps = [
     '100 1 bun /repo/bin/elanous.mjs harness say goal',
@@ -515,15 +580,18 @@ test('macOS ps/lsof attributes only the matching working tree, preserves unknown
   expect(calls[0]).toBe('ps -eo pid=,ppid=,args=');
   expect(calls).toEqual(['ps -eo pid=,ppid=,args=', ...['100', '101', '200', '300', '400', '500', '600'].map((pid) => `lsof -a -p ${pid} -d cwd -Fn`)]);
   expect(processes).toEqual([{ pid: 100, seat: 'TC' }, { pid: 200, seat: 'TC' }, { pid: 300 }, { pid: 400 }, { pid: 500, seat: 'MK' }, { pid: 600, seat: 'UX' }]);
-  const deps = { ...fixture(dir, launches), cap: () => 4, processes: () => processes,
+  const deps = { ...fixture(dir, launches), cap: () => 2, processes: () => processes,
     log: (event: string, data: Record<string, unknown>) => { if (event === 'waiting') events.push(data); } };
   await addHarnessQueue({ seat: 'TC', say: 'next' }, deps);
-  expect((await tickHarnessQueue(deps)).reason).toBe('seat TC: 4/4 (releaseGate.TC=4 · injectedCap.TC=4 · seatCaps.TC=8)');
+  // Two TC runs fill TC; the two seat-less runs (300, 400) are in the unknown-seat bucket, not TC.
+  expect((await tickHarnessQueue(deps)).reason).toBe('seat TC: 2/2 (injectedCap.TC=2 · releaseGate.TC=4 · seatCaps.TC=8)');
   expect(events[0]).toMatchObject({ attributed: { OP: 0, TC: 2, MK: 1, UX: 1 }, unattributed: 2 });
   expect(launches).toHaveLength(0);
   const withoutTrees = readHarnessQueueProcesses({ platform: 'darwin', run, seatTrees: {} });
   expect(withoutTrees).toEqual([{ pid: 100 }, { pid: 200 }, { pid: 300 }, { pid: 400 }, { pid: 500 }, { pid: 600 }]);
-  expect((await tickHarnessQueue({ ...deps, processes: () => withoutTrees })).reason).toBe('seat TC: 6/4 (releaseGate.TC=4 · injectedCap.TC=4 · seatCaps.TC=8)');
+  const allUnknown = { ...fixture(root(), []), cap: () => 2, processes: () => withoutTrees };
+  await addHarnessQueue({ seat: 'TC', say: 'six unknown do not fill TC' }, allUnknown);
+  expect((await tickHarnessQueue(allUnknown)).outcome).toBe('launched');
   const otherSeats = { ...fixture(root(), launches), cap: () => 1,
     processes: () => processes.filter((row) => row.seat === 'MK' || row.seat === 'UX') };
   await addHarnessQueue({ seat: 'TC', say: 'not blocked by MK or UX' }, otherSeats);
@@ -577,13 +645,13 @@ test('pid → runId → checkpoint seat attributes on macOS without env or a wor
     if (category === 'harness.queue' && event === 'attributed') events.push(data as Record<string, unknown>);
   }) as typeof debug.log;
   try {
-    expect(check('darwin')).toEqual([{ pid: 951, seat: 'TC' }]);
+    expect(check('darwin')).toEqual([{ pid: 951, seat: 'TC', progressAt: 1, ledgerRunIds: ['run-attributed'] }]);
     expect(events.at(-1)).toEqual({ pid: 951, seat: 'TC', source: 'ledger' });
     expect(readHarnessQueueProcesses({ platform: 'darwin', run: command(), seatTrees: {}, runsDir,
-      cwd: () => { throw Error('clone removed'); }, birthId: () => 'darwin:123456' })).toEqual([{ pid: 951, seat: 'TC' }]);
-    expect(check('darwin', ' --seat UX')).toEqual([{ pid: 951, seat: 'UX' }]);
+      cwd: () => { throw Error('clone removed'); }, birthId: () => 'darwin:123456' })).toEqual([{ pid: 951, seat: 'TC', progressAt: 1, ledgerRunIds: ['run-attributed'] }]);
+    expect(check('darwin', ' --seat UX')).toEqual([{ pid: 951, seat: 'UX', progressAt: 1, ledgerRunIds: ['run-attributed'] }]);
     expect(events.at(-1)).toEqual({ pid: 951, seat: 'UX', source: 'flag' });
-    expect(check('linux', ' --seat UX', 'ELANOUS_HARNESS_SEAT=OP\0')).toEqual([{ pid: 951, seat: 'OP' }]);
+    expect(check('linux', ' --seat UX', 'ELANOUS_HARNESS_SEAT=OP\0')).toEqual([{ pid: 951, seat: 'OP', progressAt: 1, ledgerRunIds: ['run-attributed'] }]);
     expect(events.at(-1)).toEqual({ pid: 951, seat: 'OP', source: 'env' });
     expect(readHarnessQueueProcesses({ platform: 'darwin', run: command(), seatTrees: trees, runsDir,
       cwd: () => '/work/mk', birthId: () => 'darwin:reused' })).toEqual([{ pid: 951, seat: 'MK' }]);
@@ -622,7 +690,7 @@ test('orchestrate checkpoint birth identity is accepted by the queue reader afte
     stdout: `${process.pid} 1 bun /repo/bin/elanous.mjs harness say seat-run` })) as typeof import('node:child_process').spawnSync;
   const probe = { platform: 'darwin' as const, run, runsDir, seatTrees: { MK: ['/former/tree'] },
     cwd: () => { throw Error('working tree removed'); }, birthId: () => processBirthId(process.pid) };
-  expect(readHarnessQueueProcesses(probe)).toEqual([{ pid: process.pid, seat: 'UX' }]);
+  expect(readHarnessQueueProcesses(probe)).toEqual([{ pid: process.pid, seat: 'UX', progressAt: 2, ledgerRunIds: ['orchestrate-seat-identity'] }]);
   expect(readHarnessQueueProcesses({ ...probe, birthId: () => `${birth}:reused` })).toEqual([{ pid: process.pid }]);
 });
 
@@ -638,7 +706,7 @@ test('recycled PID from a past checkpoint cannot charge its seat ahead of the cu
   expect(readHarnessQueueProcesses({ ...probe, cwd: () => '/elsewhere' })).toEqual([{ pid: 951 }]);
   saveSelfDevRun({ runId: 'current-run', createdAt: 2, updatedAt: 2, results: [],
     pid: 951, pidStart: 'darwin:current', seat: 'UX' }, runsDir);
-  expect(readHarnessQueueProcesses(probe)).toEqual([{ pid: 951, seat: 'UX' }]);
+  expect(readHarnessQueueProcesses(probe)).toEqual([{ pid: 951, seat: 'UX', progressAt: 2, ledgerRunIds: ['current-run'] }]);
 });
 
 // The child is frozen with SIGSTOP so it cannot exit before the inventory reads it; macOS has no
@@ -1131,6 +1199,54 @@ test('FINISH-RATE re-measures at most once per 10 minutes', async () => {
   expect(calls).toHaveLength(3);
 });
 
+test('FINISH-RATE history: only a fresh measurement writes an hourly row; off writes nothing', async () => {
+  const worse = { ...backlogged, landingRate: 0.2, staleDrafts: 45 };
+  let metrics: typeof healthy = backlogged;
+  const { dir, deps, advance } = finishFixture('on', backlogged, 0);
+  deps.finishMetrics = () => metrics;
+  const history = join(dir, 'harness', 'finish-history.jsonl');
+  const rows = () => existsSync(history) ? readFileSync(history, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line)) : [];
+  await addHarnessQueue({ seat: 'MK', say: 'one' }, deps);
+  await tickHarnessQueue(deps);
+  expect(rows()).toHaveLength(1);
+  advance(5 * 60_000);
+  await addHarnessQueue({ seat: 'MK', say: 'two' }, deps);
+  await tickHarnessQueue(deps);
+  expect(rows()).toHaveLength(1);
+  advance(60 * 60_000);
+  metrics = worse;
+  await addHarnessQueue({ seat: 'UX', say: 'three' }, deps);
+  await tickHarnessQueue(deps);
+  expect(rows()).toHaveLength(2);
+  expect(rows()[1]).toMatchObject({ hour: '2026-10-05T10', trend: 'worsening' });
+  const off = finishFixture('off', backlogged, 0);
+  await addHarnessQueue({ seat: 'MK', say: 'off' }, off.deps);
+  await tickHarnessQueue(off.deps);
+  expect(existsSync(join(off.dir, 'harness', 'finish-history.jsonl'))).toBe(false);
+});
+
+test('FINISH-RATE history: a failed history append (and a throwing failure log) leaves the finish-first hold unchanged', async () => {
+  const { dir, deps, launches } = finishFixture('on', backlogged, 4);
+  // The history path is a symlink into a missing directory — the append itself fails (ENOENT), even as root.
+  mkdirSync(join(dir, 'harness'), { recursive: true });
+  const history = join(dir, 'harness', 'finish-history.jsonl');
+  symlinkSync(join(dir, 'no-such-dir', 'history.jsonl'), history);
+  const original = debug.log.bind(debug);
+  const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+    if (event === 'finish-history-write-failed') throw new Error('log sink down');
+    return original(category, event, data);
+  }) as typeof debug.log);
+  try {
+    await addHarnessQueue({ seat: 'MK', say: 'held' }, deps);
+    const tick = await tickHarnessQueue(deps);
+    expect(tick.outcome).toBe('waiting');
+    expect(tick.reason).toStartWith('마무리 우선 — finish=6/10');
+    expect(launches).toHaveLength(0);
+    expect(spy.mock.calls.some(([, event]) => event === 'finish-history-write-failed')).toBe(true);
+    expect(existsSync(join(dir, 'no-such-dir'))).toBe(false);
+  } finally { spy.mockRestore(); }
+});
+
 test('FINISH-RATE: a test process without injected metrics skips the real measurement', async () => {
   const { dir, deps, launches } = finishFixture('on', backlogged, 4);
   delete deps.finishMetrics;
@@ -1157,4 +1273,539 @@ test('FINISH-RATE: the CLI harness queue tick path reaches the finish gate', asy
   } finally { console.log = old; }
   expect(lines.at(-1)).toContain('마무리 우선 — finish=6/10');
   expect(launches).toHaveLength(0);
+});
+
+describe('SEAT-CAP-STALE: seat caps count only live, progressing runs of that seat', () => {
+  const now = new Date('2026-10-06T22:00:00Z');
+  const ago = (minutes: number) => now.getTime() - minutes * 60_000;
+  const capture = () => {
+    const excluded: Record<string, unknown>[] = [], overCap: Record<string, unknown>[] = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'harness.queue' && event === 'seat-cap-excluded') excluded.push(data as Record<string, unknown>);
+      if (category === 'harness.queue' && event === 'unknown-seat-over-cap') overCap.push(data as Record<string, unknown>);
+    }) as typeof debug.log;
+    return { excluded, overCap, restore: () => { (debug as { log: typeof debug.log }).log = original; } };
+  };
+  const tcDeps = (processes: QueueProcessRow[]) => ({ ...fixture(root(), []), now: () => now, processes: () => processes });
+  type QueueProcessRow = { pid: number; seat?: 'OP' | 'TC' | 'MK' | 'UX'; runId?: string; progressAt?: number; stopReason?: string };
+
+  test('TC cap 2 with one run idle 40 min launches; the same runs both progressing stay blocked (counter-proof)', async () => {
+    const log = capture();
+    try {
+      const stale = tcDeps([{ pid: 11, seat: 'TC', runId: 'r-live', progressAt: ago(2) }, { pid: 12, seat: 'TC', runId: 'r-stale', progressAt: ago(40) }]);
+      await addHarnessQueue({ seat: 'TC', say: 'stale run frees a seat' }, stale);
+      expect((await tickHarnessQueue(stale)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: 'r-stale', launchId: null, pid: 12, seat: 'TC', reason: 'stale', idleMin: 40 }]);
+      const busy = tcDeps([{ pid: 11, seat: 'TC', progressAt: ago(2) }, { pid: 12, seat: 'TC', progressAt: ago(20) }]);
+      await addHarnessQueue({ seat: 'TC', say: 'two in progress' }, busy);
+      expect((await tickHarnessQueue(busy)).reason).toBe('seat TC: 2/2 (injectedCap.TC=2 · releaseGate.TC=4 · seatCaps.TC=8)');
+      const noSignal = tcDeps([{ pid: 11, seat: 'TC' }, { pid: 12, seat: 'TC' }]);
+      await addHarnessQueue({ seat: 'TC', say: 'no ledger yet' }, noSignal);
+      expect((await tickHarnessQueue(noSignal)).outcome).toBe('waiting');
+    } finally { log.restore(); }
+  });
+
+  test('a soft-stopped run awaiting harvest does not hold its seat; staleRunMinutes comes from config', async () => {
+    const log = capture();
+    try {
+      const soft = tcDeps([{ pid: 11, seat: 'TC', progressAt: ago(1) }, { pid: 12, seat: 'TC', runId: 'r-soft', progressAt: ago(3), stopReason: 'harvestable-awaiting-human' }]);
+      await addHarnessQueue({ seat: 'TC', say: 'soft-stopped frees a seat' }, soft);
+      expect((await tickHarnessQueue(soft)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: 'r-soft', launchId: null, pid: 12, seat: 'TC', reason: 'soft-stopped', idleMin: 3 }]);
+      const configPath = join(root(), 'config.json');
+      writeFileSync(configPath, JSON.stringify({ harness: { queue: { staleRunMinutes: 60, unknownSeatCap: 5 } } }));
+      expect(getUserConfig(configPath).harness?.queue).toMatchObject({ staleRunMinutes: 60, unknownSeatCap: 5 });
+      const patient = { ...tcDeps([{ pid: 11, seat: 'TC', progressAt: ago(2) }, { pid: 12, seat: 'TC', progressAt: ago(40) }]), configPath };
+      await addHarnessQueue({ seat: 'TC', say: 'longer stale window' }, patient);
+      expect((await tickHarnessQueue(patient)).outcome).toBe('waiting');
+    } finally { log.restore(); }
+  });
+
+  test('three seat-less runs do not reduce TC, MK or UX caps and are logged once per tick as unknown-seat', async () => {
+    const log = capture();
+    try {
+      const unknown = [{ pid: 21, progressAt: ago(1) }, { pid: 22 }, { pid: 23 }];
+      for (const seat of ['TC', 'MK', 'UX'] as const) {
+        // Configured seat caps and release gate only (no injected cap); the unknown-seat cap stays at its default 2.
+        const deps = { ...tcDeps(unknown), cap: undefined };
+        await addHarnessQueue({ seat, say: `${seat} unaffected` }, deps);
+        expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      }
+      expect(log.excluded.filter((row) => row.reason === 'unknown-seat')).toHaveLength(9);
+      expect(log.overCap).toEqual([{ count: 3, cap: 2 }, { count: 3, cap: 2 }, { count: 3, cap: 2 }]);
+      expect(log.excluded[0]).toEqual({ runId: null, launchId: null, pid: 21, seat: null, reason: 'unknown-seat', idleMin: 1 });
+    } finally { log.restore(); }
+  });
+
+  test('a launched row with no live process past the grace is not counted; a just-launched row still is', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => false, receipt: () => 'started' as const };
+      await addHarnessQueue({ seat: 'MK', say: 'next MK' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const dead: QueueItem = { ...rows[0]!, id: 'hq-dead', status: 'launched', pid: 999_991,
+        launchId: 'hq-00000000-0000-4000-8000-000000000001', at: new Date(ago(90)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([dead, ...rows]));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: null, launchId: dead.launchId, queueId: 'hq-dead', seat: 'MK', reason: 'dead-row', idleMin: 90 }]);
+      const fresh = root();
+      const freshDeps = { ...deps, root: fresh };
+      await addHarnessQueue({ seat: 'MK', say: 'behind a fresh launch' }, freshDeps);
+      const freshRows = JSON.parse(readFileSync(harnessQueuePath(fresh), 'utf8')) as QueueItem[];
+      const just: QueueItem = { ...freshRows[0]!, id: 'hq-just', status: 'launched', pid: 999_992,
+        launchId: 'hq-00000000-0000-4000-8000-000000000002', at: new Date(ago(0)).toISOString() };
+      writeFileSync(harnessQueuePath(fresh), JSON.stringify([just, ...freshRows]));
+      expect((await tickHarnessQueue(freshDeps)).reason).toBe('seat MK: 1/1 (injectedCap.MK=1 · releaseGate.MK=4 · seatCaps.MK=6)');
+      // A wrapper still in the inventory (its argv launch id) keeps an old row counted.
+      const alive = root();
+      const aliveDeps = { ...deps, root: alive, processes: () => [{ pid: 999_991, launchId: dead.launchId }] };
+      await addHarnessQueue({ seat: 'MK', say: 'behind a live old launch' }, aliveDeps);
+      const aliveRows = JSON.parse(readFileSync(harnessQueuePath(alive), 'utf8')) as QueueItem[];
+      writeFileSync(harnessQueuePath(alive), JSON.stringify([{ ...dead }, ...aliveRows]));
+      expect((await tickHarnessQueue(aliveDeps)).outcome).toBe('waiting');
+    } finally { log.restore(); }
+  });
+
+  test('an item queued long ago and launched just now keeps its seat: the grace runs from the receipt time', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => false, receipt: () => 'started' as const };
+      await addHarnessQueue({ seat: 'TC', say: 'next TC' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const launchId = 'hq-00000000-0000-4000-8000-000000000006';
+      const recent: QueueItem = { ...rows[0]!, id: 'hq-old-queued', status: 'launched', pid: 999_994, launchId,
+        at: new Date(ago(180)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([recent, ...rows]));
+      mkdirSync(join(dir, 'harness'), { recursive: true });
+      writeFileSync(harnessQueueReceiptPath(dir, launchId), JSON.stringify({ state: 'started', at: new Date(ago(1)).toISOString() }));
+      expect((await tickHarnessQueue(deps)).reason).toBe('seat TC: 1/1 (injectedCap.TC=1 · releaseGate.TC=4 · seatCaps.TC=8)');
+      expect(log.excluded).toEqual([]);
+      writeFileSync(harnessQueueReceiptPath(dir, launchId), JSON.stringify({ state: 'started', at: new Date(ago(20)).toISOString() }));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: null, launchId, queueId: 'hq-old-queued', seat: 'TC', reason: 'dead-row', idleMin: 20 }]);
+    } finally { log.restore(); }
+  });
+
+  test('an item that waited past the grace and was launched by the tick is still counted on the next tick before any receipt', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      // Real clock: the launch id (UUIDv7) is minted from the wall clock at launch.
+      const deps = { ...fixture(dir, []), cap: () => 1 };
+      await addHarnessQueue({ seat: 'MK', say: 'waited long' }, deps);
+      await addHarnessQueue({ seat: 'MK', say: 'behind it' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      writeFileSync(harnessQueuePath(dir), JSON.stringify(rows.map((row) => ({ ...row, at: new Date(Date.now() - 60 * 60_000).toISOString() }))));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(existsSync(harnessQueueReceiptPath(dir, listHarnessQueue(deps)[0]!.launchId!))).toBe(false);
+      expect((await tickHarnessQueue(deps)).reason).toBe('seat MK: 1/1 (injectedCap.MK=1 · releaseGate.MK=4 · seatCaps.MK=6)');
+      expect(log.excluded).toEqual([]);
+    } finally { log.restore(); }
+  });
+
+  test('a launching row with no recorded pid is charged while its launch id is in the inventory or within the grace, dead after', async () => {
+    const log = capture();
+    try {
+      const make = (minutes: number) => {
+        const dir = root();
+        const uncertain = { id: 'hq-uncertain', status: 'launching' as const,
+          launchId: 'hq-00000000-0000-4000-8000-000000000007', at: new Date(ago(minutes)).toISOString() };
+        return { dir, uncertain };
+      };
+      for (const [minutes, processes, outcome] of [[120, [], 'launched'], [120, [{ pid: 81, launchId: 'hq-00000000-0000-4000-8000-000000000007' }], 'waiting'],
+        [1, [], 'waiting']] as const) {
+        const { dir, uncertain } = make(minutes);
+        const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true, processes: () => processes };
+        await addHarnessQueue({ seat: 'UX', say: 'next UX' }, deps);
+        const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+        writeFileSync(harnessQueuePath(dir), JSON.stringify([{ ...rows[0]!, ...uncertain }, ...rows]));
+        expect((await tickHarnessQueue(deps)).outcome).toBe(outcome);
+      }
+      expect(log.excluded.filter((row) => row.reason === 'dead-row')).toEqual([{ runId: null,
+        launchId: 'hq-00000000-0000-4000-8000-000000000007', queueId: 'hq-uncertain', seat: 'UX', reason: 'dead-row', idleMin: 120 }]);
+    } finally { log.restore(); }
+  });
+
+  test('a launch id carries its launch time, so an item queued long ago and launched just now keeps its seat with no pid or receipt', async () => {
+    const v7 = (at: number) => { const hex = at.toString(16).padStart(12, '0');
+      return `hq-${hex.slice(0, 8)}-${hex.slice(8, 12)}-7abc-8def-0123456789ab`; };
+    expect(queueLaunchTime(v7(ago(1)))).toBe(ago(1));
+    expect(queueLaunchTime('hq-00000000-0000-4000-8000-000000000007')).toBeUndefined();
+    expect(queueLaunchTime(`hq-${Bun.randomUUIDv7()}`)).toBeGreaterThan(0);
+    const log = capture();
+    try {
+      for (const [launchedMinutesAgo, outcome] of [[1, 'waiting'], [10, 'launched']] as const) {
+        const dir = root();
+        const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true };
+        await addHarnessQueue({ seat: 'OP', say: 'next OP' }, deps);
+        const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+        const row: QueueItem = { ...rows[0]!, id: 'hq-v7', status: 'launching', launchId: v7(ago(launchedMinutesAgo)),
+          at: new Date(ago(120)).toISOString() };
+        writeFileSync(harnessQueuePath(dir), JSON.stringify([row, ...rows]));
+        expect((await tickHarnessQueue(deps)).outcome).toBe(outcome);
+      }
+      expect(log.excluded.map((row) => [row.reason, row.idleMin])).toEqual([['dead-row', 10]]);
+    } finally { log.restore(); }
+  });
+
+  test('a legacy row without a launch id follows the same liveness and grace rule', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => false };
+      await addHarnessQueue({ seat: 'UX', say: 'next UX' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const legacy: QueueItem = { ...rows[0]!, id: 'hq-legacy', status: 'launched', pid: 999_993, at: new Date(ago(60)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([legacy, ...rows]));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: null, launchId: null, queueId: 'hq-legacy', seat: 'UX', reason: 'dead-row', idleMin: 60 }]);
+    } finally { log.restore(); }
+  });
+
+  test('a seat-less process that is a queue row\'s launch charges the row\'s seat and is not logged as unknown-seat', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const base = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true };
+      await addHarnessQueue({ seat: 'OP', say: 'next OP' }, base);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const running: QueueItem = { ...rows[0]!, id: 'hq-running', status: 'launched', pid: 31,
+        launchId: 'hq-00000000-0000-4000-8000-000000000003', at: new Date(ago(120)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([running, ...rows]));
+      const live = { ...base, processes: () => [{ pid: 31, runId: 'r-op', launchId: running.launchId, progressAt: ago(1) }] };
+      expect((await tickHarnessQueue(live)).reason).toBe('seat OP: 1/1 (injectedCap.OP=1 · releaseGate.OP=4 · seatCaps.OP=4)');
+      expect(log.excluded).toEqual([]);
+      const stale = { ...base, processes: () => [{ pid: 31, runId: 'r-op', launchId: running.launchId, progressAt: ago(45) }] };
+      expect((await tickHarnessQueue(stale)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: 'r-op', launchId: running.launchId, pid: 31, seat: 'OP', reason: 'stale', idleMin: 45 }]);
+    } finally { log.restore(); }
+  });
+
+  test('a recycled wrapper pid never adopts an unrelated seat-less run; the dead row is judged on its own', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      // The recycled pid is alive (it belongs to the other run); identity is the launch id, so the old row is still dead.
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true, receipt: () => 'started' as const,
+        processes: () => [{ pid: 41, runId: 'r-other', progressAt: ago(1) }] };
+      await addHarnessQueue({ seat: 'MK', say: 'next MK' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const dead: QueueItem = { ...rows[0]!, id: 'hq-dead-reused', status: 'launched', pid: 41,
+        launchId: 'hq-00000000-0000-4000-8000-000000000004', at: new Date(ago(30)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([dead, ...rows]));
+      // The wrapper ran (it wrote its receipt 30 min ago) and died; its pid now belongs to another process.
+      mkdirSync(join(dir, 'harness'), { recursive: true });
+      writeFileSync(harnessQueueReceiptPath(dir, dead.launchId!), JSON.stringify({ state: 'started', at: new Date(ago(30)).toISOString() }));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: 'r-other', launchId: null, pid: 41, seat: null, reason: 'unknown-seat', idleMin: 1 },
+        { runId: null, launchId: dead.launchId, queueId: 'hq-dead-reused', seat: 'MK', reason: 'dead-row', idleMin: 30 }]);
+    } finally { log.restore(); }
+  });
+
+  test('a launched row with no receipt whose wrapper pid was recycled is dead after the grace', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true,
+        processes: () => [{ pid: 43, seat: 'UX' as const, runId: 'r-ux', progressAt: ago(1) }] };
+      await addHarnessQueue({ seat: 'MK', say: 'next MK' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const dead: QueueItem = { ...rows[0]!, id: 'hq-no-receipt', status: 'launched', pid: 43,
+        launchId: 'hq-00000000-0000-4000-8000-000000000009', at: new Date(ago(40)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([dead, ...rows]));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: null, launchId: dead.launchId, queueId: 'hq-no-receipt', seat: 'MK', reason: 'dead-row', idleMin: 40 }]);
+    } finally { log.restore(); }
+  });
+
+  test('a started receipt without a readable time still switches liveness to the inventory', async () => {
+    const log = capture();
+    try {
+      const dir = root();
+      const deps = { ...fixture(dir, []), now: () => now, cap: () => 1, alive: () => true };
+      await addHarnessQueue({ seat: 'MK', say: 'next MK' }, deps);
+      const rows = JSON.parse(readFileSync(harnessQueuePath(dir), 'utf8')) as QueueItem[];
+      const dead: QueueItem = { ...rows[0]!, id: 'hq-no-time', status: 'launched', pid: 42,
+        launchId: 'hq-00000000-0000-4000-8000-000000000008', at: new Date(ago(25)).toISOString() };
+      writeFileSync(harnessQueuePath(dir), JSON.stringify([dead, ...rows]));
+      mkdirSync(join(dir, 'harness'), { recursive: true });
+      writeFileSync(harnessQueueReceiptPath(dir, dead.launchId!), JSON.stringify({ state: 'started' }));
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: null, launchId: dead.launchId, queueId: 'hq-no-time', seat: 'MK', reason: 'dead-row', idleMin: 25 }]);
+    } finally { log.restore(); }
+  });
+
+  test('the queue wrapper argv gives its launch id on macOS without env', () => {
+    const launchId = 'hq-00000000-0000-4000-8000-000000000005';
+    const run = ((command: string) => ({ status: 0, stdout: command === 'ps'
+      ? `51 1 /opt/bun/bin/bun /repo/src/harness/harness-queue-child.ts /state/harness/${launchId}.receipt.json /repo/bin/elanous.mjs harness say goal\n`
+        + '52 51 /opt/bun/bin/bun /repo/bin/elanous.mjs harness say goal' : '' })) as typeof import('node:child_process').spawnSync;
+    expect(readHarnessQueueProcesses({ platform: 'darwin', run, seatTrees: {}, runsDir: selfDevRunsDir(root()) }))
+      .toEqual([{ pid: 51, launchId }]);
+  });
+
+  test('a stale run of a seat with no queued head is still observed once in the tick', async () => {
+    const log = capture();
+    try {
+      const deps = tcDeps([{ pid: 61, seat: 'MK', runId: 'r-mk-stale', progressAt: ago(50) }]);
+      await addHarnessQueue({ seat: 'TC', say: 'only TC is queued' }, deps);
+      expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+      expect(log.excluded).toEqual([{ runId: 'r-mk-stale', launchId: null, pid: 61, seat: 'MK', reason: 'stale', idleMin: 50 }]);
+    } finally { log.restore(); }
+  });
+
+  describe('SEAT-CAP-STALE2: a run working in a Pod is progressing even when its host ledger is quiet', () => {
+    const watch = () => {
+      const events: { event: string; data: Record<string, unknown> }[] = [];
+      const original = debug.log;
+      (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+        if (category === 'harness.queue' && ['seat-cap-excluded', 'seat-cap-progress', 'progress-source-unavailable'].includes(event))
+          events.push({ event, data: data as Record<string, unknown> });
+      }) as typeof debug.log;
+      return { events, restore: () => { (debug as { log: typeof debug.log }).log = original; } };
+    };
+    // TC cap 2: one fresh run plus one run idle 60 min in its ledger. Counted ⇒ 2/2 waiting; excluded ⇒ launched.
+    const podDeps = (podRuns: () => ReadonlySet<string>, idle = 60) => ({
+      ...tcDeps([]),
+      processes: () => [{ pid: 11, seat: 'TC' as const, runId: 'r-fresh', progressAt: ago(2) },
+        { pid: 12, seat: 'TC' as const, progressAt: ago(idle), ledgerRunIds: ['run-pod-a'] }],
+      podRuns,
+    });
+    // Real Job list shapes fed through the real parser: Running (active+ready), Pending Pod (active, not ready), not yet created.
+    const jobsOf = (status: Record<string, unknown>, labels: Record<string, string> = { 'elanous.run': 'run-pod-a' }) =>
+      JSON.stringify({ items: [{ metadata: { name: 'si-a', labels: { 'elanous.substrate': 'pod', ...labels } }, status }] });
+    const kubectlFor = (byContext: Record<string, string>, calls: string[]) => ((args: readonly string[]) => {
+      const context = args[args.indexOf('--context') + 1]!;
+      calls.push(context);
+      return { status: 0, stdout: byContext[context] ?? JSON.stringify({ items: [] }), stderr: '' };
+    }) as Parameters<typeof readHarnessQueuePodRuns>[0];
+
+    for (const [phase, status] of [['running', { active: 1, ready: 1 }], ['pending', { active: 1, ready: 0 }],
+      ['created-without-pod-yet', {}]] as const) {
+      test(`ledger idle 60 min with its Pod Job ${phase} is counted (real Job parser)`, async () => {
+        const log = watch();
+        const calls: string[] = [];
+        try {
+          const deps = podDeps(() => readHarnessQueuePodRuns(kubectlFor({ 'ctx-b': jobsOf(status) }, calls), [{ context: 'ctx-a' }, { context: 'ctx-b' }]));
+          await addHarnessQueue({ seat: 'TC', say: `pod ${phase}` }, deps);
+          expect((await tickHarnessQueue(deps)).outcome).toBe('waiting');
+          expect(calls).toEqual(['ctx-a', 'ctx-b']);
+          expect(log.events).toEqual([{ event: 'seat-cap-progress', data: { runId: 'run-pod-a', launchId: null, pid: 12, seat: 'TC',
+            source: 'pod-job', podRunId: 'run-pod-a', ledgerIdleMin: 60 } }]);
+        } finally { log.restore(); }
+      });
+    }
+
+    test('a finished Job does not keep the run; several stale runs across seats still read each member once per tick', async () => {
+      const log = watch();
+      const calls: string[] = [];
+      try {
+        const done = jobsOf({ succeeded: 1, conditions: [{ type: 'Complete', status: 'True' }] });
+        const deps = { ...podDeps(() => readHarnessQueuePodRuns(kubectlFor({ 'ctx-a': done }, calls), [{ context: 'ctx-a' }, { context: 'ctx-b' }])),
+          processes: () => [{ pid: 11, seat: 'TC' as const, runId: 'r-fresh', progressAt: ago(2) },
+            { pid: 12, seat: 'TC' as const, progressAt: ago(60), ledgerRunIds: ['run-pod-a'] },
+            { pid: 13, seat: 'MK' as const, progressAt: ago(70), ledgerRunIds: ['run-mk'] },
+            { pid: 14, seat: 'UX' as const, progressAt: ago(80), ledgerRunIds: ['run-ux'] }] };
+        await addHarnessQueue({ seat: 'TC', say: 'finished job' }, deps);
+        expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+        expect(calls).toEqual(['ctx-a', 'ctx-b']);
+        expect(log.events.map((row) => `${row.event}:${row.data.runId}:${row.data.reason}`).sort()).toEqual([
+          'seat-cap-excluded:run-mk:stale', 'seat-cap-excluded:run-pod-a:stale', 'seat-cap-excluded:run-ux:stale']);
+      } finally { log.restore(); }
+    });
+
+    test('ledger idle 60 min and no Pod Job is excluded as stale (counter-proof, real Job parser)', async () => {
+      const log = watch();
+      const calls: string[] = [];
+      try {
+        // ctx-a lists no Jobs at all; ctx-b lists only another run's unfinished Job.
+        const deps = podDeps(() => readHarnessQueuePodRuns(kubectlFor({ 'ctx-a': JSON.stringify({ items: [] }),
+          'ctx-b': jobsOf({ active: 1, ready: 1 }, { 'elanous.run': 'run-other' }) }, calls), [{ context: 'ctx-a' }, { context: 'ctx-b' }]));
+        await addHarnessQueue({ seat: 'TC', say: 'no pod' }, deps);
+        expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+        expect(calls).toEqual(['ctx-a', 'ctx-b']);
+        expect(log.events).toEqual([{ event: 'seat-cap-excluded', data: { runId: 'run-pod-a', launchId: null, pid: 12, seat: 'TC', reason: 'stale', idleMin: 60 } }]);
+      } finally { log.restore(); }
+    });
+
+    test('an unreadable Job list keeps the stale-looking run counted and is observed once', async () => {
+      const log = watch();
+      let reads = 0;
+      try {
+        const deps = podDeps(() => { reads++; throw new Error('kubectl down'); });
+        await addHarnessQueue({ seat: 'TC', say: 'lease unreadable' }, deps);
+        expect((await tickHarnessQueue(deps)).outcome).toBe('waiting');
+        expect(reads).toBe(1);
+        expect(log.events).toEqual([
+          { event: 'progress-source-unavailable', data: { source: 'pod-jobs', error: 'Error: kubectl down' } },
+          { event: 'seat-cap-progress', data: { runId: 'run-pod-a', launchId: null, pid: 12, seat: 'TC', source: 'pod-unavailable', ledgerIdleMin: 60 } },
+        ]);
+      } finally { log.restore(); }
+    });
+
+    test('a fresh ledger is counted without reading Pod Jobs (unchanged)', async () => {
+      const log = watch();
+      let reads = 0;
+      try {
+        const deps = podDeps(() => { reads++; return new Set(); }, 5);
+        await addHarnessQueue({ seat: 'TC', say: 'fresh' }, deps);
+        expect((await tickHarnessQueue(deps)).outcome).toBe('waiting');
+        expect(reads).toBe(0);
+        expect(log.events).toEqual([]);
+      } finally { log.restore(); }
+    });
+
+    test('Job labels: unfinished Jobs give their run and child-run; Complete/Failed Jobs do not; label values are sanitized', () => {
+      const job = (labels: Record<string, string>, conditions: { type: string; status: string }[] = []) => ({ metadata: { labels }, status: { conditions } });
+      const stdout = JSON.stringify({ items: [
+        job({ 'elanous.run': 'run-a', 'elanous.child-run': 'run-a-child' }),
+        job({ 'elanous.run': 'run-done' }, [{ type: 'Complete', status: 'True' }]),
+        job({ 'elanous.run': 'run-failed' }, [{ type: 'Failed', status: 'True' }]),
+        job({ 'elanous.run': 'run-retrying' }, [{ type: 'Failed', status: 'False' }]),
+      ] });
+      expect([...queuePodRunsFromJobs(stdout)].sort()).toEqual(['run-a', 'run-a-child', 'run-retrying']);
+      expect(() => queuePodRunsFromJobs('{}')).toThrow('invalid response');
+      for (const id of ['run-16da3121-3640-4d72-bcf4-c00051f9c8a8', 'odd id/with:chars', `x${'y'.repeat(80)}`])
+        expect(queueRunLabelValue(id)).toBe(k8sLabelValue(id)!);
+    });
+
+    test('the process inventory carries ledger run ids for Pod matching', () => {
+      const runsDir = selfDevRunsDir(root());
+      saveSelfDevRun({ runId: 'run-pod-b', createdAt: 1, updatedAt: 9, results: [], pid: 81, pidStart: 'darwin:81', seat: 'TC' }, runsDir);
+      const run = ((command: string) => ({ status: 0, stdout: command === 'ps' ? '81 1 bun /repo/bin/elanous.mjs harness say goal' : '' })) as typeof import('node:child_process').spawnSync;
+      expect(readHarnessQueueProcesses({ platform: 'darwin', run, seatTrees: {}, runsDir, birthId: () => 'darwin:81' }))
+        .toEqual([{ pid: 81, seat: 'TC', progressAt: 9, ledgerRunIds: ['run-pod-b'] }]);
+    });
+  });
+
+  test('one stopped supervisor record does not mark a process whose other record is still progressing as soft-stopped', () => {
+    const runsDir = selfDevRunsDir(root());
+    saveSelfDevRun({ runId: 'r-stopped', createdAt: 1, updatedAt: 9, results: [], pid: 71, pidStart: 'darwin:71',
+      seat: 'TC', supervisorStopReason: 'harvestable-awaiting-human' }, runsDir);
+    saveSelfDevRun({ runId: 'r-going', createdAt: 1, updatedAt: 5, results: [], pid: 71, pidStart: 'darwin:71', seat: 'TC' }, runsDir);
+    const run = ((command: string) => ({ status: 0, stdout: command === 'ps' ? '71 1 bun /repo/bin/elanous.mjs harness say goal' : '' })) as typeof import('node:child_process').spawnSync;
+    expect(readHarnessQueueProcesses({ platform: 'darwin', run, seatTrees: {}, runsDir, birthId: () => 'darwin:71' }))
+      .toEqual([{ pid: 71, seat: 'TC', progressAt: 9, ledgerRunIds: ['r-stopped', 'r-going'] }]);
+  });
+
+  test('counting limits resolve config > env > default', () => {
+    expect(harnessQueueCountingLimits(undefined, {})).toEqual({ staleRunMinutes: 30, unknownSeatCap: 2 });
+    const env = { ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES: '45', ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP: '0' };
+    expect(harnessQueueCountingLimits(undefined, env)).toEqual({ staleRunMinutes: 45, unknownSeatCap: 0 });
+    expect(harnessQueueCountingLimits({ staleRunMinutes: 10, unknownSeatCap: 3 }, env)).toEqual({ staleRunMinutes: 10, unknownSeatCap: 3 });
+    expect(harnessQueueCountingLimits({ staleRunMinutes: 0 }, { ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES: 'x' })).toEqual({ staleRunMinutes: 30, unknownSeatCap: 2 });
+  });
+});
+
+test('TASK-QUEUE: a seat launches its highest rubric priority first and prio re-ranks the next tick', async () => {
+  const dir = root(), launches: string[][] = [];
+  const scores: Record<string, number> = { 'TQ-FIVE': 5, 'TQ-TWELVE': 12 };
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 12 }), cap: () => 3,
+    cellPriority: (cell) => scores[cell] };
+  const five = await addHarnessQueue({ seat: 'TC', say: '칸: TQ-FIVE five' }, deps);
+  const twelve = await addHarnessQueue({ seat: 'TC', say: '칸: TQ-TWELVE twelve' }, deps);
+  const none = await addHarnessQueue({ seat: 'TC', say: 'no cell' }, deps);
+  expect(listHarnessQueue(deps).map((row) => row.priority)).toEqual([5, 12, undefined]);
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: twelve.id } });
+  const audit: Array<unknown> = [];
+  const original = debug.log;
+  (debug as { log: unknown }).log = (category: string, event: string, data?: unknown) => {
+    if (category === 'harness.queue' && event === 'prio') audit.push(data);
+  };
+  try {
+    expect(await setHarnessQueuePriority(none.id, 20, 'OP', deps)).toMatchObject({ id: none.id, priority: 20 });
+  } finally { (debug as { log: unknown }).log = original; }
+  expect(audit).toEqual([{ id: none.id, from: null, to: 20, by: 'OP' }]);
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: none.id } });
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: five.id } });
+  expect(launches.map((args) => args[2])).toEqual(['칸: TQ-TWELVE twelve', 'no cell', '칸: TQ-FIVE five']);
+  // A launched row's slot is taken — re-ranking it is refused.
+  await expect(setHarnessQueuePriority(twelve.id, 99, 'OP', deps)).rejects.toThrow('queued');
+  await expect(setHarnessQueuePriority('hq-missing', 1, 'OP', deps)).rejects.toThrow('항목 없음');
+  await expect(setHarnessQueuePriority(five.id, Number.NaN, 'OP', deps)).rejects.toThrow('유한한 수');
+  await expect(setHarnessQueuePriority(five.id, 1, ' ', deps)).rejects.toThrow('요청 주체');
+});
+
+test('TASK-QUEUE: prio 5→20 moves that row to the front of its seat on the next tick', async () => {
+  const dir = root(), launches: string[][] = [];
+  const scores: Record<string, number> = { 'TQ-FIVE': 5, 'TQ-TWELVE': 12 };
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 12 }), cap: () => 3,
+    cellPriority: (cell) => scores[cell] };
+  const five = await addHarnessQueue({ seat: 'UX', say: '칸: TQ-FIVE five' }, deps);
+  await addHarnessQueue({ seat: 'UX', say: '칸: TQ-TWELVE twelve' }, deps);
+  // A failed audit write rolls the change back.
+  const failing = debug.log;
+  (debug as { log: unknown }).log = (category: string, event: string) => {
+    if (category === 'harness.queue' && event === 'prio') throw new Error('log store down');
+  };
+  try { await expect(setHarnessQueuePriority(five.id, 50, 'OP', deps)).rejects.toThrow('감사 기록 실패'); }
+  finally { (debug as { log: unknown }).log = failing; }
+  expect(listHarnessQueue(deps).find((row) => row.id === five.id)?.priority).toBe(5);
+  await setHarnessQueuePriority(five.id, 20, 'OP', deps);
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: five.id, priority: 20 } });
+});
+
+test('TASK-QUEUE: a queue without priority keeps seat round robin and FIFO, and old rows still read', async () => {
+  const dir = root(), launches: string[][] = [];
+  const deps: HarnessQueueDeps = { ...fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 12 }), cap: () => 3,
+    cellPriority: () => undefined };
+  mkdirSync(join(dir, 'harness'), { recursive: true });
+  // Pre-TASK-QUEUE rows carry no priority field (one carries a cellId).
+  const row = (n: number, seat: string, input: string, extra: Record<string, unknown> = {}) => ({
+    id: `hq-00000000-0000-4000-8000-00000000000${n}`, seat, kind: 'say', input, hold: false, heavy: false,
+    at: `2026-10-06T00:00:0${n}.000Z`, status: 'queued', ...extra });
+  writeFileSync(harnessQueuePath(dir), JSON.stringify([row(1, 'TC', 'TC first', { cellId: 'OLD-ONE' }), row(2, 'TC', 'TC second'), row(3, 'MK', 'MK first')]));
+  for (let i = 0; i < 3; i++) expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+  expect(launches.map((args) => args[2])).toEqual(['TC first', 'MK first', 'TC second']);
+});
+
+test('TASK-QUEUE: the default enqueue priority is the cell rubric score plus the CEO bonus', async () => {
+  const dir = root();
+  setSchedule('9.9.1', { cutAt: '2099-10-06T18:00+09:00' }, 'fixture', dir);
+  mkdirSync(join(dir, 'release', '9.9.1'), { recursive: true });
+  writeFileSync(join(dir, 'release', '9.9.1', 'checklist.json'), JSON.stringify({ version: '9.9.1', items: [
+    { id: 'TQ-R', title: '루브릭 칸', status: 'yellow', evidence: '루브릭: A3 E2 R1 D2 M1 B0 S1 X0' },
+    { id: 'TQ-CEO', title: '\u{1F451} 대표 칸', status: 'yellow', evidence: '루브릭: A1 E1 R1 D0 M0 B0 S0 X0' },
+    { id: 'TQ-NONE', title: '루브릭 없음', status: 'yellow' },
+  ] }));
+  const now = new Date('2026-10-06T00:00:00Z');
+  expect(queueCellRubricPriority('TQ-R', dir, now)).toBe(15.5);
+  expect(queueCellRubricPriority('TQ-CEO', dir, now)).toBe(6 + QUEUE_CEO_PRIORITY_BONUS);
+  expect(queueCellRubricPriority('TQ-NONE', dir, now)).toBeUndefined();
+  expect(queueCellRubricPriority('TQ-ABSENT', dir, now)).toBeUndefined();
+  const deps: HarnessQueueDeps = { ...fixture(dir, []), now: () => now };
+  expect(await addHarnessQueue({ seat: 'OP', say: '칸: TQ-R 루브릭 칸 구현' }, deps)).toMatchObject({ cellId: 'TQ-R', priority: 15.5 });
+  // A broken lookup leaves the row unprioritized instead of refusing the enqueue.
+  const plain = await addHarnessQueue({ seat: 'OP', say: '칸: TQ-X other' }, { ...deps, cellPriority: () => { throw new Error('ledger down'); } });
+  expect(plain.priority).toBeUndefined();
+});
+
+test('TASK-QUEUE: harness queue prio CLI re-ranks a queued row and refuses a non-number', async () => {
+  const dir = root(), deps = fixture(dir, []);
+  const item = await addHarnessQueue({ seat: 'TC', say: 'cli prio' }, deps);
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli', queue: deps });
+  const original = console.log, lines: string[] = [];
+  console.log = (line: string) => { lines.push(line); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'prio', item.id, '7']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'list']);
+  } finally { console.log = original; }
+  expect(lines).toEqual([`${item.id} prio 7`, `${item.id} TC queued say cli prio · prio 7`]);
+  expect(listHarnessQueue(deps)[0]!.priority).toBe(7);
+  // The CLI refuses a launched row and a non-number, leaving the file as it was.
+  expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'launched', item: { id: item.id } });
+  const errors: string[] = [];
+  const originalError = console.error, exitCode = process.exitCode;
+  console.error = (line: string) => { errors.push(String(line)); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'prio', item.id, '9']).catch((error: unknown) => errors.push(String(error)));
+    await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'prio', item.id, 'abc']).catch((error: unknown) => errors.push(String(error)));
+  } finally { console.error = originalError; process.exitCode = exitCode ?? 0; }
+  expect(errors.join('\n')).toContain('대기(queued) 행만');
+  expect(errors.join('\n')).toContain('수가 아니다');
+  expect(listHarnessQueue(deps)[0]).toMatchObject({ status: 'launched', priority: 7 });
 });

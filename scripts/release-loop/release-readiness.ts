@@ -1,7 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { releaseLedgerRoot } from '../../src/instance/resolve.js';
-import { checklistGate, type ChecklistGate } from '../../src/release-loop/checklist.js';
+import { cutChecklistGate, type ChecklistGate } from '../../src/release-loop/checklist.js';
+
+/** Only the verdict fields are read — so a `release run` deps checklist (`Pick<…>`) fits as well. */
+export type ReadinessChecklist = Pick<ChecklistGate, 'ok' | 'red' | 'undecided' | 'blocked'>;
 import { getSchedule, formatKst } from '../../src/release-loop/release-schedule.js';
 import { debug } from '../../src/debug/log.js';
 
@@ -9,12 +12,12 @@ export type ReleaseReadiness =
   | { ready: false; reason: 'already-published'; details: string }
   | { ready: false; reason: 'already-running'; details: string }
   | { ready: false; reason: 'before-cut'; details: string }
-  | { ready: false; reason: 'checklist-blocked'; details: ChecklistGate }
-  | { ready: true; reason: 'ready'; details: ChecklistGate };
+  | { ready: false; reason: 'checklist-blocked'; details: ReadinessChecklist }
+  | { ready: true; reason: 'ready'; details: ReadinessChecklist };
 
 export interface ReleaseReadinessDeps {
   ledgerRoot?: string;
-  checklist?: typeof checklistGate;
+  checklist?: (version: string) => ReadinessChecklist;
   isPidAlive?: (pid: number) => boolean;
   now?: () => Date;
 }
@@ -57,11 +60,13 @@ export function releaseReadiness(version: string, deps: ReleaseReadinessDeps = {
     }
   }
   const schedule = getSchedule(version, deps.ledgerRoot);
-  if (schedule && (deps.now ?? (() => new Date()))().getTime() < Date.parse(schedule.cutAt)) {
+  const now = (deps.now ?? (() => new Date()))();
+  if (schedule && now.getTime() < Date.parse(schedule.cutAt)) {
     debug.log('release.schedule', 'before-cut', { version, cutAt: schedule.cutAt, landBy: schedule.landBy });
     return { ready: false, reason: 'before-cut', details: `before-cut (${formatKst(schedule.cutAt)})` };
   }
-  const gate = (deps.checklist ?? checklistGate)(version);
+  // GATE-ENTRY-ALIGN: the same cut judgement as `release run`'s entry check and the checklist-gate node.
+  const gate = (deps.checklist ?? ((v: string) => cutChecklistGate(v, schedule?.landBy, now)))(version);
   if (!gate.ok) return { ready: false, reason: 'checklist-blocked', details: gate };
   return { ready: true, reason: 'ready', details: gate };
 }

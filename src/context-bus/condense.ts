@@ -1,8 +1,9 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dlopen, FFIType } from 'bun:ffi';
 import { join } from 'node:path';
 import { listMemories, memoryRoot, saveMemory, type MemoryEntry } from '../memory.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
+import { debug } from '../debug/log.js';
 import { condenseContextWindowWithReport, readCondenseEvents, type CondenseFunnel, type CondenseSkipped, type MemoryDeps, type MemoryItem, type MemorySource, type MemorySummary } from './long-term-memory.js';
 
 const summarize = async (source: MemorySource): Promise<MemorySummary> =>
@@ -51,6 +52,7 @@ export function renderCondenseMarkdown(report: Pick<CondenseReport, 'since' | 'u
 
 type CondenseStore = {
   list(): MemoryEntry[];
+  hasMemoryDirectory?(): boolean;
   save(input: Parameters<typeof saveMemory>[0]): MemoryEntry;
   raise(input: Parameters<DecisionLedger['raiseOnce']>[0], ref: string): string;
   withLock<T>(action: () => T): T;
@@ -96,6 +98,7 @@ function defaultStore(root?: string): CondenseStore {
   const ledger = new DecisionLedger(root ? { stateDir: root } : {});
   return {
     list: () => listMemories({}, memoryDir),
+    hasMemoryDirectory: () => existsSync(memoryDir),
     save: input => saveMemory(input, memoryDir),
     raise: (input, ref) => ledger.raiseOnce(input, ref).id,
     withLock: action => withMemoryLock(memoryDir, action),
@@ -118,10 +121,22 @@ function newestActive(entries: readonly MemoryEntry[]): MemoryEntry | undefined 
 }
 
 /** Apply candidate cards through the existing curated memory and decision ledger paths. */
-export function applyCondensedCards(cards: readonly MemoryItem[], store: CondenseStore): NonNullable<CondenseReport['applied']> {
+export function applyCondensedCards(cards: readonly MemoryItem[], store: CondenseStore, now: Date = new Date()): NonNullable<CondenseReport['applied']> {
   const decisions: string[] = [];
   let written = 0;
   let retired = 0;
+  const cutoff = now.getTime() - 30 * 24 * 3_600_000;
+  const retireAged = () => {
+    let agedRetired = 0;
+    for (const old of store.list()) {
+      if (old.contextCard?.status !== 'active' || !(Date.parse(old.contextCard.updatedAt) < cutoff)) continue;
+      store.save({ type: old.type, name: old.name, description: old.description, body: old.body, id: old.id,
+        pinned: false, priority: old.priority, contextCard: { ...old.contextCard, status: 'retired' } });
+      agedRetired++;
+    }
+    retired += agedRetired;
+    debug.log('context.condense', 'aged-out', { retired: agedRetired });
+  };
   for (const card of cards) {
     if (card.conflict) {
       const ref = `context-condense:${JSON.stringify([card.project, card.seat, card.topic, card.source, card.updatedAt])}`;
@@ -162,6 +177,7 @@ export function applyCondensedCards(cards: readonly MemoryItem[], store: Condens
     };
     store.withLock(applyTopic);
   }
+  if (store.hasMemoryDirectory?.() !== false) store.withLock(retireAged);
   return { written, retired, decisions };
 }
 
@@ -184,6 +200,6 @@ export async function runContextCondense(options: {
   const conflicts = cards.filter(card => card.conflict !== undefined).length;
   const report: CondenseReport = { since, until, cards, conflicts, skipped, folded, droppedHarnessChild, funnel,
     markdown: renderCondenseMarkdown({ since, until, cards, conflicts, skipped, droppedHarnessChild, funnel }) };
-  if (options.apply === true) report.applied = applyCondensedCards(cards, store ?? defaultStore(options.root));
+  if (options.apply === true) report.applied = applyCondensedCards(cards, store ?? defaultStore(options.root), now);
   return report;
 }

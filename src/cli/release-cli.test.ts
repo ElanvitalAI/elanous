@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { checklistHistory, listChecklist, devVersion } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
@@ -40,6 +40,37 @@ function fixture() {
 }
 
 describe('release checklist CLI', () => {
+  test('refs <doc> lists citing cells across versions as a table or JSON and writes nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-refs-cli-'));
+    setElanousConfigDir(dir);
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('--version', '9.9.8', 'add', 'A', '절 칸', '--ref', 'package.json#§1');
+      await run('--version', '9.9.9', 'add', 'B', '파일 칸', '--ref', 'package.json');
+      await run('--version', '9.9.9', 'add', 'D', '남의 문서', '--ref', 'src/release-loop/checklist.ts');
+      await run('--version', '9.9.9', 'set', 'B', '--status', 'green');
+      const before = [listChecklist('9.9.8').history.length, listChecklist('9.9.9').history.length];
+      await run('refs', 'package.json', '--json');
+      const parsed = JSON.parse(lines.at(-1)!) as { doc: string; rows: Array<{ version: string; id: string; section: string | null }>; byStatus: Record<string, number> };
+      expect(parsed.doc).toBe('package.json');
+      expect(parsed.rows.map(({ version, id, section }) => [version, id, section])).toEqual([['9.9.8', 'A', '§1'], ['9.9.9', 'B', null]]);
+      expect(parsed.byStatus).toEqual({ green: 1, yellow: 1, red: 0, done: 0 });
+      lines.length = 0;
+      await run('refs', 'package.json#§1');
+      expect(lines[0]).toBe('| 판 | 칸 | 상태 | 절 | 제목 |\n| --- | --- | --- | --- | --- |\n| 9.9.8 | A | yellow | §1 | 절 칸 |');
+      expect([listChecklist('9.9.8').history.length, listChecklist('9.9.9').history.length]).toEqual(before);
+      await expect(run('refs', '#§1')).rejects.toThrow(CliUserError);
+    } finally {
+      output.mockRestore();
+      jsonOutput.mockRestore();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('add → set → status JSON · actor · 사람 상태 · rm, 기존 help 명령 보존', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-cli-'));
     setElanousConfigDir(dir);
@@ -64,7 +95,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'resume', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -72,6 +103,51 @@ describe('release checklist CLI', () => {
     } finally {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
+    }
+  });
+
+  test('DOC-REFS: the real add/set --ref entry stores repo files once, refuses folders and .. segments, and list JSON shows refs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-refs-cli-'));
+    setElanousConfigDir(dir);
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+    try {
+      await run('add', 'R1', 'refs cell', '--ref', 'package.json');
+      await run('add', 'R0', 'no refs');
+      await run('set', 'R1', '--ref', 'package.json', 'src/release-loop/checklist.ts#normalizeRefs');
+      await expect(run('set', 'R1', '--ref', 'src')).rejects.toBeInstanceOf(CliUserError);
+      await expect(run('set', 'R1', '--ref', 'src/../package.json')).rejects.toBeInstanceOf(CliUserError);
+      await run('list', '--json');
+      const items = JSON.parse(lines.at(-1)!).items as Array<{ id: string; refs?: string[] }>;
+      expect(items.find((item) => item.id === 'R1')?.refs).toEqual(['package.json', 'src/release-loop/checklist.ts#normalizeRefs']);
+      expect(Object.keys(items.find((item) => item.id === 'R0')!)).not.toContain('refs');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'R1')?.refs).toEqual(['package.json', 'src/release-loop/checklist.ts#normalizeRefs']);
+    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('DOC-REFS: the real set --ref entry, run inside another git repository, accepts that repository\'s document (installed CLI case)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-refs-repo-cli-'));
+    // A git repository outside the code tree: its docs/ exists only there, like the user's repository for an installed CLI.
+    const repo = realpathSync(mkdtempSync(join(tmpdir(), 'release-refs-repo-')));
+    mkdirSync(join(repo, 'docs', 'sub'), { recursive: true });
+    writeFileSync(join(repo, 'docs', 'RFC-x.md'), '# x\n');
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    setElanousConfigDir(dir);
+    const before = process.cwd();
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await run('add', 'R1', 'refs cell');
+      process.chdir(join(repo, 'docs', 'sub'));
+      await run('set', 'R1', '--ref', 'docs/RFC-x.md#A5');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'R1')?.refs).toEqual(['docs/RFC-x.md#A5']);
+      process.chdir(tmpdir());
+      await expect(run('set', 'R1', '--ref', 'docs/RFC-y.md')).rejects.toBeInstanceOf(CliUserError);
+    } finally {
+      process.chdir(before); output.mockRestore(); resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true });
     }
   });
 
@@ -547,7 +623,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--json'], { from: 'user' });
       expect(stdout).toHaveLength(1);
       expect(stdout[0]!.endsWith('\n')).toBe(true);
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3' } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3', branchCut: true } });
       expect(stderr.join('\n')).toContain('"previousVersion":"0.2.3"');
       expect([checklistCalls, graphCalls]).toEqual([0, 0]);
       expect(process.exitCode ?? 0).toBe(0);
@@ -610,7 +686,7 @@ describe('release run CLI', () => {
       for (const flags of [[], ['--cut-commit', 'a'.repeat(40)], ['--if-ready', '--cut-commit', 'b'.repeat(40)]])
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', ...flags], { from: 'user' });
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true },
         { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'a'.repeat(40) },
         { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'b'.repeat(40) },
       ]);
@@ -639,14 +715,14 @@ describe('release run CLI', () => {
           graph: async () => { graphCalls++; throw new Error('preview invoked graph'); } });
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready', '--json'], { from: 'user' });
         expect(stdout).toHaveLength(1);
-        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool' } });
+        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', branchCut: true } });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready'], { from: 'user' });
         expect(human).toHaveLength(1);
         expect(human[0]).toStartWith('· 드라이런 0.2.4 · 입력 ');
-        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool' });
+        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', branchCut: true });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
@@ -668,7 +744,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run'], { from: 'user' });
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain('드라이런');
-      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateRemote: 'node-b' });
+      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateRemote: 'node-b', branchCut: true });
       expect(process.exitCode ?? 0).toBe(0);
     } finally { process.exitCode = before ?? 0; output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
@@ -832,7 +908,7 @@ describe('release run CLI', () => {
       graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect(opts.input.previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
     try {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' }, state: { status: 'awaiting-approval', runId: 'run-1' } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true }, state: { status: 'awaiting-approval', runId: 'run-1' } });
       expect([checklistCalls, graphCalls]).toEqual([1, 1]);
       expect(process.exitCode ?? 0).toBe(0);
       const blocked = new Command();
@@ -898,7 +974,17 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
       expect(steps[1]!.args).toContain('--target');
       expect(steps[1]!.args[steps[1]!.args.indexOf('--target') + 1]).toBe('b'.repeat(40));
       expect(steps[1]!.args).not.toContain('--prerelease');
-      expect(planPublish({ ...f.manifest, prerelease: true }, f.notes)[1]!.args).toContain('--prerelease');
+      const preSteps = planPublish({ ...f.manifest, version: '0.2.18-rc.0', tag: 'v0.2.18-rc.0', prerelease: true }, f.notes);
+      const pre = preSteps[1]!.args;
+      expect(pre).toContain('--prerelease');
+      expect(pre).toContain('--latest=false');
+      expect(pre).toContain('--verify-tag');
+      // RELEASE-REHEARSAL-RC public push: release/<v> branch ⊕ tag, atomically — never public main.
+      expect(preSteps[0]!.args).toEqual(['push', '--atomic', 'origin', `${'b'.repeat(40)}:refs/heads/release/0.2.18-rc.0`, `${'b'.repeat(40)}:refs/tags/v0.2.18-rc.0`]);
+      expect(preSteps.flatMap((s) => s.args).some((a) => /(^|:)(refs\/heads\/)?main$/.test(a))).toBe(false);
+      expect(steps[1]!.args).not.toContain('--verify-tag');
+      expect(pre[pre.indexOf('--title') + 1]).toEndWith('(pre-release)');
+      expect(steps[1]!.args).not.toContain('--latest=false');
       // ⛔ 설치기가 읽는 SHA256SUMS 를 반드시 올린다(release-build 의 files 에는 없다)
       expect(steps[1]!.args).toContain(join(f.dist, 'SHA256SUMS'));
       expect(steps[1]!.args.filter((a) => a.startsWith(f.dist))).toHaveLength(4);
@@ -943,6 +1029,32 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
       expect(statSync(path).mode & 0o777).toBe(0o600);
       expect(observations).toContainEqual({ category: 'release.publish', event: 'tagged', data: { version: '0.1.1', commit: 'a'.repeat(40) } });
     } finally { observation.mockRestore(); rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('RELEASE-REHEARSAL-RC: an rc publication pushes release/<v> ⊕ its tag and never public main; the GitHub release uses that tag', async () => {
+    const f = fixture();
+    const rc = { ...f.manifest, version: '0.2.18-rc.0', tag: 'v0.2.18-rc.0', prerelease: true };
+    writeFileSync(join(f.out, 'release.json'), JSON.stringify(rc));
+    const calls: string[] = [];
+    try {
+      // Without --yes: the plan shows the branch ⊕ tag target and runs nothing but the read-only release lookup.
+      const lines: string[] = [];
+      const plan = await publishRelease({ dir: f.out, notesFile: f.notes, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: (l) => { lines.push(l); } }, tagRunner(calls));
+      expect(plan.published).toBe(false);
+      expect(calls).toEqual(['gh release view v0.2.18-rc.0 --repo ElanvitalAI/elanous']);
+      expect(lines.join('\n')).toContain(`git push --atomic origin ${'b'.repeat(40)}:refs/heads/release/0.2.18-rc.0 ${'b'.repeat(40)}:refs/tags/v0.2.18-rc.0`);
+      expect(lines.join('\n')).toContain('--verify-tag');
+      expect(lines.join('\n')).not.toContain('HEAD:main');
+      calls.length = 0;
+      const r = await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, tagRunner(calls));
+      expect(r.published).toBe(true);
+      const pushes = calls.filter((c) => c.startsWith('git push'));
+      expect(pushes[0]).toBe(`git push --atomic origin ${'b'.repeat(40)}:refs/heads/release/0.2.18-rc.0 ${'b'.repeat(40)}:refs/tags/v0.2.18-rc.0`);
+      expect(pushes.some((c) => /\bHEAD:main\b|:refs\/heads\/main\b/.test(c))).toBe(false);
+      const create = calls.find((c) => c.startsWith('gh release create v0.2.18-rc.0 '))!;
+      expect(calls.indexOf(create)).toBeGreaterThan(calls.indexOf(pushes[0]!));
+      expect(create).toContain('--prerelease --latest=false --verify-tag');
+    } finally { rmSync(f.out, { recursive: true, force: true }); }
   });
 
   test('공개 릴리스 실패면 내부 태그와 판 기록은 없다', async () => {
@@ -1205,4 +1317,30 @@ test('every publishRelease call in this file pins both instanceRoot and ledgerRo
   const calls = [...source.matchAll(/publishRelease\(\{([^}]*)\}/g)].map((m) => m[1]!);
   expect(calls.length).toBeGreaterThan(5);
   expect(calls.filter((args) => !/\binstanceRoot\b/.test(args) || !/\bledgerRoot\b/.test(args))).toEqual([]);
+});
+
+test('RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads checklist readiness (even with --if-ready), and rejects other kinds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-rc-cli-'));
+  mkdirSync(join(dir, 'release', '0.2.17'), { recursive: true });
+  writeFileSync(join(dir, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: 'now' }));
+  const stdout: string[] = [];
+  const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+  const error = spyOn(console, 'error').mockImplementation(() => {});
+  const before = process.exitCode;
+  const inputs: unknown[] = [];
+  try {
+    const cli = new Command();
+    registerReleaseCommands(cli, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' }, releaseRefs: () => ['refs/heads/release/0.2.18-rc.0'],
+      checklist: () => { throw new Error('rc read the checklist'); },
+      graph: async (_path, opts) => { inputs.push(opts.input); return { status: 'done' } as never; } });
+    process.exitCode = 0;
+    await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'rc', '--if-ready', '--json'], { from: 'user' });
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, input: { version: '0.2.18-rc.1', branchCut: true } });
+    expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }]);
+    expect(process.exitCode).toBe(0);
+    await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'beta', '--json'], { from: 'user' });
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: false, error: '--prerelease supports rc only: beta' });
+    expect(process.exitCode).toBe(1);
+    expect(inputs).toHaveLength(1);
+  } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
 });

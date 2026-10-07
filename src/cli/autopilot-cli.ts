@@ -6,7 +6,12 @@ import { writeStdoutJson } from './stdout-json.js';
 // runner. Spawns an ACP backend, opens a single session, runs the
 // AutopilotLoopDriver against the mission, prints agent deltas on
 // stdout + envelope/termination summary on stderr.
-export function registerAutopilotCommands(program: Command): void {
+export interface AutopilotCliDeps {
+  /** logs.db 싱크 등록(시험 주입). 기본 = `registerStandaloneLogSink`. `task-agent-action` 이 부른다. */
+  registerSink?: (surface: string) => Promise<unknown>;
+}
+
+export function registerAutopilotCommands(program: Command, cliDeps: AutopilotCliDeps = {}): void {
   // Explicit runtime entry for a selected action; the task chooser can invoke this entry.
   const autopilotCmd = program
     .command('autopilot')
@@ -14,18 +19,28 @@ export function registerAutopilotCommands(program: Command): void {
   autopilotCmd.command('task-agent-action <actionJson>')
     .description('Execute a selected task-agent action; defaults to shadow')
     .action(async (actionJson: string) => {
+      // 독립 프로세스 — 싱크를 붙이지 않으면 `task-agent`/`action` 관측이 logs.db 에 안 닿는다(fail-open).
+      const { registerTaskAgentSink } = await import('./tasks-cli.js');
+      await registerTaskAgentSink(cliDeps.registerSink);
       const { executeNextAction } = await import('../task-agent/actions.js');
       const { getUserConfig } = await import('../user-config.js');
       const { spawnSync } = await import('node:child_process');
-      const { readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+      const { writeFileSync, mkdirSync } = await import('node:fs');
+      // 상태 파일은 «없음»(ENOENT)만 빈 상태다 — 손상·해석 실패면 덮어쓰지 않고 멈춘다(사후 리뷰 must-fix · #24482).
+      const { readTaskAgentState, TaskAgentStateError } = await import('../task-agent/task-hand.js');
       const { join, dirname } = await import('node:path');
       const { debug } = await import('../debug/log.js');
       const { withFileLockSync } = await import('../storage/file-lock.js');
       const config = getUserConfig() as ReturnType<typeof getUserConfig> & { taskAgent?: { mode?: string } };
       const { effectiveInstanceRoot } = await import('../instance/resolve.js');
       const statePath = join(effectiveInstanceRoot(), 'task-agent-actions.json');
-      let state: { landingDay?: string; landingsToday?: number; failureCounts?: Record<string, number> } = {};
-      try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first run */ }
+      type ActionState = { landingDay?: string; landingsToday?: number; failureCounts?: Record<string, number> };
+      let state: ActionState;
+      try { state = readTaskAgentState<ActionState>(statePath); } catch (error) {
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 1;
+        return;
+      }
       const action = JSON.parse(actionJson) as import('../task-agent/actions.js').NextAction;
       const deps: import('../task-agent/actions.js').ActionDeps = {
         ...state,
@@ -37,8 +52,7 @@ export function registerAutopilotCommands(program: Command): void {
         mode: config.taskAgent?.mode,
         // 하루 착지 칸은 상태 파일 잠금 안에서 확보·반환한다 — 두 CLI 프로세스가 같은 잔여 칸을 쓰지 않게.
         reserveLanding: (day, limit) => withFileLockSync(`${statePath}.lock`, () => {
-          let disk: typeof state = {};
-          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first */ }
+          const disk = readTaskAgentState<ActionState>(statePath);
           const used = disk.landingDay === day ? disk.landingsToday ?? 0 : 0;
           if (used >= limit) return false;
           mkdirSync(dirname(statePath), { recursive: true });
@@ -47,8 +61,7 @@ export function registerAutopilotCommands(program: Command): void {
           return true;
         }),
         incrementFailure: (key) => withFileLockSync(`${statePath}.lock`, () => {
-          let disk: typeof state = {};
-          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* first */ }
+          const disk = readTaskAgentState<ActionState>(statePath);
           const counts = { ...(disk.failureCounts ?? {}) };
           counts[key] = (counts[key] ?? 0) + 1;
           mkdirSync(dirname(statePath), { recursive: true });
@@ -56,8 +69,7 @@ export function registerAutopilotCommands(program: Command): void {
           return counts[key]!;
         }),
         releaseLanding: (day) => withFileLockSync(`${statePath}.lock`, () => {
-          let disk: typeof state = {};
-          try { disk = JSON.parse(readFileSync(statePath, 'utf8')); } catch { return; }
+          const disk = readTaskAgentState<ActionState>(statePath);
           if (disk.landingDay !== day || !disk.landingsToday) return;
           writeFileSync(statePath, JSON.stringify({ ...disk, landingsToday: disk.landingsToday - 1 }));
           deps.landingsToday = disk.landingsToday - 1;
@@ -72,7 +84,14 @@ export function registerAutopilotCommands(program: Command): void {
           return { status: p.status ?? 1, stdout: p.stdout ?? '', stderr: p.stderr ?? '' };
         },
       };
-      const result = await executeNextAction(action, deps);
+      let result: string;
+      try { result = await executeNextAction(action, deps); } catch (error) {
+        // 잠금 안 읽기가 손상을 만나면 쓰지 않고 여기로 온다 — 실패로 끝낸다. 그 밖의 오류는 종전대로 올린다.
+        if (!(error instanceof TaskAgentStateError)) throw error;
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 1;
+        return;
+      }
       if (config.taskAgent?.mode === 'live') deps.saveState?.();
       process.stdout.write(`${result}\n`);
     });

@@ -1,5 +1,6 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { readFileSync, statSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import * as store from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
@@ -20,6 +21,8 @@ export interface ChecklistItem {
   ceoDate?: string;
   /** 다른 칸의 처리량을 올리는 칸(자율성·효율성·동시성). 없으면 가속 등급이 아니다. */
   accelerator?: true;
+  /** 이 칸이 근거로 삼는 문서(저장소 상대 경로, 선택적으로 `#절`). 없으면 칸에 실리지 않는다. */
+  refs?: string[];
   evidence?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
@@ -48,6 +51,12 @@ export interface Checklist {
 
 export function devVersion(): string {
   return (JSON.parse(readFileSync(join(import.meta.dir, '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
+}
+
+/** The checklist version of the development tree: package.json says `0.2.18-dev.0` once a release branch is cut,
+ * but the checklist only knows `0.2.18` (10-07: every server caller that passed devVersion() raw got null/throw). */
+export function checklistDevVersion(version = devVersion()): string {
+  return version.replace(/-dev\.\d+$/, '');
 }
 
 export function parseOwner(value: string): { seat: string; sub?: string } {
@@ -100,12 +109,82 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
   debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
 }
 
+const REPO_ROOT = join(import.meta.dir, '..', '..');
+
+/** `--ref` 문서를 찾는 뿌리들 — 이 코드의 트리 ⊕ 지금 작업 디렉토리의 git 뿌리.
+ *  ⭐ 설치본(`~/.local/share/elanous/current`)에는 `docs/` 가 없다 — 저장소 안에서 부른 설치본도 저장소 문서를 인용할 수 있게. */
+export function refRoots(cwd = process.cwd()): string[] {
+  const roots = [REPO_ROOT];
+  try {
+    const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', timeout: 5_000 });
+    const path = top.status === 0 ? top.stdout.trim() : '';
+    if (path && !roots.includes(path)) roots.push(path);
+  } catch { /* git 없음 — 코드 트리만 */ }
+  return roots;
+}
+
+/** `--ref` 값 검사: 저장소 상대 경로(⊕ `#절`)이고 그 파일이 뿌리들 중 하나에 있어야 한다. 중복은 순서를 지키며 지운다. */
+export function normalizeRefs(refs: readonly string[], root: string | readonly string[] = refRoots()): string[] {
+  const roots = typeof root === 'string' ? [root] : root;
+  const out: string[] = [];
+  for (const raw of refs) {
+    const ref = raw.trim();
+    const path = ref.split('#')[0] ?? '';
+    if (!path || isAbsolute(path) || path.split(/[\\/]/).some((part) => part === '..')) throw new CliUserError(`잘못된 문서 참조: ${raw}`, '저장소 상대 경로[#절] — 예: docs/manual/MANUAL-x.md#§1');
+    let isFile = false;
+    for (const base of roots) {
+      try { if (statSync(join(base, path)).isFile()) { isFile = true; break; } } catch { /* 없음 */ }
+    }
+    if (!isFile) throw new CliUserError(`없는 문서: ${path}`, '저장소 상대 «파일» 경로로 준다(폴더는 안 된다)');
+    if (!out.includes(ref)) out.push(ref);
+  }
+  return out;
+}
+
+/** 한 문서를 인용하는 칸 한 줄 — `release checklist refs <doc>` 의 «구현 현황» 행. */
+export interface DocRefRow { version: string; id: string; title: string; status: ChecklistStatus; owner: string | null; section: string | null }
+
+function splitRef(ref: string): { path: string; section: string | null } {
+  const at = ref.indexOf('#');
+  const path = (at < 0 ? ref : ref.slice(0, at)).trim().replace(/^\.\//, '');
+  return { path, section: at < 0 ? null : ref.slice(at + 1) };
+}
+
+/** 읽기 전용: 칸의 refs 중 경로(`#` 앞)가 doc 의 경로와 같은 것을 행으로 낸다. doc 에 `#절`이 붙으면 그 절과 정확히 같은 ref 만. */
+export function cellsReferencingDoc(doc: string, checklists: readonly Checklist[]): DocRefRow[] {
+  const want = splitRef(doc.trim());
+  const rows: DocRefRow[] = [];
+  for (const data of checklists) {
+    for (const item of data.items) {
+      // 칸마다 한 행 — 같은 문서의 절을 여럿 인용해도 절을 모아 한 줄로(절 없는 인용이 섞이면 문서 전체로 본다).
+      const sections: string[] = [];
+      let whole = false;
+      for (const ref of item.refs ?? []) {
+        const got = splitRef(ref);
+        if (got.path !== want.path) continue;
+        if (want.section !== null && got.section !== want.section) continue;
+        if (got.section === null) whole = true;
+        else if (!sections.includes(got.section)) sections.push(got.section);
+      }
+      if (!whole && sections.length === 0) continue;
+      rows.push({ version: data.version, id: item.id, title: item.title, status: item.status, owner: item.owner ?? null, section: whole ? null : sections.join(' · ') });
+    }
+  }
+  return rows;
+}
+
+/** `| 판 | 칸 | 상태 | 절 | 제목 |` 마크다운 표 — 행이 없으면 머리줄 둘만. */
+export function renderRefsStatus(rows: readonly DocRefRow[]): string {
+  const cell = (value: string) => value.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  return ['| 판 | 칸 | 상태 | 절 | 제목 |', '| --- | --- | --- | --- | --- |', ...rows.map((row) => `| ${cell(row.version)} | ${cell(row.id)} | ${row.status} | ${cell(row.section ?? '-')} | ${cell(row.title)} |`)].join('\n');
+}
+
 export function validateCeoLoad(input: { ceoMinutes?: number; ceoDate?: string }): void {
   if (input.ceoMinutes !== undefined && (!Number.isSafeInteger(input.ceoMinutes) || input.ceoMinutes < 0)) throw new CliUserError('대표 손 분량은 0 이상의 정수 분이어야 한다');
   if (input.ceoDate !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(input.ceoDate) || !Number.isFinite(Date.parse(`${input.ceoDate}T00:00:00Z`)) || new Date(`${input.ceoDate}T00:00:00Z`).toISOString().slice(0, 10) !== input.ceoDate)) throw new CliUserError('대표 손 날짜는 YYYY-MM-DD 이어야 한다');
 }
 
-export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
+export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
@@ -115,6 +194,7 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
   if (input.deadlineVersion !== undefined) store.validateVersion(input.deadlineVersion);
   if (input.accelerator !== undefined && input.accelerator !== true) throw new CliUserError('가속 등급은 true 이거나 생략한다');
   validateCeoLoad(input);
+  const refs = input.refs !== undefined && input.refs.length ? normalizeRefs(input.refs) : undefined;
   return mutate(v, (data, otherItems) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const collisions = otherItems(input.id);
@@ -125,14 +205,14 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
     }
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), updatedAt: at, updatedBy: by };
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.predecessors !== undefined ? { predecessors: input.predecessors } : {}), ...(input.deadlineVersion !== undefined ? { deadlineVersion: input.deadlineVersion } : {}), ...(input.ceoMinutes !== undefined ? { ceoMinutes: input.ceoMinutes } : {}), ...(input.ceoDate !== undefined ? { ceoDate: input.ceoDate } : {}), ...(input.accelerator === true ? { accelerator: true as const } : {}), ...(refs ? { refs } : {}), updatedAt: at, updatedBy: by };
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
@@ -144,13 +224,15 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
     if (patch.accelerator !== undefined && patch.accelerator !== true && patch.accelerator !== null) throw new CliUserError('가속 등급은 true(부여) 또는 null(해제)이다');
     validateCeoLoad(patch);
+    // --ref 는 «더하기»다 — 기존 참조 뒤에 붙이고 중복을 지운다.
+    if (patch.refs !== undefined) patch = { ...patch, refs: normalizeRefs([...(item.refs ?? []), ...patch.refs]) };
     if (patch.owner !== undefined) {
       parseOwner(patch.owner);
       if (item.owner && patch.owner !== item.owner) {
         throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
       }
     }
-    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
+    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {
@@ -267,6 +349,22 @@ export function checklistGate(v: string): ChecklistGate {
   }
   result.ok = result.red.length === 0 && result.undecided.length === 0 && result.blocked.length === 0;
   return result;
+}
+
+/** GATE-ENTRY-ALIGN: the cut-time judgement shared by `release run`'s entry check and the checklist-gate node —
+ *  past the landing deadline a non-P0 yellow without a disposition is carried (moved), and a P0 yellow always blocks. */
+export function cutChecklistGate(v: string, landBy: string | null | undefined, now: Date = new Date()): ChecklistGate & { autoMoved: string[] } {
+  const items = listChecklist(v).items;
+  const overdue = landBy !== null && landBy !== undefined && now.getTime() > Date.parse(landBy);
+  const autoMoved = overdue ? items.filter((item) => item.status === 'yellow' && item.priority !== 'P0' && item.disposition === undefined).map((item) => item.id) : [];
+  const p0 = items.filter((item) => item.status === 'yellow' && item.priority === 'P0').map((item) => item.id);
+  const gate = checklistGate(v);
+  gate.undecided = gate.undecided.filter((id) => !autoMoved.includes(id) && !p0.includes(id));
+  gate.moved = gate.moved.filter((id) => !p0.includes(id)).concat(autoMoved);
+  gate.knownIssues = gate.knownIssues.filter((item) => !p0.includes(item.id));
+  gate.blocked.push(...p0.filter((id) => !gate.blocked.includes(id)));
+  gate.ok = gate.red.length === 0 && gate.undecided.length === 0 && gate.blocked.length === 0;
+  return { ...gate, autoMoved };
 }
 
 export function seedFromRoadmap(v: string, markdown: string): Checklist {

@@ -3,12 +3,13 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addItem, checklistGate, listChecklist, setItem, summarizeChecklist } from '../../src/release-loop/checklist.js';
+import { addItem, checklistGate, cutChecklistGate, listChecklist, setItem, summarizeChecklist } from '../../src/release-loop/checklist.js';
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
 import * as store from '../../src/release-loop/feature-store.js';
 import { debug } from '../../src/debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
-import { runChecklistGate } from './checklist-gate-node.js';
+import { prereleaseChecklistSkip, runChecklistGate } from './checklist-gate-node.js';
+import { runUnattendedRelease } from './unattended-release.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -255,4 +256,48 @@ test('a moved screen cell keeps its kind in the next patch', () => isolated((roo
   setItem('0.2.6', 'S1', { disposition: 'move', evidence: '짝: PWA ✅ · 데스크톱 ⏳(칸 DT9) · 폴드 — · 아이폰 — · 아이패드 —' }, 'TC');
   expect(node(root, '0.2.6').result).toMatchObject({ outcome: 'ok', moved: ['S1'], parity: [] });
   expect(listChecklist('0.2.7').items[0]).toMatchObject({ id: 'S1', kind: 'screen' });
+}));
+
+test('RELEASE-REHEARSAL-RC: a prerelease skips the checklist gate and never reads or moves cells', () => isolated((root) => {
+  addItem('0.2.18', { id: 'red', title: 'title red', owner: 'TC' });
+  setItem('0.2.18', 'red', { status: 'red' }, 'TC');
+  const before = JSON.stringify(listChecklist('0.2.18'));
+  expect(prereleaseChecklistSkip(context('0.2.18-rc.0'))).toMatchObject({ outcome: 'ok', verdict: 'pass', skipped: 'prerelease' });
+  expect(prereleaseChecklistSkip(context('0.2.18'))).toBeNull();
+  const { code, result } = node(root, '0.2.18-rc.0');
+  expect(code).toBe(0);
+  expect(result).toMatchObject({ outcome: 'ok', skipped: 'prerelease' });
+  expect(JSON.stringify(listChecklist('0.2.18'))).toBe(before);
+}));
+
+test('GATE-ENTRY-ALIGN: release run entry check judges like the node — past the deadline only P0 yellows block', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'checklist-entry-'));
+  const root = join(home, '.elanous');
+  mkdirSync(join(root, 'release', '0.2.5'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.5', 'release.json'), JSON.stringify({ version: '0.2.5', publishedAt: 'now' }));
+  setElanousConfigDir(root);
+  try {
+    let graphs = 0;
+    const deps = { ledgerRoot: root, freezeRoot: root, config: { gatePodPool: 'pool' }, graph: async () => { graphs++; return { status: 'done' } as never; } };
+    // The entry check reads the real clock, so the deadline is set relative to now (already passed).
+    const hour = 3_600_000;
+    setSchedule('0.2.6', { cutAt: new Date(Date.now() - hour).toISOString(), landBy: new Date(Date.now() - 2 * hour).toISOString() }, 'OP');
+    addItem('0.2.6', { id: 'LATE', title: 'Missed deadline', owner: 'TC', priority: 'P1' });
+    addItem('0.2.6', { id: 'URGENT', title: 'P0 open', owner: 'TC', priority: 'P0' });
+    await expect(runUnattendedRelease({ version: '0.2.6' }, deps)).rejects.toThrow('release checklist blocked: URGENT');
+    expect(graphs).toBe(0);
+    setItem('0.2.6', 'URGENT', { status: 'green' }, 'TC');
+    await runUnattendedRelease({ version: '0.2.6' }, deps);
+    expect(graphs).toBe(1);
+    // The entry check only judges; carrying the non-P0 yellow stays the node's job.
+    expect(listChecklist('0.2.6').items.map((item) => item.id)).toEqual(['LATE', 'URGENT']);
+  } finally { resetElanousConfigDir(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('GATE-ENTRY-ALIGN: before the deadline the entry check still blocks an undecided non-P0 yellow', () => isolated(() => {
+  setSchedule('0.2.6', { cutAt: '2026-10-05T06:00+09:00', landBy: '2026-10-05T05:40+09:00' }, 'OP');
+  addItem('0.2.6', { id: 'WAIT', title: 'Before deadline', priority: 'P1' });
+  expect(cutChecklistGate('0.2.6', '2026-10-05T05:40+09:00', new Date('2026-10-04T20:39:00Z'))).toMatchObject({ ok: false, undecided: ['WAIT'], autoMoved: [] });
+  expect(cutChecklistGate('0.2.6', '2026-10-05T05:40+09:00', new Date('2026-10-04T20:41:00Z'))).toMatchObject({ ok: true, undecided: [], moved: ['WAIT'], autoMoved: ['WAIT'] });
+  expect(listChecklist('0.2.6').items.map((item) => item.id)).toEqual(['WAIT']);
 }));

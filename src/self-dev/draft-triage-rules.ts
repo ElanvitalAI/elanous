@@ -31,7 +31,7 @@ export type DraftDecision = { action: 'close' | 'keep'; reason: string };
 
 // Labels the sweeper must never close: an approval-waiting state and the human «keep» / release holds (R-PRK3).
 // RELGUARD's release-path hold waits for OP approval — a long wait is not «stale» (TC review #23217).
-const PROTECTED_LABELS: ReadonlySet<string> = new Set<string>([...PR_LABELS
+export const PROTECTED_LABELS: ReadonlySet<string> = new Set<string>([...PR_LABELS
   .filter((label) => label.sweep.action === 'exclude' || (label.sweep.action === 'none' && (label.axis === 'state' || label.axis === 'addon')))
   .map((label) => label.name), RELEASE_PATH_LABEL]);
 

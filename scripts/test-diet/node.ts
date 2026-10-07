@@ -10,7 +10,7 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
 import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
 import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, type LedgerLine, type Measurement, type Td1Disposition } from './lib.js';
-import { fixedCountAssertions, flakeVerdict, sweepSlice, type Mutation, type TestRun } from './effectiveness.js';
+import { fixedCountAssertions, flakeVerdict, sweepSlice, unreachableImports, type Mutation, type TestRun } from './effectiveness.js';
 
 type Context = { graphId?: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown> | null> };
 function context(): Context {
@@ -120,6 +120,13 @@ function measure(ctx: Context, audit = false, effectiveness = false): number {
         measurement.effectiveness.fixedCounts = fixedCountAssertions(measurement.file, process.cwd()).length;
       } catch (error) {
         debug.log('test-diet.effectiveness', 'fixed-count-unreadable', {
+          file: measurement.file, reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+      try {
+        measurement.effectiveness.unreachable = unreachableImports(measurement.file, process.cwd()).length;
+      } catch (error) {
+        debug.log('test-diet.effectiveness', 'unreachable-unreadable', {
           file: measurement.file, reason: error instanceof Error ? error.message : String(error),
         });
       }

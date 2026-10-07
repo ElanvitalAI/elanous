@@ -129,12 +129,33 @@ export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}
       if (changed.some((file) => file.startsWith('-') || file.startsWith('/') || file.split('/').includes('..') || file.includes('\\'))) throw new Error('unsafe changed-file path');
       verdict.tests = files.filter((file) => /(?:^|\/)[^/]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/.test(file));
       const merge = execute('git', ['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'merge', '--no-ff', '--no-edit', item.head], temp);
+      let autoResolvedNextMd = false;
       if (merge.status !== 0) {
-        const unresolved = run('git', ['diff', '--name-only', '--diff-filter=U'], temp);
-        if (!unresolved) throw new Error(`git merge failed: ${merge.stderr.trim() || `exit ${merge.status}`}`);
-        verdict.verdict = 'conflict';
-        verdict.detail = unresolved;
-      } else {
+        const unresolved = run('git', ['diff', '--name-only', '--diff-filter=U'], temp).split('\n').filter(Boolean);
+        if (!unresolved.length) throw new Error(`git merge failed: ${merge.stderr.trim() || `exit ${merge.status}`}`);
+        if (unresolved.length === 1 && unresolved[0] === NEXT_MD_PATH) {
+          const stage = (n: number): string => {
+            const result = execute('git', ['show', `:${n}:${NEXT_MD_PATH}`], temp!);
+            if (result.status !== 0) throw new Error(`release/next.md stage ${n} unavailable: ${result.stderr}`);
+            return result.stdout;
+          };
+          // Stage 2 is main in this checkout; preserve the incoming PR (stage 3) and union main's additions.
+          const resolved = resolveNextMdConflict(stage(1), stage(2), stage(3));
+          if (resolved === null) {
+            verdict.verdict = 'conflict';
+            verdict.detail = 'release/next.md conflict is not append-only';
+          } else {
+            writeFileSync(join(temp, NEXT_MD_PATH), resolved);
+            run('git', ['add', '--', NEXT_MD_PATH], temp);
+            run('git', ['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit', '-m', 'Integrate PR for L8 shadow evaluation'], temp);
+            autoResolvedNextMd = true;
+          }
+        } else {
+          verdict.verdict = 'conflict';
+          verdict.detail = unresolved.join('\n');
+        }
+      }
+      if (merge.status === 0 || autoResolvedNextMd) {
         if (verdict.tests.length) {
           if (verdict.tests.some((file) => !existsSync(join(temp!, file)))) throw new Error('changed test path unavailable');
           run('bun', ['install', '--frozen-lockfile'], temp);
@@ -152,6 +173,9 @@ export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}
           }
         } else {
           verdict.verdict = 'pass';
+        }
+        if (autoResolvedNextMd) {
+          verdict.detail = verdict.detail ? `release/next.md auto-resolved; ${verdict.detail}` : 'release/next.md auto-resolved';
         }
       }
     } finally {

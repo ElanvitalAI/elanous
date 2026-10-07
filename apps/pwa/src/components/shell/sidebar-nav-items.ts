@@ -78,6 +78,7 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/workflows/chat-ui', category: 'workflow-subflow', reason: 'Workflows에서 여는 hosted chat 하위 흐름.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },
   { href: '/404', category: 'error-page', reason: '오류 페이지.' },
+  { href: '/decisions', category: 'operator-direct-link', reason: '대표 결정 화면(OPS-BOARD #24604) — /ceo 「결정 대기 카드」에서 들어간다(메뉴엔 /ceo 만).' },
   { href: '/consult', category: 'contact-form', reason: 'AX 도입 상담·과정 문의를 접수하는 입력 화면(CS1 · #22436).' },
   { href: '/morning', category: 'unwired-screen', reason: '부르는 백엔드가 아직 없는 미배선 화면.' },
   { href: '/inside', category: 'beta-direct-link', reason: '시연자가 주소로 여는 엘라누스 안쪽 장면 지도(메뉴에는 노출하지 않음).' },

@@ -22,7 +22,7 @@ import { instanceNameForStateDir } from '../instance-identity.js';
 import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-user-question/tool.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
-import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, prTitle, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
+import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
@@ -7875,6 +7875,65 @@ describe('runSelfImplement — docs Markdown 대량 삭제 auto-merge guard', ()
     expect(result.prUrl).toBeDefined();
     expect(result.checkedHeadCommit).toBe('a'.repeat(40));
     expect(openPrCalls.at(-1)?.draft).toBe(false);
+  });
+
+  describe('FREEZE-POD: a Pod child never merges its own PR', () => {
+    const podEnv = async <T>(fn: () => Promise<T>): Promise<T> => {
+      const saved = { sub: process.env.ELANOUS_SUBSTRATE, name: process.env.ELANOUS_POD_NAME };
+      process.env.ELANOUS_SUBSTRATE = 'pod'; process.env.ELANOUS_POD_NAME = 'si-freeze-pod-test';
+      try { return await fn(); } finally {
+        if (saved.sub === undefined) delete process.env.ELANOUS_SUBSTRATE; else process.env.ELANOUS_SUBSTRATE = saved.sub;
+        if (saved.name === undefined) delete process.env.ELANOUS_POD_NAME; else process.env.ELANOUS_POD_NAME = saved.name;
+      }
+    };
+    const cleanSeams = () => {
+      const calls = { merge: 0 };
+      const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+      s.mergePr = async () => { calls.merge++; return { merged: true }; };
+      s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+      return { s, calls };
+    };
+
+    test('routePodMergeToHost: only a Pod child with auto-merge is routed; local runs are unchanged', () => {
+      const pod = { ELANOUS_SUBSTRATE: 'pod', ELANOUS_POD_NAME: 'si-x' } as NodeJS.ProcessEnv;
+      const routed = routePodMergeToHost({ autoMerge: true }, pod);
+      expect(routed.reason).toBe('pod-child-auto-merge');
+      expect(routed.opts as Record<string, unknown>).toEqual({ autoMerge: true, mergeByHost: true });
+      expect(routePodMergeToHost({ completion: 'auto-merge' as const }, pod).reason).toBe('pod-child-auto-merge');
+      expect(routePodMergeToHost({ mergeByHost: true }, pod).reason).toBe('requested');
+      expect(routePodMergeToHost({ completion: 'pr' as const }, pod)).toEqual({ opts: { completion: 'pr' }, reason: null });
+      expect(routePodMergeToHost({ autoMerge: true }, {} as NodeJS.ProcessEnv)).toEqual({ opts: { autoMerge: true }, reason: null });
+      expect(routePodMergeToHost({ autoMerge: true }, { ELANOUS_SUBSTRATE: 'pod' } as NodeJS.ProcessEnv).reason).toBeNull();
+    });
+
+    test('a Pod run launched without --merge-by-host stops at merge-ready and never calls merge', async () => {
+      const { s, calls } = cleanSeams();
+      const result = await podEnv(() => runSelfImplement({ feature: 'pod self merge refused', autoMerge: true, seams: s }));
+      expect(calls.merge).toBe(0);
+      expect(result.stage).toBe('merge-ready');
+      expect(result.checkedHeadCommit).toBe('a'.repeat(40));
+    });
+
+    test('freeze on inside a Pod: still no child merge — the host re-gate decides', async () => {
+      const { s, calls } = cleanSeams();
+      enableLandingFreeze({ reason: 'drill', by: 'OP' }, isolatedStateDir);
+      try {
+        const result = await podEnv(() => runSelfImplement({ feature: 'pod freeze', autoMerge: true, seams: s }));
+        expect(calls.merge).toBe(0);
+        expect(result.stage).toBe('merge-ready');
+      } finally { disableLandingFreeze(isolatedStateDir); }
+    });
+
+    test('a local (non-Pod) auto-merge run still merges by itself', async () => {
+      const { s, calls } = cleanSeams();
+      const saved = process.env.ELANOUS_POD_NAME;
+      delete process.env.ELANOUS_POD_NAME;
+      try {
+        const result = await runSelfImplement({ feature: 'local merge unchanged', autoMerge: true, seams: s });
+        expect(calls.merge).toBe(1);
+        expect(result.stage).toBe('merged');
+      } finally { if (saved !== undefined) process.env.ELANOUS_POD_NAME = saved; }
+    });
   });
 
   test('mergeByHost: blocked guard must not yield merge-ready', async () => {

@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { LogStore } from '../mss/logging/log-store.js';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { registerPrCommands } from './pr-cli.js';
@@ -14,7 +15,10 @@ const head = 'a'.repeat(40);
 const base = 'b'.repeat(40);
 const fork = 'c'.repeat(40);
 
-function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1) {
+function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1, nextMd?: {
+  unresolved: string;
+  stages: [string, string, string];
+}) {
   const root = mkdtempSync(join(tmpdir(), 'shadow-queue-test-'));
   roots.push(root);
   process.chdir(root);
@@ -24,6 +28,7 @@ function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1) {
   const errors: string[] = [];
   let testRuns = 0;
   let fetchedMain = base;
+  let resolvedNextMd: string | undefined;
   const deps: L8ShadowQueueDeps = {
     acquire: async () => () => {},
     observe: (verdict) => { observed.push(verdict); },
@@ -37,14 +42,22 @@ function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1) {
       if (args[0] === 'rev-parse') return ok(base);
       if (args[0] === 'worktree' && args[1] === 'add') {
         mkdirSync(join(args[3]!, 'src'), { recursive: true });
+        if (nextMd) mkdirSync(join(args[3]!, 'release'), { recursive: true });
         writeFileSync(join(args[3]!, 'src', 'changed.test.ts'), 'test("ok", () => {});\n');
         if (selectedFiles > 1) writeFileSync(join(args[3]!, 'src', 'another.test.ts'), 'test("ok", () => {});\n');
         return ok();
       }
       if (args[0] === 'merge-base') return ok(fork);
       if (args[0] === 'diff' && args.includes('-z')) return ok(`${selectedFiles > 1 ? 'src/another.test.ts\0' : ''}src/changed.test.ts\0src/other.ts\0`);
-      if (args[0] === 'diff') return ok('src/changed.test.ts\n');
+      if (args[0] === 'diff') return ok(nextMd?.unresolved ?? 'src/changed.test.ts\n');
       if (args.includes('merge')) return outcome === 'conflict' ? { status: 1, stdout: '', stderr: 'merge conflict' } : ok();
+      if (args[0] === 'show' && nextMd && /^:[123]:release\/next\.md$/.test(args[1] ?? '')) {
+        return ok(nextMd.stages[Number(args[1]![1]) - 1]);
+      }
+      if (nextMd && (args[0] === 'add' || args.includes('commit'))) {
+        if (args[0] === 'add') resolvedNextMd = readFileSync(join(cwd, 'release/next.md'), 'utf8');
+        return ok();
+      }
       if (bin === 'bun' && args[0] === 'install') return ok();
       if (bin === 'bun' && args[0] === 'run') {
         testRuns++;
@@ -63,7 +76,7 @@ function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1) {
     return program;
   };
   const cli = async (...args: string[]) => makeProgram().parseAsync(['node', 'elanous', 'pr', 'queue', ...args]);
-  return { root, calls, observed, output, errors, cli, deps, get testRuns() { return testRuns; } };
+  return { root, calls, observed, output, errors, cli, deps, get testRuns() { return testRuns; }, get resolvedNextMd() { return resolvedNextMd; } };
 }
 
 for (const outcome of ['pass', 'conflict', 'fail'] as const) {
@@ -89,6 +102,124 @@ for (const outcome of ['pass', 'conflict', 'fail'] as const) {
     expect(JSON.parse(f.output.at(-1)!).verdicts).toEqual([verdict]);
   });
 }
+
+test('next.md-only append conflict resolves on the shadow worktree before changed tests', async () => {
+  const f = fixture('conflict', 1, {
+    unresolved: 'release/next.md\n',
+    stages: ['## feat\n- a\n', '## feat\n- a\n- m\n', '## feat\n- a\n- p\n'],
+  });
+  await f.cli('enqueue', '7');
+  await f.cli('run', '--shadow');
+  const verdict = JSON.parse(f.output.at(-1)!) as L8ShadowVerdict;
+  expect(verdict).toMatchObject({ number: 7, verdict: 'pass', detail: 'release/next.md auto-resolved', tests: ['src/changed.test.ts'] });
+  expect(f.resolvedNextMd).toBe('\n## feat\n- a\n- p\n- m\n');
+  expect(f.calls).toContain('git show :1:release/next.md');
+  expect(f.calls).toContain('git show :2:release/next.md');
+  expect(f.calls).toContain('git show :3:release/next.md');
+  expect(f.calls).toContain('git add -- release/next.md');
+  expect(f.calls.some((call) => call.includes(' commit -m Integrate PR for L8 shadow evaluation'))).toBe(true);
+  expect(f.calls).toContain('bun run test:deterministic src/changed.test.ts');
+  expect(f.calls.findIndex((call) => call.startsWith('bun run'))).toBeGreaterThan(f.calls.findIndex((call) => call.includes(' commit -m Integrate PR for L8 shadow evaluation')));
+  expect(f.testRuns).toBe(1);
+  expect(f.calls.filter((call) => /git push|gh pr merge|git update-ref/.test(call))).toHaveLength(0);
+  expect(f.observed).toEqual([verdict]);
+});
+
+test('real git conflict lists next.md with a trailing newline and shadow CLI resolves it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-real-git-'));
+  roots.push(root);
+  process.chdir(root);
+  const git = (args: string[], cwd = root) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout;
+  };
+  git(['init', '-b', 'main']);
+  git(['config', 'user.name', 'shadow fixture']);
+  git(['config', 'user.email', 'fixture@localhost']);
+  mkdirSync(join(root, 'release'));
+  writeFileSync(join(root, 'release/next.md'), '## feat\n- a\n');
+  git(['add', 'release/next.md']);
+  git(['commit', '-m', 'base']);
+  const ancestor = git(['rev-parse', 'HEAD']).trim();
+  const prWorktree = join(root, 'pr-worktree');
+  git(['worktree', 'add', '--detach', prWorktree, ancestor]);
+  writeFileSync(join(prWorktree, 'release/next.md'), '## feat\n- a\n- p\n');
+  git(['add', 'release/next.md'], prWorktree);
+  git(['-c', 'user.name=shadow fixture', '-c', 'user.email=fixture@localhost', 'commit', '-m', 'PR'], prWorktree);
+  const prHead = git(['rev-parse', 'HEAD'], prWorktree).trim();
+  writeFileSync(join(root, 'release/next.md'), '## feat\n- a\n- m\n');
+  git(['add', 'release/next.md']);
+  git(['commit', '-m', 'main']);
+  git(['remote', 'add', 'origin', root]);
+  const calls: string[] = [];
+  const outputs: string[] = [];
+  const deps: L8ShadowQueueDeps = {
+    acquire: async () => () => {},
+    observe: () => {},
+    command: (bin, args, cwd) => {
+      calls.push(`${bin} ${args.join(' ')}`);
+      if (bin === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: prHead, baseRefName: 'main', state: 'OPEN', isDraft: false, isCrossRepository: false }), stderr: '' };
+      if (bin === 'git' && args[0] === 'fetch' && args[2] === 'refs/pull/7/head') {
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (bin === 'git' && args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD' && calls.at(-2) === 'git fetch origin refs/pull/7/head') {
+        return { status: 0, stdout: `${prHead}\n`, stderr: '' };
+      }
+      const result = spawnSync(bin, [...args], { cwd, encoding: 'utf8' });
+      if (bin === 'git' && args[0] === 'diff' && args.includes('--diff-filter=U')) {
+        expect(result.stdout).toBe('release/next.md\n');
+      }
+      if (bin === 'git' && args[0] === 'add' && args.includes('release/next.md')) {
+        expect(readFileSync(join(cwd, 'release/next.md'), 'utf8')).toBe('\n## feat\n- a\n- p\n- m\n');
+      }
+      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    },
+  };
+  const program = () => {
+    const cli = new Command();
+    cli.exitOverride();
+    registerPrCommands(cli, { out: { log: (text) => outputs.push(text), error: (text) => { throw new Error(text); } } }, deps);
+    return cli;
+  };
+  await program().parseAsync(['node', 'elanous', 'pr', 'queue', 'enqueue', '7']);
+  await program().parseAsync(['node', 'elanous', 'pr', 'queue', 'run', '--shadow']);
+  expect(JSON.parse(outputs.at(-1)!)).toMatchObject({ verdict: 'pass', detail: 'release/next.md auto-resolved' });
+  expect(calls).toContain('git diff --name-only --diff-filter=U');
+  expect(calls).toContain('git show :1:release/next.md');
+  expect(calls).toContain('git show :2:release/next.md');
+  expect(calls).toContain('git show :3:release/next.md');
+  expect(calls.some((call) => call.includes(' commit -m Integrate PR for L8 shadow evaluation'))).toBe(true);
+  expect(calls.filter((call) => /git push|gh pr merge|git update-ref/.test(call))).toHaveLength(0);
+});
+
+test('next.md-only non-append conflict remains a shadow conflict', async () => {
+  const f = fixture('conflict', 1, {
+    unresolved: 'release/next.md\n',
+    stages: ['## feat\n- a\n', '## feat\n- m\n', '## feat\n- a\n- p\n'],
+  });
+  await f.cli('enqueue', '7');
+  await f.cli('run', '--shadow');
+  expect(JSON.parse(f.output.at(-1)!)).toMatchObject({ verdict: 'conflict', detail: 'release/next.md conflict is not append-only' });
+  expect(f.resolvedNextMd).toBeUndefined();
+  expect(f.calls.some((call) => call.startsWith('git add ') || call.includes(' commit ') || call.startsWith('bun run'))).toBe(false);
+  expect(f.calls.filter((call) => /git push|gh pr merge|git update-ref/.test(call))).toHaveLength(0);
+});
+
+test('next.md plus another unresolved file remains a shadow conflict', async () => {
+  const f = fixture('conflict', 1, {
+    unresolved: 'release/next.md\nsrc/a.ts\n',
+    stages: ['## feat\n- a\n', '## feat\n- a\n- m\n', '## feat\n- a\n- p\n'],
+  });
+  await f.cli('enqueue', '7');
+  await f.cli('run', '--shadow');
+  const verdict = JSON.parse(f.output.at(-1)!) as L8ShadowVerdict;
+  expect(verdict).toMatchObject({ verdict: 'conflict' });
+  expect(verdict.detail).toContain('src/a.ts');
+  expect(f.calls.some((call) => call.startsWith('git show ') || call.startsWith('git add ') || call.includes(' commit '))).toBe(false);
+  expect(f.testRuns).toBe(0);
+  expect(f.calls.filter((call) => /git push|gh pr merge|git update-ref/.test(call))).toHaveLength(0);
+});
 
 test('run evaluates only the pinned front PR and leaves later PRs pending', async () => {
   const f = fixture('pass');

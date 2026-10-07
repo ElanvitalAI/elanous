@@ -21,6 +21,7 @@ import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb, recallEvents } from '../domains/surface-events.js';
 import { extractJsonBlock, skeletonFallback } from './decompose.js';
+import type { AdoptShadowVerdict } from './adopt-gate.js';
 
 export const INTAKE_CHECK_MODE = 'check' as const;
 
@@ -110,6 +111,7 @@ export interface IntakeCheckReport {
   /** 비교·시너지 제안 수(근거 없음 포함). */
   readonly proposalCount?: number;
   readonly proposals?: readonly IntakeCompareProposal[];
+  readonly adoptShadow?: readonly AdoptShadowVerdict[];
 }
 
 /** 선가공 렌즈 여섯. 🅞 원장 · PR #20009. */
@@ -1826,6 +1828,7 @@ export function intakeCheckReportJson(report: IntakeCheckReport): Record<string,
       proposalCount: report.proposalCount,
       proposals: report.proposals,
     } : {}),
+    ...(report.adoptShadow !== undefined ? { adoptShadow: report.adoptShadow } : {}),
   };
 }
 

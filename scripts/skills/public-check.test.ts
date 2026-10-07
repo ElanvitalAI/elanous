@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkPublicSkills, formatPublicCheck } from './public-check.js';
+import { buildSkillEntries, checkPublicSkills, formatPublicCheck, runPublicCheck } from './public-check.js';
 import type { SkillBoundaryReport } from '../skill-boundary.js';
 
 const goodDoc = `---
@@ -40,7 +40,126 @@ function withFixture(fn: (root: string) => void): void {
   try { fn(root); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
+describe('isolated skill build', () => {
+  test('copies only the skill, installs once, builds TS/JS entries and cleans the copy', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    const outside = join(root, 'outside.txt');
+    writeFileSync(outside, 'outside');
+    mkdirSync(join(dir, 'node_modules'));
+    writeFileSync(join(dir, 'node_modules', 'old.js'), 'stale');
+    symlinkSync(outside, join(dir, 'outside-link'));
+    writeFileSync(join(dir, 'scripts', 'other.js'), 'export {}');
+    const calls: string[][] = [];
+    let copy = '';
+    const result = buildSkillEntries(dir, ['scripts/main.ts', 'scripts/other.js', 'scripts/shell.sh'], (args, cwd) => {
+      copy = cwd;
+      calls.push(args);
+      expect(cwd).not.toBe(dir);
+      expect(existsSync(join(cwd, 'SKILL.md'))).toBe(true);
+      expect(existsSync(join(cwd, 'node_modules', 'old.js'))).toBe(false);
+      expect(existsSync(join(cwd, 'outside-link'))).toBe(false);
+      expect(existsSync(join(cwd, '..', 'outside.txt'))).toBe(false);
+      expect(existsSync(join(cwd, '..', 'skills', 'paid'))).toBe(false);
+      return true;
+    });
+    expect(result).toBe('OK');
+    expect(calls[0]).toEqual(['bun', 'install', '--ignore-scripts']);
+    expect(calls.slice(1).map((args) => args.slice(0, 4))).toEqual([
+      ['bun', 'build', 'scripts/main.ts', '--target=bun'],
+      ['bun', 'build', 'scripts/other.js', '--target=bun'],
+    ]);
+    expect(calls).toHaveLength(3);
+    expect(existsSync(copy)).toBe(false);
+    expect(existsSync(join(dir, 'scripts', 'main.ts'))).toBe(true);
+  }));
+
+  test('rejects absolute, parent traversal and external symlink entries before any install or build', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    const outside = join(root, 'outside.ts');
+    writeFileSync(outside, 'export const outside = true;');
+    symlinkSync(outside, join(dir, 'scripts', 'linked.ts'));
+    const calls: string[][] = [];
+    const run = (args: string[]) => { calls.push(args); return true; };
+    for (const entry of [outside, '../../outside.ts', 'scripts/../../../outside.ts', 'scripts/linked.ts']) {
+      expect(buildSkillEntries(dir, [entry], run)).toBe('FAIL');
+    }
+    expect(calls).toEqual([]);
+    expect(existsSync(outside)).toBe(true);
+    expect(buildSkillEntries(dir, ['scripts/main.ts'], run)).toBe('OK');
+    expect(calls.map((args) => args[1])).toEqual(['install', 'build']);
+  }));
+
+  test('skips install without a manifest and returns N/A for non-TS/JS entries', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    rmSync(join(dir, 'package.json'));
+    const commands: string[][] = [];
+    expect(buildSkillEntries(dir, ['scripts/main.ts'], (args) => { commands.push(args); return true; })).toBe('OK');
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.slice(0, 3)).toEqual(['bun', 'build', 'scripts/main.ts']);
+    expect(buildSkillEntries(dir, ['scripts/tool.py'], () => { throw new Error('must not run'); })).toBe('N/A');
+  }));
+
+  test('install or build failure returns FAIL and still removes temporary files', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    for (const failingCommand of ['install', 'build']) {
+      let copy = '';
+      const commands: string[] = [];
+      expect(buildSkillEntries(dir, ['scripts/main.ts'], (args, cwd) => {
+        copy = cwd;
+        commands.push(args[1]!);
+        return args[1] !== failingCommand;
+      })).toBe('FAIL');
+      expect(commands).toEqual(failingCommand === 'install' ? ['install'] : ['install', 'build']);
+      expect(existsSync(copy)).toBe(false);
+    }
+  }));
+
+  test('real bun build reports syntax failure from a copied entry', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    rmSync(join(dir, 'package.json'));
+    writeFileSync(join(dir, 'scripts', 'main.ts'), 'const = ;');
+    expect(buildSkillEntries(dir, ['scripts/main.ts'])).toBe('FAIL');
+    writeFileSync(join(dir, 'scripts', 'main.ts'), 'export const value = 1;');
+    expect(buildSkillEntries(dir, ['scripts/main.ts'])).toBe('OK');
+  }));
+});
+
 describe('public skill structural check', () => {
+  test('the CLI entry path builds only with --build and reflects build failure in JSON, table and exit status', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    rmSync(join(dir, 'package.json'));
+    writeFileSync(join(dir, 'SKILL.md'), goodDoc.replace('`bun install` (package.json).', '`pip install -r requirements.txt`.'));
+    writeFileSync(join(dir, 'requirements.txt'), 'requests\n');
+    writeFileSync(join(dir, 'scripts', 'main.ts'), 'const = ;');
+    const plain = runPublicCheck(root, ['--json'], boundary);
+    expect(plain.exitCode).toBe(0);
+    expect(JSON.parse(plain.output).skills[0].checks).not.toHaveProperty('build');
+    const json = runPublicCheck(root, ['--json', '--build'], boundary);
+    const table = runPublicCheck(root, ['--build'], boundary);
+    expect(JSON.parse(json.output).skills[0].checks.build).toBe('FAIL');
+    expect(json.exitCode).toBe(1);
+    expect(table.exitCode).toBe(1);
+    expect(table.output).toContain('build');
+    expect(table.output).toContain('스킬 실행 파일 빌드 실패');
+    expect(table.output).toContain('PUBLIC-CHECK FAIL');
+    const row = table.output.split('\n').find((line) => line.startsWith('example'))!;
+    expect(row.slice(35).split(/\s+/u).slice(0, 6)).toEqual(['OK', 'OK', 'OK', 'OK', 'OK', 'FAIL']);
+    writeFileSync(join(dir, 'scripts', 'main.ts'), 'export const value = 1;');
+    const repaired = runPublicCheck(root, ['--json', '--build'], boundary);
+    expect(JSON.parse(repaired.output).skills[0].checks.build).toBe('OK');
+    expect(repaired.exitCode).toBe(0);
+  }));
+
+  test('build mode marks a non-TS/JS skill N/A without failing it', () => withFixture((root) => {
+    const dir = join(root, 'skills', 'example');
+    rmSync(join(dir, 'scripts', 'main.ts'));
+    writeFileSync(join(dir, 'scripts', 'main.sh'), 'echo ok\n');
+    writeFileSync(join(dir, 'SKILL.md'), goodDoc.replaceAll('scripts/main.ts', 'scripts/main.sh'));
+    const result = checkPublicSkills(root, boundary, true);
+    expect(result.skills[0]!.checks.build).toBe('N/A');
+    expect(result.ok).toBe(true);
+  }));
+
   test('reports only public skills and does not execute entrypoints', () => withFixture((root) => {
     const report = checkPublicSkills(root, boundary);
     expect(report.ok).toBe(true);

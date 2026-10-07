@@ -23,6 +23,7 @@
 //     reload.
 
 import { useEffect, useState } from 'react';
+import { usePathname } from 'next/navigation';
 import { SidebarNav } from './SidebarNav';
 import { TopBar, useTopBarWakeLock } from './TopBar';
 import { CompactTopBar } from './CompactTopBar';
@@ -48,6 +49,8 @@ export function AppShell({
 }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { compact, setWide } = useCompactMode();
+  const pathname = usePathname();
+  const mobileChat = compact && pathname === '/chat';
   const wakeControl = useTopBarWakeLock();
   const polled = useShellActivity();
   const activity = activityOverride ?? polled;
@@ -85,12 +88,12 @@ export function AppShell({
     // useWorkspaceOptional() 호출자는 영향 없음 (provider 가 항상 mount).
     <WorkspaceProvider>
       <div className="flex h-screen w-full flex-col bg-background text-foreground">
-        <AuthRequiredBanner />
-        <SetupModeBanner />
-        <SkillProblemsBanner />
-        {compact
+        {!mobileChat && <AuthRequiredBanner />}
+        {!mobileChat && <SetupModeBanner />}
+        {!mobileChat && <SkillProblemsBanner />}
+        {!mobileChat && (compact
           ? <CompactTopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} setWide={setWide} wakeControl={wakeControl} />
-          : <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} onCompactView={() => setWide(false)} wakeControl={wakeControl} />}
+          : <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} onCompactView={() => setWide(false)} wakeControl={wakeControl} />)}
         <div className="flex flex-1 min-h-0">
           {/* md+ inline sidebar — expanded: w-56 with labels, collapsed:
               w-10 icon-only rail (U-6b) so navigation stays one tap away
@@ -107,7 +110,7 @@ export function AppShell({
 
           {/* mobile drawer overlay — collapsed = nothing (max content
               area on phone); expanded = full-width drawer with backdrop. */}
-          {sidebarOpen && (
+          {sidebarOpen && !mobileChat && (
             <>
               <button
                 type="button"

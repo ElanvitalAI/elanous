@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { dateKey } from '../time/format.js';
+import { readRequirementFunnel, type RequirementFunnelResult } from '../intake-plane/requirement-funnel.js';
 
 export const BRIEF_DOMAINS = ['운영', '판', '흡수', '시장', '행정', '코나투스'] as const;
 export const BRIEF_PRIORITIES = ['P0', 'P1', 'P2'] as const;
@@ -41,6 +42,7 @@ export interface BriefItemsOptions {
   stateDir?: string;
   now?: () => Date;
   log?: (category: string, event: string, data?: unknown) => void;
+  requirementFunnel?: (now: Date) => RequirementFunnelResult;
 }
 
 export class BriefItemsInputError extends Error {
@@ -89,8 +91,15 @@ function needsDecision(item: BriefItem, today: string): boolean {
  * duplicate claims dropped (same normalized sentence, most urgent kept).
  */
 export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlot, now: Date): string {
+  return composeBriefPage(items, slot, now).markdown;
+}
+
+/** The ids are exactly the rows represented by the composed page, after deduplication. */
+export function composeBriefPage(items: readonly BriefItem[], slot: BriefSlot, now: Date): { markdown: string; ids: number[] } {
   const today = dateKey(now, { timeZone: KST });
-  const eligible = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now));
+  // A duplicate left out of a delivered page stays unsent in the ledger, but must not reappear on a later page.
+  const deliveredClaims = new Set(items.filter(item => item.sent_at !== null).map(item => normalizeClaim(item.text)));
+  const eligible = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now) && !deliveredClaims.has(normalizeClaim(item.text)));
   // Duplicate claims keep the copy that needs a decision today (P0 or due today), then the higher priority, then the earliest (ACP must-fix).
   const rank = (item: BriefItem) => [needsDecision(item, today) ? 0 : 1, BRIEF_PRIORITIES.indexOf(item.priority), item.id];
   const better = (a: BriefItem, b: BriefItem) => { const x = rank(a), y = rank(b); return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!; };
@@ -117,7 +126,7 @@ export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlo
     for (const item of group.sort((a, b) => a.id - b.id)) lines.push(itemLine(item));
     lines.push('');
   }
-  return `${lines.join('\n').trimEnd()}\n`;
+  return { markdown: `${lines.join('\n').trimEnd()}\n`, ids: unique.map(item => item.id) };
 }
 
 function itemLine(item: BriefItem): string {
@@ -166,11 +175,13 @@ export class BriefItemsLedger {
   readonly path: string;
   private readonly now: () => Date;
   private readonly log: (category: string, event: string, data?: unknown) => void;
+  private readonly requirementFunnel: (now: Date) => RequirementFunnelResult;
 
   constructor(options: BriefItemsOptions = {}) {
     this.path = join(options.stateDir ?? elanousStateRoot(), 'briefing', 'items.sqlite');
     this.now = options.now ?? (() => new Date());
     this.log = options.log ?? ((category, event, data) => debug.log(category, event, data));
+    this.requirementFunnel = options.requirementFunnel ?? ((now) => readRequirementFunnel({ stateDir: options.stateDir, now }));
   }
 
   private using<T>(work: (db: Database) => T): T {
@@ -246,15 +257,81 @@ export class BriefItemsLedger {
 
   /**
    * Markdown for one slot. Reads only — never marks, rewrites, or sends an item.
-   * Items created at or after the slot instant are left out.
+   * Items created at or after the slot instant are left out. At 08:30 the
+   * requirement funnel contributes ephemeral lines without adding ledger rows.
    */
   compose(slot: string): string {
+    return this.composeWithIds(slot).markdown;
+  }
+
+  private itemsFromDb(db: Database): BriefItem[] {
+    return db.query('SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items ORDER BY id').all() as BriefItem[];
+  }
+
+  private pageFromDb(db: Database, slot: BriefSlot): { markdown: string; ids: number[] } {
+    const items = this.itemsFromDb(db);
+    const now = this.now();
+    const morningCutoff = Date.parse(`${dateKey(now, { timeZone: KST })}T08:30:00+09:00`);
+    let funnelItems: BriefItem[] = [];
+    if (slot === '08:30' && now.getTime() >= morningCutoff) {
+      // A funnel failure must not take the morning brief down with it.
+      try {
+        const extra = this.requirementFunnel(new Date(morningCutoff - 1)).briefItems;
+        // Negative ids never collide with ledger rows and keep the funnel's own order (summary first).
+        funnelItems = extra.map((item, index): BriefItem => ({
+          id: index - extra.length, text: item.text, domain: item.domain, priority: item.priority, deadline: null,
+          evidence: item.evidence ?? null, source: item.source,
+          created_at: new Date(morningCutoff - 1).toISOString(), sent_at: null,
+        }));
+      } catch (error) {
+        this.log('briefing.items', 'requirement-funnel-failed', { slot, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const composed = composeBriefPage([...items, ...funnelItems], slot, now);
+    // Ephemeral funnel lines appear on the page but have no ledger row to mark sent.
+    const page = { markdown: composed.markdown, ids: composed.ids.filter(id => id > 0) };
+    const candidates = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now)).length;
+    this.log('briefing.items', 'composed', { slot, candidates, bytes: Buffer.byteLength(page.markdown) });
+    return page;
+  }
+
+  /** Read-only page and the exact ledger item ids printed on it (after deduplication). */
+  composeWithIds(slot: string): { markdown: string; ids: number[] } {
     if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
-    const items = this.list();
-    const markdown = composeBriefMarkdown(items, slot as BriefSlot, this.now());
-    const included = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot as BriefSlot, this.now()));
-    this.log('briefing.items', 'composed', { slot, candidates: included.length, bytes: Buffer.byteLength(markdown) });
-    return markdown;
+    return this.using(db => this.pageFromDb(db, slot as BriefSlot));
+  }
+
+  /** Hold the ledger's SQLite writer lock from selecting unsent rows through delivery and marking.
+   * A failed delivery rolls back and releases the lock; the next sender can retry.
+   */
+  withSendLock<T>(slot: string, work: (page: { markdown: string; ids: number[] }, markSent: (ids: readonly number[], slot: BriefSlot) => number) => T): T {
+    if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
+    return this.using(db => {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const page = this.pageFromDb(db, slot as BriefSlot);
+        const result = work(page, (ids, sentSlot) => {
+          if (sentSlot !== slot || ids.length !== page.ids.length || ids.some((id, index) => id !== page.ids[index])) {
+            throw new BriefItemsInputError('marked ids must match composed page');
+          }
+          return this.markSentInDb(db, ids, sentSlot);
+        });
+        db.exec('COMMIT');
+        return result;
+      } catch (cause) {
+        db.exec('ROLLBACK');
+        throw cause;
+      }
+    });
+  }
+
+  private markSentInDb(db: Database, ids: readonly number[], slot: BriefSlot): number {
+    const at = this.now().toISOString();
+    const insert = db.query('INSERT INTO sends (item_id, slot, sent_at) VALUES (?, ?, ?)');
+    let count = 0;
+    for (const id of ids) { insert.run(id, slot, at); count++; }
+    this.log('briefing.items', 'marked-sent', { slot, count });
+    return count;
   }
 
   /**
@@ -263,14 +340,6 @@ export class BriefItemsLedger {
    */
   markSent(ids: readonly number[], slot: BriefSlot): number {
     if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
-    const at = this.now().toISOString();
-    const count = this.using(db => {
-      const insert = db.query('INSERT INTO sends (item_id, slot, sent_at) VALUES (?, ?, ?)');
-      let n = 0;
-      db.transaction(() => { for (const id of ids) { insert.run(id, slot, at); n++; } })();
-      return n;
-    });
-    this.log('briefing.items', 'marked-sent', { slot, count });
-    return count;
+    return this.using(db => db.transaction(() => this.markSentInDb(db, ids, slot))());
   }
 }

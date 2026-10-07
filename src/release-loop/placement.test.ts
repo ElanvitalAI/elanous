@@ -296,6 +296,38 @@ test('rebalance enforces cumulative destination PR capacity across seats', () =>
   expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['mk']);
 });
 
+test('rebalance defers lower rubric score first and leaves the higher score in the current release', () => {
+  setup();
+  const near = new Date('2026-10-05T01:00:00Z');
+  addItem('0.2.14', { ...cell('hi'), title: 'hi 루브릭: A3 E3 R3 D3 M3 B3 S0 X0' });
+  addItem('0.2.14', { ...cell('lo'), title: 'lo 루브릭: A0 E0 R0 D0 M0 B0 S0 X0' });
+  const result = rebalance('0.2.14', { now: near, merged24h: 4 });
+  expect(result.decisions.map((row) => row.id)).toEqual(['lo']);
+  expect(result.blocked).toContainEqual({ id: 'hi', from: '0.2.14', to: '0.2.15', reason: '다음 판 PR 용량 초과' });
+  expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['hi']);
+  expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['lo']);
+  expect(result.decisions[0]?.reason).toBe('0.2.14 착지 마감 2시간 전 미시작 칸 이월 · 루브릭 0');
+  expect(checklistHistory('lo').at(-1)?.reason).toBe(result.decisions[0]?.reason);
+});
+
+test('rebalance sorts scored cells before unscored cells and preserves original order for ties', () => {
+  setup();
+  const near = new Date('2026-10-05T01:00:00Z');
+  addItem('0.2.14', { ...cell('plain-first') });
+  addItem('0.2.14', { ...cell('score-first'), title: 'score-first 루브릭: A0 E0 R0 D0 M0 B0 S0 X0' });
+  addItem('0.2.14', { ...cell('score-second'), title: 'score-second 루브릭: A0 E0 R0 D0 M0 B0 S0 X0' });
+  addItem('0.2.14', { ...cell('plain-second') });
+  const result = rebalance('0.2.14', { now: near, merged24h: 40, seatCap: { TC: 4 }, dryRun: true });
+  expect(result.decisions.map((row) => row.id)).toEqual(['score-first', 'score-second', 'plain-first', 'plain-second']);
+  expect(result.decisions.map((row) => row.reason)).toEqual([
+    '0.2.14 착지 마감 2시간 전 미시작 칸 이월 · 루브릭 0',
+    '0.2.14 착지 마감 2시간 전 미시작 칸 이월 · 루브릭 0',
+    '0.2.14 착지 마감 2시간 전 미시작 칸 이월',
+    '0.2.14 착지 마감 2시간 전 미시작 칸 이월',
+  ]);
+  expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['plain-first', 'score-first', 'score-second', 'plain-second']);
+});
+
 test('seat move rejects deadline, capacity, and dependent constraints before writing history (a freeze window does not block it)', () => {
   setup();
   const options = { ...deps(), merged24h: 10 };

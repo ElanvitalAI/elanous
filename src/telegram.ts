@@ -82,6 +82,7 @@ import { attachTelegramProjectButtons } from './telegram-project-command.js';
 import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 import { contextNow as readContextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -269,9 +270,6 @@ const EMPTY_ALLOWLIST_NOTICE_GAP_MS = 10 * 60 * 1000;
 // Tuned above a normal chat answer but below a real delegation (which
 // pays a multi-second session load before any work).
 const NOTIFY_AS_NEW_MSG_THRESHOLD_MS = 20_000;
-/** 같은 대화에서 이 간격 안이면 context-now 요약을 다시 보내지 않는다. */
-const CONTEXT_FIRST_GAP_MS = 6 * 60 * 60 * 1000;
-const CONTEXT_UNREADABLE = '맥락 못 읽음';
 
 interface ApiResponse<T> {
   ok: boolean;
@@ -365,10 +363,7 @@ export class TelegramBot {
   private readonly handleFabricPlan: (ctx: TgIncoming) => Promise<boolean>;
   private readonly readContextNow: typeof readContextNow;
   private readonly contextNowDeps?: ContextNowDeps;
-  /** 대화 키(chat+thread) → 그 대화의 마지막 사용자 발화 시각(요약 여부와 무관하게 매 발화마다 갱신). */
-  private readonly lastUtteranceAt = new Map<string, number>();
-  /** 첫 말이거나 6시간 이상 쉰 뒤라 요약이 «밀려 있는» 대화 키 — 다음 일반 답이 한 번 소비한다. */
-  private readonly contextFirstPending = new Set<string>();
+  private readonly contextFirstGate = createContextFirstGate({ now: () => this.nowImpl() });
   private seatAskTimer: ReturnType<typeof setInterval> | null = null;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
@@ -432,27 +427,17 @@ export class TelegramBot {
 
   /** 허용된 모든 발화(명령 포함)마다 부른다 — 쉼은 마지막 발화부터 재고, 요약 전송과는 따로 기록한다. */
   private noteUtterance(ctx: TgIncoming): void {
-    const key = `${ctx.chatId}:${ctx.threadId ?? ''}`;
-    const now = this.nowImpl();
-    const previous = this.lastUtteranceAt.get(key);
-    this.lastUtteranceAt.set(key, now);
-    if (previous === undefined || now - previous >= CONTEXT_FIRST_GAP_MS) this.contextFirstPending.add(key);
+    this.contextFirstGate.note(`${ctx.chatId}:${ctx.threadId ?? ''}`);
   }
 
   /** 처음이거나 6시간 이상 쉰 대화의 첫 일반 답 앞에 context-now 요약 한 메시지를 보낸다. 실패해도 본 답은 막지 않는다. */
   private async maybeSendContextFirst(ctx: TgIncoming): Promise<void> {
     const key = `${ctx.chatId}:${ctx.threadId ?? ''}`;
-    if (!this.contextFirstPending.delete(key)) return;
+    if (!this.contextFirstGate.take(key)) return;
     const cfg = this.slashContext?.userConfig.telegram;
     if (cfg?.contextFirst === false) return;
-    let text = CONTEXT_UNREADABLE;
     try {
-      text = renderTelegramNow(this.readContextNow({}, this.contextNowDeps));
-    } catch {
-      text = CONTEXT_UNREADABLE;
-    }
-    try {
-      await this.sendMessage(ctx.chatId, text, { replyTo: ctx.messageId, threadId: ctx.threadId });
+      await this.sendMessage(ctx.chatId, renderContextFirst(this.readContextNow, this.contextNowDeps, renderTelegramNow), { replyTo: ctx.messageId, threadId: ctx.threadId });
     } catch (err) {
       this.log(`telegram context-first failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -177,6 +177,51 @@ test('real supervisor stop bodies map their existing classificationBasis', () =>
   expect(noChange.category).toBe('no-progress');
 });
 
+test('real must-fix-reported with increasing consecutive review counts is review-oscillation', () => {
+  const result = classifyStoppedPr({ body: real('must-fix-reported'), comments: [review(2, 2), review(3, 3)] });
+  expect(result.category).toBe('review-oscillation');
+  expect(result.signals).toContain('must-fix 2→3 (round 2→3) → review-oscillation');
+  expect(result.firstAction).toBe('헬퍼 자식 spawn — 기존 시험 설계 보존 후 한 라운드');
+});
+
+test('real must-fix-reported with unchanged review counts is review-oscillation', () => {
+  const result = classifyStoppedPr({ body: real('must-fix-reported'), comments: [review(2, 2), review(3, 2)] });
+  expect(result.category).toBe('review-oscillation');
+  expect(result.signals).toContain('must-fix 2→2 (round 2→3) → review-oscillation');
+});
+
+test('real must-fix-reported with decreasing review counts stays review-budget', () => {
+  const result = classifyStoppedPr({ body: real('must-fix-reported'), comments: [review(2, 3), review(3, 2)] });
+  expect(result.category).toBe('review-budget');
+});
+
+test('real must-fix-reported with only one review round stays review-budget', () => {
+  const result = classifyStoppedPr({ body: real('must-fix-reported'), comments: [review(3, 2)] });
+  expect(result.category).toBe('review-budget');
+});
+
+test('non-adjacent review rounds do not invent an oscillation', () => {
+  const result = classifyStoppedPr({ body: real('must-fix-reported'), comments: [review(1, 2), review(3, 3)] });
+  expect(result.category).toBe('review-budget');
+});
+
+test('real goal-unconvergeable candidate stays goal-revision when must-fix counts increase', () => {
+  const result = classifyStoppedPr({ body: real('supervisor-unconvergeable-goal-candidate', 'goal-unconvergeable-candidate'), comments: [review(2, 2), review(3, 3)] });
+  expect(result.category).toBe('goal-revision');
+});
+
+test('real report-deficit stays report-deficit when must-fix counts increase', () => {
+  const result = classifyStoppedPr({ body: real('no-must-fix-clean-worktree-with-cited-evidence-unmeasured', 'report-deficit'), comments: [review(2, 2), review(3, 3)] });
+  expect(result.category).toBe('report-deficit');
+});
+
+test('Gate blocker still takes first action ahead of numeric review-oscillation', () => {
+  const blocker = '✗ typecheck — missing definition';
+  const result = classifyStoppedPr({ body: real('must-fix-reported', 'implementation-deficit', blocker), comments: [review(2, 2), review(3, 3)] });
+  expect(result.category).toBe('review-oscillation');
+  expect(result.firstAction).toBe('Gate 차단 먼저');
+});
+
 test('real goal-unconvergeable candidate with must-fix 1 calls for goal revision rather than another child', () => {
   const goal = classifyStoppedPr({ body: real('supervisor-unconvergeable-goal-candidate', 'goal-unconvergeable-candidate'), comments: [review(3, 1)] });
   expect(goal.category).toBe('goal-revision');

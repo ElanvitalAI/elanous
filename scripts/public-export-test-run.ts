@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { run as exportRun } from './public-export.js';
+import { privateRedactionsPath, run as exportRun } from './public-export.js';
 
 export interface Comparison {
   exportOnly: string[];
@@ -118,4 +118,39 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
   }
 }
 
-if (import.meta.main) process.exit(run(process.argv.slice(2)));
+// GATE-REMOTE (10-06): `--remote [host]` runs the same commit on that host and prints its result (JSON gains host · remote:true);
+//   `--local` forces this machine. Without either, a busy machine (1-min load > gateRemote.loadThreshold) dispatches on its own.
+if (import.meta.main) void (async () => {
+  const { extractGateRemoteFlags, dispatchHeavyCheck, unreproducibleArgs, relativizeArgs } = await import('../src/self-implement/gate-remote.js');
+  const flags = extractGateRemoteFlags(process.argv.slice(2));
+  if (flags.error) { console.error(flags.error); process.exit(2); }
+  const repo = resolve(import.meta.dir, '..');
+  // The private redaction table changes exported file contents — the remote export must use the same one or the comparison differs.
+  const table = privateRedactionsPath();
+  const payloadFiles = existsSync(table) ? [{ env: 'ELANOUS_EXPORT_REDACTIONS', content: readFileSync(table, 'utf8') }] : [];
+  // File arguments, the --files list and its entries resolve against the repository root (as run() does).
+  const paths = flags.rest.filter((arg) => !arg.startsWith('--'));
+  const listIndex = flags.rest.indexOf('--files');
+  const list = listIndex >= 0 ? flags.rest[listIndex + 1] : undefined;
+  // List entries reach the host verbatim (only positional arguments are rewritten), so an absolute entry is not portable.
+  const absoluteEntries: string[] = [];
+  if (list) {
+    try {
+      const entries = readFileSync(resolve(repo, list), 'utf8').split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+      absoluteEntries.push(...entries.filter((entry) => isAbsolute(entry)));
+      paths.push(...entries);
+    } catch { /* run() reports it */ }
+  }
+  process.exitCode = await dispatchHeavyCheck({
+    payloadFiles,
+    localOnlyReason: (() => {
+      // Each must be a tracked file inside the repository, or the remote checkout would measure something else.
+      const bad = [...new Set([...absoluteEntries, ...unreproducibleArgs(paths, repo)])];
+      return bad.length ? `file argument not reproducible on the host (outside the repository or not tracked at HEAD): ${bad.join(' ')}` : undefined;
+    })(),
+    tool: 'public-export-test-run', repo, flags, json: flags.rest.includes('--json'),
+    installPwa: paths.some((arg) => arg.includes('apps/pwa')),
+    remoteArgv: ['bun', 'scripts/public-export-test-run.ts', '--local', ...relativizeArgs(flags.rest, repo)],
+    runLocal: () => run(flags.rest),
+  });
+})();

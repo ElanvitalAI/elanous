@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { isReleaseVersion } from './release-version.js';
 
 export interface CutBranchOptions { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; repoRoot?: string; log?: (line: string) => void }
 
@@ -26,7 +27,7 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
   const report = (event: 'created' | 'refused' | 'conflict' | 'appended', reason?: string, commit?: string, extra?: Record<string, string | string[]>) =>
     debug.log('release-loop.cut-branch', event, { version: opts.version, branch, ...(commit ? { commit } : {}), ...(reason ? { reason } : {}), ...extra });
   try {
-    if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(opts.version)) throw new Error(`invalid release version: ${opts.version}`);
+    if (!isReleaseVersion(opts.version)) throw new Error(`invalid release version: ${opts.version}`);
     if (!opts.pick.length) throw new Error('at least one --pick commit is required');
     for (const sha of [opts.base, ...opts.pick]) if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new Error(`invalid commit SHA: ${sha}`);
     git(repo, ['fetch', 'origin', 'main']);

@@ -1,7 +1,7 @@
 // WT-X-1 — ANSI escape sequence builder for the mobile modifier bar.
 //
 // Pure functions only — no React, no globals. Given a logical key
-// (Esc / Tab / arrow / Page Up / Page Down) plus an optional modifier state (Ctrl / Alt),
+// (Esc / Tab / Shift+Enter / arrow / Page Up / Page Down) plus an optional modifier state (Ctrl / Alt),
 // produce the byte sequence iPad PWA users expect when typing on a
 // physical keyboard.
 //
@@ -17,7 +17,7 @@
 //   2 = Shift · 3 = Alt · 4 = Shift+Alt · 5 = Ctrl ·
 //   6 = Shift+Ctrl · 7 = Alt+Ctrl · 8 = Shift+Alt+Ctrl
 
-export type ModifierKey = 'esc' | 'tab' | 'up' | 'down' | 'left' | 'right' | 'pageup' | 'pagedown';
+export type ModifierKey = 'esc' | 'tab' | 'shift-enter' | 'up' | 'down' | 'left' | 'right' | 'pageup' | 'pagedown';
 
 export interface ModifierState {
   ctrl: boolean;
@@ -57,8 +57,9 @@ const ARROW_FINAL: Record<'up' | 'down' | 'left' | 'right', string> = {
  *    has no standard mapping; passthrough as plain Esc).
  *  - Tab: `\x09` plain · `\x1b\x09` with Alt · Ctrl ignored (Ctrl+Tab
  *    is browser-reserved; Ctrl+I is just Tab itself anyway).
-	 *  - Page Up/Down: `\x1b[5~` / `\x1b[6~` plain · CSI modifier when active.
-	 *  - Arrows: `\x1b[A/B/C/D` plain · `\x1b[1;<mod>A/B/C/D` with any
+ *  - Shift+Enter: `\x1b\r` (ESC CR) regardless of Ctrl/Alt.
+ *  - Page Up/Down: `\x1b[5~` / `\x1b[6~` plain · CSI modifier when active.
+ *  - Arrows: `\x1b[A/B/C/D` plain · `\x1b[1;<mod>A/B/C/D` with any
  *    modifier (Ctrl=5, Alt=3, Ctrl+Alt=7).
  */
 export function buildKeySequence(key: ModifierKey, modifiers: ModifierState = NO_MODIFIERS): string {
@@ -69,6 +70,9 @@ export function buildKeySequence(key: ModifierKey, modifiers: ModifierState = NO
       return modifiers.alt ? '\x1b\x1b' : '\x1b';
     case 'tab':
       return modifiers.alt ? '\x1b\x09' : '\x09';
+    case 'shift-enter':
+      // Shift+Enter → newline without submit (ESC CR); Ctrl/Alt do not change it.
+      return '\x1b\r';
     case 'pageup':
     case 'pagedown': {
       const number = key === 'pageup' ? 5 : 6;
@@ -84,6 +88,22 @@ export function buildKeySequence(key: ModifierKey, modifiers: ModifierState = NO
       return mod === null ? `\x1b[${final}` : `\x1b[1;${mod}${final}`;
     }
   }
+}
+
+/** Only a single typed character can take a software Ctrl/Alt toggle;
+ *  focus reports, escape sequences and pastes pass through untouched. */
+export function canApplyStickyModifiers(data: string): boolean {
+  return data.length === 1;
+}
+
+/** Apply a software Ctrl/Alt toggle only to a single typed character. */
+export function applyStickyModifiers(data: string, mods: ModifierState): string {
+  if (!canApplyStickyModifiers(data)) return data;
+  const code = data.toUpperCase().charCodeAt(0);
+  const transformed = mods.ctrl && code >= 64 && code <= 95
+    ? String.fromCharCode(code - 64)
+    : data;
+  return mods.alt ? `\x1b${transformed}` : transformed;
 }
 
 /** Subset of keys that are themselves modifiers — used by the UI to

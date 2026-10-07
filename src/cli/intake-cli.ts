@@ -12,6 +12,9 @@ import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { registerIntakeSourceCommands } from './intake-source-cli.js';
+import type { IntakeItem } from '../intake-plane/items.js';
+import type { TaskCard } from '../task-cards/card-store.js';
+import { collectFunnelCandidates, type FunnelDirectiveRow } from '../intake-plane/requirement-funnel.js';
 
 export interface IntakeToTasksCliDeps {
   root: string;
@@ -19,6 +22,62 @@ export interface IntakeToTasksCliDeps {
   token?: () => string | undefined;
   fetch?: typeof fetch;
   llm?: (input: IntakeTaskInput) => Promise<string>;
+}
+
+export interface IntakeCandidatesCliDeps {
+  directives?: () => FunnelDirectiveRow[] | Promise<FunnelDirectiveRow[]>;
+  intakeItems?: () => IntakeItem[] | Promise<IntakeItem[]>;
+  cards?: () => TaskCard[] | Promise<TaskCard[]>;
+  write?: (text: string) => Promise<void>;
+}
+
+/** `--limit` 원 문자열 → 0 이상의 정수. 숫자만(`/^\d+$/`) 받고 나머지('' · 공백 · 음수 · 소수)는 거부한다. */
+export function parseCandidatesLimit(raw: string): number {
+  const limit = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(limit)) throw new Error(`--limit 는 0 이상의 정수여야 한다: ${JSON.stringify(raw)}`);
+  return limit;
+}
+
+export async function runIntakeCandidatesCli(
+  opts: { json?: boolean; limit?: string },
+  deps: IntakeCandidatesCliDeps = {},
+): Promise<void> {
+  // 원 문자열을 «먼저» 본다 — `Number('')`·`Number('  ')` 는 0 이라 빈 목록으로 조용히 통과한다.
+  const limit = opts.limit === undefined ? undefined : parseCandidatesLimit(opts.limit);
+  const directives = deps.directives ?? (async () => {
+    const [{ Database }, { existsSync }, { directiveDbPath }] = await Promise.all([
+      import('bun:sqlite'), import('node:fs'), import('../directives/directive-index.js'),
+    ]);
+    const path = directiveDbPath();
+    if (!existsSync(path)) return [];
+    const db = new Database(path, { readonly: true });
+    try { return db.query('SELECT * FROM directives ORDER BY ts DESC').all() as FunnelDirectiveRow[]; }
+    finally { db.close(); }
+  });
+  const intakeItems = deps.intakeItems ?? (async () => {
+    const [{ listIntakeItems }, { effectiveInstanceRoot }] = await Promise.all([
+      import('../intake-plane/items.js'), import('../instance/resolve.js'),
+    ]);
+    return listIntakeItems(effectiveInstanceRoot());
+  });
+  const cards = deps.cards ?? (async () => {
+    const [{ existsSync }, { CardStore, cardIndexPath }] = await Promise.all([
+      import('node:fs'), import('../task-cards/card-store.js'),
+    ]);
+    if (!existsSync(cardIndexPath())) return [];
+    const store = new CardStore(undefined, true);
+    try { return store.listCards({ open: true }); }
+    finally { store.close(); }
+  });
+  const all = collectFunnelCandidates({
+    directives: await directives(), intakeItems: await intakeItems(), cards: await cards(),
+  });
+  const candidates = limit === undefined ? all : all.slice(0, limit);
+  if (opts.json) await (deps.write ?? writeStdoutFully)(JSON.stringify({ candidates }) + '\n');
+  else await (deps.write ?? writeStdoutFully)([
+    `요구 후보 ${candidates.length}건`,
+    ...candidates.map((row) => `${row.source}\t${row.id}\t${row.score ?? '-'}\t${row.grade ?? '-'}\t${row.title}`),
+  ].join('\n') + '\n');
 }
 
 export interface IntakeDigestCliDeps {
@@ -134,7 +193,7 @@ export function resolveIntakeCheckRoot(
   }
 }
 
-export function registerIntakeCommands(program: Command): void {
+export function registerIntakeCommands(program: Command, candidateDeps: IntakeCandidatesCliDeps = {}): void {
   // ── intake check — 바깥 사실을 elanous 현재와 대조 (태스크 등록 없음) ──
   const intakeCmd = program.command('intake').description('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
   registerIntakeSourceCommands(intakeCmd);
@@ -227,6 +286,19 @@ export function registerIntakeCommands(program: Command): void {
           console.log(renderIntakeAuthorOutcomes(authoring));
         }
       }
+    });
+
+  intakeCmd
+    .command('candidates')
+    .description('지시·흡수·소원에서 읽기 전용 요구 후보를 모은다')
+    .option('--json', '구조화 출력')
+    .option('--limit <n>', '출력할 후보 상한')
+    .action(async (opts: { json?: boolean; limit?: string }) => {
+      if (opts.limit !== undefined) {
+        try { parseCandidatesLimit(opts.limit); }
+        catch (error) { console.error((error as Error).message); process.exitCode = 2; return; }
+      }
+      await runIntakeCandidatesCli(opts, candidateDeps);
     });
 
   // 정기 외부 흡수 원장 — RFC-regular-external-intake-and-normalization-pipeline §3 (① 모양 · ② 중복).

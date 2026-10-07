@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectPriorDraftFindings, goalTitleFromTargetGoalFile, type PriorDraftPr } from './prior-draft-findings.js';
 import { runSelfImplement, type ReviewDiffContext } from './orchestrator.js';
+import { format } from '../agent-substrate/pr-comment-meta.js';
 import { seams as testSeams } from './test-seams.js';
 
 const now = new Date().toISOString();
@@ -129,6 +130,30 @@ describe('collectPriorDraftFindings', () => {
         : [reviewer('run-old', 0, ['obsolete']), reviewer('run-old', 2, ['latest'])],
     });
     expect(results).toEqual([{ pr: 1, runId: 'run-old', round: 2, items: ['latest'] }]);
+  });
+
+  test('status history uses its last reviewer record and preserves the parent comment timestamp and id', async () => {
+    const old = '2020-01-01T00:00:00Z';
+    const early = reviewer('run-old', 0, ['early']);
+    const latest = reviewer('run-old', 2, ['latest status finding']);
+    const status = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n\n${early.body}\n\n${latest.body}\n</details>`;
+    const results = await collectPriorDraftFindings({
+      goalTitle: '같은 골', currentRunId: 'run-new',
+      listPrs: () => [{ ...base, number: 1, createdAt: old }, { ...base, number: 2, createdAt: old }],
+      listComments: (pr) => pr === 1
+        ? [{ body: status, created_at: now, id: 101 }, { ...reviewer('run-old', 3, ['older comment']), created_at: now, id: 100 }]
+        : [{ body: status, created_at: old, id: 101 }],
+    });
+    expect(results).toEqual([{ pr: 1, runId: 'run-old', round: 2, items: ['latest status finding'] }]);
+  });
+
+  test('current run inside status history excludes the entire draft', async () => {
+    const status = `<!-- elanous:run-status -->\n<details>\n<summary>Round history</summary>\n\n${reviewer('run-old', 0, ['old']).body}\n\n${format({ role: 'author', run: 'run-new', round: 1 })}\nRound 1: changed\n</details>`;
+    expect(await collectPriorDraftFindings({
+      goalTitle: '같은 골', currentRunId: 'run-new',
+      listPrs: () => [{ ...base, number: 1 }],
+      listComments: () => [{ body: status, created_at: now, id: 42 }],
+    })).toEqual([]);
   });
 
   test('caps items to 300 characters and twelve overall, with only must-fix bullets after the heading', async () => {

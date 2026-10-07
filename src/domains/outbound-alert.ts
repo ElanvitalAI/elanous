@@ -5,8 +5,8 @@
 // send.py 와 동일 동작을 TS 로 포팅(완전 elanous 소유). sync(curl) 계약.
 
 import * as childProcess from 'node:child_process';
-import { existsSync, readFileSync, appendFileSync, mkdirSync, unlinkSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { existsSync, readFileSync, appendFileSync, mkdirSync, unlinkSync, readdirSync, renameSync, openSync, closeSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { conatusEnv } from './conatus-env.js';
@@ -138,11 +138,11 @@ export function userRecentlyActive(now: Date = new Date()): boolean {
 
 /** 야간 보류 적재 (jsonl append — 크론 동시 실행에 안전). origin 있으면 함께 적재 —
  *  아침 flush 가 그 origin(발신 채널)으로 되돌려 발송(없으면 report 묶음). */
-function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null, path = DEFERRED_PATH): boolean {
+export function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null, path = DEFERRED_PATH): boolean {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const rec = { ts: new Date().toISOString(), kind, text, ...(origin ? { origin } : {}) };
-    appendFileSync(path, JSON.stringify(rec) + '\n');
+    withQueueLock(path, () => appendFileSync(path, JSON.stringify(rec) + '\n'));
     console.error(`[outbound] 야간 무음(00:00~06:30 KST) — 보류 적재 (${kind})`);
     return true;
   } catch (e) {
@@ -198,32 +198,195 @@ function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: stri
   try { return sendTelegramRaw(token, origin.chatId, text, origin.threadId); } catch { return false; }
 }
 
-/** 보류분 일괄 발송 — 묶음 1건(아침 폭주 방지). 발송 건수 반환.
- *  무음 창 밖 첫 sendOutbound 가 자동 호출 + 06:31 플러시 크론이 보장. */
-export function flushDeferred(path = DEFERRED_PATH): number {
+/** 보류 큐 재시도 상한 env — config `outbound.deferredMaxAttempts` 가 없을 때만 읽는다. */
+export const DEFERRED_MAX_ATTEMPTS_ENV = 'ELANOUS_OUTBOUND_DEFERRED_MAX_ATTEMPTS';
+
+/** 보류 항목이 격리되기 전까지 허용하는 실패 flush 수 — config > env > 5. */
+export function deferredMaxAttempts(config?: Pick<UserConfig, 'outbound'>): number {
+  try {
+    const v = (config ?? getUserConfig()).outbound?.deferredMaxAttempts;
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v > 0) return v;
+  } catch { /* unreadable config: env, then default */ }
+  const raw = Number(process.env[DEFERRED_MAX_ATTEMPTS_ENV]?.trim() || NaN);
+  if (Number.isSafeInteger(raw) && raw > 0) return raw;
+  return 5;
+}
+
+/** 격리 파일 — 보류 큐 옆 `<name>.failed.jsonl`. */
+export function deferredQuarantinePath(path: string): string {
+  return path.endsWith('.jsonl') ? `${path.slice(0, -'.jsonl'.length)}.failed.jsonl` : `${path}.failed`;
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+/** 큐 적재·claim 이 서로를 가로지르지 않게 하는 짧은 배타 잠금(`<queue>.lock`, O_EXCL).
+ *  적재는 open→write→close 를 잠금 안에서 하므로 claim 의 rename 이 «열린 채 쓰기 전»인 적재를 가져가지 않는다.
+ *  잠금을 못 얻으면(2초 · 30초 넘은 잔여 잠금은 걷는다) 그대로 진행한다 — 알림을 잃는 것보다 낫다. */
+function withQueueLock<T>(path: string, fn: () => T): T {
+  const lock = `${path}.lock`;
+  const deadline = Date.now() + 2_000;
+  let fd: number | null = null;
+  while (fd === null && Date.now() <= deadline) {
+    try { fd = openSync(lock, 'wx'); break; } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') { try { mkdirSync(dirname(path), { recursive: true }); } catch { break; } continue; }
+      if (code !== 'EEXIST') break;
+      try { if (Date.now() - statSync(lock).mtimeMs > 30_000) { unlinkSync(lock); continue; } } catch { continue; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  if (fd === null) { try { debug.log('outbound.send', 'deferred-lock-unavailable', { lock: basename(lock) }); } catch { /* */ } }
+  try { return fn(); } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* */ } try { unlinkSync(lock); } catch { /* */ } }
+  }
+}
+
+/** 이보다 오래된 claim 은 소유 pid 가 살아 있어도 회수한다(pid 재사용 대비 · 정상 flush 는 이보다 훨씬 짧다). */
+const STALE_CLAIM_MS = 15 * 60_000;
+
+let claimSeq = 0;
+/** 큐를 «가져간다» — 원자적 rename 으로 이 flush 만의 파일로 옮긴다. flush 도중 적재되는 항목은 새 큐 파일에
+ *  쌓이므로 잃지 않는다. 죽은 flusher(또는 이 프로세스의 앞 호출)가 남긴 claim 도 같이 회수한다. */
+function claimDeferred(path: string): string[] {
+  const claims: string[] = [];
+  const next = (): string => `${path}.flushing-${process.pid}-${Date.now()}-${claimSeq++}`;
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.flushing-`;
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(prefix)) continue;
+      const m = /^(\d+)-(\d+)-/.exec(name.slice(prefix.length));
+      const pid = Number(m?.[1]);
+      const at = Number(m?.[2]);
+      if (!Number.isSafeInteger(pid)) continue;
+      // flushDeferred 는 동기라 같은 pid 의 claim 은 «지난 호출의 잔여»다. 남의 것은 죽었거나 오래됐을 때만.
+      const stale = Number.isFinite(at) && Date.now() - at > STALE_CLAIM_MS;
+      if (pid !== process.pid && !stale && pidAlive(pid)) continue;
+      const own = next();
+      try { renameSync(join(dir, name), own); claims.push(own); } catch { /* another flusher took it */ }
+    }
+  } catch { /* no directory yet */ }
+  withQueueLock(path, () => {
+    if (!existsSync(path)) return;
+    const own = next();
+    try { renameSync(path, own); claims.push(own); } catch { /* another flusher took it */ }
+  });
+  return claims;
+}
+
+/** flushDeferred 주입점 — 시험은 실제 발송 대신 sendBatch 를 준다. */
+export type FlushDeferredDeps = {
+  sendBatch?: (text: string, kind: string, origin?: MissionOrigin) => boolean;
+  maxAttempts?: number;
+};
+
+/** 보류분 일괄 발송 — 묶음 단위. 배달 건수 반환.
+ *  무음 창 밖 첫 sendOutbound 가 자동 호출 + 06:31 플러시 크론이 보장.
+ *  ⭐ 실패한 묶음의 항목만 큐에 남긴다(성공 묶음은 다시 보내지 않는다 · 10-07 야간 11회 재발송 사고).
+ *  실패가 `maxAttempts` 번 쌓인 항목은 `<name>.failed.jsonl` 로 격리한다. */
+export function flushDeferred(path = DEFERRED_PATH, deps: FlushDeferredDeps = {}): number {
   ensureOutboundLogSink();
-  const observeFlush = (count: number, lagMin: number, kinds: string[]): void => {
+  const observeFlush = (
+    count: number, lagMin: number, kinds: string[],
+    outcome: { sent: number; kept: number; quarantined: number },
+  ): void => {
     const lagWarnMin = flushLagWarnMin();
     const over = count > 0 && lagMin > lagWarnMin;
     logSend(
       'flush',
       'deferred-batch',
-      { count, lagMin, kinds: kinds.map(safeObservationLabel), path, lagWarnMin },
+      { count, lagMin, kinds: kinds.map(safeObservationLabel), path, lagWarnMin, ...outcome },
       over ? { level: 'warn' } : undefined,
     );
   };
-  if (!existsSync(path)) {
-    observeFlush(0, 0, []);
+  const none = { sent: 0, kept: 0, quarantined: 0 };
+  const claims = claimDeferred(path);
+  if (claims.length === 0) {
+    observeFlush(0, 0, [], none);
     return 0;
   }
-  type Item = { ts: string; kind: string; text: string; origin?: MissionOrigin };
-  let items: Item[] = [];
-  try {
-    items = readFileSync(path, 'utf-8').split('\n').filter(Boolean).map(l => JSON.parse(l));
-  } catch { /* 손상 라인 무시 */ }
+  type Item = { ts: string; kind: string; text: string; origin?: MissionOrigin; attempts?: number };
+  const items: Item[] = [];
+  const corrupt: string[] = [];
+  const readClaims: string[] = [];
+  for (const claim of claims) {
+    let body = '';
+    try { body = readFileSync(claim, 'utf-8'); } catch (e) {
+      // 못 읽은 claim 은 지우지 않는다 — 다음 flush 가 다시 회수한다.
+      try { debug.log('outbound.send', 'deferred-claim-unreadable', { error: e instanceof Error ? e.message : String(e) }, { level: 'warn' }); } catch { /* */ }
+      continue;
+    }
+    readClaims.push(claim);
+    for (const line of body.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line) as Item;
+        if (rec && typeof rec === 'object' && typeof rec.text === 'string') items.push(rec);
+        else corrupt.push(line);
+      } catch { corrupt.push(line); }
+    }
+  }
+  const qPath = deferredQuarantinePath(path);
+  const settleFailed = (stage: string, e: unknown): void => {
+    try { debug.log('outbound.send', 'deferred-settle-failed', { stage, error: e instanceof Error ? e.message : String(e) }, { level: 'warn' }); } catch { /* */ }
+  };
+  /** 읽은 claim 을 정산한다. 격리 기록이 실패하면 그 줄은 큐로 돌린다(다음에 다시 격리).
+   *  큐 기록이 실패하면 claim 하나를 «남길 줄만»으로 바꿔 두어 다음 flush 가 배달분을 다시 보내지 않게 한다. */
+  /** 정산된 claim 을 걷는다. 삭제가 실패하면 비워 둔다 — 남은 claim 이 다음 flush 에 배달분을 다시 내지 않게. */
+  const retireClaim = (claim: string): void => {
+    try { unlinkSync(claim); return; } catch (e) { settleFailed('claim-unlink', e); }
+    try { writeFileSync(claim, ''); } catch (e) { settleFailed('claim-truncate', e); }
+  };
+  type Quarantine = { line: string; kind?: string; attempts?: number };
+  /** 반환 = 실제 정산 결과(관측은 이것으로 센다). */
+  const settle = (keep: string[], quarantine: Quarantine[]): { kept: number; quarantined: number } => {
+    let back = keep;
+    let quarantined = 0;
+    if (quarantine.length) {
+      try {
+        appendFileSync(qPath, quarantine.map(q => q.line).join('\n') + '\n');
+        quarantined = quarantine.length;
+        for (const q of quarantine) {
+          if (q.kind === undefined) continue;
+          try { debug.log('outbound.send', 'deferred-quarantined', { kind: safeObservationLabel(q.kind), attempts: q.attempts }); } catch { /* */ }
+        }
+      } catch (e) { settleFailed('quarantine', e); back = [...keep, ...quarantine.map(q => q.line)]; }
+    }
+    const result = { kept: back.length, quarantined };
+    if (readClaims.length === 0) return result;
+    let wrote = back.length === 0;
+    if (!wrote) {
+      try { withQueueLock(path, () => appendFileSync(path, back.join('\n') + '\n')); wrote = true; } catch (e) { settleFailed('queue', e); }
+    }
+    if (!wrote) {
+      const first = readClaims[0]!;
+      const tmp = join(dirname(first), `.${basename(first)}.tmp`);
+      try {
+        writeFileSync(tmp, back.join('\n') + '\n');
+        renameSync(tmp, first);
+        for (const claim of readClaims.slice(1)) retireClaim(claim);
+      } catch (e) { settleFailed('claim-rewrite', e); }
+      return result;
+    }
+    for (const claim of readClaims) retireClaim(claim);
+    return result;
+  };
+  const maxAttempts = deps.maxAttempts ?? deferredMaxAttempts();
+  const priorAttempts = (it: Item): number =>
+    typeof it.attempts === 'number' && Number.isSafeInteger(it.attempts) && it.attempts > 0 ? it.attempts : 0;
+  const quarantine: Quarantine[] = corrupt.map(line => ({ line }));
+  // 이미 상한에 닿은 줄(앞 flush 의 격리 기록이 실패해 큐로 돌아온 것)은 보내지 않고 다시 격리만 시도한다.
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]!;
+    if (priorAttempts(it) < maxAttempts) continue;
+    quarantine.push({ line: JSON.stringify(it), kind: it.kind, attempts: priorAttempts(it) });
+    items.splice(i, 1);
+  }
   if (items.length === 0) {
-    try { unlinkSync(path); } catch { /* */ }
-    observeFlush(0, 0, []);
+    const settled = settle([], quarantine);
+    observeFlush(0, 0, [], { ...none, ...settled });
     return 0;
   }
   const kst = (iso: string) => {
@@ -236,8 +399,7 @@ export function flushDeferred(path = DEFERRED_PATH): number {
     `🌙 야간 보류 알림 ${list.length}건 (00:00~06:30 KST 무음 · ⏳ 최대 ${lagMin}분 지연 — 일괄 전달)`,
     ...list.map(i => `\n── [${kst(i.ts)} · ${i.kind}] ──\n${i.text}`),
   ].join('\n');
-  observeFlush(items.length, lagMin, [...new Set(items.map(i => i.kind))]);
-  const sendBatch = (text: string, kind: string, origin?: MissionOrigin): boolean => {
+  const sendBatch = deps.sendBatch ?? ((text: string, kind: string, origin?: MissionOrigin): boolean => {
     let bot = 'unknown';
     const path = origin
       ? (deliverToOrigin(origin, text, label => { bot = label; }) ? 'origin' : false)
@@ -250,15 +412,17 @@ export function flushDeferred(path = DEFERRED_PATH): number {
       });
     } catch { /* observation must not change delivery */ }
     return path !== false;
+  });
+  const failed: Item[] = [];
+  const send = (batch: Item[], kind: string, origin?: MissionOrigin): void => {
+    if (!sendBatch(fmt(batch), kind, origin)) failed.push(...batch);
   };
-  let delivered = 0;
   // origin 없는 매매 알림만 report 묶음. 그 외는 kind 별로 운영 봇 경계를 유지한다.
   const noOrigin = items.filter(i => !i.origin);
   const tradingBatch = noOrigin.filter(i => !isOperationalKind(i.kind));
-  if (tradingBatch.length && sendBatch(fmt(tradingBatch), 'report')) delivered += tradingBatch.length;
+  if (tradingBatch.length) send(tradingBatch, 'report');
   for (const kind of new Set(noOrigin.filter(i => isOperationalKind(i.kind)).map(i => i.kind))) {
-    const batch = noOrigin.filter(i => i.kind === kind);
-    if (sendBatch(fmt(batch), kind)) delivered += batch.length;
+    send(noOrigin.filter(i => i.kind === kind), kind);
   }
   // origin 있는 것 = 발신 채널·스레드별로 묶어 서로 다른 수신자에게 섞이지 않게 발송.
   const groups = new Map<string, { origin: MissionOrigin; list: Item[] }>();
@@ -272,10 +436,19 @@ export function flushDeferred(path = DEFERRED_PATH): number {
   }
   for (const g of groups.values()) {
     const kinds = new Set(g.list.map(i => i.kind));
-    if (sendBatch(fmt(g.list), kinds.size === 1 ? g.list[0]!.kind : 'mixed', g.origin)) delivered += g.list.length;
+    send(g.list, kinds.size === 1 ? g.list[0]!.kind : 'mixed', g.origin);
   }
-  // 전량 배달 성공 시에만 파일 제거(부분 실패는 다음 flush 재시도 — 성공분 중복은 드문 엣지 수용).
-  if (delivered >= items.length) { try { unlinkSync(path); } catch { /* */ } }
+  // 실패 묶음의 항목만 되돌린다(시도 수 +1). 상한에 닿은 항목은 격리 — 영원히 재시도하지 않는다.
+  const keep: string[] = [];
+  for (const it of failed) {
+    const attempts = priorAttempts(it) + 1;
+    const line = JSON.stringify({ ...it, attempts });
+    if (attempts >= maxAttempts) quarantine.push({ line, kind: it.kind, attempts });
+    else keep.push(line);
+  }
+  const settled = settle(keep, quarantine);
+  const delivered = items.length - failed.length;
+  observeFlush(items.length, lagMin, [...new Set(items.map(i => i.kind))], { sent: delivered, ...settled });
   return delivered;
 }
 

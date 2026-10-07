@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { FEATURE_MATURITY, maturityOn, visibleOn } from './feature-maturity';
 import { ROUTE_MATURITY } from '../../apps/pwa/src/lib/route-maturity';
@@ -22,11 +22,15 @@ function builtPages(directory: string): string[] {
   return [...pages, '/404'];
 }
 
+// release/public-export.yaml excludes the private investment dashboard page from the public export,
+// so there the grade stays while the page is absent (both trees must pass).
+const exportExcludedPages = ['/dashboard'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
+
 describe('feature maturity across surfaces', () => {
   test('each existing PWA page has exactly one PWA grade', () => {
     const pages = builtPages(app);
     expect(new Set(pages).size).toBe(pages.length);
-    expect(Object.keys(FEATURE_MATURITY.pwaRoute).sort()).toEqual(pages.sort());
+    expect(Object.keys(FEATURE_MATURITY.pwaRoute).sort()).toEqual([...pages, ...exportExcludedPages].sort());
     expect(Object.fromEntries(Object.entries(FEATURE_MATURITY.pwaRoute).map(([route, grade]) => [route, grade.pwa]))).toEqual(ROUTE_MATURITY);
     for (const [route, grade] of Object.entries(FEATURE_MATURITY.pwaRoute)) {
       expect(maturityOn(route, 'pwa')).toBe(grade.pwa);

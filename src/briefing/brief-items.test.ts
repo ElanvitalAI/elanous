@@ -4,6 +4,8 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, normalizeClaim, type BriefItem } from './brief-items.js';
+import { runRequirementFunnel } from '../intake-plane/requirement-funnel.js';
+import type { DirectiveRow } from '../intake-plane/requirement-funnel.js';
 
 const NOW = new Date('2026-10-05T00:00:00Z'); // 09:00 KST — after 08:30, before 22:00
 
@@ -132,6 +134,42 @@ test('invalid item and slot inputs do not add rows', () => {
     expect(() => store.compose('morning')).toThrow('invalid slot');
     expect(store.list()).toEqual([]);
     expect(store.list({ domain: '운영' })).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('08:30 compose reaches requirement funnel and shows P0 oldest directive; other slots preserve their items', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-funnel-'));
+  const directive: DirectiveRow = { ts: '2026-10-04T23:00:00Z',
+    track: 'OP', text: '대표 요구', source_file: 'directive.jsonl', line_no: 1 };
+  let calls = 0;
+  const ledger = new BriefItemsLedger({ stateDir: root, now: () => NOW, log: () => {}, requirementFunnel: now => {
+    calls++;
+    return runRequirementFunnel({ now, cells: [], sources: { directives: [directive] }, placement: {
+      schedules: [], released: '0.2.17', merged24h: 0, checklist: version => ({ version, released: '0.2.17', dev: version, items: [], history: [] }),
+    } });
+  } });
+  try {
+    const morning = ledger.compose('08:30');
+    expect(morning).toContain('들어온 요구 1(문별 지시 1');
+    expect(morning).toContain('대표 지시 중 아직 칸 없는 것 — 최근 24시간 1: 대표 요구');
+    expect(morning).toContain('[P0]');
+    expect(calls).toBe(1);
+    expect(ledger.list()).toEqual([]);
+    expect(ledger.compose('22:00')).not.toContain('대표 지시 중 아직 칸 없는 것');
+    expect(calls).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('08:30 compose still renders ledger items when the requirement funnel throws', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-funnel-fail-'));
+  const events: string[] = [];
+  const ledger = new BriefItemsLedger({ stateDir: root, now: () => NOW, log: (_c, event) => { events.push(event); },
+    requirementFunnel: () => { throw new Error('directive index unreadable'); } });
+  try {
+    ledger.add({ text: '원장 항목', domain: '운영', priority: 'P1', source: 'test', createdAt: '2026-10-04T20:00:00Z' });
+    const morning = ledger.compose('08:30');
+    expect(morning).toContain('원장 항목');
+    expect(events).toContain('requirement-funnel-failed');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

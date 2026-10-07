@@ -23,6 +23,7 @@ const MARKDOWN_COMPONENTS = { pre: CollapsibleCodeBlock };
 
 interface Props {
   message: ChatMessageT;
+  mobileSimple?: boolean;
 }
 
 /** REL9p — cards only in daemon-side messages; a user's own text is shown exactly as typed. */
@@ -57,8 +58,12 @@ function MarkdownBody({ text }: { text: string }) {
  *  even when CSS is stripped: `⋯` running, `✓` done, `✗` error. */
 function ToolPill({
   block,
+  children,
+  mobileSimple = false,
 }: {
   block: Extract<ChatBlock, { kind: 'tool_use' }>;
+  children?: React.ReactNode;
+  mobileSimple?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const icon =
@@ -69,7 +74,7 @@ function ToolPill({
       : block.status === 'error'
         ? 'text-destructive border-destructive/40'
         : 'text-foreground border-border';
-  const hasDetails = !!block.args && Object.keys(block.args).length > 0;
+  const hasDetails = mobileSimple || (!!block.args && Object.keys(block.args).length > 0) || !!children;
   const timing = [block.startedAt, block.endedAt]
     .filter((value): value is number => typeof value === 'number')
     .map((value) => new Date(value).toLocaleTimeString())
@@ -81,6 +86,7 @@ function ToolPill({
       data-elanous-tool-status={block.status}
       className={cn(
         'rounded border bg-muted/40 px-2 py-1 text-xs font-mono',
+        mobileSimple && 'min-w-0',
         tone,
       )}
     >
@@ -89,6 +95,7 @@ function ToolPill({
         onClick={hasDetails ? () => setOpen(!open) : undefined}
         className={cn(
           'flex w-full items-center gap-2 text-left',
+          mobileSimple && 'min-w-0 overflow-hidden whitespace-nowrap',
           hasDetails ? 'cursor-pointer' : 'cursor-default',
         )}
         aria-expanded={hasDetails ? open : undefined}
@@ -107,11 +114,16 @@ function ToolPill({
           </span>
         )}
       </button>
-      {open && hasDetails && (
-        <pre className="mt-1 overflow-x-auto rounded bg-background/60 p-1.5 text-[10px] leading-tight">
-          {JSON.stringify(block.args, null, 2)}
-        </pre>
-      )}
+      {open && hasDetails && (mobileSimple ? (
+        <div>
+          {!!block.args && Object.keys(block.args).length > 0 && <pre className="mt-1 overflow-x-auto rounded bg-background/60 p-1.5 text-[10px] leading-tight">
+            {JSON.stringify(block.args, null, 2)}
+          </pre>}
+          {children}
+        </div>
+      ) : <pre className="mt-1 overflow-x-auto rounded bg-background/60 p-1.5 text-[10px] leading-tight">
+        {JSON.stringify(block.args, null, 2)}
+      </pre>)}
     </div>
   );
 }
@@ -119,7 +131,7 @@ function ToolPill({
 /** Phase B-2/B-3 (PWA chat streaming · 2026-05-06) — multimodal block
  *  renderer. text → markdown; image → inline `<img>`; tool_use →
  *  status pill with optional args expand. */
-function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boolean }) {
+function BlocksBody({ blocks, showCards, mobileSimple = false }: { blocks: ChatBlock[]; showCards: boolean; mobileSimple?: boolean }) {
   return (
     <div className="flex flex-col gap-2">
       {blocks.map((block, idx) => {
@@ -144,8 +156,8 @@ function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boo
         if (block.kind === 'tool_use') {
           return (
             <div key={`${block.id}-${idx}`}>
-              <ToolPill block={block} />
-              <ContextSourcesCard sources={block.sources} />
+              <ToolPill block={block} mobileSimple={mobileSimple} {...(mobileSimple && block.sources?.length ? { children: <ContextSourcesCard sources={block.sources} /> } : {})} />
+              {!mobileSimple && <ContextSourcesCard sources={block.sources} />}
             </div>
           );
         }
@@ -190,7 +202,7 @@ function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boo
   );
 }
 
-export function ChatMessageView({ message }: Props) {
+export function ChatMessageView({ message, mobileSimple = false }: Props) {
   const isUser = message.role === 'user';
   const isMeta = message.role === 'meta';
   const isSystem = message.role === 'system';
@@ -201,7 +213,7 @@ export function ChatMessageView({ message }: Props) {
       <div className="px-2 py-1 text-[11px] text-muted-foreground italic">
         <pre className="whitespace-pre-wrap font-mono text-[11px]">{message.text}</pre>
         {message.blocks?.some((block) => block.kind === 'harness_ask') &&
-          <BlocksBody blocks={message.blocks} showCards={false} />}
+          <BlocksBody blocks={message.blocks} showCards={false} mobileSimple={mobileSimple} />}
       </div>
     );
   }
@@ -254,7 +266,7 @@ export function ChatMessageView({ message }: Props) {
         )}
       >
         {useBlocks
-          ? <BlocksBody blocks={message.blocks!} showCards={!isUser} />
+          ? <BlocksBody blocks={message.blocks!} showCards={!isUser} mobileSimple={mobileSimple} />
           : <CardTextBody text={message.text} showCards={!isUser} />}
         <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
           <span>{time}</span>

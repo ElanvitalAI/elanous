@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fixedCountAssertions, flakeVerdict, mutationProbe, sweepSlice } from './effectiveness.js';
+import { fixedCountAssertions, flakeVerdict, mutationProbe, sweepSlice, unreachableImports } from './effectiveness.js';
 import { judge, propose, writeCardDraft } from './lib.js';
 
 const pass = { rc: 0, pass: 1, fail: 0 };
@@ -126,13 +126,18 @@ describe('TD3 effectiveness', () => {
     expect(propose(judge({ ...base, secs: 61, effectiveness }, 0), new Map()).proposal).toBe('shrink');
     expect(propose(judge({ ...base, effectiveness: { ...effectiveness, fixedCounts: 0 } }, 0), new Map()).proposal).toBeNull();
   });
-  test('measure --effectiveness counts local assertions and leaves unreadable counts absent', () => {
+  test('measure --effectiveness counts unreachable imports and leaves unreadable results absent', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'td-fixed-measure-')));
     const bin = join(root, 'bin');
     const repo = join(root, 'repo');
     mkdirSync(bin);
     mkdirSync(join(repo, 'test'), { recursive: true });
-    writeFileSync(join(repo, 'test/counted.test.ts'), "import { readdirSync } from 'node:fs';\nexpect(files.length).toBe(1);\n");
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src/orphan.ts'), 'export const orphan = true;\n');
+    writeFileSync(join(repo, 'test/counted.test.ts'), "import { readdirSync } from 'node:fs';\nimport '../src/orphan.js';\nexpect(files.length).toBe(1);\n");
+    for (const args of [['init', '-q'], ['add', '.'], ['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'fixture']]) {
+      expect(spawnSync('git', args, { cwd: repo }).status).toBe(0);
+    }
     writeFileSync(join(bin, 'ssh'), '#!/bin/sh\necho "COMMIT abc"\nfor f in test/counted.test.ts test/missing.test.ts; do printf "M\\t%s\\t1\\t1\\t0\\t1\\t0\\t\\n" "$f"; printf "E\\t%s\\t0,1,0;0,1,0;0,1,0\\tcaught\\t1\\n" "$f"; done\n');
     chmodSync(join(bin, 'ssh'), 0o700);
     try {
@@ -141,9 +146,52 @@ describe('TD3 effectiveness', () => {
           ELANOUS_GRAPH_CONTEXT: JSON.stringify({ input: {}, outputs: { pick: { files: ['test/counted.test.ts', 'test/missing.test.ts'] } } }) },
       });
       expect(run.status).toBe(0);
-      const measurements = (JSON.parse(run.stdout.trim()) as { measurements: Array<{ effectiveness: { fixedCounts?: number } }> }).measurements;
+      const measurements = (JSON.parse(run.stdout.trim()) as { measurements: Array<{ effectiveness: { fixedCounts?: number; unreachable?: number } }> }).measurements;
       expect(measurements[0]?.effectiveness.fixedCounts).toBe(1);
+      expect(measurements[0]?.effectiveness.unreachable).toBe(1);
       expect(measurements[1]?.effectiveness.fixedCounts).toBeUndefined();
+      expect(measurements[1]?.effectiveness.unreachable).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('unreachable direct imports exclude tests and verify resolved tracked importer specifiers', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'td-unreachable-')));
+    try {
+      mkdirSync(join(root, 'src'));
+      mkdirSync(join(root, 'test'));
+      writeFileSync(join(root, 'src/used.ts'), 'export const used = true;\n');
+      writeFileSync(join(root, 'src/orphan.ts'), 'export const orphan = true;\n');
+      writeFileSync(join(root, 'src/used-not.ts'), 'export const other = true;\n');
+      writeFileSync(join(root, 'src/main.ts'), "import './used.js';\n");
+      writeFileSync(join(root, 'src/orphan-extra.test.ts'), "import './orphan.js';\n");
+      writeFileSync(join(root, 'src/used-not.ts'), "import './used-not.js';\n");
+      writeFileSync(join(root, 'test/x.test.ts'), "import '../src/used.js';\nimport('../src/orphan.js');\nimport('../../x.js');\n");
+      const git = (args: string[]) => {
+        const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+        expect(result.status).toBe(0);
+      };
+      git(['init', '-q']);
+      git(['add', '.']);
+      git(['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'fixture']);
+      expect(unreachableImports('test/x.test.ts', root)).toEqual(['src/orphan.ts']);
+      writeFileSync(join(root, 'src/main.ts'), 'export const main = true;\n');
+      git(['add', '.']);
+      git(['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'remove importer']);
+      expect(unreachableImports('test/x.test.ts', root)).toEqual(['src/orphan.ts', 'src/used.ts']);
+      expect(unreachableImports('test/x.test.ts', root, { importers: () => ['src/used-not.ts'] }))
+        .toEqual(['src/orphan.ts', 'src/used.ts']);
+      writeFileSync(join(root, 'src/main.ts'), "export { orphan } from './orphan.js';\n");
+      git(['add', '.']);
+      git(['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'reexport orphan']);
+      expect(unreachableImports('test/x.test.ts', root)).toEqual(['src/used.ts']);
+      writeFileSync(join(root, 'src/main.ts'), "export * from './orphan.js';\n");
+      git(['add', '.']);
+      git(['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'star reexport orphan']);
+      expect(unreachableImports('test/x.test.ts', root)).toEqual(['src/used.ts']);
+      writeFileSync(join(root, 'src/orphan-not.ts'), 'export const other = true;\n');
+      writeFileSync(join(root, 'src/main.ts'), "export * from './orphan-not.js';\n");
+      git(['add', '.']);
+      git(['-c', 'user.name=TD3', '-c', 'user.email=td3@example.test', 'commit', '-qm', 'reexport different module']);
+      expect(unreachableImports('test/x.test.ts', root)).toEqual(['src/orphan.ts', 'src/used.ts']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   test('mutation runs only inside a disposable repository copy; original bytes remain intact', () => {

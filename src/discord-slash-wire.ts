@@ -48,6 +48,7 @@ export const ELANOUS_SLASH_COMMANDS: readonly SlashCommandSchema[] = [
   { name: 'now', description: '지금 판·칸·결정·자리·최근 맥락 보기', options: [
     { name: 'topic', description: '좁혀 볼 주제 (선택)', type: 3, required: false },
   ] },
+  { name: 'loops', description: '루프·크론 현황 (늦음·실패 먼저)' },
   { name: 'sessions', description: '바인딩된 세션 목록' },
   { name: 'new', description: '새 세션으로 시작 (이전 대화 보존)' },
   { name: 'attach', description: '이 채널을 다른 세션에 연결', options: [

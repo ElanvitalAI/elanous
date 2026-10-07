@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from 'node:child_process';
+import { isReleaseVersion } from './release-version.js';
 import { readFileSync } from 'node:fs';
 import { debug } from '../../src/debug/log.js';
 
@@ -17,7 +18,7 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid graph context');
   const context = value as Record<string, unknown>;
   const input = context.input as Record<string, unknown> | undefined;
-  if (!input || typeof input.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.version)
+  if (!input || typeof input.version !== 'string' || !isReleaseVersion(input.version)
     || typeof input.previousVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.previousVersion)) throw new Error('version and previousVersion required');
   return { input: input as GraphContext['input'], outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };
 }

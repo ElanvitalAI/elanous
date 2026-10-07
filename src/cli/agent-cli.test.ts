@@ -1,10 +1,10 @@
 import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
-import { unattendedSetupHint } from '../onboarding/entry-hints.js';
+import { UNATTENDED_SETUP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -40,24 +40,37 @@ describe('agent CLI onboarding refusal', () => {
     }
   }, 60_000);
 
-  test('unconfigured chat with closed stdin preserves its refusal instead of the agent hint', () => {
+  // FIRST-CHAT-NONTTY(#24511): a non-TTY first chat tries first run (subscription detection) instead of the old wizard
+  // refusal. Detection must not reach the host — a Mac with a logged-in `claude` (keychain, not HOME) or `codex` on PATH
+  // would read «ready» and call the LLM — so PATH keeps only bun and the system tools.
+  test('unconfigured chat with closed stdin and no detectable LLM stops with the setup next step (rc 2), not the agent hint', () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-chat-cli-onboarding-'));
     const stateDir = join(home, 'state');
     const configDir = join(home, 'config');
     mkdirSync(stateDir);
     mkdirSync(configDir);
     try {
-      const env = { ...process.env };
-      for (const key of ['ELANOUS_HARNESS_SPACE', 'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_RUN_CONTEXT']) delete env[key];
+      // No host config or credential reaches the child: drop every elanous/provider variable, then add back only ours.
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+        !/^(ELANOUS_|ANTHROPIC_|OPENAI_|XAI_|GROK_|GEMINI_|GOOGLE_|CLAUDE|CODEX_|OPENROUTER_|LOCAL_LLM_)/.test(key)));
+      // PATH holds only the tools the CLI needs (bun · git · sh) — never a logged-in `claude`/`codex` from the host.
+      const bin = join(home, 'bin');
+      mkdirSync(bin);
+      for (const [name, target] of [['bun', process.execPath], ['git', Bun.which('git')], ['sh', Bun.which('sh')]] as const) {
+        if (target) symlinkSync(target, join(bin, name));
+      }
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'chat', 'hi'], {
         cwd: root,
-        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1', PATH: bin },
         input: '', encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다.');
-      expect(result.stderr).not.toContain('elanous agent needs a configured LLM');
+      expect(result.stdout).toContain(`다음: elanous setup llm (또는 ${UNATTENDED_SETUP_COMMAND})`);
+      expect(`${result.stdout}${result.stderr}`).not.toContain('elanous agent needs a configured LLM');
+      expect(result.stderr).not.toContain('unavailable');
+      expect(result.stderr).not.toMatch(/^\s*at /m);
+      expect(result.stdout).not.toMatch(/^\s*at /m);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

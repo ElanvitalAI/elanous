@@ -398,8 +398,18 @@ export function registerProviderCommands(program: Command): void {
     .command('refresh <name>')
     .description('그 계정의 codex 토큰을 호스트에서 갱신해 정본 스토어로 반영한다 (⛔ default 거부 · 토큰 값은 안 찍는다 · ⚠️ refresh 토큰은 갱신마다 회전 — 본부 한 곳에서만)')
     .action(async (name: string) => {
-      const { refreshCodexAccountHome } = await import('../oauth/codex.js');
-      const r = await refreshCodexAccountHome(name);
+      const { refreshCodexAccountHome, codexAccountRefreshLockPath, withCodexAccountRefreshLock, CodexRefreshLockUnavailableError } = await import('../oauth/codex.js');
+      // PREREFRESH-LOCK: the same per-account lock as the Pod pre-refresh — a hand refresh never races a launch.
+      // 이름 있는 계정의 잠금 자리를 못 구하면 잠금 없이 갱신하지 않는다(Pod 선갱신과 경합하는 자리) — default 는 refreshCodexAccountHome 이 거부한다.
+      const lockPath = name === 'default' ? null : codexAccountRefreshLockPath(name);
+      if (name !== 'default' && !lockPath) { console.error(`갱신 거부: ${name} 의 잠금 자리를 못 구했다(계정 홈 없음) — 잠금 없이 갱신하지 않는다`); process.exitCode = 1; return; }
+      let r: Awaited<ReturnType<typeof refreshCodexAccountHome>>;
+      try { r = await withCodexAccountRefreshLock(lockPath, () => refreshCodexAccountHome(name)); }
+      catch (lockError) {
+        if (!(lockError instanceof CodexRefreshLockUnavailableError)) throw lockError;
+        const why = lockError.reason === 'lock-timeout' ? '다른 갱신이 진행 중 — 잠시 뒤 다시' : `잠금 파일을 못 만들었다: ${lockError.message}`;
+        console.error(`갱신 거부: ${name} 의 갱신 잠금을 못 잡았다(${why})`); process.exitCode = 1; return;
+      }
       if (!r.ok) { console.error(`갱신 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
       const h = (v: number | null) => (v === null ? '?' : `${v}h`);
       console.log(`✅ ${name} 갱신 — 남은 시간 ${h(r.beforeH)} → ${h(r.afterH)} · storeKey=${r.storeKey}`);

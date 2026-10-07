@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug } from '../debug/log.js';
-import { parse as parsePrCommentMeta } from '../agent-substrate/pr-comment-meta.js';
+import { expandRecords, parse as parsePrCommentMeta } from '../agent-substrate/pr-comment-meta.js';
 
 export interface PriorDraftPr {
   number: number;
@@ -85,9 +85,10 @@ export async function collectPriorDraftFindings({
         continue;
       }
       const prActivity = Date.parse(pr.state.toUpperCase() === 'CLOSED' ? pr.closedAt ?? pr.createdAt : pr.createdAt);
+      const records = comments.flatMap((comment) => expandRecords(comment.body).map((body) => ({ ...comment, body })));
       // A PR bearing the current run's comment is this run's PR, not a predecessor.
-      if (comments.some((comment) => parsePrCommentMeta(comment.body)?.run === currentRunId)) continue;
-      const reviewers = comments.flatMap((comment) => {
+      if (records.some((comment) => parsePrCommentMeta(comment.body)?.run === currentRunId)) continue;
+      const reviewers = records.flatMap((comment) => {
         const meta = parsePrCommentMeta(comment.body);
         return meta?.role === 'reviewer' && meta.run && meta.round !== undefined
           ? [{ comment, meta }] : [];

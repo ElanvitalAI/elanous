@@ -282,3 +282,42 @@ describe('autopilot CLI extraction', () => {
     expect(autopilot.commands.find(command => command.name() === 'landing')!.aliases()).toEqual(['land']);
   });
 });
+
+describe('autopilot task-agent-action — 손상된 상태 파일', () => {
+  test('손상된 task-agent-actions.json → 실행 없이 exit 1 · 파일 그대로 (ENOENT 만 빈 상태)', async () => {
+    const { mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { setElanousConfigDir, resetElanousConfigDir } = await import('../elanous-config-dir.js');
+    const dir = mkdtempSync(join(tmpdir(), 'ta-action-'));
+    const statePath = join(dir, 'task-agent-actions.json');
+    const corrupted = '{"failureCounts": {"k": 3}, "landingsToday": 2';
+    writeFileSync(statePath, corrupted);
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    const origOut = process.stdout.write.bind(process.stdout);
+    const previous = process.exitCode;
+    setElanousConfigDir(dir);
+    process.exitCode = undefined;
+    process.stderr.write = ((chunk: string) => { stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    process.stdout.write = ((chunk: string) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    let code: typeof process.exitCode;
+    try {
+      const program = new Command().name('elanous').exitOverride();
+      registerAutopilotCommands(program, { registerSink: async () => true });
+      const action = { kind: 'retry', variant: 'narrow', taskId: 't1', rationale: 'r', pr: 1, runId: 'run-1', original: 'o', checklistId: 'C1' };
+      await program.parseAsync(['node', 'elanous', 'autopilot', 'task-agent-action', JSON.stringify(action)]);
+      code = process.exitCode;
+    } finally {
+      process.stderr.write = origErr;
+      process.stdout.write = origOut;
+      resetElanousConfigDir();
+      process.exitCode = previous;
+    }
+    expect(Number(code)).toBe(1);
+    expect(stderr.join('')).toContain('덮어쓰지 않고 멈춘다');
+    expect(stdout.join('')).toBe('');
+    expect(readFileSync(statePath, 'utf8')).toBe(corrupted);
+  });
+});

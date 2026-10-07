@@ -1,24 +1,25 @@
 #!/usr/bin/env bun
-import { checklistGate, listChecklist, summarizeChecklist } from '../../src/release-loop/checklist.js';
+import { cutChecklistGate, listChecklist, summarizeChecklist } from '../../src/release-loop/checklist.js';
 import * as store from '../../src/release-loop/feature-store.js';
 import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { debug } from '../../src/debug/log.js';
+import { prereleaseKind } from './release-version.js';
 import { emitNodeResult, errorResult, readGraphContext, type GraphContext } from './node-verdict.js';
+
+/** RELEASE-REHEARSAL-RC: a prerelease rehearses the pipeline; it must not judge or carry the stable version's cells. */
+export function prereleaseChecklistSkip(context: GraphContext) {
+  const version = context.input.version;
+  if (prereleaseKind(version) === null) return null;
+  debug.log('release-loop.checklist-gate', 'skipped', { version, reason: 'prerelease' });
+  return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `checklist gate skipped — ${version} is a prerelease rehearsal`, skipped: 'prerelease' };
+}
 
 export function runChecklistGate(context: GraphContext = readGraphContext(), now: Date = new Date()) {
   const version = context.input.version;
   const data = listChecklist(version);
   const schedule = getSchedule(version);
   const deadline = schedule?.landBy;
-  const overdue = deadline !== null && deadline !== undefined && now.getTime() > Date.parse(deadline);
-  const autoMoved = overdue ? data.items.filter((item) => item.status === 'yellow' && item.priority !== 'P0' && item.disposition === undefined).map((item) => item.id) : [];
-  const gate = checklistGate(version);
-  const p0 = data.items.filter((item) => item.status === 'yellow' && item.priority === 'P0').map((item) => item.id);
-  gate.undecided = gate.undecided.filter((id) => !autoMoved.includes(id) && !p0.includes(id));
-  gate.moved = gate.moved.filter((id) => !p0.includes(id)).concat(autoMoved);
-  gate.knownIssues = gate.knownIssues.filter((item) => !p0.includes(item.id));
-  gate.blocked.push(...p0.filter((id) => !gate.blocked.includes(id)));
-  gate.ok = gate.red.length === 0 && gate.undecided.length === 0 && gate.blocked.length === 0;
+  const { autoMoved, ...gate } = cutChecklistGate(version, deadline, now);
   const [major, minor, patch] = version.split('.').map(Number);
   const next = `${major}.${minor}.${patch! + 1}`;
   const carried: string[] = [];
@@ -65,7 +66,8 @@ export function runChecklistGate(context: GraphContext = readGraphContext(), now
 
 if (import.meta.main) {
   try {
-    const result = runChecklistGate();
+    const context = readGraphContext();
+    const result = prereleaseChecklistSkip(context) ?? runChecklistGate(context);
     emitNodeResult(result);
     process.exitCode = result.outcome === 'ok' ? 0 : 1;
   } catch (error) {

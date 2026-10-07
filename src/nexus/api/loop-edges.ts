@@ -1,5 +1,7 @@
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { listSeatRequests, type SeatRequestRow } from '../../seat-dispatch/seat-request-ledger.js';
 import { listCoordEvents } from '../../context-bus/coord-events.js';
 import { CardStore, cardIndexPath, type TaskCard } from '../../task-cards/card-store.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
@@ -21,7 +23,9 @@ export interface LoopEdgesDeps {
   cardRoot?: string;
   ledgerDir?: string;
   listCards?: () => TaskCard[];
-  listRunStarts?: (since: string) => Array<{ runId: string; at: string; seat: string }>;
+  listRunStarts?: (since: string) => Array<{ runId: string; at: string; seat: string; mergedAt?: string }>;
+  listSeatRequests?: () => SeatRequestRow[];
+  listOrchestratorLaunches?: () => Array<{ key: string; runId: string }>;
   listLoopOwners?: () => Array<{ id: string; owner?: string | null }>;
   seatIds?: () => string[];
 }
@@ -47,7 +51,9 @@ function inWindow(at: string, since: number, now: number): boolean {
   return Number.isFinite(ms) && ms >= since && ms <= now;
 }
 
-function cardEdges(card: TaskCard, since: number, now: number, seats: ReadonlySet<string>): LoopEdge[] {
+type PlacedCell = { cardId: string; cellId: string; owner: string };
+
+function cardEdges(card: TaskCard, since: number, now: number, seats: ReadonlySet<string>, placedCells: PlacedCell[]): LoopEdge[] {
   if (!card.goalId.startsWith('wish:') || !ID.test(card.id)) return [];
   const node = `card:${card.id}`;
   const ref = card.id;
@@ -75,6 +81,7 @@ function cardEdges(card: TaskCard, since: number, now: number, seats: ReadonlySe
     if (!owner || !placement || placement.id !== cellId || !ID.test(cellId)
       || typeof placement.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(placement.version)) continue;
     placedOwners.add(owner);
+    placedCells.push({ cardId: card.id, cellId, owner });
     if (inWindow(section.createdAt, since, now)) {
       const cellNode = `loop:${cellId}`;
       edges.push({ at: section.createdAt, kind: 'card', from: node, to: cellNode, ref });
@@ -93,9 +100,9 @@ function cardEdges(card: TaskCard, since: number, now: number, seats: ReadonlySe
   return edges;
 }
 
-function runStarts(since: string, dir: string, owners: ReadonlyMap<string, string>, seats: ReadonlySet<string>): Array<{ runId: string; at: string; seat: string }> {
+function runStarts(since: string, dir: string, owners: ReadonlyMap<string, string>, seats: ReadonlySet<string>): Array<{ runId: string; at: string; seat: string; mergedAt?: string }> {
   if (!existsSync(dir)) return [];
-  const result: Array<{ runId: string; at: string; seat: string }> = [];
+  const result: Array<{ runId: string; at: string; seat: string; mergedAt?: string }> = [];
   let names: string[];
   try { names = readdirSync(dir); } catch { return []; }
   for (const name of names) {
@@ -110,14 +117,42 @@ function runStarts(since: string, dir: string, owners: ReadonlyMap<string, strin
     const feature = typeof start?.data.feature === 'string' ? start.data.feature : '';
     const launchSeat = start?.data.launchSeat ?? start?.data.seat ?? owners.get(feature)
       ?? start?.data.originAgent ?? start?.data.controller;
-    if (start?.timestamp && start.timestamp >= since && seat(launchSeat, seats)) {
-      result.push({ runId, at: start.timestamp, seat: launchSeat });
+    if (start?.timestamp && seat(launchSeat, seats)) {
+      const merged = entries?.find(entry => entry.event === 'merged' && entry.data.merged === true && typeof entry.timestamp === 'string');
+      if (start.timestamp >= since || (merged?.timestamp && merged.timestamp >= since)) {
+        result.push({ runId, at: start.timestamp, seat: launchSeat, ...(merged?.timestamp ? { mergedAt: merged.timestamp } : {}) });
+      }
     }
   }
   return result;
 }
 
-/** GET only; project an allowlist of fields from the three ledgers. Never serialize ledger records. */
+/** Project only the key and runId of orchestrator launches, never their card snapshots or prose. */
+function orchestratorLaunches(root: string): Array<{ key: string; runId: string }> {
+  const dir = join(root, 'loop', 'orchestrator');
+  if (!existsSync(dir)) return [];
+  const launches: Array<{ key: string; runId: string }> = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  for (const name of names) {
+    if (!/^[a-zA-Z0-9._-]+\.json$/.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      if (!statSync(path).isFile() || statSync(path).size > 5 * 1024 * 1024) continue;
+      const state = parse(readFileSync(path, 'utf8'));
+      if (state?.mode !== 'live' || !Array.isArray(state.launched)) continue;
+      for (const item of state.launched) {
+        const launch = object(item);
+        if (typeof launch?.key === 'string' && typeof launch.runId === 'string') {
+          launches.push({ key: launch.key, runId: launch.runId });
+        }
+      }
+    } catch { /* An unreadable tick cannot establish a launch. */ }
+  }
+  return launches;
+}
+
+/** GET only; project an allowlist of fields from the ledgers. Never serialize ledger records. */
 export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Response {
   const params = new URL(req.url).searchParams;
   const rawSince = params.get('since');
@@ -143,13 +178,14 @@ export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Resp
       if (seat(recipient, seats)) edges.push({ at: event.at, kind, from: event.refs.seat, to: recipient, ref });
     }
   }
+  const placedCells: PlacedCell[] = [];
   if (deps.listCards) {
-    for (const card of deps.listCards()) edges.push(...cardEdges(card, since, now, seats));
+    for (const card of deps.listCards()) edges.push(...cardEdges(card, since, now, seats, placedCells));
   } else {
     const root = deps.cardRoot;
     if (existsSync(cardIndexPath(root))) {
       const store = new CardStore(root, true);
-      try { for (const card of store.listCards()) edges.push(...cardEdges(card, since, now, seats)); }
+      try { for (const card of store.listCards()) edges.push(...cardEdges(card, since, now, seats, placedCells)); }
       finally { store.close(); }
     }
   }
@@ -163,9 +199,29 @@ export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Resp
     return (deps.ledgerDir ? [deps.ledgerDir] : resolveFederatedRunLedgerDirectories({ includeTest: false }))
       .flatMap(dir => runStarts(from, dir, owners, seats));
   });
-  for (const run of readStarts(sinceIso)) {
-    if (seat(run.seat, seats) && ID.test(run.runId) && inWindow(run.at, since, now)) {
-      edges.push({ at: run.at, kind: 'run', from: run.seat, to: `loop:${run.runId}`, ref: run.runId });
+  const runs = readStarts(sinceIso).filter(run => seat(run.seat, seats) && ID.test(run.runId)
+    && (inWindow(run.at, since, now) || (run.mergedAt !== undefined && inWindow(run.mergedAt, since, now))));
+  for (const run of runs) {
+    if (inWindow(run.at, since, now)) edges.push({ at: run.at, kind: 'run', from: run.seat, to: `loop:${run.runId}`, ref: run.runId });
+  }
+  if (placedCells.length && runs.length) {
+    const root = deps.cardRoot ?? effectiveInstanceRoot();
+    let requests: SeatRequestRow[] = [];
+    let launches: Array<{ key: string; runId: string }> = [];
+    try { requests = (deps.listSeatRequests ?? (() => listSeatRequests(root)))(); } catch { /* Missing request evidence is not a match. */ }
+    try { launches = (deps.listOrchestratorLaunches ?? (() => orchestratorLaunches(root)))(); } catch { /* Missing launch evidence is not a match. */ }
+    const confirmed = new Set(launches.filter(item => ID.test(item.runId) && runs.some(run => run.runId === item.runId))
+      .map(item => JSON.stringify([item.key, item.runId])));
+    for (const cell of placedCells) {
+      const key = `orch:${cell.cardId}:${cell.cellId}`;
+      if (!requests.some(row => row.key === key && row.cell === cell.cellId && row.source === 'orchestrator' && row.seat === cell.owner)) continue;
+      for (const run of runs) {
+        if (run.seat !== cell.owner || !confirmed.has(JSON.stringify([key, run.runId]))) continue;
+        if (inWindow(run.at, since, now)) edges.push({ at: run.at, kind: 'card', from: cell.owner, to: `loop:${run.runId}`, ref: cell.cardId });
+        if (run.mergedAt && inWindow(run.mergedAt, since, now)) {
+          edges.push({ at: run.mergedAt, kind: 'card', from: `loop:${run.runId}`, to: `landed:${cell.cellId}`, ref: cell.cardId });
+        }
+      }
     }
   }
   edges.sort((a, b) => b.at.localeCompare(a.at) || a.kind.localeCompare(b.kind) || a.from.localeCompare(b.from) || a.to.localeCompare(b.to));

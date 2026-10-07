@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { LessonLedger, type LessonRow } from '../lessons/lesson-ledger.js';
-import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
+import { DecisionLedger, type DecisionEntry, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { devVersion, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { debug } from '../debug/log.js';
 
@@ -31,6 +31,7 @@ export interface KnowResult {
 export interface KnowFindDeps {
   directives: (query: string) => DirectiveRow[];
   decisions: () => DecisionEntry[];
+  seatDecisions: () => SeatDecisionRecord[];
   checklist: (version: string) => Checklist;
   lessons: (query: string) => LessonRow[];
   versions: () => string[];
@@ -49,6 +50,7 @@ const defaults: KnowFindDeps = {
     try { return index.search(query); } finally { index.close(); }
   },
   decisions: () => new DecisionLedger().list({ status: 'all' }),
+  seatDecisions: () => new DecisionLedger().seatReport(),
   checklist: (version) => listChecklist(version),
   lessons: (query) => new LessonLedger().find(query),
   versions,
@@ -82,6 +84,13 @@ export function knowFind(query: string, deps: Partial<KnowFindDeps> = {}): KnowR
       rows.push({ source: 'decision', id: row.id, title: row.title, status: row.status,
         at: row.decidedAt ?? row.withdrawnAt ?? row.raisedAt ?? row.importedAt ?? '', current: row.status === 'open',
         ref: row.refs?.[0] ?? `decisions show ${row.id}` });
+    }
+  });
+  attempt('decision', () => {
+    for (const row of read.seatDecisions()) {
+      if (!matches([row.title, row.decision, row.delegation].join(' '), words)) continue;
+      rows.push({ source: 'decision', id: row.id, title: row.title, status: 'seat-posthoc',
+        at: row.decidedAt ?? row.recordedAt, current: false, ref: `decisions seat-report --seat ${row.seat}` });
     }
   });
   attempt('checklist', () => {

@@ -41,7 +41,8 @@ import { dispatchTouchWheel, touchScrollAction, touchScrollLines, touchWheelLine
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
-import { registerTerminalHistoryView, registerTerminalInput } from './terminal-input-registry';
+import { registerTerminalHistoryView, registerTerminalInput, takeStickyModifiers } from './terminal-input-registry';
+import { applyStickyModifiers, canApplyStickyModifiers } from '@/lib/key-sequences';
 import { shouldClear } from './terminal-clear';
 import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFocusStartDisabled, readTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from '@/lib/term-focus';
 import { useCompactMode } from '@/lib/compact-mode';
@@ -365,9 +366,9 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // WT-A-2a — keyboard input writeback. xterm.js `onData` emits the
     // standard terminal byte sequence for every key (modifyOtherKeys
     // v2 / kitty keyboard protocol when caps allow), bracketed paste
-    // (DECSET 2004), focus reports (DECSET 1004). We forward the bytes
-    // verbatim — the daemon-side PTY hands them to bash/vim/tmux which
-    // already know how to parse them. Caller can opt out via readOnly.
+    // (DECSET 2004), focus reports (DECSET 1004). Except for a one-shot
+    // software modifier, these bytes reach the daemon-side PTY verbatim.
+    // Caller can opt out via readOnly.
     const dataDisposable = readOnly
       ? null
       : term.onData((data) => {
@@ -385,8 +386,13 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
             });
             return;
           }
+          // Consume the toggle only for input it can transform; a focus
+          // report or paste must leave Ctrl/Alt armed for the next key.
+          const mods = canApplyStickyModifiers(data) ? takeStickyModifiers(terminalId) : null;
+          const input = mods ? applyStickyModifiers(data, mods) : data;
+          if (mods) debugLog('webterm.modbar.sticky-applied', { ctrl: mods.ctrl, alt: mods.alt, bytes: new TextEncoder().encode(input).length });
           debugLog('webterm.xterm.onData', { terminalId, bytes: data.length });
-          inputSender.push(data);
+          inputSender.push(input);
         });
 
     // WT-A-2a — resize → ACP `terminal/resize`. xterm.js fires onResize

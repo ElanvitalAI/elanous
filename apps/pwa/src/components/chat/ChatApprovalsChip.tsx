@@ -9,7 +9,7 @@ import { createGraphApprovalsApi, type GraphApproval } from '@/lib/graph-approva
 
 type ApprovalState = { client: DaemonClient; items: GraphApproval[]; pending: number; expanded: boolean };
 
-export function ChatApprovalsChip() {
+export function ChatApprovalsChip({ mobileOpen, onCount }: { mobileOpen?: boolean; onCount?: (count: number) => void } = {}) {
   const { client } = useDaemon();
   const api = useMemo(() => createGraphApprovalsApi({ client }), [client]);
   const [state, setState] = useState<ApprovalState>({ client, items: [], pending: 0, expanded: false });
@@ -54,21 +54,21 @@ export function ChatApprovalsChip() {
   }, [client, refresh]);
 
   useEffect(() => { debugLog('chat.approvals', { pending: visible?.pending ?? 0, expanded: visible?.expanded ?? false }); }, [visible?.pending, visible?.expanded]);
+  useEffect(() => { onCount?.(visible?.pending ?? 0); }, [onCount, visible?.pending]);
 
   if (!visible?.pending) return null;
+  if (onCount && !mobileOpen) return null;
+  const approvals = <ExecApprovals client={client} approvals={visible.items} onDecided={() => { void refresh(); }} onPendingChange={n => {
+    if (currentClient.current !== client) return;
+    setState(previous => previous.client === client ? {
+      ...previous, pending: n, ...(n === 0 ? { items: [], expanded: false } : {}),
+    } : previous);
+  }} />;
+  if (onCount) return <div id="chat-approvals-panel" className="max-h-[min(50vh,24rem)] overflow-y-auto border-b border-border p-3">{approvals}</div>;
   return <div className="shrink-0 border-b border-border bg-background px-3 py-1.5 text-sm">
     <button type="button" aria-expanded={visible.expanded} aria-controls="chat-approvals-panel" onClick={() => setState(previous => previous.client === client ? { ...previous, expanded: !previous.expanded } : previous)} className="rounded-full border border-border bg-muted px-3 py-1 font-medium text-foreground hover:bg-muted/70">
       승인 대기 {visible.pending}
     </button>
-    {visible.expanded && <div id="chat-approvals-panel" className="mt-2 max-h-[min(50vh,24rem)] overflow-y-auto rounded-lg border border-border p-3">
-      <ExecApprovals client={client} approvals={visible.items} onDecided={() => { void refresh(); }} onPendingChange={n => {
-        if (currentClient.current !== client) return;
-        setState(previous => previous.client === client ? {
-          ...previous,
-          pending: n,
-          ...(n === 0 ? { items: [], expanded: false } : {}),
-        } : previous);
-      }} />
-    </div>}
+    {visible.expanded && <div id="chat-approvals-panel" className="mt-2 max-h-[min(50vh,24rem)] overflow-y-auto rounded-lg border border-border p-3">{approvals}</div>}
   </div>;
 }

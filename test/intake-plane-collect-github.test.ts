@@ -8,6 +8,7 @@ import {
   DEFAULT_GITHUB_STAR_PER_QUERY,
   GITHUB_STAR_QUERIES,
   githubStarsFile,
+  reposFromGhSearchItems,
   type GithubStarRepo,
   type SearchGithubRepos,
 } from '../src/intake-plane/collect-github.js';
@@ -65,7 +66,7 @@ test('어제 별 100 · 오늘 별 160 이면 github.starsDelta 는 60 이다', 
   expect(item?.signals['github.starsPerDay']).toBe(60);
   expect(item?.signals['github.stars']).toBe(160);
   expect(item?.url).toBe('https://github.com/acme/agent');
-  expect(item?.text).toBe('acme/agent desc');
+  expect(item?.text).toBe('라이선스: 미상\nacme/agent desc');
   expect(res.repos[0]).toMatchObject({ starsDelta: 60, starsPerDay: 60 });
   const lines = readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   expect(lines.at(-1)).toEqual({ day: DAY, repo: 'acme/agent', stars: 160 });
@@ -97,15 +98,66 @@ test('dry-run 은 원장·스냅숏을 바꾸지 않고 질의별 받은 수와 
   expect(() => readFileSync(githubStarsFile(r), 'utf8')).toThrow();
 });
 
-test('기본 days 는 30 · 기본 per-query 는 20 · 질의는 열 개 미만이다', async () => {
+test('기본 days 는 30 · 기본 per-query 는 20 · 질의는 열 개 이하다', async () => {
   const r = root();
   const f = fake({});
   const res = await collectGithubStars(r, f, { day: DAY, dryRun: true });
   expect(res.days).toBe(DEFAULT_GITHUB_STAR_DAYS);
   expect(DEFAULT_GITHUB_STAR_DAYS).toBe(30);
   expect(res.perQuery).toBe(DEFAULT_GITHUB_STAR_PER_QUERY);
-  expect(GITHUB_STAR_QUERIES.length).toBeLessThan(10);
+  expect(GITHUB_STAR_QUERIES.length).toBeLessThanOrEqual(10);
+  for (const topic of ['agent-framework', 'computer-use', 'local-llm', 'claude-code', 'codex', 'agent-memory']) {
+    expect(GITHUB_STAR_QUERIES).toContain(`topic:${topic}` as (typeof GITHUB_STAR_QUERIES)[number]);
+  }
   expect(f.calls).toHaveLength(GITHUB_STAR_QUERIES.length);
+  expect(f.calls.length).toBeLessThanOrEqual(10);
+});
+
+test('7일 이전 가장 가까운 스냅숏으로 급등률을 계산하고 별 순보다 앞세운다', async () => {
+  const r = root();
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(githubStarsFile(r), [
+    { day: '2026-09-16', repo: 'acme/surge', stars: 100 },
+    { day: '2026-09-19', repo: 'acme/surge', stars: 200 },
+    { day: '2026-09-25', repo: 'acme/surge', stars: 690 },
+    { day: '2026-09-19', repo: 'other/large', stars: 1000 },
+  ].map((s) => JSON.stringify(s)).join('\n') + '\n');
+  const res = await collectGithubStars(r, fake({
+    [GITHUB_STAR_QUERIES[0]]: [repo('other/large', 1070), repo('acme/surge', 700, { license: 'MIT' }), repo('new/top', 2000)],
+  }), { day: DAY });
+  expect(res.repos.map((row) => row.repo)).toEqual(['acme/surge', 'other/large', 'new/top']);
+  expect(res.repos[0]).toMatchObject({ starsDelta: 10, starsPerDay: 500 / 7, baselineDays: 7, license: 'MIT' });
+  expect(res.repos[1]).toMatchObject({ starsPerDay: 10, baselineDays: 7 });
+  expect(res.repos[2]?.starsPerDay).toBeUndefined();
+  expect(listIntakeItems(r).find((i) => i.title === 'acme/surge')?.text).toBe('라이선스: MIT\nacme/surge desc');
+  expect(readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').at(-1)).toBe(JSON.stringify({ day: DAY, repo: 'new/top', stars: 2000 }));
+});
+
+test('7일 이전 스냅숏이 없으면 직전 스냅숏으로 계산한다', async () => {
+  const r = root();
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(githubStarsFile(r), JSON.stringify({ day: '2026-09-25', repo: 'acme/agent', stars: 690 }) + '\n');
+  const res = await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: [repo('acme/agent', 700)] }), { day: DAY, dryRun: true });
+  expect(res.repos[0]).toMatchObject({ starsDelta: 10, starsPerDay: 10, baselineDays: 1 });
+});
+
+test('원장 본문 첫 줄은 언제나 라이선스 — SPDX ID · 확인된 부재는 없음 · 알려 주지 않으면 미상', async () => {
+  const r = root();
+  const source = [
+    { full_name: 'acme/licensed', html_url: 'https://github.com/acme/licensed', description: 'MIT project', stargazers_count: 12, created_at: '2026-09-20T00:00:00Z', pushed_at: '2026-09-25T00:00:00Z', license: { spdx_id: 'MIT' } },
+    { full_name: 'acme/unlicensed', html_url: 'https://github.com/acme/unlicensed', description: 'no license', stargazers_count: 11, created_at: '2026-09-20T00:00:00Z', pushed_at: '2026-09-25T00:00:00Z', license: null },
+    { full_name: 'acme/unknown', html_url: 'https://github.com/acme/unknown', description: 'unchecked', stargazers_count: 10, created_at: '2026-09-20T00:00:00Z', pushed_at: '2026-09-25T00:00:00Z' },
+    { full_name: 'acme/unverified', html_url: 'https://github.com/acme/unverified', description: 'spdx not reported', stargazers_count: 9, created_at: '2026-09-20T00:00:00Z', pushed_at: '2026-09-25T00:00:00Z', license: { spdx_id: null } },
+  ];
+  const parsed = reposFromGhSearchItems(source, 20);
+  expect(parsed.map((row) => row.license)).toEqual(['MIT', '없음', undefined, undefined]);
+  const result = await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: parsed }), { day: DAY });
+  expect(result.repos.map((row) => row.license)).toEqual(['MIT', '없음', undefined, undefined]);
+  const byTitle = (name: string) => listIntakeItems(r).find((i) => i.title === `acme/${name}`)?.text;
+  expect(byTitle('licensed')).toBe('라이선스: MIT\nMIT project');
+  expect(byTitle('unlicensed')).toBe('라이선스: 없음\nno license');
+  expect(byTitle('unknown')).toBe('라이선스: 미상\nunchecked');
+  expect(byTitle('unverified')).toBe('라이선스: 미상\nspdx not reported');
 });
 
 test('최근 창 밖(생성·푸시 모두 오래됨)은 받지 않는다', async () => {

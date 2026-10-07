@@ -8,6 +8,7 @@ import { userConfigPath } from '../user-config.js';
 import { addItem, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { move, releasedVersion } from './feature-store.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
+import { parseRubric, rubricScore } from './rubric.js';
 
 export type PlacementPriority = 'P0' | 'P1' | 'P2';
 export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }
@@ -271,20 +272,29 @@ export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceR
   const backlog = deps.backlog ?? BACKLOG_VERSIONS;
   const next = rows.find((row) => versionOrder(row.version, version) > 0 && !backlog.includes(row.version));
   const snapshots = new Map(rows.map((row) => [row.version, [...(deps.checklist ?? listChecklist)(row.version).items]]));
-  const unstarted = snapshots.get(version)!.filter((item) => item.status === 'yellow' && !item.evidence);
+  const unstarted = snapshots.get(version)!.filter((item) => item.status === 'yellow' && !item.evidence)
+    .map((item, index) => {
+      const rubric = parseRubric(`${item.title}\n${item.evidence ?? ''}`);
+      return { item, index, score: rubric ? rubricScore(rubric) : null };
+    })
+    .sort((a, b) => {
+      if (a.score === null) return b.score === null ? a.index - b.index : 1;
+      if (b.score === null) return -1;
+      return a.score - b.score || a.index - b.index;
+    });
   if (unstarted.length && !next) throw new CliUserError(`${version} 다음 판이 없다`);
   if (!unstarted.length) return { decisions: [], blocked: [] };
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
   const caps = deps.seatCap ?? placementSeatCap();
   const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
   const result: RebalanceResult = { decisions: [], blocked: [] };
-  for (const item of unstarted) {
+  for (const { item, score } of unstarted) {
     const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap);
     if (violation) {
       result.blocked.push({ id: item.id, from: version, to: next!.version, reason: violation });
       continue;
     }
-    const reason = `${version} 착지 마감 2시간 전 미시작 칸 이월`;
+    const reason = `${version} 착지 마감 2시간 전 미시작 칸 이월${score === null ? '' : ` · 루브릭 ${score}`}`;
     result.decisions.push({ id: item.id, from: version, version: next!.version, reason, displaced: [] });
     snapshots.set(version, snapshots.get(version)!.filter((cell) => cell.id !== item.id));
     snapshots.get(next!.version)!.push(item);

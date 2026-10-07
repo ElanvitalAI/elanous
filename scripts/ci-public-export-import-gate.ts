@@ -88,9 +88,14 @@ export async function exportImportCheck(changedFiles: readonly string[], root: s
   const tracked = trackedFiles(root);
   if (!tracked) return { measured: false, hits: [], unseen: 0, detail: 'git ls-files 실패' };
   let included: Set<string>;
+  let present: Set<string>;
   try {
     const { loadExportConfig, selectExportFiles } = await exportSelectors();
-    included = new Set(selectExportFiles(tracked, loadExportConfig(root)));
+    const config = loadExportConfig(root);
+    included = new Set(selectExportFiles(tracked, config));
+    // An import target also exists in the export when `replace` writes a public file at that path. Only targets use
+    // this — a replaced private original is not shipped, so it is not scanned as an importer.
+    present = new Set([...included, ...Object.keys(config.replace ?? {})]);
   } catch (error) {
     return { measured: false, hits: [], unseen: 0, detail: error instanceof Error ? error.message : '매니페스트를 못 읽었다' };
   }
@@ -108,7 +113,7 @@ export async function exportImportCheck(changedFiles: readonly string[], root: s
       const resolvedSpec = resolveSpecifier(file, specifier);
       if (!resolvedSpec) return;
       const target = candidatePaths(resolvedSpec).find((candidate) => trackedSet.has(candidate));
-      if (!target || included.has(target)) return;
+      if (!target || present.has(target)) return;
       const key = `${index}\0${target}`;
       if (seen.has(key)) return;
       seen.add(key);

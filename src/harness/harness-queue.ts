@@ -6,27 +6,34 @@ import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { listChecklist, type ChecklistItem } from '../release-loop/checklist.js';
+import { readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { listSchedules } from '../release-loop/release-schedule.js';
+import { parseRubric, readRubricItems, rubricScore } from '../release-loop/rubric.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { trafficTick, TRAFFIC_SEATS, type TrafficCell } from '../loops/orchestrator/traffic.js';
-import { decideSpawn, seatCapDetails, seatCapReason } from '../loops/budget.js';
+import { decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from '../loops/budget.js';
 import { listSelfDevRuns, processBirthId, selfDevRunsDir } from '../self-dev/run-store.js';
 import { getUserConfig, userConfigPath, type OrchestratorLoopConfig } from '../user-config.js';
 import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
 import { leaseKubectl, measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
-import { finishAdvice, measureFinish, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
+import { finishAdvice, measureFinish, recordFinishHistory, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
 
 export type QueueSeat = 'OP' | 'TC' | 'MK' | 'UX';
 export type QueueItem = {
   id: string; seat: QueueSeat; kind: 'say' | 'ask'; input: string; hold: boolean; heavy: boolean;
   at: string; status: 'queued' | 'launching' | 'launched' | 'finished'; pid?: number; launchId?: string; idempotencyKey?: string; waitingReason?: string;
-  launchArgs?: string[]; launchCwd?: string; cellId?: string;
+  launchArgs?: string[]; poolHint?: string; /** 힌트를 넣은 쪽 — 'grid' 면 GRID 가 소유(그것만 GRID 가 바꾸거나 지운다). */ poolHintSource?: 'grid'; launchCwd?: string; cellId?: string;
+  /** TASK-QUEUE: larger launches first within a seat; a row without it ranks below every prioritized row (FIFO among equals). */
+  priority?: number;
 };
 export type QueuePool = { running: number; pending: number; reserved: number; limit: number };
 export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string };
-export type QueueProcess = { pid: number; seat?: QueueSeat; launchId?: string; runId?: string; rootPid?: number };
+/** progressAt = newest run-ledger updatedAt among the tree's members; stopReason = the ledger's supervisor stop (SEAT-CAP-STALE).
+ *  ledgerRunIds = run ids of the members' ledger records — the `elanous.run` label of their Pod Jobs (SEAT-CAP-STALE2). */
+export type QueueProcess = { pid: number; seat?: QueueSeat; launchId?: string; runId?: string; rootPid?: number;
+  progressAt?: number; stopReason?: string; ledgerRunIds?: string[] };
 type ProcessProbe = {
   run?: typeof spawnSync; platform?: NodeJS.Platform;
   cwd?: (pid: number) => string;
@@ -68,8 +75,13 @@ export interface HarnessQueueDeps {
     next: readonly Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status' | 'evidence'>[] };
   idleLog?: (category: string, event: string, data: Record<string, unknown>) => void;
   log?: (event: 'enqueued' | 'launched' | 'waiting' | 'skipped', data: Record<string, unknown>) => void;
+  /** TASK-QUEUE seam: default priority for a cell at enqueue (default: rubric score of that cell in an unreleased schedule). */
+  cellPriority?: (cellId: string, root: string, now: Date) => number | undefined;
   /** FINISH-RATE metrics source; a test process without it skips the real measurement. */
   finishMetrics?: (now: Date) => FinishMetrics | Promise<FinishMetrics>;
+  /** SEAT-CAP-STALE2: run ids with an unfinished Pod Job (running or pending); throws when unreadable. A test process without
+   *  it sees no Pod work (never a real kubectl). */
+  podRuns?: () => ReadonlySet<string>;
 }
 
 const FINISH_CACHE_MS = 10 * 60 * 1_000;
@@ -105,6 +117,11 @@ async function cachedFinishMetrics(root: string, now: Date, deps: HarnessQueueDe
     mkdirSync(join(root, 'harness'), { recursive: true });
     writeFileSync(path, JSON.stringify({ at: now.toISOString(), metrics }));
   } catch (error) { debug.log('loop.orchestrator', 'finish-cache-write-failed', { reason: String(error) }); }
+  // 새로 잰 뒤에만 시간별 이력 한 줄(캐시 적중 틱은 안 쓴다) — 실패해도 발사 판정은 그대로다.
+  try { recordFinishHistory(root, metrics, now); }
+  catch (error) {
+    try { debug.log('loop.orchestrator', 'finish-history-write-failed', { reason: String(error) }); } catch { /* observation is fail-soft */ }
+  }
   return metrics;
 }
 
@@ -149,8 +166,11 @@ function read(path: string): QueueItem[] {
     && (row.launchId === undefined || typeof row.launchId === 'string')
     && (row.idempotencyKey === undefined || typeof row.idempotencyKey === 'string')
     && (row.launchArgs === undefined || Array.isArray(row.launchArgs) && row.launchArgs.every((arg: unknown) => typeof arg === 'string'))
+    && (row.poolHint === undefined || typeof row.poolHint === 'string')
+    && (row.poolHintSource === undefined || row.poolHintSource === 'grid')
     && (row.launchCwd === undefined || typeof row.launchCwd === 'string' && row.launchCwd.startsWith('/'))
     && (row.cellId === undefined || typeof row.cellId === 'string')
+    && (row.priority === undefined || typeof row.priority === 'number' && Number.isFinite(row.priority))
     && (row.waitingReason === undefined || typeof row.waitingReason === 'string'))) {
     throw new Error('harness queue: invalid queue file (no launch)');
   }
@@ -226,13 +246,56 @@ function queueRowCellId(kind: QueueItem['kind'], input: string): string | undefi
   try { return queueCellId(readFileSync(input, 'utf8')); } catch { return undefined; }
 }
 
+/** A CEO directive mark on the cell (crown U+1F451 · 대표 지시) lifts it above every rubric score (max rubric ≈ 25.5). */
+export const QUEUE_CEO_PRIORITY_BONUS = 100;
+const CEO_MARK = /\u{1F451}|대표\s*지시/u;
+
+/** Rubric score of a cell, searched in unreleased schedules by cut order; no ledger, no cell, or no rubric → undefined. */
+export function queueCellRubricPriority(cellId: string, root: string, now: Date): number | undefined {
+  const ledger = root === effectiveInstanceRoot() ? releaseLedgerRoot() : root;
+  if (!existsSync(join(ledger, 'release', 'features.sqlite'))) return undefined;
+  const versions = listSchedules(ledger).filter((row) => Date.parse(row.cutAt) > now.getTime())
+    .sort((a, b) => Date.parse(a.cutAt) - Date.parse(b.cutAt)).map((row) => row.version);
+  for (const version of versions) {
+    const cell = readRubricItems(version, ledger).find((item) => item.id === cellId);
+    if (!cell) continue;
+    const text = `${cell.title}\n${cell.evidence ?? ''}`;
+    const rubric = parseRubric(text);
+    const ceo = CEO_MARK.test(text);
+    if (!rubric && !ceo) return undefined;
+    return (rubric ? rubricScore(rubric) : 0) + (ceo ? QUEUE_CEO_PRIORITY_BONUS : 0);
+  }
+  return undefined;
+}
+
+/** A failed rubric lookup leaves the row without priority (FIFO) — it never refuses the enqueue. */
+function defaultQueuePriority(cellId: string | undefined, root: string, deps: HarnessQueueDeps): number | undefined {
+  if (cellId === undefined) return undefined;
+  try {
+    const value = (deps.cellPriority ?? queueCellRubricPriority)(cellId, root, (deps.now ?? (() => new Date()))());
+    return value !== undefined && Number.isFinite(value) ? value : undefined;
+  } catch (error) {
+    try { debug.log('harness.queue', 'priority-lookup-failed', { cellId, reason: String(error) }); }
+    catch { /* Observation cannot affect enqueue. */ }
+    return undefined;
+  }
+}
+
+/** Seat head order: priority descending (none = lowest), then arrival ascending, then file order. */
+function queueHeadBefore(a: QueueItem, b: QueueItem): boolean {
+  const pa = a.priority ?? -Infinity, pb = b.priority ?? -Infinity;
+  if (pa !== pb) return pa > pb;
+  const ta = Date.parse(a.at), tb = Date.parse(b.at);
+  return Number.isFinite(ta) && Number.isFinite(tb) && ta < tb;
+}
+
 export class HarnessQueueDuplicateError extends Error {
   constructor(existing: QueueItem, key: string) {
     super(`같은 ${key} 이 이미 대기열에 있거나 도는 중이다 — ${existing.id} (${existing.status})`);
   }
 }
 
-export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string; launchArgs?: string[]; launchCwd?: string; refuseDuplicate?: boolean }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
+export async function addHarnessQueue(input: { seat: string; say?: string; ask?: string; hold?: boolean; heavy?: boolean; idempotencyKey?: string; launchArgs?: string[]; poolHint?: string; poolHintSource?: 'grid'; launchCwd?: string; refuseDuplicate?: boolean }, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
   const assigned = seat(input.seat);
   if ((input.say === undefined) === (input.ask === undefined)) throw new Error('harness queue add: --say 또는 --ask 중 하나만 필요');
   const kind = input.ask === undefined ? 'say' : 'ask';
@@ -266,14 +329,17 @@ export async function addHarnessQueue(input: { seat: string; say?: string; ask?:
         throw new HarnessQueueDuplicateError(existing, key);
       }
     }
+    const priority = defaultQueuePriority(cellId, root, deps);
     const item: QueueItem = { id: `hq-${randomUUID()}`, seat: assigned, kind, input: value,
       hold: input.hold === true, heavy: input.heavy === true, at: new Date().toISOString(), status: 'queued',
       ...(input.launchArgs === undefined ? {} : { launchArgs: input.launchArgs }),
+      ...(input.poolHint === undefined ? {} : { poolHint: input.poolHint, ...(input.poolHintSource ? { poolHintSource: input.poolHintSource } : {}) }),
       ...(input.launchCwd === undefined ? {} : { launchCwd: input.launchCwd }),
       ...(cellId === undefined ? {} : { cellId }),
+      ...(priority === undefined ? {} : { priority }),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }) };
     save(path, [...rows, item]);
-    observe('enqueued', { id: item.id, seat: item.seat, kind }, deps);
+    observe('enqueued', { id: item.id, seat: item.seat, kind, ...(priority === undefined ? {} : { priority }) }, deps);
     return item;
   });
 }
@@ -336,6 +402,46 @@ function queueRowOutcome(row: QueueItem, root: string): 'pending' | 'succeeded' 
   return state === 'started' ? 'pending' : 'unknown';
 }
 
+/** 아직 발사 전(queued)인 항목의 풀 힌트만 바꾼다 — 발사 중·발사 뒤 항목은 손대지 않는다. 바꿨으면 true. */
+export async function setQueuedPoolHint(id: string, poolHint: string | undefined, deps: HarnessQueueDeps = {}, stillValid?: (item: QueueItem) => boolean): Promise<boolean> {
+  const root = deps.root ?? effectiveInstanceRoot();
+  return locked(root, async (path) => {
+    const rows = read(path);
+    const item = rows.find((row) => row.id === id);
+    if (!item || item.status !== 'queued' || item.poolHint === poolHint) return false;
+    // GRID 가 소유하지 않은 힌트(사람·다른 경로가 넣은 것)는 바꾸지도 지우지도 않는다. 힌트가 없던 항목에 새로 넣는 것은 허용.
+    if (item.poolHint !== undefined && item.poolHintSource !== 'grid') return false;
+    // 바꾸기 직전, 같은 잠금 안에서 호출자의 전제(예: 의뢰가 아직 queued)를 다시 확인한다.
+    if (stillValid && !stillValid(item)) return false;
+    if (poolHint === undefined) { delete item.poolHint; delete item.poolHintSource; } else { item.poolHint = poolHint; item.poolHintSource = 'grid'; }
+    save(path, rows);
+    return true;
+  });
+}
+
+/** TASK-QUEUE: re-rank a waiting row; launched or launching rows are refused (their slot is already taken).
+ * `by` is required — the caller names who asked; the audit never invents an actor. */
+export async function setHarnessQueuePriority(id: string, priority: number, by: string, deps: HarnessQueueDeps = {}): Promise<QueueItem> {
+  if (!by.trim()) throw new Error('harness queue prio: 요청 주체(by)가 비었다');
+  if (!Number.isFinite(priority)) throw new Error(`harness queue prio: 우선순위는 유한한 수여야 한다 — ${priority}`);
+  const root = deps.root ?? effectiveInstanceRoot();
+  return locked(root, async (path) => {
+    const rows = read(path);
+    const item = rows.find((row) => row.id === id);
+    if (!item) throw new Error(`harness queue prio: 항목 없음 — ${id}`);
+    if (item.status !== 'queued') throw new Error(`harness queue prio: 대기(queued) 행만 바꾼다 — ${id} (${item.status})`);
+    const updated: QueueItem = { ...item, priority };
+    save(path, rows.map((row) => row.id === id ? updated : row));
+    // The audit is part of the change: a failed audit write restores the previous file and fails the call.
+    try { debug.log('harness.queue', 'prio', { id, from: item.priority ?? null, to: priority, by }); }
+    catch (error) {
+      save(path, rows);
+      throw new Error(`harness queue prio: 감사 기록 실패로 되돌림 — ${String(error)}`);
+    }
+    return updated;
+  });
+}
+
 export async function removeHarnessQueue(id: string, deps: HarnessQueueDeps = {}): Promise<boolean> {
   const root = deps.root ?? effectiveInstanceRoot();
   return locked(root, async (path) => {
@@ -358,19 +464,28 @@ export async function removeHarnessQueue(id: string, deps: HarnessQueueDeps = {}
   });
 }
 
-export function queueLaunchArgs(item: QueueItem): string[] {
-  if (item.launchArgs) return item.launchArgs;
-  return ['harness', item.kind, item.input, '--substrate', 'pod',
+export function queueLaunchArgs(item: Pick<QueueItem, 'kind' | 'input' | 'hold' | 'heavy' | 'launchArgs' | 'poolHint'>): string[] {
+  const args = item.launchArgs ?? ['harness', item.kind, item.input, '--substrate', 'pod',
     ...(item.hold ? ['--no-auto-merge'] : []), ...(item.heavy ? ['--pod-memory', 'high'] : [])];
+  if (!item.poolHint || args[0] !== 'harness' || !['say', 'ask'].includes(args[1] ?? '')) return args;
+  const substrateIndex = args.indexOf('--substrate');
+  if (substrateIndex < 0 || args[substrateIndex + 1] !== 'pod') return args;
+  const poolIndex = args.indexOf('--pod-pool');
+  if (poolIndex >= 0) return args;
+  return [...args, '--pod-pool', item.poolHint];
 }
 
-export function readHarnessQueuePool(): QueuePool {
+function harnessQueuePoolMembers(): ReturnType<typeof parsePodPool> {
   const config = getUserConfig();
   const spec = resolvePodPoolSpec(undefined, process.env, () => config.harness?.podPool ?? config.pod?.pool);
   const current = spec ? null : leaseKubectl(['config', 'current-context']);
   const context = spec ?? (current?.status === 0 ? current.stdout.trim() : '');
   if (!context) throw new Error('pod lease status: no pool/context');
-  const members = parsePodPool(context);
+  return parsePodPool(context);
+}
+
+export function readHarnessQueuePool(): QueuePool {
+  const members = harnessQueuePoolMembers();
   const observed = measurePoolLease(members);
   if (observed.members.some((member) => member.running === null || member.pending === null)) throw new Error('pod lease status: incomplete running/pending measurement');
   const pendingJobs = observed.members.flatMap((member) => member.pendingJobs ?? []);
@@ -381,6 +496,41 @@ export function readHarnessQueuePool(): QueuePool {
     reserved: hostLeaseCounts(records).reserved + records.filter((row) => row.stage === 'job' && !leaseHasPendingPod(row, pendingJobs)).length,
     limit: members.reduce((sum, member) => sum + member.capacity, 0),
   };
+}
+
+/** Same sanitizing as `k8sLabelValue` (self-implement-pod.ts), which writes the `elanous.run` label value. */
+export function queueRunLabelValue(runId: string): string {
+  return runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 63).replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+}
+
+/** SEAT-CAP-STALE2: `elanous.run` / `elanous.child-run` labels of Jobs without a Complete/Failed condition (running or pending). */
+export function queuePodRunsFromJobs(stdout: string): Set<string> {
+  const parsed = JSON.parse(stdout) as { items?: unknown };
+  if (!Array.isArray(parsed.items)) throw new Error('pod jobs: invalid response');
+  const runs = new Set<string>();
+  for (const job of parsed.items as { metadata?: { labels?: Record<string, unknown> };
+    status?: { conditions?: { type?: unknown; status?: unknown }[] } }[]) {
+    const finished = (job.status?.conditions ?? []).some((c) => (c.type === 'Complete' || c.type === 'Failed') && c.status === 'True');
+    if (finished) continue;
+    for (const key of ['elanous.run', 'elanous.child-run']) {
+      const value = job.metadata?.labels?.[key];
+      if (typeof value === 'string' && value) runs.add(value);
+    }
+  }
+  return runs;
+}
+
+/** One read-only Job list per pool member; any unreadable member makes the whole answer unavailable (throws). */
+export function readHarnessQueuePodRuns(kubectl: typeof leaseKubectl = leaseKubectl,
+  members: readonly { context: string }[] = harnessQueuePoolMembers()): ReadonlySet<string> {
+  const runs = new Set<string>();
+  for (const member of members) {
+    const result = kubectl(['--context', member.context, '--request-timeout=10s', '-n', 'elanous-test', 'get', 'jobs',
+      '-l', 'elanous.substrate=pod', '-o', 'json']);
+    if (result.status !== 0) throw new Error(`pod jobs ${member.context}: ${result.stderr.trim().split('\n').pop() || `rc=${result.status}`}`);
+    for (const run of queuePodRunsFromJobs(result.stdout)) runs.add(run);
+  }
+  return runs;
 }
 
 function alive(pid: number): boolean {
@@ -420,14 +570,25 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
   const ambiguousPids = new Set<number>();
   const candidatePids = new Set(candidates.map(({ pid }) => pid));
   const births = new Map<number, string | undefined>();
+  const ledgerProgress = new Map<number, { at: number; stopReason?: string }>();
+  const ledgerRunIds = new Map<number, Set<string>>();
   for (const record of listSelfDevRuns(probe.runsDir ?? selfDevRunsDir())) {
     const pid = record.pid;
-    if (!pid || !candidatePids.has(pid) || !record.pidStart || !queueSeatNames.some((name) => name === record.seat)) continue;
+    if (!pid || !candidatePids.has(pid) || !record.pidStart) continue;
     if (!births.has(pid)) {
       try { births.set(pid, (probe.birthId ?? ((id: number) => processBirthId(id, platform)))(pid)); }
       catch { births.set(pid, undefined); }
     }
-    if (births.get(pid) !== record.pidStart || ambiguousPids.has(pid)) continue;
+    if (births.get(pid) !== record.pidStart) continue;
+    if (record.runId) ledgerRunIds.set(pid, (ledgerRunIds.get(pid) ?? new Set<string>()).add(record.runId));
+    // Newest updatedAt is the process's latest progress; it is stopped only when every matched record stopped.
+    if (Number.isFinite(record.updatedAt)) {
+      const prior = ledgerProgress.get(pid);
+      const stopped = (prior ? prior.stopReason !== undefined : true) && Boolean(record.supervisorStopReason);
+      const stopReason = stopped ? (prior?.stopReason ?? record.supervisorStopReason) : undefined;
+      ledgerProgress.set(pid, { at: Math.max(prior?.at ?? -Infinity, record.updatedAt), ...(stopReason ? { stopReason } : {}) });
+    }
+    if (!queueSeatNames.some((name) => name === record.seat) || ambiguousPids.has(pid)) continue;
     const prior = ledgerSeats.get(pid);
     if (prior && prior !== record.seat) { ledgerSeats.delete(pid); ambiguousPids.add(pid); }
     else ledgerSeats.set(pid, record.seat!);
@@ -446,6 +607,8 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
     let launchId: string | undefined;
     let runId: string | undefined;
     for (const { process: { pid, command }, depth } of members) {
+      // The queue wrapper's argv carries its receipt path, so its launch id is its identity on every platform.
+      launchId ??= /\/harness\/(hq-[0-9a-f-]{36})\.receipt\.json(?:\s|$)/.exec(command)?.[1];
       let envSeat: string | undefined;
       if (platform === 'linux') {
         try {
@@ -487,10 +650,16 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
     const top = eligible.filter((entry) => entry.depth === depth);
     const seats = new Set(top.map((entry) => entry.seat));
     const assigned = seats.size === 1 ? top[0] : undefined;
+    const progress = members.flatMap(({ process: { pid } }) => ledgerProgress.has(pid) ? [ledgerProgress.get(pid)!] : []);
+    const progressAt = progress.length ? Math.max(...progress.map((entry) => entry.at)) : undefined;
+    // Stopped only when every ledger-bearing member's supervisor stopped; one live supervisor keeps the run in progress.
+    const stopReason = progress.length && progress.every((entry) => entry.stopReason) ? progress[0]!.stopReason : undefined;
+    const runIds = [...new Set(members.flatMap(({ process: { pid } }) => [...(ledgerRunIds.get(pid) ?? [])]))];
     try { debug.log('harness.queue', 'attributed', { pid: root.pid, seat: assigned?.seat ?? null, source: assigned?.source ?? 'all' }); }
     catch { /* Observation does not block inventory. */ }
     rows.push({ pid: root.pid, ...(assigned ? { seat: assigned.seat } : {}), ...(launchId ? { launchId } : {}),
-      ...(runId ? { runId } : {}) });
+      ...(runId ? { runId } : {}), ...(progressAt !== undefined ? { progressAt } : {}), ...(stopReason ? { stopReason } : {}),
+      ...(runIds.length ? { ledgerRunIds: runIds } : {}) });
   }
   return rows;
 }
@@ -508,6 +677,23 @@ function receipt(root: string, launchId: string): 'started' | 'finished' | 'not-
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
+}
+
+/** Launch time embedded in a UUIDv7 launch id (48-bit ms prefix); undefined for older v4 ids. */
+export function queueLaunchTime(launchId: string): number | undefined {
+  const match = /^hq-([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(launchId);
+  if (!match) return undefined;
+  const at = parseInt(`${match[1]}${match[2]}`, 16);
+  return Number.isSafeInteger(at) && at > 0 ? at : undefined;
+}
+
+/** When the wrapper wrote its receipt (≈ spawn time); undefined when absent or unreadable. */
+function receiptTime(root: string, launchId: string): number | undefined {
+  try {
+    const record = JSON.parse(readFileSync(harnessQueueReceiptPath(root, launchId), 'utf8')) as { at?: unknown };
+    const at = typeof record.at === 'string' ? Date.parse(record.at) : NaN;
+    return Number.isFinite(at) ? at : undefined;
+  } catch { return undefined; }
 }
 
 function defaultLaunch(command?: string) {
@@ -582,18 +768,23 @@ function warnLegacySeatCap(path: string): void {
   } catch { /* An unreadable config cannot affect dispatch or observation. */ }
 }
 
-function groupQueueRuns(processes: readonly QueueProcess[]): { seat?: QueueSeat; launchIds: Set<string> }[] {
-  const groups: { seats: Set<QueueSeat>; unknown: boolean; launchIds: Set<string>; keys: Set<string> }[] = [];
+type QueueRun = { seat?: QueueSeat; launchIds: Set<string>; pids: Set<number>; runIds: Set<string>; progressAt?: number; stopReason?: string;
+  /** Every run id of the group (env and ledger) — matched against Pod Job labels only, never used for grouping. */
+  podRunIds: Set<string> };
+
+function groupQueueRuns(processes: readonly QueueProcess[]): QueueRun[] {
+  const groups: { seats: Set<QueueSeat>; unknown: boolean; launchIds: Set<string>; keys: Set<string>; rows: QueueProcess[] }[] = [];
   for (const row of processes) {
     const keys = [row.runId && `run:${row.runId}`, `root:${row.rootPid ?? row.pid}`,
       row.launchId && `launch:${row.launchId}`, `pid:${row.pid}`].filter((key): key is string => Boolean(key));
     const matching = groups.filter((group) => keys.some((key) => group.keys.has(key)));
     const group = matching[0] ?? { seats: new Set<QueueSeat>(), unknown: false,
-      launchIds: new Set<string>(), keys: new Set<string>() };
+      launchIds: new Set<string>(), keys: new Set<string>(), rows: [] };
     for (const other of matching.slice(1)) {
       for (const key of other.keys) group.keys.add(key);
       for (const seat of other.seats) group.seats.add(seat);
       for (const id of other.launchIds) group.launchIds.add(id);
+      group.rows.push(...other.rows);
       group.unknown ||= other.unknown;
       groups.splice(groups.indexOf(other), 1);
     }
@@ -601,12 +792,40 @@ function groupQueueRuns(processes: readonly QueueProcess[]): { seat?: QueueSeat;
     if (row.seat) group.seats.add(row.seat);
     else group.unknown = true;
     if (row.launchId) group.launchIds.add(row.launchId);
+    group.rows.push(row);
     if (!matching.length) groups.push(group);
   }
-  return groups.map((group) => ({
-    ...(group.unknown || group.seats.size !== 1 ? {} : { seat: [...group.seats][0] }),
-    launchIds: group.launchIds,
-  }));
+  return groups.map((group) => {
+    const progress = group.rows.filter((row) => row.progressAt !== undefined);
+    const progressAt = progress.length ? Math.max(...progress.map((row) => row.progressAt!)) : undefined;
+    const stopReason = progress.length && progress.every((row) => row.stopReason) ? progress[0]!.stopReason : undefined;
+    return {
+      ...(group.unknown || group.seats.size !== 1 ? {} : { seat: [...group.seats][0] }),
+      launchIds: group.launchIds,
+      pids: new Set(group.rows.flatMap((row) => [row.pid, ...(row.rootPid ? [row.rootPid] : [])])),
+      runIds: new Set(group.rows.flatMap((row) => row.runId ? [row.runId] : [])),
+      podRunIds: new Set(group.rows.flatMap((row) => [...(row.runId ? [row.runId] : []), ...(row.ledgerRunIds ?? [])])),
+      ...(progressAt !== undefined ? { progressAt } : {}), ...(stopReason ? { stopReason } : {}),
+    };
+  });
+}
+
+/** SEAT-CAP-STALE limits: config harness.queue > env > default. */
+export function harnessQueueCountingLimits(queue: { staleRunMinutes?: number; unknownSeatCap?: number } | undefined,
+  env: NodeJS.ProcessEnv = process.env): { staleRunMinutes: number; unknownSeatCap: number } {
+  const fromEnv = (name: string, min: number): number | undefined => {
+    const raw = env[name];
+    if (raw === undefined || !/^\d+$/.test(raw.trim())) return undefined;
+    const value = Number(raw.trim());
+    return Number.isSafeInteger(value) && value >= min ? value : undefined;
+  };
+  const valid = (value: unknown, min: number): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+  return {
+    staleRunMinutes: valid(queue?.staleRunMinutes, 1) ? queue!.staleRunMinutes!
+      : fromEnv('ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES', 1) ?? SEAT_CAP_STALE_RUN_MINUTES,
+    unknownSeatCap: valid(queue?.unknownSeatCap, 0) ? queue!.unknownSeatCap!
+      : fromEnv('ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP', 0) ?? SEAT_CAP_UNKNOWN_SEAT_CAP,
+  };
 }
 
 const IDLE_REQUEST_INTERVAL_MS = 15 * 60_000;
@@ -721,6 +940,15 @@ export function requestIdleSeats(root: string, now: Date, items: readonly QueueI
   }
 }
 
+/** ORCH2 ③ — 발사를 막는 동결이면 사유(waitingReason)와 관측 칸을, 아니면 null. 동결 파일을 못 읽으면 닫힌 쪽(막는다). */
+function launchFreezeHold(root: string, now: Date): { reason: string; freezeReason: string; until: string | null } | null {
+  let freeze: ReturnType<typeof readLandingFreeze>;
+  try { freeze = readLandingFreeze(root, now); }
+  catch { return { reason: '동결 상태 읽기 실패', freezeReason: '동결 상태 읽기 실패', until: null }; }
+  if (freeze?.holdLaunches !== true) return null;
+  return { reason: `동결 — ${freeze.reason}${freeze.until ? ` · ~${freeze.until}` : ''}`, freezeReason: freeze.reason, until: freeze.until };
+}
+
 export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?: string): Promise<QueueTick> {
   const root = deps.root ?? effectiveInstanceRoot();
   return locked(root, async (path) => {
@@ -738,13 +966,33 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
       catch { /* Shadow observation cannot affect queue dispatch. */ }
     }
     const items = read(path);
+    // ORCH2 ③ 동결 창의 «발사» 절반 — `freeze on --hold-launches` 면 이 틱은 발사 0. 동결 파일을 못 읽으면 착지 쪽과 같이 닫힌 쪽(발사 0).
+    const hold = launchFreezeHold(root, (deps.now ?? (() => new Date()))());
+    if (hold) {
+      const reason = hold.reason;
+      const queued = items.filter((item) => item.status === 'queued');
+      const updated = items.map((item) => item.status === 'queued' && item.waitingReason !== reason ? { ...item, waitingReason: reason } : item);
+      if (updated.some((item, index) => item !== items[index])) save(path, updated);
+      for (const item of queued) observe('waiting', { id: item.id, seat: item.seat, reason }, deps);
+      if (queued.length) {
+        try { debug.log('loop.orchestrator', 'freeze-held-launch', { reason: hold.freezeReason, until: hold.until, queued: queued.length, phase: 'tick-start' }); }
+        catch { /* Observation cannot affect dispatch. */ }
+      }
+      const subject = (requestedId ? queued.find((item) => item.id === requestedId) : undefined) ?? (!requestedId ? queued[0] : undefined);
+      return subject ? { outcome: 'waiting', item: { ...subject, waitingReason: reason }, reason }
+        : { outcome: 'skipped', reason: requestedId ? '이미 처리됨 또는 항목 없음' : 'empty' };
+    }
     try { await (deps.idleRequest ?? requestIdleSeats)(root, (deps.now ?? (() => new Date()))(), items, deps); }
     catch (error) {
       try { debug.log('loop.orchestrator', 'idle-request-failed', { reason: String(error) }); }
       catch { /* Idle observation cannot affect queue dispatch. */ }
     }
     const heads = new Map<QueueSeat, QueueItem>();
-    for (const row of items) if (row.status === 'queued' && !heads.has(row.seat)) heads.set(row.seat, row);
+    for (const row of items) {
+      if (row.status !== 'queued') continue;
+      const head = heads.get(row.seat);
+      if (!head || queueHeadBefore(row, head)) heads.set(row.seat, row);
+    }
     if (requestedId && ![...heads.values()].some((row) => row.id === requestedId)) {
       const row = items.find((item) => item.id === requestedId);
       if (!row || row.status !== 'queued') return { outcome: 'skipped', item: row, reason: '이미 처리됨 또는 항목 없음' };
@@ -809,6 +1057,109 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
       if (run.seat) attributed[run.seat]++;
       else unattributed++;
     }
+    const limits = harnessQueueCountingLimits(config.harness?.queue);
+    const nowMs = (deps.now ?? (() => new Date()))().getTime();
+    const excludedLogged = new Set<string>();
+    const logExcluded = (key: string, data: Record<string, unknown>): void => {
+      if (excludedLogged.has(key)) return;
+      excludedLogged.add(key);
+      try { debug.log('harness.queue', 'seat-cap-excluded', data); }
+      catch { /* Observation cannot affect dispatch. */ }
+    };
+    const runLabel = (run: QueueRun): Record<string, unknown> => ({ runId: [...run.runIds][0] ?? [...run.podRunIds][0] ?? null,
+      launchId: [...run.launchIds][0] ?? null, pid: [...run.pids][0] });
+    const runKey = (run: QueueRun): string => `run:${[...run.pids].join(',')}`;
+    // SEAT-CAP-STALE2: a run quiet in its host ledger may be working in a Pod (POD-OBS writes elsewhere). Its unfinished Job
+    // keeps it progressing. One Job read per tick, only once some run would go stale; an unreadable read keeps every such run.
+    let podRuns: { ok: true; runs: ReadonlySet<string> } | { ok: false } | undefined;
+    const podState = (): typeof podRuns & {} => {
+      if (podRuns) return podRuns;
+      const testProcess = process.env.NODE_ENV === 'test' || Boolean(process.env.ELANOUS_TEST_HOME);
+      try { podRuns = { ok: true, runs: (deps.podRuns ?? (testProcess ? () => new Set<string>() : () => readHarnessQueuePodRuns()))() }; }
+      catch (error) {
+        podRuns = { ok: false };
+        try { debug.log('harness.queue', 'progress-source-unavailable', { source: 'pod-jobs', error: String(error).slice(0, 240) }, { level: 'warn' }); }
+        catch { /* Observation cannot affect dispatch. */ }
+      }
+      return podRuns;
+    };
+    const progressLogged = new Set<string>();
+    const runVerdict = (run: QueueRun, seat: QueueSeat, extra: Record<string, unknown> = {}): ReturnType<typeof seatCapExclusion> => {
+      const verdict = seatCapExclusion({ kind: 'run', seat, progressAt: run.progressAt, stopReason: run.stopReason }, nowMs, limits);
+      if (verdict?.reason !== 'stale') return verdict;
+      const pod = podState();
+      const podRunId = pod.ok ? [...run.podRunIds].find((id) => pod.runs.has(queueRunLabelValue(id))) : undefined;
+      if (pod.ok && !podRunId) return verdict;
+      if (!progressLogged.has(runKey(run))) {
+        progressLogged.add(runKey(run));
+        try { debug.log('harness.queue', 'seat-cap-progress', { ...runLabel(run), ...extra, seat, source: pod.ok ? 'pod-job' : 'pod-unavailable',
+          ...(podRunId ? { podRunId } : {}), ledgerIdleMin: verdict.idleMin }); }
+        catch { /* Observation cannot affect dispatch. */ }
+      }
+      return null;
+    };
+    // Identity is the launch id only: a recycled wrapper pid must never adopt an unrelated run.
+    const matches = (run: QueueRun, row: QueueItem): boolean => Boolean(row.launchId && run.launchIds.has(row.launchId));
+    let unknownLogged = false;
+    // A seat-less run that is a queue row's launch takes that row's seat; only the rest form the unknown-seat bucket.
+    const logUnknownBucket = (): void => {
+      if (unknownLogged) return;
+      unknownLogged = true;
+      const launchedRows = current.filter((row) => row.status === 'launching' || row.status === 'launched');
+      const bucket = runs.filter((run) => !run.seat && !launchedRows.some((row) => matches(run, row)));
+      for (const run of bucket) {
+        const verdict = seatCapExclusion({ kind: 'run', progressAt: run.progressAt }, nowMs, limits);
+        logExcluded(runKey(run), { ...runLabel(run), seat: null, reason: 'unknown-seat', idleMin: verdict?.idleMin ?? null });
+      }
+      if (bucket.length > limits.unknownSeatCap) {
+        try { debug.log('harness.queue', 'unknown-seat-over-cap', { count: bucket.length, cap: limits.unknownSeatCap }, { level: 'warn' }); }
+        catch { /* Observation cannot affect dispatch. */ }
+      }
+    };
+    // Seat-less runs live in their own bucket; a seat is charged only by its own live, progressing runs and rows.
+    const countSeat = (seat: QueueSeat): number => {
+      logUnknownBucket();
+      const own = runs.filter((run) => run.seat === seat);
+      let active = 0;
+      for (const run of own) {
+        const verdict = runVerdict(run, seat);
+        if (!verdict) { active++; continue; }
+        logExcluded(runKey(run), { ...runLabel(run), seat, reason: verdict.reason, idleMin: verdict.idleMin });
+      }
+      for (const row of current) {
+        if (row.seat !== seat || (row.status !== 'launching' && row.status !== 'launched')) continue;
+        // A row whose own-seat run is already in the inventory is that run (matched by launch id).
+        if (own.some((run) => matches(run, row))) continue;
+        // A seat-less run that is this row's launch takes the row's seat; its progress still decides whether it holds it.
+        const unattributedRun = runs.find((run) => !run.seat && matches(run, row));
+        if (unattributedRun) {
+          const verdict = runVerdict(unattributedRun, seat, { launchId: row.launchId ?? null });
+          if (!verdict) { active++; continue; }
+          logExcluded(runKey(unattributedRun), { ...runLabel(unattributedRun), launchId: row.launchId ?? null, seat, reason: verdict.reason, idleMin: verdict.idleMin });
+          continue;
+        }
+        // A legacy row without a launch id has no receipt; wrapper liveness and the launch grace still decide.
+        const state = row.launchId ? (deps.receipt ?? receipt)(root, row.launchId) : null;
+        // A row with a launch id is live only through the inventory (its wrapper argv carries the id; matched above), so a
+        // recycled pid can never keep it; the launch grace covers the moment before the wrapper appears. Only a legacy row
+        // without a launch id falls back to its recorded pid's liveness.
+        const live = !row.launchId && row.pid !== undefined && (deps.alive ?? alive)(row.pid);
+        // The grace runs from the receipt time (written at spawn), else the launch id's own time (UUIDv7), else enqueue time
+        // (legacy v4 ids only).
+        const launchedAt = (row.launchId ? receiptTime(root, row.launchId) ?? queueLaunchTime(row.launchId) : undefined)
+          ?? Date.parse(row.at);
+        const verdict = seatCapExclusion({ kind: 'row', status: row.status, receipt: state, live,
+          ...(Number.isFinite(launchedAt) ? { launchedAt } : {}) }, nowMs, limits);
+        if (!verdict) { active++; continue; }
+        logExcluded(`row:${row.id}`, { runId: null, launchId: row.launchId ?? null, queueId: row.id, seat, reason: verdict.reason, idleMin: verdict.idleMin });
+      }
+      return active;
+    };
+    const seatCounts = new Map<QueueSeat, number>();
+    const seatActive = (seat: QueueSeat): number => {
+      if (!seatCounts.has(seat)) seatCounts.set(seat, countSeat(seat));
+      return seatCounts.get(seat)!;
+    };
     current = items.flatMap((row) => {
       if ((row.status !== 'launched' && row.status !== 'launching') || !row.launchId) return [row];
       const state = (deps.receipt ?? receipt)(root, row.launchId);
@@ -820,17 +1171,15 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
       return [];
     });
     if (current.length !== items.length || current.some((row, index) => row !== items[index])) save(path, current);
+    // Every seat is counted once per tick so each excluded run or row is observed even when its seat has no queued head.
+    for (const seat of queueSeatNames) seatActive(seat);
     let pool: QueuePool | undefined;
     let poolReason: string | undefined;
     let finishHeld: string | null | undefined;
     for (const item of candidates) {
       const injectedCap = deps.cap?.(item.seat);
       const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
-      const charged = runs.filter((run) => !run.seat || run.seat === item.seat);
-      const launchIds = new Set(charged.flatMap((run) => [...run.launchIds]));
-      const active = charged.length + current.filter((row) => row.seat === item.seat &&
-        (row.status === 'launching' || row.status === 'launched')
-        && (!row.launchId || !launchIds.has(row.launchId))).length;
+      const active = seatActive(item.seat);
       if (active >= details.cap) { blocked.set(item.seat, { reason: seatCapReason(item.seat, active, details), active }); continue; }
       if (!pool && !poolReason) {
         try { pool = (deps.pool ?? readHarnessQueuePool)(); }
@@ -864,11 +1213,7 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
         const own = blocked.get(requested.seat)?.reason ?? (() => {
           const ownCap = deps.cap?.(requested.seat);
           const details = seatCapDetails({ seat: requested.seat, caps, gate, injectedCap: ownCap });
-          const charged = runs.filter((run) => !run.seat || run.seat === requested.seat);
-          const launchIds = new Set(charged.flatMap((run) => [...run.launchIds]));
-          const active = charged.length + current.filter((row) => row.seat === requested.seat &&
-            (row.status === 'launching' || row.status === 'launched')
-            && (!row.launchId || !launchIds.has(row.launchId))).length;
+          const active = seatActive(requested.seat);
           if (active >= details.cap) return seatCapReason(requested.seat, active, details);
           const budget = decideSpawn({ seat: requested.seat, running: active, caps, gate, injectedCap: ownCap });
           return budget.allow ? undefined : `${budget.reason}: ${seatCapReason(requested.seat, active, details)}`;
@@ -878,7 +1223,17 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
         observe('waiting', { id: requested.id, seat: requested.seat, reason }, deps);
         return { outcome: 'waiting', item: { ...requested, waitingReason: reason }, reason };
       }
-      const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${randomUUID()}` };
+      // 발사 직전 다시 본다 — 틱 앞의 확인과 여기 사이에 await(idleRequest·pool·finish 측정)가 있어 그새 켜진 동결을 놓치지 않게.
+      const lateHold = launchFreezeHold(root, (deps.now ?? (() => new Date()))());
+      if (lateHold) {
+        save(path, current.map((row) => row.id === item.id ? { ...row, waitingReason: lateHold.reason } : row));
+        observe('waiting', { id: item.id, seat: item.seat, reason: lateHold.reason }, deps);
+        try { debug.log('loop.orchestrator', 'freeze-held-launch', { reason: lateHold.freezeReason, until: lateHold.until, queued: 1, phase: 'pre-launch' }); }
+        catch { /* Observation cannot affect dispatch. */ }
+        return { outcome: 'waiting', item: { ...item, waitingReason: lateHold.reason }, reason: lateHold.reason };
+      }
+      // UUIDv7 carries the launch time, so the dead-row grace can run from launch without a new queue field.
+      const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${Bun.randomUUIDv7()}` };
       delete launching.waitingReason;
       save(path, current.map((row) => row.id === item.id ? launching : row));
       try {

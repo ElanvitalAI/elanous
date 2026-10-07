@@ -20,6 +20,7 @@ interface Props {
   pending: boolean;
   /** BACKLOG #3 — workspace tab id for scroll-position snapshot. */
   tabId?: string;
+  mobileSimple?: boolean;
 }
 
 const SCROLL_PERSIST_DEBOUNCE_MS = 250;
@@ -28,7 +29,7 @@ const SCROLL_PERSIST_DEBOUNCE_MS = 250;
  *  📏 실측 2026-08-21: 컴포저 83px · 스크롤러 paddingBottom «0px» ⇒ 마지막 줄이 입력창에 붙었다. */
 const COMPOSER_CLEARANCE = 'pb-24';
 
-export function ChatHistory({ messages, pending, tabId }: Props) {
+export function ChatHistory({ messages, pending, tabId, mobileSimple = false }: Props) {
   const endRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const persistKey = snapshotKey('chatScroll', tabId);
@@ -234,7 +235,7 @@ export function ChatHistory({ messages, pending, tabId }: Props) {
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
         <p>무엇이든 말을 걸어 보세요.</p>
         <p className="text-xs"><code className="rounded bg-muted px-1.5 py-0.5 font-mono">:help</code> 를 치면 명령 목록이 나옵니다.</p>
-        <ChatPendingDecision />
+        {!mobileSimple && <ChatPendingDecision />}
       </div>
     );
   }
@@ -244,9 +245,9 @@ export function ChatHistory({ messages, pending, tabId }: Props) {
       <ScrollArea className="h-full">
         <div className={`flex flex-col gap-1 pt-2 ${COMPOSER_CLEARANCE}`}>
           {messages.map((m) => (
-            <ChatMessageView key={m.id} message={m} />
+            <ChatMessageView key={m.id} message={m} mobileSimple={mobileSimple} />
           ))}
-          <ChatPendingDecision />
+          {!mobileSimple && <ChatPendingDecision />}
           {pending && (
             <div className="flex justify-start px-4 py-3">
               <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm text-muted-foreground">

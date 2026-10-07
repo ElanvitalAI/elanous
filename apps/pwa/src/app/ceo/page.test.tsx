@@ -22,6 +22,13 @@ const seat = (id: string, green = 0, yellow = 0) => ({
 });
 const seats = { date: '2026-10-05', seats: [seat('OP', 1), seat('TC', 1, 1), seat('MK'), seat('UX')] };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+const gridData = {
+  hq: { record: { holder: '본부-OP', generation: 4, acquiredAt: 900, renewedAt: 990, ttlSeconds: 1500 }, ageSeconds: 125, expired: false, reason: null },
+  members: [
+    { context: 'long-pool-context-alpha', capacity: 3, running: 1, pending: 1, occupied: 2, reason: null },
+    { context: 'pool-beta', capacity: 5, running: 0, pending: 1, occupied: 1, reason: null },
+  ], poolReason: null,
+};
 
 afterEach(async () => {
   if (tree) await act(async () => { tree!.unmount(); });
@@ -50,6 +57,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
     calls.push({ url, init });
+    if (url.includes('/v1/grid')) return json(gridData);
     if (url.includes('/v1/ops/seats')) return json(seats);
     if (url.includes('/v1/schedules')) return json({ schedules: [
       schedule('late', 'stale', 'ok', '2026-10-04T09:00:00Z'),
@@ -76,9 +84,10 @@ test('owner overview preserves four summary cards and adds two compact cards usi
   expect(card(root, '루프 판정')).toContain('실패 1');
   expect(card(root, '루프 판정')).toContain('살아 있음 1');
   expect(card(root, '결정 대기 카드')).toContain('2');
+  expect(root.findByProps({ 'aria-label': '결정 대기 카드' }).findByType('a').props.href).toBe('/decisions');
   expect(card(root, '오늘 병합 PR')).toContain('2');
   expect(card(root, '위험·막힘 톱 5')).toContain('못 읽음');
-  expect(card(root, '그리드')).toContain('준비 중');
+  expect(card(root, '그리드')).toContain('칸 사용 3/8');
   expect(calls.map((call) => call.url)).toEqual([
     'https://nexus.example/v1/ops/seats',
     'https://nexus.example/v1/schedules?includeOff=1',
@@ -86,9 +95,67 @@ test('owner overview preserves four summary cards and adds two compact cards usi
     'https://nexus.example/v1/decisions?status=open',
     `https://nexus.example/v1/harness/runs?finishedSince=${Date.parse('2026-10-04T15:00:00Z')}`,
     `https://nexus.example/v1/harness/runs?finishedSince=${Date.parse('2026-09-27T15:00:00Z')}`,
+    'https://nexus.example/v1/grid',
   ]);
   expect(calls.every(({ init }) => !init?.method || init.method === 'GET')).toBe(true);
   expect(calls.every(({ init }) => (init?.headers as Record<string, string>)?.authorization === 'Bearer owner-token')).toBe(true);
+});
+
+function gridFetch(grid: unknown, status = 200) {
+  globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/grid')) return json(grid, status);
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/schedules')) return json({ schedules: [] });
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) return json({ decisions: [] });
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+}
+
+test('grid shows live HQ, two measured members and total slots without invented heartbeat columns', async () => {
+  gridFetch(gridData);
+  const root = await mount();
+  const section = root.findByProps({ 'aria-label': '그리드' });
+  expect(card(root, '그리드')).toContain('본부 · 본부-OP · 2분 전');
+  expect(card(root, '그리드')).toContain('long-pool-context-alpha2/3');
+  expect(card(root, '그리드')).toContain('pool-beta1/5');
+  expect(card(root, '그리드')).toContain('칸 사용 3/8');
+  expect(section.findByProps({ title: 'long-pool-context-alpha' }).props.className).toContain('truncate');
+  expect(section.findAllByProps({ role: 'meter' }).map((meter) => meter.props['aria-valuenow'])).toEqual([2, 1]);
+  expect(section.findAllByProps({ role: 'meter' })[0]!.findAllByType('div').find((node) => node.props.style)?.props.style.width).toBe('66.66666666666666%');
+  expect(card(root, '그리드')).not.toContain('하트비트');
+});
+
+test('expired HQ is marked red', async () => {
+  gridFetch({ ...gridData, hq: { ...gridData.hq, expired: true } });
+  const root = await mount();
+  expect(card(root, '그리드')).toContain('만료');
+  expect(root.findByProps({ 'aria-label': '그리드' }).findAllByType('span').find((span) => span.children.includes('만료'))?.props.className).toContain('text-red-600');
+});
+
+test('unmeasured member is not plotted as zero and pool/HQ read errors stay distinct', async () => {
+  gridFetch({ hq: { record: null, ageSeconds: null, expired: null, reason: 'arbiter down' },
+    members: [{ ...gridData.members[0], occupied: null, running: null, pending: null, reason: 'unreachable' }, gridData.members[1]], poolReason: 'pool unavailable' });
+  const root = await mount();
+  expect(card(root, '그리드')).toContain('본부 못 읽음');
+  expect(card(root, '그리드')).toContain('풀 못 읽음 · pool unavailable');
+  expect(card(root, '그리드')).toContain('long-pool-context-alpha측정 불가');
+  expect(card(root, '그리드')).toContain('pool-beta1/5');
+  expect(card(root, '그리드')).toContain('칸 사용 측정 불가/8');
+  expect(root.findByProps({ 'aria-label': '그리드' }).findAllByProps({ role: 'meter' })[0]!.props['aria-valuenow']).toBeUndefined();
+  expect(card(root, '그리드')).not.toContain('0/3');
+});
+
+test('failed grid read is 못 읽음 while all five existing cards remain readable', async () => {
+  gridFetch({ error: 'offline' }, 503);
+  const root = await mount();
+  expect(card(root, '그리드')).toBe('그리드못 읽음');
+  expect(card(root, '릴리스 판 진행')).toContain('green 2');
+  expect(card(root, '루프 판정')).toContain('등록 0');
+  expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드0');
+  expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
+  expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5해당 없음');
 });
 
 test('each unreadable source is 못 읽음 rather than zero; a successfully empty source is zero', async () => {
@@ -106,7 +173,7 @@ test('each unreadable source is 못 읽음 rather than zero; a successfully empt
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR못 읽음');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
-  expect(card(root, '그리드')).toBe('그리드준비 중');
+  expect(card(root, '그리드')).toBe('그리드못 읽음');
 });
 
 test('a partial checklist, malformed schedules and truncated PR list are not measured counts', async () => {

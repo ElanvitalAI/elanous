@@ -140,6 +140,57 @@ test('--apply writes two project/seat memories, retires an older version, and ra
   expect(ledger.list()).toHaveLength(1);
 });
 
+test('apply retires only active context cards older than 30 days, even without new candidates', () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-condense-')); dirs.push(root);
+  const dir = join(root, 'elanous', 'memory');
+  const aged = saveMemory({ type: 'project', name: 'A', description: 'old summary', body: 'old summary',
+    priority: 7, pinned: true, contextCard: { project: 'alpha', seat: 'MK', topic: 'old',
+      source: 'https://example.test/aged', updatedAt: '2026-09-05T00:00:00.000Z', status: 'active' } }, dir);
+  const recent = saveMemory({ type: 'project', name: 'B', description: 'recent summary', body: 'recent summary',
+    contextCard: { project: 'beta', seat: 'TC', topic: 'recent',
+      source: 'https://example.test/recent', updatedAt: '2026-09-07T00:00:00.000Z', status: 'active' } }, dir);
+  const ordinary = saveMemory({ type: 'project', name: 'C', description: 'ordinary', body: 'ordinary' }, dir);
+  const offsetRecent = saveMemory({ type: 'project', name: 'offset recent', description: 'offset recent', body: 'offset recent',
+    pinned: true, contextCard: { project: 'gamma', seat: 'UX', topic: 'offset',
+      source: 'https://example.test/offset', updatedAt: '2026-09-05T23:00:00-07:00', status: 'active' } }, dir);
+  const agedBodyBefore = listMemories({}, dir).find(entry => entry.id === aged.id)?.body;
+  const ordinaryBefore = readFileSync(join(dir, ordinary.filename));
+  const recentBefore = readFileSync(join(dir, recent.filename));
+  const offsetRecentBefore = readFileSync(join(dir, offsetRecent.filename));
+  const store = { list: () => listMemories({}, dir), save: (input: Parameters<typeof saveMemory>[0]) => saveMemory(input, dir),
+    raise: () => { throw new Error('unexpected conflict'); }, withLock: <T>(action: () => T) => action() };
+  const at = new Date('2026-10-06T00:00:00.000Z');
+  expect(applyCondensedCards([], store, at)).toEqual({ written: 0, retired: 1, decisions: [] });
+  const entries = store.list();
+  expect(entries.find(entry => entry.id === aged.id)).toMatchObject({ name: 'A', description: 'old summary',
+    body: agedBodyBefore, priority: 7, pinned: false, contextCard: { status: 'retired',
+      updatedAt: '2026-09-05T00:00:00.000Z', source: 'https://example.test/aged' } });
+  expect(entries.find(entry => entry.id === recent.id)?.contextCard?.status).toBe('active');
+  expect(readFileSync(join(dir, recent.filename))).toEqual(recentBefore);
+  expect(readFileSync(join(dir, offsetRecent.filename))).toEqual(offsetRecentBefore);
+  expect(entries.find(entry => entry.id === offsetRecent.id)).toMatchObject({ pinned: true, contextCard: { status: 'active' } });
+  expect(readFileSync(join(dir, ordinary.filename))).toEqual(ordinaryBefore);
+  expect(applyCondensedCards([], store, at)).toEqual({ written: 0, retired: 0, decisions: [] });
+});
+
+test('--apply forwards the window clock to age retirement when there are no candidate cards', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-condense-')); dirs.push(root);
+  const dir = join(root, 'elanous', 'memory');
+  const aged = saveMemory({ type: 'project', name: 'A', description: 'old', body: 'old',
+    contextCard: { project: 'alpha', seat: 'MK', topic: 'old', source: 'https://example.test/aged',
+      updatedAt: '2026-09-05T00:00:00.000Z', status: 'active' } }, dir);
+  const at = new Date('2026-10-06T00:00:00.000Z');
+  const deps = { events: () => [], decisions: () => [], summarize: async () => {
+    throw new Error('no source to summarize');
+  } };
+  const dry = await runContextCondense({ hours: 24, now: at, root }, deps);
+  expect(dry.applied).toBeUndefined();
+  expect(listMemories({}, dir).find(entry => entry.id === aged.id)?.contextCard?.status).toBe('active');
+  const applied = await runContextCondense({ hours: 24, now: at, root, apply: true }, deps);
+  expect(applied.applied).toEqual({ written: 0, retired: 1, decisions: [] });
+  expect(listMemories({}, dir).find(entry => entry.id === aged.id)?.contextCard?.status).toBe('retired');
+});
+
 test('a failed retirement is repaired on retry even when the candidate was already saved', () => {
   const root = mkdtempSync(join(tmpdir(), 'context-condense-')); dirs.push(root);
   const dir = join(root, 'elanous', 'memory');

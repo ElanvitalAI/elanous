@@ -95,3 +95,39 @@ test('export from and a dynamic import() of an excluded module are hits; an excl
     expect(await runPublicExportImportGate({ args: ['--changed-files'], cwd: root, log: () => {}, error: () => {} })).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('an excluded module that the export replaces is present in the export, so importing it is not a hit', async () => {
+  const root = fixture();
+  try {
+    // Same shape as apps/pwa/.../sidebar-nav-private.ts: excluded from the private tree, written by `replace`.
+    writeFileSync(join(root, 'release/public-export.yaml'), [
+      'include:',
+      '  - src/**',
+      'exclude:',
+      '  - src/directives/directive-index*',
+      'replace:',
+      '  src/directives/directive-index.ts: release/public/directive-index.ts',
+      '',
+    ].join('\n'));
+    expect(await exportImportCheck(['src/decisions/proact-meter.ts'], root)).toMatchObject({ measured: true, hits: [] });
+    expect(await runPublicExportImportGate({ args: ['--changed-files', 'src/decisions/proact-meter.ts'], cwd: root, log: () => {}, error: () => {} })).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a replaced private original is not scanned as an importer, even if it imports an excluded module', async () => {
+  const root = fixture();
+  try {
+    writeFileSync(join(root, 'release/public-export.yaml'), [
+      'include:',
+      '  - src/**',
+      'exclude:',
+      '  - src/directives/directive-index*',
+      '  - src/decisions/proact-meter.ts',
+      'replace:',
+      '  src/decisions/proact-meter.ts: release/public/proact-meter.ts',
+      '',
+    ].join('\n'));
+    // proact-meter.ts (excluded, replaced) still imports the excluded directive index — the export ships the replacement.
+    expect(await exportImportCheck(['src/decisions/proact-meter.ts'], root)).toMatchObject({ measured: true, hits: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -68,7 +68,8 @@ test('failed Pod exit without a result classifies from the returned ledger inste
   } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('BackoffLimitExceeded preserves pod-job-failed with only the job reason even when child exited 1', async () => {
+// POD-NORESULT: Jobs run with backoffLimit 0, so a child exit 1 is always «BackoffLimitExceeded» — it still gets the ledger diagnostic.
+test('BackoffLimitExceeded keeps pod-job-failed and adds the no-result ledger diagnostic when the child exited 1', async () => {
   const kubectl: Kubectl = (args) => {
     if (args.includes('current-context')) return { status: 0, stdout: 'test-context', stderr: '' };
     if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
@@ -80,7 +81,7 @@ test('BackoffLimitExceeded preserves pod-job-failed with only the job reason eve
   };
   const result = await podSelfImplementSpawn({ kubectl, credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }), env: {} })({ feature: 'x', spaceId: 'backoff-no-result-preserved' }).done;
   expect(result.exitCode).toBe(1);
-  expect(result.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff-no-result-preserved')} failed (BackoffLimitExceeded, container=Error/1) — childError=no-result-line · reason=사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음` });
+  expect(result.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff-no-result-preserved')} failed (BackoffLimitExceeded, container=Error/1) — childError=no-result-line · reason=사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음 · child terminal result missing; last ledger stage=unknown; round=unknown; mustFix=unknown` });
 });
 
 test('a failed App push retries next poll with a newly verified token; human Job retains its token', async () => {

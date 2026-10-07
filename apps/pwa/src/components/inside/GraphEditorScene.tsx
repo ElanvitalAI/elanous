@@ -37,12 +37,16 @@ export function GraphEditorScene({
         ))}
       </div>
       <div id="inside-editor-panel-harness" role="tabpanel" aria-labelledby="inside-editor-tab-harness"
-        hidden={mode !== 'harness'} className={mode === 'harness' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
-        <GraphEditor palette={graphPalette} initialGraphId="self-implement" />
+        hidden={mode !== 'harness'} className={mode === 'harness' ? 'min-h-0 min-w-0 flex-1 overflow-x-auto' : 'hidden'}>
+        <div className="flex h-full min-h-[640px] min-w-[700px] flex-col min-[700px]:min-w-0">
+          <GraphEditor palette={graphPalette} initialGraphId="self-implement" />
+        </div>
       </div>
       <div id="inside-editor-panel-workflow" role="tabpanel" aria-labelledby="inside-editor-tab-workflow"
-        hidden={mode !== 'workflow'} className={mode === 'workflow' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
-        <WorkflowEditor palette={workflowPalette} />
+        hidden={mode !== 'workflow'} className={mode === 'workflow' ? 'min-h-0 min-w-0 flex-1 overflow-x-auto' : 'hidden'}>
+        <div className="flex h-full min-h-[640px] min-w-[700px] flex-col min-[700px]:min-w-0">
+          <WorkflowEditor palette={workflowPalette} />
+        </div>
       </div>
     </section>
   );

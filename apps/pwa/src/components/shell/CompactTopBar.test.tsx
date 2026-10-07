@@ -3,6 +3,11 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { createElement } from 'react';
 import { CompactTopBar } from './CompactTopBar';
 import { AppShell } from './AppShell';
+import { InstallBanner } from '@/components/install-banner';
+import { MobileBottomTabs } from './MobileBottomTabs';
+import ChatPage from '@/app/chat/page';
+import { MobileChatStatus } from '@/components/chat/MobileChatStatus';
+import { ChatPanel } from '@/components/chat/ChatPanel';
 import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
 import { TopBar } from './TopBar';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
@@ -37,6 +42,8 @@ beforeEach(() => {
     addEventListener: (kind: string, listener: () => void) => { (listeners.get(kind) ?? listeners.set(kind, new Set()).get(kind)!).add(listener); },
     removeEventListener: (kind: string, listener: () => void) => { listeners.get(kind)?.delete(listener); },
     dispatchEvent: (event: { type: string; detail?: unknown }) => { (listeners.get(event.type) ?? new Set()).forEach((listener) => (listener as (event: unknown) => void)(event)); return true; },
+    location: { search: '', href: 'https://example.test/chat' },
+    sessionStorage: { getItem: () => null },
     matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
     navigator: { standalone: false },
   } });
@@ -292,6 +299,52 @@ describe('CompactTopBar', () => {
     const compact = renderer!.root.findByType('header').findAllByType('button').find((button) => button.children.includes('간소하게 보기'))!;
     act(() => compact.props.onClick());
     expect(renderer!.root.findAllByType(CompactTopBar)).toHaveLength(1);
+  });
+
+  test('390px /chat composes one status row across AppShell and ChatPage without install banner', async () => {
+    const config = { baseUrl: '', token: '', provider: '' };
+    const daemon = { config, client: new DaemonClient(config), sessionId: 'session-1', setSessionId() {}, setConfig() {} };
+    width = 390;
+    await act(async () => { renderer = create(createElement(DaemonContext.Provider, { value: daemon },
+      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: '/chat' },
+        createElement(AppRouterContext.Provider, { value: { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never },
+          createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement(ChatPage) })))))); });
+    expect(renderer!.root.findAllByProps({ 'data-elanous-mobile-chat-status': '' })).toHaveLength(1);
+    expect(renderer!.root.findAllByType(CompactTopBar)).toHaveLength(0);
+    expect(renderer!.root.findAllByType(TopBar)).toHaveLength(0);
+    expect(renderer!.root.findAllByProps({ 'data-testid': 'install-banner' })).toHaveLength(0);
+    expect(renderer!.root.findByType(ChatPanel).props.mobileSimple).toBe(true);
+  });
+
+  test('390px chat suppresses shell top rows but keeps bottom tabs (primary navigation); 1024px and other routes keep their shell', async () => {
+    const config = { baseUrl: '', token: '', provider: '' };
+    const daemon = { config, client: new DaemonClient(config), sessionId: 'session-1', setSessionId() {}, setConfig() {} };
+    const mountShell = (path: string) => create(createElement(DaemonContext.Provider, { value: daemon },
+      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: path },
+        createElement(AppRouterContext.Provider, { value: { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never },
+          createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'room') }))))));
+    width = 390;
+    await act(async () => { renderer = mountShell('/chat'); });
+    expect(renderer!.root.findAllByType(CompactTopBar)).toHaveLength(0);
+    expect(renderer!.root.findAllByType(TopBar)).toHaveLength(0);
+    expect(renderer!.root.findAllByType(MobileBottomTabs)).toHaveLength(1);
+    expect(renderer!.root.findAllByType(InstallBanner)).toHaveLength(1);
+    await act(async () => { renderer!.update(createElement(DaemonContext.Provider, { value: daemon },
+      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: '/term' },
+        createElement(AppRouterContext.Provider, { value: { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never },
+          createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'room') })))))); });
+    expect(renderer!.root.findAllByType(CompactTopBar)).toHaveLength(1);
+    expect(renderer!.root.findAllByType(MobileBottomTabs)).toHaveLength(1);
+    width = 1024;
+    act(() => listeners.get('resize')?.forEach((listener) => listener()));
+    expect(renderer!.root.findAllByType(TopBar)).toHaveLength(1);
+    expect(renderer!.root.findAllByType(CompactTopBar)).toHaveLength(0);
+    await act(async () => { renderer!.update(createElement(DaemonContext.Provider, { value: daemon },
+      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: '/chat' },
+        createElement(AppRouterContext.Provider, { value: { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never },
+          createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'room') })))))); });
+    expect(renderer!.root.findAllByType(TopBar)).toHaveLength(1);
+    expect(renderer!.root.findAllByType(InstallBanner)).toHaveLength(1);
   });
 
   test('wide TopBar retains the original header and only offers compact view within the compact width', () => {

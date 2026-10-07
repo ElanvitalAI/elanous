@@ -6,11 +6,19 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  applyStickyModifiers,
   buildKeySequence,
   isModifierToggleKey,
   NO_MODIFIERS,
   type ModifierKey,
 } from './key-sequences';
+
+test('sticky Ctrl+c and Alt+b transform a single character, not a multi-character paste', () => {
+  expect(applyStickyModifiers('c', { ctrl: true, alt: false })).toBe('\x03');
+  expect(applyStickyModifiers('b', { ctrl: false, alt: true })).toBe('\x1bb');
+  expect(applyStickyModifiers('paste', { ctrl: true, alt: true })).toBe('paste');
+  expect(applyStickyModifiers('', { ctrl: false, alt: true })).toBe('');
+});
 
 describe('buildKeySequence — plain (no modifiers)', () => {
   test('Esc → 0x1b', () => {
@@ -20,6 +28,11 @@ describe('buildKeySequence — plain (no modifiers)', () => {
 
   test('Tab → 0x09', () => {
     expect(buildKeySequence('tab')).toBe('\x09');
+  });
+
+  test('Shift+Enter → ESC CR, unchanged by Ctrl/Alt', () => {
+    expect(buildKeySequence('shift-enter')).toBe('\x1b\r');
+    expect(buildKeySequence('shift-enter', { ctrl: true, alt: true })).toBe('\x1b\r');
   });
 
   test('Up arrow → ESC [ A', () => {
@@ -124,7 +137,7 @@ describe('isModifierToggleKey', () => {
   });
 
   test('nav keys are not toggles', () => {
-    const navs: ModifierKey[] = ['esc', 'tab', 'up', 'down', 'left', 'right'];
+    const navs: ModifierKey[] = ['esc', 'tab', 'shift-enter', 'up', 'down', 'left', 'right'];
     for (const k of navs) {
       expect(isModifierToggleKey(k)).toBe(false);
     }

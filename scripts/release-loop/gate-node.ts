@@ -54,6 +54,8 @@ export interface GateResult {
   knownEnvCleared: string[];
   stalledEnv: Array<{ file: string; reason: 'no-output' | 'isolated-timeout'; local: 'passed' | 'failed' | 'timeout' }>;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
+  /** GATE-BASELINE-CACHE — isolated baseline files answered from the ledger (hits) or run now (misses). */
+  baselineCache?: { hits: number; misses: number };
   durationMs: number;
   error?: string;
   stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
@@ -583,6 +585,61 @@ function fileOf(id: string): string {
   return file;
 }
 
+/**
+ * GATE-BASELINE-CACHE (0.2.18) — the isolated `bun run test:deterministic <file>` result of one test file at one commit,
+ * kept in the machine ledger so a later gate does not run it again (0.2.17: the failing files were re-run on the previous
+ * release commit although that release had already measured them). Cache format harvested from draft #24500.
+ * `host` is where the result was measured (`local` or the ssh host) — a result from another host is a miss.
+ * Timeouts are never stored: an environment stall is measured again, not remembered.
+ */
+export interface BaselineFileResult { commit: string; file: string; host: string; failures: string[]; errors: string[]; missing: boolean }
+export const baselineCachePath = (ledger: string, commit: string) => join(ledger, 'gate-baseline-cache', `${commit}.jsonl`);
+function validFileResult(value: unknown, commit: string): value is BaselineFileResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Partial<BaselineFileResult>;
+  if (row.commit !== commit || typeof row.file !== 'string' || typeof row.host !== 'string' || !row.host.trim()
+    || typeof row.missing !== 'boolean' || !Array.isArray(row.failures) || !Array.isArray(row.errors)
+    || (row.missing && (row.failures.length || row.errors.length))) return false;
+  try {
+    fileOf(`${row.file} > case`);
+    return [...row.failures, ...row.errors].every((id) => typeof id === 'string' && fileOf(id) === row.file);
+  } catch { return false; }
+}
+/** A missing cache file is empty; any unreadable or invalid row discards the whole file — it is never read as a pass. */
+export function readBaselineFileCache(ledger: string, commit: string): Map<string, BaselineFileResult> {
+  const entries = new Map<string, BaselineFileResult>();
+  if (!sha.test(commit)) return entries;
+  const path = baselineCachePath(ledger, commit);
+  if (!existsSync(path)) return entries;
+  try {
+    // The writer always ends with one newline and never writes an empty line — anything else is a damaged file.
+    const text = readFileSync(path, 'utf8');
+    if (!text.endsWith('\n')) throw new Error('missing final newline');
+    for (const line of text.slice(0, -1).split('\n')) {
+      if (!line.trim()) throw new Error('empty line');
+      const row: unknown = JSON.parse(line);
+      if (!validFileResult(row, commit)) throw new Error('invalid row');
+      entries.set(`${row.file}\0${row.host}`, row);
+    }
+  } catch (error) {
+    debug.log('release.gate', 'baseline-cache-corrupt', { path, error: String(error) });
+    entries.clear();
+  }
+  return entries;
+}
+export function saveBaselineFileCache(ledger: string, commit: string, rows: BaselineFileResult[]): void {
+  if (!rows.length || !sha.test(commit)) return;
+  const entries = readBaselineFileCache(ledger, commit);
+  for (const row of rows) entries.set(`${row.file}\0${row.host}`, row);
+  const path = baselineCachePath(ledger, commit);
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = join(dirname(path), `.gate-baseline-${process.pid}-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temp, [...entries.values()].map((row) => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
+    renameSync(temp, path);
+  } finally { if (existsSync(temp)) rmSync(temp); }
+}
+
 export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote)): Promise<GateResult> {
   const start = Date.now();
   const explicitConfig = getElanousConfigDirOverride();
@@ -743,7 +800,23 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     const diff = diffFailures(countedCut.counted, countedBaseline.counted);
     result.fixed = diff.fixed.length;
     result.preexisting = diff.common.length;
-    for (const file of new Set(diff.newFailures.map(fileOf))) {
+    // GATE-BASELINE-CACHE — only the files whose new failures reproduce in isolation reach the baseline, and each
+    // (commit, file, host) is run at most once across gates: this gate's cut results also seed the next gate's baseline.
+    const cacheHost = opts.remote ?? 'local';
+    const newFailureFiles = new Set(diff.newFailures.map(fileOf));
+    const baseCache = newFailureFiles.size ? readBaselineFileCache(ledger, baseSha) : new Map<string, BaselineFileResult>();
+    const cacheStats = { hits: 0, misses: 0 };
+    const remember = (row: BaselineFileResult) => {
+      // Only a row the reader would accept is stored; an unstorable result skips the cache and leaves the verdict alone.
+      const { commit, file } = row;
+      if (!validFileResult(row, commit)) {
+        debug.log('release.gate', 'baseline-cache-skip', { commit, file });
+        return;
+      }
+      try { saveBaselineFileCache(ledger, row.commit, [row]); }
+      catch (error) { debug.log('release.gate', 'baseline-cache-write-failed', { commit: row.commit, file: row.file, error: String(error) }); }
+    };
+    for (const file of newFailureFiles) {
       // 0.2.15: the cut re-check of a new-failure file (InsidePage.test.tsx · headless Chrome) hung for good — limit it like the host re-run.
       const cutCheck = cutHostFailed.has(file) ? undefined : await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree, GATE_ISOLATED_TIMEOUT_MS);
       if (cutCheck?.timedOut) {
@@ -754,30 +827,42 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const isolatedCut = cutCheck === undefined
         ? { failures: cut.failures.filter((id) => fileOf(id) === file), errors: cut.errors.filter((id) => fileOf(id) === file) }
         : failuresOf(cutCheck, `cut isolated ${file}`);
+      if (cutCheck !== undefined) remember({ commit: opts.commit, file, host: cacheHost, failures: isolatedCut.failures, errors: isolatedCut.errors, missing: false });
       const reproduced = new Set([...isolatedCut.failures, ...isolatedCut.errors]);
       const candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
       if (candidates.length === 0) continue;
-      const baselineTree = await getBaseTree();
-      const previous = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], baselineTree, GATE_ISOLATED_TIMEOUT_MS);
-      if (previous.timedOut) {
-        debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'baseline isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
-        result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
-        continue;
-      }
       let oldFailures: Set<string>;
-      if (/No tests found|had no matches/i.test(previous.output) && previous.rc === 1) {
-        const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], opts.remote ? baselineTree : repo);
-        if (lookup.rc !== 0 || lookup.output.trim()) throw new Error(`baseline isolated run incomplete: ${file}`);
-        oldFailures = new Set();
+      const hit = baseCache.get(`${file}\0${cacheHost}`);
+      if (hit) {
+        cacheStats.hits++;
+        oldFailures = new Set([...hit.failures, ...hit.errors]);
       } else {
-        const prior = failuresOf(previous, `baseline isolated ${file}`);
-        oldFailures = new Set([...prior.failures, ...prior.errors]);
+        cacheStats.misses++;
+        const baselineTree = await getBaseTree();
+        const previous = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], baselineTree, GATE_ISOLATED_TIMEOUT_MS);
+        if (previous.timedOut) {
+          debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'baseline isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
+          result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
+          continue;
+        }
+        if (/No tests found|had no matches/i.test(previous.output) && previous.rc === 1) {
+          const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], opts.remote ? baselineTree : repo);
+          if (lookup.rc !== 0 || lookup.output.trim()) throw new Error(`baseline isolated run incomplete: ${file}`);
+          oldFailures = new Set();
+          remember({ commit: baseSha, file, host: cacheHost, failures: [], errors: [], missing: true });
+        } else {
+          const prior = failuresOf(previous, `baseline isolated ${file}`);
+          oldFailures = new Set([...prior.failures, ...prior.errors]);
+          remember({ commit: baseSha, file, host: cacheHost, failures: prior.failures, errors: prior.errors, missing: false });
+        }
       }
       for (const id of candidates) {
         if (oldFailures.has(id)) result.preexisting++;
         else result.introduced.push(id);
       }
     }
+    result.baselineCache = cacheStats;
+    debug.log('release.gate', 'baseline-cache', { hits: cacheStats.hits, misses: cacheStats.misses, commit: baseSha });
     result.outcome = result.introduced.length ? 'regression' : 'ok';
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);

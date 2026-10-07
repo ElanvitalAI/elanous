@@ -11,13 +11,172 @@ import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from '../intake-plane
 import { handleSeatRequests } from '../nexus/api/seat-requests.js';
 import { resolveDashboardChatMainSubmitIntent } from '../dashboard/input/chat-main-submit-route.js';
 import type { UserConfig } from '../user-config.js';
-import { answerSeatAsk, askSeat, deliverSeatAnswers, getTuiSeatAskClientId, parseSeatAsk, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
+import { acknowledgeSeatAnswers, answerSeatAsk, askSeat, askSeatAs, deliverSeatAnswers, getTuiSeatAskClientId, listSeatAskRoundTrips, parseSeatAsk, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
 
 const config = { raw: { decisions: { telegramOwnerId: 111 } } } as unknown as UserConfig;
 const command = (store: MsgStore, lines: string[]) => ({ ownerId: '111', replyTarget: 'acme/repo#42',
   runGh: async (_args: string[], stdin: string) => { lines.push(stdin); return 0; },
   append: (message: Parameters<MsgStore['append']>[0]) => store.append(message),
 });
+
+const roundTripFixture = async (minutes: number) => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  let time = 1_700_000_000_000;
+  const deps = { open: () => store, now: () => time, send: async () => {} };
+  const receipt = await askSeat('CTO에게 물어봐 상태?', { channel: 'telegram', chatId: 111, messageId: 1 }, command(store, []), deps);
+  const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+  time += 60_000;
+  answerSeatAsk(id, '완료', deps);
+  time = 1_700_000_000_000 + minutes * 60_000;
+  await deliverSeatAnswers(deps);
+  return { store, id, rows: listSeatAskRoundTrips({ since: 1_699_999_000_000, now: time, open: () => store }) };
+};
+
+test('9 minute ask-to-delivery is 10분 안 and records sent_at in the sent update', async () => {
+  const { store, id, rows } = await roundTripFixture(9);
+  try {
+    expect(rows).toEqual([{ id, surface: 'telegram', askedAt: 1_700_000_000_000,
+      answeredAt: 1_700_000_060_000, deliveredAt: 1_700_000_540_000, roundTripMs: 540_000, verdict: '10분 안' }]);
+    expect((store.db.query('SELECT sent_at FROM seat_ask_outbox WHERE id = ?').get(id) as { sent_at: number }).sent_at).toBe(1_700_000_540_000);
+  } finally { store.close(); }
+});
+
+test('11 minute ask-to-delivery is 10분 넘음 (not the answer latency)', async () => {
+  const { store, rows } = await roundTripFixture(11);
+  try { expect(rows[0]?.verdict).toBe('10분 넘음'); expect(rows[0]?.roundTripMs).toBe(660_000); }
+  finally { store.close(); }
+});
+
+test('past deadline is 미답 even before a worker has sent the expiry notice', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  try {
+    const receipt = await askSeat('CTO에게 물어봐 상태?', { channel: 'telegram', chatId: 111, messageId: 1 }, command(store, []),
+      { open: () => store, now: () => 1_000, timeoutMs: 60_000, send: async () => {} });
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    expect(listSeatAskRoundTrips({ since: 0, now: 61_000, open: () => store })[0]).toMatchObject({ id, verdict: '미답', deliveredAt: null, roundTripMs: null });
+    await deliverSeatAnswers({ open: () => store, now: () => 61_000, send: async () => {} });
+    expect(listSeatAskRoundTrips({ since: 0, now: 61_000, open: () => store })[0])
+      .toMatchObject({ id, verdict: '미답', deliveredAt: 61_000, answeredAt: null, roundTripMs: null });
+  } finally { store.close(); }
+});
+
+test('open ask distinguishes 답 대기 from answered outbox 전달 대기 without claiming delivery', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  try {
+    const deps = { open: () => store, now: () => 1_000, send: async () => { throw Error('delivery offline'); } };
+    const receipt = await askSeat('CTO에게 물어봐 상태?', { channel: 'telegram', chatId: 111, messageId: 1 }, command(store, []), deps);
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    const rows = () => listSeatAskRoundTrips({ since: 0, now: 2_000, open: () => store });
+    expect(rows()[0]).toMatchObject({ id, verdict: '답 대기', answeredAt: null, deliveredAt: null });
+    answerSeatAsk(id, '완료', { open: () => store, now: () => 2_000 });
+    await deliverSeatAnswers(deps).catch(() => {});
+    expect(rows()[0]).toMatchObject({ id, verdict: '전달 대기', answeredAt: 2_000, deliveredAt: null, roundTripMs: null });
+  } finally { store.close(); }
+});
+
+test('legacy ask without asked_at is 시각 미상 rather than zero latency', async () => {
+  const { store, id } = await roundTripFixture(9);
+  try {
+    store.db.query('UPDATE seat_asks SET asked_at = NULL WHERE id = ?').run(id);
+    expect(listSeatAskRoundTrips({ since: 1_699_999_000_000, now: 1_700_000_540_000, open: () => store })[0])
+      .toMatchObject({ id, askedAt: null, roundTripMs: null, verdict: '시각 미상' });
+  } finally { store.close(); }
+});
+
+test('legacy outbox missing sent_at migrates and retains pending claim fields', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  try {
+    store.db.exec(`CREATE TABLE seat_ask_outbox (id TEXT PRIMARY KEY, origin TEXT NOT NULL, text TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', claim_until INTEGER NOT NULL DEFAULT 0, claim_token TEXT)`);
+    const receipt = await askSeat('CTO에게 물어봐 상태?', { channel: 'telegram', chatId: 111, messageId: 1 }, command(store, []),
+      { open: () => store, now: () => 1_000, send: async () => {} });
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    answerSeatAsk(id, '완료', { open: () => store, now: () => 2_000 });
+    await deliverSeatAnswers({ open: () => store, now: () => 3_000, send: async () => {} });
+    expect((store.db.query('SELECT status, sent_at, claim_token FROM seat_ask_outbox WHERE id = ?').get(id) as
+      { status: string; sent_at: number; claim_token: string | null })).toEqual({ status: 'sent', sent_at: 3_000, claim_token: null });
+  } finally { store.close(); }
+});
+
+test('PWA delivery remains pending until the owning client explicitly acknowledges', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  try {
+    const receipt = await askSeat('CTO에게 물어봐 상태?', { channel: 'pwa', clientId: 'browser' }, command(store, []),
+      { open: () => store, send: async () => {} });
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    answerSeatAsk(id, '완료', { open: () => store });
+    await deliverSeatAnswers({ open: () => store, channel: 'pwa', clientId: 'browser', send: async () => {} });
+    expect((store.db.query('SELECT status, sent_at FROM seat_ask_outbox WHERE id = ?').get(id) as object))
+      .toEqual({ status: 'pending', sent_at: null });
+    acknowledgeSeatAnswers('other', [id], () => store);
+    expect((store.db.query('SELECT sent_at FROM seat_ask_outbox WHERE id = ?').get(id) as { sent_at: number | null }).sent_at).toBeNull();
+    acknowledgeSeatAnswers('browser', [id], () => store);
+    expect((store.db.query('SELECT status, sent_at FROM seat_ask_outbox WHERE id = ?').get(id) as { status: string; sent_at: number }))
+      .toEqual({ status: 'sent', sent_at: expect.any(Number) });
+  } finally { store.close(); }
+});
+
+test('legacy sent row without sent_at is 시각 미상, not pending or a zero-time delivery', async () => {
+  const { store, id } = await roundTripFixture(9);
+  try {
+    store.db.query('UPDATE seat_ask_outbox SET sent_at = NULL WHERE id = ?').run(id);
+    expect(listSeatAskRoundTrips({ since: 1_699_999_000_000, now: 1_700_000_540_000, open: () => store })[0])
+      .toMatchObject({ id, deliveredAt: null, roundTripMs: null, verdict: '시각 미상' });
+  } finally { store.close(); }
+});
+
+test('seat asks CLI prints a body-free KST table and JSON with the same measured delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-asks-cli-'));
+  const open = () => new MsgStore(join(root, 'msg', 'messages.db'));
+  const store = open();
+  try {
+    const now = Date.now();
+    const receipt = await askSeat('CTO에게 물어봐 private question?', { channel: 'telegram', chatId: 111, messageId: 1 }, command(store, []),
+      { open, now: () => now - 9 * 60_000, send: async () => {} });
+    const id = /요청: ([\w-]+)/.exec(receipt)![1]!;
+    answerSeatAsk(id, 'private answer', { open, now: () => now - 8 * 60_000 });
+    await deliverSeatAnswers({ open, now: () => now, send: async () => {} });
+    const absent = mkdtempSync(join(tmpdir(), 'seat-asks-absent-'));
+    try {
+      const missing = Bun.spawnSync(['bun', 'bin/elanous.mjs', `--test=${absent}`, 'seat', 'asks'],
+        { cwd: process.cwd(), env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
+      expect(missing.exitCode).toBe(0);
+      expect(new TextDecoder().decode(missing.stdout)).toContain(`원장 없음 — ${join(absent, 'msg', 'messages.db')}`);
+      const missingJson = Bun.spawnSync(['bun', 'bin/elanous.mjs', `--test=${absent}`, 'seat', 'asks', '--json'],
+        { cwd: process.cwd(), env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
+      expect(missingJson.exitCode).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(missingJson.stdout))).toEqual([]);
+    } finally { rmSync(absent, { recursive: true, force: true }); }
+    const cli = (...args: string[]) => Bun.spawnSync(['bun', 'bin/elanous.mjs', `--test=${root}`, 'seat', 'asks', ...args],
+      { cwd: process.cwd(), env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
+    const table = cli();
+    const text = new TextDecoder().decode(table.stdout);
+    expect(table.exitCode).toBe(0);
+    expect(text).toContain('id · 표면 · 물음 HH:MM KST · 답 · 도착 · 왕복 분 · 판정');
+    const kst = (value: number) => new Intl.DateTimeFormat('ko-KR', {
+      timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(value);
+    expect(text).toContain(`${id} · telegram · ${kst(now - 9 * 60_000)} KST · ${kst(now - 8 * 60_000)} · ${kst(now)} · 9.0분 · 10분 안`);
+    expect(text).toContain('10분 안 1 / 넘음 0 / 미답 0 / 대기 0 / 미상 0');
+    expect(text).not.toContain('private question');
+    expect(text).not.toContain('private answer');
+    const json = cli('--json');
+    expect(json.exitCode).toBe(0);
+    expect(JSON.parse(new TextDecoder().decode(json.stdout))).toEqual([{
+      id, surface: 'telegram', askedAt: now - 9 * 60_000, answeredAt: now - 8 * 60_000,
+      deliveredAt: now, roundTripMs: 540_000, verdict: '10분 안',
+    }]);
+    expect(new TextDecoder().decode(cli('--since', '1m').stdout)).toContain('이 창에 되묻기 0건');
+    const emptyJson = cli('--since', '1m', '--json');
+    expect(emptyJson.exitCode).toBe(0);
+    expect(JSON.parse(new TextDecoder().decode(emptyJson.stdout))).toEqual([]);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+}, 20_000);
 
 test('CTO ask accepts the spoken form without requiring punctuation, but not an empty question', () => {
   expect(parseSeatAsk('CTO에게 물어봐 배포 상태?')).toBe('배포 상태?');
@@ -267,6 +426,30 @@ test('Discord DM asks use the same seat inbox and return to the originating chan
     store.db.query('UPDATE msg_messages SET created_at = ? WHERE kind = ?').run('1970-01-01T00:01:00.000Z', 'seat-ask-reply');
     await deliverSeatAnswers(askDeps);
     expect(sent).toEqual([{ origin: { channel: 'discord', channelId: 'dm-111', messageId: 'm1' }, text: `CTO 답변 (${id}): 네` }]);
+  } finally { store.close(); }
+});
+
+test('all seat titles label delivered answers and unanswered notices', async () => {
+  const store = new MsgStore(':memory:');
+  store.close = () => {};
+  const sent: string[] = [];
+  let time = 0;
+  const deps = { open: () => store, now: () => time, timeoutMs: 60_000, channel: 'discord' as const,
+    send: async (_origin: AskOrigin, text: string) => { sent.push(text); } };
+  try {
+    for (const [seat, title] of [['OP', 'COO'], ['TC', 'CTO'], ['MK', 'CMO'], ['UX', 'CXO']] as const) {
+      const origin: AskOrigin = { channel: 'discord', channelId: 'dm-111', messageId: 'm1' };
+      const reply = await askSeatAs(seat, '일정 정리해 줘', origin, command(store, []), deps);
+      const id = /요청: ([\w-]+)/.exec(reply)![1]!;
+      expect(store.list(seat).at(-1)!.body).toContain(`일: 일정 정리해 줘 답장 요청: ${id}`);
+      answerSeatAsk(id, '완료', deps);
+      await deliverSeatAnswers(deps);
+      expect(sent.at(-1)).toBe(`${title} 답변 (${id}): 완료`);
+      const unanswered = /요청: ([\w-]+)/.exec(await askSeatAs(seat, '미답 요청', origin, command(store, []), deps))![1]!;
+      time += 60_000;
+      await deliverSeatAnswers(deps);
+      expect(sent.at(-1)).toBe(`${title} 미답 (${unanswered}): 아직 답 없음 (1분 경과).`);
+    }
   } finally { store.close(); }
 });
 

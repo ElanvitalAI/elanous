@@ -33,6 +33,8 @@ export function extractPodFailureReason(input: {
   containerReason?: string | null;
   jobReason?: string;
   deadlineSeconds?: number;
+  /** POD-NORESULT: the stage and PR from the child's parsed result row (disposition) — used only when no log line gives a readable reason. */
+  result?: { stage?: string | null; prUrl?: string | null; prNumber?: number | null } | null;
 }): string {
   if (input.jobReason === 'DeadlineExceeded') {
     return `DeadlineExceeded: Job 수명 상한 ${input.deadlineSeconds ?? 'unknown'}초 초과`;
@@ -72,6 +74,14 @@ export function extractPodFailureReason(input: {
   const errorLine = [...meaningful].reverse().find((line) => line.terminal || isError(line.text));
   const reason = errorLine?.text.replace(/\/home\/[^/\s]+\//gu, '~/').slice(0, 240);
   if (reason) return reason;
+  // POD-NORESULT: an unconverged child (exit 2 → BackoffLimitExceeded under backoffLimit 0) often leaves a result row
+  // with a stage and PR but no error text — report that instead of «unreadable».
+  const stage = input.result?.stage?.trim();
+  if (stage) {
+    const prNumber = input.result?.prNumber;
+    const pr = Number.isSafeInteger(prNumber) && prNumber! > 0 ? `PR #${prNumber}` : input.result?.prUrl ? `PR ${input.result.prUrl}` : '';
+    return pr ? `수확 가능(${stage}) · ${pr}` : `수렴 못 함(단계 ${stage})`;
+  }
   const why = input.logTailReason?.trim() || (input.logs.trim() ? '로그에 읽을 수 있는 오류 줄 없음' : '자식 로그 비어 있음');
   return `사유 못 읽음: ${why.replace(/\/home\/[^/\s]+\//gu, '~/').slice(0, 240)}`;
 }

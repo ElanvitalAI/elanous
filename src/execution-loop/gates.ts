@@ -3,6 +3,7 @@ import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInp
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from '../harness/harness-substrate-default.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { recallMemoryContext } from '../agent-substrate/execution/memory-context.js';
+import { CONTEXT_CARD_SCREEN_CHARS } from '../context-card/index.js';
 
 export interface GateResult<T> {
   decision: T;
@@ -169,6 +170,7 @@ export async function relationGate(
 export interface MemoryGateDeps {
   recall: (query: string) => Promise<string>;
   priorAbandonment: (goalId: string) => Promise<string | undefined> | string | undefined;
+  priorMustFix?: (goalId: string) => readonly string[];
 }
 
 export interface MemoryDecision {
@@ -183,15 +185,22 @@ export async function memoryGate(
   card: Pick<TaskCard, 'goalId' | 'title'>,
   deps: MemoryGateDeps = { recall: recallMemoryContext, priorAbandonment: () => undefined },
 ): Promise<GateResult<MemoryDecision>> {
-  const [context, priorAbandonment] = await Promise.all([
+  const [recall, priorAbandonment] = await Promise.all([
     deps.recall(card.title), deps.priorAbandonment(card.goalId),
   ]);
+  // must-fix 와 recall 은 서로 독립이다 — recall 이 비어도 앞선 must-fix 는 맥락에 남는다.
+  const mustFix = deps.priorMustFix?.(card.goalId) ?? [];
+  const mustFixBlock = mustFix.length ? `앞선 must-fix:\n${mustFix.map((item) => `- ${item}`).join('\n')}` : '';
+  const combined = [mustFixBlock, recall].filter(Boolean).join('\n');
+  const codePoints = [...combined];
+  const truncated = codePoints.length > CONTEXT_CARD_SCREEN_CHARS;
+  const context = truncated ? codePoints.slice(0, CONTEXT_CARD_SCREEN_CHARS).join('') : combined;
   const decision: MemoryDecision = {
     action: 'record', context, fragmentIds: [],
     ...(priorAbandonment === undefined ? {} : { priorAbandonment }),
   };
   return {
     decision,
-    explanation: `memory=${context ? 'recalled' : 'none or unavailable'}; prior abandonment=${priorAbandonment ?? 'unknown'}; fragment IDs unavailable from recall API`,
+    explanation: `memory=${recall ? 'recalled' : 'none or unavailable'}; prior abandonment=${priorAbandonment ?? 'unknown'}; fragment IDs unavailable from recall API${truncated ? `; truncated; chars=${[...context].length}/${CONTEXT_CARD_SCREEN_CHARS}` : ''}`,
   };
 }

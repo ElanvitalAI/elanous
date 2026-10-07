@@ -57,7 +57,10 @@ const HARNESS_TEST_ENV_KEYS = [
 // Discovery: rg -n "process\.env\.ELANOUS_(HOST|RUN|ORIGIN|SUPERVISOR|PARENT)" src
 // These are ambient execution identities, not inputs to a deterministic test.
 // debug.log also attributes SUBSTRATE and ARM_ID to every plain-object record.
-const GIT_LOCATION_ENV_KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'] as const;
+export const GIT_LOCATION_ENV_KEYS = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+] as const;
 
 const EXECUTION_ORIGIN_ENV_KEYS = [
   'ELANOUS_HOST_ID',
@@ -123,7 +126,7 @@ export type DeterministicRunnerDeps = {
   childGraceMs?: number;
   killProcessGroup?: KillProcessGroup;
   getProcessGroupId?: GetProcessGroupId;
-  gitConfig?: (cwd: string, args: string[]) => string;
+  gitConfig?: (cwd: string, args: string[]) => string | undefined;
 };
 
 export function isLivePid(pid: number): boolean {
@@ -273,14 +276,17 @@ export async function terminateDirectChild(
   reportVisible(`failed to terminate child pid=${pid}`, report);
 }
 
-function gitConfig(cwd: string, args: string[]): string {
+function gitConfig(cwd: string, args: string[]): string | undefined {
   const env = { ...process.env };
   for (const key of GIT_LOCATION_ENV_KEYS) delete env[key];
   const result = spawnSync('git', args, { cwd, env, encoding: 'utf8' });
   if (result.error || (result.status !== 0 && !(result.status === 1 && args.includes('--get-all') && !result.stderr))) {
     throw new Error(`git ${args.join(' ')} failed: ${result.error?.message ?? result.stderr}`);
   }
-  return result.stdout.trim();
+  if (result.status === 1) return undefined;
+  // --null --get-all terminates each complete value with NUL, even when
+  // a value itself contains newlines or is empty.
+  return args.includes('--get-all') ? result.stdout : result.stdout.trim();
 }
 
 export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: string): NodeJS.ProcessEnv {
@@ -406,33 +412,45 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   const cwd = deps.cwd ?? process.cwd();
   const config = deps.gitConfig ?? gitConfig;
   const commonDir = config(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  if (commonDir === undefined) throw new Error('git common directory is unset');
   const configFile = join(resolve(cwd, commonDir), 'config');
-  const bareArgs = ['config', '--file', configFile];
-  const readBare = () => config(cwd, [...bareArgs, '--get-all', 'core.bare']);
-  const bareBefore = readBare();
-  let bareChanged = false;
-  let bareChecked = false;
-  const checkBare = (): void => {
-    bareChecked = true;
-    let bareAfter = '<unreadable>';
-    const visible = (values: string) => values ? values.replaceAll('\n', ',') : '<unset>';
-    try {
-      bareAfter = readBare();
-      if (bareAfter === bareBefore) return;
-      bareChanged = true;
-      const originalValues = bareBefore ? bareBefore.split('\n') : [];
-      if (originalValues.length > 0) {
-        config(cwd, [...bareArgs, '--replace-all', 'core.bare', originalValues[0]!]);
-        for (const value of originalValues.slice(1)) config(cwd, [...bareArgs, '--add', 'core.bare', value]);
-      } else if (bareAfter) {
-        config(cwd, [...bareArgs, '--unset-all', 'core.bare']);
+  const configArgs = ['config', '--file', configFile];
+  const watchedKeys = ['core.bare', 'user.name', 'user.email'] as const;
+  // Legacy injected gitConfig fixtures supply newline-delimited results and
+  // return '' for an absent key. Real Git uses NUL-delimited complete values.
+  const readConfig = (key: string): string[] => {
+    const value = config(cwd, [...configArgs, '--null', '--get-all', key]);
+    if (value === undefined || (deps.gitConfig && value === '')) return [];
+    if (deps.gitConfig && !value.includes('\0')) return value.split('\n');
+    if (!value.endsWith('\0')) throw new Error(`unterminated git config value for ${key}`);
+    return value.slice(0, -1).split('\0');
+  };
+  const before = new Map(watchedKeys.map((key) => [key, readConfig(key)]));
+  let configChanged = false;
+  let configChecked = false;
+  const checkConfig = (): void => {
+    configChecked = true;
+    const visible = (values: string[]) => values.length === 0 ? '<unset>' : values.map((value) => value === '' ? '<empty>' : value.replaceAll('\n', ',')).join(',');
+    for (const key of watchedKeys) {
+      const original = before.get(key)!;
+      let after: string[] = ['<unreadable>'];
+      try {
+        after = readConfig(key);
+        if (JSON.stringify(after) === JSON.stringify(original)) continue;
+        configChanged = true;
+        if (original.length > 0) {
+          config(cwd, [...configArgs, '--replace-all', key, original[0]!]);
+          for (const value of original.slice(1)) config(cwd, [...configArgs, '--add', key, value]);
+        } else {
+          config(cwd, [...configArgs, '--unset-all', key]);
+        }
+        const restored = readConfig(key);
+        if (JSON.stringify(restored) !== JSON.stringify(original)) throw new Error(`expected ${visible(original)}, got ${visible(restored)}`);
+        report(`[test-deterministic] ${key} changed ${visible(original)} -> ${visible(after)}; restored ${visible(original)}; failing run`);
+      } catch (error) {
+        configChanged = true;
+        report(`[test-deterministic] ${key} changed ${visible(original)} -> ${visible(after)}; restore failed: ${formatError(error)}`);
       }
-      const restored = readBare();
-      if (restored !== bareBefore) throw new Error(`expected ${visible(bareBefore)}, got ${visible(restored)}`);
-      report(`[test-deterministic] core.bare changed ${visible(bareBefore)} -> ${visible(bareAfter)}; restored ${visible(bareBefore)}; failing run`);
-    } catch (error) {
-      bareChanged = true;
-      report(`[test-deterministic] core.bare changed ${visible(bareBefore)} -> ${visible(bareAfter)}; restore failed: ${formatError(error)}`);
     }
   };
   // ⛔ 사람이 «경로»를 직접 준 창에서는 아무것도 빼지 않는다 — 그 창은 「이것만 돌려라」다.
@@ -494,7 +512,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       });
       cleanupTemporaryRoot(testRoot, { rmSync: deps.rmSync, report });
       rootCleanupAttempted = true;
-      checkBare();
+      checkConfig();
       gate?.dispose();
       gate = undefined;
       if (deps.killSelf) {
@@ -509,8 +527,8 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
     }
 
     cleanupRoot();
-    checkBare();
-    return bareChanged ? 1 : (outcome.code ?? 1);
+    checkConfig();
+    return configChanged ? 1 : (outcome.code ?? 1);
   } catch (error) {
     if (child) {
       try {
@@ -529,7 +547,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   } finally {
     gate?.dispose();
     cleanupRoot();
-    if (!bareChecked) checkBare();
+    if (!configChecked) checkConfig();
   }
 }
 

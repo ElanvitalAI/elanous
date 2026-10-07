@@ -20,12 +20,17 @@ function observeGoalAuthor(
 import { getUserConfig } from '../user-config.js';
 
 export type GoalAuthorGrade = 'full' | 'lite';
-export type GoalAuthorGradeSource = 'flag' | 'config' | 'default';
+export type GoalAuthorGradeSource = 'flag' | 'env' | 'config' | 'default';
 export interface GoalAuthorGradeSelection { grade: GoalAuthorGrade; source: GoalAuthorGradeSource }
 
-/** The flag is authoritative; malformed or absent configuration keeps the full pipeline. */
-export function resolveGoalAuthorGrade(flag?: GoalAuthorGrade, configured?: unknown): GoalAuthorGradeSelection {
+/**
+ * Precedence flag > env (`ELANOUS_AUTHOR_GRADE`) > config > default(full). Malformed env or
+ * configuration values are ignored and keep the full pipeline. The env seam lets the Pod carry the
+ * grade without a CLI flag an older in-Pod elanous would reject (AUTHOR-LITE2-POD).
+ */
+export function resolveGoalAuthorGrade(flag?: GoalAuthorGrade, configured?: unknown, env: unknown = process.env.ELANOUS_AUTHOR_GRADE): GoalAuthorGradeSelection {
   if (flag !== undefined) return { grade: flag, source: 'flag' };
+  if (env === 'lite' || env === 'full') return { grade: env, source: 'env' };
   if (configured === 'lite' || configured === 'full') return { grade: configured, source: 'config' };
   return { grade: 'full', source: 'default' };
 }

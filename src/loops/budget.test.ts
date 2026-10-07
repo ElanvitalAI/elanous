@@ -1,5 +1,5 @@
-import { expect, test } from 'bun:test';
-import { decideSpawn, seatCapDetails, seatCapReason } from './budget.js';
+import { describe, expect, test } from 'bun:test';
+import { decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
 
 test('configured seat caps and default four-per-seat gate both constrain spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 3, caps: { TC: 8 } })).toEqual({ allow: true, reason: 'within-cap', cap: 4 });
@@ -61,4 +61,29 @@ test('injected cap is an independent candidate that cannot raise the configured 
 test('invalid cap inputs cannot permit a spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 0, caps: { TC: NaN } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
   expect(decideSpawn({ seat: 'TC', running: 0, gate: { TC: -1 } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
+});
+
+describe('seatCapExclusion (SEAT-CAP-STALE)', () => {
+  const now = Date.parse('2026-10-06T22:00:00Z');
+  const min = 60_000;
+  test('a progressing seat run holds its seat; stale, soft-stopped and seat-less runs do not', () => {
+    expect(seatCapExclusion({ kind: 'run', seat: 'TC', progressAt: now - 5 * min }, now)).toBeNull();
+    expect(seatCapExclusion({ kind: 'run', seat: 'TC' }, now)).toBeNull();
+    expect(seatCapExclusion({ kind: 'run', seat: 'TC', progressAt: now - 40 * min }, now)).toEqual({ reason: 'stale', idleMin: 40 });
+    expect(seatCapExclusion({ kind: 'run', seat: 'TC', progressAt: now - 40 * min }, now, { staleRunMinutes: 60 })).toBeNull();
+    expect(seatCapExclusion({ kind: 'run', seat: 'MK', progressAt: now - min, stopReason: 'harvestable-awaiting-human' }, now))
+      .toEqual({ reason: 'soft-stopped', idleMin: 1 });
+    expect(seatCapExclusion({ kind: 'run', progressAt: now }, now)).toEqual({ reason: 'unknown-seat', idleMin: 0 });
+  });
+  test('a launched row without a live process is dead only after the launch grace', () => {
+    const row = { kind: 'row' as const, status: 'launched', receipt: 'started' as const, live: false };
+    expect(seatCapExclusion({ ...row, launchedAt: now - 10 * min }, now)).toEqual({ reason: 'dead-row', idleMin: 10 });
+    expect(seatCapExclusion({ ...row, launchedAt: now - 10_000 }, now)).toBeNull();
+    expect(seatCapExclusion({ ...row, launchedAt: now - 10 * min, live: true }, now)).toBeNull();
+    expect(seatCapExclusion({ ...row, launchedAt: now - 10 * min, receipt: null }, now)).toEqual({ reason: 'dead-row', idleMin: 10 });
+    expect(seatCapExclusion({ ...row }, now)).toBeNull();
+    expect(seatCapExclusion({ ...row, status: 'queued', launchedAt: now - 10 * min }, now)).toBeNull();
+    expect(SEAT_CAP_STALE_RUN_MINUTES).toBe(30);
+    expect(SEAT_CAP_UNKNOWN_SEAT_CAP).toBe(2);
+  });
 });

@@ -5,8 +5,10 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--cut-commit <sha>] [--dry-run] [--json] [--if-ready]
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--dry-run] [--json] [--if-ready]
+//   elanous release resume  --run <runId> --from <node> [--json]   (release/<v> 수리 뒤 새 끝으로 이어 달리기)
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
+//   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 30분 전 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
 //
 // 🩸 계기(2026-09-25 v0.1.0 첫 공개): 손으로 밟은 절차에서 둘을 빠뜨릴 뻔했다 — 공개본 git 커밋(판 커밋이 공개본 커밋이 된다) ·
@@ -25,11 +27,12 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { getUserConfig, userConfigPath } from '../user-config.js';
-import { addItem, claimItem, decodeClaimHistoryEntry, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
 import { placeCell, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
+import { parseRubric, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
 import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
@@ -37,8 +40,11 @@ import { fileLeaseStore } from '../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
+import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
+import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
+import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
 
@@ -151,7 +157,7 @@ export async function prepareRelease(opts: PrepareOptions, run: Runner = default
     must(run('git', ['add', '-A'], publicDir), 'git add');
     must(run('git', ['-c', `user.name=${name}`, '-c', `user.email=${email}`, 'commit', '-q', '--allow-empty', '-m', `elanous ${tag}`], publicDir), 'git commit');
     const publicCommit = must(run('git', ['rev-parse', 'HEAD'], publicDir), 'git rev-parse');
-    log(`③ 공개 커밋 ${publicCommit.slice(0, 12)} (${publicRepo} main 위)`);
+    log(`③ 공개 커밋 ${publicCommit.slice(0, 12)} (${publicRepo} main 위${isPrerelease(opts.version) ? ` · 미리보기 — 공개 main 이 아니라 release/${opts.version} 가지 ⊕ 태그로 나간다` : ''})`);
 
     // ④ PWA 빌드 — ⛔ 빠뜨리면 «웹 화면 없는 판»(빌드 산출은 공개본에 안 실린다).
     symlinkSync(join(modulesRoot, 'node_modules'), join(publicDir, 'node_modules'), 'dir');
@@ -216,12 +222,17 @@ export function planPublish(m: ReleaseManifest, notesFile: string): PublishStep[
   //    🩸 2026-09-25 v0.1.1 드라이런: release-build 의 `files` 에는 SHA256SUMS 가 없어(체크섬 대상 목록이라) «자산 4» 로 올릴 뻔했다.
   const assets = [...new Set([...m.files.map((f) => f.name), 'SHA256SUMS'])];
   return [
-    { what: `공개 저장소 ${m.publicRepo} main 푸시(${m.publicCommit.slice(0, 12)})`, command: 'git', args: ['push', 'origin', 'HEAD:main'], cwd: m.publicDir },
+    // RELEASE-REHEARSAL-RC: a prerelease never moves public main — its export goes to release/<v> plus its tag (one atomic push).
+    m.prerelease
+      ? { what: `공개 저장소 ${m.publicRepo} release/${m.version} 가지 ⊕ 태그 ${m.tag} 푸시(${m.publicCommit.slice(0, 12)} · main 무접촉)`, command: 'git',
+        args: ['push', '--atomic', 'origin', `${m.publicCommit}:refs/heads/release/${m.version}`, `${m.publicCommit}:refs/tags/${m.tag}`], cwd: m.publicDir }
+      : { what: `공개 저장소 ${m.publicRepo} main 푸시(${m.publicCommit.slice(0, 12)})`, command: 'git', args: ['push', 'origin', 'HEAD:main'], cwd: m.publicDir },
     {
       what: `릴리스 ${m.tag}${m.prerelease ? ' (prerelease)' : ''} 생성 ⊕ 자산 ${assets.length}(${assets.join(' · ')})`,
       command: 'gh',
       args: ['release', 'create', m.tag, ...assets.map((name) => join(m.distDir, name)), '--repo', m.publicRepo, '--target', m.publicCommit,
-        '--title', `elanous ${m.tag}`, '--notes-file', notesFile, ...(m.prerelease ? ['--prerelease'] : [])],
+        // RELEASE-REHEARSAL-RC: a prerelease is never Latest — the one-line installer keeps serving the last stable release.
+        '--title', `elanous ${m.tag}${m.prerelease ? ' (pre-release)' : ''}`, '--notes-file', notesFile, ...(m.prerelease ? ['--prerelease', '--latest=false', '--verify-tag'] : [])],
       cwd: m.publicDir,
     },
   ];
@@ -660,6 +671,36 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   };
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   const actor = () => process.env.ELANOUS_TRACK || 'cli';
+  withContext(checklist.command('rubric').description('루브릭 채점(읽기 전용)'))
+    .action(async (_opts: unknown, cmd: Command) => {
+      if (cmd.opts().version === undefined && cmd.parent?.opts().version === undefined) throw new CliUserError('조회할 판을 지정하라', '--version <v>');
+      const { version, json } = context(cmd);
+      const items = readRubricItems(version, releaseLedgerRoot());
+      const rows = items.flatMap((item) => {
+        const rubric = parseRubric(`${item.title}\n${item.evidence ?? ''}`);
+        if (!rubric) return [];
+        const score = rubricScore(rubric);
+        return [{ id: item.id, score, grade: rubricGrade(score), priority: item.priority ?? null }];
+      }).sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+      const missing = items.length - rows.length;
+      if (json) { await writeStdoutJson(`${JSON.stringify({ version, rows, missing })}\n`); return; }
+      console.log('id · 점수 · 등급 · 현재 우선순위');
+      for (const row of rows) console.log(`${row.id} · ${row.score} · ${row.grade} · ${row.priority ?? '-'}`);
+      console.log(`루브릭 없는 칸 ${missing}`);
+    });
+  withContext(checklist.command('refs <doc>').description('문서를 인용하는 칸 — 모든 판의 구현 현황(읽기 전용)'))
+    .action(async (doc: string, _opts: unknown, cmd: Command) => {
+      if (!doc.trim() || doc.trim().startsWith('#')) throw new CliUserError(`잘못된 문서: ${doc}`, '저장소 상대 경로[#절] — 예: docs/RFC-x.md#§3');
+      const { json } = context(cmd);
+      const ledgerRoot = releaseLedgerRoot();
+      const rows = cellsReferencingDoc(doc, features.assignedVersions(ledgerRoot).map((version) => listChecklist(version, ledgerRoot)));
+      const byStatus = { green: 0, yellow: 0, red: 0, done: 0 } as Record<ChecklistStatus, number>;
+      for (const row of rows) byStatus[row.status] += 1;
+      debug.log('release.checklist', 'refs-read', { doc, rows: rows.length });
+      if (json) { await writeStdoutJson(`${JSON.stringify({ doc, rows, byStatus })}\n`); return; }
+      console.log(renderRefsStatus(rows));
+      console.log(`칸 ${rows.length} · 🟢 ${byStatus.green} · 🟡 ${byStatus.yellow} · 🔴 ${byStatus.red} · ✅ ${byStatus.done}`);
+    });
   withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = context(cmd);
     await checklistOutput(version, codenames, 'list', json, opts.owner);
@@ -742,10 +783,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD (없으면 판 착지일 KST)')
     .option('--accelerator', '가속 등급 — 다른 칸의 처리량을 올리는 칸(자율성·효율성·동시성). 생략하면 등급 없음')
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
-    .action((id: string, title: string, opts: { owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean }, cmd: Command) => {
+    .option('--ref <path...>', '근거 문서 — 저장소 상대 경로[#절] (반복 가능)')
+    .action((id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
-    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
+    const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
@@ -754,13 +796,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
-    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
+    .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
+    .action((id: string, opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
-      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
+      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
       if (!mayWrite(cmd)) return;
-      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      const data = setItem(version, id, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       const item = data.items.find((entry) => entry.id === id);
       const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
       if (why) {
@@ -909,7 +952,16 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+      // Only the rc rehearsal channel is operated for now (alpha/beta stay valid version shapes, not run options).
+      if (o.prerelease !== undefined && o.prerelease !== 'rc') {
+        const message = `--prerelease supports rc only: ${o.prerelease}`;
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: message })}\n`);
+        else console.error(`⛔ ${message}`);
+        process.exitCode = 1;
+        return false;
+      }
+      const prerelease = o.prerelease as PrereleaseKind | undefined;
       if (!o.dryRun) {
         try {
           const frozen = readLandingFreeze(releaseRunDeps.freezeRoot);
@@ -935,12 +987,13 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           return false;
         }
       }
-      if (o.ifReady && !o.dryRun) {
+      // A prerelease rehearsal never reads the stable version's readiness (checklist cells): it runs directly.
+      if (o.ifReady && !o.dryRun && !prerelease) {
         try {
           const outcome = await runReleaseIfReady(o.version, {
             ledgerRoot: releaseRunDeps.ledgerRoot,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, forceFreeze: o.forceFreeze }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (o.json) await writeStdoutJson(`${JSON.stringify(outcome)}\n`);
@@ -968,7 +1021,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, forceFreeze: o.forceFreeze }, releaseRunDeps);
+        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze }, releaseRunDeps);
         log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
         return result;
       }, (r) => r.dryRun || r.state?.status === 'done' || r.state?.status === 'awaiting-approval');
@@ -976,12 +1029,43 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   release.command('run')
     .description('릴리스 루프 실행 — 원장 직전 판과 release.loop 설정으로 그래프 입력 구성 · --dry-run 은 입력만 출력')
     .requiredOption('--version <v>', '공개할 판(x.y.z)')
-    .option('--cut-commit <sha>', 'origin/main HEAD 대신 컷으로 쓸 커밋')
+    .option('--cut-commit <sha>', 'origin/main HEAD 대신 컷으로 쓸 커밋(이미 자른 release/<v> 끝 — 옛 경로)')
+    .option('--main-cut', '옛 경로: 판 올림을 main 에 착지(기본은 release/<v> 가지에만 올린다)')
+    .option('--prerelease <kind>', '미리보기 판(rc) — <v>-rc.<다음 빈 번호> · npm next · GitHub pre-release · docs-land/ops-upgrade/dev-bump 건너뜀')
     .option('--dry-run', '체크리스트·그래프 실행 없이 전체 입력 보기')
     .option('--if-ready', '준비되지 않았으면 사유를 출력하고 성공으로 건너뛴다')
-    .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록)')
+    .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }) => { await runAction(o); });
+  release.command('preflight')
+    .description('컷 30분 전 사전 점검(읽기 전용) — 체크리스트 게이트 모의 · 발행 뒤 칸 · run --dry-run 입력 · 동결 · 일정/게이트 실측. ⛔ 있으면 exit 1')
+    .requiredOption('--version <v>', '점검할 판(x.y.z)')
+    .option('--publish-at <iso>', '계획 발행 시각(기본: 컷 뒤 첫 07·18시 KST)')
+    .option('--json', '결과 한 줄 JSON(stdout)')
+    .action(async (o: { version: string; publishAt?: string; json?: boolean }) => {
+      try {
+        const result = await releasePreflight(o.version, { publishAt: o.publishAt, releaseRunDeps });
+        if (o.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+        else for (const line of formatPreflight(result)) console.log(line);
+        if (result.blockers > 0) process.exitCode = 1;
+      } catch (e) {
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: (e as Error).message })}\n`);
+        else console.error(`⛔ ${(e as Error).message}`);
+        process.exitCode = 1;
+      }
+    });
+  release.command('resume')
+    .description('실패한 릴리스 런을 이어 달린다 — cut-branch --append 로 고친 release/<v> 새 끝을 version-release 기록에 반영(빨리감기만·상태 백업) 뒤 --from 노드부터')
+    .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
+    .requiredOption('--from <node>', '다시 시작할 노드(예: gate)')
+    .option('--json', '결과 한 줄 JSON(stdout)')
+    .action(async (o: { run: string; from: string; json?: boolean }) => {
+      await jsonAction(o.json, async (log) => {
+        const result = await resumeReleaseRun({ runId: o.run, from: o.from });
+        log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
+        return { tip: result.tip, status: result.state.status, runId: result.state.runId };
+      }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
+    });
   release.command('auto-start')
     .description('판 일정의 컷 창에서 릴리스 시작을 미리 본다 · --apply 로 release run --if-ready 실행')
     .option('--window-minutes <n>', '컷 뒤 선택 창(분)', '15')

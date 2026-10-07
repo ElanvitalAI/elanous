@@ -721,6 +721,8 @@ export function buildSelfImplementDevSpec(o: {
   ground?: boolean;
   draft: boolean;
   autoMerge?: boolean;
+  /** Pod child: stop at merge-ready so the launching host re-gates (and checks the landing freeze) before merging. */
+  mergeByHost?: boolean;
   openPr?: boolean;
   autoReview?: boolean;
   autoReviewSource?: DevSelectionSource;
@@ -755,6 +757,8 @@ export function buildSelfImplementDevSpec(o: {
     ...(o.runId ? { runId: o.runId } : {}),
     self: {
       draft: o.draft,
+      // FREEZE-POD: this flag used to be dropped here, so `self implement --merge-by-host` in a Pod merged by itself (#24478).
+      ...(o.mergeByHost === true ? { mergeByHost: true } : {}),
       ...(o.childLlm ? { childLlm: o.childLlm } : {}),
       ...(o.maxWaitSec !== undefined ? { maxWaitSec: o.maxWaitSec } : {}),
       ...(o.ground ? { ground: true } : {}),

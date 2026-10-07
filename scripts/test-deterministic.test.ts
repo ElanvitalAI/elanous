@@ -742,7 +742,8 @@ describe('runDeterministicTests core.bare guard', () => {
       report: (message) => messages.push(message),
       gitConfig: (_cwd, args) => {
         if (args[0] === 'rev-parse') return join(process.cwd(), '.git');
-        if (args.includes('--get-all')) return values;
+        // Only core.bare drifts here; user.name/user.email (also watched) stay unset.
+        if (args.includes('--get-all')) return args.at(-1) === 'core.bare' ? values : '';
         if (args.includes('--replace-all')) return '';
         throw new Error(`unexpected git call: ${args.join(' ')}`);
       },
@@ -769,7 +770,8 @@ describe('runDeterministicTests core.bare guard', () => {
       spawn: () => ({ pid: process.pid, exited: Promise.resolve(0), kill: () => true }),
     });
     expect(code).toBe(0);
-    expect(reads).toBe(2);
+    // Three watched keys (core.bare · user.name · user.email), read once before and once after.
+    expect(reads).toBe(6);
   });
 
   test('does not raise an alert when core.bare remains unchanged', async () => {

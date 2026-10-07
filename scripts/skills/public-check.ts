@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
-/** Static readiness inventory for the public (core) skills; never executes a skill. */
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+/** Public (core) skill readiness inventory; optional builds never execute a skill. */
+import { cpSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, isAbsolute, join, relative, sep, win32 } from 'node:path';
 import { computeSkillBoundaries, type SkillBoundaryReport } from '../skill-boundary.js';
 
 export type PublicCheckKey = 'header' | 'entry' | 'free' | 'portable' | 'install';
 export interface PublicSkillRow {
   readonly skill: string;
-  readonly checks: Readonly<Record<PublicCheckKey, boolean | 'N/A'>>;
+  readonly checks: Readonly<Record<PublicCheckKey, boolean | 'N/A'> & { build?: SkillBuildResult }>;
   readonly violations: readonly string[];
 }
 export interface PublicCheckReport {
@@ -68,6 +69,44 @@ function executableEntries(files: readonly string[], dir: string, docs: string):
     && (commanded.has(file) || file.startsWith('bin/') || ENTRY_NAME.test(file)));
 }
 
+export type SkillBuildResult = 'OK' | 'FAIL' | 'N/A';
+
+/** Build only selected TS/JS entries from an isolated skill copy, never from the repository. */
+export function buildSkillEntries(
+  dir: string,
+  entries: readonly string[],
+  run: (args: string[], cwd: string) => boolean = (args, cwd) => Bun.spawnSync(args, {
+    cwd, stdout: 'ignore', stderr: 'ignore',
+  }).exitCode === 0,
+): SkillBuildResult {
+  const buildable = entries.filter((entry) => /\.(?:ts|tsx|js|mjs|cjs)$/iu.test(entry));
+  if (buildable.length === 0) return 'N/A';
+  if (buildable.some((entry) => isAbsolute(entry) || win32.isAbsolute(entry) || entry.split(/[\\/]/u).includes('..'))) return 'FAIL';
+  const temp = mkdtempSync(join(tmpdir(), 'skill-public-build-'));
+  try {
+    const skill = join(temp, 'skill');
+    cpSync(dir, skill, {
+      recursive: true,
+      filter: (source) => source === dir || !['.git', 'node_modules', '__pycache__'].includes(basename(source)) && !lstatSync(source).isSymbolicLink(),
+    });
+    const copiedRoot = realpathSync(skill);
+    for (const entry of buildable) {
+      const target = realpathSync(join(skill, entry));
+      const inside = relative(copiedRoot, target);
+      if (inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside) || !lstatSync(target).isFile()) return 'FAIL';
+    }
+    if (existsSync(join(skill, 'package.json')) && !run(['bun', 'install', '--ignore-scripts'], skill)) return 'FAIL';
+    for (const [index, entry] of buildable.entries()) {
+      if (!run(['bun', 'build', entry, '--target=bun', '--outfile', join(temp, `entry-${index}.js`)], skill)) return 'FAIL';
+    }
+    return 'OK';
+  } catch {
+    return 'FAIL';
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 function freeValid(doc: string, entries: ReadonlySet<string>): boolean {
   const section = /(?:^|\n)#{1,4}\s*[^\n]*(?:무료|free)[^\n]*\n([\s\S]*?)(?=\n#{1,4}\s|$)/giu;
   for (const match of doc.matchAll(section)) {
@@ -97,7 +136,7 @@ function installValid(doc: string, dir: string): boolean {
 }
 
 /** `boundary` is injectable for pure fixture tests; production always derives it from the repository. */
-export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = computeSkillBoundaries(root)): PublicCheckReport {
+export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = computeSkillBoundaries(root), build = false): PublicCheckReport {
   const errors = [...boundary.errors];
   const skills: PublicSkillRow[] = [];
   const skillsDir = join(root, 'skills');
@@ -133,6 +172,7 @@ export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = 
       free: freeValid(docs, entries),
       portable: matches.length === 0,
       install: installValid(docs, dir),
+      ...(build ? { build: buildSkillEntries(dir, [...entries]) } : {}),
     };
     const violations = [
       ...(!checks.header ? ['SKILL.md 머리(name·description) 없음/불일치'] : []),
@@ -140,6 +180,7 @@ export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = 
       ...(!checks.free ? ['키/.env 없이 쓰는 무료 경로가 문서에 없음'] : []),
       ...matches.map((file) => `${file}: 개인 경로/내부 표지 문자열`),
       ...(!checks.install ? ['의존 manifest와 문서의 한 줄 설치 명령이 없음'] : []),
+      ...(checks.build === 'FAIL' ? ['스킬 실행 파일 빌드 실패'] : []),
     ];
     skills.push({ skill, checks, violations });
   }
@@ -147,23 +188,32 @@ export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = 
 }
 
 export function formatPublicCheck(report: PublicCheckReport): string {
-  const columns: PublicCheckKey[] = ['header', 'entry', 'free', 'portable', 'install'];
+  const columns: (PublicCheckKey | 'build')[] = ['header', 'entry', 'free', 'portable', 'install'];
+  if (report.skills.some((row) => row.checks.build !== undefined)) columns.push('build');
   return [
     `skill                              ${columns.map((key) => key.padEnd(9)).join(' ')} result`,
-    ...report.skills.map((row) => `${row.skill.padEnd(34)} ${columns.map((key) => (row.checks[key] === 'N/A' ? 'N/A' : row.checks[key] ? 'OK' : 'FAIL').padEnd(9)).join(' ')} ${row.violations.length ? row.violations.join('; ') : 'OK'}`),
+    ...report.skills.map((row) => `${row.skill.padEnd(34)} ${columns.map((key) => { const value = row.checks[key]; return (typeof value === 'string' ? value : value ? 'OK' : 'FAIL').padEnd(9); }).join(' ')} ${row.violations.length ? row.violations.join('; ') : 'OK'}`),
     ...report.errors.map((error) => `ERROR ${error}`),
     `PUBLIC-CHECK ${report.ok ? 'PASS' : 'FAIL'} (${report.skills.length} public skills)`,
   ].join('\n');
 }
 
+export function runPublicCheck(root: string, args: readonly string[], boundary?: SkillBoundaryReport): { output: string; exitCode: number } {
+  const report = checkPublicSkills(root, boundary, args.includes('--build'));
+  return {
+    output: args.includes('--json') ? JSON.stringify(report, null, 2) : formatPublicCheck(report),
+    exitCode: report.ok ? 0 : 1,
+  };
+}
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  if (args.some((arg) => arg !== '--json')) {
-    console.error('Usage: bun scripts/skills/public-check.ts [--json]');
+  if (args.some((arg) => arg !== '--json' && arg !== '--build')) {
+    console.error('Usage: bun scripts/skills/public-check.ts [--json] [--build]');
     process.exitCode = 2;
   } else {
-    const report = checkPublicSkills(join(import.meta.dir, '..', '..'));
-    console.log(args.includes('--json') ? JSON.stringify(report, null, 2) : formatPublicCheck(report));
-    if (!report.ok) process.exitCode = 1;
+    const result = runPublicCheck(join(import.meta.dir, '..', '..'), args);
+    console.log(result.output);
+    process.exitCode = result.exitCode;
   }
 }

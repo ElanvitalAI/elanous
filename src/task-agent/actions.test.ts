@@ -29,13 +29,16 @@ test('registered autopilot action entry invokes executor in default shadow mode'
   setElanousConfigDir(isolated);
   process.env.ELANOUS_STATE_DIR = isolated;
   const program = new Command();
-  registerAutopilotCommands(program);
+  const surfaces: string[] = [];
+  registerAutopilotCommands(program, { registerSink: async (surface) => { surfaces.push(surface); return true; } });
   const output: string[] = [];
   const original = process.stdout.write;
   process.stdout.write = ((text: string) => { output.push(text); return true; }) as typeof process.stdout.write;
   try {
     await program.parseAsync(['autopilot', 'task-agent-action', JSON.stringify(action)], { from: 'user' });
     expect(output).toContain('shadow\n');
+    // 독립 프로세스 관측 — task-agent 싱크를 실행 전에 등록한다(실 logs.db 대신 주입).
+    expect(surfaces).toEqual(['task-agent']);
   } finally { process.stdout.write = original; resetElanousConfigDir(); delete process.env.ELANOUS_STATE_DIR; }
 });
 test('pass reviews then lands then greens with actual merged SHA, not input SHA', async () => {

@@ -1078,6 +1078,9 @@ export interface SelfImplementSeams {
   openPr: (opts: { title: string; body: string; head: string; base?: string; draft?: boolean; labels?: string[]; cwd: string }) => Promise<{ url: string; number: number }>;
   /** PR 생성 뒤 런의 라운드 대화를 게시한다. 실패는 PR 개설을 되돌리지 않는다. */
   postPrComment?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
+  /** Read and edit the single marked status comment; missing seams fall back to individual comments. */
+  findPrComment?: (opts: { number: number; marker: string; cwd: string; comments?: unknown }) => Promise<{ id: number; body: string } | undefined>;
+  editPrComment?: (opts: { id: number; body: string; cwd: string }) => Promise<void>;
   addPrLabel?: (opts: { number: number; label: string; cwd: string }) => Promise<void>;
   readPrFiles?: (opts: { number: number; cwd: string; base?: string }) => Promise<string[]>;
   /** PR의 base/head SHA와 관측된 PR base를 한 응답에서 고정한다. 미주입·실패·빈 SHA면 검사 대상을 증명할 수 없어 fail-closed로 PR을 열어 둔다. */
@@ -3185,6 +3188,20 @@ function autoMergeEnabled(opts: Pick<SelfImplementOptions, 'completion' | 'autoM
   return completionIntentOf(opts) === 'auto-merge';
 }
 
+/**
+ * FREEZE-POD — a Pod child never merges its own PR. The host's landing freeze is invisible inside the Pod, so an
+ * auto-merge run there always stops at merge-ready and the launching host re-gates and merges (or holds it).
+ * Local (non-Pod) runs are returned unchanged.
+ */
+export function routePodMergeToHost<T extends Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost'>>(
+  opts: T, env: NodeJS.ProcessEnv = process.env,
+): { opts: T; reason: 'requested' | 'pod-child-auto-merge' | null } {
+  const podChild = env.ELANOUS_SUBSTRATE === 'pod' && Boolean(env.ELANOUS_POD_NAME?.trim());
+  if (!podChild || !autoMergeEnabled(opts)) return { opts, reason: null };
+  if (opts.mergeByHost === true) return { opts, reason: 'requested' };
+  return { opts: { ...opts, mergeByHost: true }, reason: 'pod-child-auto-merge' };
+}
+
 const SELF_IMPLEMENT_LOG_CATEGORY = 'self-implement';
 
 /** Emits a run-aware auxiliary log without admitting it to the run ledger. */
@@ -3468,6 +3485,12 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   }
   const identity = resolveRunIdentity({ explicit: opts.runId });
   const { runId } = identity;
+  const podMerge = routePodMergeToHost(opts);
+  if (podMerge.reason) {
+    opts = podMerge.opts;
+    try { debug.log('self-implement.pod', 'merge-routed-to-host', { job: process.env.ELANOUS_POD_NAME ?? null, runId, reason: podMerge.reason }); }
+    catch { /* observation must not block the run */ }
+  }
   const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId, runId);
   try {
     debug.log('self-implement.branch', 'planned', {
@@ -5444,9 +5467,11 @@ async function runSelfImplementInner(
     const omission = `\n\n[${omittedChars} characters omitted; original body length ${body.length}]`;
     prCommentBuffer.push(`${body.slice(0, MAX_PR_COMMENT_BODY_CHARS - omission.length)}${omission}`);
   };
-  const flushPrComments = async (pr: { number: number }): Promise<void> => {
+  let statusCommentCreateAttempted = false;
+  const flushPrComments = async (pr: { number: number }, salvageAction?: 'launched'): Promise<void> => {
     if (!prCommentBuffer.length) return;
     if (!s.postPrComment) {
+      observe('pr.comment.mode', { number: pr.number, mode: 'seam-missing', buffered: prCommentBuffer.length });
       observe('pr.comment.seam-missing', { number: pr.number, buffered: prCommentBuffer.length }, { level: 'warn' });
       return;
     }
@@ -5454,24 +5479,39 @@ async function runSelfImplementInner(
     if (s.findPrComment && s.editPrComment) {
       try {
         const existing = await s.findPrComment({ number: pr.number, marker, cwd: wt.path });
-        const history = prCommentBuffer.join('\n\n');
-        const body = existing
-          ? existing.body.includes('</details>')
-            ? existing.body.replace(/<\/details>(?![\s\S]*<\/details>)/, `\n\n${history}\n</details>`)
-            : `${existing.body}\n\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`
-          : `${marker}\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`;
-        if (existing) await s.editPrComment({ id: existing.id, body, cwd: wt.path });
-        else await s.postPrComment({ number: pr.number, body, cwd: wt.path });
+        if (!existing && statusCommentCreateAttempted) {
+          observe('pr.comment.mode', { number: pr.number, mode: 'individual-fallback', reason: 'status-creation-uncertain', buffered: prCommentBuffer.length });
+        } else {
+          const history = prCommentBuffer.join('\n\n');
+          const body = existing
+            ? existing.body.includes('</details>')
+              ? existing.body.replace(/<\/details>(?![\s\S]*<\/details>)/, `\n\n${history}\n</details>`)
+              : `${existing.body}\n\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`
+            : `${marker}\n<details>\n<summary>Round history</summary>\n\n${history}\n</details>`;
+          if (existing) await s.editPrComment({ id: existing.id, body, cwd: wt.path });
+          else {
+            statusCommentCreateAttempted = true;
+            await s.postPrComment({ number: pr.number, body, cwd: wt.path });
+          }
+          observe('pr.comment.mode', { number: pr.number, mode: existing ? 'status-updated' : 'status-created', buffered: prCommentBuffer.length });
+          prCommentBuffer.length = 0;
+        }
       } catch (error) {
         // Unknown lookup/edit outcome is not proof of absence: never create a second status comment.
         observe('pr.comment.status-failed', { number: pr.number, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        observe('pr.comment.mode', { number: pr.number, mode: 'individual-fallback', reason: 'status-failed', buffered: prCommentBuffer.length });
       }
+    } else {
+      observe('pr.comment.mode', { number: pr.number, mode: 'individual-fallback', reason: 'status-seam-missing', buffered: prCommentBuffer.length });
     }
-    for (const body of prCommentBuffer) {
+    if (!prCommentBuffer.length) return;
+    const pending = prCommentBuffer.splice(0);
+    for (const body of pending) {
       try {
         await s.postPrComment({ number: pr.number, body, cwd: wt.path });
       } catch (error) {
-        observe('pr.comment.post-failed', { number: pr.number, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        // Posting may have succeeded remotely even if the response failed; do not retry an uncertain comment.
+        observe('pr.comment.post-failed', { number: pr.number, ...(salvageAction && body.includes('Rework salvage status: launched.') ? { salvageAction } : {}), error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
       }
     }
   };
@@ -5822,7 +5862,13 @@ async function runSelfImplementInner(
   };
   const postSalvageStatus = async (pr: { number: number } | undefined, action: 'launched' | 'parked', reason?: string): Promise<void> => {
     if (!pr) return;
+    if (action === 'launched') {
+      bufferPrComment(round, 'author', 'Rework salvage status: launched.', reason ? [`reason: ${reason}`] : []);
+      await flushPrComments(pr, 'launched');
+      return;
+    }
     if (!s.postPrComment) {
+      observe('pr.comment.mode', { number: pr.number, mode: 'seam-missing', salvageAction: action });
       observe('pr.comment.seam-missing', { number: pr.number, salvageAction: action }, { level: 'warn' });
       return;
     }
@@ -5831,6 +5877,7 @@ async function runSelfImplementInner(
       `Rework salvage status: ${action}.`,
       ...(reason ? ['', `- reason: ${reason}`] : []),
     ].join('\n');
+    observe('pr.comment.mode', { number: pr.number, mode: 'individual', salvageAction: action });
     try {
       await s.postPrComment({ number: pr.number, body, cwd: wt.path });
     } catch (error) {
@@ -6000,7 +6047,7 @@ async function runSelfImplementInner(
       if (!s.launchReworkSalvage) throw new Error('launch seam unavailable');
       await s.launchReworkSalvage({ goalFile: opts.goalFile!, base: wt.branch, salvageAttempt: (opts.salvageAttempt ?? 0) + 1 });
       observe('rework-salvage', { action: 'launched', ...launchObservation });
-      await postSalvageStatus(pr, 'launched');
+      await postSalvageStatus(pr, 'launched', environmentReason ?? (hardCapBlockedExtend ? 'hard-cap-extend' : undefined));
       return 'launched';
     } catch (error) {
       const reason = 'launch-failed';

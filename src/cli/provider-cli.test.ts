@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import { _setRotationConfigReaderForTesting } from '../oauth/codex-account-store.js';
+import * as codexModule from '../oauth/codex.js';
 import { refreshCodexAccountHome } from '../oauth/codex.js';
 import { loadTokens, saveTokens } from '../oauth/store.js';
 import {
@@ -210,6 +211,34 @@ describe('provider codex account refresh', () => {
     expect(r.text).toContain('default-refused');
     expect(r.text).toContain('exit=1');
     expect(r.fetches).toBe(0);
+  });
+
+  test('a refreshable named account whose lock path is null is refused before any refresh (never refreshes unlocked)', async () => {
+    const homes = statusFixture();
+    writeFileSync(join(homes[2]!, 'auth.json'), JSON.stringify({ tokens: { access_token: jwt(2.5), refresh_token: 'rt-old.Yy-8_original-token', account_id: 'acct-third-1234' } }), { mode: 0o600 });
+    const lockSpy = spyOn(codexModule, 'codexAccountRefreshLockPath').mockImplementation(() => null);
+    try {
+      const r = await runRefresh('third');
+      expect(lockSpy).toHaveBeenCalled();
+      expect(r.text).toContain('갱신 거부: third');
+      expect(r.text).toContain('exit=1');
+      expect(r.fetches).toBe(0);
+    } finally { lockSpy.mockRestore(); }
+    expect(JSON.parse(readFileSync(join(homes[2]!, 'auth.json'), 'utf8')).tokens.refresh_token).toBe('rt-old.Yy-8_original-token');
+  });
+
+  test('a refresh lock file that cannot be created (real ENOENT) is a refusal with exit 1, not an unhandled throw', async () => {
+    const homes = statusFixture();
+    writeFileSync(join(homes[2]!, 'auth.json'), JSON.stringify({ tokens: { access_token: jwt(2.5), refresh_token: 'rt-old.Yy-8_original-token', account_id: 'acct-third-1234' } }), { mode: 0o600 });
+    // the real file lock, pointed under a directory that does not exist — acquisition itself fails.
+    const lockSpy = spyOn(codexModule, 'codexAccountRefreshLockPath').mockImplementation(() => join(homes[2]!, 'no-such-dir', 'x.lock'));
+    try {
+      const r = await runRefresh('third');
+      expect(r.text).toContain('갱신 거부: third 의 갱신 잠금을 못 잡았다');
+      expect(r.text).toContain('exit=1');
+      expect(r.fetches).toBe(0);
+    } finally { lockSpy.mockRestore(); }
+    expect(JSON.parse(readFileSync(join(homes[2]!, 'auth.json'), 'utf8')).tokens.refresh_token).toBe('rt-old.Yy-8_original-token');
   });
 
   test('a named account is refreshed once, written 0600, imported, and only hours are printed', async () => {

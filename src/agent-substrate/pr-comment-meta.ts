@@ -97,3 +97,23 @@ export function parse(body: string): PrCommentMeta | null {
   }
   return parsed;
 }
+
+/** 상태 댓글의 details 에 쌓인 라운드 기록을 개별 댓글 본문으로 펼친다. */
+export function expandRecords(body: string): string[] {
+  if (!/^<!-- elanous:run-status -->(?:\r?\n|$)/.test(body)) return [body];
+
+  const records: string[] = [];
+  for (const details of body.matchAll(/<details(?:\s[^>]*)?>([\s\S]*?)<\/details>/g)) {
+    const content = details[1];
+    const headers: Array<{ index: number; round?: number }> = [];
+    for (const header of content.matchAll(/^<!-- elanous-pr-comment v1 [^\r\n]* -->$/gm)) {
+      const meta = parse(header[0]);
+      if (meta) headers.push({ index: header.index, round: meta.round });
+    }
+    for (let i = 0; i < headers.length; i++) {
+      if (headers[i].round === undefined) continue;
+      records.push(content.slice(headers[i].index, headers[i + 1]?.index ?? content.length).replace(/(?:\r?\n)+$/, ''));
+    }
+  }
+  return records.length ? records : [body];
+}
