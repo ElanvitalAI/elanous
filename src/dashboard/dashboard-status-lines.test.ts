@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildDashboardStatusLines, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
+import { buildDashboardStatusLines, dashboardStatusSummaryLines, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
+import { executeImmediateDashboardSlash } from './input/slash-executor.js';
 
 const input: DashboardStatusLinesInput = {
   provider: 'openai-codex',
@@ -65,7 +66,7 @@ describe('buildDashboardStatusLines', () => {
     const lines = buildDashboardStatusLines({ ...input, provider: ' ', model: null, reasoning: undefined, daemonAddress: undefined, daemonConnected: false, accountName: undefined });
     expect(lines.slice(0, 3)).toEqual([
       '모델: 모름/모름 (모름)',
-      '연결: 데몬 모름 안 붙음',
+      '연결: 혼자 돎(데몬 없음)',
       '계정: 모름',
     ]);
     expect(buildDashboardStatusLines({ ...input, accountName: '  ' })[2]).toBe('계정: 모름');
@@ -86,5 +87,50 @@ describe('buildDashboardStatusLines', () => {
     });
     expect(lines[1]).toBe('연결: 데몬 wss://daemon.example:8443 붙음');
     expect(lines.join('\n')).not.toMatch(/password|secret|api_key|fragment/);
+  });
+});
+
+describe('TUI-SLASH-DECIDE-NOW C — /status default is human words, --debug adds the detail block', () => {
+  const getStatusLines = () => buildDashboardStatusLines(input);
+
+  test('default: model · connection · account only, no internal field names', () => {
+    const result = executeImmediateDashboardSlash({ name: 'status', args: [] }, { getStatusLines });
+    expect(result?.logLines).toEqual([
+      '모델: openai-codex/gpt-6 (high)',
+      '연결: 데몬 wss://daemon.example 붙음',
+      '계정: work',
+      '  자세히: /status --debug',
+    ]);
+    expect(result!.logLines!.join('\n')).not.toMatch(/surface:|chatOnly|acp:|starterClosed/);
+    // The seats line is part of the default view.
+    const seatsNow = '지금 자리들: CTO Context door · 3분 전';
+    expect(dashboardStatusSummaryLines(buildDashboardStatusLines({ ...input, seatsNow })).slice(0, 4)).toEqual([
+      '모델: openai-codex/gpt-6 (high)', '연결: 데몬 wss://daemon.example 붙음', '계정: work', seatsNow,
+    ]);
+    expect(executeImmediateDashboardSlash({ name: 'st', args: [] }, { getStatusLines })?.logLines)
+      .toEqual(result?.logLines);
+  });
+
+  test('--debug: the full block, unchanged', () => {
+    const result = executeImmediateDashboardSlash({ name: 'status', args: ['--debug'] }, { getStatusLines });
+    expect(result?.logLines).toEqual(buildDashboardStatusLines(input));
+    expect(result!.logLines!).toContain('자세히');
+    expect(result!.logLines!).toContain('  chatOnly: off');
+    expect(executeImmediateDashboardSlash({ name: 'status', args: ['--verbose'] }, { getStatusLines })).toBeNull();
+  });
+
+  test('no daemon: plain words, never «데몬 모름 안 붙음»', () => {
+    const lines = buildDashboardStatusLines({ ...input, daemonAddress: undefined, daemonConnected: false });
+    expect(lines[1]).toBe('연결: 혼자 돎(데몬 없음)');
+    expect(buildDashboardStatusLines({ ...input, daemonAddress: 'not a url', daemonConnected: false })[1]).toBe('연결: 혼자 돎(데몬 없음)');
+    expect(buildDashboardStatusLines({ ...input, daemonAddress: undefined, daemonConnected: true })[1]).toBe('연결: 데몬 붙음');
+    expect(buildDashboardStatusLines({ ...input, daemonConnected: false })[1]).toBe('연결: 데몬 wss://daemon.example 안 붙음');
+    const summary = dashboardStatusSummaryLines(lines).join('\n');
+    expect(summary).not.toContain('데몬 모름');
+    expect(summary).not.toContain('모름 안 붙음');
+  });
+
+  test('lines without a detail block pass through untouched', () => {
+    expect(dashboardStatusSummaryLines(['Dashboard status', '  view: log'])).toEqual(['Dashboard status', '  view: log']);
   });
 });

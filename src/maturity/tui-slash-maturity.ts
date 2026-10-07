@@ -12,6 +12,7 @@ export function readTuiSlashAudience(raw: unknown = getUserConfig().raw?.tui): {
 }
 
 export function slashMaturity(name: string): Maturity | undefined {
+  // Aliases inherit the canonical grade (including /dec from /decide).
   const command = SLASH_COMMANDS.find((entry) => entry.name === name || entry.aliases?.includes(name));
   if (!command) return undefined;
   return FEATURE_MATURITY.tuiSlash[command.name as keyof typeof FEATURE_MATURITY.tuiSlash];

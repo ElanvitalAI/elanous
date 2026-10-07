@@ -3,14 +3,15 @@ export type DaemonHarnessTarget =
   | { ok: false; reason: string };
 
 /** Read-only target selection. An explicitly configured path must never fall back to the daemon cwd. */
-export function resolveDaemonHarnessTarget({ configured, cwd, isGitRepo }: {
+export function resolveDaemonHarnessTarget({ configured, cwd, isGitRepo, allowNonGit = false }: {
   configured?: string;
   cwd: string;
   isGitRepo: (path: string) => boolean;
+  allowNonGit?: boolean;
 }): DaemonHarnessTarget {
   if (configured !== undefined) {
-    if (isGitRepo(configured)) return { ok: true, repo: configured, source: 'config' };
-  } else if (isGitRepo(cwd)) {
+    if (allowNonGit || isGitRepo(configured)) return { ok: true, repo: configured, source: 'config' };
+  } else if (allowNonGit || isGitRepo(cwd)) {
     return { ok: true, repo: cwd, source: 'cwd' };
   }
   return {

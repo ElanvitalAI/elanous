@@ -136,6 +136,7 @@ import {
   type DailyReflectionSchedulerHandle,
 } from '../notes/daily-reflection-scheduler.js';
 import { type ScheduleRunnerHandle } from '../domains/schedule-runner.js';
+import { startWatchDefaultScheduler } from '../domains/watch-default-scheduler.js';
 import { resolvePwaStaticDir } from './static-dir-resolve.js';
 import {
   createHitlPendingCallbacks,
@@ -1310,6 +1311,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // the daily-reflection scheduler regardless of which branch booted
   // it. Tests with detachForTesting set leave this undefined.
   let dailyReflectionScheduler: DailyReflectionSchedulerHandle | undefined;
+  let watchDefaultScheduler: ReturnType<typeof startWatchDefaultScheduler> | undefined;
   // RFC #2161 FU A8 (2026-05-11) — discovery cron via NEXUS. Dormant
   // by default (opt-in via `ELANOUS_DISCOVERY_CRON_INTERVAL_MS`); when
   // configured, fires runDiscovery every interval and pushes the
@@ -3198,6 +3200,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       //  schedule migrate 로 이관.) 롤백: 아래 한 줄 복원.
       // try { scheduleRunner = startScheduleRunner(); } catch { /* fail-soft */ }
       void scheduleRunner; // 은퇴(undefined 유지)
+      try { watchDefaultScheduler = startWatchDefaultScheduler(); }
+      catch (error) { debug.log('watch.default', 'failed', { stage: 'boot', reason: error instanceof Error ? error.message : String(error) }); }
     }
   }
 
@@ -3335,6 +3339,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
     // S2 (2026-07-07) · stop the schedule runner so its node-cron tasks +
     // reconcile interval don't keep firing/holding the loop past shutdown.
+    if (watchDefaultScheduler) {
+      try { watchDefaultScheduler.stop(); } catch { /* swallow */ }
+    }
     if (scheduleRunner) {
       try { scheduleRunner.stop(); } catch { /* swallow */ }
     }

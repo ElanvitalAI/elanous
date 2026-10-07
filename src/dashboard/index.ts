@@ -1323,7 +1323,7 @@ import {
   AGENT_ACTIVITY_SEGMENT_KEY,
   PULSE_HALF_PERIOD_MS,
 } from '../agent-activity-hud.js';
-import { createEscAbortGate, routeStreamingEscapeKey } from '../esc-abort-gate.js';
+import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
 import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
 import { createSshPickerModal } from '../ssh/ssh-picker-modal.js';
@@ -6700,6 +6700,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
    * this function is invoked.
    */
   const escAbortToolState = createEscAbortToolState();
+  let clarificationModalId: string | null = null;
 
   const attachChatStreamingKeys = (abortCtrl: AbortController): () => void => {
     const chatLinesStartIndex = chatLines.length;
@@ -6710,24 +6711,31 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // work is running, pop a confirmation modal before tearing down
     // the stream — the running count is visible in the HUD (T3-B1)
     // so the user can make an informed call.
+    let abortGateModalId: string | null = null;
+    const showHarnessEscHint = createHarnessEscHint((line) => pushChatLine(line));
     const escGate = createEscAbortGate({
       abortCtrl,
       getRunningCount: () => getEscAbortRunningCount(escAbortToolState),
       mountModal: (surface) => {
         attachSurfaceToWorkspace(surface, currentWorkspaceOwnerId());
+        abortGateModalId = surface.id;
         const h = display.pushModal(surface);
-        return () => { try { h.dispose(); } catch { /* ignore */ } };
+        return () => { abortGateModalId = null; try { h.dispose(); } catch { /* ignore */ } };
       },
       getViewport: () => termSize(),
       requestRedraw: () => draw(),
       getTheme: () => currentThemeTokens(),
       getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState),
       onAbortPending: ({ targets }) => {
-        pushChatLine(`  ⏳ 중단 요청됨 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+        if (!showHarnessEscHint(targets)) {
+          pushChatLine(`  ⏳ 중단 요청됨 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+        }
         chatScrollOffset = -1;
       },
       onAbortRepeat: ({ repeat, targets }) => {
-        pushChatLine(`  ⏳ ESC 재시도 ${repeat}회 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+        if (!showHarnessEscHint(targets)) {
+          pushChatLine(`  ⏳ ESC 재시도 ${repeat}회 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+        }
         chatScrollOffset = -1;
       },
       // ⭐⭐⭐ 턴을 멈추기 «전»에 살아남을 자식을 백그라운드 라우팅으로 넘긴다(`R4a` · 2026-08-19).
@@ -7182,6 +7190,28 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             interceptors: dispatchInterceptors,
           };
           return (await inputCoreRouteInputEventAsync(ev, ctx)) === 'consumed';
+        },
+        () => {
+          const modal = topModalSurface({ focusStack: display.modalStack(), surfaceAt: id => display.surface(id) });
+          if (modal?.windowRole === 'companion') return false;
+          const askHandle = approvalModalRouter.currentKind() === 'askUser' ? approvalModalRouter.current() : null;
+          const topModalId = () => topModalSurface({ focusStack: display.modalStack(), surfaceAt: id => display.surface(id) })?.id ?? null;
+          return consumeStreamingTopModalEscape({
+            modal,
+            abortGateModalId,
+            event: toDashboardKeyEvent(key),
+            question: askHandle ? {
+              id: askHandle.surface.id,
+              dispose: (cancelled) => askHandle.dispose(cancelled),
+              isClarification: askHandle.surface.id === clarificationModalId,
+            } : undefined,
+            onClarificationClosed: () => {
+              pushChatLine('되묻기 창을 닫았다 — 답 없이 진행한다');
+              chatScrollOffset = -1;
+            },
+            topModalId,
+            redraw: draw,
+          });
         },
       );
       if (streamingEscapeConsumed) return;
@@ -17649,11 +17679,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             // it via setExitInputLoop, or exit showDashboard via
             // { return: DashboardAction }.
             const dashboardSlashSurfaceUx = resolveDashboardSlashSurfaceUx();
+            const clarificationSurfaceUx = dashboardSlashSurfaceUx ? {
+              question: (request: Parameters<typeof dashboardSlashSurfaceUx.question>[0]) => {
+                const pending = dashboardSlashSurfaceUx.question(request);
+                if ((request as typeof request & { [DASHBOARD_CLARIFICATION_REQUEST]?: boolean })[DASHBOARD_CLARIFICATION_REQUEST]) {
+                  const handle = approvalModalRouter.current();
+                  if (approvalModalRouter.currentKind() === 'askUser' && handle) {
+                    clarificationModalId = handle.surface.id;
+                    void handle.promise.finally(() => {
+                      if (clarificationModalId === handle.surface.id) clarificationModalId = null;
+                    });
+                  }
+                }
+                return pending;
+              },
+            } : undefined;
             const slashCtx: DashboardSlashContext = {
               ad: { run: (args) => dispatchDashboardAdSlash(adSlashRuntime, [...args], () => { draw(); }) },
               chatLines,
               getStatusLines: getDashboardStatusLines,
-              ...(dashboardSlashSurfaceUx ? { surfaceUx: dashboardSlashSurfaceUx } : {}),
+              ...(clarificationSurfaceUx ? { surfaceUx: clarificationSurfaceUx } : {}),
               attachmentRowMap,
               pushDebugLine,
               pushChatLine: (line) => { chatLines.push(line); },

@@ -1,6 +1,6 @@
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -402,6 +402,25 @@ describe('harness worktree add', () => {
 describe('harness worktree add git command seam', () => {
   afterEach(() => setGitCommandRunnerForTesting(undefined));
 
+  test('seam: a failed core.bare move throws before extensions.worktreeConfig is enabled (fail closed)', () => {
+    const calls: string[][] = [];
+    setGitCommandRunnerForTesting((_cwd, args) => {
+      calls.push([...args]);
+      if (args[0] === 'rev-parse') return { status: 0, stdout: '/injected/repo.git\n', stderr: '' };
+      if (args.includes('/injected/repo.git/config') && args.includes('--get')) return { status: 0, stdout: 'true\0', stderr: '' };
+      if (args.includes('--get') || args.includes('--get-all')) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('--unset-all')) return { status: 5, stdout: '', stderr: 'unset-failed' };
+      return { status: 0, stdout: '', stderr: '' };
+    });
+    expect(() => recordHarnessWorktreeProvenance('/injected/worktree', {
+      owner: 'session-42',
+      command: 'harness worktree add',
+      createdAt: '2026-10-07T00:00:00.000Z',
+    })).toThrow('harness worktree shared core.bare unset failed — unset-failed');
+    expect(calls).toContainEqual(['config', '--file', '/injected/repo.git/config.worktree', 'core.bare', 'true']);
+    expect(calls.some((args) => args.includes('extensions.worktreeConfig'))).toBe(false);
+  });
+
   test('seam: injected runner records config writes without a real git process', () => {
     const calls: Array<{ cwd: string; args: string[]; options: GitCommandOptions }> = [];
     setGitCommandRunnerForTesting((cwd, args, options) => {
@@ -447,7 +466,8 @@ describe('harness worktree add git command seam', () => {
     const calls: Array<{ cwd: string; args: string[] }> = [];
     setGitCommandRunnerForTesting((cwd, args) => {
       calls.push({ cwd, args: [...args] });
-      if (args[0] === 'config' && args.includes('--get-all')) {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: '.git\n', stderr: '' };
+      if (args[0] === 'config' && (args.includes('--get-all') || args.includes('--get'))) {
         return { status: 1, stdout: '', stderr: '' };
       }
       return { status: 0, stdout: '', stderr: '' };
@@ -459,8 +479,11 @@ describe('harness worktree add git command seam', () => {
       createdAt: '2026-08-05T00:00:00.000Z',
     });
 
-    expect(calls.map((call) => call.cwd)).toEqual(Array(7).fill('/injected/worktree'));
+    expect(calls.map((call) => call.cwd)).toEqual(Array(10).fill('/injected/worktree'));
     expect(calls.map((call) => call.args)).toEqual([
+      ['rev-parse', '--git-common-dir'],
+      ['config', '--file', '/injected/worktree/.git/config', '--type=bool', '--null', '--get', 'core.bare'],
+      ['config', '--file', '/injected/worktree/.git/config', '--null', '--get', 'core.worktree'],
       ['config', 'extensions.worktreeConfig', 'true'],
       ['config', '--worktree', '--null', '--get-all', 'elanous.harness.command'],
       ['config', '--worktree', '--null', '--get-all', 'elanous.harness.createdAt'],
@@ -469,5 +492,120 @@ describe('harness worktree add git command seam', () => {
       ['config', '--worktree', '--replace-all', 'elanous.harness.createdAt', '2026-08-05T00:00:00.000Z'],
       ['config', '--worktree', '--replace-all', 'elanous.harness.owner', 'session-42'],
     ]);
+  });
+});
+
+// Incident 10-07 HQ-WORKTREE-CONFIG — seats are linked worktrees of a bare repo; a shared `core.bare=true`
+// turned on with `extensions.worktreeConfig` made every seat fail with «must be run in a work tree».
+describe('harness worktree provenance on a bare repository', () => {
+  let root: string;
+  let bare: string;
+  let seatA: string;
+  let seatB: string;
+  const out = (cwd: string, ...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'harness-wt-bare-')));
+    const src = join(root, 'src');
+    git(root, 'init', '-q', '-b', 'main', src);
+    git(src, 'config', 'user.email', 'test@example.com');
+    git(src, 'config', 'user.name', 'Test');
+    writeFileSync(join(src, 'README.md'), 'initial\n');
+    git(src, 'add', '.');
+    git(src, 'commit', '-qm', 'initial');
+    bare = join(root, 'repo.git');
+    git(root, 'clone', '-q', '--bare', src, bare);
+    git(bare, 'branch', 'seat-a', 'main');
+    git(bare, 'branch', 'seat-b', 'main');
+    seatA = join(root, 'seat-a');
+    seatB = join(root, 'seat-b');
+    git(root, '--git-dir', bare, 'worktree', 'add', '-q', seatA, 'seat-a');
+    git(root, '--git-dir', bare, 'worktree', 'add', '-q', seatB, 'seat-b');
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.bare').stdout.trim()).toBe('true');
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  function expectHealthy(): void {
+    expect(out(seatA, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
+    expect(out(seatB, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
+    expect(out(seatB, 'status', '--porcelain').status).toBe(0);
+    expect(out(root, '--git-dir', bare, 'rev-parse', '--is-bare-repository').stdout.trim()).toBe('true');
+    expect(out(root, '--git-dir', bare, 'config', '--get', 'extensions.worktreeConfig').stdout.trim()).toBe('true');
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.bare').status).toBe(1);
+    expect(out(root, 'config', '--file', join(bare, 'config.worktree'), '--get', 'core.bare').stdout.trim()).toBe('true');
+  }
+
+  test('판정 신호: core.bare moves to config.worktree before the extension is enabled — every seat stays a work tree', () => {
+    recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expectHealthy();
+    expect(worktreeConfigValues(seatA, 'elanous.harness.owner')).toEqual(['seat-a']);
+    expect(worktreeConfigValues(seatA, 'elanous.harness.command')).toEqual(['harness worktree add']);
+  });
+
+  test('판정 신호: extension already on with core.bare still shared — the invariant is repaired on the next record', () => {
+    git(root, '--git-dir', bare, 'config', 'extensions.worktreeConfig', 'true');
+    expect(out(seatB, 'rev-parse', '--is-inside-work-tree').stdout.trim()).not.toBe('true');
+    expect(out(seatB, 'status', '--porcelain').stderr).toContain('must be run in a work tree');
+    recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expectHealthy();
+    expect(worktreeConfigValues(seatA, 'elanous.harness.owner')).toEqual(['seat-a']);
+    // Idempotent: a second record keeps the moved value and does not duplicate it.
+    recordHarnessWorktreeProvenance(seatB, { owner: 'seat-b', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expectHealthy();
+    expect(out(root, 'config', '--file', join(bare, 'config.worktree'), '--get-all', 'core.bare').stdout.trim()).toBe('true');
+  });
+
+  test('판정 신호: a conflicting core.bare=false in config.worktree fails closed — the bare repo stays bare and the extension stays off', () => {
+    git(root, 'config', '--file', join(bare, 'config.worktree'), 'core.bare', 'false');
+    expect(() => recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' }))
+      .toThrow('harness worktree core.bare conflict');
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.bare').stdout.trim()).toBe('true');
+    expect(out(root, '--git-dir', bare, 'config', '--get', 'extensions.worktreeConfig').status).toBe(1);
+    expect(out(root, '--git-dir', bare, 'rev-parse', '--is-bare-repository').stdout.trim()).toBe('true');
+    expect(out(seatA, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
+  });
+
+  test('core.bare spelled `yes` is judged true and moved with its original spelling', () => {
+    git(root, 'config', '--file', join(bare, 'config'), 'core.bare', 'yes');
+    recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.bare').status).toBe(1);
+    expect(out(root, 'config', '--file', join(bare, 'config.worktree'), '--get', 'core.bare').stdout.trim()).toBe('yes');
+    expect(out(seatB, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
+    expect(out(root, '--git-dir', bare, 'rev-parse', '--is-bare-repository').stdout.trim()).toBe('true');
+  });
+
+  test('a valueless `bare` (means true) is moved as true, never as an empty false', () => {
+    const shared = join(bare, 'config');
+    git(root, 'config', '--file', shared, '--unset-all', 'core.bare');
+    writeFileSync(shared, `${readFileSync(shared, 'utf8')}[core]\n\tbare\n`);
+    expect(out(root, '--git-dir', bare, 'rev-parse', '--is-bare-repository').stdout.trim()).toBe('true');
+    recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expectHealthy();
+  });
+
+  test('a mixed per-tree core.bare list (false then true) fails closed before the extension is enabled', () => {
+    git(root, 'config', '--file', join(bare, 'config.worktree'), '--add', 'core.bare', 'false');
+    git(root, 'config', '--file', join(bare, 'config.worktree'), '--add', 'core.bare', 'true');
+    expect(() => recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' }))
+      .toThrow('harness worktree core.bare conflict');
+    expect(out(root, '--git-dir', bare, 'config', '--get', 'extensions.worktreeConfig').status).toBe(1);
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.bare').stdout.trim()).toBe('true');
+  });
+
+  test('core.worktree moves byte-for-byte, edge whitespace included', () => {
+    const odd = ` ${join(root, 'elsewhere')} `;
+    git(root, 'config', '--file', join(bare, 'config'), 'core.worktree', odd);
+    recordHarnessWorktreeProvenance(seatA, { owner: 'seat-a', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expect(out(root, 'config', '--file', join(bare, 'config'), '--get', 'core.worktree').status).toBe(1);
+    expect(out(root, 'config', '--file', join(bare, 'config.worktree'), '--null', '--get', 'core.worktree').stdout).toBe(`${odd}\0`);
+    expect(out(seatB, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
+  });
+
+  test('a normal (non-bare) repository keeps core.bare=false in its shared config', () => {
+    const src = join(root, 'src');
+    recordHarnessWorktreeProvenance(src, { owner: 'main', command: 'harness worktree add', createdAt: '2026-10-07T00:00:00.000Z' });
+    expect(out(src, 'config', '--file', join(src, '.git', 'config'), '--get', 'core.bare').stdout.trim()).toBe('false');
+    expect(existsSync(join(src, '.git', 'config.worktree'))).toBe(true);
+    expect(out(src, 'config', '--file', join(src, '.git', 'config.worktree'), '--get', 'core.bare').status).toBe(1);
+    expect(out(src, 'rev-parse', '--is-inside-work-tree').stdout.trim()).toBe('true');
   });
 });

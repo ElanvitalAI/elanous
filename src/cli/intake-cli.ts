@@ -46,7 +46,8 @@ export async function runIntakeCandidatesCli(
   const limit = opts.limit === undefined ? undefined : parseCandidatesLimit(opts.limit);
   const directives = deps.directives ?? (async () => {
     const [{ Database }, { existsSync }, { directiveDbPath }] = await Promise.all([
-      import('bun:sqlite'), import('node:fs'), import('../directives/directive-index.js'),
+      // The directive index is excluded from the public export; load it at run time only (proact-meter · know-find pattern).
+      import('bun:sqlite'), import('node:fs'), import(['..', 'directives', 'directive-index.js'].join('/')) as Promise<{ directiveDbPath: () => string }>,
     ]);
     const path = directiveDbPath();
     if (!existsSync(path)) return [];
@@ -144,14 +145,15 @@ export async function runIntakeToTasksCli(
 
 /** `--telegram` 다이제스트. 렌즈는 digest 를 만들기 전에 돈다. 렌즈 실패는 보고를 막지 않는다. */
 export async function runIntakeDigestCli(
-  opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string },
+  opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string; seat?: string },
   deps: IntakeDigestCliDeps = {},
 ): Promise<{ sent?: boolean; empty?: boolean }> {
-  const { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
+  const { buildIntakeDigest, recordSeatBriefed, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const root = deps.root ?? effectiveInstanceRoot();
   const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
-  if (opts.telegram) {
+  // A seat briefing ignores lens rows (digest drops them), so it does not pay for a lens pass over other seats' items.
+  if (opts.telegram && opts.seat === undefined) {
     const annotate = deps.annotateLens ?? (async (lensRoot, lensDay) => {
       const { annotateIntakeLens } = await import('../intake-plane/lens.js');
       return annotateIntakeLens(lensRoot, lensDay);
@@ -159,9 +161,10 @@ export async function runIntakeDigestCli(
     try { await annotate(root, day); }
     catch (error) { debug.log('intake.lens', 'annotate-failed', { day, reason: error instanceof Error ? error.message : String(error) }); }
   }
-  const d = (deps.buildDigest ?? buildIntakeDigest)(root, day);
+  const seat = opts.seat === undefined ? undefined : (await import('../intake-plane/intake-sources.js')).canonicalSeat(opts.seat);
+  const d = (deps.buildDigest ?? buildIntakeDigest)(root, day, undefined, undefined, seat);
   if (opts.telegram) {
-    if (!d.absorbed.length && !d.news?.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
+    if (!seat && !d.absorbed.length && !d.news?.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
     const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
     const sent = deps.sendTelegram
       ? await deps.sendTelegram(text)
@@ -171,6 +174,8 @@ export async function runIntakeDigestCli(
         return sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
       })();
     debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
+    if (seat && sent) recordSeatBriefed(root, seat, day, d.absorbed.map((entry) => entry.id));
+    if (seat === 'user') debug.log('watch.default', 'brief', { topics: (await import('../intake-plane/intake-sources.js')).listSources({ seat }, root).length, items: d.absorbed.length, sent });
     console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
     if (!sent) process.exitCode = 3;
     return { sent };
@@ -397,9 +402,10 @@ export function registerIntakeCommands(program: Command, candidateDeps: IntakeCa
     .option('--day <YYYY-MM-DD>', 'KST 날짜 (기본 오늘)')
     .option('--json', '구조화 출력')
     .option('--telegram', '텔레그램 보고 채널(telegram.reportChannel)로 짧은 판을 보낸다')
+    .option('--seat <id>', '자리 id (user 아침 브리핑)')
     .option('--vault <root>', '옵시디언 볼트 뿌리 — 텔레그램 판에 노트 열기 주소를 싣는다')
     .option('--note <path>', '열기 주소가 가리킬 노트(그날 트렌드 노트)')
-    .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string }) => {
+    .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string; seat?: string }) => {
       await runIntakeDigestCli(opts);
     });
 

@@ -77,6 +77,42 @@ export function shouldSuppressDevJsonWrapper(opts: Pick<DevCliOpts, 'elanous' | 
   return opts.elanous === true && opts.hold === true && opts.json === true;
 }
 
+/** 격리 TUI 기동의 작업 디렉토리 갈래(TUI-ONE-WORD-LAUNCH · 대표 *"cwd 를 넣어야 한다는 것 자체가 프릭션"*).
+ *
+ * - `explicit-cwd` — 사람이 `--cwd` 를 줬다. ⭐ 명시가 이긴다(그대로 쓴다).
+ * - `requested`    — `--worktree` 를 줬다(종전 경로).
+ * - `auto`         — 명시 격리 우주 ⊕ `--elanous` ⊕ 둘 다 없음 ⇒ 시스템이 `prepareDevWorktree` 로 스스로 만든다.
+ *                    ⚠️ `hold` 여부와 무관하다 — `--elanous --goal` 도 같은 우주에서 같은 거부를 받았기 때문이다.
+ * - `none`         — 격리가 아닌 우주(운영·트리 파생) 또는 elanous 가 아닌 경로 — 종전 동작 그대로.
+ *
+ * ⛔ `explicitlyIsolated` 는 `isExplicitlyIsolated`(src/cli/pty-drive-cli.ts) 한 벌에서 온다. */
+export type AutoWorktreeDecision = 'explicit-cwd' | 'requested' | 'auto' | 'none';
+
+export function decideAutoWorktree(input: {
+  readonly explicitlyIsolated: boolean;
+  readonly elanous?: boolean;
+  readonly hold?: boolean;
+  readonly cwd?: string;
+  readonly worktree?: boolean;
+}): AutoWorktreeDecision {
+  if (input.cwd?.trim()) return 'explicit-cwd';
+  if (input.worktree === true) return 'requested';
+  if (input.explicitlyIsolated && input.elanous === true) return 'auto';
+  return 'none';
+}
+
+/** git 저장소 밖 등으로 자동 워크트리를 못 만들었을 때의 사람 문면(스택 없이 한 줄). */
+export function formatAutoWorktreeFailure(cause: unknown): string {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const reason = /requires a Git repository/i.test(raw) ? '지금 디렉토리가 git 저장소가 아니다' : raw.split('\n')[0]!.trim();
+  return `작업 디렉토리를 스스로 정하지 못했다 — git 저장소 안에서 치거나 --cwd <경로> 를 주십시오 (${reason})`;
+}
+
+/** 자동 워크트리를 만들었을 때 사람에게 알리는 한 줄. */
+export function formatAutoWorktreeNotice(path: string): string {
+  return `작업 디렉토리: ${path} (격리 우주라 자동으로 만들었다 · 직접 정하려면 --cwd)`;
+}
+
 export interface DevCliOpts {
   base?: string;
   enhance?: boolean;

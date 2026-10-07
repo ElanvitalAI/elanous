@@ -117,7 +117,10 @@ describe('runSelfGateCli', () => {
     const passed = run({ ...sharded, aggregate: { status: 'passed', retryShardIds: [] } });
     expect(passed.exitCode).toBe(0);
     expect(passed.lines).toContain('tests: pass (6 files)');
-    expect(observed).toEqual(Array.from({ length: 2 }, () => ['/repo', 'HEAD', '2', ...files]));
+    expect(passed.lines.find((line) => line.startsWith('shards: 2 '))).not.toContain('측정 실패');
+    const fallback = run({ ...sharded, measurementFailures: 1, aggregate: { status: 'passed', retryShardIds: [] } });
+    expect(fallback.lines.find((line) => line.startsWith('shards: 2 '))).toContain('측정 실패 1');
+    expect(observed).toEqual(Array.from({ length: 3 }, () => ['/repo', 'HEAD', '2', ...files]));
     expect(() => runSelfGateCli('/repo', { shards: 0 })).toThrow('invalid --shards count');
   });
 

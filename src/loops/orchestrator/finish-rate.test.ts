@@ -113,17 +113,19 @@ test('recent startless ledger reports a lower bound while an old one is excluded
     }
     const runGh = deps(0, 1, [], [pr(1, { mergeable: 'MERGEABLE' })]).runGh;
     const metrics = measureFinish({ runGh, ledgerTargets: [{ name: 'isolated', dbPath: join(root, 'logs', 'logs.db') }] }, now);
-    expect(metrics.launched).toBe(2);
-    expect(metrics.launchedUnreadable).toBe(1);
-    expect(metrics.landingRate).toBe(0.5);
-    expect(metrics.reasons.launched).toContain('1개 원장 시작 줄 없음(하한값)');
+    // ORCH-LIVE-1008 ①: a `pod-ledger-incomplete` ledger is a launched Pod run whose result never came back — it counts
+    // as launched (no longer «unreadable»), and the incomplete count is observed by reason.
+    expect(metrics.launched).toBe(3);
+    expect(metrics.launchedUnreadable).toBeUndefined();
+    expect(metrics.launchedIncomplete).toBe(1);
+    expect(metrics.landingRate).toBeCloseTo(1 / 3);
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-      directories: 1, launched: 2, launchOnly: 0, childLedgers: 0, unreadable: 1,
+      directories: 1, launched: 3, launchOnly: 0, childLedgers: 0, unreadable: 0, incomplete: 1,
     });
-    expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-ledger-unreadable', {
-      count: 1, sample: [{ runId: ids[2], reason: 'pod-ledger-incomplete' }],
+    expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-ledger-incomplete', {
+      count: 1, byReason: { 'child-ledger-missing': 1 }, sample: [{ runId: ids[2], reason: 'child-ledger-missing' }],
     });
-    expect(finishAdvice(metrics, 20)).toMatchObject({ state: 'healthy', reasons: [metrics.reasons.launched!] });
+    expect(log.mock.calls.some(([, event]) => event === 'finish-ledger-unreadable')).toBe(false);
 
     const cleanRoot = realpathSync(mkdtempSync(join(tmpdir(), 'finish-rate-clean-')));
     try {
@@ -195,24 +197,26 @@ test('federated launch population deduplicates runs and child ledgers and refuse
     write(temp, 6, 'start'); write(temp, 3, 'start');
     write(axon, 7, 'pod-child-run'); write(temp, 8, 'pod-child-run');
     write(prod, 9, 'pod-ledger-incomplete');
+    // A ledger with neither a start nor a launch/incomplete marker stays «unreadable» (lower bound).
+    write(prod, 10, 'heartbeat');
     symlinkSync(join(root, 'test-axon'), alias);
     targets.push({ name: 'alias-axon', dbPath: join(alias, 'logs', 'logs.db') });
     const runGh = (landed: number): MeasureFinishDeps['runGh'] => args => JSON.stringify(
       args.includes('merged') ? Array.from({ length: landed }, (_, i) => pr(i, { mergedAt: now.toISOString() })) : [],
     );
     const four = measureFinish({ ledgerTargets: targets, runGh: runGh(4) }, now);
-    expect(four).toMatchObject({ launched: 6, launchedUnreadable: 1, landed: 4 });
-    expect(four.landingRate).toBeCloseTo(0.667, 2);
+    expect(four).toMatchObject({ launched: 7, launchedUnreadable: 1, launchedIncomplete: 1, landed: 4 });
+    expect(four.landingRate).toBeCloseTo(4 / 7, 3);
     expect(four.reasons.launched).toContain('1개 원장 시작 줄 없음(하한값)');
     expect(log).toHaveBeenCalledWith('loop.orchestrator', 'finish-launch-population', {
-      directories: 3, launched: 6, launchOnly: 0, childLedgers: 2, unreadable: 1,
+      directories: 3, launched: 7, launchOnly: 0, childLedgers: 2, unreadable: 1, incomplete: 1,
     });
     const nine = measureFinish({ ledgerTargets: targets, runGh: runGh(9) }, now);
-    expect(nine).toMatchObject({ launched: 6, launchedUnreadable: 1, landed: 9, landingRate: null });
-    expect(nine.reasons.landingRate).toBe('landed exceeds launched — population mismatch (launched=6, landed=9)');
+    expect(nine).toMatchObject({ launched: 7, launchedUnreadable: 1, landed: 9, landingRate: null });
+    expect(nine.reasons.landingRate).toBe('landed exceeds launched — population mismatch (launched=7, landed=9)');
 
     const partial = measureFinish({ ledgerTargets: [...targets, { name: 'missing', dbPath: join(root, 'missing', 'logs', 'logs.db') }], runGh: runGh(4) }, now);
-    expect(partial).toMatchObject({ launched: 6, launchedUnreadable: 1, landed: 4 });
+    expect(partial).toMatchObject({ launched: 7, launchedUnreadable: 1, landed: 4 });
     expect(partial.reasons.launched).toContain('원장 폴더 1개 못 읽음(하한값)');
     const directoryOnly = measureFinish({ ledgerTargets: [{ name: 'prod', dbPath: join(root, 'missing', 'logs', 'logs.db') }], runGh: runGh(4) }, now);
     expect(directoryOnly).toMatchObject({ launched: 0, landed: 4, landingRate: null });
@@ -350,4 +354,55 @@ test('recordFinishHistory starts a new line after a partially written tail', () 
     expect(lines).toHaveLength(2);
     expect(JSON.parse(lines[1]!)).toEqual(written);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ORCH-LIVE-1008: a run seen as launch-only in one ledger and pod-ledger-incomplete in another is one launch with an unknown result, in either read order', () => {
+  for (const order of [['host', 'pod'], ['pod', 'host']] as const) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-incomplete-order-')));
+    const now = new Date('2026-10-07T00:00:00Z');
+    const id = 'run-00000000-0000-4000-8000-000000000042';
+    const dirs = order.map((name) => { const dir = join(root, name, 'run-ledger'); mkdirSync(dir, { recursive: true }); return dir; });
+    const event = (name: string) => name === 'host'
+      ? { runId: id, event: 'author-on-pod-receipt', timestamp: '2026-10-06T20:00:00Z', data: {} }
+      : { runId: id, event: 'pod-ledger-incomplete', timestamp: '2026-10-06T21:00:00Z', data: { reason: 'logs-unavailable' } };
+    order.forEach((name, i) => {
+      const path = join(dirs[i]!, `${id}.jsonl`);
+      writeFileSync(path, JSON.stringify(event(name)) + '\n');
+      utimesSync(path, now, now);
+    });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const targets = dirs.map((dir, i) => ({ name: `t${i}`, dbPath: join(dir, '..', 'logs', 'logs.db') }));
+      const metrics = measureFinish({ ledgerTargets: targets, runGh: () => '[]' }, now);
+      expect(metrics.launched).toBe(1);
+      expect(metrics.launchedIncomplete).toBe(1);
+      expect(log.mock.calls.find(([, e]) => e === 'finish-ledger-incomplete')?.[2]).toMatchObject({ byReason: { 'logs-unavailable': 1 } });
+    } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('ORCH-LIVE-1008: a real start beats the incomplete marker in either read order — its time is kept and nothing counts as incomplete', () => {
+  for (const order of [['start', 'pod'], ['pod', 'start']] as const) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-start-order-')));
+    const now = new Date('2026-10-07T00:00:00Z');
+    const id = 'run-00000000-0000-4000-8000-000000000043';
+    const dirs = order.map((name) => { const dir = join(root, name, 'run-ledger'); mkdirSync(dir, { recursive: true }); return dir; });
+    const event = (name: string) => name === 'start'
+      ? { runId: id, event: 'start', timestamp: '2026-10-06T19:00:00Z', data: {} }
+      : { runId: id, event: 'pod-ledger-incomplete', timestamp: '2026-10-06T21:00:00Z', data: { reason: 'child-ledger-missing' } };
+    order.forEach((name, i) => {
+      const path = join(dirs[i]!, `${id}.jsonl`);
+      writeFileSync(path, JSON.stringify(event(name)) + '\n');
+      utimesSync(path, now, now);
+    });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const targets = dirs.map((dir, i) => ({ name: `t${i}`, dbPath: join(dir, '..', 'logs', 'logs.db') }));
+      const metrics = measureFinish({ ledgerTargets: targets, runGh: () => '[]' }, now);
+      expect(metrics.launched).toBe(1);
+      expect(metrics.launchedIncomplete).toBeUndefined();
+      expect(log.mock.calls.some(([, e]) => e === 'finish-ledger-incomplete')).toBe(false);
+      expect(log.mock.calls.find(([, e]) => e === 'finish-launch-population')?.[2]).not.toHaveProperty('incomplete');
+    } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  }
 });

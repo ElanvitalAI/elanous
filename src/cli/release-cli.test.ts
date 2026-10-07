@@ -95,7 +95,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'resume', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -1343,4 +1343,29 @@ test('RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads che
     expect(process.exitCode).toBe(1);
     expect(inputs).toHaveLength(1);
   } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+describe('CHECKLIST-PRED-CLEAR — set --no-predecessor', () => {
+  test('clears the predecessor list, records history, and still rejects empty ids', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-pred-clear-'));
+    setElanousConfigDir(dir);
+    const quiet = spyOn(console, 'log').mockImplementation(() => {});
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('--version', '9.9.9', 'add', 'A', '앞 칸');
+      await run('--version', '9.9.9', 'add', 'B', '뒤 칸', '--predecessor', 'A');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'B')?.predecessors).toEqual(['A']);
+      await run('--version', '9.9.9', 'set', 'B', '--no-predecessor');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'B')?.predecessors ?? []).toEqual([]);
+      expect(JSON.stringify(checklistHistory('B'))).toContain('predecessors');
+      // --predecessor 로 목록을 바꾸는 동작은 그대로 · 빈 id 는 여전히 거부
+      await run('--version', '9.9.9', 'set', 'B', '--predecessor', 'A');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'B')?.predecessors).toEqual(['A']);
+      await expect(run('--version', '9.9.9', 'set', 'B', '--predecessor', '')).rejects.toBeInstanceOf(CliUserError);
+    } finally {
+      quiet.mockRestore();
+      resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

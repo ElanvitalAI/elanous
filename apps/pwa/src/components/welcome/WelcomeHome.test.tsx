@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { ROUTE_GUIDANCE_ITEMS, RouteGuidanceList, isSidebarRouteHref, WelcomeHome } from './WelcomeHome';
-import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
+import { isSidebarViewLink, SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
 import { splitWelcomeRoutes } from './welcome-core-routes';
 
 function decodedHtml(html: string): string {
@@ -31,7 +31,8 @@ describe('WelcomeHome — core routes and not-found guidance', () => {
 
   test('shows core tiles first and nests every other menu tile in the closed all-screens disclosure', () => {
     const html = decodedHtml(renderToStaticMarkup(<WelcomeHome role="owner" />));
-    const { core, more } = splitWelcomeRoutes([...SIDEBAR_NAV_ITEMS, { href: '/setup' }]);
+    // 보기 링크(`?view=`)는 주소 안내에 없다 — 그 경로 타일이 이미 있다.
+    const { core, more } = splitWelcomeRoutes([...SIDEBAR_NAV_ITEMS.filter((item) => !isSidebarViewLink(item.href)), { href: '/setup' }]);
     expect(html).toContain('aria-label="핵심 화면"');
     expect(html).toContain('<details');
     expect(html).not.toContain('<details open=""');

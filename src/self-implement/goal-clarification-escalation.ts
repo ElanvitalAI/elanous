@@ -39,6 +39,7 @@ type GoalClarificationAnsweredBy = 'human' | 'agent' | 'none' | 'mixed';
 
 export interface GoalClarificationEscalationInput {
   goalFile: string;
+  runId?: string;
   /** Explicit provenance for isolated test fixtures; never inferred from goalFile. */
   testOrigin?: true;
   delivery?: GoalClarificationDelivery;
@@ -443,6 +444,7 @@ export async function escalateGoalDocumentClarifications(
         path: input.selfAnswerPath,
         ask: document,
         resolver: input.selfResolveClarification,
+        runId: input.runId ?? process.env.ELANOUS_RUN_ID,
       });
       if (resolution.newlyAnswered > 0) {
         writeGoalDocumentAtomic(input.goalFile, resolution.document);

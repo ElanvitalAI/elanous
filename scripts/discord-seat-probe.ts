@@ -84,7 +84,9 @@ export async function probeDiscordSeatWork(text: string, options: ProbeOptions =
     },
   };
   const start = performance.now();
-  const reply = await handleDiscordSeatWork(text, msg, options.live ? live : dry);
+  let reply = await handleDiscordSeatWork(text, msg, options.live ? live : dry);
+  // The ask path answers with its real acceptance text («…에게 맡겼습니다»); a dry run must still say nothing was assigned.
+  if (!options.live && (route as ProbeResult['route']) === 'ask' && reply !== null) reply = `마른 실행 (실제 맡김 없음) — ${reply}`;
   return { text: Array.from(text).slice(0, 80).join(''), ms: Math.round((performance.now() - start) * 100) / 100,
     route, seat, body, reply: reply === null ? null : Array.from(reply).slice(0, 120).join('') };
 }

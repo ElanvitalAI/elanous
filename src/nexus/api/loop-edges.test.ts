@@ -283,23 +283,28 @@ test('filters time window, sorts newest first, caps rows, and rejects invalid qu
   expect(handleLoopEdgesGet(new Request(path.replace(encodeURIComponent(since), '2026-10-04')), deps).status).toBe(400);
 });
 
-test('daemon GET requires owner bearer and cannot write through this route', async () => {
+test('daemon GET uses the same owner auth as its neighbouring GETs and cannot write through this route', async () => {
   const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
   const eventBus = new NexusEventBus();
   state.bus = eventBus;
-  const server = startNexusHttpServer({ state, eventBus, registry: new TabRegistry(state), startPort: 45000 + Math.floor(Math.random() * 1000), metaApi: { bearerToken: 'owner-token', noAuth: false } });
+  const start = (noAuth: boolean) => startNexusHttpServer({ state, eventBus, registry: new TabRegistry(state), startPort: 45000 + Math.floor(Math.random() * 1000), metaApi: { bearerToken: 'owner-token', noAuth } });
+  const server = start(false);
   try {
     const target = `${server.url}/v1/loops/edges?since=${encodeURIComponent(since)}&limit=1`;
     expect((await fetch(target, { headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(401);
+    expect((await fetch(target, { headers: { authorization: 'Bearer wrong-token', 'sec-fetch-site': 'cross-site' } })).status).toBe(401);
     const authorized = await fetch(target, { headers: { authorization: 'Bearer owner-token', 'sec-fetch-site': 'cross-site' } });
     expect(authorized.status).toBe(200);
     expect((await authorized.json() as { edges: unknown[] }).edges).toBeInstanceOf(Array);
-    const sameOrigin = await fetch(target, { headers: { 'sec-fetch-site': 'same-origin' } });
-    expect(sameOrigin.status).toBe(401);
+    // UX 10-07: the PWA got 401 here while its neighbouring GETs answered — same-origin is decided by checkAuth for both.
+    const sameOrigin = { 'sec-fetch-site': 'same-origin' };
+    const neighbour = await fetch(`${server.url}/v1/harness/ask-status`, { headers: sameOrigin });
+    expect(neighbour.status).toBe(400); // passed auth: ask-status answers 400 without its query, 401 when refused
+    expect((await fetch(target, { headers: sameOrigin })).status).toBe(200);
     expect((await fetch(target, { method: 'POST', headers: { authorization: 'Bearer owner-token', 'sec-fetch-site': 'cross-site' } })).status).not.toBe(200);
-    const withoutBearer = startNexusHttpServer({ state, eventBus, registry: new TabRegistry(state), startPort: 45000 + Math.floor(Math.random() * 1000), metaApi: { bearerToken: 'owner-token', noAuth: true } });
-    try {
-      expect((await fetch(`${withoutBearer.url}/v1/loops/edges`, { headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(401);
-    } finally { withoutBearer.stop(); }
   } finally { server.stop(); }
-});
+  const open = start(true);
+  try {
+    expect((await fetch(`${open.url}/v1/loops/edges?since=${encodeURIComponent(since)}&limit=1`, { headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(200);
+  } finally { open.stop(); }
+}, 30_000);

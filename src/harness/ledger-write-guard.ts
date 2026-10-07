@@ -1,19 +1,7 @@
-import { realpathSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
-
-function physicalPath(path: string): string {
-  const absolute = resolve(path);
-  try {
-    return realpathSync(absolute);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    const parent = dirname(absolute);
-    if (parent === absolute) throw error;
-    return resolve(physicalPath(parent), relative(parent, absolute));
-  }
-}
+import { isInsideOpsRoot, physicalPath, testProcessSignal } from '../instance/test-write-guard.js';
 
 /** Refuse a test's write to the production instance, including an explicitly supplied ledger directory. */
 export function refuseProductionLedgerWriteInTest(
@@ -23,11 +11,13 @@ export function refuseProductionLedgerWriteInTest(
   productionRoot = prodInstanceRoot(),
   instanceRoot = effectiveInstanceRoot(),
 ): boolean {
-  if (env.NODE_ENV !== 'test' && !env.ELANOUS_TEST_HOME) return false;
+  if (!testProcessSignal(env, env === process.env ? undefined : '')) return false;
   const target = physicalPath(root);
   const production = physicalPath(productionRoot);
   const withinProduction = relative(production, target);
-  if (withinProduction === '..' || withinProduction.startsWith(`..${sep}`) || isAbsolute(withinProduction)) return false;
+  const outsideHomeRoot = withinProduction === '..' || withinProduction.startsWith(`..${sep}`) || isAbsolute(withinProduction);
+  // The account's real ~/.elanous is production too when a runner redirected HOME (TEST-PROD-LEAK).
+  if (outsideHomeRoot && !isInsideOpsRoot(root)) return false;
   try {
     debug.log('harness.incidents', 'write-refused', { store, root: target, effectiveInstanceRoot: instanceRoot });
   } catch { /* Observation cannot reopen a closed write boundary. */ }

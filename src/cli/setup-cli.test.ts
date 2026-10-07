@@ -9,7 +9,8 @@ import { Command } from 'commander';
 import { registerSetupCommand, type SetupCliDeps } from './setup-cli.js';
 import { planClaudePluginSetup, type ClaudePluginSetupPlan } from './claude-plugin-setup.js';
 import { debug } from '../debug/log.js';
-import type { UserConfig } from '../user-config.js';
+import { buildUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
+import { addSource, listSources } from '../intake-plane/intake-sources.js';
 
 const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: 'access', refreshToken: 'refresh' } } } });
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
@@ -198,6 +199,88 @@ describe('setup Claude Code CLI', () => {
     expect(result.applies).toEqual([]);
     expect(result.exitCodes).toEqual([1]);
   });
+});
+
+test('starter topics and watch opt-out survive user-config save and reload', () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-config-'));
+  try {
+    const path = join(root, 'config.json');
+    saveUserConfig({ ...buildUserConfig(path), starter: { topics: ['agents'] }, watch: { enabled: false } }, path);
+    expect(buildUserConfig(path).starter?.topics).toEqual(['agents']);
+    expect(buildUserConfig(path).watch?.enabled).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('first-run setup asks for topics even when provider is auto', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-first-provider-'));
+  let cfg = { ...config('auto'), skills: { deny: [], allow: [] } } as unknown as UserConfig;
+  const program = new Command();
+  try {
+    registerSetupCommand(program, {
+      firstRunTopics: true, watchRoot: root, getUserConfig: () => cfg, saveUserConfig: (next) => { cfg = next; },
+      runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
+      isStdinTty: () => true, prompt: async (message) => message.startsWith('관심 주제') ? 'AI agents' : 'y',
+      out: { log: () => {} }, setExitCode: () => {}, runDoctorFix: async () => 0,
+    });
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(cfg.starter?.topics).toEqual(['AI agents']);
+    expect(listSources({ seat: 'user' }, root).map(source => source.spec)).toEqual(['AI agents']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('first-run setup accepts interested topics and persists user sources', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-first-run-'));
+  const cfg = { ...config('openai-codex'), skills: { deny: [], allow: [] } } as unknown as UserConfig;
+  const saved: UserConfig[] = [];
+  const program = new Command();
+  try {
+    registerSetupCommand(program, {
+      firstRunTopics: true, watchRoot: root, getUserConfig: () => saved.at(-1) ?? cfg,
+      saveUserConfig: (next) => { saved.push(next); },
+      runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
+      isStdinTty: () => true, prompt: async (message) => message.startsWith('관심 주제') ? 'AI agents, robotics' : 'n',
+      out: { log: () => {} }, setExitCode: () => {},
+    });
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(saved.at(-1)?.starter?.topics).toEqual(['AI agents', 'robotics']);
+    expect(listSources({ seat: 'user' }, root).map(source => source.spec)).toEqual(['AI agents', 'robotics']);
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(saved).toHaveLength(1);
+    expect(listSources({ seat: 'user' }, root)).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('interactive setup registers starter topics once and skips existing sources; report-only remains read-only', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-setup-'));
+  try {
+    addSource({ id: 'old', kind: 'github-query', seat: 'user', spec: 'agents', every: '1w' }, root);
+    const cfg = { ...config('openai-codex'), skills: { deny: [], allow: [] }, starter: { topics: ['agents', 'bun', 'bun'] } } as unknown as UserConfig;
+    const program = new Command();
+    registerSetupCommand(program, {
+      watchRoot: root, getUserConfig: () => cfg, runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }),
+      detectSkillCliAuth: () => [], isStdinTty: () => true, prompt: async () => 'n',
+      out: { log: () => {} }, setExitCode: () => {},
+    });
+    await program.parseAsync(['node', 'elanous', 'setup', '--non-interactive']);
+    expect(listSources({ seat: 'user' }, root)).toHaveLength(1);
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(listSources({ seat: 'user' }, root).map(s => s.spec)).toEqual(['agents', 'bun']);
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(listSources({ seat: 'user' }, root)).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('watch opt-out leaves setup sources absent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-off-'));
+  try {
+    const cfg = { ...config('openai-codex'), skills: { deny: [], allow: [] }, watch: { enabled: false }, starter: { topics: ['agents'] } } as unknown as UserConfig;
+    const program = new Command();
+    registerSetupCommand(program, { watchRoot: root, getUserConfig: () => cfg,
+      runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
+      isStdinTty: () => true, prompt: async () => 'n', out: { log: () => {} }, setExitCode: () => {} });
+    await program.parseAsync(['node', 'elanous', 'setup']);
+    expect(listSources({}, root)).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 describe('setup CLI', () => {

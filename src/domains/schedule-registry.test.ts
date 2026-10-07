@@ -1,4 +1,4 @@
-import { setDefaultTimeout, test, expect, describe } from 'bun:test';
+import { setDefaultTimeout, test, expect, describe, spyOn } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import { TaskStore } from '../task-orchestrator/store.js';
 import { createTask } from '../task-orchestrator/types.js';
 import { migrateJobToTrigger, registerScheduledToxTasks, scheduledRunViaById } from './schedule-migrate.js';
 import { debug } from '../debug/log.js';
+import { addSource, removeSource } from '../intake-plane/intake-sources.js';
 import {
   openSchedulesDb, parseCronLine, scriptName, inferCategory, unwrapCronCommand, wrapCronLine, wrapShellCronLine, unwrapCronLine, sharesCrontabLine,
   inventoryCrontab, inventoryInternalSchedules, listSchedules, driftedSchedules,
@@ -407,6 +408,40 @@ describe('driftedSchedules — crontab에서 사라진 잡 감지', () => {
     expect(drift.length).toBe(1);
     expect(drift[0]!.name).toBe('outbound-flush');
   });
+});
+
+test('watch default inventory adds only daemon jobs with a user source and reconciles opt-out without touching crontab', () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-schedules-'));
+  const d = db();
+  try {
+    inventoryCrontab(d, { crontab: SAMPLE });
+    const original = listSchedules(d, { source: 'crontab' });
+    const opts = { watchRoot: root, workflowSchedules: [], discoveryIntervalMs: 0 };
+    inventoryInternalSchedules(d, opts);
+    expect(listSchedules(d, { source: 'watch-default' })).toEqual([]);
+    addSource({ id: 'my-topic', seat: 'user', kind: 'github-query', spec: 'agent', every: '1d' }, root);
+    addSource({ id: 'other-topic', seat: 'MK', kind: 'github-query', spec: 'tools', every: '1d' }, root);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      inventoryInternalSchedules(d, opts);
+      expect(log).toHaveBeenCalledWith('watch.default', 'scheduled', { topics: 1, items: 0, sent: false });
+    } finally { log.mockRestore(); }
+    expect(listSchedules(d, { source: 'watch-default' }).map(({ name, cron, command, run_via }) => ({ name, cron, command, run_via }))).toEqual([
+      { name: 'watch-brief', cron: '30 8 * * *', command: 'intake digest --seat user --telegram', run_via: 'daemon' },
+      { name: 'watch-collect', cron: '0 7 * * *', command: 'intake source run-due --seat user', run_via: 'daemon' },
+    ]);
+    inventoryInternalSchedules(d, opts);
+    expect(listSchedules(d, { source: 'watch-default' })).toHaveLength(2);
+    removeSource('my-topic', root);
+    inventoryInternalSchedules(d, opts);
+    expect(listSchedules(d, { source: 'watch-default' })).toEqual([]);
+    addSource({ id: 'my-topic', seat: 'user', kind: 'github-query', spec: 'agent', every: '1d' }, root);
+    inventoryInternalSchedules(d, opts);
+    inventoryInternalSchedules(d, { ...opts, watchEnabled: false });
+    expect(listSchedules(d, { source: 'watch-default' })).toEqual([]);
+    expect(listSchedules(d, { source: 'crontab' })).toEqual(original);
+    expect(listSchedules(d, { source: 'daily-reflection' })).toHaveLength(1);
+  } finally { d.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 describe('inventoryInternalSchedules — 내부 스케줄 통합 뷰 (B2)', () => {

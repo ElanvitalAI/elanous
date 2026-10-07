@@ -49,8 +49,23 @@ import type { AcpServerOptions, AcpTurnContext } from './server.js';
 import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
+import { classifyTuiChatIntent, type TuiChatRoute } from '../core-turn/short-question.js';
+import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
+
+// An allowlist, not a denylist: a new repository writer cannot slip into a quick turn.
+const QUICK_TOOLS: Record<Exclude<TuiChatRoute, '코딩·구현'>, readonly string[]> = {
+  '조회': ['decisions_pending', 'ops_seats', 'ops_status', 'release_status', 'logs_query', 'context_now', 'memory_recall', 'Read'],
+  '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig'],
+  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check'],
+  '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'session_manage', 'ops_status'],
+};
+
+export function toolsForTuiRoute(tools: readonly LLMToolSpec[], route: Exclude<TuiChatRoute, '코딩·구현'>): LLMToolSpec[] {
+  const preferred = QUICK_TOOLS[route];
+  return preferred.flatMap((name) => tools.filter((tool) => tool.name === name));
+}
 
 export interface CoreTurnBridgeDeps {
   /** Build the seed message list for this ACP prompt. Implementations
@@ -110,6 +125,8 @@ export interface CoreTurnBridgeDeps {
    *  to 1ms so they don't spend real wall clock waiting for the
    *  flag to propagate. */
   abortPollMs?: number;
+  /** Only the in-process dashboard session opts into TUI routing; daemon ACP stays unchanged. */
+  tuiRouting?: boolean;
 }
 
 /** Default abort-poll cadence. 50ms = 20 Hz: responsive without
@@ -192,12 +209,32 @@ export function bridgeCoreTurnToAcp(
           promptMeta: turnCtx.promptMeta,
         }),
       );
-      const tools = await Promise.resolve(
+      const availableTools = await Promise.resolve(
         deps.getTools({
           sessionId: turnCtx.sessionId,
           userText: turnCtx.userText,
         }),
       );
+      // Only a goal-driven harness child (explicit executor role — dev-harness · self-implement surfaces) keeps every
+      // turn on the goal loop. A human TUI inside a harness space (one-word `dev --elanous`, `--hold`) is routed (UX 10-07).
+      const harness = process.env[HARNESS_ROLE_ENV]?.trim() === 'executor';
+      const route = deps.tuiRouting && !harness
+        ? classifyTuiChatIntent(turnCtx.userText, {
+            hasAttachments: turnCtx.promptBlocks?.some((block) => block.type !== 'text') ?? false,
+          })
+        : { route: '코딩·구현' as const, reason: harness ? 'harness' : 'legacy', goalLoop: true };
+      const tools = !route.goalLoop && route.route !== '코딩·구현'
+        ? toolsForTuiRoute(availableTools, route.route)
+        : availableTools;
+      if (deps.tuiRouting) {
+        debug.log('chat.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop });
+        // Only a quick route is announced: a coding turn's transcript stays exactly as before (preservation).
+        // Awaited so the route line precedes the answer; a failed write is observed, not fatal to the turn.
+        if (!route.goalLoop) {
+          try { await turnCtx.push(`라우팅: ${route.route}\n`); }
+          catch (error) { debug.log('chat.route', 'push-failed', { route: route.route, error: String(error) }); }
+        }
+      }
       const modelOverride = deps.resolveModel?.({ sessionId: turnCtx.sessionId, userText: turnCtx.userText });
       const factQuestion = isFactQuestion(turnCtx.userText);
       const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
@@ -233,7 +270,7 @@ export function bridgeCoreTurnToAcp(
       const goalLoopCfg = getUserConfig().llm.goalLoop;
       const turnModel = modelOverride ?? getUserConfig().llm.model;
       const turnFamily = getModelFamily(turnModel);
-      const armGoalLoop = goalLoopCfg?.enabled === true;
+      const armGoalLoop = goalLoopCfg?.enabled === true && route.goalLoop;
       if (armGoalLoop) {
         // 관측 — 어느 family/모델에서 across-turn goal-loop 가 아밍됐나(전-family 개방 검증).
         debug.log('goal.loop', 'arm', { family: turnFamily, model: turnModel });

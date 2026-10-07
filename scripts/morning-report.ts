@@ -6,10 +6,15 @@
 //   bun run scripts/morning-report.ts --no-upload  # skip S3 상세 업로드(로컬 미리보기)
 
 import { composeMorningReport } from '../src/domains/morning-report.js';
-import { sendTelegramReport, sendReportPhoto } from '../src/telegram-report.js';
+import { explainReportRoute, sendTelegramReport, sendReportPhoto } from '../src/telegram-report.js';
 import { getUserConfig } from '../src/user-config.js';
 import { getFirecrawlConfig } from '../src/registry/discovery/config.js';
 import { captureFinvizMapImageUrl } from '../src/domains/finviz-image.js';
+
+import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
+
+// cron runs this outside the daemon — attach logs.db so `elanous logs --category telegram.report` sees the send.
+await registerStandaloneLogSink('morning-report');
 
 const dry = process.argv.includes('--dry');
 const cfg = getUserConfig();
@@ -32,9 +37,18 @@ if (dry) {
   console.log(report);
 } else {
   const sent = await sendTelegramReport(cfg, report, { markdown: true, kind: 'report' });
-  console.error(sent
-    ? '[morning-report] sent to report channel ✓'
-    : '[morning-report] no report channel configured — skipped');
+  if (sent) console.error('[morning-report] sent to report channel ✓');
+  else {
+    // ⛔ «no report channel configured» was printed for four days while reportChannel was set
+    //    (BRIEF-DELIVERY-1007) — say which routing rule closed it, and fail the cron run.
+    const why = explainReportRoute(cfg, 'report');
+    console.error(!report
+      ? '[morning-report] ⛔ 못 보냄(report) — empty-report: 본문이 비었다(composeMorningReport 산출 확인)'
+      : why.reason === 'routed'
+        ? '[morning-report] ⛔ 못 보냄(report) — unconfirmed: 텔레그램이 message_id 를 돌려주지 않았다(elanous logs --category telegram.report)'
+        : `[morning-report] ⛔ 못 보냄(report) — ${why.reason}: ${why.hint}`);
+    process.exitCode = 1;
+  }
 
   // 히트맵 이미지 첨부(위에서 캡처한 URL 재사용). fail-soft.
   if (heatmapImageUrl) {

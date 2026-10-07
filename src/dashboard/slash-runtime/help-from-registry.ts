@@ -2,6 +2,7 @@ import type { SlashCommand } from '../../chat/index.js';
 import { readTuiSlashAudience, slashMaturity, slashVisibleFor } from '../../maturity/tui-slash-maturity.js';
 import type { Role } from '../../maturity/feature-maturity.js';
 import { visibleWidth } from '../../tui.js';
+import { HELP_GROUP_ORDER, helpGroupFor } from './help-groups.js';
 
 const ESSENTIAL_KEYS = [
   ['Enter', 'Send message'],
@@ -29,6 +30,11 @@ function fitLine(text: string, width: number): string {
     fitted += segment;
   }
   return fitted + '…';
+}
+
+/** Head line for one help group (never starts with `/`, so it can't read as a command). */
+export function helpGroupHeading(group: string): string {
+  return `▸ ${group}`;
 }
 
 /** Plain content for the dashboard modal; registration, not the picker, decides which slash names exist. */
@@ -65,15 +71,22 @@ export function buildEssentialHelpLines({
     ? Math.max(1, Math.floor(width / (readableCellWidth + 1)))
     : 1;
   const columnWidth = Math.floor(width / columns);
+  // Task order (TUI-SLASH-DECIDE-NOW C): group head line, then that group's commands by name.
+  // Empty groups print no head; unmapped commands land in «그 밖», so none disappears.
   const commandLines: string[] = [];
-  for (let start = 0; start < entries.length; start += columns) {
-    const cells = entries.slice(start, start + columns).map(({ label, description }) => {
-      const cellWidth = columnWidth - (columns > 1 ? 1 : 0);
-      return visibleWidth(`${label}  `) > cellWidth ? '' : fitLine(`${label}  ${description}`, cellWidth);
-    });
-    commandLines.push(cells.map((cell, index) =>
-      index === cells.length - 1 ? cell : cell + ' '.repeat(columnWidth - visibleWidth(cell)),
-    ).join('').trimEnd());
+  for (const group of HELP_GROUP_ORDER) {
+    const members = entries.filter(({ name }) => helpGroupFor(name) === group);
+    if (members.length === 0) continue;
+    commandLines.push(fitLine(helpGroupHeading(group), width));
+    for (let start = 0; start < members.length; start += columns) {
+      const cells = members.slice(start, start + columns).map(({ label, description }) => {
+        const cellWidth = columnWidth - (columns > 1 ? 1 : 0);
+        return visibleWidth(`${label}  `) > cellWidth ? '' : fitLine(`${label}  ${description}`, cellWidth);
+      });
+      commandLines.push(cells.map((cell, index) =>
+        index === cells.length - 1 ? cell : cell + ' '.repeat(columnWidth - visibleWidth(cell)),
+      ).join('').trimEnd());
+    }
   }
   const keyItems = ESSENTIAL_KEYS.map(([key, description]) => `${key}  ${description}`);
   const keyLines: string[] = [];

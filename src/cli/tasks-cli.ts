@@ -1,11 +1,14 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { readNexusRuntime } from '../nexus/runtime.js';
+import { checklistDevVersion } from '../release-loop/checklist.js';
+import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { handTask, nextMoveFor, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type TaskCard, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { cardPrNumber, COMPLETION_KINDS, handTask, nextMoveFor, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 
 type TaskRow = Pick<Task, 'id' | 'title' | 'priority' | 'status' | 'createdAt' | 'approval' | 'generatedBy'>;
@@ -25,6 +28,10 @@ export interface TasksCliDeps {
   missionDecompose?: MissionDecompose;
   /** `task advance` 의 착지 근거 읽기(시험 주입). 기본 = `predecessorState`(gh · 런 원장). */
   pieceEvidence?: PieceEvidenceReader;
+  /** `task board` 의 내부 팩 어댑터(시험 주입). 기본 = 현재 판(`checklistDevVersion()`)의 `releasePackBoard` — 읽기만. */
+  releaseBoard?: () => BoardNode[];
+  /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
+  cardRunEvidence?: CardRunEvidenceDeps;
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -65,16 +72,28 @@ export async function registerTaskAgentSink(register?: (surface: string) => Prom
  * config-dir 은 명시(`--config-dir`/`--test`)가 있으면 그것, 없으면 운영 루트(`prodInstanceRoot()`)다.
  * (작업 트리에서 그냥 띄우면 test 우주로 가서 동결·몫·풀 상한 밖에서 돈다.)
  */
-export async function defaultTaskLauncher(args: string[]): Promise<void> {
-  const { spawn } = await import('node:child_process');
+/** This package's CLI entry — never `process.argv[1]`, which is whatever script started this process
+ *  (ORCH-LIVE-1008: the orchestrator tick runs `bun …/tick.ts delegate`, so the hand launched `tick.ts --config-dir …
+ *  harness say …`, which exited 2 with stdio ignored — the card said `launched` and no run ever started). */
+export const ELANOUS_CLI_ENTRY = resolve(import.meta.dir, '../../bin/elanous.mjs');
+
+/** argv for a detached `elanous` child that runs `args` in `configDir`. */
+export function taskLauncherArgv(configDir: string, args: readonly string[]): string[] {
+  return [ELANOUS_CLI_ENTRY, '--config-dir', configDir, ...args];
+}
+
+export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: { spawn?: DetachedSpawn } = {}): Promise<void | TaskLaunchReceipt> {
+  const spawn = deps.spawn ?? ((await import('node:child_process')).spawn as unknown as DetachedSpawn);
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { prodInstanceRoot } = await import('../instance/resolve.js');
   const configDir = getElanousConfigDirOverride() ?? prodInstanceRoot();
-  await spawnDetachedConfirmed(spawn as unknown as DetachedSpawn, process.execPath, [process.argv[1]!, '--config-dir', configDir, ...args]);
+  // TA-CARD-RUN-LINK: 런 id 를 자식 환경에 얹는다 — `harness say` 의 런(호스트 orchestrate)이 그 id 를 상속한다.
+  await spawnDetachedConfirmed(spawn, process.execPath, taskLauncherArgv(configDir, args), SPAWN_CONFIRM_TIMEOUT_MS, cwd, context?.env);
+  return context ? { runId: context.runId } : undefined;
 }
 
 /** `spawn` 의 필요한 면만(시험 주입). */
-export type DetachedSpawn = (command: string, args: string[], options: { detached: true; stdio: 'ignore' }) => {
+export type DetachedSpawn = (command: string, args: string[], options: { detached: true; stdio: 'ignore'; cwd?: string; env?: NodeJS.ProcessEnv }) => {
   pid?: number;
   once(event: 'spawn', listener: () => void): unknown;
   once(event: 'error', listener: (error: Error) => void): unknown;
@@ -89,10 +108,10 @@ export const SPAWN_CONFIRM_TIMEOUT_MS = 2_000;
  * 떼어 띄우고 «떴는지» 확인한다 — 'spawn' 이면 성공, 'error'(ENOENT·EACCES 등)면 던진다.
  * 확인 없이 돌려주면 비동기 error 가 처리되지 않고 카드가 `launched` 로 남는다(사후 리뷰 must-fix).
  */
-export function spawnDetachedConfirmed(spawnFn: DetachedSpawn, command: string, args: string[], timeoutMs = SPAWN_CONFIRM_TIMEOUT_MS): Promise<void> {
+export function spawnDetachedConfirmed(spawnFn: DetachedSpawn, command: string, args: string[], timeoutMs = SPAWN_CONFIRM_TIMEOUT_MS, cwd?: string, env?: Record<string, string>): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let child: ReturnType<DetachedSpawn>;
-    try { child = spawnFn(command, args, { detached: true, stdio: 'ignore' }); } catch (error) { reject(error); return; }
+    try { child = spawnFn(command, args, { detached: true, stdio: 'ignore', ...(cwd ? { cwd } : {}), ...(env ? { env: { ...process.env, ...env } } : {}) }); } catch (error) { reject(error); return; }
     let settled = false;
     const finish = (error?: Error) => {
       if (settled) return;
@@ -122,10 +141,20 @@ function headLine(text: string): string {
   return first.length > 100 ? `${first.slice(0, 100)}…` : first;
 }
 
+/** 런 연결 한 줄 — 런 id 가 없으면 없다(옛 카드 · shadow). */
+function runLinkLine(card: TaskCard): string[] {
+  if (!card.runId) return [];
+  const number = cardPrNumber(card);
+  const url = typeof card.pr === 'object' ? card.pr.url : undefined;
+  const pr = number !== undefined ? `#${number}${url ? ` ${url}` : ''}` : '-';
+  return [`런: ${card.runId} · 골: ${card.goalId ?? '-'} · PR: ${pr}${card.runChildId ? ` · 자식 런: ${card.runChildId}` : ''}`];
+}
+
 function taskCardLines(card: TaskCard): string[] {
   return [
     [card.id, card.status, card.seat ?? '-', card.checklistId ?? '-', card.createdAt, card.text].join('\t'),
     ...(card.mission ? [`미션: ${card.mission} · after: ${card.after?.length ? card.after.join(', ') : '-'}`] : []),
+    ...runLinkLine(card),
     `다음 수: ${moveLine(card)}`,
   ];
 }
@@ -135,7 +164,8 @@ function missionLines(mission: TaskCard, pieces: TaskCard[]): string[] {
   const edges = pieces.flatMap((piece) => (piece.after ?? []).map((before) => `간선: ${before} -> ${piece.id}`));
   return [
     [mission.id, 'mission', mission.seat ?? '-', mission.checklistId ?? '-', mission.createdAt, `조각 ${pieces.length} · 간선 ${edges.length} · 출처 ${mission.splitSource ?? '-'}`, headLine(mission.text)].join('\t'),
-    ...pieces.map((piece) => [`조각: ${piece.id}`, piece.status, nextMoveFor(piece).kind, `after: ${piece.after?.length ? piece.after.join(',') : '-'}`, headLine(piece.text)].join('\t')),
+    ...pieces.map((piece) => [`조각: ${piece.id}`, piece.status, nextMoveFor(piece).kind, `after: ${piece.after?.length ? piece.after.join(',') : '-'}`, headLine(piece.text),
+      ...(piece.runId ? [`런: ${piece.runId}${cardPrNumber(piece) !== undefined ? ` · PR #${cardPrNumber(piece)}` : ''}`] : [])].join('\t')),
     ...edges,
     ...(mission.greenProposal ? [`green 제안: ${mission.greenProposal.at} · 칸 ${mission.greenProposal.checklistId ?? '-'} · 근거 ${Object.entries(mission.greenProposal.evidence).map(([id, ref]) => `${id}=${ref}`).join(', ')}`] : []),
   ];
@@ -255,13 +285,28 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .description('TASK-AGENT 에 과제 한 줄을 넘긴다 — 카드를 적고 첫 수(harness say --substrate pod --merge-by-host)를 고른다 · 기본 shadow(발사 0) · `--mission` 이면 조각 카드 ⊕ 선후로 쪼개 선행 없는 조각만 넘긴다')
     .addOption(new Option('--seat <seat>', `과제 자리 (${TASK_SEATS.join('|')})`).choices([...TASK_SEATS]))
     .option('--checklist <cellId>', '릴리스 체크리스트 칸 id')
+    .addOption(new Option('--completion <kind>', `종결 종류 (${COMPLETION_KINDS.join('|')} · 기본 code-pr = PR 병합)`).choices([...COMPLETION_KINDS]))
     .option('--mission <text>', '미션 문면 — 조각(`- …`·`① …`·`1. …` ⊕ `after: 1`)으로 나열돼 있으면 결정론, 아니면 분해기로 쪼갠다')
+    .option('--project <id>', '프로젝트 id — --target 과 함께')
+    .option('--goal <id>', '보드 소속 목표 id (task board)')
+    .option('--milestone <id>', '보드 소속 이정표 id (task board)')
+    .option('--target <dir>', '프로젝트 대상 디렉터리(있어야 한다 · 상대 경로는 절대로 · git 이 아니면 --completion 이 code-pr 밖이어야 한다) — 발사기를 이 디렉터리에서 띄운다')
     .option('--live', '실제로 발사한다(기본은 shadow — 명령만 출력)')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; mission?: string; live?: boolean; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; json?: boolean }) => {
       await registerTaskAgentSink(deps.registerSink);
       if ((text === undefined) === (opts.mission === undefined)) {
         out('과제 한 줄 «또는» --mission <문면> 중 하나만 준다');
+        process.exitCode = 1;
+        return;
+      }
+      if ((opts.project === undefined) !== (opts.target === undefined)) {
+        out('--project <id> 와 --target <dir> 를 함께 줘야 한다');
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined)) {
+        out('--completion/--project/--target/--goal/--milestone 은 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
         process.exitCode = 1;
         return;
       }
@@ -297,8 +342,12 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       try {
         const result = await handTask({
           text: text!,
+          ...(opts.project !== undefined && opts.target !== undefined ? { project: { id: opts.project, target: opts.target } } : {}),
+          ...(opts.goal !== undefined ? { goal: opts.goal } : {}),
+          ...(opts.milestone !== undefined ? { milestone: opts.milestone } : {}),
           ...(opts.seat ? { seat: opts.seat } : {}),
           ...(opts.checklist ? { checklistId: opts.checklist } : {}),
+          ...(opts.completion ? { completion: opts.completion } : {}),
           live: opts.live === true,
           ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
@@ -307,10 +356,42 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         else {
           out(`${result.card.id}\t${result.mode}\t${result.launched ? 'launched' : 'not launched'}`);
           out(`elanous ${result.move.command!.map(shellQuote).join(' ')}`);
+          if (result.cwd) out(`(cwd: ${result.cwd})`);
           if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
         }
       } catch (error) {
         out(error instanceof Error ? error.message : '과제 넘기기 실패');
+        process.exitCode = 1;
+      }
+    });
+
+  tasks.command('board')
+    .description('보드 — 프로젝트 › 목표 › 이정표 › 과제. 과제 카드(project·goal·milestone)와 내부 팩(릴리스 체크리스트 = elanous › 판 › 칸)을 합쳐 읽는다(쓰지 않는다)')
+    .option('--project <id>', '이 프로젝트만')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { project?: string; json?: boolean }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      try {
+        // 내부 팩은 elanous 프로젝트만 낸다 — 다른 프로젝트로 거르면 릴리스 원장을 열지 않는다(그 원장의 오류가 카드 보드를 막지 않게).
+        const wantsPack = opts.project === undefined || opts.project === INTERNAL_PACK_PROJECT;
+        const board = mergeBoards(
+          cardsBoard(deps.taskStatePath ?? taskStatePathDefault()),
+          wantsPack ? (deps.releaseBoard ?? (() => releasePackBoard(checklistDevVersion())))() : [],
+        );
+        // 무소속(unassigned: true)은 어떤 --project 로도 고르지 않는다 — 실제 프로젝트 id 와 겹치지 않게.
+        const selected = opts.project !== undefined ? board.filter((project) => project.unassigned !== true && project.id === opts.project) : board;
+        try { debug.log('task-agent', 'board', { projects: selected.length, tasks: countBoardTasks(selected), project: opts.project ?? null }); } catch { /* fail-soft */ }
+        if (opts.json) out(JSON.stringify(selected));
+        else {
+          const show = (node: BoardNode, depth: number): void => {
+            out(`${'  '.repeat(depth)}${node.level}\t${node.id}\t${node.status}\t${headLine(node.title)}`);
+            for (const next of node.children ?? []) show(next, depth + 1);
+          };
+          if (selected.length === 0) out(opts.project !== undefined ? `프로젝트 없음: ${opts.project}` : '보드가 비어 있다');
+          for (const project of selected) show(project, 0);
+        }
+      } catch (error) {
+        out(error instanceof Error ? error.message : '보드 읽기 실패');
         process.exitCode = 1;
       }
     });
@@ -366,6 +447,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
               ...(statePath ? { statePath } : {}),
               launcher: deps.taskLauncher ?? defaultTaskLauncher,
               ...(deps.pieceEvidence ? { readEvidence: deps.pieceEvidence } : {}),
+              ...(deps.cardRunEvidence ? { runEvidence: deps.cardRunEvidence } : {}),
             }));
           } catch (error) {
             // 미션 id 하나면 그대로 실패 · --all 이면 그 미션만 실패로 적고 다음 미션으로 간다(크론이 한 미션에 막히지 않게).
@@ -405,7 +487,18 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       if (id.startsWith(TASK_CARD_PREFIX)) {
         await registerTaskAgentSink(deps.registerSink);
         let card: TaskCard | undefined;
-        try { card = readTaskCard(id, deps.taskStatePath); } catch (error) {
+        try {
+          card = readTaskCard(id, deps.taskStatePath);
+          // 런 id 가 있으면 원장에서 골 id · PR 을 묶는다(찾았을 때만 적는다 · 실패는 그대로 보인다).
+          const bindable = card?.pieces ? card.pieces : card ? [card.id] : [];
+          for (const cardId of bindable) {
+            try { await refreshCardRunBinding(cardId, deps.taskStatePath ?? taskStatePathDefault(), deps.cardRunEvidence ?? {}); } catch (error) {
+              // 근거 없음으로 보인다 — 원장 부재와 갈리게 실패는 남긴다.
+              try { debug.log('task-agent', 'card-bind-failed', { card: cardId, via: 'show', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+            }
+          }
+          if (card) card = readTaskCard(id, deps.taskStatePath);
+        } catch (error) {
           out(error instanceof Error ? error.message : '과제 카드 읽기 실패');
           process.exitCode = 1;
           return;

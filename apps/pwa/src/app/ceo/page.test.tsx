@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { DaemonClient } from '@/lib/daemon-client';
@@ -51,6 +51,96 @@ function card(root: ReactTestRenderer['root'], label: string) {
   const text = (node: typeof section): string => node.children.map((child) => typeof child === 'string' ? child : text(child)).join('');
   return text(section);
 }
+
+test('all six cards show loading rather than unreadable before the first response', async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    calls.push(url);
+    await pending;
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/schedules')) return json({ schedules: [] });
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) return json({ decisions: [] });
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    if (url.includes('/v1/grid')) return json(gridData);
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+  const root = await mount();
+  const labels = ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드'];
+  expect(calls).toHaveLength(7);
+  expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual(labels);
+  for (const label of labels) {
+    expect(card(root, label)).toContain('불러오는 중…');
+    expect(card(root, label)).not.toContain('못 읽음');
+  }
+  expect(root.findByProps({ 'aria-label': '결정 대기 카드' }).findByType('a').props.href).toBe('/decisions');
+  await act(async () => { release(); });
+  expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드0');
+  expect(card(root, '그리드')).toContain('칸 사용 3/8');
+});
+
+test('failed and unanswered reads show 못 읽음 only after the request ends', async () => {
+  const deadlines: Array<() => void> = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    if (delay !== 15_000) return originalSetTimeout(callback, delay);
+    deadlines.push(callback);
+    return deadlines.length as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  try {
+    globalThis.fetch = (async (url: string): Promise<Response> => {
+      if (url.includes('/v1/grid')) return new Promise<Response>(() => {});
+      throw Error('offline');
+    }) as typeof fetch;
+    const root = await mount();
+    expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual([
+      '릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드',
+    ]);
+    expect(deadlines).toHaveLength(7);
+    for (const label of ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5']) {
+      expect(card(root, label)).toContain('못 읽음');
+    }
+    expect(card(root, '그리드')).toContain('불러오는 중…');
+    expect(card(root, '그리드')).not.toContain('못 읽음');
+    await act(async () => { deadlines[6]!(); });
+    expect(card(root, '릴리스 판 진행')).toBe('릴리스 판 진행못 읽음발행 현황 보기 →');
+    expect(card(root, '루프 판정')).toBe('루프 판정못 읽음루프 상호작용 보기 →');
+    expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
+    expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR못 읽음');
+    expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
+    expect(card(root, '그리드')).toBe('그리드못 읽음');
+    expect(root.findByProps({ 'aria-label': '릴리스 판 진행' }).findByType('a').props.href).toBe('/ops/release');
+    expect(root.findByProps({ 'aria-label': '루프 판정' }).findByType('a').props.href).toBe('/loops?view=interact');
+    expect(root.findByProps({ 'aria-label': '결정 대기 카드' }).findByType('a').props.href).toBe('/decisions');
+  } finally {
+    timer.mockRestore();
+  }
+});
+
+test('completed cards resolve independently while another request remains unanswered', async () => {
+  let releaseGrid!: (response: Response) => void;
+  const pendingGrid = new Promise<Response>((resolve) => { releaseGrid = resolve; });
+  globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/grid')) return pendingGrid;
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/schedules')) return json({ schedules: [] });
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) throw Error('offline');
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+  const root = await mount();
+  expect(card(root, '릴리스 판 진행')).toContain('green 2');
+  expect(card(root, '루프 판정')).toContain('등록 0');
+  expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
+  expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
+  expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
+  expect(card(root, '그리드')).toBe('그리드불러오는 중…');
+  await act(async () => { releaseGrid(json(gridData)); });
+  expect(card(root, '그리드')).toContain('칸 사용 3/8');
+});
 
 test('owner overview preserves four summary cards and adds two compact cards using existing read-only daemon endpoints', async () => {
   Date.now = () => at;
@@ -168,8 +258,12 @@ test('each unreadable source is 못 읽음 rather than zero; a successfully empt
     return json({ landed: [], landedError: 'gh unavailable' });
   }) as typeof fetch;
   const root = await mount();
-  expect(card(root, '릴리스 판 진행')).toBe('릴리스 판 진행못 읽음');
-  expect(card(root, '루프 판정')).toBe('루프 판정등록 0');
+  // RELEASE-LIVE2: 못 읽어도 «발행 현황» 으로 가는 길은 남는다.
+  expect(card(root, '릴리스 판 진행')).toBe('릴리스 판 진행못 읽음발행 현황 보기 →');
+  expect(root.findByProps({ 'aria-label': '릴리스 판 진행' }).findByType('a').props.href).toBe('/ops/release');
+  // LOOP-INTERACT D: 루프 판정 카드에서 루프 상호작용 지도로 한 탭.
+  expect(card(root, '루프 판정')).toBe('루프 판정등록 0루프 상호작용 보기 →');
+  expect(root.findByProps({ 'aria-label': '루프 판정' }).findByType('a').props.href).toBe('/loops?view=interact');
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR못 읽음');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
@@ -203,7 +297,7 @@ test('a failed loop registry never turns a readable schedule count into a false 
     throw Error(`Unexpected GET: ${url}`);
   }) as typeof fetch;
   const root = await mount();
-  expect(card(root, '루프 판정')).toBe('루프 판정등록 0');
+  expect(card(root, '루프 판정')).toBe('루프 판정등록 0루프 상호작용 보기 →');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
 });

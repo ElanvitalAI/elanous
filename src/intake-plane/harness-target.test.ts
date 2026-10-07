@@ -24,3 +24,8 @@ test('configured git repository takes precedence over non-git cwd', () => {
 test('configured non-git directory rejects rather than silently using a git cwd', () => {
   expect(resolveDaemonHarnessTarget({ configured: cwd, cwd: repo, isGitRepo })).toMatchObject({ ok: false });
 });
+
+test('allowNonGit accepts configured non-git target without falling back to cwd', () => {
+  expect(resolveDaemonHarnessTarget({ configured: cwd, cwd: repo, isGitRepo, allowNonGit: true })).toEqual({ ok: true, repo: cwd, source: 'config' });
+  expect(resolveDaemonHarnessTarget({ cwd, isGitRepo, allowNonGit: true })).toEqual({ ok: true, repo: cwd, source: 'cwd' });
+});

@@ -47,6 +47,7 @@ import { runReleaseIfReady } from './release-run-if-ready.js';
 import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
+import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -594,7 +595,7 @@ function compareReleaseVersions(a: string, b: string): number {
   return 0;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
@@ -793,17 +794,17 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
     .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
-    .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id')
+    .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id').option('--no-predecessor', '선행 칸 비우기(진짜 의존이 아니면 · CHECKLIST-PRED-CLEAR)')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
     .option('--ref <path...>', '근거 문서 더하기 — 저장소 상대 경로[#절] (반복 가능 · 중복 제거)')
-    .action((id: string, opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
+    .action((id: string, opts: { ref?: string[]; status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[] | false; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
       if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
       if (!mayWrite(cmd)) return;
-      const data = setItem(version, id, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      const data = setItem(version, id, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       const item = data.items.find((entry) => entry.id === id);
       const why = item?.kind === 'screen' && item.status === 'green' ? parityGap(item.evidence) : null;
       if (why) {
@@ -1054,16 +1055,40 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         process.exitCode = 1;
       }
     });
+  // LIGHT-RC (0.2.19) — read-only for the ledger · never touches the landing freeze or launches Pods.
+  release.command('light-rc')
+    .description('가벼운 RC 점검 — 직전 판 컷(또는 --base) 이후 변경 범위 self gate ⊕ 상시 목록(release/light-rc-always.txt)을 원격 게이트 호스트에서 · 새 회귀(introduced>0)면 exit 1')
+    .requiredOption('--version <v>', '점검할 판(x.y.z)')
+    .option('--base <ref>', '비교 기준(기본: git merge-base origin/main origin/release/<원장 직전 판>)')
+    .option('--remote <host>', '게이트 호스트(기본 config gateRemote.host)')
+    .option('--local', '원격 대신 이 기계에서 돌린다(원격 자식이 이것으로 다시 불린다)')
+    .option('--shards <n>', '시험 분할 수', '4')
+    .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
+    .action(async (o: { version: string; base?: string; remote?: string; local?: boolean; shards: string; json?: boolean }) => {
+      // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
+      const local = !!o.local || process.argv.slice(2).includes('--local');
+      await jsonAction(o.json, async (log) => {
+        if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
+        const shards = Number(o.shards);
+        const result = await runLightRc(o.version, { base: o.base, remote: o.remote, local, shards, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        for (const line of formatLightRc(result)) log(line);
+        return result;
+      }, (r) => r.ok);
+    });
   release.command('resume')
     .description('실패한 릴리스 런을 이어 달린다 — cut-branch --append 로 고친 release/<v> 새 끝을 version-release 기록에 반영(빨리감기만·상태 백업) 뒤 --from 노드부터')
     .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
     .requiredOption('--from <node>', '다시 시작할 노드(예: gate)')
+    .option('--partial', 'GATE-PARTIAL — --from gate 에서 앞 게이트 뒤 바뀐 시험 파일 ⊕ 앞 실패 파일만 다시 돈다(시험·문서만 바뀐 경우 · 아니면 전체 게이트로)')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; json?: boolean }) => {
+    .action(async (o: { run: string; from: string; partial?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
-        const result = await resumeReleaseRun({ runId: o.run, from: o.from });
+        const result = await resumeReleaseRun({ runId: o.run, from: o.from, partial: o.partial });
+        if (result.partial.requested) log(result.partial.applied
+          ? `◐ 부분 재검: ${result.partial.files}파일 · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
+          : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
-        return { tip: result.tip, status: result.state.status, runId: result.state.runId };
+        return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId };
       }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
     });
   release.command('auto-start')

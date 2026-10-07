@@ -413,6 +413,8 @@ import { handleSelfEvent } from './self-event.js';
 /** 매매 «실행»은 애드온이다(대표 09-20 결정 ③ · 별도 상용 저장소 · release/trading-export.yaml) — 공개 코어엔 없다.
  *  있으면 그 경로를 켜고, 없으면 501. 경로를 변수로 둬 공개본 타입 검사가 «모듈 없음»으로 막히지 않게 한다. */
 const TRADE_PROPOSAL_MODULE: string = './trade-proposal.js';
+/** PITCH-ROOM — 투자자 피치 방(덱·티저)은 비공개다(release/public-export.yaml 이 pitch-api 를 뺀다). 공개본엔 모듈이 없어 404. */
+const PITCH_MODULE: string = './pitch-api.js';
 import {
   handleShowroomLayoutDelete,
   handleShowroomLayoutGet,
@@ -926,6 +928,16 @@ export async function routeRequest(
   if (pathname === '/v1/ops' || pathname.startsWith('/v1/ops/')) {
     return handleOpsApi(req, opts.metaApi);
   }
+  // PITCH-ROOM — same operatorSignal gate, inside the (private-only) pitch module.
+  if (pathname.startsWith('/v1/pitch/')) {
+    let pitch: { handlePitchApi(req: Request, metaApi: typeof opts.metaApi): Response };
+    try {
+      pitch = await import(PITCH_MODULE) as typeof pitch;
+    } catch {
+      return jsonResponse({ error: 'not-found' }, 404);
+    }
+    return pitch.handlePitchApi(req, opts.metaApi);
+  }
 
   // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
   // Reuses checkAuth (same-origin exemption + constant-time bearer).
@@ -1299,12 +1311,11 @@ export async function routeRequest(
     return handleDevices(req, opts.devices);
   }
 
+  // Same owner auth as the neighbouring GETs (short-lived owner tokens · same-origin PWA); #23932 compared the admin
+  // bearer only, so a PWA on a short-lived token got 401 and the loop map stayed empty.
   if (pathname === '/v1/loops/edges' && method === 'GET') {
-    if (!opts.metaApi?.bearerToken) return jsonResponse({ error: 'unauthorized' }, 401);
-    const offered = req.headers.get('authorization');
-    if (!offered?.startsWith('Bearer ') || !compareTokenConstTime(offered.slice('Bearer '.length).trim(), opts.metaApi.bearerToken)) {
-      return jsonResponse({ error: 'unauthorized' }, 401);
-    }
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleLoopEdgesGet(req);
   }
 

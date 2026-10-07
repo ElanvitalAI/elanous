@@ -7,9 +7,12 @@
  * - 기본은 SHADOW: 카드와 명령만 남기고 아무것도 띄우지 않는다. `--live` 일 때만 주입된 launcher 로 띄운다.
  * - 관측: `debug.log('task-agent', 'handed', {taskId, seat, checklistId, mode})`.
  */
+import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
+import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
@@ -18,14 +21,28 @@ export const TASK_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TaskSeat = typeof TASK_SEATS[number];
 /** 과제 카드 id 접두 — `task show <id>` 가 이 접두로 TOX 태스크와 갈린다. */
 export const TASK_CARD_PREFIX = 'ta-';
+/**
+ * 과제 종결 종류(RFC-loop-agent-map §A4b③) — 비면 code-pr(PR 병합)로 읽는다.
+ * code-pr 밖의 종류는 «확인 증거»(`judge.ts` TaskJudgeInput.evidence)로 종결한다 — 증거를 만드는 일은 DEFAULT-HANDS 몫.
+ */
+export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support'] as const;
+export type CompletionKind = typeof COMPLETION_KINDS[number];
 
-export interface TaskCardEvent { at: string; event: string; detail?: string }
+/** `run-bound`·`goal-bound`·`pr-bound` 은 runId(⊕ pr)를 싣는다 — 옛 카드의 칸은 at·event·detail 뿐이다. */
+export interface TaskCardEvent { at: string; event: string; detail?: string; runId?: string; pr?: number }
 export interface TaskCardMove { kind: 'launch' | 'wait'; command?: string[]; reason: string }
 export interface TaskCard {
   id: string;
   text: string;
   seat?: TaskSeat;
   checklistId?: string;
+  /** 종결 종류 — 비면 code-pr. */
+  completion?: CompletionKind;
+  /** 과제 대상 프로젝트(§A4b②) — target 은 절대 경로(git 이 아닐 수 있다). id 는 `task hand --project` 가 싣는다(옛 카드엔 없을 수 있다). */
+  project?: { id?: string; target: string };
+  /** 보드(§A4b① `board.ts`) 소속 — 목표 id · 이정표 id(`task hand --goal/--milestone`). 조각 카드의 `goalId`(골 sha 16자)와 다른 칸이다. */
+  goal?: string;
+  milestone?: string;
   createdAt: string;
   /** launch-failed = 발사기가 띄우기에 실패했다(사유는 history 마지막 칸) — 다음 수는 다시 발사. */
   status: 'handed' | 'launched' | 'launch-failed';
@@ -36,16 +53,47 @@ export interface TaskCard {
   /** 조각 카드만 — 소속 미션 카드 id · 먼저 착지해야 하는 조각 id(선후). */
   mission?: string;
   after?: string[];
-  /** 조각 카드만 — 착지 근거(② `tasks advance --pr|--goal`): 이 조각 런이 연 PR 번호 · 골 id(16자 · 런 원장 `pr-opened` 로 PR 을 찾는다). */
-  pr?: number;
+  /**
+   * 이 카드 런이 연 PR · 골 id(16자). 두 출처가 한 칸을 쓴다(UX LOOP-INTERACT 계약 — card.runId → goalId):
+   * - 수동(② `tasks advance --pr|--goal` · 미션 조각만) — PR 은 번호(number) · `refSource: 'manual'`.
+   * - 런 원장 묶기(TA-CARD-RUN-LINK `card-evidence.ts`) — PR 은 `{number, url}` · 비어 있을 때만 «한 번» 채운다 · 수동 근거를 덮지 않는다.
+   * 번호는 `cardPrNumber` 로 읽는다(옛 카드의 number 도 그대로 읽힌다).
+   */
+  pr?: number | TaskCardPr;
   goalId?: string;
+  /** `manual` = pr/goalId 를 사람이 적었다(`recordPieceRef`) — 런 묶기가 건드리지 않는다. */
+  refSource?: 'manual';
   /** 조각 카드만 — ② 가 선행 착지 뒤 넘겼다(한 번만 · 같은 잠금 안에서 먼저 적는다). */
   handed?: { at: string; mode: 'shadow' | 'live'; claim?: string; error?: string };
+  /**
+   * TA-CARD-RUN-LINK — `--live` 발사가 발사기에 넘긴 런 id(`ELANOUS_RUN_ID` 상속 → 하니스 런이 그 id 로 돈다) ⊕ 발사 토큰.
+   * 발사기가 그 id 를 «받았다»고 돌려줄 때만 적는다(한 번만). 원장이 아직 없으면 그 런은 시작 전이거나 대기열로 갔다.
+   */
+  runId?: string;
+  launchId?: string;
+  /** Pod 런이면 PR 을 연 자식 런 id(런 묶기가 PR 과 함께 적는다). */
+  runChildId?: string;
   /** 미션 카드만 — 모든 조각 착지 → 칸 green «제안»(체크리스트는 손대지 않는다 · OP/주인이 뒤집는다). */
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
+  /** TA-JUDGE-LIVE-SAFE — live `review` 수가 리뷰를 요청한 PR 머리들(머리마다 한 번 · 띄우기 실패면 error · 이력은 지우지 않는다). */
+  reviewRequests?: Array<{ pr: number; head: string; at: string; error?: string }>;
+}
+
+/** 런 원장에서 묶은 PR — url 은 원장(pr-opened · Pod job-finished)에 있을 때만(지어내지 않는다). */
+export interface TaskCardPr { number: number; url?: string }
+
+/** 카드의 PR 번호 — 수동(number)·묶음(`{number,url}`) 둘 다. */
+export function cardPrNumber(card: Pick<TaskCard, 'pr'>): number | undefined {
+  return typeof card.pr === 'number' ? card.pr : card.pr?.number;
 }
 
 interface TaskAgentStateFile { tasks?: Record<string, TaskCard>; [key: string]: unknown }
+
+function isGitWorkTree(path: string): boolean {
+  try {
+    return execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'true';
+  } catch { return false; }
+}
 
 export function taskAgentStatePath(): string {
   return join(effectiveInstanceRoot(), 'task-agent-actions.json');
@@ -137,12 +185,22 @@ export function shellQuote(arg: string): string {
   return /^[A-Za-z0-9_./:=@%+-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
 }
 
-export type TaskLauncher = (args: string[]) => void | Promise<void>;
+/** 발사기에 넘기는 연결 — env(`ELANOUS_RUN_ID`)를 자식 환경에 얹으면 하니스 런이 `runId` 로 돈다(`resolveRunIdentity` 상속). launchId 는 카드에만 남는 발사 토큰이다. */
+export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string> }
+/** 발사기가 «이 런 id 로 띄웠다»고 돌려주는 영수증 — 없으면 카드에 런 id 를 적지 않는다(추측하지 않는다). */
+export interface TaskLaunchReceipt { runId?: string }
+export type TaskLauncher = (args: string[], cwd?: string, context?: TaskLaunchContext) => void | TaskLaunchReceipt | Promise<void | TaskLaunchReceipt>;
 
 export interface HandTaskOptions {
   text: string;
   seat?: TaskSeat;
   checklistId?: string;
+  completion?: TaskCard['completion'];
+  /** `--project <id> --target <dir>` — target 은 존재 확인 뒤 절대 경로로 바꿔 싣는다. */
+  project?: { id: string; target: string };
+  /** 보드 소속 목표·이정표 id — 카드에 그대로 싣는다. */
+  goal?: string;
+  milestone?: string;
   live?: boolean;
   statePath?: string;
   /** `--live` 일 때만 불린다. */
@@ -179,12 +237,31 @@ export class TaskLaunchError extends Error {
   }
 }
 
-export interface HandTaskResult { card: TaskCard; move: TaskCardMove; mode: 'shadow' | 'live'; launched: boolean }
+export interface HandTaskResult { card: TaskCard; move: TaskCardMove; mode: 'shadow' | 'live'; launched: boolean; cwd?: string }
 
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
   if (!text) throw new Error('과제 한 줄이 비어 있다');
   if (opts.seat !== undefined && !TASK_SEATS.includes(opts.seat)) throw new Error(`자리는 ${TASK_SEATS.join('|')} 중 하나다: ${opts.seat}`);
+  if (opts.completion !== undefined && !COMPLETION_KINDS.includes(opts.completion)) throw new Error(`종결 종류는 ${COMPLETION_KINDS.join('|')} 중 하나다: ${opts.completion}`);
+  for (const [flag, value] of [['--goal', opts.goal], ['--milestone', opts.milestone]] as const) {
+    if (value !== undefined && (!value.trim() || /\p{Cc}/u.test(value))) throw new Error(`${flag} id 가 비었거나 제어 문자를 담았다: ${JSON.stringify(value)}`);
+  }
+  let project: TaskCard['project'];
+  let targetIsGit: boolean | null = null;
+  if (opts.project) {
+    if (!opts.project.id.trim()) throw new Error('--project id 가 비어 있다');
+    const target = resolve(opts.project.target);
+    let isDir = false;
+    try { isDir = statSync(target).isDirectory(); } catch { /* 없음 */ }
+    if (!isDir) throw new Error(`대상 디렉터리가 없습니다: ${target}`);
+    targetIsGit = isGitWorkTree(target);
+    // 코드 종결(code-pr · 비면 code-pr)은 git 대상만 — 그 밖의 종결 종류는 git 이 아닌 폴더도 받는다(같은 판정을 harness-target 과 공유).
+    const codeCompletion = (opts.completion ?? 'code-pr') === 'code-pr';
+    const selection = resolveDaemonHarnessTarget({ configured: target, cwd: target, isGitRepo: () => targetIsGit === true, allowNonGit: !codeCompletion });
+    if (!selection.ok) throw new Error(`코드 종결은 git 대상이 필요 — --completion 을 고르거나 git init: ${target}`);
+    project = { id: opts.project.id, target: selection.repo };
+  }
   const now = (opts.now ?? (() => new Date()))();
   const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   const mode = opts.live ? 'live' : 'shadow';
@@ -193,6 +270,10 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     id, text,
     ...(opts.seat ? { seat: opts.seat } : {}),
     ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
+    ...(opts.completion ? { completion: opts.completion } : {}),
+    ...(project ? { project } : {}),
+    ...(opts.goal ? { goal: opts.goal } : {}),
+    ...(opts.milestone ? { milestone: opts.milestone } : {}),
     createdAt: now.toISOString(),
     status: 'handed',
     history: [],
@@ -210,17 +291,21 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       if (!guard(current)) return undefined;
       owned.ok = true;
       // next 의 옛 근거는 버리고 디스크의 근거로 «교체»한다 — 정정된 근거 옆에 옛 근거가 되살아나지 않게.
-      const { pr: _stalePr, goalId: _staleGoal, ...base } = next;
-      return { ...base, ...(current?.pr !== undefined ? { pr: current.pr } : {}), ...(current?.goalId !== undefined ? { goalId: current.goalId } : {}) };
+      const { pr: _stalePr, goalId: _staleGoal, refSource: _staleSource, ...base } = next;
+      return { ...base, ...(current?.pr !== undefined ? { pr: current.pr } : {}), ...(current?.goalId !== undefined ? { goalId: current.goalId } : {}), ...(current?.refSource ? { refSource: current.refSource } : {}) };
     });
     if (!owned.ok) throw new TaskCardSupersededError(next.id);
   };
   writeCard(path, card);
-  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode }); } catch { /* fail-soft */ }
-  if (mode === 'shadow') return { card, move, mode, launched: false };
+  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit }); } catch { /* fail-soft */ }
+  if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
+  const runId = mintRunId();
+  const launchId = `tl-${randomBytes(6).toString('hex')}`;
+  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId } };
+  let receipt: void | TaskLaunchReceipt;
   try {
-    await opts.launcher(move.command!);
+    receipt = await opts.launcher(move.command!, project?.target, context);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const failed: TaskCard = { ...card, status: 'launch-failed', history: [{ at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason }] };
@@ -228,8 +313,25 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     try { debug.log('task-agent', 'launch-failed', { taskId: id, seat: card.seat ?? null, reason }); } catch { /* fail-soft */ }
     throw new TaskLaunchError(failed, reason);
   }
-  const launched: TaskCard = { ...card, status: 'launched', history: [{ at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch', detail: move.command!.join(' ') }] };
+  const launchedAt = (opts.now ?? (() => new Date()))().toISOString();
+  const receivedRunId = receipt && typeof receipt.runId === 'string' ? receipt.runId.trim() : '';
+  // 넘긴 런 id 와 «같은» 영수증만 — 다른 id 면 env 로 넘긴 런과 카드가 어긋난다(묶지 않는다).
+  const boundRunId = receivedRunId && receivedRunId === runId && normalizeRunId(receivedRunId) === receivedRunId ? receivedRunId : undefined;
+  if (receivedRunId && !boundRunId) {
+    try { debug.log('task-agent', 'card-run-unbound', { card: id, launchId, expected: runId, received: receivedRunId }); } catch { /* fail-soft */ }
+  }
+  const launched: TaskCard = {
+    ...card, status: 'launched',
+    ...(boundRunId ? { runId: boundRunId, launchId } : {}),
+    history: [
+      { at: launchedAt, event: 'launch', detail: move.command!.join(' ') },
+      ...(boundRunId ? [{ at: launchedAt, event: 'run-bound', detail: boundRunId, runId: boundRunId }] : []),
+    ],
+  };
   writeCard(path, launched);
-  try { debug.log('task-agent', 'launched', { taskId: id, seat: card.seat ?? null }); } catch { /* fail-soft */ }
-  return { card: launched, move, mode, launched: true };
+  try { debug.log('task-agent', 'launched', { taskId: id, seat: card.seat ?? null, runId: boundRunId ?? null }); } catch { /* fail-soft */ }
+  if (boundRunId) {
+    try { debug.log('task-agent', 'card-run-bound', { card: id, runId: boundRunId, launchId }); } catch { /* fail-soft */ }
+  }
+  return { card: launched, move, mode, launched: true, ...(project ? { cwd: project.target } : {}) };
 }

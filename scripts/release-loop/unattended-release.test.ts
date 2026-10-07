@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReleaseRunInput, latestPublishedPreviousVersion, runUnattendedRelease } from './unattended-release.js';
+import { parseOptions } from './gate-node.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 
 function fixture(body: (root: string) => void) {
@@ -135,3 +136,19 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
     expect(inputs).toHaveLength(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('GATE-SPEED A3①: release.loop.gatePodCpu becomes graph input gatePodCpu, and the gate reads it as shard cpu request/limit', () => fixture((root) => {
+  record(root, '0.2.98', { version: '0.2.98', publishedAt: 'now' });
+  const input = buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1', gatePodCpu: 2 } });
+  expect(input).toMatchObject({ version: '0.2.99', previousVersion: '0.2.98', gatePodPool: 'pool-x@h:1', gatePodCpu: 2 });
+  const context = join(root, 'graph-context.json');
+  writeFileSync(context, JSON.stringify({ input, outputs: {} }));
+  const opts = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
+  if (opts === 'help') throw new Error('unexpected help');
+  expect(opts.pod).toMatchObject({ pool: 'pool-x@h:1', cpu: { request: '2', limit: '2' } });
+  // Omitted config keeps today's default: no cpu override reaches the gate (request 1 / limit 4).
+  writeFileSync(context, JSON.stringify({ input: buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1' } }), outputs: {} }));
+  const plain = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
+  if (plain === 'help') throw new Error('unexpected help');
+  expect(plain.pod?.cpu).toBeUndefined();
+}));

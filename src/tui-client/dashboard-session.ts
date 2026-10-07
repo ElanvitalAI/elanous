@@ -195,6 +195,7 @@ export class DashboardSession {
     const pair = createInProcessTransportPair();
     const shutdownCtrl = new AbortController();
     const runTurn = bridgeCoreTurnToAcp({
+      tuiRouting: true,
       getMessages: opts.getMessages,
       getTools: opts.getTools,
       dispatchTool: opts.dispatchTool,

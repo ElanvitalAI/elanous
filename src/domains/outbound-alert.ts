@@ -15,7 +15,7 @@ import { openSurfaceEventsDb, recordEvent } from './surface-events.js';
 import { latestUserIntentTs } from '../user-intent/index.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
-import { isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';
+import { explainReportRoute, isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
 import { registerLogStoreSink, setLogInstanceName } from '../mss/logging/log-store.js';
 import type { LogSink } from '../mss/logging/sink.js';
@@ -24,7 +24,8 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js'
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
 //   import 라 런타임 순환 없음(발송 로직은 이 파일에 self-contained). origin 없으면 report 폴백.
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
-import { conatusPath } from './conatus-data-dir.js';
+import { conatusDataDir, conatusPath } from './conatus-data-dir.js';
+import { assertNoRealSendFromTest, assertNotTestWritingOps, isTestDouble } from '../instance/test-write-guard.js';
 
 /** Explicit `ELANOUS_NEXUS_URL` wins. Otherwise ask the daemon endpoint resolver.
  *  A missing daemon is not a guessed port — the caller falls through to direct send. */
@@ -37,6 +38,8 @@ function nexusUrl(): string | null {
 // /v1/outbound 로 POST — getElanousConfigDir() 치환은 prod 동치(~/.elanous) + --config-dir 정합.
 const ACP_TOKEN_PATH = join(getElanousConfigDir(), 'acp-token');
 const DEFERRED_PATH = conatusPath('outbound_deferred.jsonl');
+// The real transport, captured before any test can spy on it — a pass-through spy is not a fake.
+const REAL_EXEC_FILE_SYNC = childProcess.execFileSync;
 
 // CLI/cron do not inherit the daemon's StoreSink. Register once before the first
 // send, but never attach a second sink to a daemon which already owns one.
@@ -139,6 +142,7 @@ export function userRecentlyActive(now: Date = new Date()): boolean {
 /** 야간 보류 적재 (jsonl append — 크론 동시 실행에 안전). origin 있으면 함께 적재 —
  *  아침 flush 가 그 origin(발신 채널)으로 되돌려 발송(없으면 report 묶음). */
 export function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null, path = DEFERRED_PATH): boolean {
+  assertNotTestWritingOps(path, 'append the deferred-alert queue');
   try {
     mkdirSync(dirname(path), { recursive: true });
     const rec = { ts: new Date().toISOString(), kind, text, ...(origin ? { origin } : {}) };
@@ -171,9 +175,12 @@ function resolveBotToken(botId?: string): string | null {
 function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: string) => void): boolean {
   if (origin.channel === 'discord') {
     if (!origin.channelId) return false;
+    let token: string | undefined;
+    try { token = resolveChannelBotToken('discord', getUserConfig())?.token; } catch { return false; }
+    if (!token) return false;
+    // Outside the swallowing try below: a refused test send must surface, not read as «delivery failed».
+    assertTestSendFaked('send a real Discord message');
     try {
-      const token = resolveChannelBotToken('discord', getUserConfig())?.token;
-      if (!token) return false;
       onBot?.('discord:configured');
       const channelId = origin.discordThreadId || origin.channelId;
       const out = spillLongContent(text).text;
@@ -184,6 +191,7 @@ function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: stri
           `https://discord.com/api/v10/channels/${channelId}/messages`,
           JSON.stringify({ content: out.slice(start, end) }),
           [`Authorization: Bot ${token}`, 'Content-Type: application/json'],
+          'send a real Discord message',
         );
         if (typeof response?.id !== 'string' || !response.id) return false;
         start = end;
@@ -195,6 +203,7 @@ function deliverToOrigin(origin: MissionOrigin, text: string, onBot?: (bot: stri
   const token = resolveBotToken(origin.botId);
   if (!token) return false;
   onBot?.(botLabel(token));
+  assertTestSendFaked('send a real Telegram message to the origin');
   try { return sendTelegramRaw(token, origin.chatId, text, origin.threadId); } catch { return false; }
 }
 
@@ -287,6 +296,7 @@ export type FlushDeferredDeps = {
  *  ⭐ 실패한 묶음의 항목만 큐에 남긴다(성공 묶음은 다시 보내지 않는다 · 10-07 야간 11회 재발송 사고).
  *  실패가 `maxAttempts` 번 쌓인 항목은 `<name>.failed.jsonl` 로 격리한다. */
 export function flushDeferred(path = DEFERRED_PATH, deps: FlushDeferredDeps = {}): number {
+  assertNotTestWritingOps(path, 'flush the deferred-alert queue');
   ensureOutboundLogSink();
   const observeFlush = (
     count: number, lagMin: number, kinds: string[],
@@ -452,8 +462,18 @@ export function flushDeferred(path = DEFERRED_PATH, deps: FlushDeferredDeps = {}
   return delivered;
 }
 
-/** 동기 curl(POST). body 는 stdin. 파싱 실패/에러 → null. */
-function curlPost(url: string, body: string, headers: string[]): any {
+/** TEST-PROD-LEAK — a test process may not reach a real bot or the ops daemon. `external` = a third-party bot API
+ *  (refused unless curl is a test double replacing the real one); the local daemon is refused only when ops-routed. */
+function assertTestSendFaked(what: string, external = true): void {
+  let roots: string[] = [];
+  try { roots = [getElanousConfigDir(), dirname(ACP_TOKEN_PATH), effectiveInstanceRoot(), conatusDataDir(), dirname(DEFERRED_PATH)]; }
+  catch { roots = [dirname(ACP_TOKEN_PATH), dirname(DEFERRED_PATH)]; }
+  assertNoRealSendFromTest(what, { transportFaked: isTestDouble(childProcess.execFileSync, REAL_EXEC_FILE_SYNC), routingRoots: roots, external });
+}
+
+/** 동기 curl(POST). body 는 stdin. 파싱 실패/에러 → null. `what` names the send for the test guard (never the URL — it carries the token). */
+function curlPost(url: string, body: string, headers: string[], what = 'send a real outbound message', external = true): any {
+  assertTestSendFaked(what, external);
   const args = ['-s', '-m', '25', '-X', 'POST'];
   for (const h of headers) args.push('-H', h);
   args.push('--data', '@-', url);
@@ -560,6 +580,7 @@ export function setInProcessOutbound(send: InProcessOutbound | null): void { inP
 export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => void, source?: string): 'daemon' | 'direct' | false {
   // 0) inside the daemon — route in-process, asynchronously; the caller's synchronous answer is «accepted».
   if (inProcessOutbound && process.env.SEND_VIA_ELANOUS !== '0') {
+    assertTestSendFaked('route through the in-process daemon sender', false);
     onBot?.('daemon:configured');
     const send = inProcessOutbound;
     const fallback = (): void => {
@@ -592,7 +613,9 @@ export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => v
       ...(token ? [`Authorization: Bearer ${token}`] : [])];
     const nexus = nexusUrl();
     const j = nexus
-      ? curlPost(`${nexus}/v1/outbound`, JSON.stringify({ text, markdown: false, kind }), headers)
+      // An explicit ELANOUS_NEXUS_URL can name any daemon, the ops one included: a test treats it like a real bot API.
+      ? curlPost(`${nexus}/v1/outbound`, JSON.stringify({ text, markdown: false, kind }), headers, 'post to the daemon /v1/outbound',
+        Boolean(process.env.ELANOUS_NEXUS_URL?.trim()))
       : null;
     const classification = classifyDaemonResponse(j);
     if (classification === 'ok') { onBot?.('daemon:configured'); return 'daemon'; }
@@ -602,27 +625,33 @@ export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => v
     logDaemonPath(classification, kind, extra);
   }
   // 2) fallback: 텔레그램 sendMessage 직접(3900자 분할) — 데몬 미경유라 클라가 원장 기록.
-  if (sendTelegramDirect(text, kind, {}, onBot)) return 'direct';
-  reportUndeliverable(kind, daemonPath);
+  //    The same config judges the route and explains a failure (review r1).
+  let cfg: UserConfig | undefined;
+  try { cfg = getUserConfig(); } catch { /* sendTelegramDirect fails closed without config */ }
+  if (sendTelegramDirect(text, kind, cfg ? { config: cfg } : {}, onBot)) return 'direct';
+  reportUndeliverable(kind, daemonPath, cfg);
   return false;
 }
 
 /** OB8b — both paths failed: say so loudly, with the universe this process resolved, instead of a silent false.
  *  The usual cause (10-01 · MK): an ad-hoc `bun -e` or a script from a source tree resolves a cwd-derived test
  *  universe, so it finds neither the production daemon nor the production bot token. */
-function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-found' | 'disabled'): void {
+function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-found' | 'disabled', cfg?: UserConfig): void {
   let root = '?';
   let universe: 'prod' | 'test' | '?' = '?';
   try {
     root = effectiveInstanceRoot();
     universe = root === prodInstanceRoot() ? 'prod' : 'test';
   } catch { /* the report still goes out */ }
+  // Which routing rule closed the direct path — «토큰 없음 또는 전송 실패» hid a missing role for four days (BRIEF-DELIVERY-1007).
+  let route: ReturnType<typeof explainReportRoute> | null = null;
+  try { if (cfg) route = explainReportRoute(cfg, kind); } catch { /* the report still goes out */ }
   ensureOutboundLogSink();
-  try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root }); } catch { /* fail-soft */ }
+  try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root, route: route?.reason ?? 'unknown' }); } catch { /* fail-soft */ }
   const hint = universe === 'prod'
     ? '운영 데몬이 떠 있는지 확인: elanous nexus show'
     : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous 와 --config-dir ~/.elanous 를 준다';
-  try { console.error(`[outbound] ⛔ 못 보냄(${kind}) — 데몬 ${daemonPath} · 직접 발송도 실패(토큰 없음 또는 전송 실패) · 이 프로세스의 우주 ${universe} (${root}) · ${hint}`); } catch { /* fail-soft */ }
+  try { console.error(`[outbound] ⛔ 못 보냄(${kind}) — 데몬 ${daemonPath} · 직접 발송도 실패(${route && route.reason !== 'routed' ? `${route.reason}: ${route.hint}` : '토큰 없음 또는 전송 실패'}) · 이 프로세스의 우주 ${universe} (${root}) · ${hint}`); } catch { /* fail-soft */ }
 }
 
 /** 텔레그램 raw 발송(토큰·chatId 명시) — spill + 3900자 분할(줄 경계). thread 지원. */
@@ -641,7 +670,7 @@ function sendTelegramRaw(token: string, chatId: string | number, text: string, t
   for (const ch of chunks) {
     const params: Record<string, string> = { chat_id: String(chatId), text: ch, disable_web_page_preview: 'true' };
     if (threadId !== undefined) params.message_thread_id = String(threadId);
-    if (!curlPost(url, new URLSearchParams(params).toString(), ['Content-Type: application/x-www-form-urlencoded'])) ok = false;
+    if (!curlPost(url, new URLSearchParams(params).toString(), ['Content-Type: application/x-www-form-urlencoded'], 'send a real Telegram message')) ok = false;
   }
   return ok;
 }
@@ -653,6 +682,8 @@ export function sendTelegramDirect(
   onBot?: (bot: string) => void,
 ): boolean {
   const sendRaw = deps.sendRaw ?? sendTelegramRaw;
+  // An injected sender still may not run in a test that resolved the ops universe.
+  if (deps.sendRaw) assertTestSendFaked('send a Telegram message from the ops universe', false);
   let cfg: UserConfig | undefined;
   try { cfg = deps.config ?? getUserConfig(); } catch { /* unavailable config: operational delivery still fails closed */ }
   if (cfg) {

@@ -2,12 +2,13 @@
 // The saved version-release output is re-pointed at the new branch tip (fast-forward only, state backed up first), so
 // every later node reads the repaired commit without anyone hand-editing the run state.
 import { spawnSync } from 'node:child_process';
-import { constants, copyFileSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { constants, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
-import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { isReleaseVersion } from './release-version.js';
+import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -24,6 +25,8 @@ export interface ResumeReleaseDeps {
   /** Node command runner for the resumed graph (tests record each node's context instead of running it). */
   runBash?: NonNullable<NonNullable<Parameters<typeof runGraph>[1]>['deps']>['runBash'];
   now?: () => Date;
+  /** Machine release ledger (gate-failures.json of the prior gate) — default releaseLedgerRoot(). */
+  ledgerRoot?: string;
 }
 
 export interface TipRefresh { version: string; branch: string; from: string; to: string; changed: boolean; statePath: string; backup?: string }
@@ -106,10 +109,66 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   return { version, branch, from: recorded, to, changed: true, statePath, backup };
 }
 
+/** GATE-PARTIAL outcome of a resume — applied (plan written) or the reason it fell back to a full gate. */
+export type PartialOutcome = { requested: false } | { requested: true; applied: true; files: number; priorCommit: string } | { requested: true; applied: false; reason: string };
+
+/** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate. */
+function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean }, deps: ResumeReleaseDeps): PartialOutcome {
+  const root = deps.root ?? effectiveInstanceRoot();
+  // Any resume starts from no plan: one without --partial (from whatever node) never inherits an older plan.
+  clearPartialPlan(root, tip.version);
+  if (!opts.partial) return { requested: false };
+  const fallback = (reason: string): PartialOutcome => {
+    debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason });
+    return { requested: true, applied: false, reason };
+  };
+  if (opts.from !== 'gate') return fallback('--partial only applies to --from gate');
+  if (!tip.changed) return fallback('release branch tip unchanged — nothing new to re-check');
+  let prior: { commit?: unknown; failures?: unknown; errors?: unknown } | undefined;
+  for (const location of [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]) {
+    const path = join(location, 'release', tip.version, 'gate-failures.json');
+    if (!existsSync(path)) continue;
+    let record: typeof prior;
+    try { record = JSON.parse(readFileSync(path, 'utf8')) as typeof prior; }
+    catch { return fallback(`unreadable gate record: ${path}`); }
+    if (record?.commit === tip.from) { prior = record; break; }
+  }
+  if (!prior || !Array.isArray(prior.failures) || !(prior.errors === undefined || Array.isArray(prior.errors))) {
+    return fallback(`no complete gate record for ${tip.from.slice(0, 12)} (a stalled or errored gate keeps none)`);
+  }
+  // Both sides of a rename count (`--no-renames`): a source moved to a test/Markdown name is still a source change.
+  let changed: string[];
+  try {
+    changed = deps.git
+      ? deps.git(['diff', '--name-only', '--no-renames', `${tip.from}..${tip.to}`]).split(/\r?\n/).filter(Boolean)
+      : changedFilesBetween(deps.repo ?? process.cwd(), tip.from, tip.to);
+  } catch (error) {
+    // The tip is already refreshed — a failed diff must not strand the resume: run the full gate and say why.
+    return fallback(`changed files unreadable: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`);
+  }
+  const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: changed,
+    priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[] });
+  if (!planned.ok) return fallback(planned.reason);
+  const path = writePartialPlan(root, planned.plan);
+  debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length, path });
+  return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.from };
+}
+
+/** The graph file the run started from — a snapshot run refuses any other path (the installed CLI's own copy differs). */
+function savedGraphPath(statePath: string): string | undefined {
+  try {
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')) as { graphPath?: unknown };
+    return typeof saved.graphPath === 'string' && saved.graphPath ? saved.graphPath : undefined;
+  } catch { return undefined; }
+}
+
 /** Refresh the branch tip, then restart the failed run at `from` with the saved graph snapshot. */
-export async function resumeReleaseRun(opts: { runId: string; from: string }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; state: GraphRunState }> {
+export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
   const tip = refreshReleaseBranchTip(opts.runId, deps, opts.from);
-  const state = await (deps.graph ?? runGraph)(deps.graphPath ?? GRAPH, { resumeRunId: opts.runId, fromNodeId: opts.from, ...(deps.root || deps.runBash ? { deps: { ...(deps.root ? { root: deps.root } : {}), ...(deps.runBash ? { runBash: deps.runBash } : {}) } } : {}) });
-  return { tip, state };
+  const partial = preparePartial(tip, opts, deps);
+  // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
+  const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
+  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, ...(deps.root || deps.runBash ? { deps: { ...(deps.root ? { root: deps.root } : {}), ...(deps.runBash ? { runBash: deps.runBash } : {}) } } : {}) });
+  return { tip, partial, state };
 }

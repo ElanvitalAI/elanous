@@ -1,7 +1,7 @@
 {
   "name": "elanous",
   "mcpName": "io.github.ElanvitalAI/elanous",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",

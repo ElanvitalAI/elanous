@@ -22,6 +22,7 @@ import {
 import { computeAnchorCount } from '../src/compact/pipeline.js';
 import { displayedSlashCommandNames, SLASH_COMMANDS, type ChatMessage } from '../src/chat/index.js';
 import { buildEssentialHelpLines } from '../src/dashboard/slash-runtime/help-from-registry.js';
+import { HELP_GROUP_ORDER, helpGroupFor } from '../src/dashboard/slash-runtime/help-groups.js';
 import { showTransientTerminalModal } from '../src/dashboard/modals/transient.js';
 import { DisplayCoordinator } from '../src/display/coordinator.js';
 import { clearTelemetryForTest } from '../src/context-display/index.js';
@@ -699,7 +700,9 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
     const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
     try {
-      for (const [cols, rows] of [[160, 40], [220, 60]] as const) {
+      // TUI-SLASH-DECIDE-NOW C: group head lines (시작 ⊕ seven verbs ⊕ 그 밖) make the catalog taller,
+      // so the modal case uses a taller terminal; 160×40 still falls back to the scrollable chat log.
+      for (const [cols, rows] of [[160, 40], [220, 80]] as const) {
         Object.defineProperty(process.stdout, 'columns', { configurable: true, value: cols });
         Object.defineProperty(process.stdout, 'rows', { configurable: true, value: rows });
         const registry = buildDashboardSlashRegistry();
@@ -814,8 +817,10 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 220 });
     const commandLines = lines.slice(1, lines.indexOf(''));
     const text = commandLines.join('\n');
+    // TUI-SLASH-DECIDE-NOW C: commands appear once each, in group order, by name inside a group.
+    const groupRank = new Map(HELP_GROUP_ORDER.map((group, index) => [group, index]));
     const orderedCommands = SLASH_COMMANDS.filter(({ name }) => registered.has(name))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) => (groupRank.get(helpGroupFor(a.name))! - groupRank.get(helpGroupFor(b.name))!) || a.name.localeCompare(b.name));
     let previousPosition = -1;
     for (const command of orderedCommands) {
       const aliases = (command.aliases ?? []).filter((alias) => registered.has(alias));

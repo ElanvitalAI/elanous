@@ -3,6 +3,7 @@ import { SLASH_COMMANDS } from '../../chat/index.js';
 import { FEATURE_MATURITY } from '../../maturity/feature-maturity.js';
 import { setUserConfigOverlay } from '../../user-config.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
+import { HELP_GROUP_BY_NAME, HELP_GROUP_ORDER, HELP_OTHER_GROUP, HELP_VERB_GROUPS } from './help-groups.js';
 
 const descriptions = [
   { name: 'help', description: 'Show help overlay' },
@@ -125,11 +126,11 @@ test('groups registered aliases under their primary name once, alphabetically', 
     names: ['exit', 'model', 'q', 'm', 'quit', 'model'], descriptions: commands, width: 80,
   });
   expect(lines.slice(1, lines.indexOf(''))).toEqual([
-    '/model (m)  Switch active model', '/quit (q, exit)  Leave',
+    '▸ 시작', '/model (m)  Switch active model', '▸ 그 밖', '/quit (q, exit)  Leave',
   ]);
   expect(lines.join('\n')).not.toContain('/m  ');
   expect(lines.join('\n')).not.toContain('/exit  ');
-  expect(buildEssentialHelpLines({ names: ['quit', 'q'], descriptions: commands, width: 80 })[1]).toBe('/quit (q)  Leave');
+  expect(buildEssentialHelpLines({ names: ['quit', 'q'], descriptions: commands, width: 80 })[2]).toBe('/quit (q)  Leave');
 });
 
 test('strips leading internal markers only in rendered descriptions', () => {
@@ -138,6 +139,7 @@ test('strips leading internal markers only in rendered descriptions', () => {
   const descriptions = marked.map((description, index) => ({ name: `item${index}`, description }));
   const lines = buildEssentialHelpLines({ names: descriptions.map(({ name }) => name), descriptions, width: 80 });
   expect(lines.slice(1, lines.indexOf(''))).toEqual([
+    '▸ 그 밖',
     '/item0  Agent room', '/item1  cross-agent handoff', '/item2  Show flows',
     '/item3  Build flows', '/item4  multi-LLM lanes',
   ]);
@@ -169,4 +171,49 @@ test('truncates long descriptions to terminal columns without splitting a graphe
   expect(command).toEndWith('…');
   expect(Bun.stringWidth(command)).toBeLessThanOrEqual(20);
   expect(command).not.toContain('\ufffd');
+});
+
+test('TUI-SLASH-DECIDE-NOW C: group order is 시작, the seven verbs, then 그 밖 — /model, /decide and /now under their groups', () => {
+  expect(HELP_GROUP_ORDER).toEqual(['시작', '지켜보기', '조사하기', '판단하기', '만들기', '실행하기', '확인하기', '기억하기', '그 밖']);
+  expect([...HELP_VERB_GROUPS]).toEqual(['지켜보기', '조사하기', '판단하기', '만들기', '실행하기', '확인하기', '기억하기']);
+  const names = SLASH_COMMANDS.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
+  const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 80, audience: { role: 'owner', showBeta: true } });
+  const commands = lines.slice(1, lines.indexOf(''));
+  const heads = commands.filter((line) => line.startsWith('▸ ')).map((line) => line.slice(2));
+  expect(heads).toEqual([...HELP_GROUP_ORDER]);
+  const groupOf = (name: string) => {
+    const at = commands.findIndex((line) => new RegExp(`^/${name}(?:\\s|\\()`).test(line));
+    expect(at).toBeGreaterThan(-1);
+    return commands.slice(0, at).filter((line) => line.startsWith('▸ ')).at(-1)!.slice(2);
+  };
+  expect(groupOf('model')).toBe('시작');
+  expect(groupOf('help')).toBe('시작');
+  expect(groupOf('status')).toBe('시작');
+  expect(groupOf('decide')).toBe('판단하기');
+  expect(groupOf('now')).toBe('지켜보기');
+  expect(groupOf('harness')).toBe('만들기');
+  expect(groupOf('memory')).toBe('기억하기');
+  expect(groupOf('provider')).toBe(HELP_OTHER_GROUP);
+  // Inside a group: name order.
+  const start = commands.slice(commands.indexOf('▸ 시작') + 1, commands.indexOf('▸ 지켜보기')).map((line) => line.split(/[ (]/)[0]);
+  expect(start).toEqual([...start].sort((a, b) => a.localeCompare(b)));
+});
+
+test('TUI-SLASH-DECIDE-NOW C: every registered command sits in exactly one group — none disappears', () => {
+  const names = SLASH_COMMANDS.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
+  for (const width of [80, 152]) {
+    const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width, audience: { role: 'owner', showBeta: true } });
+    const commandText = lines.slice(1, lines.indexOf('')).join('\n');
+    for (const { name } of SLASH_COMMANDS) {
+      // At 80 columns each row holds one command, so a command line starts with its label.
+      if (width === 80) expect(commandText.match(new RegExp(`^/${name}(?:\\s|\\()`, 'gm'))?.length).toBe(1);
+      else expect(commandText).toMatch(new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`, 'm'));
+    }
+  }
+  // The table names only real commands or the planned /new; it never invents a slash.
+  const known = new Set([...SLASH_COMMANDS.map(({ name }) => name), 'new']);
+  expect([...HELP_GROUP_BY_NAME.keys()].filter((name) => !known.has(name))).toEqual([]);
+  // A command missing from the table falls into 그 밖, and empty groups print no head.
+  const lone = buildEssentialHelpLines({ names: ['zz-unmapped'], descriptions: [{ name: 'zz-unmapped', description: 'Unmapped' }], width: 80, audience: { role: 'owner', showBeta: false } });
+  expect(lone.slice(1, lone.indexOf(''))).toEqual(['▸ 그 밖', '/zz-unmapped  Unmapped']);
 });

@@ -1,0 +1,26 @@
+graph_id: guardian
+loop:
+  title: GUARD-ONE-a shadow observation
+  description: Manual-only guardian shadow tick (one tick per invocation — no 288-tick daily schedule runs in production yet; whole-day coverage is `elanous guardian compare --day`, which simulates every 5-minute tick against recorded schedule_runs). Existing crontab remains the executor. Activation and retirement require separate human action.
+  trigger:
+    events: [manual]
+version: 1
+entry_node: shadow
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: shadow
+    kind: agent
+    recipe: cmd:guardian-shadow
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    recipe: none
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    recipe: none
+    max_visits: 1
+edges:
+  - from: shadow
+    on: outcome
+    map: { ok: done, fail: failed }

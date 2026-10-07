@@ -4,9 +4,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { intakeToTasksMessages, registerIntakeCommands, renderIntakeToTasksResult, runIntakeCandidatesCli, runIntakeDigestCli, runIntakeToTasksCli } from './intake-cli.js';
-import type { DirectiveRow } from '../directives/directive-index.js';
+/** Local copy of the directive row shape — `src/directives/directive-index` is excluded from the public export. */
+interface DirectiveRow {
+  ts: string; agent: string; session_id: string; cwd: string | null;
+  track: string | null; released: string | null; dev: string | null;
+  codename: string | null; text: string; source_file: string; line_no: number;
+}
 import type { IntakeItem } from '../intake-plane/items.js';
 import type { TaskCard } from '../task-cards/card-store.js';
+import { ingestIntakeItems, markIntakeItem, listIntakeItems } from '../intake-plane/items.js';
+import { buildIntakeDigest } from '../intake-plane/digest.js';
+import { addSource } from '../intake-plane/intake-sources.js';
+import { debug } from '../debug/log.js';
 
 test('registers the complete intake command tree on a fresh Command with its help and options', () => {
   const program = new Command().name('elanous');
@@ -29,7 +38,7 @@ test('registers the complete intake command tree on a fresh Command with its hel
     items: { help: '흡수 원장 항목 보기 (최근 본 순)', options: ['--status', '--source', '--seat', '--limit', '--json'] },
     source: { help: '자리별 흡수 원천과 주기 등록·조회·실행', options: [] },
     mark: { help: '흡수 원장 항목의 상태·산출을 갱신한다 (예: 흡수 뒤 absorbed ⊕ 노트 경로)', options: ['--status', '--output'] },
-    digest: { help: '흡수 하루 다이제스트 — 그날 흡수한 것을 축별로 · 노트의 한 줄 결론 · 골 후보. 노트 절(마크다운) 또는 텔레그램 보고 채널로', options: ['--day', '--json', '--telegram', '--vault', '--note'] },
+    digest: { help: '흡수 하루 다이제스트 — 그날 흡수한 것을 축별로 · 노트의 한 줄 결론 · 골 후보. 노트 절(마크다운) 또는 텔레그램 보고 채널로', options: ['--day', '--json', '--telegram', '--seat', '--vault', '--note'] },
     route: { help: '흡수가 끝난 항목의 대조 결과(intake check --json)를 산출 큐로 나눈다 — 없음→goals · 문서뿐인 판단 필요→manual · 노트→grounding 후보', options: ['--check-json', '--dry-run', '--json'] },
     'grounding-sync': { help: '흡수 그라운딩 후보 큐의 노트를 등록 가능한 단일 문서 폴더로 복사한다 (레지스트리는 읽기만)', options: ['--dry-run', '--json'] },
     queue: { help: '자동 흡수 대기열 — 텔레그램 저장 링크를 별도 레인으로 먼저 고르고 일반 몫을 하루 상한까지 queued 로 옮긴다', options: ['--max', '--lane-max', '--kind', '--dry-run', '--json'] },
@@ -220,6 +229,61 @@ test('to-tasks CLI refuses an unavailable Nexus without consuming the goal line'
     });
     expect(result.items).toMatchObject([{ status: 'failed', reason: 'intake-to-tasks request failed' }]);
     expect(result.items[0]!.id).toStartWith('goal:');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('intake digest --seat user sends only two user notes and sends an empty arrival receipt through the same channel', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-brief-'));
+  const day = '2026-10-05';
+  const now = '2026-10-04T16:00:00Z';
+  try {
+    addSource({ id: 'watch-topic', kind: 'github-query', seat: 'user', spec: 'agent', every: '1d' }, root);
+    for (const [seat, title] of [['user', 'one'], ['MK', 'other'], ['user', 'two']]) {
+      ingestIntakeItems(root, 'github', [{ seat, url: `https://example.com/${title}`, title, kind: 'repo' }], now);
+      const id = listIntakeItems(root).find(item => item.title === title)!.id;
+      expect(markIntakeItem(root, id, { status: 'absorbed', output: { kind: 'note', ref: `/notes/${title}.md` } }, now)).toBe(true);
+    }
+    const unfiltered = buildIntakeDigest(root, day);
+    expect(unfiltered.absorbed).toHaveLength(3);
+    const messages: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const sent = await runIntakeDigestCli({ seat: 'user', telegram: true, day }, {
+        root, annotateLens: async () => {}, sendTelegram: async text => { messages.push(text); return true; },
+      });
+      expect(sent).toEqual({ sent: true });
+      expect(buildIntakeDigest(root, day, undefined, undefined, 'user').absorbed.map(e => e.noteName)).toEqual(['one', 'two']);
+      expect(messages[0]).toContain('흡수 2');
+      expect(messages[0]).not.toContain('other');
+      expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 2, sent: true });
+      await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-06' }, {
+        root, annotateLens: async () => {}, sendTelegram: async text => { messages.push(text); return true; },
+      });
+      expect(messages[1]).toBe('오늘 새 소식 없음');
+      expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 0, sent: true });
+    } finally { log.mockRestore(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a seat briefing does not resend yesterday\'s items when the same search result is collected again', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'watch-rebrief-'));
+  try {
+    const raw = [{ seat: 'user', url: 'https://example.com/repo', title: 'repo', kind: 'repo' as const }];
+    ingestIntakeItems(root, 'github', raw, '2026-10-04T23:00:00Z');
+    const messages: string[] = [];
+    const deps = { root, annotateLens: async () => {}, sendTelegram: async (text: string) => { messages.push(text); return true; } };
+    await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-05' }, deps);
+    expect(messages[0]).toContain('repo');
+    await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-05' }, deps);
+    expect(messages[1]).toContain('repo');
+    ingestIntakeItems(root, 'github', raw, '2026-10-05T23:00:00Z');
+    ingestIntakeItems(root, 'github', [{ seat: 'user', url: 'https://example.com/fresh', title: 'fresh', kind: 'repo' }], '2026-10-05T23:00:00Z');
+    await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-06' }, deps);
+    expect(messages[2]).toContain('fresh');
+    expect(messages[2]).not.toContain('example.com/repo');
+    ingestIntakeItems(root, 'github', raw, '2026-10-06T23:00:00Z');
+    await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-07' }, { ...deps, sendTelegram: async (text: string) => { messages.push(text); return false; } });
+    expect(messages[3]).toBe('오늘 새 소식 없음');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

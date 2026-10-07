@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getReleaseNodeLog, getReleaseRuns, type OpsResult, type ReleaseRun } from '@/lib/ops-api';
-import { ReleaseStrip } from './ReleaseStrip';
+import { latestReleaseRun, ReleaseStrip } from './ReleaseStrip';
+import { currentNodeId, ReleaseFlow, ReleaseNodeDetail } from './ReleaseFlow';
 
-export function currentNodeId(run: ReleaseRun): string | undefined {
-  const current = run.path.find((id) => run.nodes.find((node) => node.nodeId === id)?.ok === null);
-  return current ?? run.path.at(-1);
-}
+export { currentNodeId };
+// 원장 상태값 실측: done · failed · running — 'done' 이 빠져 있으면 끝난 런을 10초마다 계속 다시 읽는다.
+const FINISHED_RUN = ['done', 'completed', 'failed', 'cancelled', 'aborted', 'success', 'succeeded', 'error'];
+const runClock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 
 export function ReleaseRunsContent({ result, version, versions = [], selectedRunId, openedNodeId, log, onVersion, onRun, onNode, releaseStrip }: {
   result: OpsResult<ReleaseRun[]> | null;
@@ -25,10 +26,9 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
   if (result?.kind === 'forbidden' || log?.kind === 'forbidden') return <p>운영자만 볼 수 있습니다</p>;
   const runs = result?.kind === 'ready' ? result.data : [];
   const filtered = version ? runs.filter((run) => run.version === version) : runs;
-  const selected = filtered.find((run) => run.runId === selectedRunId) ?? filtered[0];
+  const selected = filtered.find((run) => run.runId === selectedRunId) ?? latestReleaseRun({ kind: 'ready', data: filtered }, Date.now()) ?? filtered[0];
   const choices = [...new Set([...versions, ...runs.map((run) => run.version).filter((v): v is string => !!v)])];
   if (version && !choices.includes(version)) choices.push(version);
-  const current = selected && currentNodeId(selected);
   return <main className="mx-auto w-full min-w-0 max-w-4xl space-y-6 overflow-x-hidden px-4 py-6 text-foreground">
     {releaseStrip}
     <header className="space-y-1"><p className="text-sm text-muted-foreground">운영 / 릴리스</p><h1 className="text-2xl font-semibold">릴리스</h1></header>
@@ -44,25 +44,15 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
         {filtered.map((run) => <button key={run.runId} type="button" aria-pressed={selected?.runId === run.runId} onClick={() => onRun(run.runId)}
           className="block w-full min-w-0 rounded-md border p-3 text-left hover:bg-muted aria-pressed:border-primary">
           <span className="block truncate font-medium">{run.version ?? '판 미상'} · {run.status}</span>
-          <time className="block break-all text-sm text-muted-foreground" dateTime={run.startedAt}>{run.startedAt}</time>
+          <time className="block break-all text-sm text-muted-foreground" dateTime={run.startedAt}>{Number.isFinite(Date.parse(run.startedAt)) ? `${runClock.format(new Date(run.startedAt))} KST` : '시각 미기록'}</time>
         </button>)}
       </section>
-      {selected && <section className="min-w-0 space-y-2" aria-label="노드 진행">
-        <h2 className="font-semibold">노드 진행</h2>
-        {selected.path.map((id, index) => {
-          const node = selected.nodes.find((entry) => entry.nodeId === id);
-          const open = openedNodeId === id;
-          return <div key={`${id}-${index}`} className="min-w-0 rounded-md border">
-            <button type="button" aria-expanded={open} onClick={() => onNode(id)} className="flex w-full min-w-0 items-start gap-2 p-3 text-left hover:bg-muted">
-              <span aria-label={node?.ok === true ? '성공' : node?.ok === false ? '실패' : '진행 대기'}>{node?.ok === true ? '✅' : node?.ok === false ? '❌' : '⏳'}</span>
-              <span className="min-w-0 flex-1"><span className="block break-all font-medium">{id} {id === current && <strong className="text-sm text-primary">지금 위치</strong>}</span>
-                {node?.summary && <span className="block break-all text-sm text-muted-foreground">{node.summary}</span>}</span>
-            </button>
-            {open && <div className="min-w-0 border-t p-3">{log?.kind === 'ready'
-              ? <pre className="max-w-full overflow-x-auto whitespace-pre font-mono text-xs" aria-label="노드 로그">{log.data.log}</pre>
-              : <p role="status" className="text-sm">{log?.kind === 'error' ? `로그를 불러오지 못했습니다 (${log.status})` : '로그를 불러오는 중…'}</p>}</div>}
-          </div>;
-        })}
+      {selected && <section className="min-w-0 space-y-3" aria-label="노드 진행">
+        <h2 className="font-semibold">노드 흐름 <span className="text-sm font-normal text-muted-foreground">· {selected.version ?? '판 미상'} · {selected.status}</span></h2>
+        <ReleaseFlow run={selected} openedNodeId={openedNodeId} onNode={onNode} />
+        {openedNodeId && selected.path.includes(openedNodeId)
+          ? <ReleaseNodeDetail run={selected} nodeId={openedNodeId} log={log} />
+          : <p className="text-sm text-muted-foreground">노드를 누르면 요약 전문과 로그 꼬리가 열립니다.</p>}
       </section>}
     </>}
   </main>;
@@ -74,7 +64,6 @@ export function ReleaseRunsView(): React.ReactNode {
   const [versions, setVersions] = useState<string[]>([]);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [result, setResult] = useState<OpsResult<ReleaseRun[]> | null>(null);
-  const [allRuns, setAllRuns] = useState<OpsResult<ReleaseRun[]> | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [openedNode, setOpenedNode] = useState<{ runId: string; nodeId: string } | null>(null);
   const [log, setLog] = useState<{ runId: string; nodeId: string; result: OpsResult<{ log: string }> } | null>(null);
@@ -94,7 +83,6 @@ export function ReleaseRunsView(): React.ReactNode {
       priorClient.current = client;
       permissionDenied.current = false;
       setDenied(false);
-      setAllRuns(null);
       setVersions([]);
       newestVersion.current = null;
       setLatestVersion(null);
@@ -109,14 +97,13 @@ export function ReleaseRunsView(): React.ReactNode {
     void getReleaseRuns(client, version || undefined).then((next) => {
       if (!active || permissionDenied.current) return;
       setResult(next);
-      if (next.kind === 'forbidden') { permissionDenied.current = true; setAllRuns(null); setDenied(true); }
+      if (next.kind === 'forbidden') { permissionDenied.current = true; setDenied(true); }
       if (next.kind === 'ready') {
-        if (version === null) setAllRuns(next);
         latestRuns.current = next.data;
         setVersions((previous) => [...new Set([...previous, ...next.data.map((run) => run.version).filter((v): v is string => !!v)])]);
         if (version === null && newestVersion.current === null) {
           const requestedRunId = new URLSearchParams(window.location?.search ?? '').get('run');
-          newestVersion.current = next.data.find((run) => run.runId === requestedRunId)?.version ?? next.data[0]?.version ?? null;
+          newestVersion.current = next.data.find((run) => run.runId === requestedRunId)?.version ?? latestReleaseRun(next, Date.now())?.version ?? next.data[0]?.version ?? null;
           setLatestVersion(newestVersion.current);
         }
       }
@@ -125,20 +112,20 @@ export function ReleaseRunsView(): React.ReactNode {
   }, [client, version]);
 
   const running = !denied && (result?.kind === 'ready' || result?.kind === 'error') && latestRuns.current.some((run) =>
-    !['completed', 'failed', 'cancelled', 'aborted', 'success', 'error'].includes(run.status.toLowerCase()));
+    !FINISHED_RUN.includes(run.status.toLowerCase()));
   useEffect(() => {
     if (!running) return;
     let active = true;
     let busy = false;
     const refresh = async () => {
       if (busy || document.hidden || !active || permissionDenied.current
-        || !latestRuns.current.some((run) => !['completed', 'failed', 'cancelled', 'aborted', 'success', 'error'].includes(run.status.toLowerCase()))) return;
+        || !latestRuns.current.some((run) => !FINISHED_RUN.includes(run.status.toLowerCase()))) return;
       busy = true;
       const next = await getReleaseRuns(client, version || undefined);
       busy = false;
       if (active && !permissionDenied.current) {
         setResult(next);
-        if (next.kind === 'ready') { latestRuns.current = next.data; if (version === null) setAllRuns(next); }
+        if (next.kind === 'ready') latestRuns.current = next.data;
         if (next.kind === 'forbidden') { permissionDenied.current = true; setDenied(true); }
       }
     };
@@ -149,8 +136,9 @@ export function ReleaseRunsView(): React.ReactNode {
   }, [client, version, running]);
 
   const activeVersion = version === null ? latestVersion : version;
-  const selected = result?.kind === 'ready' ? result.data.find((run) => run.runId === selectedRunId && (!activeVersion || run.version === activeVersion))
-    ?? result.data.find((run) => !activeVersion || run.version === activeVersion) : undefined;
+  const versionRuns = result?.kind === 'ready' ? result.data.filter((run) => !activeVersion || run.version === activeVersion) : [];
+  const selected = versionRuns.find((run) => run.runId === selectedRunId)
+    ?? latestReleaseRun({ kind: 'ready', data: versionRuns }, Date.now()) ?? versionRuns[0];
   const effectiveVersion = activeVersion ?? selected?.version ?? '';
   const selectedId = selected?.runId;
   useEffect(() => {
@@ -186,5 +174,5 @@ export function ReleaseRunsView(): React.ReactNode {
   const visibleLog = log && log.runId === selectedId && log.nodeId === visibleNode ? log.result : null;
   return <ReleaseRunsContent result={result} version={effectiveVersion} versions={versions} selectedRunId={selectedRunId} openedNodeId={visibleNode}
     log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode}
-    releaseStrip={<ReleaseStrip result={allRuns ?? result} onSelect={selectStripRun} />} />;
+    releaseStrip={<ReleaseStrip result={result} selectedRun={selected ?? null} onSelect={selectStripRun} />} />;
 }

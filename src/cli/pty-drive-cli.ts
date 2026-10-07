@@ -51,6 +51,18 @@ export interface TuiWorkdirDecision {
   readonly message?: string;
 }
 
+/** 「명시 격리」 판정 — `--test`(명시 플래그 층) 이거나 `--isolated-root` 를 줬을 때만 참.
+ *
+ * ⭐ 이 식은 «한 벌»이다 — `runPtyDriveInner`(거부)와 `src/index.ts` dev 의 자동 워크트리
+ *    판정(`decideAutoWorktree`)이 같이 쓴다. 둘이 갈리면 「자동으로 만들었어야 하는데 거부」나
+ *    「거부했어야 하는데 자동」이 조용히 생긴다. 3층(트리 파생)은 «명시»가 아니라서 빠진다. */
+export function isExplicitlyIsolated(
+  resolution: { readonly kind: string; readonly layer: string },
+  isolatedRoot?: string,
+): boolean {
+  return (resolution.kind === 'test' && resolution.layer === 'explicit-flag') || Boolean(isolatedRoot);
+}
+
 /** Reject the unsafe combination before a TUI child can inherit the caller's tree. */
 export function decideTuiWorkdir(isolated: boolean, cwd: string | undefined): TuiWorkdirDecision {
   const workdirProvided = Boolean(cwd?.trim());
@@ -62,7 +74,7 @@ export function decideTuiWorkdir(isolated: boolean, cwd: string | undefined): Tu
     // ⛔⭐ 거부 문면은 **무엇을 주면 되는지**까지 말한다(교차 세션 제안 · 2026-08-02).
     //    상대가 헤맨 이유가 *"어디에 config 를 쓰나"* 였다 — 실효 자리를 확인하는 한 줄을 함께 준다.
     ...(rejected
-      ? { message: '격리 우주에서는 작업 디렉토리를 명시해야 한다 — `--cwd <worktree-path>` 를 주십시오. '
+      ? { message: '격리 우주에서는 작업 디렉토리를 명시해야 한다 — `--worktree` 를 주거나 `--cwd <worktree-path>` 를 주십시오. '
           + '(안 주면 명령을 친 트리가 자식의 쓰기 허용 구역이 됩니다.) '
           + '지금 어느 우주인지는 `elanous where` 로 확인할 수 있습니다.' }
       : {}),
@@ -499,8 +511,7 @@ async function runPtyDriveInner(opts: PtyDriveOpts): Promise<{ exitCode: number 
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const scopeRoot = effectiveInstanceRoot();
   const resolution = resolveCurrentInstance();
-  const explicitlyIsolated = (resolution.kind === 'test' && resolution.layer === 'explicit-flag')
-    || Boolean(opts.isolatedRoot);
+  const explicitlyIsolated = isExplicitlyIsolated(resolution, opts.isolatedRoot);
   const workdirDecision = decideTuiWorkdir(explicitlyIsolated, opts.cwd);
   debug.log('pty.drive', 'tui-workdir-decision', workdirDecision);
   if (workdirDecision.rejected) throw new Error(workdirDecision.message);

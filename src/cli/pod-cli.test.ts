@@ -237,7 +237,8 @@ describe('elanous pod lease status', () => {
     await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
     expect(cap.code()).toBe(0);
     expect(JSON.parse(cap.lines[0]!)).toMatchObject({ pool: 'node-b:20', members: [{ context: 'node-b', capacity: 20 }] });
-    expect(calls).toHaveLength(3);
+    // nodes · jobs · pods ⊕ POD-ADMIT-BY-USAGE `top pods` (a read; unparseable here → limits as before).
+    expect(calls).toHaveLength(4);
     expect(calls.every((args) => args[0] === '--context' && args[1] === 'node-b')).toBe(true);
     const table = capture(); const tableProgram = new Command(); tableProgram.exitOverride();
     registerPodCommands(tableProgram, { io: table.io, kubectl, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, harnessPool: () => 'node-b:20' });
@@ -255,9 +256,10 @@ describe('elanous pod lease status', () => {
     });
     await program.parseAsync(['pod', 'lease', 'status', '--pool', 'node-b:20', '--json'], { from: 'user' });
     expect(JSON.parse(cap.lines[0]!).pool).toBe('node-b:20');
-    expect(calls).toHaveLength(3);
-    expect(calls.find((args) => args.includes('pods'))).toContain('--all-namespaces');
-    expect(calls.every((args) => args[0] === '--context' && args[1] === 'node-b' && args[2] === '--request-timeout=10s' && args.includes('get'))).toBe(true);
+    expect(calls).toHaveLength(4);
+    expect(calls.find((args) => args.includes('pods') && args.includes('get'))).toContain('--all-namespaces');
+    expect(calls.find((args) => args.includes('top'))).toEqual(['--context', 'node-b', '--request-timeout=10s', '-n', 'elanous-test', 'top', 'pods', '--no-headers']);
+    expect(calls.every((args) => args[0] === '--context' && args[1] === 'node-b' && args[2] === '--request-timeout=10s' && (args.includes('get') || args.includes('top')))).toBe(true);
   });
   test('foreign Pod reservation is reflected in both JSON and the table', async () => {
     const foreign = { metadata: { namespace: 'system', name: 'foreign', labels: {} }, status: { phase: 'Running' },

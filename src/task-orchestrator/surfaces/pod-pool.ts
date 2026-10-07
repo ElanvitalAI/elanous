@@ -193,7 +193,8 @@ export class PodPoolScheduler {
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
     this.hostLease = options.hostLease ?? podPoolHostLease(members);
     const measureStatus = options.status ?? (() => {
-      const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) });
+      // POD-ADMIT-BY-USAGE: admission reads observed Pod usage (`kubectl top`); tryAcquire's occupancy read does not.
+      const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
       return recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
     });
     this.measure = async () => measureStatus();
@@ -297,11 +298,18 @@ export class PodPoolScheduler {
    * POOL-SPREAD (10-06): comparing absolute free slots always picked the big member (node-b 25 vs node-c 4), so the small
    * member idled until the big one was full. Comparing the free share fills members in proportion to their capacity.
    * A member whose occupancy could not be read falls back to inflight-only (never treated as zero occupied).
+   * `selfCapped` (POOLGLOBAL-REG 10-07): a caller with its own concurrency cap (the release gate) counts only its own Jobs
+   * — free = capacity − this scheduler's inflight, summed over members as the pool total — and reads no cluster occupancy.
+   * #24253 made every acquire subtract all Running+Pending harness goal Pods, so with ~24 goal Pods on the gate's 25-slot
+   * member the 0.2.15 gate launched its shards one at a time.
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean } = {}): Promise<PodPoolMember | null> {
+    const selfCapped = mode.selfCapped === true;
     let reading: Record<string, MemberOccupancy>;
-    try { reading = await this.occupancy(); }
+    // A self-capped caller's own Jobs are its inflight; other workloads' Pods are not its slots (no cluster read).
+    if (selfCapped) reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: 0 }]));
+    else try { reading = await this.occupancy(); }
     catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: null, reason }]));
@@ -329,12 +337,12 @@ export class PodPoolScheduler {
       if (better(cand)) best = cand;
     }
     if (!best) {
-      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}`);
+      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}`);
       return null;
     }
     this.inflight.set(best.member.context, (this.inflight.get(best.member.context) ?? 0) + 1);
     const share = Object.fromEntries(this.members.map((m) => [m.context, Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100]));
-    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured, share });
+    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured, share, ...(selfCapped ? { selfCapped: true } : {}) });
     return best.member;
   }
   release(member: PodPoolMember): void {

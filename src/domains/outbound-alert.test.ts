@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import * as fs from 'node:fs';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,11 +92,14 @@ test('standalone CLI send is visible through elanous logs --category outbound.se
   const fakeBin = join(root, 'bin');
   mkdirSync(fakeBin);
   const fakeCurl = join(fakeBin, 'curl');
-  writeFileSync(fakeCurl, '#!/bin/sh\nprintf "{\\"ok\\":true}"\n', { mode: 0o755 });
+  const curlCalls = join(root, 'curl-calls');
+  writeFileSync(fakeCurl, `#!/bin/sh\necho called >> '${curlCalls}'\nprintf '{"ok":true}'\n`, { mode: 0o755 });
   const source = `cli-observation-${process.pid}-${Date.now()}`;
   const control = `sink-removed-${process.pid}-${Date.now()}`;
+  // The first probe run is a real entry point, so clear every test-process signal the guard reads — the
+  // deterministic runner also exports ELANOUS_TEST_HOME (testProcessSignal), not only NODE_ENV.
   const env = {
-    ...process.env, NODE_ENV: '', ELANOUS_STATE_DIR: join(repo, '.elanous-test'), ELANOUS_CONFIG_DIR: join(repo, '.elanous-test'),
+    ...process.env, NODE_ENV: '', ELANOUS_TEST_HOME: '', ELANOUS_STATE_DIR: join(repo, '.elanous-test'), ELANOUS_CONFIG_DIR: join(repo, '.elanous-test'),
     ELANOUS_NEXUS_URL: '', OUTBOUND_PROBE_SOURCE: source,
     PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
   };
@@ -116,8 +119,11 @@ test('standalone CLI send is visible through elanous logs --category outbound.se
     expect(query.stdout).not.toContain('private-secret');
     expect(query.stdout).not.toContain('98765');
     expect(send.stdout).not.toContain('SECRET-BODY-DO-NOT-LOG');
+    // Under NODE_ENV=test the probe is a test process: no store sink, and the real-transport send is refused
+    // by the test-write guard (TEST-PROD-LEAK) — the fake curl on PATH is invisible to it.
     const missing = run(['src/domains/outbound-log-probe.ts'], { OUTBOUND_PROBE_SOURCE: control, NODE_ENV: 'test' });
-    expect(missing.status).toBe(0);
+    expect(missing.stderr).toContain('[test-guard] refused');
+    expect(readFileSync(curlCalls, 'utf8').trim().split('\n')).toHaveLength(1); // only the first (real-entry) send reached curl
     expect(missing.stdout).not.toContain('SECRET-BODY-DO-NOT-LOG');
     const withoutSink = run(['bin/elanous.mjs', '--test', 'logs', '--category', 'outbound.send', '--event', 'sent', '--grep', control, '--json', '--json-data']);
     expect(withoutSink.stdout).not.toContain(control);

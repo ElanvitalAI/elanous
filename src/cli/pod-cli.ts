@@ -71,7 +71,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         const current = spec ? null : kubectl(['config', 'current-context']);
         const context = spec ?? (current?.status === 0 ? current.stdout.trim() : '');
         const members = context ? parsePodPool(context) : [];
-        const measure: PoolLeaseMeasure = members.length ? measurePoolLease(members, { kubectl, dns: (context) => (deps.dns ?? probePoolDns)(context, kubectl) }) : { members: [] };
+        const measure: PoolLeaseMeasure = members.length ? measurePoolLease(members, { kubectl, dns: (context) => (deps.dns ?? probePoolDns)(context, kubectl), measureUsage: true }) : { members: [] };
         let accounts: number | null = null;
         let accountReason: string | null = null;
         try { accounts = (deps.accounts ?? (() => listCodexAccountsInStore().length))(); }
@@ -96,6 +96,10 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
           }
           io.log(`실측 점유: ${measure.members.map((m) => `${m.context} ${m.running === null || m.pending === null ? '못 쟀다' : m.running + m.pending}/${m.capacity}`).join(' · ') || '?'}`);
           io.log(`권장 지금 ${decision.recommended ?? '?'} 개 더 (limitedBy=${decision.limitedBy ?? 'unknown'})${decision.reason ? ` · ${decision.reason}` : ''}`);
+          if (decision.admission) {
+            const g = (v: number | null) => v === null ? '?' : `${(v / 1024 ** 3).toFixed(1)}Gi`;
+            io.log(`골당 입장 ${g(decision.admission.admitBytes)} (실사용 표본 ${decision.admission.samples} · p95 ${g(decision.admission.p95Bytes)}${decision.admission.fallback ? ` · 폴백: ${decision.admission.fallback}` : ''})`);
+          }
           io.log(`예약(저작 중) ${host.reserved} · 대기 Job ${waitingJobs ?? '?'} · 실행 ${decision.running ?? '?'}`);
           io.log(`임대 없는 실행 ${decision.unleasedRunning ?? '?'}`);
           io.log(`capacity: ${decision.capacitySlots ?? '?'} 칸 (상한 ${members.reduce((sum, m) => sum + m.capacity, 0)} − Running ${decision.running ?? '?'} − Pending ${decision.pending ?? '?'}; 권장 수에서 건강한 멤버의 임대 없는 실행 차감)`);

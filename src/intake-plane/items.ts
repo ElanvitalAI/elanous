@@ -84,6 +84,7 @@ export function canonicalUrl(raw: string): string | undefined {
 function normalizedSeat(seat: unknown): string | undefined {
   if (seat === undefined) return undefined;
   if (typeof seat !== 'string') throw new Error(`알 수 없는 자리: ${String(seat)}`);
+  if (seat.trim() === 'user') return 'user';
   const track = findTrack(seat.trim());
   if (!track) throw new Error(`알 수 없는 자리: ${seat}`);
   return track.id;

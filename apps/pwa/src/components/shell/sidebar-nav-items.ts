@@ -1,7 +1,7 @@
 import {
   Activity, BookOpen, Bot, CalendarClock, Compass, Crosshair, GitBranch,
   GitPullRequest, Inbox, KanbanSquare, Layers, Layers2, Lightbulb, LayoutGrid,
-  MessageSquare, Palette, Settings, Sliders, Store, Telescope, TerminalSquare,
+  MessageSquare, Palette, Settings, Share2, Sliders, Store, Telescope, TerminalSquare,
   type LucideIcon, Users,
 } from 'lucide-react';
 import type { WorkspaceTabKind } from '@/lib/workspace/types';
@@ -54,6 +54,41 @@ export function visibleNavGroups(
 export const NAV_SHOW_LABS_KEY = 'elanous.nav.showLabs';
 export const NAV_SHOW_HIDDEN_KEY = 'elanous.nav.showHidden';
 export type SidebarRouteHref = `/${string}`;
+
+/** 메뉴 항목의 «주소» — `?view=` 같은 보기 링크는 그 경로의 한 보기라 주소 회계에선 경로만 센다. */
+export function sidebarRoutePath(href: string): string {
+  return href.split(/[?#]/, 1)[0] || '/';
+}
+
+/** 경로에 질의가 붙은 메뉴 항목(같은 화면의 다른 보기) — 404 안내·주소 회계에서 경로 항목과 겹쳐 세지 않는다. */
+export function isSidebarViewLink(href: string): boolean {
+  return sidebarRoutePath(href) !== href;
+}
+
+function queryMatches(href: string, search: string): boolean {
+  const current = new URLSearchParams(search);
+  for (const [key, value] of new URLSearchParams(href.slice(href.indexOf('?') + 1))) if (current.get(key) !== value) return false;
+  return true;
+}
+
+/** 메뉴 항목이 «지금 화면»인가 — 경로 ⊕ 보기 링크(`?view=`)의 질의까지 본다(LOOP-NAV-ACTIVE).
+ *  보기 링크는 경로와 질의가 다 맞을 때만 켜지고, 그때 같은 경로의 경로 항목은 비켜 준다(강조는 하나). */
+export function navItemActive(
+  item: { href: string; activeAlso?: readonly string[] },
+  path: string,
+  search: string,
+  items: readonly { href: string }[],
+): boolean {
+  const route = sidebarRoutePath(item.href);
+  const pathMatch = route === '/'
+    ? path === '/'
+    : path === route || path.startsWith(route + '/')
+      || (item.activeAlso ?? []).some((p) => path === p || path.startsWith(p + '/'));
+  if (!pathMatch) return false;
+  if (isSidebarViewLink(item.href)) return path === route && queryMatches(item.href, search);
+  return !items.some((other) => other !== item && isSidebarViewLink(other.href)
+    && sidebarRoutePath(other.href) === path && queryMatches(other.href, search));
+}
 
 export const NON_MENU_SIDEBAR_ROUTE_CATEGORIES = [
   'retired', 'system-share-target', 'dynamic-route-parent', 'provider-onboarding',
@@ -109,6 +144,8 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'settings', href: '/settings', label: '설정', hint: '환경 + provider + theme', icon: Settings, kind: 'settings' },
   { group: 'ops', href: '/ceo', label: '대표 조망판', hint: '판 진행 · 루프 판정 · 결정 대기 · 오늘 병합', icon: LayoutGrid, kind: null },
   { group: 'ops', href: '/loops', label: '루프 현황', hint: '루프·크론 발화 상태 (읽기 전용 · beta)', icon: Activity, kind: null },
+  // 같은 주소(/loops)의 «보기» — 주소 회계는 `sidebarRoutePath` 로 경로만 센다(LOOP-INTERACT D).
+  { group: 'ops', href: '/loops?view=interact', label: '루프 상호작용', hint: '자리·루프·런 사이 실제 사건 지도 (?journey=<카드> 여정 · 실시간)', icon: Share2, kind: null },
   { group: 'ops', href: '/ops/release', label: '릴리스', hint: '판 진행 노드 줄 · 로그 꼬리', icon: GitBranch, kind: null },
   { group: 'ops', href: '/ops/checklist', label: '판별 피처', hint: '확인표 칸 목록 · 상태 · 담당 · 근거', icon: GitPullRequest, kind: null },
   { group: 'ops', href: '/ops/seats', label: '자리 현황', hint: '자리별 지금 일 · 착지 · 막힘 · 결정 대기(?capture=public 공개 시연)', icon: Users, kind: null },
@@ -120,6 +157,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'work', href: '/board', label: '보드', hint: '태스크 카드 흐름 (스튜어드 → 실행 → 착지 → 릴리스)', icon: KanbanSquare, kind: null, visibility: 'labs' },
   { group: 'work', href: '/sessions', label: '대화 카드', hint: '대화 카드 데크 (스와이프 결정)', icon: Layers2, kind: null, visibility: 'hidden' },
   { group: 'today', href: '/reflection', label: 'Reflection', hint: '오늘의 회고 (5분 갱신)', icon: Lightbulb, kind: null, visibility: 'hidden' },
-  ...PRIVATE_SIDEBAR_NAV_ITEMS.map((item) => ({ ...item, group: 'files' as const })),
+  // 비공개 항목은 자기 칸을 적을 수 있다(피치 = 운영🔒) — 안 적으면 «자료».
+  ...PRIVATE_SIDEBAR_NAV_ITEMS.map((item) => ({ ...item, group: item.group ?? ('files' as const) })),
   { group: 'make', href: '/showroom', label: 'Showroom', hint: 'multi-agent 동시 비교 (broadcast · CV-3)', icon: LayoutGrid, kind: null, visibility: 'labs' },
 ] as const;

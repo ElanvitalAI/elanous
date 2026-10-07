@@ -283,6 +283,8 @@ import { runRebindCommand } from '../../input-core/index.js';
 import { resolveRepositoryDesignCheck } from '../../cli/repo-cli.js';
 import { renderDesignCheckLines, type DesignCheckTone } from '../../design/design-check-render.js';
 import { handleDesignPick } from './design-pick.js';
+import { createDecideSlashHandler } from './decide-slash.js';
+import type { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { listDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
 import {
   dashboardDeltaHelpLines,
@@ -303,8 +305,6 @@ import {
   rotateNextProvider, jumpToRotationEntry, rotationEntryLabel,
   currentRotationIndex,
 } from '../../user-config.js';
-import type { LLMProviderName } from '../../user-config.js';
-import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import { listProviders } from '../../llm.js';
 import { enabledModels, loadCatalog } from '../../intelligence-map/model-catalog.js';
 import { selfOrchestrateRuntime } from '../../self-dev/self-orchestrate-runtime.js';
@@ -343,6 +343,7 @@ import { terminalModalRouter } from '../input/terminal-modal-router.js';
 import { termSize, stripAnsi } from '../../tui.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
+import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, modelChangeLine, modelOverviewLines, resolveModelChoice } from './model-choices.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveDashboardChatMainLogCommand } from '../input/chat-main-log-command.js';
 import {
@@ -375,6 +376,7 @@ import { dirname as pathDirname, relative } from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import type { SurfaceUx } from '../../agent/surface-ux/types.js';
 import type { AskUserQuestionRequest } from '../../ask-user-question/types.js';
+import { DASHBOARD_CLARIFICATION_REQUEST } from '../../esc-abort-gate.js';
 import type { GoalDocumentClarification } from '../../self-implement/goal-author-clarification.js';
 import { renderReplayPreviewLines } from '../replay-preview.js';
 import {
@@ -1295,6 +1297,7 @@ let selfOrchestrateSlashRuntime: SelfOrchestrateSlashRuntime = selfOrchestrateRu
 export async function readDashboardAskClarification(
   clarification: GoalDocumentClarification,
   surfaceUx: Pick<SurfaceUx, 'question'> | undefined,
+  notify?: (line: string) => void,
 ): Promise<string> {
   if (!surfaceUx) return '';
   const request: AskUserQuestionRequest = {
@@ -1309,10 +1312,13 @@ export async function readDashboardAskClarification(
       includeOther: clarification.includeOther,
     }],
   };
+  Object.defineProperty(request, DASHBOARD_CLARIFICATION_REQUEST, { value: true });
   try {
-    const result = await surfaceUx.question(request);
-    if (!result || result.cancelled) return '';
+    const pending = surfaceUx.question(request);
     const id = clarification.questionId;
+    notify?.('하니스가 묻는다 — 창에서 고르거나 Esc 로 답 없이 진행');
+    const result = await pending;
+    if (!result || result.cancelled) return '';
     const answer = result.answers[id];
     const selectedLabel = Array.isArray(answer) ? answer[0] : answer;
     const optionIndex = clarification.options.findIndex((option) => option.label === selectedLabel);
@@ -1393,8 +1399,14 @@ async function fetchLoopsDaemonJson<T>(url: string, headers: Record<string, stri
   }
 }
 
-export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
+export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedger?: DecisionLedger): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
   const registry = new SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn>();
+  const decide = createDecideSlashHandler(decideLedger);
+  registry.register(['decide', 'dec'], (args, ctx) => {
+    // showDashboard in src/dashboard/index.ts dispatches into this registry.
+    for (const line of decide(args).split('\n')) ctx.pushChatLine(line);
+    ctx.setChatScrollOffset(-1);
+  });
 
   registry.register(['now'], (args, ctx) => {
     for (const line of tuiNowSlash(args, nowDeps)) ctx.pushChatLine(line);
@@ -2436,7 +2448,11 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
         print: (line) => { for (const part of line.split('\n')) ctx.chatLines.push(`  ${part}`); },
         log: (event, data, level) => debug.log('dev-pipeline', event, { ...data, surface: 'tui-slash' }, { level }),
         readLine: async () => '',
-        readClarification: (clarification) => readDashboardAskClarification(clarification, ctx.surfaceUx),
+        readClarification: (clarification) => readDashboardAskClarification(clarification, ctx.surfaceUx, (line) => {
+          ctx.pushChatLine(line);
+          ctx.setChatScrollOffset(-1);
+          ctx.draw();
+        }),
         readFile: (file) => readFileSync(file, 'utf8'),
         writeFile: (file, data) => writeFileSync(file, data, 'utf8'),
         cwd: () => process.cwd(),
@@ -6161,46 +6177,57 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
   });
 
   registry.register(['model', 'm'], (args, ctx) => {
-    // /model            — 현재 모델 + 스위치 가능 목록
-    // /model <alias>    — 아래 curated 목록의 alias
+    // /model            — 지금 모델(사람 낱말) + 고르기
+    // /model 빠름|보통|깊음 — 지금 provider 의 budget·better·best 티어 (model-choices.ts)
+    // /model <코드명>    — codex·terra·sol·luna·opus·sonnet·grok (그대로 동작)
     // effort(low/med/high)는 /reasoning. NL 미지원(대표 OK·slash-only).
-    //
-    // 명시 target 맵(id + provider) — catalog/prefix 추론 대신 확정값. 핵심:
-    // Codex 계열(gpt-5.5/5.6-sol/terra/luna)은 gpt- prefix 라 자동 추론은
-    // 'openai'(Chat Completions)로 오분류하나, 실제론 Responses API 필수라
-    // provider=openai-codex 여야 한다(omni-crawl 2026-07-17 확인). GPT(openai·
-    // Chat Completions)는 노출하지 않는다(대표 지시 — 혼란 방지·codex만).
-    // 비-OpenAI fallback 은 claude(anthropic)·grok.
-    const MODEL_TARGETS: Record<string, { model: string; provider: LLMProviderName }> = {
-      codex:  { model: 'gpt-5.5',        provider: 'openai-codex' },
-      // 🩸 2026-09-23 — GPT-6 에는 terra 가 없다(결정). 별칭은 남기되 codex 사다리 better 칸(sol 한 칸 아래 자리)을 가리킨다.
-      terra:  { model: lookupLlmTierSpec('openai-codex', 'better').model, provider: 'openai-codex' },
-      sol:    { model: lookupLlmTierSpec('openai-codex', 'best').model, provider: 'openai-codex' },
-      luna:   { model: lookupLlmTierSpec('openai-codex', 'budget').model, provider: 'openai-codex' },
-      opus:   { model: 'claude-opus-4-8',   provider: 'anthropic' },
-      sonnet: { model: 'claude-sonnet-5', provider: 'anthropic' },
-      // ⭐ 티어 표를 따른다(옆 luna 와 같은 형태) — 하드코딩이면 표를 바꿔도 «안 따라온다»(2026-08-18 대표 4.6 재편)
-      grok:   { model: lookupLlmTierSpec('grok', 'best').model, provider: 'grok' },
-    };
     const arg = (args[0] ?? '').toLowerCase().trim();
     const curCfg = getUserConfig();
-    const curModel = curCfg.llm.model ?? '(provider default)';
-    const aliases = Object.keys(MODEL_TARGETS);
+    const curProvider = curCfg.llm.provider;
+    const curModel = curCfg.llm.model;
+    const curReasoning = effectiveReasoningLevel(curCfg.llm, curProvider, curModel);
     if (!arg) {
-      ctx.chatLines.push(`model: ${curModel}  ·  provider ${curCfg.llm.provider}`);
-      ctx.chatLines.push(ctx.muted(`  switch: /model <${aliases.join('|')}>  ·  effort: /reasoning`));
+      const [now, codes] = modelOverviewLines(curProvider, curModel, curReasoning);
+      ctx.chatLines.push(now);
+      ctx.chatLines.push(ctx.muted(codes));
       ctx.setChatScrollOffset(-1);
       return;
     }
-    const target = MODEL_TARGETS[arg];
-    if (!target) {
-      ctx.chatLines.push(ctx.muted(`/model: unknown "${arg}". try ${aliases.join('/')}.`));
+    const resolution = resolveModelChoice(arg, curProvider);
+    if (resolution.kind === 'needs-provider') {
+      debug.log('dashboard.model', 'human-word-needs-provider', { word: resolution.word, provider: curProvider });
+      ctx.chatLines.push(ctx.muted(`/model ${resolution.word}: provider 가 auto 라 고를 사다리가 없다 — /provider 로 먼저 하나를 고르거나 코드명(${MODEL_CODE_NAMES.join('/')})을 쓴다.`));
       ctx.setChatScrollOffset(-1);
       return;
     }
-    saveUserConfig({ ...curCfg, llm: { ...curCfg.llm, provider: target.provider, model: target.model } });
+    if (resolution.kind === 'unknown') {
+      ctx.chatLines.push(ctx.muted(`/model: "${arg}" 를 모른다. ${HUMAN_MODEL_WORDS.join(' | ')} 또는 ${MODEL_CODE_NAMES.join('/')}.`));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    const { target } = resolution;
+    // A human word picks a whole tier (model ⊕ reasoning, like /reasoning it clears the codex override);
+    // a code name changes the model only.
+    const tierReasoning = resolution.kind === 'human' ? resolution.reasoningLevel : undefined;
+    saveUserConfig({
+      ...curCfg,
+      llm: {
+        ...curCfg.llm,
+        provider: target.provider,
+        model: target.model,
+        ...(tierReasoning ? { reasoningLevel: tierReasoning, codexReasoning: undefined } : {}),
+      },
+    });
     reloadUserConfig();
-    ctx.chatLines.push(`model: ${curModel} → ${target.model}  (provider ${target.provider})`);
+    if (tierReasoning) ctx.refreshReasoningHudSegment();
+    debug.log('dashboard.model', 'switch', {
+      via: resolution.kind,
+      choice: resolution.kind === 'human' ? resolution.tier : resolution.name,
+      from: { provider: curProvider, model: curModel ?? null },
+      to: target,
+      reasoning: tierReasoning ?? null,
+    });
+    ctx.chatLines.push(modelChangeLine({ provider: curProvider, model: curModel, reasoning: curReasoning }, resolution));
     ctx.chatLines.push(ctx.muted('  └─ 다음 턴부터 반영 · 실행 뱃지(#4442)로 확인'));
     ctx.setChatScrollOffset(-1);
   });
@@ -6453,7 +6480,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashComm
       { getStatusLines: ctx.getStatusLines ?? (() => []) },
     );
     if (!result) {
-      ctx.chatLines.push(ctx.warning('  /status takes no arguments'));
+      ctx.chatLines.push(ctx.warning('  /status 는 인자 없이 · 자세히는 /status --debug'));
       ctx.setChatScrollOffset(-1);
       return;
     }

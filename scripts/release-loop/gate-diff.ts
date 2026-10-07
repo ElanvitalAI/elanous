@@ -18,6 +18,24 @@ export function parseFailures(output: string): string[] {
   return [...failures].sort();
 }
 
+/** GATE-INTRO-RECHECK (0.2.19) — the failures that are bun's «timed out» shape: a `(fail) name` line whose next line is
+ *  `^ this test timed out after <n>ms.` An assertion failure prints its error above the `(fail)` line, never this. */
+export function parseTimedOutFailures(output: string): string[] {
+  const timedOut = new Set<string>();
+  let file: string | undefined;
+  let pending: string | undefined;
+  for (const raw of output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (pending && /^\^ this test timed out after \d+(?:\.\d+)?ms\.?$/.test(line)) timedOut.add(pending);
+    pending = undefined;
+    const header = /^(?:\.\/)?((?:[\w.-]+\/)+[\w.-]+\.test\.tsx?):(?:\s|$)/.exec(line);
+    if (header) { file = header[1]; continue; }
+    const failed = /\(fail\)\s+(.+?)(?:\s+\[[\d.]+(?:ms|s)\])?$/.exec(line);
+    if (failed && file) pending = `${file} > ${failed[1]!.trim()}`;
+  }
+  return [...timedOut].sort();
+}
+
 const xmlText = (value: string): string => value
   .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
   .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code))).replace(/&amp;/g, '&');

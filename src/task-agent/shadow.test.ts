@@ -1,11 +1,13 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { taskAgentStatePath } from './task-hand.js';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { superviseRun, type SupervisorJobResult, type SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction } from './actions.js';
-import { recordTaskAgentShadowMove, shadowJudgeInput } from './shadow.js';
+import { recordTaskAgentShadowMove, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
 
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
   ({ taskId: 't', feature: 'feature ask', status: 'done', ...over }) as SupervisorJobResult;
@@ -23,7 +25,124 @@ const SAMPLES: Array<[SupervisorStopReason, SupervisorJobResult[], string, strin
 
 const noSweep = async () => ({ pending: 0, merged: 0 }) as never;
 
+function deliveryFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'task-delivery-'));
+  const worktree = join(root, 'worktree');
+  const target = join(root, 'target');
+  mkdirSync(worktree);
+  execFileSync('git', ['init', '-q', worktree]);
+  writeFileSync(join(worktree, 'report.md'), '# 조사\n출처 https://one.example/report https://two.example/report\n## 반대 근거\n다른 해석');
+  writeFileSync(join(worktree, 'image.png'), 'png');
+  const card = { id: 't', text: 'research', createdAt: '', status: 'launched' as const, history: [], completion: 'research-report' as const, project: { target } };
+  return { worktree, target, card };
+}
+
 describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow)', () => {
+  test('새 파일만 종류별로 선택하고 caller 는 shadow 에서 복사 없이 경로를 남긴다', async () => {
+    const { worktree, target, card } = deliveryFixture();
+    expect(selectDeliveryCandidates(worktree, 'research-report')).toEqual(['report.md']);
+    expect(selectDeliveryCandidates(worktree, 'artifact')).toEqual(['image.png', 'report.md']);
+    for (const extension of ['html', 'pdf', 'pptx']) writeFileSync(join(worktree, `output.${extension}`), 'output');
+    writeFileSync(join(worktree, 'unsupported.txt'), 'not deliverable');
+    expect(selectDeliveryCandidates(worktree, 'content')).toEqual([
+      'image.png', 'output.html', 'output.pdf', 'output.pptx', 'report.md',
+    ]);
+    writeFileSync(join(worktree, '.gitignore'), 'ignored/\n');
+    mkdirSync(join(worktree, 'ignored'));
+    writeFileSync(join(worktree, 'ignored', 'private.md'), 'not an output');
+    mkdirSync(join(worktree, 'reports'));
+    writeFileSync(join(worktree, 'reports', 'extra.md'), 'additional output');
+    writeFileSync(join(worktree, 'tracked.md'), 'old');
+    writeFileSync(join(worktree, 'tracked2.md'), 'old');
+    execFileSync('git', ['-C', worktree, 'add', 'tracked.md', 'tracked2.md']);
+    writeFileSync(join(worktree, 'tracked.md'), 'modified');
+    expect(selectDeliveryCandidates(worktree, 'research-report')).toEqual(['report.md', join('reports', 'extra.md')]);
+    let commands = 0;
+    const out = await recordTaskAgentShadowMove({ runId: 'run-delivery', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => card, log: () => {}, command: async () => { commands++; throw new Error('command called'); },
+    });
+    expect(out).toMatchObject({ move: 'wait', executorKind: 'deliver', executorResult: 'shadow', pr: null });
+    expect(out.wouldDo).toContain(join(target, 'elanous-out', 't'));
+    expect(commands).toBe(0);
+    expect(existsSync(target)).toBe(false);
+    const code = await recordTaskAgentShadowMove({ runId: 'run-delivery', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => ({ ...card, completion: 'code-pr' }), log: () => {},
+    });
+    expect(code.move).toBe('wait');
+    expect(code.executorResult).toBeNull();
+    expect(code.wouldDo).toBeNull();
+    expect(commands).toBe(0);
+  });
+
+  test('plain temporary folder is eligible as a new-output worktree', () => {
+    const folder = mkdtempSync(join(tmpdir(), 'plain-report-'));
+    writeFileSync(join(folder, 'report.md'), 'research report');
+    expect(selectDeliveryCandidates(folder, 'research-report')).toEqual(['report.md']);
+  });
+
+  test('supervisor taskId differs from card id: unique launched feature resolves card without custom lookup', async () => {
+    const { worktree, card, target } = deliveryFixture();
+    const statePath = taskAgentStatePath();
+    mkdirSync(join(statePath, '..'), { recursive: true });
+    const unique = `research-${Date.now()}-${Math.random()}`;
+    const original = existsSync(statePath) ? readFileSync(statePath, 'utf8') : undefined;
+    try {
+      writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-real': { ...card, id: 'ta-real', text: unique } } }));
+      const out = await recordTaskAgentShadowMove({ runId: 'run-shadow', stopReason: 'converged', results: [job({ taskId: 'self-dev-other', feature: unique, ok: true, worktreePath: worktree })] }, { log: () => {} });
+      expect(out.executorKind).toBe('deliver');
+      expect(out.wouldDo).toContain(join(target, 'elanous-out', 'ta-real'));
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      if (original === undefined) unlinkSync(statePath);
+      else writeFileSync(statePath, original);
+    }
+  });
+
+  test('live caller delivers verified report with no PR', async () => {
+    const { worktree, target, card } = deliveryFixture();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const out = await recordTaskAgentShadowMove({ runId: 'run-live', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+        mode: 'live', readCard: () => card, log: () => {}, command: async () => { throw new Error('commands forbidden'); },
+      });
+      const report = join(target, 'elanous-out', 't', 'report.md');
+      expect(existsSync(report)).toBe(true);
+      expect(out).toMatchObject({ move: 'propose-green', executorResult: 'done', pr: null, wouldDo: null });
+      expect(log.mock.calls.some(call => call[0] === 'task-agent' && call[1] === 'deliver' &&
+        (call[2] as { taskId: string; kind: string; files: string[]; evidenceOk: boolean }).taskId === 't' &&
+        (call[2] as { files: string[]; evidenceOk: boolean }).files.includes(report) &&
+        (call[2] as { evidenceOk: boolean }).evidenceOk === true)).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('후보 0이면 wait 전달 후보 없음', async () => {
+    const { worktree, card, target } = deliveryFixture();
+    execFileSync('git', ['-C', worktree, 'add', 'report.md']);
+    const out = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => card, log: () => {}, mode: 'live',
+    });
+    expect(out.move).toBe('wait');
+    expect(out.reason).toBe('전달 후보 없음');
+    expect(out.executorKind).toBeNull();
+    expect(existsSync(target)).toBe(false);
+  });
+
+  test('completion absent or ok false preserves legacy judgement and never delivers', async () => {
+    const { worktree, card, target } = deliveryFixture();
+    for (const [overrides, completion] of [
+      [{ ok: true, worktreePath: worktree }, undefined],
+      [{ ok: false, worktreePath: worktree }, card.completion],
+      [{ ok: true }, card.completion],
+    ] as const) {
+      const out = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job(overrides)] }, {
+        readCard: () => ({ ...card, completion }), log: () => {}, mode: 'live',
+      });
+      expect(out.move).toBe('wait');
+      expect(out.executorKind).toBeNull();
+      expect(existsSync(target)).toBe(false);
+    }
+  });
+
   test('종료 어휘 8표본 → shadow-move 하나씩 · 실제 명령 0', async () => {
     const events: Array<Record<string, unknown>> = [];
     let commands = 0;
@@ -106,5 +225,48 @@ describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow
       expect(asyncThrow).toEqual(quiet);
       expect(log.mock.calls.filter((c) => c[0] === 'task-agent' && c[1] === 'shadow-move-failed')).toHaveLength(2);
     } finally { log.mockRestore(); }
+  });
+});
+
+describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RFC-loop-agent-map §A4b③)', () => {
+  test('shadowJudgeInput 은 completion 을 주면 싣고 안 주면 종전 입력 그대로', () => {
+    expect(shadowJudgeInput('converged', [job()], 'ops-action')).toEqual({ stopReason: 'converged', completion: 'ops-action' });
+    expect(shadowJudgeInput('converged', [job()], undefined)).toEqual({ stopReason: 'converged' });
+  });
+
+  test('파일 전달 밖 종류(ops-action)는 확인 증거를 기다리고 shadow-move 에 completion 을 남긴다 · code-pr 은 종전 문면', async () => {
+    const { worktree, card } = deliveryFixture();
+    const logged: Array<Record<string, unknown>> = [];
+    const log = (_c: string, _e: string, data: Record<string, unknown>) => { logged.push(data); };
+    const ops = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => ({ ...card, completion: 'ops-action' }), log,
+    });
+    expect(ops.move).toBe('wait');
+    expect(ops.reason).toBe('확인 증거 대기 — ops-action');
+    expect(ops.executorKind).toBeNull();
+    expect(logged.at(-1)).toMatchObject({ completion: 'ops-action' });
+    const pr = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => ({ ...card, completion: 'code-pr' }), log,
+    });
+    expect(pr.reason).toBe('완주했으나 PR 병합 근거 대기');
+    expect(logged.at(-1)).toMatchObject({ completion: 'code-pr' });
+    await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'no-progress', results: [job()] }, { log });
+    expect(logged.at(-1)).toMatchObject({ completion: null });
+    const legacy = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => ({ ...card, completion: undefined }), log,
+    });
+    expect(legacy.reason).toBe('완주했으나 PR 병합 근거 대기');
+    expect(logged.at(-1)).toMatchObject({ completion: 'code-pr' });
+  });
+
+  test('카드 조회 실패는 종결 종류 «미확인» — 관측에 unmeasured · reason 에 표지(수는 종전 판단 그대로)', async () => {
+    const { worktree } = deliveryFixture();
+    const logged: Array<Record<string, unknown>> = [];
+    const out = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => { throw new Error('state unreadable'); }, log: (_c, _e, data) => { logged.push(data); },
+    });
+    expect(out.move).toBe('wait');
+    expect(out.reason).toBe('완주했으나 PR 병합 근거 대기 · 종결 종류 미확인(카드 조회 실패)');
+    expect(logged.at(-1)).toMatchObject({ completion: 'unmeasured' });
   });
 });

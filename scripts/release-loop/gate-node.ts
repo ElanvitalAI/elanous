@@ -1,20 +1,22 @@
 #!/usr/bin/env bun
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { landingFreezeMessage, readLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
-import { diffFailures, junitFailures, parseFailures } from './gate-diff';
+import { diffFailures, junitFailures, parseFailures, parseTimedOutFailures } from './gate-diff';
 import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { baselineFromCutLogs } from './baseline-from-logs';
-import { planShards, readFileDurations, readFileMemory } from './shard-plan';
+import { mergePartialFailures, readPartialPlan, testFileOfId } from './gate-partial';
+import { logPlanWalltime, planDurations, planShards, readFileMemory } from './shard-plan';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
-import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { runPodCommand, parsePodCpu, resolvePodCpu, type RunPodCommandOptions, type PodCommandResult, type PodCpu } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
@@ -23,7 +25,8 @@ interface CommandResult { rc: number; output: string; passedIds?: string[]; stal
 export interface GateRunner {
   command(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<CommandResult>;
   localCommand(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<CommandResult>;
-  sweep(tree: string, logDir?: string, pod?: GateOptions['pod']): Promise<CommandResult>;
+  /** `only` (GATE-PARTIAL) restricts the sweep to these test files; absent = every test file. */
+  sweep(tree: string, logDir?: string, pod?: GateOptions['pod'], only?: readonly string[]): Promise<CommandResult>;
   add(tree: string, commit: string): Promise<void>;
   remove(tree: string): Promise<void>;
   snapshot(tree: string, commit: string): Promise<void>;
@@ -42,24 +45,38 @@ export interface GateOptions {
   instanceRoot?: string;
   ledgerRoot?: string;
   repo?: string;
-  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string };
+  /** freshShards — GATE-SHARD-RESUME off: every shard starts a Pod even when this logDir already holds its result. */
+  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string; freshShards?: boolean;
+    /** GATE-SKIP-KNOWN-RETRY — failure ids the previous release already had (and env-known ones): a shard that fails only
+     *  with these is not re-run in isolation; the verdict still classifies them against the baseline as before. */
+    knownFailures?: readonly string[];
+    /** GATE-SPEED A3① — shard Pod CPU request/limit (`release.loop.gatePodCpu`); omitted = request 1 / limit 4. */
+    cpu?: PodCpu };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
   commit: string;
   introduced: string[];
   preexisting: number;
-  fixed: number;
+  /** null = not counted (GATE-SPEED A4: the swept baseline ran only the cut's failing files). */
+  fixed: number | null;
   knownEnv: number;
   knownEnvCleared: string[];
   stalledEnv: Array<{ file: string; reason: 'no-output' | 'isolated-timeout'; local: 'passed' | 'failed' | 'timeout' }>;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
   /** GATE-BASELINE-CACHE — isolated baseline files answered from the ledger (hits) or run now (misses). */
   baselineCache?: { hits: number; misses: number };
+  /** GATE-SPEED A4 — a swept baseline ran only the cut's failing files that exist at the previous release. */
+  baselineDeferred?: { cutFiles: number; swept: number };
   durationMs: number;
   error?: string;
   stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
   partialSummary?: { pass: number; fail: number; errors: number; ran: number; files: number };
+  /** GATE-PARTIAL — this verdict re-ran only these files and carried the prior gate's results for the rest. */
+  partial?: { priorCommit: string; files: number };
+  /** GATE-INTRO-RECHECK — new failures that were only the «timed out» shape and passed one isolated re-run with a
+   *  {@link GATE_TIMEOUT_RECHECK_MS} per-test limit: a warning (flaky under load), not an introduced regression. */
+  loadFlaky?: string[];
 }
 
 const sha = /^[0-9a-f]{7,40}$/i;
@@ -116,6 +133,65 @@ const lastMatch = (output: string, pattern: RegExp): RegExpExecArray | null => {
 const summaryCount = (output: string, label: string) => Number(lastMatch(output, new RegExp(`(?:^|\\n)\\s*(\\d+) ${label}s?\\s*(?=\\n|$)`))?.[1] ?? NaN);
 /** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
 const asPath = (path: string) => path.startsWith('./') || path.startsWith('/') ? path : `./${path}`;
+/** A Pod path (`~/repo/src/…` · `../..~/repo/src/…`) as a repository-relative one. */
+const podRelative = (path: string) => path.replace(/^(?:\.\.\/)*\/?home\/ubuntu\/repo\//, '');
+/** `file > [error]` ids of bun's «Unhandled error between tests» blocks, or undefined when one cannot be attributed. */
+function unhandledErrorIds(output: string): string[] | undefined {
+  const errors: string[] = [];
+  let file: string | undefined;
+  for (const raw of output.split(/\r?\n/)) {
+    const header = /^(?:\.\/)?((?:[\w.-]+\/)+[\w.-]+\.test\.tsx?):/.exec(raw.trim());
+    if (header) file = header[1];
+    if (/^# Unhandled error between tests/.test(raw.trim())) {
+      if (!file) return undefined;
+      errors.push(`${file} > [error]`);
+      file = undefined;
+    }
+  }
+  return errors;
+}
+/**
+ * GATE-SKIP-KNOWN-RETRY / GATE-ISOLATE-FAILED-FILES — the failing ids of one Pod shard, but only when every failure the
+ * summary counts is named (junit first, else the console `(fail)` lines) and every unhandled error is attributed.
+ * Anything less returns undefined, and the shard keeps the old retry path.
+ */
+export function shardFailureIds(clean: string, junit: string | undefined, fails: number, errors: number): { failures: string[]; errors: string[] } | undefined {
+  if (!Number.isFinite(fails)) return undefined;
+  const stripped = stripPodRepoRoot(clean);
+  let failures: string[];
+  try { failures = junit !== undefined ? [...new Set(junitFailures(junit).map(podRelative))].sort() : parseFailures(stripped); }
+  catch { return undefined; }
+  if (failures.length !== fails) return undefined;
+  const errorIds = unhandledErrorIds(stripped);
+  if (!errorIds || errorIds.length !== (Number.isNaN(errors) ? 0 : errors)) return undefined;
+  return { failures, errors: [...new Set(errorIds)].sort() };
+}
+/** The console form `failuresOf` reads back, for failures named from junit (same shape as `pod-shard-junit-attribution`). */
+const failureOutput = (failures: readonly string[], errors: readonly string[]) => [
+  ...failures.map((id) => { const cut = id.indexOf(' > '); return `${id.slice(0, cut)}:\n(fail) ${id.slice(cut + 3)}`; }),
+  ...errors.map((id) => `${testFileOfId(id)}:\n# Unhandled error between tests`),
+].join('\n');
+/** Repository-relative test files with at least one passed or failed junit testcase (an empty suite is no result). */
+function junitFiles(xml: string): Set<string> {
+  const files = new Set<string>();
+  for (const id of [...junitPassedIds(xml), ...junitFailures(xml)]) {
+    try { files.add(testFileOfId(podRelative(id))); } catch { /* an unreadable id proves nothing about its file */ }
+  }
+  return files;
+}
+/**
+ * GATE-ISOLATE-FAILED-FILES — the files of a failed shard worth re-running: those with a failing test or an unhandled
+ * error, and those with no junit result at all (crashed or never reached). undefined = cannot tell (fallback: whole shard).
+ */
+export function retryFiles(paths: readonly string[], clean: string | undefined, junit: string | undefined, fails: number, errors: number): string[] | undefined {
+  if (junit === undefined || clean === undefined) return undefined;
+  const ids = shardFailureIds(clean, junit, fails, errors);
+  if (!ids) return undefined;
+  const failing = new Set([...ids.failures, ...ids.errors].map((id) => { try { return testFileOfId(id); } catch { return id; } }));
+  if ([...failing].some((file) => !paths.includes(file))) return undefined;
+  const reported = junitFiles(junit);
+  return paths.filter((file) => failing.has(file) || !reported.has(file));
+}
 export const POD_ISOLATION_MEMORY_LIMIT = '32Gi';
 /** GT1b — a file whose measured peak is at least this runs alone at the isolation limit from the start: one such file
  *  sank a whole 203-file root shard at 16Gi (0.2.6 shard 12 · `unwired-exports` 9.9 GB) and cost two halving rounds. */
@@ -150,8 +226,64 @@ const lastStartedTestFile = (output: string, paths: string[]): string | undefine
   return last;
 };
 
+/**
+ * GATE-SHARD-RESUME (0.2.19) — the result a previous attempt left in this log directory for exactly this shard: same name,
+ * same commit, the same files in the same order and a test exit (rc 0|1) with its log. 0.2.18: the second gate stopped
+ * after 33 minutes on a tool error (unsafe test path) and the third ran all 80 minutes again although the cut commit and
+ * every finished shard were unchanged. The caller re-reads the log with the current tool code; anything else is a miss.
+ */
+/** GATE-SHARD-RESUME — how a previous attempt went past this shard without a verdict of its own: it re-ran in a fresh Job
+ *  after no output (`-retry`), or it failed here and was split (`-c0` cap chunks · `-0` halves · `-file-0` isolation). The
+ *  split shape follows from depth and size alone, so the same plan reaches the same child names (TC 09:30 review ②).
+ *  `runKey` hashes where and how the Pod ran the shard (pool · command · ignores · memory · deadline · Bun cache): a fix on the Pod side
+ *  makes every old result a miss instead of re-reading an old failure as introduced (TC 09:48 review). */
+export function previousShardDescent(logDir: string, name: string, commit: string, files: readonly string[], runKey: string, parentAttempt?: string, splitChild?: string): { way: 'retry' | 'split'; attemptId: string } | undefined {
+  const meta = (file: string): { commit?: unknown; files?: unknown; rc?: unknown; runKey?: unknown; attemptId?: unknown; parentAttempt?: unknown } | undefined => {
+    try { return JSON.parse(readFileSync(join(logDir, `${file}.json`), 'utf8')); } catch { return undefined; }
+  };
+  const own = meta(name);
+  if (own?.commit !== commit || own.runKey !== runKey || !Array.isArray(own.files) || own.files.length !== files.length || own.files.some((file, index) => file !== files[index])) return undefined;
+  if (typeof own.attemptId !== 'string' || (parentAttempt !== undefined && own.parentAttempt !== parentAttempt)) return undefined;
+  const attemptId = own.attemptId;
+  // Children are checked whatever the parent's rc was: a parent can exit 0|1 and still have gone down (no output · an
+  // unreadable summary). A child counts only for this commit and only with files taken from this shard.
+  const parent = new Set(files);
+  const child = (file: string, whole: boolean) => {
+    const row = meta(file);
+    // A child counts only when the parent's latest attempt wrote it — a child left by an older attempt is not this way down.
+    return row?.commit === commit && row.parentAttempt === attemptId && Array.isArray(row.files) && row.files.length > 0 && row.files.every((path) => typeof path === 'string' && parent.has(path))
+      && (!whole || row.files.length === files.length);
+  };
+  if (child(`${name}-retry`, true)) return { way: 'retry', attemptId };
+  // Only the first child of the split the caller takes now (`-file-0` · `-c0` · `-0` · review r3): a record of another
+  // split shape is not followed.
+  return splitChild !== undefined && child(`${name}${splitChild}`, false) ? { way: 'split', attemptId } : undefined;
+}
+
+export function previousShardResult(logDir: string, name: string, commit: string, files: readonly string[], runKey: string, parentAttempt?: string): { output: string; junit?: string; rc: 0 | 1; durationMs?: number } | undefined {
+  try {
+    const meta = JSON.parse(readFileSync(join(logDir, `${name}.json`), 'utf8')) as { commit?: unknown; files?: unknown; rc?: unknown; durationMs?: unknown; runKey?: unknown; parentAttempt?: unknown; jobExitCode?: unknown; jobFailed?: unknown };
+    // Only a Job that itself exited 0 — a crashed Job can still leave rc 0 and a clean-looking log (review r6).
+    if (meta.jobExitCode !== 0 || meta.jobFailed !== false) return undefined;
+    if (meta.commit !== commit || meta.runKey !== runKey || (parentAttempt !== undefined && meta.parentAttempt !== parentAttempt) || (meta.rc !== 0 && meta.rc !== 1) || !Array.isArray(meta.files)
+      || meta.files.length !== files.length || meta.files.some((file, index) => file !== files[index])) return undefined;
+    const logPath = join(logDir, `${name}.log`);
+    if (!existsSync(logPath)) return undefined;
+    const junitPath = join(logDir, `${name}.junit.xml`);
+    return { output: readFileSync(logPath, 'utf8'), rc: meta.rc, ...(existsSync(junitPath) ? { junit: readFileSync(junitPath, 'utf8') } : {}),
+      ...(typeof meta.durationMs === 'number' ? { durationMs: meta.durationMs } : {}) };
+  } catch { return undefined; }
+}
+
+/** 0.2.18 gate: a test that changed process.cwd made bun print later test files relative to that cwd
+ *  (`../..~/repo/src/…`), and the safe-path check stopped the whole gate. The Pod clone root is
+ *  `~/repo`; strip it back to a repository-relative path before any id is read. */
+export function stripPodRepoRoot(output: string): string {
+  return output.replace(/^(\s*(?:\(fail\)\s+)?)(?:\.\.\/)*(?:\/)?home\/ubuntu\/repo\//gm, '$1');
+}
+
 function failuresOf(run: CommandResult, label: string): SweepFailures {
-  const output = run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  const output = stripPodRepoRoot(run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
   const ran = lastMatch(output, /Ran (\d+) tests? across ([1-9]\d*) files?/);
   const reportedErrors = summaryCount(output, 'error');
   const errorCount = Number.isNaN(reportedErrors) ? 0 : reportedErrors;
@@ -193,6 +325,11 @@ class StalledPodShards extends Error {
 
 /** Isolated re-runs (host stall re-run · cut and baseline re-checks) are time-limited; sweeps and installs keep their full time. */
 export const GATE_ISOLATED_TIMEOUT_MS = 300_000;
+/** GATE-INTRO-RECHECK (0.2.19) — the per-test limit of the one re-run given to a «timed out after 5000ms» new failure.
+ *  0.2.18: both first-gate introductions were 5 s limits missed at 6.04/6.06 s, and they alone cost an 84-minute re-gate. */
+export const GATE_TIMEOUT_RECHECK_MS = 60_000;
+/** TEST-CENSUS intake: one row per load-flaky test, in the machine ledger (read by the test census, never by the gate). */
+export const loadFlakyCensusPath = (ledger: string) => join(ledger, 'release', 'test-census', 'load-flaky.jsonl');
 
 /**
  * Runs a limited local command in its own process group. On timeout: SIGTERM the group (test-deterministic forwards it to its own
@@ -252,7 +389,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}`, ...(timedOut ? { timedOut } : {}) };
     }
     : localCommand);
-  const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>): Promise<CommandResult> => {
+  const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>, only?: readonly string[]): Promise<CommandResult> => {
     const shardCount = pod.shards ?? 24;
     const deadlineSeconds = pod.shardTimeoutSeconds ?? 1200;
     if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
@@ -263,7 +400,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('invalid cut tree HEAD');
     const listed = await command('git', ['ls-files', '*.test.*'], tree);
     check(listed, 'git ls-files tests');
-    const files = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)).sort();
+    const allFiles = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)).sort();
+    const onlySet = only ? new Set(only) : undefined;
+    // GATE-PARTIAL: every planned file must exist at this commit — a deleted/renamed failing file would otherwise «pass»
+    // by not running. Fail closed (gate error), never a smaller sweep than planned.
+    const missing = only?.filter((file) => !allFiles.includes(file)) ?? [];
+    if (missing.length) throw new Error(`partial plan file missing at this commit: ${missing.slice(0, 5).join(', ')}`);
+    const files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
     if (files.some((file) => file.startsWith('-') || file.startsWith('/') || file.startsWith('./')
       || file.split('/').some((part) => !part || part === '.' || part === '..') || /[\r\n]/.test(file))) throw new Error('unsafe pod test path');
     if (new Set(files).size !== files.length) throw new Error('duplicate pod test path');
@@ -278,7 +421,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const integrationOnly = files.filter((file) => POD_SWEEP_INTEGRATION_ONLY.includes(file));
     if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
     if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
-    const durations = pod.durationSource ? readFileDurations(pod.durationSource) : new Map<string, number>();
+    const { durations, wall: planWall } = planDurations(pod.durationSource);
     const memory = readFileMemory(join(tree, POD_MEMORY_SOURCE));
     // The TD1 measurements predate the fixture-only gate; do not isolate those five files at their old 2–13 GB peaks.
     const fixtureOnly = new Set([...GATE_NIGHTLY_AUDITS, 'test/guardian/dispatch-surface-contract.test.ts', 'test/user-config-mcp.test.ts']);
@@ -288,6 +431,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       ...(light.length ? planShards(light, durations, shardCount) : []),
       ...[...heavy].map((file) => ({ files: [file], plannedSeconds: durations.get(file) ?? 0 })),
     ];
+    logPlanWalltime(planWall, shards);
     if (heavy.size) debug.log('release-loop.gate', 'pod-heavy-alone', { files: [...heavy], thresholdMb: POD_HEAVY_FILE_MB, memoryLimit: POD_ISOLATION_MEMORY_LIMIT });
     const known = assignable.filter((file) => durations.has(file)).length;
     debug.log('release-loop.gate', 'pod-shard-plan', {
@@ -295,6 +439,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       maxPlannedSeconds: Math.max(...shards.map((shard) => shard.plannedSeconds)),
       source: durations.size ? pod.durationSource : 'none',
     });
+    // GATE-SPEED A3①: shard Pod CPU (`release.loop.gatePodCpu` · default request 1 / limit 4) — shards × request must fit the pool.
+    const cpu = resolvePodCpu(pod.cpu);
+    debug.log('release-loop.gate', 'shard-resources', { shards: shards.length, cpuRequest: cpu.request, cpuLimit: cpu.limit, cpuSource: pod.cpu ? 'config' : 'default' });
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), defaultKubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
@@ -315,18 +462,22 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     type ShardReason = NonNullable<GateResult['stalledShards']>[number]['reason'];
     // 깊이 끝 OOM 조각은 «조각 전체»를 파일 하나씩 격리한다 — 상한 40 이면 나머지가 못 잰 채 남았다(09-30 ① 7번 조각 110 파일).
     const isolationRemaining = shards.map((item) => item.files.length);
+    const knownFailures = new Set(pod.knownFailures ?? []);
     const estimated = (paths: string[]) => paths.reduce((sum, file) => {
       const value = durations.get(file);
       return sum + (value !== undefined && Number.isFinite(value) && value >= 0 ? value : unknownSeconds);
     }, 0);
     const knownTimes = assignable.map((file) => durations.get(file)).filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
     const unknownSeconds = knownTimes.length ? (knownTimes[Math.floor((knownTimes.length - 1) / 2)]! + knownTimes[Math.floor(knownTimes.length / 2)]!) / 2 : 1;
-    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       const ignores = cdpPatterns.filter((pattern) => paths.includes(pattern))
         .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
       const args = ['bun', 'run', 'test:deterministic', ...ignores, ...paths.map(asPath)].map(quote).join(' ')
         + ' --reporter=junit --reporter-outfile="$HOME/outbox/junit.xml"';
+      const memoryLimit = paths.length === 1 && (depth >= 1 || heavy.has(paths[0]!)) ? POD_ISOLATION_MEMORY_LIMIT : undefined;
+      const podShell = `mkdir -p "$HOME/outbox"; ${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`;
+      const runKey = createHash('sha256').update(JSON.stringify({ pool: pod.pool, podShell, memoryLimit: memoryLimit ?? null, deadlineSeconds, bunCache: bunCache ?? null })).digest('hex');
       const start = Date.now();
       let output: string | undefined;
       let junit: string | undefined;
@@ -334,14 +485,41 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let jobExitCode: number | undefined;
       let lastFile: string | undefined;
       let jobFailed = false;
-      try {
+      // The way down a previous attempt took wins over its own log: that log was not a verdict, or it would have no children.
+      // The split this shard would take if it failed here — the same rule as the split code below (isolation at depth 2 ·
+      // cap chunks for a big root shard · halves otherwise · none for one file).
+      // Isolation follows only while this shard's isolation budget still covers every file (review r7) — the budget is the
+      // shard's file count and isolations take disjoint files, so this holds unless the plan changed; if not, run the Pod.
+      const splitChild = depth === 2 && paths.length > 1 ? (isolationRemaining[shard]! >= paths.length ? '-file-0' : undefined)
+        : depth < 2 && paths.length > 1 ? (depth === 0 && paths.length > POD_SHARD_FILE_CAP ? '-c0' : '-0') : undefined;
+      const found = !fresh && logDir ? previousShardDescent(logDir, `pod-${shard}${branch}`, commit, paths, runKey, parentAttempt, splitChild) : undefined;
+      const descent = found?.way;
+      const reused = !fresh && !descent && logDir ? previousShardResult(logDir, `pod-${shard}${branch}`, commit, paths, runKey, parentAttempt) : undefined;
+      // This shard's attempt id: the recorded one when its way down is followed, a new one when a Pod runs. Children carry it.
+      const attemptId = found?.attemptId ?? randomUUID();
+      if (descent === 'retry') {
+        // «descend» is only the way down; «resumed» comes from each leaf whose log reads cleanly (review r4).
+        debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: 'retry' });
+        return runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId);
+      }
+      if (descent === 'split') {
+        output = undefined;
+        debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: 'split' });
+      } else if (reused) {
+        output = reused.output;
+        junit = reused.junit;
+        rc = reused.rc;
+        jobExitCode = 0;
+        lastFile = lastStartedTestFile(output, paths);
+      } else try {
         const job = await podCommand({
           pool: pod.pool, poolScheduler, clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds,
           ...(bunCache ? { bunCache } : {}),
+          ...(pod.cpu ? { cpu: pod.cpu } : {}),
           // 실패 뒤 다시 도는 파일 하나짜리 Job 은 메모리 한도를 올린다 — 16Gi 에선 무거운 한 파일이 혼자서도 OOM 이었다(09-30 `unwired-exports`).
-          ...(paths.length === 1 && (depth >= 1 || heavy.has(paths[0]!)) ? { memoryLimit: POD_ISOLATION_MEMORY_LIMIT } : {}),
+          ...(memoryLimit ? { memoryLimit } : {}),
           name: `gate-${randomUUID()}`,
-          command: ['bash', '-lc', `mkdir -p "$HOME/outbox"; ${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`],
+          command: ['bash', '-lc', podShell],
         });
         jobExitCode = job.exitCode;
         const logPath = join(job.artifactsDir, 'shard.log');
@@ -360,17 +538,21 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         jobFailed = true;
       }
       const durationMs = Date.now() - start;
-      if (logDir) {
+      // A reused shard keeps its files as they are — rewriting would replace the measured durationMs the next release plans by.
+      if (logDir && !reused && !descent) {
         mkdirSync(logDir, { recursive: true });
+        // GATE-SHARD-RESUME: the json is what makes a log reusable, so it goes first and comes back last — a stop between
+        // the new log and the new json leaves no json, never the old Job's exit paired with the new log (review r8).
+        rmSync(join(logDir, `pod-${shard}${branch}.json`), { force: true });
         const destination = join(logDir, `pod-${shard}${branch}.log`);
         if (output !== undefined) writeFileSync(destination, output, { mode: 0o600 });
         else rmSync(destination, { force: true });
-        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths), shardCount: shards.length, commit }) + '\n', { mode: 0o600 });
         const junitDestination = join(logDir, `pod-${shard}${branch}.junit.xml`);
         if (junit !== undefined) writeFileSync(junitDestination, junit, { mode: 0o600 });
         else rmSync(junitDestination, { force: true });
+        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths), shardCount: shards.length, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed }) + '\n', { mode: 0o600 });
       }
-      debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds: parseInstallSeconds(output ?? '') });
+      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds: parseInstallSeconds(output ?? '') });
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
       const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
       const passes = clean === undefined ? NaN : summaryCount(clean, 'pass');
@@ -379,7 +561,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let reason: ShardReason | undefined;
       let namedFailures: number | undefined;
       let unattributedDetail: string | undefined;
-      if (jobFailed || (jobExitCode !== undefined && jobExitCode !== 0) || (rc !== undefined && rc !== 0 && rc !== 1)) reason = 'job-failed';
+      if (descent === 'split') reason = 'incomplete';
+      else if (jobFailed || (jobExitCode !== undefined && jobExitCode !== 0) || (rc !== undefined && rc !== 0 && rc !== 1)) reason = 'job-failed';
       else if (!clean || rc === undefined) reason = 'no-output';
       else if (!ran || !Number.isFinite(passes) || !Number.isFinite(fails)
         || Number(ran[2]) === 0 || Number(ran[2]) > paths.length
@@ -410,19 +593,51 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           }
         }
       }
+      // A reused result that the current tool cannot read cleanly is not a verdict: run that shard for real.
+      if (reused && reason) {
+        debug.log('release-loop.gate', 'pod-shard-resume-miss', { shard, branch, reason });
+        return runShard(paths, shard, depth, branch, retriedNoOutput, true, parentAttempt);
+      }
       if (reason === 'no-output' && !retriedNoOutput) {
-        const retry = await runShard(paths, shard, depth, `${branch}-retry`, true);
+        const retry = await runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId);
         debug.log('release-loop.gate', 'pod-shard-retry', { shard, files: paths, reason, outcome: retry.stalled[0]?.reason ?? 'ok' });
         return retry;
       }
       if (reason) {
+        // GATE-SKIP-KNOWN-RETRY — a shard whose summary is complete but whose failures could not be read back (unattributed)
+        // and whose every named failure is one the previous release already had is not re-run: re-running only re-measures
+        // known failures (0.2.18 cut: 109 retry Pods · 1,840 shard-minutes, 4x the first pass). Those failures go to the
+        // verdict as they are, so it still classifies them against the baseline (preexisting) — never silently dropped.
+        if (reason === 'unattributed' && knownFailures.size && clean && ran) {
+          const ids = shardFailureIds(clean, junit, fails, errors);
+          const all = ids ? [...ids.failures, ...ids.errors] : [];
+          if (ids && all.length && all.every((id) => knownFailures.has(id))) {
+            debug.log('release-loop.gate', 'retry-skipped-known', { shard, failures: all.length });
+            return { runs: [{ output: `${failureOutput(ids.failures, ids.errors)}\n`, rc: 1, pass: Number.isFinite(passes) ? passes : 0,
+              fail: ids.failures.length, errors: ids.errors.length, ran: Number(ran[1]), files: Number(ran[2]),
+              passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
+          }
+        }
+        // GATE-ISOLATE-FAILED-FILES — with this shard's junit, only the files with a failing test or an unhandled error and
+        // the files with no junit result (crashed · never reached) are re-run; the rest passed here and keep that result.
+        // The narrowed set runs under its own branch (`-n`) at the same depth, so the usual split/isolation rules still apply
+        // to it, and a resumed gate finds this shard's own log (not a `-c0`/`-0` child) and narrows the same way again.
+        const narrowed = !descent ? retryFiles(paths, clean, junit, fails, errors) : undefined;
+        if (narrowed && narrowed.length && narrowed.length < paths.length) {
+          debug.log('release-loop.gate', 'retry-narrowed', { shard, before: paths.length, after: narrowed.length });
+          const kept = new Set(paths.filter((file) => !narrowed.includes(file)));
+          const passedIds = junitPassedIds(junit!).map(podRelative).filter((id) => { try { return kept.has(testFileOfId(id)); } catch { return false; } });
+          const child = await runShard(narrowed, shard, depth, `${branch}-n`, false, undefined, attemptId);
+          return { runs: [{ output: '', rc: 0, pass: passedIds.length, fail: 0, errors: 0, ran: passedIds.length, files: kept.size, passedIds },
+            ...child.runs], stalled: child.stalled };
+        }
         // 깊이 2 에서 «이름 없는 실패»·«불완전»도 파일 단위로 가른다 — 아니면 149파일 조각의 실패 하나가 끝까지 주인 없이 남는다(09-30 G1e 7번 조각: 요약 28 · 이름 27).
         // 로그 없이 죽은 조각(`no-output` · OOM)도 같다 — 09-30 G1f ② 4-0-0 은 150파일이 격리 0 으로 남았다.
         if (depth === 2 && paths.length > 1) {
           const count = Math.min(paths.length, isolationRemaining[shard]!);
           isolationRemaining[shard]! -= count;
           const children = await Promise.all(paths.slice(0, count).map(async (file, index) => {
-            const child = await runShard([file], shard, depth + 1, `${branch}-file-${index}`);
+            const child = await runShard([file], shard, depth + 1, `${branch}-file-${index}`, false, undefined, attemptId);
             debug.log('release-loop.gate', 'pod-shard-isolate', { shard, file, outcome: child.stalled[0]?.reason ?? 'ok' });
             return child;
           }));
@@ -443,17 +658,18 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         if (depth === 0 && paths.length > POD_SHARD_FILE_CAP) {
           const chunks = Array.from({ length: Math.ceil(paths.length / POD_SHARD_FILE_CAP) }, (_, i) => paths.slice(i * POD_SHARD_FILE_CAP, (i + 1) * POD_SHARD_FILE_CAP));
           debug.log('release-loop.gate', 'pod-shard-cap-split', { shard, files: paths.length, chunks: chunks.length, cap: POD_SHARD_FILE_CAP, reason });
-          const children = await Promise.all(chunks.map((chunk, i) => runShard(chunk, shard, 2, `${branch}-c${i}`)));
+          const children = await Promise.all(chunks.map((chunk, i) => runShard(chunk, shard, 2, `${branch}-c${i}`, false, undefined, attemptId)));
           return { runs: children.flatMap((child) => child.runs), stalled: children.flatMap((child) => child.stalled) };
         }
         debug.log('release-loop.gate', 'pod-shard-split', { shard, depth, files: paths, reason });
         const middle = Math.ceil(paths.length / 2);
         const children = await Promise.all([
-          runShard(paths.slice(0, middle), shard, depth + 1, `${branch}-0`),
-          runShard(paths.slice(middle), shard, depth + 1, `${branch}-1`),
+          runShard(paths.slice(0, middle), shard, depth + 1, `${branch}-0`, false, undefined, attemptId),
+          runShard(paths.slice(middle), shard, depth + 1, `${branch}-1`, false, undefined, attemptId),
         ]);
         return { runs: children.flatMap((child) => child.runs), stalled: children.flatMap((child) => child.stalled) };
       }
+      if (reused) debug.log('release-loop.gate', 'pod-shard-resumed', { shard, branch, files: paths.length, rc, durationMs: reused.durationMs ?? null });
       return { runs: [{ output: clean!, rc: rc!, pass: passes, fail: fails,
         errors: Number.isNaN(errors) ? 0 : errors,
         ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
@@ -480,12 +696,16 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     localCommand: commandOverride && !remote ? commandOverride : localCommand,
     get remoteMirror() { return remoteMirror; },
     set remoteMirror(path) { remoteMirror = path; },
-    async sweep(tree, logDir, pod) {
-      if (pod) return podSweep(tree, logDir, pod);
+    async sweep(tree, logDir, pod, only) {
+      if (pod) return podSweep(tree, logDir, pod, only);
       const listed = await command('git', ['ls-files', '*.test.*'], tree);
       check(listed, 'git ls-files tests');
-      const files = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file));
-      const groups = [
+      const allFiles = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file));
+      const onlySet = only ? new Set(only) : undefined;
+      const missing = only?.filter((file) => !allFiles.includes(file)) ?? [];
+      if (missing.length) throw new Error(`partial plan file missing at this commit: ${missing.slice(0, 5).join(', ')}`);
+      const files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
+      const groups = onlySet ? [{ name: 'partial', paths: files }] : [
         { name: 'src-cli', paths: ['src/cli'] },
         { name: 'src-rest', paths: [...new Set(files.filter((f) => f.startsWith('src/') && !f.startsWith('src/cli/')).map((f) => f.split('/').length === 2 ? f : f.split('/').slice(0, 2).join('/')))] },
         { name: 'test', paths: ['test'] },
@@ -579,11 +799,7 @@ export function baselineCommit(root: string, version: string): string {
   return commit;
 }
 
-function fileOf(id: string): string {
-  const file = id.split(' > ', 1)[0]!;
-  if (!id.includes(' > ') || !/^(?:[\w.-]+\/)+[\w.-]+\.test\.tsx?$/.test(file) || file.split('/').includes('..')) throw new Error(`unsafe test path: ${file}`);
-  return file;
-}
+const fileOf = testFileOfId;
 
 /**
  * GATE-BASELINE-CACHE (0.2.18) — the isolated `bun run test:deterministic <file>` result of one test file at one commit,
@@ -716,8 +932,25 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     trees.push(cutTree);
     await runner.add(cutTree, opts.commit);
     for (const dir of [cutTree, join(cutTree, 'apps/pwa')]) check(await runner.command('bun', ['install'], dir), `bun install ${dir}`);
-    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', 'cut'),
-      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined);
+    // GATE-PARTIAL: a plan made by `release resume --from gate --partial` for exactly this commit re-runs only its files.
+    // Its logs go to cut-partial/ — the full cut/ logs stay whole (the next release reads them as a baseline source).
+    const partial = readPartialPlan(roots, opts.version, opts.commit);
+    if (partial) debug.log('release-loop.gate', 'partial-regate', { version: opts.version, priorCommit: partial.priorCommit, commit: opts.commit, files: partial.files.length });
+    // GATE-SKIP-KNOWN-RETRY — the ids the verdict will not count as introduced (the recorded baseline ⊕ env-known), read
+    // before the sweep so a shard failing only with them skips its isolation retries. No recorded baseline = no skip.
+    let knownFailures: string[] = [];
+    if (opts.pod) {
+      try {
+        const knownSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
+        const saved = cachedBaseline(opts.baselineVersion, knownSha)?.saved;
+        const recorded = saved ? undefined : baselineFromCutLogs(join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), knownSha);
+        const trustedKnown = saved ?? (recorded?.complete ? recorded : undefined);
+        if (trustedKnown) knownFailures = [...trustedKnown.failures, ...(trustedKnown.errors ?? []), ...loadEnvKnownFailures(repo)];
+      } catch (error) { debug.log('release-loop.gate', 'known-failures-unavailable', { error: String(error) }); }
+    }
+    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', partial ? 'cut-partial' : 'cut'),
+      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), ...(knownFailures.length ? { knownFailures } : {}) } : undefined,
+      partial?.files);
     const localStalled = async (run: CommandResult, tree: string, commit: string, label: string) => {
       const stalled = run.stalledEnv ?? [];
       const noCompletedShard = stalled.length && run.rc === 0
@@ -757,7 +990,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       debug.log('release-loop.gate', 'pod-shard-stalled-env', { files: stalled.map(({ file, reason }) => ({ file, reason })), local });
       return measured;
     };
-    const cut = await localStalled(cutRun, cutTree, opts.commit, 'cut');
+    const measuredCut = await localStalled(cutRun, cutTree, opts.commit, 'cut');
+    const cut = partial ? mergePartialFailures(partial, measuredCut) : measuredCut;
+    if (partial) result.partial = { priorCommit: partial.priorCommit, files: partial.files.length };
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
     const cached = cachedBaseline(opts.baselineVersion, baseSha);
@@ -782,11 +1017,28 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     };
     let baseline: SweepFailures | undefined = trusted ? { failures: trusted.failures, errors: trusted.errors ?? [] } : undefined;
     if (!baseline) {
-      // K9b — with no reusable ledger the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an
-      // hour of local baseline after a 23-minute Pod cut).
-      const baseRun = await runner.sweep(await getBaseTree(), join(root, 'release', opts.version, 'gate-logs', 'baseline'),
-        opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined);
-      baseline = await localStalled(baseRun, baseTree!, baseSha, 'baseline');
+      // GATE-SPEED A4 (RFC-release-gate-under-30min §A4) — with no recorded baseline only the files that failed at the cut
+      // are swept at the previous release; a passing cut file needs no comparison. Files absent there stay new failures.
+      const cutFiles = [...new Set([...cut.failures, ...cut.errors].map(fileOf))].sort();
+      let present: string[] = [];
+      if (cutFiles.length) {
+        const tree = await getBaseTree();
+        // -z: the default output quotes paths with special characters, which would read as absent.
+        const listed = await runner.command('git', ['ls-files', '-z', '--', ...cutFiles], tree);
+        check(listed, 'baseline ls-files');
+        const known = new Set(listed.output.split('\0'));
+        present = cutFiles.filter((file) => known.has(file));
+      }
+      result.baselineDeferred = { cutFiles: cutFiles.length, swept: present.length };
+      debug.log('release-loop.gate', 'baseline-deferred', { version: opts.baselineVersion, commit: baseSha, cutFiles: cutFiles.length, swept: present.length });
+      if (present.length) {
+        // K9b — the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an hour of local baseline
+        // after a 23-minute Pod cut).
+        const baseRun = await runner.sweep(baseTree!, join(root, 'release', opts.version, 'gate-logs', 'baseline'),
+          opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined,
+          present);
+        baseline = await localStalled(baseRun, baseTree!, baseSha, 'baseline');
+      } else baseline = { failures: [], errors: [] };
     }
     for (const id of [...baseline.failures, ...baseline.errors, ...cut.failures, ...cut.errors]) fileOf(id);
     const known = opts.pod ? loadEnvKnownFailures(repo) : new Set<string>();
@@ -798,7 +1050,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     result.knownEnv = countedCut.knownEnv.length;
     result.knownEnvCleared = [...new Set(cutRun.passedIds ?? [])].filter((id) => known.has(id) && !cutIds.includes(id) && !cutRun.stalledEnv?.some(({ file }) => fileOf(id) === file)).sort();
     const diff = diffFailures(countedCut.counted, countedBaseline.counted);
-    result.fixed = diff.fixed.length;
+    result.fixed = result.baselineDeferred ? null : diff.fixed.length;
     result.preexisting = diff.common.length;
     // GATE-BASELINE-CACHE — only the files whose new failures reproduce in isolation reach the baseline, and each
     // (commit, file, host) is run at most once across gates: this gate's cut results also seed the next gate's baseline.
@@ -829,7 +1081,36 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         : failuresOf(cutCheck, `cut isolated ${file}`);
       if (cutCheck !== undefined) remember({ commit: opts.commit, file, host: cacheHost, failures: isolatedCut.failures, errors: isolatedCut.errors, missing: false });
       const reproduced = new Set([...isolatedCut.failures, ...isolatedCut.errors]);
-      const candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
+      let candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
+      // GATE-INTRO-RECHECK — a new failure that is only bun's «timed out» shape gets one more isolated run with a generous
+      // per-test limit, on the same runner (node-b when the gate is remote). Passing there = flaky under load (warning);
+      // an assertion failure, a failure again, or a run that cannot be read stays introduced.
+      const timedOut = cutCheck === undefined ? new Set<string>() : new Set(parseTimedOutFailures(stripPodRepoRoot(cutCheck.output)));
+      const shaped = candidates.filter((id) => timedOut.has(id) && isolatedCut.failures.includes(id));
+      if (shaped.length) {
+        const relaxed = await runner.command('bun', ['run', 'test:deterministic', asPath(file), '--timeout', String(GATE_TIMEOUT_RECHECK_MS)], cutTree, GATE_ISOLATED_TIMEOUT_MS);
+        let flaky: string[] = [];
+        let recheck: 'read' | 'timeout' | 'unreadable' = 'read';
+        if (relaxed.timedOut) recheck = 'timeout';
+        else {
+          try {
+            const again = failuresOf(relaxed, `cut timeout recheck ${file}`);
+            const still = new Set([...again.failures, ...again.errors]);
+            flaky = again.errors.length ? [] : shaped.filter((id) => !still.has(id));
+          } catch { recheck = 'unreadable'; }
+        }
+        debug.log('release-loop.gate', 'timeout-recheck', { file, shaped: shaped.length, flaky: flaky.length, recheck, remote: opts.remote ?? 'local', limitMs: GATE_TIMEOUT_RECHECK_MS });
+        if (flaky.length) {
+          (result.loadFlaky ??= []).push(...flaky);
+          candidates = candidates.filter((id) => !flaky.includes(id));
+          try {
+            const path = loadFlakyCensusPath(ledger);
+            mkdirSync(dirname(path), { recursive: true });
+            const at = new Date().toISOString();
+            appendFileSync(path, flaky.map((id) => JSON.stringify({ at, version: opts.version, commit: opts.commit, id, host: cacheHost, limitMs: GATE_TIMEOUT_RECHECK_MS }) + '\n').join(''), { mode: 0o600 });
+          } catch (error) { debug.log('release-loop.gate', 'load-flaky-census-write-failed', { file, error: String(error) }); }
+        }
+      }
       if (candidates.length === 0) continue;
       let oldFailures: Set<string>;
       const hit = baseCache.get(`${file}\0${cacheHost}`);
@@ -912,7 +1193,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
 export function graphGateResult(result: GateResult, graph: boolean) {
   return { ...result, ...(graph && result.outcome === 'regression' ? { outcome: 'fail' as const } : {}),
     verdict: result.outcome === 'ok' ? 'pass' as const : 'fail' as const,
-    summary: (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
+    summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
+      + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
+      + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(시간 초과 꼴 · ${GATE_TIMEOUT_RECHECK_MS / 1000}s 재실행 통과 · 막지 않음)` : '')
       + (result.stalledEnv.length ? ` · 환경 멈춤 ${result.stalledEnv.length} (Pod 밖 통과 ${result.stalledEnv.filter((item) => item.local === 'passed').length})` : '') };
 }
 
@@ -936,12 +1219,17 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       ...(fromGraph.gatePodShards !== undefined ? { shards: Number(fromGraph.gatePodShards) } : {}),
       ...(fromGraph.gatePodShardTimeoutSeconds !== undefined ? { shardTimeoutSeconds: Number(fromGraph.gatePodShardTimeoutSeconds) } : {}),
       ...(typeof fromGraph.gatePodBunCache === 'string' && fromGraph.gatePodBunCache.trim() ? { bunCache: fromGraph.gatePodBunCache } : {}),
+      ...(fromGraph.gatePodFreshShards === true ? { freshShards: true } : {}),
+      ...((cpu) => cpu ? { cpu } : {})(parsePodCpu(fromGraph.gatePodCpu, 'release.loop.gatePodCpu')),
     } : undefined,
   };
+  let freshShards = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help') return 'help';
     if (arg === '--json') continue;
+    // Applied after the loop and only to a Pod gate — on its own it must not turn a local gate into a Pod one (review r5).
+    if (arg === '--fresh-shards') { freshShards = true; continue; }
     const key = ({ '--commit': 'commit', '--version': 'version', '--baseline-version': 'baselineVersion', '--baseline-commit': 'baselineCommit', '--remote': 'remote', '--remote-mirror': 'remoteMirror', '--pod-pool': 'pod', '--pod-shards': 'pod', '--pod-shard-timeout-seconds': 'pod' } as Record<string, keyof GateOptions>)[arg!];
     if (!key) throw new Error(`unknown option: ${arg}`);
     const value = args[++i];
@@ -956,17 +1244,21 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     else if (key === 'remote') opts.remote = value;
     else if (key === 'remoteMirror') opts.remoteMirror = value;
   }
+  if (freshShards && opts.pod) opts.pod = { ...opts.pod, freshShards: true };
   return opts;
 }
 
 if (import.meta.main) {
   const start = Date.now();
+  // The graph spawns this file as its own process, which inherits no daemon sink — without this every
+  // `release-loop.gate`/`release.gate`/`pod.pool` event stayed in the file trail and `elanous logs` read 0 rows.
+  await registerStandaloneLogSink('release-loop');
   let result: GateResult;
   let version = '';
   try {
     const opts = parseOptions(process.argv.slice(2), process.env);
     if (opts === 'help') {
-      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.');
+      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--fresh-shards] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.');
       process.exit(0);
     }
     version = opts.version;

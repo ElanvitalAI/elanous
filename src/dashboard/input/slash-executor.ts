@@ -1,5 +1,6 @@
 import type { SlashExecuteRequest, SlashExecuteResult } from '../../skills/tools/dashboard-slash.js';
 import type { PaneFocus } from '../../workspace-types.js';
+import { dashboardStatusSummaryLines } from '../dashboard-status-lines.js';
 
 export interface ImmediateDashboardSlashDeps {
   getStatusLines: () => string[];
@@ -17,12 +18,15 @@ export function executeImmediateDashboardSlash(
   req: SlashExecuteRequest,
   deps: ImmediateDashboardSlashDeps,
 ): SlashExecuteResult | null {
-  if ((req.name === 'status' || req.name === 'st') && req.args.length === 0) {
+  // `/status` = human lines only · `/status --debug` = with the internal detail block (TUI-SLASH-DECIDE-NOW C).
+  if ((req.name === 'status' || req.name === 'st')
+    && (req.args.length === 0 || (req.args.length === 1 && req.args[0] === '--debug'))) {
+    const lines = deps.getStatusLines();
     return {
       ok: true,
       name: req.name,
       args: req.args,
-      logLines: deps.getStatusLines(),
+      logLines: req.args.length === 0 ? dashboardStatusSummaryLines(lines) : lines,
     };
   }
   if ((req.name === 'surface' || req.name === 'surf') && req.args.length >= 1) {

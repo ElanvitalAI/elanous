@@ -478,6 +478,8 @@ describe('hq config block is read from config.json (was silently dropped)', () =
     expect(parseHqConfig({ ttlSeconds: -1, arbiter: '' })).toBeUndefined();
     expect(parseHqConfig({ autoPromote: { enabled: true, streak: 4 } })).toEqual({ autoPromote: { enabled: true, streak: 4 } });
     expect(parseHqConfig({ autoPromote: { enabled: 'yes', streak: -2 } })).toBeUndefined();
+    expect(parseHqConfig({ boardFencing: 'enforce' })).toEqual({ boardFencing: 'enforce' });
+    expect(parseHqConfig({ boardFencing: 'invalid' })).toBeUndefined();
   });
 });
 

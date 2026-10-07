@@ -1494,6 +1494,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.branch ? { branch: disp.branch } : {}),
           ...(disp?.harvestable === true && disp.branch ? { harvestable: true } : {}),
           ...(disp?.worktreePath ? { worktreePath: disp.worktreePath } : {}),
+          ...(disp?.ok !== undefined ? { ok: disp.ok } : {}),
           ...(disp?.prUrl ? { prUrl: disp.prUrl } : {}),
           ...(disp?.prNumber !== undefined ? { prNumber: disp.prNumber } : {}),
           ...(disp?.merged !== undefined ? { merged: disp.merged } : {}),

@@ -1,8 +1,10 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { loopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopSchedule } from '@/components/loops/loop-status';
+import { LOOPS_INTERACT_HREF } from '@/components/loops/loops-view';
 import { listOpenDecisions } from '@/lib/decisions-api';
 import { getSeats, type OpsSeats } from '@/lib/ops-api';
 import type { DaemonClient } from '@/lib/daemon-client';
@@ -11,17 +13,16 @@ import type { GridData } from '../../../../../src/nexus/api/grid';
 type Risk = { id: string; kind: string; title: string; at: string };
 type SchedulesResult = { summary: Record<string, number>; risks: Risk[] };
 type DecisionsResult = { count: number; risks: Risk[] };
-type RunsResult = { merged: number | null; risks: Risk[] | null };
 type Snapshot = {
-  release: { green: number; yellow: number } | null;
-  loops: Record<string, number> | null;
-  decisions: number | null;
-  merged: number | null;
-  risks: Risk[] | null;
-  grid: GridData | null;
+  release: { green: number; yellow: number } | null | undefined;
+  loops: Record<string, number> | null | undefined;
+  decisions: number | null | undefined;
+  merged: number | null | undefined;
+  risks: Risk[] | null | undefined;
+  grid: GridData | null | undefined;
 };
 
-const empty: Snapshot = { release: null, loops: null, decisions: null, merged: null, risks: null, grid: null };
+const empty: Snapshot = { release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined };
 const validTime = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -77,22 +78,27 @@ async function readLoopFailures(client: DaemonClient): Promise<Risk[] | null> {
   } catch { return null; }
 }
 
-async function readRuns(client: DaemonClient, now: Date): Promise<RunsResult> {
+function todayStart(now: Date): number {
+  const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(now);
+  return Date.parse(`${date}T00:00:00+09:00`);
+}
+
+async function readMergedRuns(client: DaemonClient, today: number): Promise<number | null> {
   try {
-    const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(now);
-    const today = Date.parse(`${date}T00:00:00+09:00`);
-    const [todayResult, riskResult] = await Promise.allSettled([
-      client.fetchResponse(`/v1/harness/runs?finishedSince=${today}`).then(async (response) => response.ok ? await response.json() as unknown : null),
-      client.fetchResponse(`/v1/harness/runs?finishedSince=${today - 7 * 24 * 60 * 60 * 1000}`).then(async (response) => response.ok ? await response.json() as unknown : null),
-    ]);
-    const body: unknown = todayResult.status === 'fulfilled' ? todayResult.value : null;
+    const response = await client.fetchResponse(`/v1/harness/runs?finishedSince=${today}`);
+    const body: unknown = response.ok ? await response.json() : null;
     const landed = object(body) ? body.landed : null;
-    const merged = object(body) && (body.landedTruncated === undefined || body.landedTruncated === false) && body.landedError == null
+    return object(body) && (body.landedTruncated === undefined || body.landedTruncated === false) && body.landedError == null
       && Array.isArray(landed) && landed.every((row: unknown) => object(row) && typeof row.number === 'number' && validTime(row.mergedAt))
       ? new Set(landed.filter((row) => Date.parse(row.mergedAt) >= today).map((row) => row.number)).size : null;
-    if (riskResult.status !== 'fulfilled') return { merged, risks: null };
-    const riskBody: unknown = riskResult.value;
-    if (!object(riskBody)) return { merged, risks: null };
+  } catch { return null; }
+}
+
+async function readRunRisks(client: DaemonClient, today: number): Promise<Risk[] | null> {
+  try {
+    const response = await client.fetchResponse(`/v1/harness/runs?finishedSince=${today - 7 * 24 * 60 * 60 * 1000}`);
+    const riskBody: unknown = response.ok ? await response.json() : null;
+    if (!object(riskBody)) return null;
     const finished = riskBody.finished;
     const entries = riskBody.entries;
     const risks = riskBody.completeness !== 'complete' || !Array.isArray(finished) || !Array.isArray(entries)
@@ -108,8 +114,8 @@ async function readRuns(client: DaemonClient, now: Date): Promise<RunsResult> {
             && !finished.some((done) => done.runId === row.runId))
             .map((row) => ({ id: `run:${row.runId}`, kind: '멈춘 하니스 런', title: typeof row.objective === 'string' && row.objective ? row.objective : row.runId, at: row.lastActivityTimestamp as string })),
         ] : null;
-    return { merged, risks };
-  } catch { return { merged: null, risks: null }; }
+    return risks;
+  } catch { return null; }
 }
 
 async function readDecisions(client: DaemonClient, now: number): Promise<DecisionsResult | null> {
@@ -148,28 +154,40 @@ async function readGrid(client: DaemonClient): Promise<GridData | null> {
   } catch { return null; }
 }
 
-async function readSnapshot(client: DaemonClient): Promise<Snapshot> {
+function readWithDeadline<T>(request: Promise<T>, onTimeout: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(onTimeout), 15_000);
+    void request.then(
+      (result) => { clearTimeout(timeout); resolve(result); },
+      () => { clearTimeout(timeout); resolve(onTimeout); },
+    );
+  });
+}
+
+function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) => void): void {
   const now = Date.now();
-  const [seats, loops, loopFailures, decisions, runs, grid] = await Promise.all([
-    getSeats(client),
-    readSchedules(client),
-    readLoopFailures(client),
-    readDecisions(client, now),
-    readRuns(client, new Date(now)),
-    readGrid(client),
-  ]);
-  return {
-    release: seats.kind === 'ready' ? releaseFromSeats(seats.data) : null,
-    loops: loops?.summary ?? null,
-    decisions: decisions?.count ?? null,
-    merged: runs.merged,
-    grid,
-    risks: loops && loopFailures && decisions && runs.risks ? [...new Map(
-      [...loops.risks, ...loopFailures, ...decisions.risks, ...runs.risks]
+  const today = todayStart(new Date(now));
+  const seats = readWithDeadline(getSeats(client), { kind: 'error' as const, status: 0 });
+  const loops = readWithDeadline(readSchedules(client), null);
+  const loopFailures = readWithDeadline(readLoopFailures(client), null);
+  const decisions = readWithDeadline(readDecisions(client, now), null);
+  const merged = readWithDeadline(readMergedRuns(client, today), null);
+  const runRisks = readWithDeadline(readRunRisks(client, today), null);
+  const grid = readWithDeadline(readGrid(client), null);
+
+  void seats.then((value) => update({ release: value.kind === 'ready' ? releaseFromSeats(value.data) : null }));
+  void loops.then((value) => update({ loops: value?.summary ?? null }));
+  void decisions.then((value) => update({ decisions: value?.count ?? null }));
+  void merged.then((value) => update({ merged: value }));
+  void grid.then((value) => update({ grid: value }));
+  void Promise.all([loops, loopFailures, decisions, runRisks]).then(([schedule, failures, decision, runs]) => {
+    const risks = schedule && failures && decision && runs ? [...new Map(
+      [...schedule.risks, ...failures, ...decision.risks, ...runs]
         .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
         .map((risk) => [risk.id, risk] as const),
-    ).values()].sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || a.id.localeCompare(b.id)).slice(0, 5) : null,
-  };
+    ).values()].sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || a.id.localeCompare(b.id)).slice(0, 5) : null;
+    update({ risks });
+  });
 }
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
@@ -185,26 +203,28 @@ export default function CeoPage() {
   useEffect(() => {
     let active = true;
     setSnapshot(empty);
-    void readSnapshot(client).then((result) => { if (active) setSnapshot(result); });
+    readSnapshot(client, (patch) => { if (active) setSnapshot((current) => ({ ...current, ...patch })); });
     return () => { active = false; };
   }, [client]);
 
   return <main className="mx-auto w-full min-w-0 max-w-3xl px-3 py-4 text-foreground sm:px-6">
     <header className="mb-4"><p className="text-xs text-muted-foreground">운영 · 오늘</p><h1 className="text-xl font-semibold">대표 조망판</h1></header>
     <div className="grid grid-cols-2 gap-2 sm:gap-4" aria-label="대표 조망 카드">
-      <Card title="릴리스 판 진행">{snapshot.release
+      <Card title="릴리스 판 진행">{snapshot.release === undefined ? '불러오는 중…' : snapshot.release
         ? <><span className="text-emerald-600">green {snapshot.release.green}</span><span className="block text-amber-600">노랑 {snapshot.release.yellow}</span></>
-        : '못 읽음'}</Card>
-      <Card title="루프 판정">{snapshot.loops === null ? '못 읽음' : Object.keys(snapshot.loops).length === 0
+        : '못 읽음'}
+        <Link href="/ops/release" className="mt-1 block rounded text-xs font-medium text-primary underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="발행 현황 보기 — 운영 › 릴리스">발행 현황 보기 →</Link></Card>
+      <Card title="루프 판정">{snapshot.loops === undefined ? '불러오는 중…' : snapshot.loops === null ? '못 읽음' : Object.keys(snapshot.loops).length === 0
         ? '등록 0' : <div className="flex flex-wrap gap-1 text-xs font-medium">{Object.entries(snapshot.loops).map(([verdict, count]) =>
-          <span key={verdict} className="rounded-full bg-muted px-2 py-1">{verdict} {count}</span>)}</div>}</Card>
-      <Card title="결정 대기 카드"><a href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions ?? '못 읽음'}</a></Card>
-      <Card title="오늘 병합 PR">{snapshot.merged ?? '못 읽음'}</Card>
+          <span key={verdict} className="rounded-full bg-muted px-2 py-1">{verdict} {count}</span>)}</div>}
+        <Link href={LOOPS_INTERACT_HREF} className="mt-1 block rounded text-xs font-medium text-primary underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="루프 상호작용 보기 — 운영 › 루프 상호작용">루프 상호작용 보기 →</Link></Card>
+      <Card title="결정 대기 카드"><Link href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions === undefined ? '불러오는 중…' : snapshot.decisions ?? '못 읽음'}</Link></Card>
+      <Card title="오늘 병합 PR">{snapshot.merged === undefined ? '불러오는 중…' : snapshot.merged ?? '못 읽음'}</Card>
     </div>
     <div className="mt-2 grid min-w-0 grid-cols-2 gap-2 sm:mt-4 sm:gap-4" aria-label="위험과 그리드 카드">
       <section aria-label="위험·막힘 톱 5" className="min-w-0 rounded-xl border border-border bg-card p-2 sm:p-4">
         <h2 className="text-xs font-medium text-muted-foreground sm:text-sm">위험·막힘 톱 5</h2>
-        {snapshot.risks === null ? <p className="mt-2 text-sm">못 읽음</p> : snapshot.risks.length === 0
+        {snapshot.risks === undefined ? <p className="mt-2 text-sm">불러오는 중…</p> : snapshot.risks === null ? <p className="mt-2 text-sm">못 읽음</p> : snapshot.risks.length === 0
           ? <p className="mt-2 text-sm">해당 없음</p>
           : <ol className="mt-2 space-y-1 text-xs">{snapshot.risks.map((risk) => <li key={risk.id} className="min-w-0 border-b border-border pb-1 last:border-0">
             <span className="block text-muted-foreground">{risk.kind} · <time dateTime={risk.at}>{risk.at.slice(0, 16).replace('T', ' ')}</time></span>
@@ -213,7 +233,7 @@ export default function CeoPage() {
       </section>
       <section aria-label="그리드" className="min-w-0 rounded-xl border border-border bg-card p-2 sm:p-4">
         <h2 className="text-xs font-medium text-muted-foreground sm:text-sm">그리드</h2>
-        {snapshot.grid === null ? <p className="mt-2 text-sm">못 읽음</p> : <div className="mt-2 space-y-2 text-xs">
+        {snapshot.grid === undefined ? <p className="mt-2 text-sm">불러오는 중…</p> : snapshot.grid === null ? <p className="mt-2 text-sm">못 읽음</p> : <div className="mt-2 space-y-2 text-xs">
           <p className="min-w-0 break-words">본부 · {snapshot.grid.hq.reason ? '본부 못 읽음'
             : snapshot.grid.hq.record ? <><span title={snapshot.grid.hq.record.holder}>{snapshot.grid.hq.record.holder}</span>
               {snapshot.grid.hq.ageSeconds !== null && <> · {Math.floor(snapshot.grid.hq.ageSeconds / 60)}분 전</>}

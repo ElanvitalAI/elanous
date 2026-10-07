@@ -35,7 +35,11 @@ export interface GraphRunState {
   stoppedAt?: string;
   status: 'running' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
   path: string[];
-  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string }>;
+  /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
+  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string;
+    startedAt?: string; endedAt?: string; seconds?: number }>;
+  /** The node now running and when it started; cleared when its record is written. */
+  currentNode?: { nodeId: string; startedAt: string };
   input?: unknown;
   pending?: { nodeId: string; message: string; since: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; decidedBy?: string; decidedAt?: string };
   approvalSourceHash?: string;
@@ -658,6 +662,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     state.status = 'running';
     const startedAt = performance.now();
+    const nodeStartedAt = new Date().toISOString();
+    if (!resumingCompleted) state.currentNode = { nodeId: current, startedAt: nodeStartedAt };
     console.error(`[graph] ${current} start (0.00s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: 'start' });
@@ -723,6 +729,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       error = result.error ? redactCredentials(result.error) : undefined;
       state.executed++;
     }
+    const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
+    // A wall clock stepped back mid-node must not record an end before the start.
+    const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
+    delete state.currentNode;
     if (resumingCompleted && completed) {
       ok = completed.ok;
       exit = completed.exit;
@@ -734,7 +744,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
       state.nodes.push({ nodeId: current, ok, exit, executed: !!command && (!state.dryRun || !!command.dry_run_command), ...((command || approval) && (!state.dryRun || !!command?.dry_run_command) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
-        ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}) });
+        ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
+        startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }
     if (approval) {
       delete state.pending;
@@ -742,7 +753,6 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const reported = command && (!state.dryRun || command.dry_run_command) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
-    const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
@@ -892,11 +902,21 @@ export function manageGraphRun(graphId: string, runId: string, action: 'stop' | 
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
       }
     }
+    const current = state.currentNode;
+    const running = current && state.path.length === state.nodes.length + 1 && current.nodeId === state.path.at(-1) &&
+      Number.isFinite(Date.parse(current.startedAt)) ? current.startedAt : undefined;
+    // One stop instant for the node end, finishedAt and stoppedAt — never before the running node's start.
+    const stopMs = running === undefined ? Date.now() : Math.max(Date.now(), Date.parse(running));
     if (state.path.length === state.nodes.length + 1) {
-      state.nodes.push({ nodeId: state.path.at(-1)!, ok: false, exit: null, executed: false, error: 'stopped before node completed' });
+      state.nodes.push({ nodeId: state.path.at(-1)!, ok: false, exit: null, executed: false, error: 'stopped before node completed',
+        // The stop instant is always the node end; a start (and so seconds) exists only when the ledger named the running
+        // node — a run begun by a runner before GRAPH-NODE-TIMES did not, and a guessed start would be a false time.
+        endedAt: new Date(stopMs).toISOString(),
+        ...(running === undefined ? {} : { startedAt: running, seconds: Number(((stopMs - Date.parse(running)) / 1000).toFixed(2)) }) });
     }
+    delete state.currentNode;
     state.status = 'failed';
-    state.finishedAt = new Date().toISOString();
+    state.finishedAt = new Date(stopMs).toISOString();
     state.stoppedAt = state.finishedAt;
     delete state.activeNode;
     persistGraphRun(state);

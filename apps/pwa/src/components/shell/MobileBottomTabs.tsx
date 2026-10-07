@@ -61,7 +61,8 @@ export function MobileBottomTabs() {
   const groups = NAV_GROUPS.map((group) => ({ ...group, items: items.filter((item) => item.group === group.id) }))
     .filter((group) => group.items.length > 0);
   const tabs = groups.filter((group) => group.bottomTab);
-  const extra = groups.filter((group) => !group.bottomTab);
+  // 운영자에게 «더보기» 시트는 운영 칸이 맨 위다 — 맨 아래면 폰 폭에서 접혀 «릴리스»를 못 찾는다(10-07 피드백).
+  const extra = groups.filter((group) => !group.bottomTab).sort((a, b) => Number(b.id === 'ops') - Number(a.id === 'ops'));
   const path = (pathname ?? '/').replace(/\/+$/, '') || '/';
   const isActive = (item: typeof items[number]) => path === item.href || (item.href !== '/' && path.startsWith(`${item.href}/`))
     || (item.activeAlso ?? []).some((href) => path === href || path.startsWith(`${href}/`));

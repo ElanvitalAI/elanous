@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'bun:test';
 import { FABRIC_STAGES, FabricStageHeader } from './FabricStageHeader';
 import LoopsPage from '@/app/loops/page';
-import { LoopStatusPanel } from '@/components/loops/LoopStatusPanel';
+import { LoopsView } from '@/components/loops/LoopsView';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
 import { SIDEBAR_NAV_ITEMS } from './sidebar-nav-items';
@@ -29,7 +29,7 @@ describe('FABRIC_STAGES', () => {
   });
 
   it('루프 현황은 스케줄 단계를 공유하되 별도 파이프라인 단계를 만들지 않는다', () => {
-    expect(LoopsPage().type).toBe(LoopStatusPanel);
+    expect(LoopsPage().props.children.type).toBe(LoopsView);
     expect(renderToStaticMarkup(createElement(FabricStageHeader, { active: 'scheduler' }))).toMatch(/<a aria-current="page"[^>]*href="\/scheduler"/);
     expect(FABRIC_STAGES.map((stage) => stage.href)).not.toContain('/loops');
   });

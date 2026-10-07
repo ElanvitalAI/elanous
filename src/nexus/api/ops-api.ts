@@ -18,13 +18,35 @@ let seatsCache: ReturnType<typeof createSeatsCache> | null = null;
 export function setSeatsCacheForTest(cache: ReturnType<typeof createSeatsCache> | null): void { seatsCache = cache; }
 const LOG_PATH = /^\/v1\/ops\/release\/runs\/([^/]+)\/nodes\/([^/]+)\/log$/;
 
-interface RunNode { nodeId: string; ok?: unknown; output?: unknown }
+interface RunNode { nodeId: string; ok?: unknown; output?: unknown; startedAt?: unknown; endedAt?: unknown }
 interface RunRecord {
   status: string;
   path: string[];
   startedAt: string;
   input?: unknown;
   nodes: RunNode[];
+  currentNode?: { nodeId?: unknown; startedAt?: unknown };
+}
+
+/** Node times come only from the ledger (GRAPH-NODE-TIMES); older ledgers have none and the screen says so. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+function isoTime(value: unknown): string | undefined {
+  return typeof value === 'string' && ISO_TIME.test(value) && Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
+function nodeTimes(node: RunNode): { startedAt?: string; endedAt?: string } {
+  const startedAt = isoTime(node.startedAt);
+  const endedAt = isoTime(node.endedAt);
+  return { ...(startedAt ? { startedAt } : {}), ...(endedAt ? { endedAt } : {}) };
+}
+
+/** The running node has no record yet — show it with its start time when the ledger names it as the path tail. */
+function runningNode(run: RunRecord, recorded: number): Array<{ nodeId: string; ok: null; summary: string; startedAt: string }> {
+  const current = run.currentNode;
+  const startedAt = isoTime(current?.startedAt);
+  if (run.status !== 'running' || !startedAt || typeof current?.nodeId !== 'string' ||
+      run.path.length !== recorded + 1 || run.path.at(-1) !== current.nodeId) return [];
+  return [{ nodeId: redactSecretText(current.nodeId), ok: null, summary: '', startedAt }];
 }
 
 function recordAt(path: string): RunRecord | null {
@@ -66,6 +88,77 @@ function runVersion(input: unknown): string | null {
   return typeof version === 'string' && VERSION.test(version) ? version : null;
 }
 
+/** Facts away mode prints for a node — only built when asked, so the HTTP shape stays as it was. */
+export interface ReleaseNodeFacts { verdict?: string; introduced?: number; preexisting?: number; waiver?: string }
+export interface ReleaseRunNodeView {
+  nodeId: string; ok: boolean | null; summary: string; startedAt?: string; endedAt?: string; facts?: ReleaseNodeFacts;
+}
+
+function parsedOutput(output: unknown): Record<string, unknown> | null {
+  let value = output;
+  if (typeof value === 'string') {
+    const text = value;
+    try { value = JSON.parse(text) as unknown; }
+    catch {
+      const last = text.split('\n').map((line) => line.trim()).filter(Boolean).at(-1);
+      try { value = JSON.parse(last ?? '') as unknown; } catch { return null; }
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+export function releaseNodeFacts(output: unknown): ReleaseNodeFacts {
+  const value = parsedOutput(output);
+  if (!value) return {};
+  const verdict = typeof value.verdict === 'string' ? value.verdict : typeof value.outcome === 'string' ? value.outcome : undefined;
+  const introduced = Array.isArray(value.introduced) ? value.introduced.length : typeof value.introduced === 'number' ? value.introduced : undefined;
+  const preexisting = typeof value.preexisting === 'number' ? value.preexisting : undefined;
+  const waiver = typeof value.waiver === 'string' && value.waiver.trim() ? redactSecretText(value.waiver).slice(0, 200) : undefined;
+  return {
+    ...(verdict ? { verdict: redactSecretText(verdict).slice(0, 40) } : {}),
+    ...(introduced !== undefined ? { introduced } : {}),
+    ...(preexisting !== undefined ? { preexisting } : {}),
+    ...(waiver ? { waiver } : {}),
+  };
+}
+export interface ReleaseRunView {
+  runId: string; status: string; startedAt: string; version: string | null; path: string[]; nodes: ReleaseRunNodeView[];
+}
+
+/** The release run ledger as `/v1/ops/release/runs` serves it (newest 20) — shared with Telegram /release and away mode
+ *  so every surface reads the same verdicts. `'unavailable'` = the directory exists but cannot be read. */
+export function readReleaseRuns(version: string | null = null,
+  dir: string = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop'),
+  opts: { facts?: boolean } = {}): ReleaseRunView[] | 'unavailable' {
+  let filenames: string[];
+  try {
+    filenames = readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json')
+        && IDENTIFIER.test(entry.name.slice(0, -5)))
+      .map((entry) => entry.name);
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    return 'unavailable';
+  }
+  return filenames.flatMap((filename) => {
+    const run = recordAt(join(dir, filename));
+    if (!run) return [];
+    const v = runVersion(run.input);
+    if (version !== null && v !== version) return [];
+    return [{
+      runId: redactSecretText(filename.slice(0, -5)), status: redactSecretText(run.status),
+      startedAt: redactSecretText(run.startedAt), version: v,
+      path: run.path.filter((step): step is string => typeof step === 'string').map(redactSecretText),
+      nodes: [...run.nodes.filter((node) => node && typeof node.nodeId === 'string').map((node) => ({
+        nodeId: redactSecretText(node.nodeId), ok: typeof node.ok === 'boolean' ? node.ok : null,
+        summary: nodeSummary(node.output), ...nodeTimes(node),
+        ...(opts.facts ? { facts: releaseNodeFacts(node.output) } : {}),
+      })), ...runningNode(run, run.nodes.length)],
+    }];
+  }).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 20);
+}
+
 /** The sole data gate for every read-only /v1/ops endpoint. */
 export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Response | Promise<Response> {
   const url = new URL(req.url);
@@ -103,33 +196,8 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
   }
   if (pathname === '/v1/ops/release/runs') {
     if (version !== null && !VERSION.test(version)) return jsonResponse({ error: 'invalid-version' }, 400);
-    const dir = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop');
-    let filenames: string[];
-    try {
-      filenames = readdirSync(dir, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && entry.name.endsWith('.json')
-          && IDENTIFIER.test(entry.name.slice(0, -5)))
-        .map((entry) => entry.name);
-    }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return served(jsonResponse([]));
-      return jsonResponse({ error: 'runs-unavailable' }, 500);
-    }
-    const runs = filenames.flatMap((filename) => {
-      const run = recordAt(join(dir, filename));
-      if (!run) return [];
-      const v = runVersion(run.input);
-      if (version !== null && v !== version) return [];
-      return [{
-        runId: redactSecretText(filename.slice(0, -5)), status: redactSecretText(run.status),
-        startedAt: redactSecretText(run.startedAt), version: v,
-        path: run.path.filter((step): step is string => typeof step === 'string').map(redactSecretText),
-        nodes: run.nodes.filter((node) => node && typeof node.nodeId === 'string').map((node) => ({
-          nodeId: redactSecretText(node.nodeId), ok: typeof node.ok === 'boolean' ? node.ok : null,
-          summary: nodeSummary(node.output),
-        })),
-      }];
-    }).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 20);
+    const runs = readReleaseRuns(version);
+    if (runs === 'unavailable') return jsonResponse({ error: 'runs-unavailable' }, 500);
     return served(jsonResponse(runs));
   }
   // WHATWG URL normalizes a literal runs/../nodes/... before routing.

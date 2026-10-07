@@ -29,6 +29,14 @@ test('가장 최근 startedAt 런의 판·현재 노드·순번·경과를 표�
   expect(markup).toContain('opacity-50');
 });
 
+test('선택된 런이 있으면 최신 자동 런보다 우선해 동일한 런의 노드와 상태를 보인다', () => {
+  const older = { ...run, runId: 'older', version: '0.2.8', status: 'done', startedAt: '2026-10-06T10:00:00Z', path: ['older-node'], nodes: [{ nodeId: 'older-node', ok: true, summary: '완료' }] };
+  const markup = renderToStaticMarkup(<ReleaseStrip result={ready([run, older])} selectedRun={older} onSelect={() => {}} now={now} />);
+  expect(markup).toContain('발행 0.2.8');
+  expect(markup).toContain('older-node (1/1)');
+  expect(markup).not.toContain('publish');
+});
+
 test('현재 실패 노드 또는 실패·막힘 상태에서 summary 첫 줄만 보인다', () => {
   const failed = { ...run, nodes: run.nodes.map((node) => node.nodeId === 'publish' ? { ...node, ok: false, summary: '인증 실패\n민감한 로그' } : node) };
   expect(html([failed])).toContain('막힘: 인증 실패');

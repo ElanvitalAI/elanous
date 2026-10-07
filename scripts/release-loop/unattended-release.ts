@@ -19,6 +19,8 @@ export interface ReleaseLoopConfig {
   gatePodBunCache?: string;
   gatePodShards?: number;
   gatePodShardTimeoutSeconds?: number;
+  /** GATE-SPEED A3①: gate shard Pod CPU — `2` (request = limit) or `{ request, limit }`. Omitted = request 1 / limit 4. */
+  gatePodCpu?: number | string | { request?: number | string; limit?: number | string };
   gateRemote?: string;
   gateRemoteMirror?: string;
   opsHosts?: string[];

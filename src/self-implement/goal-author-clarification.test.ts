@@ -1,4 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { authorGoal, type GoalAuthorDeps } from './goal-author.js';
 import type { IntakeClarification } from '../autopilot/mission-intake-clarify.js';
@@ -26,6 +28,148 @@ function clarification(overrides: Partial<IntakeClarification> = {}): IntakeClar
 function responseFor(clarification: IntakeClarification) {
   return parseGoalAuthorClarifications(serializeGoalAuthorClarification(clarification))[0].response;
 }
+
+function preservationDocument(id = 'preservation_contract'): string {
+  return ['## WHAT TO BUILD', 'Question: NOT-GROUNDED — Preserve?', `Answer: UNANSWERED — ${id}`, '',
+    '- Clarification:', `  - id: ${id}`, '  - header: Clarification', '  - question: Preserve?',
+    '  - options:', '    - label: Failing test', '      description: Name one.',
+    '  - includeOther: true', '  - answer: DEFERRED-UNTIL: Preserve?', '',
+  ].join('\n');
+}
+
+test('zero evidence preservation contract applies default exactly once and counts answered', async () => {
+  const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+  try {
+    const result = await selfAnswerGoalDocumentClarifications(preservationDocument(), {
+      path: 'say-first', runId: 'run-preserve', evidence: [],
+    });
+    expect(result).toMatchObject({ asked: 1, answered: 1, unanswered: 0, newlyAnswered: 1 });
+    expect(parseGoalDocumentClarifications(result.document)[0]).toMatchObject({
+      answered: true, provenanceSource: 'default', answer: expect.stringContaining('기존 공개 동작'),
+    });
+    expect(result.document).toContain('Answer: NOT-GROUNDED — 대상 경로의 기존 공개 동작');
+    const repeated = await selfAnswerGoalDocumentClarifications(result.document, {
+      path: 'say-first', evidence: [], resolver: async () => { throw new Error('answered again'); },
+    });
+    expect(repeated).toEqual({ document: result.document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0 });
+    expect(log.mock.calls.filter(([category, event]) => category === 'goal-author' && event === 'self-answer-default-applied'))
+      .toEqual([['goal-author', 'self-answer-default-applied', { runId: 'run-preserve', questionId: 'preservation_contract', exportCount: 0 }]]);
+  } finally { log.mockRestore(); }
+});
+
+test('preservation default appends names exported by supplied target files, not unrelated names', async () => {
+  const root = mkdtempSync(join(process.cwd(), 'src/preservation-exports-'));
+  const rel = root.slice(process.cwd().length + 1);
+  try {
+    writeFileSync(join(root, 'one.ts'), 'export function keepOne() {}\nconst hidden = 1;\n');
+    writeFileSync(join(root, 'two.ts'), 'const original = 1; export { original as keepTwo };\n');
+    writeFileSync(join(root, 'three.ts'), "export * from './one.js';\n");
+    writeFileSync(join(root, 'four.ts'), 'const value = 1;\nexport = value;\n');
+    writeFileSync(join(root, 'five.ts'), 'const value = { a: 1, b: [2, 3] };\nexport const { a: keepA, b: [keepB, , keepC] } = value;\n');
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await selfAnswerGoalDocumentClarifications(preservationDocument(), {
+        path: 'say-first', evidence: [], runId: 'run-exports',
+        ask: `## PROBLEM\n대상 경로: src/decoy.ts\nOriginal ask (verbatim, unmodified):\n\`\`\`\n대상 경로: ${rel}/one.ts, ${rel}/two.ts\n- 대상 경로: ${rel}/three.ts\n1. 대상 경로: ${rel}/four.ts\n+ 대상 경로: \`${rel}/five.ts\`\n\`\`\``,
+      });
+      expect(result.document).toContain(`${rel}/one.ts: keepOne`);
+      expect(result.document).toContain(`${rel}/two.ts: keepTwo`);
+      expect(result.document).toContain(`${rel}/three.ts: * from ./one.js`);
+      expect(result.document).toContain(`${rel}/four.ts: export =`);
+      expect(result.document).not.toContain(`${rel}/four.ts: default`);
+      expect(result.document).toContain(`${rel}/five.ts: keepA, ${rel}/five.ts: keepB, ${rel}/five.ts: keepC`);
+      expect(result.document).not.toContain('hidden');
+      expect(result.document).toContain('기존 공개 동작');
+      expect(log.mock.calls).toContainEqual(['goal-author', 'self-answer-default-applied', {
+        runId: 'run-exports', questionId: 'preservation_contract', exportCount: 7,
+      }]);
+    } finally { log.mockRestore(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('serialized preservation refusal remains a valid deferred clarification outside the document self-answer path', async () => {
+  const serialized = await serializeResolvedGoalAuthorClarification(clarification({
+    questionId: 'preservation_contract', options: [],
+  }), {
+    evidence: ['src/example.ts: exports only'],
+    selfResolve: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => '{"answer":null}' }),
+  });
+  expect(parseGoalAuthorClarifications(serialized)).toHaveLength(1);
+  expect(parseGoalAuthorClarifications(serialized)[0].response).toMatchObject({
+    answer: null, status: 'DEFERRED-UNTIL: Choose a repository target.',
+  });
+  expect(serialized).not.toContain('"declined"');
+});
+
+test('unmarked resolver abstention does not apply a preservation default', async () => {
+  const document = preservationDocument();
+  const result = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence: [], resolver: async () => ({}),
+  });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+});
+
+test('default does not require an Other option or change human clarification requirements', async () => {
+  const document = preservationDocument().replace('  - includeOther: true', '  - includeOther: false');
+  const result = await selfAnswerGoalDocumentClarifications(document, { path: 'say-first', evidence: [] });
+  expect(result).toMatchObject({ answered: 1, unanswered: 0 });
+  expect(parseGoalDocumentClarifications(result.document)[0]).toMatchObject({
+    answered: true, includeOther: false, provenanceSource: 'default',
+  });
+});
+
+test('other questions remain unanswered when evidence is insufficient', async () => {
+  const document = preservationDocument('implementation_target');
+  const result = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence: [],
+  });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+});
+
+test('an unrelated question explicitly declined despite evidence remains unanswered', async () => {
+  const document = preservationDocument('implementation_target');
+  const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+  try {
+    const result = await selfAnswerGoalDocumentClarifications(document, {
+      path: 'say-first', evidence: ['src/example.ts:1: exports only'],
+      resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => '{"answer":null}' }),
+    });
+    expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+    expect(log.mock.calls.filter(([, event]) => event === 'self-answer-default-applied')).toHaveLength(0);
+  } finally { log.mockRestore(); }
+});
+
+test('evidence-backed preservation answer wins without applying a default', async () => {
+  const document = preservationDocument();
+  const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+  try {
+    const result = await selfAnswerGoalDocumentClarifications(document, {
+      path: 'say-first', evidence: ['src/api.ts:12: verified'],
+      resolver: async ({ evidence }) => ({ answer: 'Keep verified interface', evidence }),
+    });
+    expect(result).toMatchObject({ asked: 1, answered: 1, unanswered: 0 });
+    expect(parseGoalDocumentClarifications(result.document)[0]).toMatchObject({
+      answer: 'Keep verified interface', provenanceSource: 'self-authored',
+    });
+    expect(log.mock.calls.filter(([, event]) => event === 'self-answer-default-applied')).toHaveLength(0);
+  } finally { log.mockRestore(); }
+});
+
+test('declined preservation contract with nonzero evidence receives the default; malformed output does not', async () => {
+  const document = preservationDocument();
+  const evidence = Array.from({ length: 20 }, (_, index) => `src/example.ts:${index + 1}: fact`);
+  const declined = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence,
+    resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => '{"answer":null}' }),
+  });
+  expect(declined).toMatchObject({ answered: 1, unanswered: 0 });
+  expect(parseGoalDocumentClarifications(declined.document)[0].provenanceSource).toBe('default');
+  const malformed = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence,
+    resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => 'not json' }),
+  });
+  expect(malformed).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+});
 
 test('shared document self-answer persists one response and leaves the other deferred', async () => {
   const document = ['## WHAT TO BUILD', '- TRACED PATHS:', '  - evidence: src/example.ts: contract',

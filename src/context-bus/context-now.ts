@@ -1,4 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
+import { loadRunLedger } from '../self-implement/run-ledger.js';
+import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
 import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
@@ -12,7 +16,10 @@ export type ContextFact =
   | { kind: 'version'; version: string; source: string }
   | { kind: 'cell'; version: string; id: string; title: string; status: string; owner: string | null; source: string }
   | { kind: 'decision'; id: string; title: string; status: string; dueAt: string | null; source: string }
-  | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string };
+  | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string }
+  | { kind: 'run'; goal: string; phase: string; elapsed: string; source: string; unreadable?: string }
+  | { kind: 'release'; version: string; node: string; status: string; source: string; unreadable?: string }
+  | { kind: 'schedule-late'; count: number | null; names: string[]; source: string; unreadable?: string };
 export type ContextEvent = { at: string; kind: string; summary: string; source: string };
 export type ContextNowAnswer = { at: string; topic: string | null; facts: ContextFact[]; events: ContextEvent[]; guide: string[]; hiddenCount?: number };
 
@@ -23,6 +30,10 @@ export interface ContextNowDeps {
   decisions?: () => DecisionEntry[];
   seatEntries?: (now: Date) => Array<{ entry: SeatEntry; source: string }>;
   events?: (since: string) => CoordEvent[];
+  runningRuns?: (now: Date) => Extract<ContextFact, { kind: 'run' }>[];
+  queryRuns?: () => QueriedRunningRunsResult;
+  releaseRun?: () => Extract<ContextFact, { kind: 'release' }> | null;
+  lateSchedules?: (now: Date) => Extract<ContextFact, { kind: 'schedule-late' }> | null;
   brandCheck?: typeof checkBrand;
 }
 
@@ -37,6 +48,75 @@ function todaySeatEntries(now: Date): Array<{ entry: SeatEntry; source: string }
       source: `elanous://seat-loop/${seat}/${day}#${index + 1}`,
     }] : []);
   });
+}
+
+const runSource = 'elanous://self-implement/running-runs';
+const releaseSource = 'elanous://graph-runs/release-loop';
+const scheduleSource = 'elanous://schedules';
+const oneLine = (text: string) => redactSecretText(text.split(/\r?\n/, 1)[0] ?? '').slice(0, 120);
+
+function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = () => queryRunningRuns({ includeTest: false, caller: 'context-now' })): Extract<ContextFact, { kind: 'run' }>[] {
+  const observed = queryRuns();
+  const unreadable = observed.completeness === 'partial' || observed.pty.unreadable.length || !!observed.phases?.unreadableTargetCount;
+  const facts = observed.entries.filter(entry => observed.countedStatuses.includes(entry.status)).slice(0, 8).flatMap(entry => {
+    let ledgerReadFailure = false;
+    const starts = entry.ledgerDirectories.flatMap(directory => {
+      try { return loadRunLedger(entry.runId, directory)?.filter(record => record.event === 'start') ?? []; }
+      catch { ledgerReadFailure = true; return []; }
+    });
+    const goalRecord = starts.find(record => typeof record.data.feature === 'string' && record.data.feature.trim());
+    const goal = typeof goalRecord?.data.feature === 'string' ? goalRecord.data.feature : ledgerReadFailure ? '골 관측 불가' : '골 미기록';
+    const started = starts.map(record => record.timestamp ? Date.parse(record.timestamp) : NaN).find(Number.isFinite) ?? NaN;
+    const minutes = Number.isFinite(started)
+      ? Math.max(0, Math.floor((now.getTime() - started) / 60_000)) : null;
+    const fact = { kind: 'run' as const, goal: oneLine(goal),
+      phase: entry.lastPhase ?? '단계 미관측', elapsed: minutes === null ? ledgerReadFailure ? '경과 관측 불가' : '경과 미관측' : `${minutes}분`,
+      source: `${runSource}/${encodeURIComponent(entry.runId)}` };
+    return ledgerReadFailure
+      ? [
+          ...(goalRecord || minutes !== null ? [fact] : []),
+          { kind: 'run' as const, goal: '', phase: '', elapsed: '', source: fact.source, unreadable: '런 원장 일부 관측 불가' },
+        ] : [fact];
+  });
+  return unreadable ? [...facts, { kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: '런 원장 또는 관측 대상 일부' }] : facts;
+}
+
+function latestReleaseRun(): Extract<ContextFact, { kind: 'release' }> | null {
+  const dir = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop');
+  let filenames: string[];
+  try { filenames = readdirSync(dir).filter(name => /^[A-Za-z0-9-]+\.json$/.test(name)); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const runs = filenames.flatMap(filename => {
+    const path = join(dir, filename);
+    let run: { startedAt?: unknown; status?: unknown; input?: { version?: unknown }; path?: unknown; nodes?: unknown };
+    try {
+      if (!lstatSync(path).isFile()) return [];
+      run = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return [];
+      throw error;
+    }
+    if (typeof run.startedAt !== 'string' || typeof run.status !== 'string' || !Array.isArray(run.path) || !Array.isArray(run.nodes)) return [];
+    const steps = run.path.filter((step): step is string => typeof step === 'string');
+    const nodes = run.nodes.filter((node): node is { nodeId: string } => !!node && typeof node.nodeId === 'string');
+    const version = typeof run.input?.version === 'string' && /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(run.input.version) ? run.input.version : '판 미기록';
+    const index = Math.min(steps.length, nodes.length + (run.status === 'running' || run.status === 'awaiting-approval' ? 1 : 0));
+    return [{ startedAt: run.startedAt, fact: { kind: 'release' as const, version, node: `${index}/${steps.length}${steps[index - 1] ? ` ${oneLine(steps[index - 1]!)}` : ''}`,
+      status: oneLine(run.status), source: `${releaseSource}/${encodeURIComponent(filename.slice(0, -5))}` } }];
+  });
+  return runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.fact ?? null;
+}
+
+function lateScheduleFact(now: Date): Extract<ContextFact, { kind: 'schedule-late' }> {
+  const names = localLoopRows(now).filter(row => row.verdict === 'late').map(row => oneLine(row.name));
+  return { kind: 'schedule-late', count: names.length, names, source: scheduleSource };
+}
+
+function unreadableReason(error: unknown): string {
+  return oneLine(error instanceof Error ? error.message : String(error)) || '원천 조회 실패';
 }
 
 /** Read a bounded, source-labelled view of current ledgers, never a transcript or decision body. */
@@ -71,6 +151,20 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const rawEvents = (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
   const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at));
   const matches = (text: string) => !topic || text.toLocaleLowerCase().includes(topic.toLocaleLowerCase());
+  const operational: ContextFact[] = [];
+  if (options.audience !== 'public-demo') {
+    try { operational.push(...(deps.runningRuns ?? (date => runningRunFacts(date, deps.queryRuns)))(now)); }
+    catch (error) { operational.push({ kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: unreadableReason(error) }); }
+    try {
+      const release = (deps.releaseRun ?? latestReleaseRun)();
+      if (release) operational.push(release);
+    } catch (error) { operational.push({ kind: 'release', version: '', node: '', status: '', source: releaseSource, unreadable: unreadableReason(error) }); }
+    try { const schedules = (deps.lateSchedules ?? lateScheduleFact)(now); if (schedules) operational.push(schedules); }
+    catch (error) { operational.push({ kind: 'schedule-late', count: null, names: [], source: scheduleSource, unreadable: unreadableReason(error) }); }
+  }
+  const selectedOperational = operational.filter(f => !topic || ('unreadable' in f && !!f.unreadable) || (f.kind === 'run' && matches(`${f.goal} ${f.phase}`))
+    || (f.kind === 'release' && matches(`${f.version} ${f.node} ${f.status}`))
+    || (f.kind === 'schedule-late' && matches(f.names.join(' '))));
   const selectedFacts = facts.filter(f => !topic || (f.kind === 'cell' && matches(`${f.id} ${f.title}`))
     || (f.kind === 'seat' && matches(`${f.id ?? ''} ${f.title ?? ''}`)));
   const groups = (['version', 'cell', 'decision', 'seat'] as const).map(kind => selectedFacts.filter(f => f.kind === kind));
@@ -92,7 +186,7 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
     chosen[index]!.push(...extra);
     remaining -= extra.length;
   }
-  const boundedFacts = chosen.flat();
+  const boundedFacts = [...selectedOperational.slice(0, limit), ...chosen.flat()];
   const summaries = chronologicalEvents.map(event => ({
     at: event.at, kind: event.kind, summary: redactSecretText(event.summary.split(/\r?\n/, 1)[0] ?? '').slice(0, 120),
     source: event.refs.source ?? event.refs.url ?? `elanous://context/event/${encodeURIComponent(event.id)}`,

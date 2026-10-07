@@ -26,10 +26,13 @@ import {
 import { listWorktrees } from '../git-fs/worktree.js';
 import { runShardedGateTests } from '../self-dev/shard-run.js';
 
-interface SelfGateCliOptions {
+export interface SelfGateCliOptions {
   base?: string;
   pr?: string;
   shards?: number;
+  /** LIGHT-RC (0.2.19) — repository-relative test paths run on every call, whatever changed. Existing ones join the
+   *  run (deduplicated, same introduced/preexisting baseline as the rest); missing ones go to `alwaysIncludeMissing`. */
+  alwaysInclude?: readonly string[];
 }
 
 interface ProcessResult {
@@ -102,7 +105,7 @@ interface GateOutput {
   error: (message: string) => void;
 }
 
-interface SelfGateCliResult {
+export interface SelfGateCliResult {
   exitCode: number;
   lines: string[];
   changedFiles: string[];
@@ -110,6 +113,11 @@ interface SelfGateCliResult {
   unverified: readonly string[];
   documentPaths: readonly string[];
   documentsWithoutDerivedTests: readonly string[];
+  /** `alwaysInclude` paths that do not exist in the tree (empty when none were given). */
+  alwaysIncludeMissing: readonly string[];
+  /** New vs. already-present failures (unknown/preconditionUnmet = failures it could not classify). Absent = the test
+   *  step did not produce a measurement (e.g. shards unmeasured). */
+  baseline?: { introduced: number; preexisting: number; unknown: number; preconditionUnmet: number };
 }
 
 /** 시험 단계와 독립인 정책 관문 넷. skipTestStep 이든 시험 통과든 같은 함수를 부른다. */
@@ -590,7 +598,12 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const expose = publicExposureFiles(selection.files).length > 0
     ? runExposeGate(cwd, selection.files, getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn', deps.runCommand)
     : { passed: true, log: '' };
-  const testFiles = [...(scope.testArgs ?? [])];
+  const alwaysInclude = [...new Set((options.alwaysInclude ?? []).map(normalizeGatePath).filter(Boolean))];
+  const alwaysIncludeMissing = alwaysInclude.filter((path) => !exists(path));
+  const scopedTests = scope.testArgs ?? [];
+  const alwaysIncludeExtra = alwaysInclude.filter((path) => exists(path) && !scopedTests.includes(path));
+  const testFiles = [...scopedTests, ...alwaysIncludeExtra];
+  const skipTestStep = scope.skipTestStep && alwaysIncludeExtra.length === 0;
   const unrunImporterTotal = lookupFailed ? null : (scope.importerTestsNotRun?.total ?? 0);
   const importerLookupFailed = Boolean(lookupFailed);
   const lines = [
@@ -619,6 +632,10 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     ...(routeIndex?.lookupFailures.length ? [`⚠️ caller route base lookup failed — unmeasured: ${routeIndex.lookupFailures.map(({ source, reason }) => `${source} (${reason})`).join(', ')}`] : []),
     ...(scope.callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${scope.callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
     changedTestCountNote(cwd, selection.files, selection.baseRef, deps.runCommand, deps.readFile),
+    // Only printed when the caller asked for always-include paths — the plain `self gate` output is unchanged.
+    ...(options.alwaysInclude !== undefined
+      ? [`always include: ${alwaysInclude.length - alwaysIncludeMissing.length}/${alwaysInclude.length} (added ${alwaysIncludeExtra.length}${alwaysIncludeMissing.length ? ` · missing: ${alwaysIncludeMissing.join(', ')}` : ''})`]
+      : []),
   ];
   if (expose.log) lines.push(expose.log);
   if (options.pr) {
@@ -641,17 +658,18 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const iosPassed = runAdditionalGate('ios-gate', deps.runIosGate ?? runIosUnitTestGate, selection.files, cwd, lines);
   const pwaPassed = runAdditionalGate('pwa-gate', deps.runPwaGate ?? runPwaBuildGate, selection.files, cwd, lines);
 
-  if (scope.skipTestStep) {
+  if (skipTestStep) {
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   if (options.shards !== undefined) {
     const sharded = (deps.runShards ?? runShardedGateTests)(cwd, testFiles, selection.baseRef, options.shards);
-    lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})`);
+    lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}`);
     for (const attempt of sharded.attempts) lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt}`);
     const { aggregate } = sharded;
+    let shardBaseline: SelfGateCliResult['baseline'];
     if (aggregate.status === 'unmeasured') lines.push(`shards: unmeasured (${aggregate.retryShardIds.join(', ') || sharded.reason || 'no complete JUnit'})`);
     else if (aggregate.report) {
       const report = aggregate.report;
@@ -662,15 +680,18 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
         baselineFiles: report.files, baselineStatus: report.baselineStatus, unrunImporterTotal, lookupFailed: importerLookupFailed,
       });
       lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
+      shardBaseline = { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet };
     } else {
       lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
       logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
+      shardBaseline = { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 };
     }
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     return {
       exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
+      alwaysIncludeMissing, ...(shardBaseline ? { baseline: shardBaseline } : {}),
     };
   }
 
@@ -680,7 +701,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -702,5 +723,5 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
   const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
-  return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+  return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
 }

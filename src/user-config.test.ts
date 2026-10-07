@@ -13,6 +13,7 @@ import {
   inferRuntimeLlmModelFamily,
   isNativeStructureEnabledForProvider,
   isRuntimeLlmModelCompatibleWithProvider,
+  parseProjectRubricAxes,
   resolveRoleModel,
   saveUserConfig,
 } from './user-config.js';
@@ -88,6 +89,53 @@ afterEach(() => {
   }
   savedEnv.clear();
   rmSync(root, { recursive: true, force: true });
+});
+
+test('projects rubric axes validate and survive save/reload without dropping unrelated project fields', () => {
+  writeConfig({ projects: { p1: { title: '고객 프로젝트', rubric: { axes: [{ key: '고객', weight: 1 }], note: 'keep' } } } });
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.projects?.p1?.rubric?.axes).toEqual([{ key: '고객', weight: 1 }]);
+  saveUserConfig(cfg, configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).projects.p1).toEqual({ title: '고객 프로젝트', rubric: { axes: [{ key: '고객', weight: 1 }], note: 'keep' } });
+  expect(buildUserConfig(configPath).projects?.p1?.rubric?.axes).toEqual([{ key: '고객', weight: 1 }]);
+  // Loading stays non-fatal: an invalid entry keeps its config error text instead of axes.
+  writeConfig({ projects: { p1: { rubric: { axes: [{ key: 'V', weight: 3 }, { key: 'V', weight: 1 }] } }, p2: { rubric: { axes: [{ key: '고객', weight: 1 }] } } } });
+  const dup = buildUserConfig(configPath);
+  expect(dup.projects?.p1?.rubric).toEqual({ error: '[user-config] projects.p1.rubric.axes 키 중복: V' });
+  expect(dup.projects?.p2?.rubric?.axes).toEqual([{ key: '고객', weight: 1 }]);
+  writeConfig({ projects: { p1: { rubric: { axes: [{ key: '고객', weight: 'x' }] } } } });
+  expect(buildUserConfig(configPath).projects?.p1?.rubric?.error).toBe('[user-config] projects.p1.rubric.axes[0].weight 는 유한한 숫자여야 합니다: x');
+  writeConfig({ projects: { p1: { rubric: { axes: [{ key: '고객', weight: null }] } } } });
+  expect(buildUserConfig(configPath).projects?.p1?.rubric?.error).toContain('projects.p1.rubric.axes[0].weight');
+  // An unrelated save keeps the user's invalid entry verbatim (never destroys their text, never blocks the save);
+  // the error still surfaces when the axes are resolved. Only typed axes handed to save are validated.
+  writeConfig({ projects: { p1: { rubric: { axes: [{ key: '고객', weight: 'x' }] } } } });
+  saveUserConfig(buildUserConfig(configPath), configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).projects).toEqual({ p1: { rubric: { axes: [{ key: '고객', weight: 'x' }] } } });
+  expect(buildUserConfig(configPath).projects?.p1?.rubric?.error).toContain('projects.p1.rubric.axes[0].weight');
+  writeConfig({ projects: ['not-an-object'] });
+  expect(buildUserConfig(configPath).projects).toBeUndefined();
+  expect(() => parseProjectRubricAxes('p1', [{ key: 'V', weight: 'x' }])).toThrow('projects.p1.rubric.axes[0].weight');
+  writeConfig({ projects: { p1: { rubric: { axes: [{ key: '고객', weight: 1 }] } } } });
+  const invalid = { ...buildUserConfig(configPath), projects: { p1: { rubric: { axes: [{ key: '고객', weight: NaN }] } } } };
+  expect(() => saveUserConfig(invalid, configPath)).toThrow('projects.p1.rubric.axes[0].weight');
+  expect(buildUserConfig(configPath).projects?.p1?.rubric?.axes).toEqual([{ key: '고객', weight: 1 }]);
+});
+
+test('orchestrator maxDelegatePerTick is optional, accepts safe nonnegative integers and survives save', () => {
+  writeConfig({});
+  expect(buildUserConfig(configPath).loops?.orchestrator?.maxDelegatePerTick).toBeUndefined();
+  for (const invalid of [-1, 1.5, '1', null, Number.MAX_SAFE_INTEGER + 1]) {
+    writeConfig({ loops: { orchestrator: { maxDelegatePerTick: invalid } } });
+    expect(buildUserConfig(configPath).loops?.orchestrator?.maxDelegatePerTick).toBeUndefined();
+  }
+  for (const limit of [0, 1, 3]) {
+    writeConfig({ loops: { orchestrator: { maxDelegatePerTick: limit } } });
+    const config = buildUserConfig(configPath);
+    expect(config.loops?.orchestrator?.maxDelegatePerTick).toBe(limit);
+    saveUserConfig(config, configPath);
+    expect(buildUserConfig(configPath).loops?.orchestrator?.maxDelegatePerTick).toBe(limit);
+  }
 });
 
 test('harness.authorGrade retains full or lite and discards absent or invalid values', () => {

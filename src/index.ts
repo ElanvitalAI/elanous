@@ -51,6 +51,7 @@ import { registerRoleCommands } from './cli/role-cli.js';
 import { registerMachineCommands } from './cli/machine-cli.js';
 import { registerAgentEnvCommands } from './cli/agent-env-cli.js';
 import { registerScheduleCommands } from './cli/schedule-cli.js';
+import { registerGuardianCommands } from './cli/guardian-cli.js';
 export { runSchedule, scheduleCreatePlan } from './cli/schedule-cli.js';
 export type { ScheduleDispatch } from './cli/schedule-cli.js';
 import { registerReviewLoopOptions, buildReviewLoopOpts } from './agent-mission/review-loop-cli.js';
@@ -75,6 +76,7 @@ import { registerIntakeCommands } from './cli/intake-cli.js';
 import { registerTasksCommands } from './cli/tasks-cli.js';
 import { registerBriefCommands } from './cli/brief-cli.js';
 import { registerNotifyCommand } from './cli/notify-cli.js';
+import { registerAwayCommand } from './cli/away-cli.js';
 import { registerLabelsCommands } from './cli/labels-cli.js';
 import { registerMsgCommands } from './cli/msg-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
@@ -214,6 +216,23 @@ export { cliVersion, setInstallMetadataRootForTesting };
 
 export const program = new Command();
 program.enablePositionalOptions();
+
+program.command('preview <target>')
+  .description('Isolated PR/branch-head TUI + PWA preview; publish the TUI-COMFORT friction table to a PR')
+  .option('--scenario <id>', 'TUI-COMFORT scenario (default S2)', 'S2')
+  .option('--flag <path>', 'Enable an existing config feature flag in main-based preview (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+  .option('--comment-pr <number>', 'PR to receive a branch/main preview report', (value: string) => Number(value))
+  .action(async (target: string, opts: { scenario: string; flag: string[]; commentPr?: number }) => {
+    try {
+      const { runPrPreview } = await import('./self-dev/pr-preview.js');
+      const result = await runPrPreview({ target, repoRoot: process.cwd(), scenario: opts.scenario, flags: opts.flag, ...(opts.commentPr === undefined ? {} : { commentPr: opts.commentPr }) });
+      console.log(`preview ${result.status} · ${result.head} · PR #${result.prNumber} · comment posted`);
+      if (result.status !== 'passed') process.exitCode = 1;
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  });
 
 export { SELF_SEND_RECENT_FRAME_WINDOW_MS, SELF_SEND_STALE_HEARTBEAT_MS, formatSelfSendCandidateDisplay } from './harness/self-send-decide.js';
 export type { SelfSendCandidate, SelfSendCandidateDisplay } from './harness/self-send-decide.js';
@@ -891,6 +910,7 @@ registerResearchCommand(program);
 registerReleaseCommands(program);
 registerKnowCommand(program);
 registerNotifyCommand(program);
+registerAwayCommand(program);
 registerFreezeCommands(program);
 registerFlowCommands(program);
 // HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
@@ -5979,6 +5999,7 @@ program
   });
 
 registerScheduleCommands(program);
+registerGuardianCommands(program);
 
 /** `elanous decide*` 공통 — 보낼 곳과 자격을 정한다(설정 decide.endpoint > ELANOUS_JEV_ENDPOINT > Typesafe). 없으면 안내하고 rc 2. */
 async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAccess> {
@@ -7173,7 +7194,7 @@ const selfDevCmd = program
             const members = parsePodPool(devAskSubstrate.pool!);
             const host = podPoolHostLease(members);
             while (!authoringLease) {
-              const status = recommendConcurrency(measurePoolLease(members), { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
+              const status = recommendConcurrency(measurePoolLease(members, { measureUsage: true }), { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
               if (status.recommended !== null && status.recommended > 0) {
                 const { leaseHasPendingPod } = await import('./pod-lease/host-lease.js');
                 const pendingJobs = status.pendingJobs ?? [];
@@ -7328,7 +7349,23 @@ const selfDevCmd = program
         if (hasExplicitReviewerContext && loaded.failed.length > 0) throw new DevPipelineError(contextStatus);
         if (loaded.items.length > 0) spec = { ...spec, reviewerContext: loaded.items };
       }
-      if (devOpts.worktree === true) {
+      // ⭐ TUI-ONE-WORD-LAUNCH — 명시 격리 우주에서 `--cwd`·`--worktree` 둘 다 없으면 «자동» 갈래로
+      //    같은 `prepareDevWorktree` 를 탄다(새 생성 경로 없음). 명시 `--cwd` 는 그대로 이긴다.
+      const autoWorktreeDecision = await (async () => {
+        if (!devOpts.elanous || devOpts.worktree === true || devOpts.cwd !== undefined) {
+          return devCli.decideAutoWorktree({ explicitlyIsolated: false, ...devOpts });
+        }
+        const [{ resolveCurrentInstance }, { isExplicitlyIsolated }] = await Promise.all([
+          import('./instance/current.js'),
+          import('./cli/pty-drive-cli.js'),
+        ]);
+        return devCli.decideAutoWorktree({
+          explicitlyIsolated: isExplicitlyIsolated(resolveCurrentInstance(), devOpts.isolatedRoot),
+          ...devOpts,
+        });
+      })();
+      debug.log('dev-pipeline', 'auto-worktree-decision', { runId: devRunId, decision: autoWorktreeDecision });
+      if (autoWorktreeDecision === 'requested' || autoWorktreeDecision === 'auto') {
         const { prepareDevWorktree, renderPreparedDevWorktree } = await import('./harness/harness-worktree-auto.js');
         const goal = 'file' in input
           ? await (async () => {
@@ -7338,13 +7375,25 @@ const selfDevCmd = program
               return { id: goalId, file: input.file };
             })()
           : undefined;
-        const prepared = prepareDevWorktree(process.cwd(), devRunId, invokedAsDrive ? 'drive' : 'dev', goal);
+        const prepared = (() => {
+          try {
+            return prepareDevWorktree(process.cwd(), devRunId, invokedAsDrive ? 'drive' : 'dev', goal);
+          } catch (error) {
+            if (autoWorktreeDecision !== 'auto') throw error;
+            debug.log('dev-pipeline', 'auto-worktree-failed', { runId: devRunId, cwd: process.cwd(), msg: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+            throw new DevPipelineError(devCli.formatAutoWorktreeFailure(error));
+          }
+        })();
         preparedWorktree = prepared;
         if (spec.elanous) spec = { ...spec, elanous: { ...spec.elanous, cwd: prepared.worktree.path } };
         else if (spec.drive) spec = { ...spec, drive: { ...spec.drive, cwd: prepared.worktree.path } };
         else throw new DevPipelineError('--worktree 는 elanous 또는 셸 drive child에만 유효');
         if (!opts.json) console.log(renderPreparedDevWorktree(prepared).join('\n'));
         debug.log('dev-pipeline', 'auto-worktree-prepared', { runId: devRunId, ...prepared.environment, worktree: prepared.worktree });
+        if (autoWorktreeDecision === 'auto') {
+          if (!opts.json) console.log(devCli.formatAutoWorktreeNotice(prepared.worktree.path));
+          debug.log('dev-pipeline', 'auto-worktree-implied', { runId: devRunId, worktree: prepared.worktree.path });
+        }
       }
       // ⛔ 종전의 `const plan = planDevPipeline(spec)` 를 지운다(무인 리뷰 must-fix) — 쓰이지 않는
       //    데다 **잔여 조회보다 먼저 던질 수 있어** 관측 자체를 건너뛰게 만든다. 계획은 어차피

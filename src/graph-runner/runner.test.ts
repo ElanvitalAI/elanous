@@ -182,9 +182,114 @@ test('two successful commands reach done and persist both outcomes', async () =>
   expect(result.executed).toBe(2);
   expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).nodes.slice(0, 2)).toEqual([
-    { nodeId: 'first', ok: true, exit: 0, executed: true, output: '' },
-    { nodeId: 'second', ok: true, exit: 0, executed: true, output: '' },
+    { nodeId: 'first', ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) },
+    { nodeId: 'second', ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) },
   ]);
+});
+
+function expectNodeTimes(record: { startedAt?: string; endedAt?: string; seconds?: number } | undefined): void {
+  expect(record?.startedAt).toBe(new Date(Date.parse(record!.startedAt!)).toISOString());
+  expect(record?.endedAt).toBe(new Date(Date.parse(record!.endedAt!)).toISOString());
+  expect(Date.parse(record!.startedAt!)).toBeLessThanOrEqual(Date.parse(record!.endedAt!));
+  expect(record!.seconds).toBeGreaterThanOrEqual(0);
+}
+
+test('GRAPH-NODE-TIMES: each run node records start, end and seconds in the ledger, and no running node is left behind', async () => {
+  const { graph, root } = fixture('sleep 0.2');
+  const result = await runGraph(graph, { runId: 'timed', deps: { root } });
+  const saved = JSON.parse(readFileSync(result.statePath, 'utf8'));
+  for (const record of saved.nodes) expectNodeTimes(record);
+  expect(saved.nodes[0].seconds).toBeGreaterThanOrEqual(0.15);
+  expect(Date.parse(saved.nodes[0].endedAt)).toBeLessThanOrEqual(Date.parse(saved.nodes[1].startedAt));
+  expect(saved.currentNode).toBeUndefined();
+});
+
+test('GRAPH-NODE-TIMES: the ledger names the running node and its start while it runs', async () => {
+  const { graph, root } = fixture('exit 0');
+  let seen: { currentNode?: { nodeId: string; startedAt: string }; nodes: unknown[] } | undefined;
+  const result = await runGraph(graph, { runId: 'running', deps: { root, runBash: async () => {
+    seen ??= JSON.parse(readFileSync(join(root, 'graph-runs', 'test-graph', 'running.json'), 'utf8'));
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } });
+  expect(seen?.nodes).toEqual([]);
+  expect(seen?.currentNode).toEqual({ nodeId: 'first', startedAt: expect.any(String) });
+  expect(result.nodes[0]?.startedAt).toBe(seen!.currentNode!.startedAt);
+});
+
+test('GRAPH-NODE-TIMES: a failed node records its times too', async () => {
+  const { graph, root } = fixture('exit 1');
+  const result = await runGraph(graph, { deps: { root } });
+  expect(result.nodes[0]).toMatchObject({ ok: false, exit: 1 });
+  expectNodeTimes(result.nodes[0]);
+});
+
+test('GRAPH-NODE-TIMES: a stopped node keeps its start and ends at the stop', async () => {
+  const { graph, root } = fixture('exit 0');
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const ongoing = runGraph(graph, { runId: 'timed-stop', deps: { root, runBash: async () => {
+    entered();
+    await blocked;
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } });
+  await started;
+  let stopped;
+  try { stopped = manageGraphRun('test-graph', 'timed-stop', 'stop', root, () => null); }
+  finally { release(); }
+  await expect(ongoing).rejects.toThrow('run was stopped or ownership changed');
+  expect(stopped.nodes[0]).toMatchObject({ nodeId: 'first', error: 'stopped before node completed', endedAt: stopped.stoppedAt });
+  expectNodeTimes(stopped.nodes[0]);
+  expect(stopped.currentNode).toBeUndefined();
+});
+
+test('GRAPH-NODE-TIMES: stopping a run whose older runner never named the running node records only the stop as its end', async () => {
+  const { root } = fixture('exit 0');
+  const dir = join(root, 'graph-runs', 'test-graph');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, 'legacy-stop.json');
+  writeFileSync(file, JSON.stringify({ graphId: 'test-graph', runId: 'legacy-stop', startedAt: '2026-10-06T00:00:00.000Z', status: 'running',
+    pid: 999999, pidStartedAt: '2026-10-06T00:00:00.000Z', path: ['first'], nodes: [], executed: 0, dryRun: false, statePath: file }, null, 2));
+  const stopped = manageGraphRun('test-graph', 'legacy-stop', 'stop', root, () => null);
+  expect(stopped.nodes).toEqual([{ nodeId: 'first', ok: false, exit: null, executed: false, error: 'stopped before node completed', endedAt: stopped.stoppedAt }]);
+});
+
+test('GRAPH-NODE-TIMES: --from keeps earlier node times and writes new times for re-run nodes; an old ledger without times still resumes', async () => {
+  const { graph, root } = fixture('printf original');
+  let calls = 0;
+  const deps = { root, runBash: async () => {
+    calls++;
+    return { stdout: 'x', stderr: '', exitCode: calls === 2 ? 1 : 0 };
+  } };
+  const first = await runGraph(graph, { runId: 'timed-restart', deps });
+  expect(first.status).toBe('failed');
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  // An older ledger: the preserved node has no times at all.
+  const legacyFirst = { ...ledger.nodes[0] };
+  delete legacyFirst.startedAt; delete legacyFirst.endedAt; delete legacyFirst.seconds;
+  writeFileSync(first.statePath, JSON.stringify({ ...ledger, nodes: [legacyFirst, ...ledger.nodes.slice(1)] }, null, 2));
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'second', deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.nodes[0]).toEqual(legacyFirst);
+  expectNodeTimes(resumed.nodes[1]);
+  expect(Date.parse(resumed.nodes[1]!.startedAt!)).toBeGreaterThanOrEqual(Date.parse(ledger.nodes[1].endedAt));
+
+  const timed = await runGraph(graph, { runId: 'timed-restart-2', deps: { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 1 }) } });
+  expect(timed.status).toBe('failed');
+  const again = await runGraph(graph, { resumeRunId: timed.runId, fromNodeId: 'first', deps: { root } });
+  expectNodeTimes(again.nodes[0]);
+
+  // A timed earlier node survives --from byte for byte.
+  let third = 0;
+  const thirdDeps = { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: ++third === 2 ? 1 : 0 }) };
+  const failedSecond = await runGraph(graph, { runId: 'timed-restart-3', deps: thirdDeps });
+  expectNodeTimes(failedSecond.nodes[0]);
+  const kept = await runGraph(graph, { resumeRunId: failedSecond.runId, fromNodeId: 'second', deps: thirdDeps });
+  expect(kept.nodes[0]).toEqual(failedSecond.nodes[0]);
+  expect(Date.parse(kept.nodes[1]!.startedAt!)).toBeGreaterThanOrEqual(Date.parse(failedSecond.nodes[1]!.endedAt!));
+  expect(kept.resume?.at).toBeDefined();
+  expectNodeTimes(kept.nodes[1]);
 });
 
 test('each cmd receives its own context file with input and previous stdout', async () => {

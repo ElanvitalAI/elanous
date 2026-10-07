@@ -17,7 +17,7 @@ describe('machine ledger migration', () => {
   test('retains each compute-resource and portable-device row, including the unnamed purchases', () => {
     expect(ledger.machines.map(({ id, name }) => [id, name])).toEqual([
       ['mbp', 'mbp'],
-      ['mac-mini-m5-pro', '(미정)'],
+      ['mac-studio-m5-max', '(미정)'],
       ['node-b', 'node-b'],
       ['mac-studio-m5-ultra', '(미정)'],
       ['node-c', 'node-c'],
@@ -38,7 +38,7 @@ describe('machine ledger migration', () => {
       locationStatus: '**사무실** 고정(들고 다니지 않음) · 가동',
       role: '**작업실(사무실 메인)**',
     });
-    expect(ledger.machines.find(({ id }) => id === 'mac-mini-m5-pro')?.duties).toContain('이전 = 0.2.8 HQ2(TC)');
+    expect(ledger.machines.find(({ id }) => id === 'mac-studio-m5-max')?.duties).toContain('영상 파이프라인');
     expect(ledger.machines.find(({ id }) => id === 'cloud-vm')?.duties).toContain('폰 릴레이 서비스 설치 예정');
     expect(ledger.devices.find(({ id }) => id === 'iphone-duo')?.status).toBe('**구매 예정**(10-23 출시)');
   });

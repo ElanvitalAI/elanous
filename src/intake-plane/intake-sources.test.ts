@@ -88,6 +88,20 @@ test('ingest canonicalizes raw seat aliases before ID and merge, and rejects unk
   expect(readFileSync(join(root, 'intake', 'items.jsonl'), 'utf8')).toBe(before);
 }));
 
+test('user watch github query runs through runDue with user identity, not MK', fixture(async (root) => {
+  addSource({ id: 'watch-agent', seat: 'user', kind: 'github-query', spec: 'topic:agent', every: '1d' }, root);
+  addSource({ id: 'mk-agent', seat: 'MK', kind: 'github-query', spec: 'topic:marketing', every: '1d' }, root);
+  const queries: string[] = [];
+  const result = await runDue({ now, seat: 'user', deps: { stateDir: root, searchGithub: async (query) => {
+    queries.push(query);
+    return [{ fullName: 'example/agent', url: 'https://github.com/example/agent', description: 'Agent', stars: 7, createdAt: now.toISOString(), pushedAt: now.toISOString() }];
+  } } });
+  expect(result.ran).toEqual([{ id: 'watch-agent', items: 1 }]);
+  expect(queries).toHaveLength(1);
+  expect(listIntakeItems(root, { seat: 'user' })).toHaveLength(1);
+  expect(listIntakeItems(root, { seat: 'MK' })).toHaveLength(0);
+}));
+
 test('github-query invokes exactly its own query, ingests the repo with its seat', fixture(async (root) => {
   addSource({ id: 'gh', seat: 'TC', kind: 'github-query', spec: 'topic:agent', every: '1w' }, root);
   const queries: string[] = [];

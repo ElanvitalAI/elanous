@@ -3491,6 +3491,8 @@ export interface OrchestratorLoopConfig {
   mode: 'off' | 'shadow' | 'live';
   seatTrees: Partial<Record<OrchestratorSeat, string[]>>;
   seatCaps: Record<OrchestratorSeat, number>;
+  /** Max new delegations per tick; absent means no limit. */
+  maxDelegatePerTick?: number;
   /** Per-seat release gate; absent seats retain the spawn-budget default. */
   releaseGate?: Partial<Record<OrchestratorSeat, number>>;
   trafficMode: 'shadow' | 'live';
@@ -3502,6 +3504,9 @@ export interface OrchestratorLoopConfig {
   handToTaskAgent?: 'off' | 'shadow' | 'live';
   /** Demo: hand only this cell id (others keep the seat path). Absent = every delegatable cell. */
   handToTaskAgentCell?: string;
+  /** COORD-HA — the tick CLI probes LLM ⊕ task board for the degradation ladder. Absent = shadow (probe and log only) ·
+   *  live = the tick acts on it (L1 rules only · L2 no new assignment) · off = no probe. */
+  degradationSignal?: 'off' | 'shadow' | 'live';
 }
 
 export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
@@ -3527,12 +3532,16 @@ export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfi
     if (typeof gate === 'number' && Number.isSafeInteger(gate) && gate >= 0) releaseGate[seat] = gate;
   }
   const mode = value.mode === 'off' || value.mode === 'live' ? value.mode : 'shadow';
-  return { mode, seatTrees, seatCaps, ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
+  const maxDelegatePerTick = value.maxDelegatePerTick;
+  return { mode, seatTrees, seatCaps,
+    ...(typeof maxDelegatePerTick === 'number' && Number.isSafeInteger(maxDelegatePerTick) && maxDelegatePerTick >= 0 ? { maxDelegatePerTick } : {}),
+    ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
     trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow',
     idleRequest: value.idleRequest === 'off' || value.idleRequest === 'live' ? value.idleRequest : 'shadow',
     finishGate: value.finishGate === 'off' || value.finishGate === 'on' ? value.finishGate : 'shadow',
     ...(value.handToTaskAgent === 'shadow' || value.handToTaskAgent === 'live' ? { handToTaskAgent: value.handToTaskAgent } : {}),
-    ...(typeof value.handToTaskAgentCell === 'string' && value.handToTaskAgentCell.trim() ? { handToTaskAgentCell: value.handToTaskAgentCell.trim() } : {}) };
+    ...(typeof value.handToTaskAgentCell === 'string' && value.handToTaskAgentCell.trim() ? { handToTaskAgentCell: value.handToTaskAgentCell.trim() } : {}),
+    ...(value.degradationSignal === 'off' || value.degradationSignal === 'shadow' || value.degradationSignal === 'live' ? { degradationSignal: value.degradationSignal } : {}) };
 }
 
 export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
@@ -3602,6 +3611,8 @@ export interface HqConfig {
   tailscaleBin?: string;
   /** Highest lease generation this host ever saw (default ~/.elanous-hq/seen-generation · 600). */
   seenGenerationFile?: string;
+  /** Board writes only reject stale generations when explicitly enforced (default shadow). */
+  boardFencing?: 'shadow' | 'enforce';
   /** Per-probe timeout in seconds (default 5). */
   probeTimeoutSeconds?: number;
 }
@@ -3636,7 +3647,64 @@ export function parseGateRemoteConfig(raw: unknown): GateRemoteConfig | undefine
   return Object.keys(out).length ? out : undefined;
 }
 
+export interface ProjectConfig {
+  /** `axes` is absent when the configured axes are invalid; `error` then carries the config error text. */
+  rubric?: { axes?: import('./release-loop/rubric.js').RubricAxis[]; error?: string };
+}
+
+/** Validate one project's `rubric.axes` — throws the config error text (key duplicate · non-numeric weight). */
+export function parseProjectRubricAxes(id: string, axes: unknown): Array<{ key: string; weight: number }> {
+  if (!Array.isArray(axes)) throw new Error(`[user-config] projects.${id}.rubric.axes 는 배열이어야 합니다`);
+  const seen = new Set<string>();
+  const parsed: Array<{ key: string; weight: number }> = [];
+  for (const [index, axis] of axes.entries()) {
+    const field = `projects.${id}.rubric.axes[${index}]`;
+    if (!axis || typeof axis !== 'object' || Array.isArray(axis)) throw new Error(`[user-config] ${field} 는 {key,weight} 객체여야 합니다`);
+    const { key, weight } = axis as Record<string, unknown>;
+    if (typeof key !== 'string' || !key.trim()) throw new Error(`[user-config] ${field}.key 는 빈 문자열일 수 없습니다`);
+    if (seen.has(key)) throw new Error(`[user-config] projects.${id}.rubric.axes 키 중복: ${key}`);
+    if (typeof weight !== 'number' || !Number.isFinite(weight)) throw new Error(`[user-config] ${field}.weight 는 유한한 숫자여야 합니다: ${String(weight)}`);
+    seen.add(key);
+    parsed.push({ key, weight });
+  }
+  return parsed;
+}
+
+/**
+ * Project rubric axes (P3b CORE-GENERIC). Loading never throws — one bad project entry must not
+ * stop every command — so an invalid entry keeps its error text and `resolveRubricAxes` raises it.
+ */
+function parseProjectsConfig(raw: unknown): Record<string, ProjectConfig> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const projects: Record<string, ProjectConfig> = {};
+  for (const [id, entry] of Object.entries(raw)) {
+    if (id === '__proto__' || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const rubric = (entry as Record<string, unknown>).rubric;
+    if (!rubric || typeof rubric !== 'object' || Array.isArray(rubric)) continue;
+    const axes = (rubric as Record<string, unknown>).axes;
+    if (axes === undefined) continue;
+    try {
+      projects[id] = { rubric: { axes: parseProjectRubricAxes(id, axes) } };
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      console.warn(`${error} — 이 프로젝트의 루브릭 축 해석은 오류로 멈춘다`);
+      projects[id] = { rubric: { error } };
+    }
+  }
+  return Object.keys(projects).length ? projects : undefined;
+}
+
 export interface UserConfig {
+  projects?: Record<string, ProjectConfig>;
+  /** Default personal topic watch; absent = enabled when user sources exist. */
+  watch?: { enabled?: boolean };
+  starter?: { topics?: string[] };
+  /** GUARD-ONE-a: omitted means shadow. `live` is parsed for the later cutover, but `elanous guardian tick`
+   *  refuses it until a human-confirmed operational change (GUARD-ONE-a ships shadow only). */
+  guardian?: { mode?: 'shadow' | 'live' };
+  /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
+   *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
+  taskAgent?: { liveMoves?: string[] };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -3912,6 +3980,36 @@ function parseAutoReviewConfig(raw: unknown): AutoReviewConfig | undefined {
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Keeps `taskAgent.liveMoves` as raw strings — the allow-list (and the unknown-entry warning) lives in the task agent. */
+function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('taskAgent', '섹션이 객체가 아니다 — 버림');
+    return undefined;
+  }
+  const liveMoves = (raw as Record<string, unknown>).liveMoves;
+  if (liveMoves === undefined) return undefined;
+  // 설정이 «있으면» 환경 변수로 내려가지 않는다 — 배열이 아니면 빈 목록(fail-closed), 문자열 밖 항목은 글자로 바꿔 넘겨
+  // 실행부가 «모르는 항목»으로 경고하고 버리게 한다(유효한 항목은 산다).
+  if (!Array.isArray(liveMoves)) {
+    warnUserConfigDrop('taskAgent.liveMoves', '배열이 아니다 — 빈 목록(실행 0)');
+    return { liveMoves: [] };
+  }
+  return { liveMoves: liveMoves.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry) ?? String(entry)) };
+}
+
+function parseGuardianConfig(raw: unknown): UserConfig['guardian'] {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('guardian', '섹션이 객체가 아니다 — 버림');
+    return undefined;
+  }
+  const mode = (raw as Record<string, unknown>).mode;
+  if (mode === 'shadow' || mode === 'live') return { mode };
+  if (mode !== undefined) warnUserConfigDrop('guardian.mode', 'shadow 또는 live 가 아니다 — 버림');
+  return undefined;
 }
 
 /** Parse optional ops fields independently; invalid settings cannot silently select a cron cwd. */
@@ -4635,6 +4733,7 @@ export function parseHqConfig(raw: unknown): HqConfig | undefined {
   }
   if (typeof r.ttlSeconds === 'number' && Number.isFinite(r.ttlSeconds) && r.ttlSeconds > 0) out.ttlSeconds = r.ttlSeconds;
   if (typeof r.probeTimeoutSeconds === 'number' && Number.isFinite(r.probeTimeoutSeconds) && r.probeTimeoutSeconds > 0) out.probeTimeoutSeconds = r.probeTimeoutSeconds;
+  if (r.boardFencing === 'shadow' || r.boardFencing === 'enforce') out.boardFencing = r.boardFencing;
   if (r.autoPromote && typeof r.autoPromote === 'object' && !Array.isArray(r.autoPromote)) {
     const auto = r.autoPromote as Record<string, unknown>;
     const setting: NonNullable<HqConfig['autoPromote']> = {};
@@ -4771,7 +4870,15 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const nexus = rawObj.nexus && typeof rawObj.nexus === 'object' && !Array.isArray(rawObj.nexus)
     ? rawObj.nexus as Record<string, unknown> : {};
   const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
+  const projects = parseProjectsConfig(rawObj.projects);
   return {
+    ...(projects ? { projects } : {}),
+    ...(rawObj.starter && typeof rawObj.starter === 'object' && !Array.isArray(rawObj.starter)
+      && Array.isArray((rawObj.starter as Record<string, unknown>).topics)
+      ? { starter: { topics: ((rawObj.starter as { topics: unknown[] }).topics).filter((topic): topic is string => typeof topic === 'string' && !!topic.trim()) } } : {}),
+    ...(rawObj.watch && typeof rawObj.watch === 'object' && !Array.isArray(rawObj.watch)
+      && typeof (rawObj.watch as Record<string, unknown>).enabled === 'boolean'
+      ? { watch: { enabled: (rawObj.watch as { enabled: boolean }).enabled } } : {}),
     nexus: { demoMode: nexus.demoMode === true },
     ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
     pod: {
@@ -5507,6 +5614,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     loops: { ...(stewardLoops ?? {}), ...parseLoopOwners(rawObj.loops), orchestrator: parseOrchestratorLoopConfig((rawObj.loops as { orchestrator?: unknown } | undefined)?.orchestrator), seat: parseSeatLoopsConfig(rawObj.loops),
       persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true } },
     events: parseEventsConfig(rawObj.events),
+    guardian: parseGuardianConfig(rawObj.guardian),
+    taskAgent: parseTaskAgentConfig(rawObj.taskAgent),
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.
     ...spreadIfDefined('modelTier', parseModelTierConfig(rawObj.modelTier)),
@@ -6045,6 +6154,21 @@ export function saveUserConfig(
     },
   };
   const rawRest = { ...(cfg.raw ?? {}) };
+  // projects: raw entries are kept verbatim — an invalid entry loaded from disk is preserved, not blocked (its error
+  // surfaces in resolveRubricAxes) — and typed axes handed to save are validated (invalid ones refuse the save).
+  const rawProjectsValue = rawRest.projects;
+  const rawProjects = rawRest.projects && typeof rawRest.projects === 'object' && !Array.isArray(rawRest.projects)
+    ? rawRest.projects as Record<string, unknown> : undefined;
+  const savedProjects: Record<string, unknown> | undefined = rawProjects || cfg.projects ? { ...(rawProjects ?? {}) } : undefined;
+  for (const [id, project] of Object.entries(cfg.projects ?? {})) {
+    if (project?.rubric?.axes === undefined) continue;
+    const axes = parseProjectRubricAxes(id, project.rubric.axes);
+    const rawProject = rawProjects?.[id] && typeof rawProjects[id] === 'object' && !Array.isArray(rawProjects[id])
+      ? rawProjects[id] as Record<string, unknown> : {};
+    const rawRubric = rawProject.rubric && typeof rawProject.rubric === 'object' && !Array.isArray(rawProject.rubric)
+      ? rawProject.rubric as Record<string, unknown> : {};
+    savedProjects![id] = { ...rawProject, rubric: { ...rawRubric, axes } };
+  }
   // Strip typed sections from raw so we don't double-write stale copies.
   delete rawRest.skillRouter;
   delete rawRest.llm;
@@ -6079,6 +6203,10 @@ export function saveUserConfig(
   delete rawRest.smartDefaults;
   delete rawRest.grounding;
   delete rawRest.diagnostics;
+  delete rawRest.projects;
+  delete rawRest.starter;
+  delete rawRest.watch;
+  delete rawRest.guardian;
   const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
     ? rawRest.harness as Record<string, unknown> : {};
   delete rawRest.harness;
@@ -6113,6 +6241,10 @@ export function saveUserConfig(
       helper: cfg.harness?.helper ?? rawHarness.helper,
     }),
     ...rawRest,
+    ...(savedProjects ? { projects: savedProjects } : rawProjectsValue !== undefined ? { projects: rawProjectsValue } : {}),
+    ...(cfg.starter ? { starter: cfg.starter } : {}),
+    ...(cfg.watch ? { watch: cfg.watch } : {}),
+    ...(cfg.guardian ? { guardian: cfg.guardian } : {}),
     ...(cfg.loops ? { loops: {
       ...rawLoops,
       owners: cfg.loops.owners ?? {}, defaultOwner: cfg.loops.defaultOwner ?? 'OP',

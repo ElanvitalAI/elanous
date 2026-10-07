@@ -94,3 +94,32 @@ describe('§A9 G2 — 재발사 갈래가 실행부에 구분되어 넘어간다
     expect(judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 1 }).executorVariant).toBeUndefined();
   });
 });
+
+describe('종결 종류 — code-pr 밖은 확인 증거로 종결 (RFC-loop-agent-map §A4b③)', () => {
+  test('증거 ok → green 제안(근거 ref) · 증거 없음 → 확인 증거 대기 · ok=false → 좁혀 재발사', () => {
+    const green = judgeNextMove({ stopReason: 'converged', completion: 'research-report', evidence: { ok: true, ref: 'out/report.md' } });
+    expect(green.move).toBe('propose-green');
+    expect(green.executorKind).toBe('green');
+    expect(green.reason).toContain('out/report.md');
+    const waiting = judgeNextMove({ stopReason: 'converged', completion: 'research-report' });
+    expect(waiting.move).toBe('wait');
+    expect(waiting.reason).toContain('확인 증거 대기');
+    expect(judgeNextMove({ completion: 'ops-action' }).reason).toBe('확인 증거 대기 — ops-action');
+    const failed = judgeNextMove({ stopReason: 'converged', completion: 'artifact', evidence: { ok: false, ref: 'a.png' } });
+    expect(failed.move).toBe('narrow-relaunch');
+    expect(failed.executorKind).toBe('retry');
+    const blankRef = judgeNextMove({ stopReason: 'converged', completion: 'artifact', evidence: { ok: true, ref: '  ' } });
+    expect(blankRef.move).toBe('wait');
+    expect(blankRef.reason).toBe('확인 증거 대기 — artifact (ref 비어 있음)');
+  });
+
+  test('보존 — completion 생략·code-pr 은 종전 수·문면 그대로 · 증거가 없으면 종료 어휘 표가 그대로 산다', () => {
+    for (const completion of [undefined, 'code-pr'] as const) {
+      expect(judgeNextMove({ stopReason: 'converged', completion })).toEqual(judgeNextMove({ stopReason: 'converged' }));
+      expect(judgeNextMove({ stopReason: 'converged', completion }).reason).toBe('완주했으나 PR 병합 근거 대기');
+      expect(judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 7, completion, evidence: { ok: false, ref: 'x' } }).move).toBe('propose-green');
+    }
+    expect(judgeNextMove({ stopReason: 'provider-exhausted', completion: 'watch-brief' }).move).toBe('wait-retry');
+    expect(judgeNextMove({ stopReason: 'no-progress', completion: 'content' }).move).toBe('narrow-relaunch');
+  });
+});

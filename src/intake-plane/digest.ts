@@ -1,14 +1,15 @@
 // 흡수 하루 다이제스트 — 그날 흡수한 것을 사람이 «발견»하는 자리. 노트 절(마크다운) ⊕ 텔레그램 짧은 판.
 // 결정론만: 요약 한 줄은 각 노트가 이미 쓴 「한 줄 결론」을 뽑는다(LLM 을 다시 부르지 않는다).
-import { existsSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { loadIntakeLedger, type IntakeItem } from './items.js';
+import { canonicalSeat } from './intake-sources.js';
 import { readSavedCursorAt } from './collect-telegram-saved.js';
 import { intakeOutboxDir, kstDay } from './route.js';
 
 export type DigestLensVerdict = '대체 후보' | '보강' | '경쟁 대조';
 export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
-export interface IntakeDigest { day: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
+export interface IntakeDigest { day: string; seat?: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
 const AXIS_LABEL: Record<string, string> = {
   video_automation: '영상 자동화', agent_basics: '에이전트 기본', agent_applied: '에이전트 응용', unrelated: '그 밖',
@@ -51,9 +52,27 @@ export function pathOnly(why: string): boolean {
   return rest.length < 4;
 }
 
-export function buildIntakeDigest(root: string, day: string, readFile: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : undefined), now: Date = new Date()): IntakeDigest {
+/** Seat briefing receipts — `outbox/brief/<seat>.jsonl` rows `{ id, day }`: an item already sent on an earlier day is not «new» again. */
+export function seatBriefFile(root: string, seat: string): string { return join(intakeOutboxDir(root), 'brief', `${seat}.jsonl`); }
+
+/** Record the items a seat briefing delivered (called only after a successful send). */
+export function recordSeatBriefed(root: string, seat: string, day: string, ids: readonly string[]): void {
+  if (!ids.length) return;
+  const file = seatBriefFile(root, seat);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, ids.map((id) => JSON.stringify({ id, day })).join('\n') + '\n');
+}
+
+export function buildIntakeDigest(root: string, day: string, readFile: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : undefined), now: Date = new Date(), seat?: string): IntakeDigest {
+  const selectedSeat = seat === undefined ? undefined : canonicalSeat(seat);
+  // Re-collecting the same search result moves lastSeenAt to today; without receipts it would be «new» every morning.
+  const briefedEarlier = new Set(selectedSeat
+    ? readJsonl(seatBriefFile(root, selectedSeat)).filter((r) => typeof r.id === 'string' && r.day !== day).map((r) => r.id as string)
+    : []);
   const items = [...loadIntakeLedger(root).items.values()]
-    .filter((i) => (i.status === 'absorbed' || i.status === 'routed') && kstDay(i.lastSeenAt) === day && i.outputs.some((o) => o.kind === 'note'));
+    .filter((i) => (selectedSeat === undefined || (i.seat === selectedSeat && !briefedEarlier.has(i.id)))
+      && (selectedSeat ? i.status !== 'discarded' : (i.status === 'absorbed' || i.status === 'routed') && i.outputs.some((o) => o.kind === 'note'))
+      && kstDay(i.lastSeenAt) === day);
   const out = intakeOutboxDir(root);
   const relevant = new Map<string, NonNullable<DigestEntry['impact']>>();
   // The lens (src/intake-plane/lens.ts) writes its verdicts to outbox/lens/<day>.jsonl; route folders carry none.
@@ -76,13 +95,13 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
     return {
       id: i.id, sources: i.sources, ...(i.url ? { url: i.url } : {}),
       ...(note ? { note, noteName: basename(note, '.md') } : {}),
-      ...(md ? { oneLiner: noteOneLiner(md) } : {}),
+      ...(md ? { oneLiner: noteOneLiner(md) } : selectedSeat && i.title ? { oneLiner: i.title } : {}),
       axis: AXIS_LABEL[i.judgement?.axis ?? i.axis ?? ''] ?? (i.sources.includes('telegram-saved') ? '내가 저장한 것' : '그 밖'),
       ...(impact ? { impact } : {}),
     };
   });
-  const goals = readJsonl(join(out, 'goals', `${day}.jsonl`)).map((g) => ({ fact: String(g.fact ?? ''), ...(g.url ? { url: String(g.url) } : {}) }));
-  const lensRows = readJsonl(join(out, 'lens', `${day}.jsonl`));
+  const goals = selectedSeat ? [] : readJsonl(join(out, 'goals', `${day}.jsonl`)).map((g) => ({ fact: String(g.fact ?? ''), ...(g.url ? { url: String(g.url) } : {}) }));
+  const lensRows = selectedSeat ? [] : readJsonl(join(out, 'lens', `${day}.jsonl`));
   const news = lensRows.flatMap((row) =>
     typeof row.title === 'string' && typeof row.url === 'string' && Array.isArray(row.summary) && Array.isArray(row.implication)
       ? [{ title: row.title, url: row.url, summary: row.summary.filter((s): s is string => typeof s === 'string'), implication: row.implication.filter((s): s is string => typeof s === 'string') }]
@@ -94,15 +113,15 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
       if (suggestion.status !== '제안' || typeof suggestion.fact !== 'string' || !suggestion.fact.trim()) return [];
       return [{ fact: suggestion.fact, ...(typeof row.url === 'string' ? { url: row.url } : {}), verdict: typeof suggestion.verdict === 'string' ? suggestion.verdict : '판단 필요' }];
     }) : []);
-  const review = readJsonl(join(out, 'review', `${day}.jsonl`)).map((r) => ({ fact: String(r.fact ?? ''), ...(r.note ? { note: String(r.note) } : {}) }));
-  const grounding = readJsonl(join(out, 'grounding.jsonl')).filter((g) => typeof g.at === 'string' && kstDay(g.at) === day).length;
-  const lastNewAt = readSavedCursorAt(root);
+  const review = selectedSeat ? [] : readJsonl(join(out, 'review', `${day}.jsonl`)).map((r) => ({ fact: String(r.fact ?? ''), ...(r.note ? { note: String(r.note) } : {}) }));
+  const grounding = selectedSeat ? 0 : readJsonl(join(out, 'grounding.jsonl')).filter((g) => typeof g.at === 'string' && kstDay(g.at) === day).length;
+  const lastNewAt = selectedSeat ? undefined : readSavedCursorAt(root);
   const silentMs = lastNewAt ? now.getTime() - Date.parse(lastNewAt) : NaN;
   return {
-    day, absorbed, goals, ...(news.length ? { news } : {}), ...(shadowSuggestions.length ? { shadowSuggestions } : {}), review, grounding,
-    release: readJsonl(join(out, 'release', `${day}.jsonl`)).length,
-    manual: readJsonl(join(out, 'manual', `${day}.jsonl`)).length,
-    ...(lastNewAt && silentMs > SAVED_SILENCE_MS ? { savedSilence: { days: Math.floor(silentMs / 86_400_000), lastNewAt } } : {}),
+    day, ...(selectedSeat ? { seat: selectedSeat } : {}), absorbed, goals, ...(news.length ? { news } : {}), ...(shadowSuggestions.length ? { shadowSuggestions } : {}), review, grounding,
+    release: selectedSeat ? 0 : readJsonl(join(out, 'release', `${day}.jsonl`)).length,
+    manual: selectedSeat ? 0 : readJsonl(join(out, 'manual', `${day}.jsonl`)).length,
+    ...(!selectedSeat && lastNewAt && silentMs > SAVED_SILENCE_MS ? { savedSilence: { days: Math.floor(silentMs / 86_400_000), lastNewAt } } : {}),
   };
 }
 
@@ -146,6 +165,11 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
 
 /** 텔레그램 — 흡수 렌즈가 대조한 항목만 SCQA 짧은 판으로 낸다. */
 export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string } = {}): string {
+  if (d.seat && !d.absorbed.length) return '오늘 새 소식 없음';
+  if (d.seat) return [
+    `흡수 ${d.absorbed.length}`,
+    ...d.absorbed.map((item) => `- ${item.oneLiner ?? item.noteName ?? item.id}${item.url ? ` · ${item.url}` : ''}`),
+  ].join('\n');
   // «Touching» is decided by the lens verdict alone; a missing note summary only changes how S reads (ACP must-fix).
   const touching = d.absorbed.filter((e) => e.impact);
   const L = [`흡수 ${d.absorbed.length} → 우리에게 닿는 것 ${touching.length}`];

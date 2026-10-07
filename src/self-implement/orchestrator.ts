@@ -5381,6 +5381,7 @@ async function runSelfImplementInner(
       const { listSubscribers } = await import('../session/index.js');
       clarificationEscalation = await escalateGoalDocumentClarifications({
         goalFile: resolvedGoalFile,
+        runId,
         dispatchContext: clarificationDispatchContext,
         resolveOriginDelivery: (sessionId) => originHitlDelivery(listSubscribers(sessionId)),
         // ⛔ seam 이 주입되면 전역 리졸버는 «불리지 않는다» — 그때 'terminal' 이라 적으면
@@ -6231,7 +6232,7 @@ async function runSelfImplementInner(
                     const source = readFileSync(opts.goalFile, 'utf8');
                     // Always run the shared self-answer so every rework pass leaves one observation, even with nothing pending.
                     const resolved = await selfAnswerGoalDocumentClarifications(source, {
-                      path: 'rework', ask: source, resolver: s.selfResolveClarification,
+                      path: 'rework', ask: source, resolver: s.selfResolveClarification, runId,
                     });
                     if (resolved.newlyAnswered > 0) writeGoalDocumentAtomic(opts.goalFile, resolved.document);
                   } catch (error) {

@@ -12,6 +12,8 @@ import {
   podCommandScript,
   podCommandSecretKeys,
   podCommandTargetCommit,
+  podCpuMillis,
+  resolvePodCpu,
   runPodCommand,
   tailBytes,
 } from './pod-command-job.js';
@@ -81,6 +83,28 @@ describe('pod command job manifest', () => {
     expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46');
     expect(JSON.stringify(manifest({ clone: true, bunCache: undefined }))).toBe(JSON.stringify(original));
     expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
+  });
+
+  test('GATE-SPEED A3①: cpu omitted keeps request 1 / limit 4 and the pre-change bytes; cpu override reaches the Job spec', () => {
+    const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
+    const original = manifest({ clone: true });
+    expect(res(original)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46');
+    expect(JSON.stringify(manifest({ clone: true, cpu: undefined }))).toBe(JSON.stringify(original));
+    expect(JSON.stringify(manifest({ clone: true, cpu: {} }))).toBe(JSON.stringify(original));
+    expect(res(manifest({ clone: true, cpu: { request: '1', limit: '1' } }))).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '1' } });
+    expect(res(manifest({ clone: true, cpu: { request: '500m' } })).requests.cpu).toBe('500m');
+    expect(res(manifest({ clone: true, cpu: { request: '500m' } })).limits.cpu).toBe('4');
+    expect(() => manifest({ cpu: { request: '2', limit: '1' } })).toThrow('exceeds limit');
+    expect(() => manifest({ cpu: { request: 'two' } })).toThrow('not a positive CPU quantity');
+    expect(() => manifest({ cpu: { limit: '0' } })).toThrow('not a positive CPU quantity');
+  });
+
+  test('podCpuMillis / resolvePodCpu read Kubernetes CPU quantities', () => {
+    expect([podCpuMillis('1'), podCpuMillis('0.5'), podCpuMillis('1500m'), podCpuMillis(' 2 ')]).toEqual([1000, 500, 1500, 2000]);
+    expect([podCpuMillis('0'), podCpuMillis('-1'), podCpuMillis('1Gi'), podCpuMillis('0.0001'), podCpuMillis('')]).toEqual([null, null, null, null, null]);
+    expect(resolvePodCpu(undefined)).toEqual({ request: '1', limit: '4' });
+    expect(resolvePodCpu({ limit: '2' })).toEqual({ request: '1', limit: '2' });
   });
 
   test('skills·llm 이 없으면 Secret 자격 키가 0개다', () => {
@@ -239,6 +263,27 @@ describe('runPodCommand', () => {
     expect(applied!.spec.template.spec.containers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
   });
 
+  test('POOLGLOBAL-REG: a caller-supplied scheduler (the gate) launches past cluster occupancy — own Jobs only', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 8, k3dCluster: 'elanous-pool' };
+    let occupancyReads = 0;
+    // The cluster reports 17 goal Pods on an 8-slot spec: the pre-fix scheduler would wait here forever.
+    const pool = new PodPoolScheduler([member], { occupancy: () => { occupancyReads++; return { 'pool-node-b': { occupied: 17 } }; } });
+    let applied = false;
+    const result = await runPodCommand({ command: ['true'], poolScheduler: pool, name: 'gate-self-capped',
+      sleep: async () => { throw new Error('waited for a slot'); },
+      kubectl: (args, input) => {
+        if (input && JSON.parse(input).kind === 'Job') applied = true;
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      imageCommit: null, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-self-capped-test',
+    });
+    expect(result.job).toBe('gate-self-capped');
+    expect(applied).toBe(true);
+    expect(occupancyReads).toBe(0);
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
   test('pool registry tag uses IfNotPresent for both the isolation gate and child', async () => {
     const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5050' };
     const ref = 'k3d-elanous-registry:5050/elanous-harness:abcdef123456';
@@ -341,6 +386,30 @@ describe('runPodCommand', () => {
     expect(omittedSpec.containers[0]!.volumeMounts).toBeUndefined();
     expect(podCommandScript(omitted)).not.toContain('BUN_INSTALL_CACHE_DIR');
     await expect(runPodCommand({ command: ['true'], bunCache: 'relative/cache', env: {}, kubectl: () => ({ status: 0, stdout: '', stderr: '' }) })).rejects.toThrow('absolute directory path');
+  });
+
+  test('GATE-SPEED A3①: runPodCommand passes cpu to the Job only when given; a bad quantity is refused before any apply', async () => {
+    const applied: Array<Record<string, unknown>> = [];
+    const run = async (cpu?: { request?: string; limit?: string }) => {
+      await runPodCommand({ command: ['true'], ...(cpu ? { cpu } : {}), env: {}, configHostMirror: () => undefined,
+        kubectl: (args, input) => {
+          if (input) applied.push(JSON.parse(input) as Record<string, unknown>);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, imageCommit: null, name: 'cpu-test', artifactsRoot: '/tmp/pod-command-cpu-test',
+      });
+      const job = applied.filter((body) => body.kind === 'Job').at(-1)!;
+      return (job.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
+    };
+    // Non-gate callers (agent-mission · pod command CLI) name no cpu: today's request 1 / limit 4.
+    expect(await run()).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
+    expect(await run({ request: '1', limit: '1' })).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '1' } });
+    const before = applied.length;
+    const kubectlCalls: string[][] = [];
+    await expect(runPodCommand({ command: ['true'], cpu: { request: '8', limit: '4' }, env: {}, configHostMirror: () => undefined,
+      kubectl: (args) => { kubectlCalls.push([...args]); return { status: 0, stdout: '', stderr: '' }; } })).rejects.toThrow('exceeds limit');
+    expect(kubectlCalls).toEqual([]);
+    expect(applied.length).toBe(before);
   });
 
   test('clone-free Job mounts a configured host mirror when an environment mirror is set', async () => {

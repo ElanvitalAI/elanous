@@ -40,6 +40,7 @@ export interface ChecklistHistory {
   dev: string;
   force?: true;
   reason?: string;
+  generation?: number;
 }
 export interface Checklist {
   version: string;
@@ -101,6 +102,7 @@ export function statusChangesSince(history: readonly ChecklistHistory[], sinceIs
 }
 
 function mutate(v: string, apply: (data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]) => boolean): Checklist {
+  // addItem/setItem/claimItem/removeItem/seedFromRoadmap reach the generation-fenced ledger write here.
   return decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply));
 }
 

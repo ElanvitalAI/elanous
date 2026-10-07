@@ -3810,6 +3810,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     // 📋 자리별 발사 대기열 — `harness queue`(AUTOQ-LOOP #23651).
     'queue',
     'replay',
+    // 🌿 원격 salvage/* 가지 대조 — `harness salvage`(harness-salvage-cli.ts · #24661).
+    'salvage',
     'say',
     // 🛑 런 정지 — `harness stop <runId>`(stopHarnessRun).
     'stop',

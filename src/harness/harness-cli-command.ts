@@ -23,6 +23,7 @@ import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
+import { installHarnessSalvageCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
@@ -2511,6 +2512,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installDeliverableVerifyCliCommand(harnessCmd, deps.deliverableVerify);
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
   installHarnessBudgetCommand(harnessCmd);
+  installHarnessSalvageCommand(harnessCmd);
   installHarnessGoalCommand(harnessCmd, deps.goalLookup, deps.goalArchive);
   installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
   const queue = harnessCmd.command('queue').description('자리별 영속 발사 대기열');

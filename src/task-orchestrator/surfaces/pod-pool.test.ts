@@ -106,6 +106,24 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     } finally { debug.log = original; }
   });
 
+  test('POOLGLOBAL-REG: a self-capped (gate) pool counts its own Jobs, not cluster occupancy — 17 occupied · own 1 · cap 8 → 7 free', async () => {
+    let reads = 0;
+    const occupancy = () => { reads++; return { node-b: { occupied: 17 } } as Record<string, MemberOccupancy>; };
+    const gate = new PodPoolScheduler(parsePodPool('node-b:8'), { occupancy });
+    const self = { selfCapped: true };
+    expect((await gate.tryAcquire(undefined, undefined, self))?.context).toBe('node-b');   // the gate's own Job 1
+    const more: Array<string | null> = [];
+    for (let i = 0; i < 8; i++) more.push((await gate.tryAcquire(undefined, undefined, self))?.context ?? null);
+    expect(more.filter(Boolean)).toHaveLength(7);   // 8 − 1 = 7 free, the cluster's 17 goal Pods do not count
+    expect(more.at(-1)).toBeNull();                 // ⊕ the cap still holds
+    expect(reads).toBe(0);
+    gate.release(gate.members[0]!);
+    expect((await gate.tryAcquire(undefined, undefined, self))?.context).toBe('node-b');
+    // The ordinary (harness) pool keeps counting cluster occupancy (#24253): the same reading leaves it no slot.
+    expect(await new PodPoolScheduler(parsePodPool('node-b:8'), { occupancy }).tryAcquire()).toBeNull();
+    expect(reads).toBe(1);
+  });
+
   test('occupancy reads Running plus Pending per member and marks a failed member unknown, not zero', () => {
     const members = parsePodPool('node-b:20,node-c:4');
     const kubectl = (args: readonly string[]) => {
@@ -147,7 +165,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
-    const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:1'), { status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 1, memorySlots: 1, placeableSlots: 1, running: 0, pending: 0 }) });
+    const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:1'), { status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 1, memorySlots: 1, placeableSlots: 1, running: 0, pending: 0 }), occupancy: () => ({}) });
     const spawn = podSelfImplementSpawn({
       kubectl, pool, pollMs: 1, imageCommit: null, sleep: async () => {},
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
@@ -500,7 +518,8 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     };
     const pool = new PodPoolScheduler(parsePodPool('configured:2'), { kubectl, dns: () => 'ready' });
     const release = await pool.acquireAdmission();
-    expect(calls).toHaveLength(3);
+    // nodes · jobs · pods ⊕ POD-ADMIT-BY-USAGE `top pods` (admission reads usage).
+    expect(calls).toHaveLength(4);
     expect(calls.every((args) => args.slice(0, 2).join(' ') === '--context configured')).toBe(true);
     release();
   });

@@ -11,6 +11,7 @@ export interface ShardRunResult {
   shards: GateTestShard[];
   attempts: GateShardAttempt[];
   reason?: string;
+  measurementFailures?: number;
 }
 
 export type ShardProcess = (cwd: string, files: readonly string[]) => {
@@ -34,24 +35,39 @@ export function runShardedGateTests(
   if (!Number.isSafeInteger(count) || count < 1) throw new Error('invalid --shards count');
   const rss = new Map<string, number>();
   const seconds = new Map<string, number>();
+  const failedMeasurements: string[] = [];
   for (const file of [...new Set(files)]) {
     let sample: ReturnType<ShardProcess>;
     try {
       sample = run(cwd, [file]);
-    } catch (error) {
-      return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: `measurement failed: ${file}: ${String(error)}` };
+    } catch {
+      failedMeasurements.push(file);
+      continue;
     }
-    if (![0, 1].includes(sample.exitCode ?? -1) || sample.signal || !sample.junit || !Number.isFinite(sample.rssMb) || !Number.isFinite(sample.seconds)) {
-      return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: `measurement unavailable: ${file}` };
+    if (![0, 1].includes(sample.exitCode ?? -1) || sample.signal || !sample.junit
+      || !Number.isFinite(sample.rssMb) || sample.rssMb! <= 0
+      || !Number.isFinite(sample.seconds) || sample.seconds! < 0) {
+      failedMeasurements.push(file);
+      continue;
     }
     rss.set(file, sample.rssMb!);
     seconds.set(file, sample.seconds!);
   }
+  if (failedMeasurements.length) {
+    if (!rss.size) return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: 'no valid file measurements', measurementFailures: failedMeasurements.length };
+    const averageRss = [...rss.values()].reduce((sum, value) => sum + value, 0) / rss.size;
+    const averageSeconds = [...seconds.values()].reduce((sum, value) => sum + value, 0) / seconds.size;
+    for (const file of failedMeasurements) {
+      rss.set(file, averageRss);
+      seconds.set(file, averageSeconds);
+    }
+  }
+  const measurementFailures = failedMeasurements.length || undefined;
   let shards: GateTestShard[];
   try {
     shards = planGateTestShards(files, rss, seconds, budgetGiB, count);
   } catch (error) {
-    return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error) };
+    return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), ...(measurementFailures ? { measurementFailures } : {}) };
   }
   const attempts: GateShardAttempt[] = [];
   const baseline = baselineWorktree(cwd, baseRef, (dir) => {
@@ -76,8 +92,8 @@ export function runShardedGateTests(
     }
     return aggregateGateTestShards(shards, attempts);
   });
-  if ('retryShardIds' in baseline) return { aggregate: baseline, shards, attempts };
-  return { aggregate: { status: 'unmeasured', retryShardIds: shards.map((shard) => shard.id) }, shards, attempts, reason: baseline.log };
+  if ('retryShardIds' in baseline) return { aggregate: baseline, shards, attempts, ...(measurementFailures ? { measurementFailures } : {}) };
+  return { aggregate: { status: 'unmeasured', retryShardIds: shards.map((shard) => shard.id) }, shards, attempts, reason: baseline.log, ...(measurementFailures ? { measurementFailures } : {}) };
 }
 
 export function runBunShard(cwd: string, files: readonly string[]): ReturnType<ShardProcess> {

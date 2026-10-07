@@ -11,11 +11,25 @@
 // the report channel while interactive Q&A stays on the main bot.
 
 import { TelegramBot } from './telegram.js';
-import { isTradingKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
+import { explainReportRoute, isTradingKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
+export { explainReportRoute } from './domains/telegram-kind-route.js';
 export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { UserConfig } from './user-config.js';
 import { findSessionByTelegramChat, createSession, appendMessage } from './session/index.js';
+import { debug } from './debug/log.js';
+// Observations go through debug.log only: a standalone caller (cron morning-report) registers its own
+// logs.db sink at its entry point (registerStandaloneLogSink) — registering here would duplicate every
+// row inside the daemon, which already has one (review r4).
+function logReport(event: 'sent' | 'unconfirmed' | 'unrouted', data: Record<string, unknown>): void {
+  try { debug.log('telegram.report', event, data); } catch { /* fail-soft */ }
+}
+
+/** Public numeric bot id only — never the token's secret suffix. */
+function botId(token: string): string {
+  const id = token.split(':', 1)[0] ?? '';
+  return /^\d+$/.test(id) ? id : 'configured';
+}
 
 /** Cross-surface memory — mirror an outbound report/alert into the
  *  RECEIVING channel's session transcript so a follow-up question in that
@@ -95,14 +109,24 @@ export async function sendTelegramReport(
   opts: SendReportOpts = {},
 ): Promise<boolean> {
   const target = resolveReportTarget(cfg, opts.kind);
-  if (!target || !text) return false;
+  if (!text) return false;
+  if (!target) {
+    const why = explainReportRoute(cfg, opts.kind);
+    logReport('unrouted', { kind: opts.kind ?? null, role: why.role, reason: why.reason });
+    return false;
+  }
   const bot = new TelegramBot({
     token: target.botToken,
     allowedUsers: [],
     onMessage: async () => undefined,
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
   });
-  await bot.sendMessage(target.chatId, text, { markdown: opts.markdown ?? true });
+  const sent = await bot.sendMessage(target.chatId, text, { markdown: opts.markdown ?? true });
+  // Delivered only with Telegram's message id back — an empty answer is unconfirmed and returns false (review r4).
+  const confirmed = Number.isSafeInteger(sent?.messageId) && (sent?.messageId ?? 0) > 0;
+  logReport(confirmed ? 'sent' : 'unconfirmed',
+    { kind: opts.kind ?? null, role: explainReportRoute(cfg, opts.kind).role, bot: botId(target.botToken), chars: text.length });
+  if (!confirmed) return false;
   // Mirror into the report channel's session so a follow-up question in
   // that chat can recall this alert (Fix — was surface_events-only).
   mirrorOutboundToSession(target, text);

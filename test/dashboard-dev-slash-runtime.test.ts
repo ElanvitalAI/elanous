@@ -64,9 +64,10 @@ describe('/harness dev dashboard slash', () => {
   });
 
   test('catalog exposes /harness for autocomplete and help', () => {
-    expect(SLASH_COMMANDS.find((command) => command.name === 'harness')).toMatchObject({
-      name: 'harness',
-      description: expect.stringContaining('self-dev'),
-    });
+    // Not toMatchObject with an asymmetric matcher: in this bun it wrote the matcher object into the shared
+    // SLASH_COMMANDS entry, and later /help tests in the same run crashed on `description.replace`.
+    const harness = SLASH_COMMANDS.find((command) => command.name === 'harness');
+    expect(harness?.name).toBe('harness');
+    expect(harness?.description).toContain('self-dev');
   });
 });

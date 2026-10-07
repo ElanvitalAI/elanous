@@ -4258,11 +4258,11 @@ describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다
   // ⛔⭐⭐ 실물 CLI 를 띄우면 그 자식이 **저장소의 standalone 로그 sink 에 진짜로 쓴다**
   //   (무인 리뷰 must-fix). ⇒ state·config 를 «임시 디렉터리»로 격리하고 끝나면 지운다.
   //   ⚠️ 이 저장소 규율상 둘을 «같이» 줘야 한다 — `ELANOUS_STATE_DIR` 만으로는 config-dir 스코프가 안 갈린다.
-  function runCli(args: string[], extraEnv: Record<string, string> = {}): { code: number; stderr: string; stdout: string } {
+  function runCli(args: string[], extraEnv: Record<string, string> = {}, cwd: string = REPO): { code: number; stderr: string; stdout: string } {
     const sandbox = mkdtempSync(join(tmpdir(), 'dev-guard-cli-'));
     try {
       const r = spawnSync('bun', [CLI, '--config-dir', sandbox, ...args], {
-        cwd: REPO,
+        cwd,
         encoding: 'utf8',
         timeout: 120_000,
         env: { ...process.env, ELANOUS_STATE_DIR: sandbox, ...extraEnv },
@@ -4342,11 +4342,18 @@ describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다
   }, 130_000);
 
   it('elanous hold remains advisory-free on its existing path', () => {
-    const r = runCli(['dev', '--elanous', '--hold', 'x']);
-    expect(r.stderr).not.toContain('elanous pty auto');
-    expect(r.stderr).not.toContain('elanous agent-mission mission');
-    expect(r.stderr).toContain('격리 우주에서는 작업 디렉토리를 명시해야 한다');
-    expect(r.code).not.toBe(0);
+    // ⭐ TUI-ONE-WORD-LAUNCH — 격리 우주에서 `--cwd`·`--worktree` 가 없으면 이제 워크트리를 «스스로» 만든다.
+    //    ⛔ 본 저장소에 진짜 워크트리를 만들지 않도록 git 저장소 «밖» 임시 cwd 에서 돌려 사람 문면을 본다.
+    const outside = mkdtempSync(join(tmpdir(), 'dev-hold-no-git-'));
+    try {
+      const r = runCli(['dev', '--elanous', '--hold', 'x'], {}, outside);
+      expect(r.stderr).not.toContain('elanous pty auto');
+      expect(r.stderr).not.toContain('elanous agent-mission mission');
+      expect(r.stderr).toContain('작업 디렉토리를 스스로 정하지 못했다');
+      expect(r.code).not.toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   }, 130_000);
 
   it('초입 거부(self + 비-pty transport)는 정직한 결론이므로 미결론 산출이 없다', () => {

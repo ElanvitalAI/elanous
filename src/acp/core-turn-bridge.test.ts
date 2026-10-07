@@ -10,7 +10,7 @@ import * as config from '../user-config.js';
 import { debug } from '../debug/log.js';
 import type { CoreTurnContext } from '../core-turn/index.js';
 import type { AcpTurnContext } from './server.js';
-import { bridgeCoreTurnToAcp } from './core-turn-bridge.js';
+import { bridgeCoreTurnToAcp, toolsForTuiRoute } from './core-turn-bridge.js';
 import { buildWebSearchTool } from '../boot/daemon-tools/web-search.js';
 import { buildUserConfig } from '../user-config.js';
 
@@ -217,3 +217,107 @@ test.each(['src/acp/server.ts 의 승인 정책 고쳐줘', '현재 파일을 �
     expect(f.persisted).toEqual(['수정했습니다.']);
   },
 );
+
+test('TUI route selects one core turn, matching tools and visible/logged decision; daemon remains unfiltered', async () => {
+  const base = config.getUserConfig();
+  spyOn(config, 'getUserConfig').mockReturnValue({
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
+  });
+  const coreCalls: CoreTurnContext[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    coreCalls.push(ctx);
+    return { stopReason: 'end_turn', finalText: '' };
+  });
+  const routeLog = spyOn(debug, 'log');
+  const specs = ['Edit', 'Write', 'Bash', 'decisions_pending', 'ops_seats', 'logs_query',
+    'DashboardConfigSet', 'WebSearch', 'schedule_manage', 'Read'].map((name) => ({
+    name, description: '', parameters: { type: 'object' as const },
+  }));
+  for (const [text, expected, preferred] of [
+    ['나한테 온 결정 카드 있어?', '조회', 'decisions_pending'],
+    ['답변을 좀 더 빠른 모델로 바꿔줘', '설정 변경', 'DashboardConfigSet'],
+    ['이번 주 업계 소식 조사', '조사', 'WebSearch'],
+    ['매일 아침 8시 뉴스', '상시 일', 'schedule_manage'],
+  ] as const) {
+    const pushes: string[] = [];
+    const turn = bridgeCoreTurnToAcp({
+      tuiRouting: true,
+      getMessages: () => [{ role: 'user', content: text }], getTools: () => specs,
+      dispatchTool: async () => ({}),
+    });
+    await turn({
+      sessionId: 'tui-route', cwd: '/tmp', userText: text,
+      promptBlocks: [{ type: 'text', text }], isAborted: () => false,
+      push: async (delta: string) => { pushes.push(delta); },
+      pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+      pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+    } as unknown as AcpTurnContext);
+    expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).toContain(preferred);
+    expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Edit');
+    expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Write');
+    expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Bash');
+    expect(pushes[0]).toBe(`라우팅: ${expected}\n`);
+    expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
+      route: expected, reason: expect.any(String), goalLoop: false,
+    });
+  }
+  expect(coreCalls).toHaveLength(4);
+  expect(toolsForTuiRoute(specs, '조회').map((tool) => tool.name)[0]).toBe('decisions_pending');
+  // review r4: the same lookup sentence on a bridge without tuiRouting (daemon ACP) keeps every tool and no route line.
+  const daemonPushes: string[] = [];
+  const daemonTurn = bridgeCoreTurnToAcp({
+    getMessages: () => [{ role: 'user', content: '나한테 온 결정 카드 있어?' }], getTools: () => specs,
+    dispatchTool: async () => ({}),
+  });
+  await daemonTurn({
+    sessionId: 'daemon-route', cwd: '/tmp', userText: '나한테 온 결정 카드 있어?',
+    promptBlocks: [{ type: 'text', text: '나한테 온 결정 카드 있어?' }], isAborted: () => false,
+    push: async (delta: string) => { daemonPushes.push(delta); },
+    pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  expect(coreCalls.length).toBeGreaterThan(4);
+  // Every host tool stays, and the goal loop arms as before (it adds update_goal).
+  expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  expect(daemonPushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
+});
+
+test('TUI routing skips only an explicit executor harness child; a human TUI in a harness space is routed', async () => {
+  const coreCalls: CoreTurnContext[] = [];
+  const coreSpy = spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    coreCalls.push(ctx);
+    return { stopReason: 'end_turn', finalText: '' };
+  });
+  const saved = { space: process.env.ELANOUS_HARNESS_SPACE, role: process.env.ELANOUS_HARNESS_ROLE };
+  const specs = ['Edit', 'decisions_pending'].map((name) => ({ name, description: '', parameters: { type: 'object' as const } }));
+  const run = async () => {
+    const pushes: string[] = [];
+    await bridgeCoreTurnToAcp({
+      tuiRouting: true,
+      getMessages: () => [{ role: 'user', content: '나한테 온 결정 카드 있어?' }], getTools: () => specs,
+      dispatchTool: async () => ({}),
+    })({
+      sessionId: 'route-role', cwd: '/tmp', userText: '나한테 온 결정 카드 있어?',
+      promptBlocks: [{ type: 'text', text: '나한테 온 결정 카드 있어?' }], isAborted: () => false,
+      push: async (delta: string) => { pushes.push(delta); },
+      pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+      pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+    } as unknown as AcpTurnContext);
+    return { tools: coreCalls.at(-1)!.tools.map((tool) => tool.name), pushes };
+  };
+  try {
+    process.env.ELANOUS_HARNESS_SPACE = 'dev-harness';
+    delete process.env.ELANOUS_HARNESS_ROLE;
+    const human = await run();
+    expect(human.tools).toEqual(['decisions_pending']);
+    expect(human.pushes[0]).toBe('라우팅: 조회\n');
+    process.env.ELANOUS_HARNESS_ROLE = 'executor';
+    const executor = await run();
+    expect(executor.tools).toContain('Edit');
+    expect(executor.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
+  } finally {
+    coreSpy.mockRestore();
+    if (saved.space === undefined) delete process.env.ELANOUS_HARNESS_SPACE; else process.env.ELANOUS_HARNESS_SPACE = saved.space;
+    if (saved.role === undefined) delete process.env.ELANOUS_HARNESS_ROLE; else process.env.ELANOUS_HARNESS_ROLE = saved.role;
+  }
+});

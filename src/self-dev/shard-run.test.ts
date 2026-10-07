@@ -38,6 +38,25 @@ test('six fake test files in two processes have the same introduced/preexisting 
     .toEqual(unsharded.report?.failures.map((f) => [f.name, f.attribution]).sort());
 });
 
+test('one unavailable file measurement uses the mean weights and still executes every shard', () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
+  const calls: string[][] = [];
+  const run: ShardProcess = (cwd, selected) => {
+    calls.push([cwd, ...selected]);
+    if (selected.length === 1 && selected[0] === files[1]) throw new Error('measurement crashed');
+    return { exitCode: 0, junit: xml(selected, []), rssMb: selected[0] === files[2] ? 300 : 100, seconds: selected[0] === files[2] ? 3 : 1 };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const result = runShardedGateTests('/head', files, 'HEAD', 2, run, baseline as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 1);
+  expect(result.measurementFailures).toBe(1);
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files);
+  expect(result.shards.find((shard) => shard.files.includes(files[1]!))?.plannedRssMb).toBe(300);
+  expect(result.shards.find((shard) => shard.files.includes(files[1]!))?.plannedSeconds).toBe(3);
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.attempts).toHaveLength(2);
+  expect(calls.filter(([cwd, ...selected]) => cwd === '/base' && selected.length > 0)).toHaveLength(2);
+});
+
 test('one dead bundle is the only one retried; an unfinished retry fails closed', () => {
   const files = Array.from({ length: 6 }, (_, i) => `test/f${i}.test.ts`);
   const calls: string[][] = [];

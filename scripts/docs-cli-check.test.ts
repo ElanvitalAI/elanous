@@ -146,7 +146,7 @@ describe('docs-cli-check — 문서의 elanous 호출을 실제 CLI 에 대조',
       return { ok: r.status === 0, out: `${r.stdout ?? ''}\n${r.stderr ?? ''}` };
     };
     expect(checkCommands(refs, realHelp)).toEqual([]);
-  });
+  }, 60_000);
   test('public loop agents guide names the graph stages and safe orchestrator modes; its commands exist', () => {
     const repo = resolve(import.meta.dir, '..');
     const file = 'release/public/docs/loop-agents.md';
@@ -169,7 +169,8 @@ describe('docs-cli-check — 문서의 elanous 호출을 실제 CLI 에 대조',
       return { ok: r.status === 0, out: `${r.stdout ?? ''}\n${r.stderr ?? ''}` };
     };
     expect(checkCommands(refs, realHelp)).toEqual([]);
-  });
+  // Two real `--help` spawns under the test preload pass 5 s on a loaded host (0.2.18 gate 3: introduced at 5006 ms).
+  }, 60_000);
 });
 
 // 09-26: 도움말은 별칭을 `self-update|update [options]` 로 찍는다 — 문서의 `elanous update` 를 «없는 명령»으로 잡았다.

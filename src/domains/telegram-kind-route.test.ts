@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { resolveReportTarget, sendReportPhoto, sendReportPhotoBuffer, sendTelegramReport } from '../telegram-report.js';
 import { flushDeferred, sendTelegramDirect, setInProcessOutbound } from './outbound-alert.js';
-import { DEFAULT_KIND_ROLES, roleForKind } from './telegram-kind-route.js';
+import { DEFAULT_KIND_ROLES, explainReportRoute, roleForKind } from './telegram-kind-route.js';
 import { routeOutbound } from '../nexus/outbound/router.js';
 
 const main = 'MAIN:token-not-real';
@@ -455,3 +457,98 @@ test('without a channels table, distinct tokens: every operational kind goes to 
   expect(await sendTelegramReport(config(), 'x', { kind: 'not-in-any-table', markdown: false, fetchImpl })).toBe(true);
   expect(calls[0]?.url).toBe(`https://api.telegram.org/bot${main}/sendMessage`);
 });
+
+// BRIEF-DELIVERY-1007 — the production shape: a channels table whose trading channel carries finance
+// roles but not `report`, with the legacy reportChannel pointing at that same bot and chat.
+test('channels table without a report role: the skip names the missing role, and adding it restores the old target', async () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'main', botToken: main, chatId: 101, interactive: true, roles: ['qa', 'default', 'system', 'mission', 'tuning'] },
+    { name: 'conatus', botToken: trading, chatId: 202, interactive: false, roles: ['investment', 'finance', 'trade', 'signal'] },
+  ];
+  for (const kind of ['report', 'alert', 'digest']) {
+    expect(resolveReportTarget(cfg, kind)).toBeNull();
+    const why = explainReportRoute(cfg, kind);
+    expect(why.reason).toBe('report-role-missing');
+    expect(why.hint).toContain('telegram.channels[].roles');
+  }
+  expect(explainReportRoute(cfg, 'ops-report').reason).toBe('routed');
+
+  log.mockClear();
+  const fetchImpl = (async () => new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }))) as unknown as typeof fetch;
+  expect(await sendTelegramReport(cfg, '브리핑', { kind: 'report', fetchImpl })).toBe(false);
+  const unrouted = log.mock.calls.filter(([c, e]) => c === 'telegram.report' && e === 'unrouted').map(([, , f]) => f);
+  expect(unrouted).toEqual([{ kind: 'report', role: 'report', reason: 'report-role-missing' }]);
+
+  cfg.telegram.channels[1]!.roles.push('report');
+  for (const kind of ['report', 'alert', 'digest']) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: trading, chatId: 202 });
+    expect(explainReportRoute(cfg, kind).reason).toBe('routed');
+  }
+});
+
+test('explainReportRoute separates the legacy (no channels table) reasons', () => {
+  expect(explainReportRoute(config(), 'report').reason).toBe('routed');
+  expect(explainReportRoute(config(main), 'report').reason).toBe('report-bot-not-distinct');
+  const badChat = config();
+  badChat.telegram.reportChannel = { botToken: trading, chatId: Number.NaN };
+  expect(resolveReportTarget(badChat, 'report')).toBeNull();
+  expect(explainReportRoute(badChat, 'report').reason).toBe('report-chat-invalid');
+  const none = config();
+  delete none.telegram.reportChannel;
+  expect(explainReportRoute(none, 'report').reason).toBe('no-report-channel');
+  const homeless = { telegram: { enabled: true, botToken: main, allowedUsers: [] } } as unknown as UserConfig;
+  expect(explainReportRoute(homeless, 'ops-report').reason).toBe('no-main-home');
+  const table = config();
+  table.telegram.channels = [{ name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] }];
+  expect(explainReportRoute(table, 'brief').reason).toBe('no-role-channel');
+});
+
+test('a standalone report skip reaches logs.db as telegram.report unrouted (no token · no chat id · no body)', () => {
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const env = { ...process.env, NODE_ENV: '', ELANOUS_STATE_DIR: join(repo, '.elanous-test'), ELANOUS_CONFIG_DIR: join(repo, '.elanous-test') };
+  const run = (args: string[]) => spawnSync('bun', args, { cwd: repo, env, encoding: 'utf8', timeout: 30_000 });
+  const probe = run(['src/telegram-report-log-probe.ts']);
+  expect(probe.status).toBe(0);
+  const start = /probe-start (\S+)/.exec(probe.stdout)?.[1];
+  expect(start).toBeTruthy();
+  const query = run(['bin/elanous.mjs', '--test', 'logs', '--category', 'telegram.report', '--event', 'unrouted', '--since', '10m', '--json', '--json-data']);
+  expect(query.status).toBe(0);
+  const rows = query.stdout.split('\n').filter(l => l.startsWith('{')).map(l => JSON.parse(l))
+    .filter(r => r.event === 'unrouted' && String(r.ts) >= start!);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].data).toMatchObject({ kind: 'report', role: 'report', reason: 'report-role-missing' });
+  for (const leak of ['private-secret', '98765', '98766', 'SECRET-BODY-DO-NOT-LOG']) expect(query.stdout).not.toContain(leak);
+  // Control: the same probe without the entry-point sink leaves no row — the library itself registers nothing.
+  const control = spawnSync('bun', ['src/telegram-report-log-probe.ts'], { cwd: repo, env: { ...env, NODE_ENV: 'test' }, encoding: 'utf8', timeout: 30_000 });
+  expect(control.status).toBe(0);
+  const controlStart = /probe-start (\S+)/.exec(control.stdout)?.[1];
+  expect(controlStart).toBeTruthy();
+  const after = run(['bin/elanous.mjs', '--test', 'logs', '--category', 'telegram.report', '--event', 'unrouted', '--since', '10m', '--json', '--json-data']);
+  expect(after.status).toBe(0);
+  expect(after.stdout.split('\n').filter(l => l.startsWith('{')).map(l => JSON.parse(l))
+    .filter(r => r.event === 'unrouted' && String(r.ts) >= controlStart!)).toHaveLength(0);
+}, 90_000);
+
+test('telegram.report sent needs a Telegram message id; an empty answer is unconfirmed and an API error records nothing', async () => {
+  const cfg = config();
+  const answer = (body: unknown) => (async () => new Response(JSON.stringify(body))) as unknown as typeof fetch;
+  const events = () => log.mock.calls.filter(([c]) => c === 'telegram.report').map(([, e, f]) => [e, f]);
+
+  log.mockClear();
+  expect(await sendTelegramReport(cfg, '보고', { kind: 'report', fetchImpl: answer({ ok: true, result: { message_id: 7, chat: { id: 202 } } }) })).toBe(true);
+  expect(events()).toEqual([['sent', { kind: 'report', role: 'report', bot: 'configured', chars: 2 }]]);
+
+  log.mockClear();
+  for (const result of [{}, { message_id: null }, { message_id: '7' }, { message_id: 0 }]) {
+    log.mockClear();
+    expect(await sendTelegramReport(cfg, '보고', { kind: 'report', fetchImpl: answer({ ok: true, result }) })).toBe(false);
+    expect(events().map(([e]) => e)).toEqual(['unconfirmed']);
+  }
+
+  log.mockClear();
+  await expect(sendTelegramReport(cfg, '보고', { kind: 'report', fetchImpl: answer({ ok: false, error_code: 403, description: 'Forbidden' }) })).rejects.toThrow();
+  expect(events()).toEqual([]);
+  expect(JSON.stringify(log.mock.calls)).not.toContain('token-not-real');
+});
+

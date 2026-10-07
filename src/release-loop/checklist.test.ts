@@ -344,6 +344,7 @@ describe('release checklist ledger', () => {
       expect(data).toMatchObject({ released: '0.10.0', dev: devVersion() });
       expect(data.history.map((h) => h.field)).toEqual(['add', 'evidence', 'status']);
       expect(data.history.every((h) => h.released === '0.10.0' && h.dev === devVersion())).toBe(true);
+      expect(data.history.every((h) => !Object.hasOwn(h, 'generation'))).toBe(true);
       mkdirSync(join(dir, 'release/1.0.0'), { recursive: true });
       writeFileSync(join(dir, 'release/1.0.0/release.json'), JSON.stringify({ version: '1.0.0', publishedAt: 'now' }));
       expect(listChecklist('9.9.9').released).toBe('1.0.0');

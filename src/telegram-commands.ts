@@ -50,6 +50,7 @@ import { createAdPipelineDeps, runAdPipeline } from './ad-pipeline/run.js';
 import { projectCommand } from './telegram-project-command.js';
 import { telegramNowSlash } from './context-bus/context-now-surfaces.js';
 import { telegramLoopsStatus } from './telegram-loops-command.js';
+import { telegramAwaySlash, telegramReleaseStatus } from './telegram-away-command.js';
 import { createWishCard } from './intake-plane/wish-card.js';
 import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
 import { CardStore } from './task-cards/card-store.js';
@@ -333,6 +334,16 @@ export function defaultTelegramCommands(
       name: 'loops',
       description: '루프·크론 현황 — 늦음·실패를 먼저 보여줍니다',
       handler: (args) => telegramLoopsStatus(args),
+    },
+    {
+      name: 'release',
+      description: '발행 현황 — 지금 런·노드·막힘을 한 통으로',
+      handler: async (args) => telegramReleaseStatus(args),
+    },
+    {
+      name: 'away',
+      description: '외출 모드 — /away on|off|status (켜면 발행 전이를 여기로)',
+      handler: async (args) => telegramAwaySlash(args),
     },
     {
       name: 'status',

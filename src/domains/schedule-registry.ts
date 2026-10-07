@@ -18,6 +18,9 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { prevScheduledFire } from './cron-match.js';
 import { debug } from '../debug/log.js';
+import { listSources } from '../intake-plane/intake-sources.js';
+import { getUserConfig } from '../user-config.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { deriveScheduleName, ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 
 /** 스케줄 레지스트리 DB 정본 경로 — state-dir 존중(lazy · Phase B). prod(ELANOUS_STATE_DIR
@@ -490,6 +493,9 @@ export interface InventoryInternalOpts {
   discoveryIntervalMs?: number;
   /** 테스트 seam — workflow-runtime schedule 트리거 주입(미지정 시 discoverWorkflows). */
   workflowSchedules?: Array<{ workflowName: string; nodeId: string; cron?: string | null; intervalMs?: number | null }>;
+  /** Test seams for the installed instance; production reads the active config and instance root. */
+  watchRoot?: string;
+  watchEnabled?: boolean;
 }
 
 /** 데몬 내부 스케줄을 레지스트리에 upsert(멱등·고정 id). 등록 수 반환. */
@@ -513,6 +519,23 @@ export function inventoryInternalSchedules(db: Database, opts: InventoryInternal
   // 회고(retro loop = retro-aggregate/report/rebalance)와는 별개.
   const hour = opts.reflectionHour ?? (Number.isFinite(Number.parseInt(process.env.ELANOUS_REFLECTION_HOUR ?? '', 10)) ? Number.parseInt(process.env.ELANOUS_REFLECTION_HOUR!, 10) : 21);
   upsert('internal:daily-reflection', 'daily-reflection', 'daily-reflection', `0 ${hour} * * *`, null, 'daemon: elanous 활동 회고(노트/OCR/세션) 스냅샷 푸시', 'report', 'elanous');
+  // WATCH-DEFAULT — fail-soft: a broken sources file or config must not stop the other internal rows.
+  let watchSources: ReturnType<typeof listSources> = [];
+  try {
+    const watchEnabled = opts.watchEnabled ?? (getUserConfig().watch?.enabled !== false);
+    watchSources = watchEnabled ? listSources({ seat: 'user' }, opts.watchRoot ?? effectiveInstanceRoot()) : [];
+  } catch (error) {
+    debug.log('watch.default', 'failed', { stage: 'inventory', reason: error instanceof Error ? error.message : String(error) });
+  }
+  if (watchSources.length > 0) {
+    upsert('internal:watch-collect', 'watch-collect', 'watch-default', '0 7 * * *', null,
+      'intake source run-due --seat user', 'ingest', 'elanous');
+    upsert('internal:watch-brief', 'watch-brief', 'watch-default', '30 8 * * *', null,
+      'intake digest --seat user --telegram', 'digest', 'elanous');
+    debug.log('watch.default', 'scheduled', { topics: watchSources.length, items: 0, sent: false });
+  } else {
+    db.run("DELETE FROM schedule_registry WHERE id IN ('internal:watch-collect', 'internal:watch-brief') AND source = 'watch-default'");
+  }
   // discovery (env 설정 시에만 가동) — 코어 인프라 → elanous.
   const dm = opts.discoveryIntervalMs ?? Number.parseInt(process.env.ELANOUS_DISCOVERY_CRON_INTERVAL_MS ?? '', 10);
   if (Number.isFinite(dm) && dm > 0) {

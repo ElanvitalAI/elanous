@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { LoopStatusContent, LoopStatusPanel } from './LoopStatusPanel';
+import { Suspense } from 'react';
 import LoopsPage from '@/app/loops/page';
+import { LoopsView } from './LoopsView';
 import { createLoopRowsRefresh, loadLoopRows, loopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopSchedule } from './loop-status';
 import { routeMaturity } from '@/lib/route-maturity';
 import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
@@ -108,7 +110,10 @@ test('overlapping refreshes apply only the newest request including errors and d
 test('operational beta page is reachable from the operations navigation and mounts the status panel', () => {
   expect(routeMaturity('/loops')).toBe('beta');
   expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/loops')).toMatchObject({ group: 'ops', label: '루프 현황' });
-  expect(LoopsPage().type).toBe(LoopStatusPanel);
+  // 정적 export — 보기 갈래(`?view=`)는 Suspense 안 클라이언트에서 읽고, 기본 보기가 이 패널이다(LoopsView.test).
+  const page = LoopsPage();
+  expect(page.type).toBe(Suspense);
+  expect(page.props.children.type).toBe(LoopsView);
 });
 
 test('no registry entries and fetch failure are not shown as healthy', () => {

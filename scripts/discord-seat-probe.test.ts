@@ -34,6 +34,8 @@ describe('Discord seat probe', () => {
       expect(result?.body).toStartWith('일: 내일 행사 공지 써 줘\n답장 요청: ');
       // The seat-ask path writes its own receipt even in dry mode; «nothing really delegated» is held by the effects assertions below.
       expect(result?.reply).toContain('결과를 이 대화로 돌려드립니다');
+      // A dry run never reads as a real assignment (EV12 follow-up · 10-07).
+      expect(result?.reply).toStartWith('마른 실행 (실제 맡김 없음) — ');
       expect(result?.ms).toBeGreaterThanOrEqual(0);
       const [ordinary] = await runProbeCli(['--text', '일반 글', '--json'], config);
       expect(['submit', 'none']).toContain(ordinary?.route);

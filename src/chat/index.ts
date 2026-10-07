@@ -434,7 +434,7 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'help',  aliases: ['?'],         description: '명령과 키 보기' },
   { name: 'resume',    aliases: [],             description: '지난 대화 이어 가기 · /resume <id 앞자리>' },
-  { name: 'model',     aliases: ['m'],           description: '모델 바꾸기 — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
+  { name: 'model',     aliases: ['m'],           description: '모델 바꾸기 — /model 빠름|보통|깊음 (코드명도 됨)', subcommands: ['빠름', '보통', '깊음', 'codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
   { name: 'clear', aliases: ['cls'],       description: '대화 기록 지우기' },
   { name: 'status', aliases: ['st'], description: '지금 상태 — 모델 · 연결 · 계정' },
   { name: 'now', aliases: [], description: '현재 맥락과 출처 표 — /now [주제]' },
@@ -448,6 +448,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   //   and the PWA `/design-check` panel. Listed (not baselined as hidden) on
   //   purpose: a surface nobody can discover is not a surface.
   { name: 'design',    aliases: ['design-check'], description: 'Design rulebooks this repository declares · /design [--declared] · /design pick [number|id] to choose a design direction', subcommands: ['--declared', 'pick'] },
+  { name: 'decide', aliases: ['dec'], description: '열린 결정 카드 보기·답하기 — /decide [번호] [선택지 키] [확인]' },
   { name: 'provider',  aliases: ['p'],          description: 'LLM providers — /provider (list) · next (cycle, also Alt+M / pill click) · use <name> · pick (visual picker) · reset', subcommands: ['next', 'use', 'pick', 'picker', 'menu', 'reset', 'list'] },
   { name: 'reasoning', aliases: ['r', 'think'],  description: 'Reasoning level (codex effort + summary, anthropic extended-thinking budget) — /reasoning [off|low|medium|high|xhigh] (cycle when no arg · xhigh 는 모델 상한이 xhigh 이상일 때만 wire 에 실린다, 아니면 high 로 깎인다)', subcommands: ['off', 'low', 'medium', 'high', 'xhigh'] },
   { name: 'local',     aliases: ['ll'],         description: 'Local OpenAI-compatible LLM — ping / models / test / use', subcommands: ['ping', 'models', 'test', 'use', 'status'] },

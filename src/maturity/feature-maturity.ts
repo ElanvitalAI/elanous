@@ -48,6 +48,7 @@ export const FEATURE_MATURITY = {
     '/ceo': { pwa: 'ops' },
     '/decisions': { pwa: 'ops' },
     '/dashboard': { pwa: 'ops' },
+    '/pitch': { pwa: 'ops' },           // PITCH-ROOM — 투자자 피치 방(운영자 전용 · 공개 내보내기 제외)
     '/bots': { pwa: 'ops' },
     '/botlab': { pwa: 'ops' },
     '/morning': { pwa: 'broken' },
@@ -57,7 +58,7 @@ export const FEATURE_MATURITY = {
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
-    pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', 'agent-env': 'beta',
+    preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', 'agent-env': 'beta',
     where: 'stable', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', live: 'beta',
     research: 'beta', release: 'beta', know: 'beta', freeze: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
@@ -73,10 +74,10 @@ export const FEATURE_MATURITY = {
     loops: 'beta', buzz: 'beta', harness: 'stable', self: 'beta', factcheck: 'beta',
     provider: 'stable', 'provider:set': 'beta', 'provider:restore': 'beta',
     'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta',
-    schedule: 'beta', intake: 'beta', logs: 'stable', ad: 'beta', docs: 'beta',
+    schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', ad: 'beta', docs: 'beta',
     decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta',
     env: 'beta', 'agent-mission': 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
-    config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', labels: 'beta', msg: 'beta', ask: 'stable',
+    config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable',
     onboarding: 'beta', login: 'stable', session: 'beta', chat: 'stable', repl: 'stable',
     agent: 'stable', registry: 'beta', tier: 'stable', local: 'beta', scheduler: 'beta',
     attach: 'beta', wf: 'beta', nexus: 'stable', phone: 'beta', token: 'beta',
@@ -99,6 +100,7 @@ export const FEATURE_MATURITY = {
     'run-skill': 'stable',
     ad: 'beta',
     design: 'beta',
+    decide: 'beta',
     provider: 'stable',
     reasoning: 'stable',
     local: 'tool',
@@ -158,7 +160,7 @@ export const FEATURE_MATURITY = {
     ping: 'stable', provider: 'stable', sessions: 'stable', fork: 'stable', resume: 'stable',
     decisions: 'stable', work: 'stable', cancel: 'stable',
     skills: 'beta', skill: 'beta', digest: 'beta', intake: 'beta', ad: 'beta',
-    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', loops: 'beta', project: 'beta', wish: 'beta',
+    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', loops: 'beta', release: 'beta', away: 'beta', project: 'beta', wish: 'beta',
     brain: 'tool', cc: 'tool', cdx: 'tool', gem: 'tool', local: 'tool',
     harness: 'ops',
     // Existing commands outside the CXO four-grade menu list are owner-only.

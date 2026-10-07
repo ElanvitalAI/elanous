@@ -3,7 +3,7 @@ import { act, create } from 'react-test-renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ComponentProps } from 'react';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
-import { LoopAgentsScene, LoopAgentsViewContent } from './LoopAgentsScene';
+import { LoopAgentsScene, LoopAgentsViewContent, loopEdgesPath, mapNodeDetails } from './LoopAgentsScene';
 import { loopAgentsView } from './loop-agents-view';
 
 const originalFetch = globalThis.fetch;
@@ -114,4 +114,14 @@ test('polls every 10 seconds, pauses while hidden, preserves the other feed on f
     expect(cleared).toBe(true);
     expect(visible).toBeUndefined();
   }
+});
+
+test('demo address asks one journey with ?ref=&mode=live instead of the 60-minute window; bad ids fall back', () => {
+  const at = Date.parse('2026-10-05T10:00:00Z');
+  expect(loopEdgesPath(at, 'card-1')).toBe('/v1/loops/edges?ref=card-1&mode=live&limit=500');
+  expect(loopEdgesPath(at, null)).toBe('/v1/loops/edges?since=2026-10-05T09%3A00%3A00.000Z&limit=200');
+  expect(loopEdgesPath(at, '../x')).toContain('since=');
+  const details = mapNodeDetails(loopAgentsView(null, null), true);
+  expect(details['agent:task-agent']).toEqual({ running: '못 읽음' });
+  expect(details.TC).toEqual({ now: '못 읽음', waiting: '못 읽음' });
 });

@@ -1,7 +1,8 @@
 import type { DaemonClient } from './daemon-client';
 
 export type OpsResult<T> = { kind: 'ready'; data: T } | { kind: 'forbidden' } | { kind: 'error'; status: number };
-export interface ReleaseNode { nodeId: string; ok: boolean | null; summary: string }
+// startedAt/endedAt 은 GRAPH-NODE-TIMES(0.2.19 TC) 가 원장에 넣는다 — 그 전엔 없다(화면은 «시각 미기록»).
+export interface ReleaseNode { nodeId: string; ok: boolean | null; summary: string; startedAt?: string | null; endedAt?: string | null }
 export interface ReleaseRun {
   runId: string;
   status: string;
@@ -55,7 +56,9 @@ function utcIso(value: unknown): value is string {
     && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19);
 }
 function node(value: unknown): value is ReleaseNode {
-  return record(value) && string(value.nodeId) && (value.ok === null || typeof value.ok === 'boolean') && string(value.summary);
+  return record(value) && string(value.nodeId) && (value.ok === null || typeof value.ok === 'boolean') && string(value.summary)
+    && (value.startedAt === undefined || value.startedAt === null || string(value.startedAt))
+    && (value.endedAt === undefined || value.endedAt === null || string(value.endedAt));
 }
 function run(value: unknown): value is ReleaseRun {
   return record(value) && string(value.runId) && string(value.status) && string(value.startedAt)

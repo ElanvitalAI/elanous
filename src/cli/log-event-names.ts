@@ -1564,6 +1564,7 @@ export const KNOWN_LOG_EVENT_NAMES: ReadonlySet<string> = new Set([
   "visibility-failed",
   "visibility-noninteractive",
   "visibility-preflight",
+  "visible",
   "voice-mode-active",
   "warn",
   "watch-error",

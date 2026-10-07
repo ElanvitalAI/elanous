@@ -225,3 +225,26 @@ test('checklist carries the version schedule (cut · land-by) or null when none 
   const after = await (await send('/v1/ops/checklist?version=0.2.10', headers))!.json() as { schedule: { cutAt: string; landBy: string | null } };
   expect(after.schedule).toEqual({ cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z' });
 });
+
+test('GRAPH-NODE-TIMES: run list carries ledger node times and the running node start; old ledgers carry none', async () => {
+  const { dir, send } = fixture(true);
+  const folder = join(dir, 'graph-runs', 'release-loop');
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, 'timed.json'), JSON.stringify({
+    status: 'running', path: ['version-release', 'gate'], startedAt: '2026-10-07T00:00:00.000Z', input: { version: '0.2.19' },
+    nodes: [{ nodeId: 'version-release', ok: true, output: '', startedAt: '2026-10-07T00:00:01.000Z', endedAt: '2026-10-07T00:02:00.000Z', seconds: 119 }],
+    currentNode: { nodeId: 'gate', startedAt: '2026-10-07T00:02:01.000Z' },
+  }));
+  writeFileSync(join(folder, 'legacy.json'), JSON.stringify({
+    status: 'failed', path: ['version-release'], startedAt: '2026-10-06T00:00:00.000Z', input: { version: '0.2.18' },
+    nodes: [{ nodeId: 'version-release', ok: false, output: '', startedAt: 'not a time', endedAt: 'October 7, 2026' }],
+    currentNode: { nodeId: 'version-release', startedAt: '2026-10-06T00:00:01.000Z' },
+  }));
+  const response = await send('/v1/ops/release/runs', { 'x-elanous-operator': SECRET });
+  const runs = await response?.json() as Array<{ runId: string; nodes: unknown[] }>;
+  expect(runs.find((run) => run.runId === 'timed')?.nodes).toEqual([
+    { nodeId: 'version-release', ok: true, summary: '', startedAt: '2026-10-07T00:00:01.000Z', endedAt: '2026-10-07T00:02:00.000Z' },
+    { nodeId: 'gate', ok: null, summary: '', startedAt: '2026-10-07T00:02:01.000Z' },
+  ]);
+  expect(runs.find((run) => run.runId === 'legacy')?.nodes).toEqual([{ nodeId: 'version-release', ok: false, summary: '' }]);
+});

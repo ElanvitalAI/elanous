@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CliUserError } from '../cli/cli-user-error.js';
+import { resolveRepositoryName } from '../harness/repository-name.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
@@ -40,10 +41,41 @@ function versionOrder(a: string, b: string): number {
   return 0;
 }
 
+/** Where each cell id lives. An id may repeat when one copy is in an already released version — history kept two
+ *  different cells under one id (IA1 · EV10a … in 0.2.6~0.2.15) and later cells reused old ids (INSIDE1 0.2.11 ⊕
+ *  0.2.19). A released copy is history: an open copy wins over it, and between released copies the latest wins. Only
+ *  two open copies are a real conflict (ORCH-LIVE-1008 rehearsal 1: every placement failed on «여러 판의 같은 칸»). */
+function cellLocations(snapshots: Iterable<[string, readonly { id: string }[]]>, released: string | null | undefined, skip: readonly string[] = []): { locations: Map<string, string>; conflict: string | null } {
+  const locations = new Map<string, string>();
+  const shipped = (version: string) => !!released && versionOrder(version, released) <= 0;
+  for (const [version, items] of snapshots) {
+    if (skip.includes(version)) continue;
+    for (const item of items) {
+      const previous = locations.get(item.id);
+      if (previous !== undefined) {
+        if (!shipped(previous) && !shipped(version)) return { locations, conflict: item.id };
+        // Keep the open copy; between two released copies keep the later one.
+        const keepPrevious = shipped(version) && (!shipped(previous) || versionOrder(version, previous) < 0);
+        if (keepPrevious) continue;
+      }
+      locations.set(item.id, version);
+    }
+  }
+  return { locations, conflict: null };
+}
+
 /** The merged PR list is a first-class GitHub query, not a count inferred from checklist status. */
+// ORCH-LIVE-1008: the orchestrator tick runs from the installed package (not a git checkout), where a bare `gh pr list`
+// fails «not a git repository» and placement silently left every cell unplaced — so the repository is named explicitly
+// (--repo > harness.repo > GH_REPO > the checkout's remote · `resolveRepositoryName`).
 export function mergedPrsLast24h(now = new Date()): number {
   const since = new Date(now.getTime() - 86_400_000).toISOString();
-  const r = spawnSync('gh', ['pr', 'list', '--state', 'merged', '--search', `merged:>=${since.slice(0, 10)}`, '--limit', '1000', '--json', 'number,mergedAt'], { encoding: 'utf8' });
+  let repo: string;
+  try { repo = resolveRepositoryName(); }
+  catch (error) {
+    throw new CliUserError(`병합 PR 속도 조회 실패: 저장소를 못 정했다 — ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`, 'harness.repo 설정(owner/name) 또는 GH_REPO');
+  }
+  const r = spawnSync('gh', ['pr', 'list', '--repo', repo, '--state', 'merged', '--search', `merged:>=${since.slice(0, 10)}`, '--limit', '1000', '--json', 'number,mergedAt'], { encoding: 'utf8' });
   if (r.status !== 0) throw new CliUserError(`병합 PR 속도 조회 실패: ${(r.stderr || r.error || '').toString().trim()}`);
   let rows: Array<{ number: number; mergedAt: string }>;
   try { rows = JSON.parse(r.stdout) as typeof rows; }
@@ -92,10 +124,16 @@ function dependencyViolation(
   locations: Map<string, string>,
   overrides: Map<string, string>,
   input: PlacementCell,
+  released?: string | null,
 ): string | null {
   for (const [version, snapshot] of snapshots) for (const item of snapshot.items) {
-    const dependentVersion = overrides.get(item.id) ?? version;
+    // A released version is history — its cells (and what they once depended on) never constrain a new placement.
+    if (released && versionOrder(version, released) <= 0) continue;
     const predecessors = item.id === input.id ? input.predecessors : item.predecessors ?? [];
+    // Only the cells this placement moves, and cells that depend on them, can be made wrong by it — a pre-existing
+    // violation elsewhere on the board must not make every placement infeasible (ORCH-LIVE-1008 rehearsal 1).
+    if (!overrides.has(item.id) && !predecessors.some((predecessor) => overrides.has(predecessor))) continue;
+    const dependentVersion = overrides.get(item.id) ?? version;
     for (const predecessor of predecessors) {
       const predecessorVersion = overrides.get(predecessor) ?? locations.get(predecessor);
       if (!predecessorVersion || versionOrder(dependentVersion, predecessorVersion) <= 0)
@@ -131,12 +169,8 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   const open = schedules.filter((row) => (!released || versionOrder(row.version, released) > 0) && row.landBy && available(row, now, backlog));
   const sources = [...new Set([...schedules.map((row) => row.version), ...backlog])];
   const snapshots = new Map(sources.map((version) => [version, (deps.checklist ?? listChecklist)(version)]));
-  const locations = new Map<string, string>();
-  for (const [version, snapshot] of snapshots) for (const item of snapshot.items) {
-    if (backlog.includes(version)) continue;
-    if (locations.has(item.id)) throw new CliUserError(`여러 판의 같은 칸: ${item.id}`);
-    locations.set(item.id, version);
-  }
+  const { locations, conflict } = cellLocations([...snapshots].map(([version, snapshot]) => [version, snapshot.items] as [string, readonly { id: string }[]]), released, backlog);
+  if (conflict) throw new CliUserError(`여러 판의 같은 칸: ${conflict}`);
   // A backlog copy never outranks a scheduled cell with the same id.
   for (const version of backlog) for (const item of snapshots.get(version)?.items ?? []) if (!locations.has(item.id)) locations.set(item.id, version);
   const from = locations.get(input.id) ?? null;
@@ -172,7 +206,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   const displaced: PlacementDecision['displaced'] = [];
   let chosen: ReleaseSchedule | undefined;
   let loadIssue: string | null = null;
-  const feasible = candidates.filter((row) => !dependencyViolation(snapshots, locations, new Map([[input.id, row.version]]), input));
+  const feasible = candidates.filter((row) => !dependencyViolation(snapshots, locations, new Map([[input.id, row.version]]), input, released));
   // 판은 «마감 안 가장 이른 판»부터 본다(기존 불변식). 가속 등급은 그 판이 찼을 때 같은 우선순위 비가속 칸을 밀 수 있게만 한다.
   for (const row of feasible) {
     const placement = new Map([[input.id, row.version]]);
@@ -192,7 +226,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
       || (accelerator && priority === input.priority);
     const p2 = [...items].reverse().find((item) => {
       if (item.accelerator === true) return false;
-      if (!victimOk(item.priority) || dependencyViolation(snapshots, locations, new Map([...placement, [item.id, next.version]]), input)) return false;
+      if (!victimOk(item.priority) || dependencyViolation(snapshots, locations, new Map([...placement, [item.id, next.version]]), input, released)) return false;
       if (item.deadlineVersion && versionOrder(next.version, item.deadlineVersion) > 0) return false;
       if (items.length < capacity(row) && !(seatItems.length >= seatLimit && ownerMatches(item.owner, seat))) return false;
       if (!item.owner) return false;
@@ -235,6 +269,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
 function moveConstraint(
   item: ChecklistItem, to: ReleaseSchedule, backlog: readonly string[],
   snapshots: Map<string, ChecklistItem[]>, now: number, rate: number, caps: Record<string, number>, rows: ReleaseSchedule[], ceoCap: number,
+  released: string | null | undefined,
 ): string | null {
   if (!to.landBy || !available(to, now, backlog)) return '착지 마감이 지났거나 백로그 판이라 이동 불가';
   if (item.deadlineVersion && versionOrder(to.version, item.deadlineVersion) > 0) return '마감 판 뒤로 이월 불가';
@@ -246,16 +281,15 @@ function moveConstraint(
   const loadIssue = ceoOverload(item, to, new Map([...snapshots].map(([version, items]) => [version, { items }])),
     rows, ceoCap);
   if (loadIssue) return loadIssue;
-  const locations = new Map<string, string>();
-  for (const [version, items] of snapshots) for (const cell of items) {
-    if (locations.has(cell.id)) return `여러 판의 같은 칸: ${cell.id}`;
-    locations.set(cell.id, version);
-  }
+  const { locations, conflict } = cellLocations(snapshots, released);
+  if (conflict) return `여러 판의 같은 칸: ${conflict}`;
   for (const predecessor of item.predecessors ?? []) {
     const location = locations.get(predecessor);
     if (!location || versionOrder(to.version, location) <= 0) return `선행 칸 ${predecessor} 이후 판으로만 이동 가능`;
   }
   for (const [version, items] of snapshots) for (const dependent of items) {
+    // A released version is history — its cells never pin a move (same rule as placement).
+    if (released && versionOrder(version, released) <= 0) continue;
     if (dependent.id !== item.id && dependent.predecessors?.includes(item.id) && versionOrder(version, to.version) <= 0)
       return `의존 칸 ${dependent.id} 이전 판으로만 이동 가능`;
   }
@@ -289,7 +323,7 @@ export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceR
   const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
   const result: RebalanceResult = { decisions: [], blocked: [] };
   for (const { item, score } of unstarted) {
-    const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap);
+    const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap, deps.released ?? releasedVersion());
     if (violation) {
       result.blocked.push({ id: item.id, from: version, to: next!.version, reason: violation });
       continue;
@@ -315,7 +349,7 @@ export function seatMove(id: string, from: string, to: string, by: string, reaso
   if (!ownerMatches(item.owner, parseOwner(by).seat) || next?.version !== to) throw new CliUserError('남의 칸 당기기 거부 — COO 에 요청');
   const now = (deps.now ?? new Date()).getTime();
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
-  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()));
+  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()), deps.released ?? releasedVersion());
   if (violation) throw new CliUserError(`${id}: ${violation}`);
   if (!deps.dryRun) move(id, from, to, by, undefined, undefined, reason);
 }

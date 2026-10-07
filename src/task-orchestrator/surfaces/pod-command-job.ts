@@ -37,6 +37,54 @@ export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
 export const POD_LITE_MEMORY_LIMIT = '2Gi';
 
 /** 요청은 한도를 넘을 수 없다(쿠버네티스가 Job 을 거부한다) — lite 2Gi 처럼 한도가 기본 요청보다 작으면 한도로 맞춘다. */
+/** The command Job container's CPU limit when the caller names none (GATE-SPEED A3①: unchanged default). */
+export const POD_COMMAND_CPU_LIMIT_DEFAULT = '4';
+
+/** Container CPU request/limit override. Omitted fields keep the defaults (request `POD_CHILD_REQUESTS.cpu` · limit 4). */
+export interface PodCpu { request?: string; limit?: string }
+
+/** Kubernetes CPU quantity → millicores (`1` · `0.5` · `500m`); null when it is not a positive quantity we accept. */
+export function podCpuMillis(value: string): number | null {
+  const m = /^(?:(\d+(?:\.\d{1,3})?)|(\d+)m)$/.exec(value.trim());
+  if (!m) return null;
+  const millis = m[1] !== undefined ? Math.round(Number(m[1]) * 1000) : Number(m[2]);
+  return Number.isSafeInteger(millis) && millis > 0 ? millis : null;
+}
+
+/** Resolve a CPU override against the defaults; throws when a value is malformed or the request exceeds the limit (k8s would refuse the Job). */
+export function resolvePodCpu(cpu: PodCpu | undefined): { request: string; limit: string } {
+  const request = cpu?.request?.trim() || POD_CHILD_REQUESTS.cpu;
+  const limit = cpu?.limit?.trim() || POD_COMMAND_CPU_LIMIT_DEFAULT;
+  const r = podCpuMillis(request), l = podCpuMillis(limit);
+  if (r === null) throw new Error(`pod cpu request is not a positive CPU quantity: ${request}`);
+  if (l === null) throw new Error(`pod cpu limit is not a positive CPU quantity: ${limit}`);
+  if (r > l) throw new Error(`pod cpu request ${request} exceeds limit ${limit}`);
+  return { request, limit };
+}
+
+/** Config value → CPU override (release gate `release.loop.gatePodCpu`). A scalar (`2` · `"1500m"`) sets request = limit;
+ *  `{ request, limit }` sets either side. Absent/empty = undefined (request 1 / limit 4). Malformed values throw. */
+export function parsePodCpu(value: unknown, label = 'cpu'): PodCpu | undefined {
+  const text = (v: unknown): string | undefined => {
+    if (v === undefined || v === null || v === '') return undefined;
+    if (typeof v !== 'number' && typeof v !== 'string') throw new Error(`${label} must be a CPU quantity or { request, limit }`);
+    return String(v).trim() || undefined;
+  };
+  let cpu: PodCpu;
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const { request, limit, ...rest } = value as Record<string, unknown>;
+    if (Object.keys(rest).length) throw new Error(`${label} has unknown keys: ${Object.keys(rest).join(', ')}`);
+    const r = text(request), l = text(limit);
+    cpu = { ...(r ? { request: r } : {}), ...(l ? { limit: l } : {}) };
+  } else {
+    const both = text(value);
+    cpu = both ? { request: both, limit: both } : {};
+  }
+  if (!cpu.request && !cpu.limit) return undefined;
+  resolvePodCpu(cpu);
+  return cpu;
+}
+
 export function memoryRequestWithin(limit: string | undefined): string {
   const gi = (value: string | undefined) => { const m = /^(\d+)Gi$/.exec(value ?? ''); return m ? Number(m[1]) : null; };
   const request = gi(POD_CHILD_REQUESTS.memory);
@@ -130,6 +178,8 @@ export interface PodCommandJobInput {
   bunCache?: string;
   /** 컨테이너 메모리 한도(기본 16Gi) — 게이트가 파일 하나 격리 Job 에 올린다. */
   memoryLimit?: string;
+  /** GATE-SPEED A3①: CPU request/limit override (release gate shards only). Omitted = request 1 / limit 4. */
+  cpu?: PodCpu;
   source?: PodSource;
   deadlineSeconds: number;
   runId?: string;
@@ -147,6 +197,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   }
   const grok = o.llm === 'grok';
   const bunCache = o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
+  const cpu = resolvePodCpu(o.cpu);
   const quotedArgs = o.command.map(bashSingleQuote).join(' ');
   const credLines = [
     ...(grok ? ['mkdir -p ~/.grok && install -m 600 /creds/grok-auth.json ~/.grok/auth.json'] : []),
@@ -185,7 +236,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
           initContainers: [{ name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] }],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
-            resources: { requests: { ...POD_CHILD_REQUESTS, memory: memoryRequestWithin(o.memoryLimit) }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: '4' } },
+            resources: { requests: { ...POD_CHILD_REQUESTS, cpu: cpu.request, memory: memoryRequestWithin(o.memoryLimit) }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: cpu.limit } },
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
@@ -272,6 +323,8 @@ export interface RunPodCommandOptions {
   bunCache?: string;
   /** 컨테이너 메모리 한도(기본 16Gi · lite 면 2Gi). */
   memoryLimit?: string;
+  /** GATE-SPEED A3①: CPU request/limit override — only the release gate passes it. Omitted = request 1 / limit 4. */
+  cpu?: PodCpu;
   /** POD7: 호출부가 «네트워크 스킬만 쓰는 명령»이라고 말할 때만 lite 이미지 ⊕ 2Gi. */
   lite?: boolean;
   source?: PodSource;
@@ -284,6 +337,7 @@ export interface RunPodCommandOptions {
   name?: string;
   pollMs?: number;
   kubectl?: Kubectl;
+  /** A caller-owned scheduler is self-capped: acquires count only its own Jobs, never cluster occupancy (POOLGLOBAL-REG). */
   poolScheduler?: PodPoolScheduler;
   checkPool?: typeof checkPodPool;
   syncImages?: typeof syncPoolImages;
@@ -356,6 +410,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const bunCache = options.bunCache?.trim() || undefined;
   if (bunCache && !isAbsolute(bunCache)) throw new Error('pod.bunCache must be an absolute directory path');
+  // Fail before any Secret/Job is applied — a bad quantity must not reach the cluster.
+  if (options.cpu) resolvePodCpu(options.cpu);
 
   let member: PodPoolMember | null = null;
   let pool = options.poolScheduler;
@@ -366,12 +422,16 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const members = parsePodPool(spec);
       const checked = (options.checkPool ?? checkPodPool)(members, baseKubectl as PoolKubectl);
       if (!checked.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
-      pool = new PodPoolScheduler(checked.ready);
+      // Occupancy reads go through the same kubectl as the readiness check (an injected one included).
+      pool = new PodPoolScheduler(checked.ready, { kubectl: baseKubectl as PoolKubectl });
     }
   }
   if (pool) {
+    // POOLGLOBAL-REG: a caller that hands in its own scheduler (the release gate fans its shards over one) holds its own
+    // concurrency cap — its Jobs count against the spec caps, not the cluster's goal Pods (#24253 → 0.2.15 gate ran 1 shard).
+    const selfCapped = options.poolScheduler !== undefined;
     for (;;) {
-      member = await pool.tryAcquire();
+      member = await pool.tryAcquire(undefined, undefined, { selfCapped });
       if (member) break;
       await sleep(options.pollMs ?? 15_000);
     }
@@ -426,7 +486,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       name, namespace, launch, image: imageRef ?? image,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(memoryLimit ? { memoryLimit } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);

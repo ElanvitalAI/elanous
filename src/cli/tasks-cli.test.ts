@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { readFileSync } from 'node:fs';
-import { registerTasksCommands, type TasksCliDeps } from './tasks-cli.js';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
 const tasks = [
@@ -39,6 +41,38 @@ async function run(args: string[], deps: TasksCliDeps): Promise<{ lines: string[
     return { lines, code: process.exitCode };
   } finally { process.exitCode = previous ?? 0; }
 }
+
+test('task hand requires project id and target together', async () => {
+  const result = await run(['task', 'hand', '보고서', '--project', 'p1'], { registerSink: async () => true });
+  expect(result.code).toBe(1);
+  expect(result.lines.join('\n')).toContain('--target');
+});
+
+test('detached launcher keeps original options without cwd and sets cwd when supplied', async () => {
+  const target = mkdtempSync(join(tmpdir(), 'tasks-cli-target-'));
+  const options: Array<{ detached: true; stdio: 'ignore'; cwd?: string; env?: NodeJS.ProcessEnv }> = [];
+  const spawn: DetachedSpawn = (_command, _args, opts) => {
+    options.push(opts);
+    const listeners: Record<string, Array<(...args: never[]) => void>> = {};
+    const child = {
+      pid: 123,
+      once(event: 'spawn' | 'error', listener: (...args: never[]) => void) {
+        (listeners[event] ??= []).push(listener);
+        if (event === 'spawn') queueMicrotask(() => listener());
+      },
+      removeListener() {},
+      unref() {},
+    };
+    return child;
+  };
+  await spawnDetachedConfirmed(spawn, 'bun', ['x']);
+  await spawnDetachedConfirmed(spawn, 'bun', ['x'], 2_000, target);
+  expect(options).toEqual([{ detached: true, stdio: 'ignore' }, { detached: true, stdio: 'ignore', cwd: target }]);
+  // TA-CARD-RUN-LINK: env 를 주면 부모 환경 위에 얹는다(런 id 상속).
+  await spawnDetachedConfirmed(spawn, 'bun', ['x'], 2_000, undefined, { ELANOUS_RUN_ID: 'run-test-1234' });
+  expect(options[2]!.env?.ELANOUS_RUN_ID).toBe('run-test-1234');
+  expect(options[2]!.env?.PATH).toBe(process.env.PATH);
+});
 
 test('list sorts urgent > high > medium > low and fetches real approval/source through authenticated details', async () => {
   const server = nexus();
@@ -126,7 +160,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['list', 'hand', 'advance', 'show', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['list', 'hand', 'board', 'advance', 'show', 'approve']);
 });
 
 test('an isolated universe without an acp-token still lists — no Authorization header is sent', async () => {
@@ -135,4 +169,37 @@ test('an isolated universe without an acp-token still lists — no Authorization
   expect(result.code ?? 0).toBe(0);
   expect(result.lines.slice(1).map((line) => line.split('\t')[0])).toEqual(['urgent', 'high', 'medium', 'low']);
   expect(server.requests.every((req) => req.authorization === null)).toBe(true);
+});
+
+test('real detached spawn: the env handed by the launcher reaches the child (ELANOUS_RUN_ID inheritance)', async () => {
+  const { spawn } = await import('node:child_process');
+  const { existsSync } = await import('node:fs');
+  const out = join(mkdtempSync(join(tmpdir(), 'tasks-cli-env-')), 'env.txt');
+  await spawnDetachedConfirmed(spawn as unknown as DetachedSpawn, process.execPath,
+    ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, process.env.ELANOUS_RUN_ID ?? '')`], 2_000, undefined, { ELANOUS_RUN_ID: 'run-inherit-check-1234' });
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(out) && Date.now() < deadline) await new Promise((done) => setTimeout(done, 50));
+  expect(readFileSync(out, 'utf8')).toBe('run-inherit-check-1234');
+});
+
+test('ORCH-LIVE-1008: the hand launcher runs the elanous CLI entry, not whatever script started this process (orchestrator tick)', async () => {
+  const started = process.argv[1];
+  const seen: string[][] = [];
+  const fakeSpawn = ((command: string, args: string[]) => {
+    seen.push([command, ...args]);
+    const handlers: Record<string, () => void> = {};
+    setTimeout(() => handlers.spawn?.(), 0);
+    return { pid: 1, once: (event: string, fn: () => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
+  }) as unknown as DetachedSpawn;
+  try {
+    process.argv[1] = '/somewhere/src/loops/orchestrator/tick.ts';
+    await defaultTaskLauncher(['harness', 'say', 'x'], undefined, undefined, { spawn: fakeSpawn });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]![0]).toBe(process.execPath);
+    expect(seen[0]![1]).toBe(ELANOUS_CLI_ENTRY);
+    expect(seen[0]![1]!.endsWith('/bin/elanous.mjs')).toBe(true);
+    expect(existsSync(seen[0]![1]!)).toBe(true);
+    expect(seen[0]!.slice(2)).toContain('harness');
+    expect(taskLauncherArgv('/cfg', ['a'])).toEqual([ELANOUS_CLI_ENTRY, '--config-dir', '/cfg', 'a']);
+  } finally { process.argv[1] = started; }
 });

@@ -12,7 +12,9 @@
 import { randomBytes } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import type { SelfDevDecomposition } from '../self-dev/decompose.js';
+import { refreshCardRunBinding, type CardRunEvidenceDeps } from './card-evidence.js';
 import {
+  cardPrNumber,
   handTask,
   nextMoveFor,
   readTaskAgentState,
@@ -245,11 +247,19 @@ async function defaultEvidenceReader(ref: number | string): Promise<'merged' | '
   return predecessorState(ref);
 }
 
-/** 조각 카드마다 근거를 모은다 — PR 번호가 있으면 그것, 없으면 골 id. 읽기 실패는 pending(미착지). */
+/**
+ * 조각의 착지 근거 하나 — PR 번호 › 골 id. 수동(`--pr`/`--goal`)이든 런 원장 묶기든 같은 칸이다(TA-CARD-RUN-LINK) —
+ * 수동이 적히면 `refSource: 'manual'` 이라 묶기가 다시 채우지 않는다(수동이 덮는다).
+ */
+export function pieceRef(piece: Pick<TaskCard, 'pr' | 'goalId'>): number | string | undefined {
+  return cardPrNumber(piece) ?? piece.goalId;
+}
+
+/** 조각 카드마다 근거를 모은다 — `pieceRef` 순. 읽기 실패는 pending(미착지). */
 export async function collectPieceEvidence(pieces: readonly TaskCard[], read: PieceEvidenceReader = defaultEvidenceReader): Promise<Record<string, PieceEvidence>> {
   const out: Record<string, PieceEvidence> = {};
   for (const piece of pieces) {
-    const ref = piece.pr ?? piece.goalId;
+    const ref = pieceRef(piece);
     if (ref === undefined) { out[piece.id] = 'no-ref'; continue; }
     let state: 'merged' | 'waiting' | 'blocked';
     try { state = await read(ref); } catch { state = 'waiting'; }
@@ -275,8 +285,9 @@ export function recordPieceRef(pieceId: string, ref: { pr?: number; goalId?: str
     // green 제안 뒤 근거를 바꾸면 제안이 바뀐 근거와 어긋난다 — 제안된 미션의 조각 근거는 잠근다.
     if (tasks[current.mission]?.greenProposal) { refused.reason = `미션 ${current.mission} 은 이미 green 제안됐다 — 근거를 바꾸지 않는다`; return undefined; }
     // 근거는 하나만 — 새 근거가 옛 근거를 «교체»한다(정정한 골 id 뒤에 옛 PR 이 남아 우선되지 않게).
-    const { pr: _oldPr, goalId: _oldGoal, ...rest } = current;
-    return { ...rest, ...(ref.pr !== undefined ? { pr: ref.pr } : { goalId: ref.goalId! }) };
+    // 런 묶기가 적은 자식 런도 함께 지운다 — 수동 근거를 옛 Pod 자식 런의 결과처럼 보이지 않게.
+    const { pr: _oldPr, goalId: _oldGoal, runChildId: _oldChild, ...rest } = current;
+    return { ...rest, ...(ref.pr !== undefined ? { pr: ref.pr } : { goalId: ref.goalId! }), refSource: 'manual' as const };
   });
   if (refused.reason || !card) throw new Error(refused.reason ?? `미션 조각 카드가 아니다: ${pieceId}`);
   try { debug.log('task-agent', 'mission-piece-ref', { pieceId, missionId: card.mission ?? null, pr: ref.pr ?? null, goalId: ref.goalId ?? null }); } catch { /* fail-soft */ }
@@ -295,6 +306,8 @@ export interface AdvanceMissionOptions {
   statePath?: string;
   launcher?: TaskLauncher;
   readEvidence?: PieceEvidenceReader;
+  /** 런 id 가 있는 조각의 런 근거(PR·골 id) 읽기(시험 주입) — `false` 면 묶지 않는다. */
+  runEvidence?: CardRunEvidenceDeps | false;
   now?: () => Date;
 }
 
@@ -344,6 +357,19 @@ async function advanceMissionOnce(missionId: string, opts: AdvanceMissionOptions
   const clock = opts.now ?? (() => new Date());
   // live 인데 발사기가 없으면 claim 을 적기 «전»에 멈춘다 — live 표지가 발사 없이 남아 영영 안 넘겨지지 않게.
   if (mode === 'live' && !opts.launcher) throw new Error('--live 인데 launcher 가 없다');
+  const before = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {};
+  if (!before[missionId]?.pieces) throw new Error(`미션 카드가 아니다: ${missionId}`);
+  // 런 id 가 있고 PR·골 id 중 빈 칸이 있는 조각 — 원장에서 묶어 둔다(제안 끝난 미션은 건드리지 않는다 · 실패는 근거 없음).
+  if (opts.runEvidence !== false && !before[missionId]!.greenProposal) {
+    for (const id of before[missionId]!.pieces!) {
+      const piece = before[id];
+      if (!piece?.runId || piece.refSource === 'manual' || (piece.pr !== undefined && piece.goalId !== undefined)) continue;
+      try { await refreshCardRunBinding(id, path, opts.runEvidence ?? {}); } catch (error) {
+        // 근거 없음으로 본다(미착지) — 원장 부재와 갈리게 실패는 남긴다.
+        try { debug.log('task-agent', 'card-bind-failed', { card: id, runId: piece.runId, via: 'advance', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+      }
+    }
+  }
   const all = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {};
   const mission = all[missionId];
   if (!mission?.pieces) throw new Error(`미션 카드가 아니다: ${missionId}`);
@@ -398,13 +424,13 @@ async function advanceMissionOnce(missionId: string, opts: AdvanceMissionOptions
     const proposal = {
       at: clock().toISOString(),
       checklistId: mission.checklistId ?? null,
-      evidence: Object.fromEntries(pieces.map((piece) => [piece.id, piece.pr !== undefined ? `#${piece.pr}` : `goal:${piece.goalId}`])),
+      evidence: Object.fromEntries(pieces.map((piece) => { const ref = pieceRef(piece); return [piece.id, typeof ref === 'number' ? `#${ref}` : `goal:${ref}`]; })),
     };
     const wrote = { proposed: false, stale: false };
     updateTaskCard(path, missionId, (current, tasks) => {
       if (!current || current.greenProposal) return undefined;
       // 조회에 쓴 근거가 잠금 안에서도 그대로일 때만 — 조회 도중 근거가 바뀌었으면 다음 호출이 다시 본다.
-      if (pieces.some((piece) => tasks[piece.id]?.pr !== piece.pr || tasks[piece.id]?.goalId !== piece.goalId)) { wrote.stale = true; return undefined; }
+      if (pieces.some((piece) => { const now = tasks[piece.id]; return (now ? cardPrNumber(now) : undefined) !== cardPrNumber(piece) || now?.goalId !== piece.goalId; })) { wrote.stale = true; return undefined; }
       wrote.proposed = true;
       return { ...current, greenProposal: proposal };
     });

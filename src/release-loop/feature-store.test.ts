@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistGate, claimItem, listChecklist, removeItem, setItem, summarizeChecklist, type Checklist } from './checklist.js';
 import * as features from './feature-store.js';
+import * as hqModule from '../hq/hq.js';
+import { CliUserError } from '../cli/cli-user-error.js';
 
 let dir: string;
 function setup(): string { dir = mkdtempSync(join(tmpdir(), 'release-features-')); setElanousConfigDir(dir); return dir; }
@@ -22,6 +24,178 @@ function fixture(version: string): Checklist {
   writeFileSync(join(folder, 'checklist.json'), JSON.stringify(data));
   return data;
 }
+
+test('board fencing: shadow observes stale, enforce rolls back, current generation is recorded, missing and corrupt leases fail open', () => {
+  setup();
+  const home = join(dir, 'machine');
+  const leasePath = join(home, '.elanous-hq', 'lease.json');
+  const seenPath = join(dir, 'seen-generation');
+  mkdirSync(join(home, '.elanous-hq'), { recursive: true });
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: seenPath } }));
+  writeFileSync(seenPath, '4\n');
+  writeFileSync(leasePath, JSON.stringify({ holder: 'mbp', generation: 5, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const add = (id: string) => features.add('0.2.19', { id, title: id, status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+  const staleLogs = () => log.mock.calls.filter(([category, event]) => category === 'hq.fence' && event === 'board-stale-write');
+  const unmeasuredLogs = () => log.mock.calls.filter(([category, event]) => category === 'hq.fence' && event === 'board-lease-unmeasured');
+  try {
+    expect(addItem('0.2.19', { id: 'SHADOW', title: 'SHADOW' }).history.at(-1)?.generation).toBe(4);
+    expect(features.list('0.2.19').history.at(-1)?.generation).toBe(4);
+    expect(staleLogs()).toEqual([['hq.fence', 'board-stale-write', { writer: 4, lease: 5, version: '0.2.19' }]]);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: seenPath, boardFencing: 'enforce' } }));
+    const ledger = join(dir, 'release', 'features.sqlite');
+    const before = createHash('sha256').update(readFileSync(ledger)).digest('hex');
+    expect(() => add('ENFORCE')).toThrow(new CliUserError('낡은 세대 4 < 5 — 쓰기 거부'));
+    expect(createHash('sha256').update(readFileSync(ledger)).digest('hex')).toBe(before);
+    expect(features.list('0.2.19').items.map((item) => item.id)).toEqual(['SHADOW']);
+    writeFileSync(seenPath, '5\n');
+    expect(() => features.mutate('0.2.19', '', '', (data) => {
+      writeFileSync(leasePath, JSON.stringify({ holder: 'node-b', generation: 6, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+      data.items.push({ id: 'RACED', title: '늦게 깬 쓰기', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+      return true;
+    })).toThrow(new CliUserError('낡은 세대 5 < 6 — 쓰기 거부'));
+    expect(features.list('0.2.19').items.map((item) => item.id)).toEqual(['SHADOW']);
+    writeFileSync(leasePath, JSON.stringify({ holder: 'mbp', generation: 5, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+    writeFileSync(seenPath, '5\n');
+    log.mockClear();
+    expect(add('CURRENT').history.at(-1)?.generation).toBe(5);
+    expect(features.list('0.2.19').history.at(-1)?.generation).toBe(5);
+    expect(staleLogs()).toHaveLength(0);
+    rmSync(leasePath);
+    log.mockClear();
+    const withoutLease = add('NO-LEASE').history.at(-1)!;
+    expect(withoutLease).not.toHaveProperty('generation');
+    expect(unmeasuredLogs()).toHaveLength(1);
+    writeFileSync(leasePath, '{bad');
+    log.mockClear();
+    expect(add('CORRUPT').history.at(-1)).not.toHaveProperty('generation');
+    expect(unmeasuredLogs()).toHaveLength(1);
+    expect(staleLogs()).toHaveLength(0);
+  } finally {
+    log.mockRestore();
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+
+test('board fencing reads the lease once outside the write transaction in shadow; only enforce re-reads before writing', () => {
+  setup();
+  const home = join(dir, 'machine');
+  const seenPath = join(dir, 'seen-generation');
+  mkdirSync(join(home, '.elanous-hq'), { recursive: true });
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: seenPath } }));
+  writeFileSync(seenPath, '5\n');
+  writeFileSync(join(home, '.elanous-hq', 'lease.json'), JSON.stringify({ holder: 'mbp', generation: 5, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  // At each lease read, probe the ledger from a second connection: BEGIN IMMEDIATE succeeds only if no write lock is held.
+  const original = hqModule.readHqLease;
+  const lockFree: boolean[] = [];
+  const reads = spyOn(hqModule, 'readHqLease').mockImplementation(((deps) => {
+    const ledger = join(dir, 'release', 'features.sqlite');
+    let free = true;
+    try {
+      const probe = new Database(ledger);
+      try { probe.exec('PRAGMA busy_timeout = 0'); probe.exec('BEGIN IMMEDIATE'); probe.exec('ROLLBACK'); }
+      catch { free = false; }
+      finally { probe.close(); }
+    } catch { free = true; /* no ledger yet — nothing can be locked */ }
+    lockFree.push(free);
+    return original(deps);
+  }) as typeof hqModule.readHqLease);
+  try {
+    features.add('0.2.19', { id: 'S0', title: 'S0', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+    reads.mockClear(); lockFree.length = 0;
+    features.add('0.2.19', { id: 'S1', title: 'S1', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(lockFree).toEqual([true]);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: seenPath, boardFencing: 'enforce' } }));
+    reads.mockClear(); lockFree.length = 0;
+    features.add('0.2.19', { id: 'E1', title: 'E1', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+    expect(reads).toHaveBeenCalledTimes(2);
+    // enforce: the first read is outside the lock, the second one inside the write transaction (by design).
+    expect(lockFree).toEqual([true, false]);
+  } finally {
+    reads.mockRestore();
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+
+test('enforce: a lease that breaks between the first read and the write is unmeasured — the write goes through without a generation', () => {
+  setup();
+  const home = join(dir, 'machine');
+  const leasePath = join(home, '.elanous-hq', 'lease.json');
+  const seenPath = join(dir, 'seen-generation');
+  mkdirSync(join(home, '.elanous-hq'), { recursive: true });
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: seenPath, boardFencing: 'enforce' } }));
+  writeFileSync(seenPath, '5\n');
+  writeFileSync(leasePath, JSON.stringify({ holder: 'mbp', generation: 5, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const result = features.mutate('0.2.19', '', '', (data) => {
+      writeFileSync(leasePath, '{bad');
+      data.items.push({ id: 'BROKE', title: '쓰는 사이 임대 깨짐', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+      data.history.push({ at: '2026-10-07T00:00:00Z', by: 'OP', id: 'BROKE', field: 'add', from: null, to: null, released: '', dev: '' });
+      return true;
+    });
+    expect(result.items.map((item) => item.id)).toContain('BROKE');
+    expect(features.list('0.2.19').history.at(-1)).not.toHaveProperty('generation');
+    expect(log.mock.calls.some(([category, event, data]) => category === 'hq.fence' && event === 'board-lease-unmeasured'
+      && (data as { phase?: string }).phase === 'before-write')).toBe(true);
+    // Same with no seen-generation file at all: the first read measured the lease, so the broken re-read is still logged.
+    rmSync(seenPath);
+    writeFileSync(leasePath, JSON.stringify({ holder: 'mbp', generation: 5, acquiredAt: 1, renewedAt: 1, ttlSeconds: 1500 }));
+    log.mockClear();
+    features.mutate('0.2.19', '', '', (data) => {
+      writeFileSync(leasePath, '{bad');
+      data.items.push({ id: 'BROKE2', title: 'seen 없음', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+      return true;
+    });
+    expect(log.mock.calls.filter(([category, event, data]) => category === 'hq.fence' && event === 'board-lease-unmeasured'
+      && (data as { phase?: string }).phase === 'before-write')).toHaveLength(1);
+  } finally {
+    log.mockRestore();
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+
+test('without a seen-generation file, a broken or missing lease is still logged as unmeasured (with distinct reasons) and the write goes through', () => {
+  setup();
+  const home = join(dir, 'machine');
+  const leasePath = join(home, '.elanous-hq', 'lease.json');
+  mkdirSync(join(home, '.elanous-hq'), { recursive: true });
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ hq: { arbiter: 'local', seenGenerationFile: join(dir, 'no-such-seen') } }));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const reasons = () => log.mock.calls.filter(([category, event]) => category === 'hq.fence' && event === 'board-lease-unmeasured')
+    .map(([, , data]) => String((data as { reason: string }).reason));
+  try {
+    writeFileSync(leasePath, '{bad');
+    features.add('0.2.19', { id: 'BROKEN', title: 'BROKEN', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+    expect(reasons()).toHaveLength(1);
+    expect(reasons()[0]).not.toBe('no-lease');
+    log.mockClear();
+    rmSync(leasePath);
+    features.add('0.2.19', { id: 'MISSING', title: 'MISSING', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' });
+    expect(reasons()).toEqual(['no-lease']);
+    expect(features.list('0.2.19').items.map((item) => item.id)).toEqual(['BROKEN', 'MISSING']);
+    expect(features.list('0.2.19').history.some((row) => 'generation' in row)).toBe(false);
+  } finally {
+    log.mockRestore();
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+
+test('without HQ configuration, board writes and history retain their legacy shape', () => {
+  setup();
+  const row = features.add('0.2.19', { id: 'LEGACY', title: '기존', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' }).history[0];
+  expect(row).toEqual({ at: '2026-10-07T00:00:00Z', by: 'OP', id: 'LEGACY', field: 'add', from: null,
+    to: { id: 'LEGACY', title: '기존', status: 'yellow', updatedAt: '2026-10-07T00:00:00Z', updatedBy: 'OP' }, released: '', dev: features.list('0.2.19').dev });
+});
 
 test('네 판 JSON 들이기: 집계와 노랑 처분·parity 게이트가 그대로이며 재수입은 멱등', () => {
   setup();

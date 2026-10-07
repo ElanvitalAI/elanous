@@ -315,3 +315,58 @@ test('RELEASE-REHEARSAL-RC: docs-land and ops-upgrade skip a prerelease; its pub
     expect(labelPrerelease('0.2.18-rc.1', 'body')).toContain('elanous@next');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; --partial plans test-only changes and falls back otherwise', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-partial-'));
+  const ledger = mkdtempSync(join(tmpdir(), 'release-resume-ledger-'));
+  try {
+    const runFile = join(root, 'graph-runs', 'release-loop', 'r.json');
+    mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+    const old = 'a'.repeat(40), tip = 'b'.repeat(40);
+    const write = () => writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed', input: { version: '0.2.18', branchCut: true },
+      path: ['version-release', 'cutoff', 'gate'], graphPath: '/elsewhere/wt-release/graphs/release/release-loop.yaml',
+      nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18', commit: old, branch: 'release/0.2.18' }) },
+        { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
+        { nodeId: 'gate', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' }],
+      executed: 1, dryRun: false, statePath: runFile }));
+    let changed = 'scripts/audit.test.ts\n';
+    const git = (args: string[]) => args[0] === 'ls-remote' ? `${tip}\trefs/heads/release/0.2.18` : args[0] === 'rev-parse' ? tip : args[0] === 'diff' ? changed : '';
+    mkdirSync(join(ledger, 'release', '0.2.18'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: old, failures: ['src/x.test.ts > slow'] }));
+    const paths: string[] = [];
+    const graph = (async (path: string) => { paths.push(path); return { status: 'done', runId: 'r' }; }) as never;
+    // Each resume backs the state up under a timestamped name (exclusive) — give every call its own instant.
+    let tick = 0;
+    const now = () => new Date(Date.UTC(2026, 9, 7, 0, 0, tick++));
+    write();
+    const applied = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    expect(paths).toEqual(['/elsewhere/wt-release/graphs/release/release-loop.yaml']);
+    expect(applied.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old });
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({ forCommit: tip, files: ['scripts/audit.test.ts', 'src/x.test.ts'] });
+    // A source change: fall back to a full gate — and the old plan for this version is removed, not reused.
+    write();
+    changed = 'scripts/audit.test.ts\nsrc/release-loop/gate.ts\n';
+    const fell = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    expect(fell.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('non-test change') });
+    expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
+    // A failing diff: full gate with the reason — the already refreshed tip never strands the resume.
+    write();
+    const throwingGit = (args: string[]) => { if (args[0] === 'diff') throw new Error('bad object'); return git(args); };
+    const noDiff = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git: throwingGit, isAncestor: () => true, graph, now });
+    expect(noDiff.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('changed files unreadable') });
+    // A corrupt prior gate record: fall back to a full gate with the reason (never an exception mid-resume).
+    write();
+    writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), '{broken');
+    const corrupt = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    expect(corrupt.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('unreadable gate record') });
+    writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: old, failures: ['src/x.test.ts > slow'] }));
+    // Without --partial: no plan, full gate — and a plan left from before is removed even when resuming at another node.
+    write();
+    changed = 'scripts/audit.test.ts\n';
+    await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    write();
+    const full = await resumeReleaseRun({ runId: 'r', from: 'cutoff' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now });
+    expect(full.partial).toEqual({ requested: false });
+    expect(() => readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).toThrow();
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(ledger, { recursive: true, force: true }); }
+});

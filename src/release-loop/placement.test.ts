@@ -1,25 +1,29 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../cli/release-cli.js';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistHistory, listChecklist, setItem } from './checklist.js';
 import { mergedPrsLast24h, placeCell, rebalance, seatMove } from './placement.js';
 import { move } from './feature-store.js';
+import { CliUserError } from '../cli/cli-user-error.js';
 import { setSchedule } from './release-schedule.js';
 
 let dir = '';
 const now = new Date('2026-10-04T00:00:00.000Z');
+const ghRepo = process.env.GH_REPO;
 function setup() {
+  // Fake `gh` binaries answer every call with PR rows, so name the repository instead of asking `gh repo view`.
+  process.env.GH_REPO = 'owner/repo';
   dir = mkdtempSync(join(tmpdir(), 'release-placement-'));
   setElanousConfigDir(dir);
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { placement: { seatCap: { TC: 2, MK: 2 } } } }));
   for (const [version, deadline] of [['0.2.14', '05T02'], ['0.2.15', '05T12'], ['0.2.16', '06T02'], ['0.2.17', '07T02']] as const)
     setSchedule(version, { cutAt: `2026-10-${deadline}:00Z`, landBy: `2026-10-${deadline}:00Z` }, 'OP');
 }
-afterEach(() => { resetElanousConfigDir(); if (dir) rmSync(dir, { recursive: true, force: true }); dir = ''; });
+afterEach(() => { resetElanousConfigDir(); if (ghRepo === undefined) delete process.env.GH_REPO; else process.env.GH_REPO = ghRepo; if (dir) rmSync(dir, { recursive: true, force: true }); dir = ''; });
 const cell = (id: string, priority: 'P0' | 'P1' | 'P2' = 'P2') => ({ id, title: id, owner: 'TC', priority, predecessors: [] });
 const deps = () => ({ now, merged24h: 2 });
 
@@ -28,11 +32,30 @@ test('merged PR throughput is measured from the first-class query within the exa
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   const gh = join(bin, 'gh');
-  writeFileSync(gh, '#!/bin/sh\nprintf "%s\\n" "[{\\"number\\":1,\\"mergedAt\\":\\"2026-10-03T01:00:00Z\\"},{\\"number\\":2,\\"mergedAt\\":\\"2026-10-02T23:59:59Z\\"}]"\n');
+  const argsFile = join(dir, 'gh-args');
+  writeFileSync(gh, `#!/bin/sh\nprintf "%s " "$@" > ${argsFile}\nprintf "%s\\n" "[{\\"number\\":1,\\"mergedAt\\":\\"2026-10-03T01:00:00Z\\"},{\\"number\\":2,\\"mergedAt\\":\\"2026-10-02T23:59:59Z\\"}]"\n`);
   chmodSync(gh, 0o700);
   const path = process.env.PATH;
   process.env.PATH = `${bin}:${path ?? ''}`;
-  try { expect(mergedPrsLast24h(now)).toBe(1); }
+  try {
+    // ORCH-LIVE-1008: outside a git checkout (like the installed package) the default resolver takes GH_REPO and passes it as --repo.
+    const cwd = process.cwd();
+    const outside = mkdtempSync(join(tmpdir(), 'placement-no-git-'));
+    process.chdir(outside);
+    try {
+      process.env.GH_REPO = 'installed-owner/installed-repo';
+      expect(mergedPrsLast24h(now)).toBe(1);
+      expect(readFileSync(argsFile, 'utf8')).toContain('--repo installed-owner/installed-repo ');
+      // No --repo · no harness.repo · no GH_REPO · not a git checkout → a user error naming what to set (no bare `gh`).
+      delete process.env.GH_REPO;
+      let thrown: unknown;
+      try { mergedPrsLast24h(now); } catch (error) { thrown = error; }
+      expect(thrown).toBeInstanceOf(CliUserError);
+      expect(String((thrown as Error).message)).toContain('저장소를 못 정했다');
+      expect((thrown as CliUserError).hint).toContain('harness.repo');
+      expect((thrown as CliUserError).hint).toContain('GH_REPO');
+    } finally { process.chdir(cwd); rmSync(outside, { recursive: true, force: true }); }
+  }
   finally { if (path === undefined) delete process.env.PATH; else process.env.PATH = path; }
 });
 
@@ -398,4 +421,58 @@ test('rebalance moves only unstarted yellow cells in two-hour pre-deadline windo
   expect(rebalance('0.2.15', { now: new Date('2026-10-05T11:00:00Z'), merged24h: 10 }).decisions.map((row) => row.id)).toEqual(['new']);
   expect(listChecklist('0.2.15').items.map((item) => item.id)).toEqual(['late']);
   expect(before).toEqual(['new', 'late']);
+});
+
+test('ORCH-LIVE-1008: a released copy of an id never blocks placement (open copy wins); two open copies still do', () => {
+  setup();
+  for (const version of ['0.2.10', '0.2.11']) {
+    setSchedule(version, { cutAt: '2026-10-01T02:00:00Z', landBy: '2026-10-01T02:00:00Z' }, 'OP');
+    addItem(version, { id: 'IA1', title: `IA1 of ${version}`, owner: 'TC' }, { allowDuplicateId: true });
+  }
+  addItem('0.2.11', { id: 'INSIDE1', title: 'old INSIDE1', owner: 'UX' }, { allowDuplicateId: true });
+  addItem('0.2.15', { id: 'INSIDE1', title: 'INSIDE1', owner: 'TC' }, { allowDuplicateId: true });
+  expect(placeCell(cell('fresh'), { ...deps(), released: '0.2.13', dryRun: true }).version).toBe('0.2.14');
+  // released-only copy: still refused as history
+  expect(() => placeCell(cell('IA1'), { ...deps(), released: '0.2.13', dryRun: true })).toThrow('이미 발행된 판의 칸은 배치하지 않는다: IA1');
+  // the open copy (0.2.15) is the one placement sees, not the 0.2.11 history
+  expect(placeCell(cell('INSIDE1'), { ...deps(), released: '0.2.13', dryRun: true }).version).not.toBe('0.2.11');
+  // a released cell that once depended on the old INSIDE1 is history: it does not pin the open INSIDE1
+  addItem('0.2.10', { id: 'OLDDEP', title: 'old dependent', owner: 'UX', predecessors: ['INSIDE1'] });
+  expect(placeCell(cell('INSIDE1'), { ...deps(), released: '0.2.13', dryRun: true }).version).not.toBe('0.2.11');
+  addItem('0.2.14', { id: 'INSIDE1', title: 'INSIDE1 twice', owner: 'TC' }, { allowDuplicateId: true });
+  expect(() => placeCell(cell('fresh2'), { ...deps(), released: '0.2.13', dryRun: true })).toThrow('여러 판의 같은 칸: INSIDE1');
+});
+
+test('ORCH-LIVE-1008: a pre-existing dependency violation elsewhere on the board does not block an unrelated placement', () => {
+  setup();
+  addItem('0.2.14', { id: 'before', title: 'before', owner: 'MK', predecessors: ['after'] });
+  addItem('0.2.15', { id: 'after', title: 'after', owner: 'MK' });
+  expect(placeCell(cell('unrelated'), { ...deps(), released: '0.2.13', dryRun: true }).version).toMatch(/^0\.2\.1[4-7]$/);
+  // a placement that depends on a cell is still placed after it
+  const after = placeCell({ ...cell('needs-after'), predecessors: ['after'] }, { ...deps(), released: '0.2.13', dryRun: true }).version;
+  expect(['0.2.16', '0.2.17']).toContain(after);
+});
+
+test('ORCH-LIVE-1008: a released cell that once depended on an id does not pin a seat move of the open cell', () => {
+  setup();
+  setSchedule('0.2.10', { cutAt: '2026-10-01T02:00:00Z', landBy: '2026-10-01T02:00:00Z' }, 'OP');
+  addItem('0.2.14', { id: 'mk2', title: 'MK cell', owner: 'MK' });
+  addItem('0.2.10', { id: 'OLDDEP', title: 'old dependent', owner: 'MK', predecessors: ['mk2'] }, { allowDuplicateId: true });
+  expect(() => seatMove('mk2', '0.2.14', '0.2.15', 'MK', 'capacity', { ...deps(), merged24h: 10, released: '0.2.13', dryRun: true })).not.toThrow();
+});
+
+
+test('ORCH-LIVE-1008: rebalance and seat moves of an open cell are not blocked by a released copy of its id or a released dependent', () => {
+  setup();
+  const near = new Date('2026-10-05T01:00:00Z');
+  setSchedule('0.2.10', { cutAt: '2026-10-01T02:00:00Z', landBy: '2026-10-01T02:00:00Z' }, 'OP');
+  addItem('0.2.10', { id: 'dup', title: 'old dup', owner: 'TC' });
+  addItem('0.2.10', { id: 'OLDDEP2', title: 'old dependent', owner: 'TC', predecessors: ['dup'] });
+  addItem('0.2.14', { ...cell('dup') }, { allowDuplicateId: true });
+  const balanced = rebalance('0.2.14', { now: near, merged24h: 4, released: '0.2.13', dryRun: true });
+  expect(balanced.blocked).toEqual([]);
+  expect(balanced.decisions.map((row) => row.id)).toEqual(['dup']);
+  addItem('0.2.10', { id: 'mkdup', title: 'old mk', owner: 'MK' }, { allowDuplicateId: true });
+  addItem('0.2.14', { id: 'mkdup', title: 'MK cell', owner: 'MK' }, { allowDuplicateId: true });
+  expect(() => seatMove('mkdup', '0.2.14', '0.2.15', 'MK', 'capacity', { ...deps(), merged24h: 10, released: '0.2.13', dryRun: true })).not.toThrow();
 });

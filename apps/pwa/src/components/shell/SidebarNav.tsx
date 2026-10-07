@@ -9,7 +9,8 @@ import { usePwaRole } from '@/lib/pwa-role';
 import { useOperator } from '@/lib/use-operator';
 import { routeMaturity, visibleForRole } from '@/lib/route-maturity';
 import { useShowBeta } from '@/lib/show-beta';
-import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, NAV_GROUPS, SIDEBAR_NAV_ITEMS, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
+import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, NAV_GROUPS, SIDEBAR_NAV_ITEMS, navItemActive, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
+import { NavSearchProbe } from './NavSearchProbe';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
 import { SidebarWorkflowInvoker } from './SidebarWorkflowInvoker';
 import { ShowroomSidebarSection } from './ShowroomSidebarSection';
@@ -43,6 +44,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
   const pathname = usePathname();
   const router = useRouter();
   const current = normalizePath(pathname ?? '/');
+  const [search, setSearch] = useState('');
   const role = usePwaRole();
   const { showBeta } = useShowBeta();
   const operator = useOperator();
@@ -82,11 +84,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
   const groups = visibleNavGroups(NAV_ITEMS, prefs, role, operator, { showBeta });
   const renderItem = (item: typeof NAV_ITEMS[number]) => {
     // Highlight nested routes and the shared Missions/Editor destinations.
-    const active =
-      item.href === '/'
-        ? current === '/'
-        : current === item.href || current.startsWith(item.href + '/')
-          || (item.activeAlso ?? []).some((p) => current === p || current.startsWith(p + '/'));
+    const active = navItemActive(item, current, search, NAV_ITEMS);
     const Icon = item.icon;
     const experimental = role === 'general' && showBeta && item.href !== '/settings' && routeMaturity(item.href) === 'beta';
     return (
@@ -144,6 +142,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
   };
   return (
     <nav className="flex h-full flex-col">
+      <Suspense fallback={null}><NavSearchProbe onSearch={setSearch} /></Suspense>
       {onClose && !compact && (
         <div className="flex items-center justify-between px-3 pt-3 pb-1">
           <span className="text-[10px] font-medium uppercase tracking-wide text-sidebar-foreground/50">

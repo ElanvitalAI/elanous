@@ -1,5 +1,21 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { debug } from '../../src/debug/log.js';
+
+/** Plan weights for a Pod sweep: wall-scaled when the previous cut recorded shard wall times, junit seconds otherwise. */
+export function planDurations(durationSource: string | undefined): { durations: Map<string, number>; wall?: { shards: number; scaledFiles: number } } {
+  if (!durationSource) return { durations: new Map() };
+  const junit = readFileDurations(durationSource);
+  const wall = readFileWallWeights(durationSource, junit);
+  return wall ? { durations: wall.weights, wall: { shards: wall.shards, scaledFiles: wall.scaledFiles } } : { durations: junit };
+}
+
+/** Observation for GATE-PLAN-WALLTIME, emitted once the shards are planned so `maxPlannedMin` is the heaviest shard. */
+export function logPlanWalltime(wall: { shards: number; scaledFiles: number } | undefined, shards: ReadonlyArray<{ plannedSeconds: number }>): void {
+  if (!wall) return;
+  const maxPlannedSeconds = Math.max(0, ...shards.map((shard) => shard.plannedSeconds));
+  debug.log('release-loop.gate', 'plan-walltime', { shards: wall.shards, scaledFiles: wall.scaledFiles, maxPlannedMin: Math.round(maxPlannedSeconds / 6) / 10 });
+}
 
 /** Read per-file seconds from previous cut Pod reports; missing or damaged reports are not estimates. */
 export function readFileDurations(dir: string): Map<string, number> {
@@ -61,4 +77,53 @@ export function planShards(files: string[], durations: Map<string, number>, coun
     lightest.plannedSeconds += weight(file);
   }
   return shards.filter((shard) => shard.files.length > 0);
+}
+
+/**
+ * GATE-PLAN-WALLTIME: junit testsuite times run far below a shard's real wall time (0.2.18 pod-23: planned 2.7 min,
+ * measured 33.3 min), so LPT balanced the wrong quantity. When the previous cut left `pod-*.json` records
+ * (`durationMs` ⊕ `files`), each file's junit seconds are scaled so its shard's planned total equals the measured wall
+ * time; files without junit take that shard's average per-file wall time. A file measured in several records takes
+ * its first-pass shard (`pod-<n>.json` — the shape the next cut plans) over descent/retry children, whose per-Pod
+ * install overhead lands on one or two files; among equals, the record with the fewest files.
+ * Returns undefined when no usable record exists, so callers keep the junit-only behaviour.
+ */
+export function readFileWallWeights(dir: string, junit: Map<string, number>): { weights: Map<string, number>; shards: number; scaledFiles: number } | undefined {
+  let names: string[];
+  try { names = readdirSync(dir).filter((name) => /^pod-.*\.json$/.test(name)).sort(); }
+  catch { return undefined; }
+  const records: Array<{ wallSeconds: number; files: string[]; firstPass: boolean }> = [];
+  for (const name of names) {
+    try {
+      const meta = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { durationMs?: unknown; files?: unknown };
+      if (typeof meta.durationMs !== 'number' || !Number.isFinite(meta.durationMs) || meta.durationMs <= 0) continue;
+      if (!Array.isArray(meta.files) || !meta.files.length || !meta.files.every((file) => typeof file === 'string')) continue;
+      records.push({ wallSeconds: meta.durationMs / 1000, files: [...new Set(meta.files as string[])], firstPass: /^pod-\d+\.json$/.test(name) });
+    } catch { /* One damaged record must not discard the others. */ }
+  }
+  if (!records.length) return undefined;
+  const valid = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value) && value >= 0;
+  const best = new Map<string, { rank: number; seconds: number }>();
+  for (const record of records) {
+    const unknownCount = record.files.filter((file) => !valid(junit.get(file))).length;
+    const junitSum = record.files.reduce((sum, file) => { const value = junit.get(file); return sum + (valid(value) ? value : 0); }, 0);
+    const average = record.wallSeconds / record.files.length;
+    const remaining = record.wallSeconds - unknownCount * average;
+    for (const file of record.files) {
+      const seconds = junit.get(file);
+      const weight = valid(seconds) && junitSum > 0 && remaining > 0 ? seconds * (remaining / junitSum) : average;
+      const prior = best.get(file);
+      const rank = (record.firstPass ? 0 : 1_000_000) + record.files.length;
+      if (!prior || rank < prior.rank) best.set(file, { rank, seconds: weight });
+    }
+  }
+  // Files timed by junit but absent from every record (new or renamed since the cut) take the overall scale, so the
+  // plan never mixes wall seconds with raw junit seconds.
+  let scaledSum = 0;
+  let junitSum = 0;
+  for (const [file, { seconds }] of best) { const value = junit.get(file); if (valid(value) && value > 0) { scaledSum += seconds; junitSum += value; } }
+  const overall = junitSum > 0 ? scaledSum / junitSum : 1;
+  const weights = new Map([...junit].map(([file, seconds]) => [file, seconds * overall] as [string, number]));
+  for (const [file, { seconds }] of best) weights.set(file, seconds);
+  return { weights, shards: records.length, scaledFiles: best.size };
 }

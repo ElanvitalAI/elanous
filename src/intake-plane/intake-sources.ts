@@ -20,6 +20,7 @@ export interface RegisteredIntakeSource {
 }
 
 export function canonicalSeat(value: string): string {
+  if (value.trim() === 'user') return 'user';
   const seat = findTrack(value.trim());
   if (!seat) throw new Error(`알 수 없는 자리: ${value}`);
   return seat.id;

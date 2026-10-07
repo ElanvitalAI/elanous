@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyShortQuestion } from './short-question';
+import { classifyShortQuestion, classifyTuiChatIntent } from './short-question';
 
 // 고정 표 20개(골 ASK-bot-short-question-fast-path-b1b) ⊕ 리뷰 라운드가 든 요청형 변형.
 const FAST = ['안녕', 'hi', '고마워', '오늘 기분 어때? 한 줄로.', '서울에서 부산까지 KTX 로 대략 몇 시간? 한 줄로.',
@@ -17,5 +17,49 @@ describe('B1 짧은 물음 빠른 경로 — 허용 방식', () => {
     expect(classifyShortQuestion('  ').reason).toBe('empty');
     expect(classifyShortQuestion('서울 날씨').reason).toBe('live');
     expect(classifyShortQuestion('그냥 적어 둔 메모').reason).toBe('not-a-question');
+  });
+});
+
+describe('TUI intent (daemon short-question fast verdict is independent)', () => {
+  test.each([
+    ['나한테 온 결정 카드 있어?', '조회'],
+    ['답변을 좀 더 빠른 모델로 바꿔줘', '설정 변경'],
+    ['이번 주 업계 소식 조사', '조사'],
+    ['매일 아침 8시 뉴스', '상시 일'],
+    // review r2: an edit verb whose object is a setting stays a quick settings turn.
+    ['모델 설정 수정해줘', '설정 변경'],
+    ['매일 아침 8시 뉴스 알림 만들어줘', '상시 일'],
+    ['오늘 로그 보여줘', '조회'],
+    ['이번 주 업계 소식 조사해줘', '조사'],
+    // review r8: «…마다» is a recurring job even when it researches.
+    ['아침마다 뉴스 보내줘', '상시 일'],
+    ['매주 결정 카드 현황 알려줘', '상시 일'],
+    // review r9: editing a schedule is a scheduling request.
+    ['매일 아침 뉴스 예약 변경해줘', '상시 일'],
+  ] as const)('%s → %s without goal loop', (text, route) => {
+    expect(classifyTuiChatIntent(text)).toMatchObject({ route, goalLoop: false });
+  });
+  test.each([
+    'src/acp/server.ts 의 승인 정책 고쳐줘', '하니스로 구현해줘', '이거 좀 해줘',
+    // review r1: a research or lookup word does not hide an edit or a file path.
+    '뉴스 검색해서 README.md 수정해줘', '로그 보고 고쳐줘', '업계 소식 조사해서 docs/news.md 에 적어줘', 'fix the status page',
+    // review r3: running tests and an edit whose object is not the setting stay coding.
+    '로그 확인하고 테스트 돌려줘', '모델 얘기하고 서버 고쳐줘', '설정 파일 고쳐줘',
+    // review r4: a create verb, or a second edit whose object is not the setting, keeps the goal loop.
+    '뉴스 조사해서 화면 만들어줘', '모델 설정 고쳐줘 그리고 화면 고쳐줘',
+    // review r5: change verbs are checked per occurrence too.
+    '모델 설정 바꿔줘 그리고 화면 바꿔줘', '설정 바꿔서 로그 형식 변경해줘',
+    // review r6: request verbs are an allowlist — delete, run, move … keep the goal loop.
+    '뉴스 조사해서 화면 지워줘', '결정 카드 보고 옮겨줘', '로그 확인하고 다시 돌려줘',
+    // review r11: destructive or executing verbs without «…줘» stay coding too.
+    'delete status page', '로그 확인하고 화면 지워', '상태 보고 데몬 재시작',
+  ])('%s retains goal loop', (text) => {
+    expect(classifyTuiChatIntent(text)).toMatchObject({ route: '코딩·구현', goalLoop: true });
+  });
+  test('attachments and mixed intents are conservative; daemon verdict is unchanged', () => {
+    expect(classifyTuiChatIntent('결정 카드 있어?', { hasAttachments: true }).goalLoop).toBe(true);
+    expect(classifyTuiChatIntent('뉴스 조사하고 설정 바꿔줘').goalLoop).toBe(true);
+    expect(classifyShortQuestion('안녕')).toEqual({ fast: true, reason: 'greeting' });
+    expect(classifyShortQuestion('나한테 온 결정 카드 있어?')).toEqual({ fast: true, reason: 'question' });
   });
 });

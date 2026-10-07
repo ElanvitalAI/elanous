@@ -15,6 +15,8 @@ export type FinishMetric = 'launched' | 'landed' | 'landingRate' | 'staleDrafts'
 export type FinishMetrics = {
   launched: number | null;
   launchedUnreadable?: number;
+  /** Launched Pod runs whose child ledger never came back (`pod-ledger-incomplete`) — counted in `launched`, result unknown. */
+  launchedIncomplete?: number;
   landed: number | null;
   landingRate: number | null;
   staleDrafts: number | null;
@@ -97,7 +99,9 @@ export function recordFinishHistory(root: string, metrics: FinishMetrics, now: D
 }
 
 type Start = { runId: string; startedAt: string };
-type StartObservation = { starts: readonly Start[]; unreadable: readonly { runId: string; reason: string }[]; unreadableDirectories?: number };
+type StartObservation = { starts: readonly Start[]; unreadable: readonly { runId: string; reason: string }[]; unreadableDirectories?: number;
+  /** Runs counted as launched although their child ledger never came back (reason = the host marker's data.reason). */
+  incomplete?: readonly { runId: string; reason: string }[] };
 type Pr = { number: number; headRefName: string; mergedAt?: string; createdAt?: string; mergeable?: string; labels?: { name: string }[] };
 export interface MeasureFinishDeps {
   listStarts?: (cutoff: number) => StartObservation;
@@ -113,6 +117,7 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
   let unreadableDirectories = 0;
   let unresolvedDirectories = 0;
   const launchOnlyIds = new Set<string>();
+  const incomplete = new Map<string, { runId: string; reason: string }>();
   for (const { ledgerDirectory } of resolveFederatedRunLedgerTargets({ includeTest: true, ...(targets ? { targets } : {}) })) {
     let dir: string;
     try {
@@ -143,6 +148,20 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
         continue;
       }
       const start = entries.find(entry => entry.event === 'start');
+      // ORCH-LIVE-1008 ①: the host writes `pod-ledger-incomplete` on a Pod child run's ledger when the child's own ledger
+      // never came back (OOM · logs unavailable · partial collection). The Job did run — it is a launch with an unknown
+      // result, not a ledger without a start. Its time is the marker's timestamp, else the ledger mtime.
+      const incompleteMarker = !start ? entries.find(entry => entry.event === 'pod-ledger-incomplete') : undefined;
+      if (incompleteMarker) {
+        // Only a real `start` (from any directory) outranks the marker; a host launch-only record does not — the same
+        // run read as launch-only first is still a launch whose result never came back.
+        if (starts.has(runId) && !launchOnlyIds.has(runId)) continue;
+        if (!starts.has(runId)) starts.set(runId, { runId, startedAt: incompleteMarker.timestamp ?? new Date(statSync(path).mtimeMs).toISOString() });
+        const why = (incompleteMarker.data as { reason?: unknown } | undefined)?.reason;
+        incomplete.set(runId, { runId, reason: typeof why === 'string' && why ? why : 'unknown' });
+        unreadable.delete(runId);
+        continue;
+      }
       // A Pod-dispatched launch leaves only a host launch record (launch-quota-policy · author-on-pod-receipt) — the run
       // itself starts inside the Pod. That is still a launch: its time is the record's timestamp, else the ledger mtime.
       const launchRecord = !start ? entries.find(entry => LAUNCH_ONLY_EVENTS.has(entry.event)) : undefined;
@@ -157,12 +176,14 @@ function defaultListStarts(cutoff: number, targets?: readonly LogTarget[]): Star
       if (launchRecord) launchOnlyIds.add(runId); else launchOnlyIds.delete(runId);
       starts.set(runId, { runId, startedAt });
       unreadable.delete(runId);
+      incomplete.delete(runId);
     }
   }
   debug.log('loop.orchestrator', 'finish-launch-population', {
     directories: directories.size + unresolvedDirectories, launched: starts.size, launchOnly: launchOnlyIds.size, childLedgers: childLedgers.size, unreadable: unreadable.size,
+    ...(incomplete.size > 0 ? { incomplete: incomplete.size } : {}),
   });
-  return { starts: [...starts.values()], unreadable: [...unreadable.values()], unreadableDirectories };
+  return { starts: [...starts.values()], unreadable: [...unreadable.values()], unreadableDirectories, incomplete: [...incomplete.values()] };
 }
 
 function defaultRunGh(args: string[]): string {
@@ -184,6 +205,7 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
   const cutoff = now.getTime() - DAY_MS;
   let launched: number | null = null;
   let launchedUnreadable = 0;
+  let launchedIncomplete = 0;
   let landed: number | null = null;
   let staleDrafts: number | null = null;
   let conflictRatio: number | null = null;
@@ -196,6 +218,14 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
       || observation.unreadable.some(entry => !entry || typeof entry.runId !== 'string' || typeof entry.reason !== 'string')) throw new Error('invalid run start observation');
     launched = new Set(observation.starts.filter(start => Date.parse(start.startedAt) >= cutoff && Date.parse(start.startedAt) <= now.getTime()).map(start => start.runId)).size;
     launchedUnreadable = observation.unreadable.length;
+    const incompleteRuns = (observation.incomplete ?? []).filter(entry => observation.starts.some(start => start.runId === entry.runId
+      && Date.parse(start.startedAt) >= cutoff && Date.parse(start.startedAt) <= now.getTime()));
+    launchedIncomplete = incompleteRuns.length;
+    if (launchedIncomplete > 0) {
+      const byReason: Record<string, number> = {};
+      for (const entry of incompleteRuns) byReason[entry.reason] = (byReason[entry.reason] ?? 0) + 1;
+      debug.log('loop.orchestrator', 'finish-ledger-incomplete', { count: launchedIncomplete, byReason, sample: incompleteRuns.slice(0, 5) });
+    }
     if (launchedUnreadable > 0) {
       reasons.launched = `${launchedUnreadable}개 원장 시작 줄 없음(하한값)`;
       debug.log('loop.orchestrator', 'finish-ledger-unreadable', { count: launchedUnreadable, sample: observation.unreadable.slice(0, 5) });
@@ -234,7 +264,7 @@ export function measureFinish(deps: MeasureFinishDeps = {}, now: Date = new Date
     : 'no harness runs launched in the last 24 hours';
   else if (landed > launched) reasons.landingRate = `landed exceeds launched — population mismatch (launched=${launched}, landed=${landed})`;
   else landingRate = landed / launched;
-  return { launched, ...(launchedUnreadable > 0 ? { launchedUnreadable } : {}), landed, landingRate, staleDrafts, conflictRatio, unknownMergeable, reasons };
+  return { launched, ...(launchedUnreadable > 0 ? { launchedUnreadable } : {}), ...(launchedIncomplete > 0 ? { launchedIncomplete } : {}), landed, landingRate, staleDrafts, conflictRatio, unknownMergeable, reasons };
 }
 
 /** Advice only: no launch cap, PR, or config is changed. */

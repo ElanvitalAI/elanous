@@ -44,6 +44,7 @@ else if (args.includes('wait')) console.log('condition met');
 else if (args.some((a) => a.startsWith('pod/elanous-dns-')) && args.includes('logs')) console.log('Name: kubernetes.default.svc.cluster.local\\nAddress: 10.43.0.1');
 else if (args.some((a) => a.startsWith('pod/elanous-dns-')) && args.includes('get')) output({ status: { phase: 'Succeeded' } });
 else if (args.some((a) => a.startsWith('pod/elanous-dns-'))) console.log('');
+else if (args.includes('top')) process.exit(1); // no metrics-server: POD-ADMIT-BY-USAGE keeps limit reservations
 else if (args.includes('nodes')) output({ items: [{ metadata: { name: 'node' }, status: { allocatable: { memory: '32Gi', cpu: '8' }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
 else if (args.includes('jobs')) output({ items: get().applied.filter((n) => !get().completed.includes(n)).map((n) => ({ metadata: { name: n, labels: { 'elanous.substrate': 'pod' }, annotations: (get().annotations ?? {})[n] ?? {} } })) });
 else if (args.includes('pods')) {

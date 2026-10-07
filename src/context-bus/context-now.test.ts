@@ -1,9 +1,10 @@
-import { expect, test } from 'bun:test';
+import { expect, test, setDefaultTimeout, setSystemTime } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { contextNow, type ContextNowDeps } from './context-now.js';
-import { renderVoiceNow } from './context-now-surfaces.js';
+import { renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
+import type { QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { recordExternalEvent } from './external-events.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
@@ -14,13 +15,115 @@ import { createDevProxyRuntimeRef } from '../nexus/api/admin-dev-proxy.js';
 import { SELF_COGNITION_RUNTIMES } from '../tool-runtime/self-cognition-runtimes.js';
 import { buildCoreTools } from '../domains/core-tools.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { openSchedulesDb } from '../domains/schedule-registry.js';
+import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
+
+// The HTTP/chat parity test now reads the live operational sources (running runs scan the federated ledgers);
+// that alone took ~6 s on a loaded host, past Bun's 5 s default.
+setDefaultTimeout(30_000);
 
 const at = '2026-10-03T04:00:00.000Z';
+const noOperations: ContextNowDeps = { runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null };
+
+function ledgerRunAnswer(start: Record<string, unknown> | null) {
+  const root = mkdtempSync(join(tmpdir(), 'context-run-ledger-'));
+  try {
+    const directory = join(root, 'run-ledger');
+    mkdirSync(directory);
+    writeFileSync(join(directory, 'run-now.jsonl'), start ? JSON.stringify({ runId: 'run-now', event: 'start', ...start }) + '\n' : '');
+    const entry = { runId: 'run-now', status: 'running', ledgerDirectories: [directory], lastPhase: 'implement' };
+    const queryRuns = () => ({ entries: [entry], countedStatuses: ['running'], completeness: 'complete',
+      pty: { unreadable: [] }, phases: { unreadableTargetCount: 0 } }) as unknown as QueriedRunningRunsResult;
+    return contextNow({}, { ...noOperations, runningRuns: undefined, queryRuns, now: () => new Date(at), version: () => '0.2.0',
+      checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      decisions: () => [], seatEntries: () => [], events: () => [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+test('TUI /now running run reads goal and elapsed minutes from start ledger', () => {
+  const answer = ledgerRunAnswer({ timestamp: '2026-10-03T03:52:00.000Z', data: { feature: 'Ship ledger goal' } });
+  expect(answer.facts[0]).toMatchObject({ kind: 'run', goal: 'Ship ledger goal', phase: 'implement', elapsed: '8분' });
+  expect(renderTuiNow(answer).join('\n')).toContain('Ship ledger goal · implement · 8분');
+});
+
+test('TUI /now running run reports missing goal and elapsed only without ledger values', () => {
+  const answer = ledgerRunAnswer({ data: {} });
+  expect(answer.facts[0]).toMatchObject({ kind: 'run', goal: '골 미기록', phase: 'implement', elapsed: '경과 미관측' });
+  expect(renderTuiNow(answer).join('\n')).toContain('골 미기록 · implement · 경과 미관측');
+});
+
+test('TUI /now keeps recorded goal and elapsed when another ledger directory is unreadable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-run-partial-'));
+  try {
+    const broken = join(root, 'broken');
+    const healthy = join(root, 'healthy');
+    mkdirSync(broken);
+    mkdirSync(healthy);
+    writeFileSync(join(broken, 'run-now.jsonl'), '{broken}\n');
+    writeFileSync(join(healthy, 'run-now.jsonl'), JSON.stringify({ runId: 'run-now', event: 'start',
+      timestamp: '2026-10-03T03:52:00.000Z', data: { feature: 'Recovered goal' } }) + '\n');
+    const queryRuns = () => ({ entries: [{ runId: 'run-now', status: 'running', ledgerDirectories: [broken, healthy], lastPhase: 'implement' }],
+      countedStatuses: ['running'], completeness: 'complete', pty: { unreadable: [] }, phases: { unreadableTargetCount: 0 } }) as unknown as QueriedRunningRunsResult;
+    const observed = contextNow({}, { ...noOperations, runningRuns: undefined, queryRuns, now: () => new Date(at),
+      version: () => '0.2.0', checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      decisions: () => [], seatEntries: () => [], events: () => [] });
+    expect(observed.facts[0]).toMatchObject({ kind: 'run', goal: 'Recovered goal', elapsed: '8분' });
+    const lines = renderTuiNow(observed).join('\n');
+    expect(lines).toContain('Recovered goal · implement · 8분');
+    expect(lines).toContain('못 읽음 · 런 원장 일부 관측 불가');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const [label, start, goal, elapsed] of [
+  ['goal only', { data: { feature: 'Recovered goal' } }, 'Recovered goal', '경과 관측 불가'],
+  ['start only', { timestamp: '2026-10-03T03:52:00.000Z', data: {} }, '골 관측 불가', '8분'],
+] as const) {
+  test(`TUI /now retains ${label} from a healthy directory when another is damaged`, () => {
+    const root = mkdtempSync(join(tmpdir(), 'context-run-partial-field-'));
+    try {
+      const broken = join(root, 'broken');
+      const healthy = join(root, 'healthy');
+      mkdirSync(broken);
+      mkdirSync(healthy);
+      writeFileSync(join(broken, 'run-now.jsonl'), '{broken}\n');
+      writeFileSync(join(healthy, 'run-now.jsonl'), JSON.stringify({ runId: 'run-now', event: 'start', ...start }) + '\n');
+      const queryRuns = () => ({ entries: [{ runId: 'run-now', status: 'running', ledgerDirectories: [broken, healthy], lastPhase: 'implement' }],
+        countedStatuses: ['running'], completeness: 'complete', pty: { unreadable: [] }, phases: { unreadableTargetCount: 0 } }) as unknown as QueriedRunningRunsResult;
+      const observed = contextNow({}, { ...noOperations, runningRuns: undefined, queryRuns, now: () => new Date(at),
+        version: () => '0.2.0', checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+        decisions: () => [], seatEntries: () => [], events: () => [] });
+      expect(observed.facts[0]).toMatchObject({ kind: 'run', goal, elapsed });
+      const lines = renderTuiNow(observed).join('\n');
+      expect(lines).toContain(`${goal} · implement · ${elapsed}`);
+      expect(lines).toContain('못 읽음 · 런 원장 일부 관측 불가');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('TUI /now distinguishes unreadable run ledger from absent goal and start time', () => {
+  const answer = ledgerRunAnswer({ timestamp: '2026-10-03T03:52:00.000Z', data: { feature: 'Recorded goal' } });
+  const root = mkdtempSync(join(tmpdir(), 'context-run-unreadable-'));
+  try {
+    const directory = join(root, 'run-ledger');
+    mkdirSync(directory);
+    writeFileSync(join(directory, 'run-now.jsonl'), '{broken}\n');
+    const queryRuns = () => ({ entries: [{ runId: 'run-now', status: 'running', ledgerDirectories: [directory], lastPhase: 'implement' }],
+      countedStatuses: ['running'], completeness: 'complete', pty: { unreadable: [] }, phases: { unreadableTargetCount: 0 } }) as unknown as QueriedRunningRunsResult;
+    const observed = contextNow({}, { ...noOperations, runningRuns: undefined, queryRuns, now: () => new Date(at),
+      version: () => '0.2.0', checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      decisions: () => [], seatEntries: () => [], events: () => [] });
+    expect(observed.facts[0]).toMatchObject({ kind: 'run', unreadable: '런 원장 일부 관측 불가' });
+    expect(renderTuiNow(observed).join('\n')).toContain('못 읽음 · 런 원장 일부 관측 불가');
+    expect(renderTuiNow(observed).join('\n')).not.toContain('골 미기록');
+    expect(renderTuiNow(observed).join('\n')).not.toContain('경과 미관측');
+    expect(answer.facts[0]).toMatchObject({ goal: 'Recorded goal', elapsed: '8분' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 // Fake ledger readers exercise filtering and source preservation without creating a store.
 test('topic filters cell IDs/titles and event summaries; lines carry sources and no conversation bodies', () => {
   const answer = contextNow({ topic: 'K6' }, {
-    now: () => new Date(at), version: () => '0.2.0',
+    ...noOperations, now: () => new Date(at), version: () => '0.2.0',
     checklist: v => ({ version: v, released: '', dev: v, history: [], items: v === '0.2.0' ? [
       { id: 'K6', title: 'Ship the context door', status: 'red', updatedAt: at, updatedBy: 'TC' },
       { id: 'K7', title: 'Another feature', status: 'yellow', updatedAt: at, updatedBy: 'TC' },
@@ -43,7 +146,7 @@ test('topic filters cell IDs/titles and event summaries; lines carry sources and
   expect([...answer.facts, ...answer.events].every(line => !!line.source)).toBe(true);
   expect(JSON.stringify(answer)).not.toContain('SECRET CONVERSATION');
   const byTitle = contextNow({ topic: 'another FEATURE' }, {
-    now: () => new Date(at), version: () => '0.2.0',
+    ...noOperations, now: () => new Date(at), version: () => '0.2.0',
     checklist: v => ({ version: v, released: '', dev: v, history: [], items: v === '0.2.0'
       ? [{ id: 'K7', title: 'Another feature', status: 'yellow', updatedAt: at, updatedBy: 'TC' }] : [] }),
     decisions: () => [], seatEntries: () => [], events: () => [],
@@ -53,7 +156,7 @@ test('topic filters cell IDs/titles and event summaries; lines carry sources and
 
 test('unfiltered version facts, bounded limit and empty ledgers retain the read-only answer shape', () => {
   const answer = contextNow({ limit: 1 }, {
-    now: () => new Date(at), version: () => '0.2.0',
+    ...noOperations, now: () => new Date(at), version: () => '0.2.0',
     checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
     decisions: () => [], seatEntries: () => [], events: () => [],
   });
@@ -64,7 +167,7 @@ test('crowded ledgers retain decisions and the latest seat status within the fac
   const earlier = '2026-10-03T02:00:00.000Z';
   const later = '2026-10-03T03:00:00.000Z';
   const deps: ContextNowDeps = {
-    now: () => new Date(at), version: () => '0.2.0',
+    ...noOperations, now: () => new Date(at), version: () => '0.2.0',
     checklist: version => ({ version, released: '', dev: version, history: [], items: version === '0.2.0'
       ? Array.from({ length: 25 }, (_, i) => ({ id: `K${i}`, title: `Open cell ${i}`, status: 'yellow' as const, updatedAt: at, updatedBy: 'TC' })) : [] }),
     decisions: () => [{ id: 'D1', title: 'Decision needed', status: 'open', raisedBy: { agent: 'TC' },
@@ -89,7 +192,87 @@ test('crowded ledgers retain decisions and the latest seat status within the fac
   expect(defaultAnswer.facts.filter(f => f.kind === 'seat').map(f => f.status)).toEqual(['launched', 'attempting']);
 });
 
+test('operational sources are independently injectable, unreadable is not zero, and topic narrows all facts', () => {
+  const base: ContextNowDeps = { ...noOperations, now: () => new Date(at), version: () => '0.2.0',
+    checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+    decisions: () => [], seatEntries: () => [], events: () => [] };
+  const run = { kind: 'run' as const, goal: 'Ship K6', phase: 'review', elapsed: '8분', source: 'run://one' };
+  const release = { kind: 'release' as const, version: '0.2.1', node: '2/4 publish', status: 'running', source: 'release://one' };
+  const late = { kind: 'schedule-late' as const, count: 1, names: ['K6 cron'], source: 'cron://one' };
+  const deps = { ...base, runningRuns: () => [run], releaseRun: () => release, lateSchedules: () => late };
+  expect(contextNow({}, deps).facts.slice(0, 3)).toEqual([run, release, late]);
+  expect(contextNow({ topic: 'K6' }, deps).facts).toEqual([run, late]);
+  expect(contextNow({ topic: 'K6' }, { ...deps, releaseRun: () => { throw new Error('잠김'); } }).facts).toContainEqual(
+    expect.objectContaining({ kind: 'release', unreadable: '잠김' }),
+  );
+  const calls: string[] = [];
+  expect(contextNow({ audience: 'public-demo' }, { ...deps,
+    runningRuns: () => { calls.push('run'); return [run]; },
+    releaseRun: () => { calls.push('release'); return release; },
+    lateSchedules: () => { calls.push('schedule-late'); return late; },
+    brandCheck: () => ({ missing: false, findings: [] }) as never,
+  }).facts.map(fact => fact.kind)).toEqual(['version']);
+  expect(calls).toEqual([]);
+  for (const failed of ['runningRuns', 'releaseRun', 'lateSchedules'] as const) {
+    const broken = { ...deps, [failed]: () => { throw new Error('잠김'); } };
+    const facts = contextNow({}, broken).facts;
+    expect(facts.find(fact => 'unreadable' in fact && fact.unreadable)).toMatchObject({ unreadable: '잠김' });
+    expect(facts.filter(fact => !('unreadable' in fact && fact.unreadable))).toEqual(expect.arrayContaining(
+      [run, release, late].filter(fact => fact.kind !== ({ runningRuns: 'run', releaseRun: 'release', lateSchedules: 'schedule-late' } as const)[failed]),
+    ));
+  }
+});
+
+test('release adapter reads the same graph-runs/release-loop ledger as /v1/ops/release/runs and selects the latest', () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-release-'));
+  const previous = { config: process.env.ELANOUS_CONFIG_DIR, state: process.env.ELANOUS_STATE_DIR };
+  process.env.ELANOUS_CONFIG_DIR = root;
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  try {
+    const dir = join(root, 'graph-runs', 'release-loop');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'old.json'), JSON.stringify({ startedAt: '2026-10-02T00:00:00Z', status: 'done', input: { version: '0.2.0' }, path: ['prepare'], nodes: [{ nodeId: 'prepare' }] }));
+    writeFileSync(join(dir, 'latest.json'), JSON.stringify({ startedAt: at, status: 'running', input: { version: '0.2.1' }, path: ['prepare', 'publish', 'verify'], nodes: [{ nodeId: 'prepare' }] }));
+    const facts = contextNow({}, { ...noOperations, releaseRun: undefined, now: () => new Date(at), version: () => '0.2.0',
+      checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      decisions: () => [], seatEntries: () => [], events: () => [] }).facts;
+    expect(facts[0]).toEqual({ kind: 'release', version: '0.2.1', node: '2/3 publish', status: 'running', source: 'elanous://graph-runs/release-loop/latest' });
+  } finally {
+    resetElanousConfigDir();
+    if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
+    if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schedule adapter reuses /loops local cron verdict over the read-only schedule registry', () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-schedules-'));
+  const previous = { config: process.env.ELANOUS_CONFIG_DIR, state: process.env.ELANOUS_STATE_DIR };
+  process.env.ELANOUS_CONFIG_DIR = root;
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  try {
+    const db = openSchedulesDb();
+    db.run(`INSERT INTO schedule_registry (id, name, source, cron, interval_ms, category, enabled, last_run, last_status, run_via)
+      VALUES (?, ?, 'crontab', '0 * * * *', 60000, 'maintenance', 1, ?, 'ok', 'crontab')`, ['late-cron', 'nightly', '2026-10-02T00:00:00Z']);
+    expect(db.query('SELECT name FROM schedule_registry').all()).toEqual([{ name: 'nightly' }]);
+    db.close();
+    expect(localLoopRows(new Date(at))).toContainEqual(expect.objectContaining({ name: 'nightly', verdict: 'late' }));
+    const facts = contextNow({}, { ...noOperations, lateSchedules: undefined, now: () => new Date(at), version: () => '0.2.0',
+      checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      decisions: () => [], seatEntries: () => [], events: () => [] }).facts;
+    expect(facts[0]).toEqual({ kind: 'schedule-late', count: 1, names: ['nightly'], source: 'elanous://schedules' });
+  } finally {
+    resetElanousConfigDir();
+    if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
+    if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('GET /v1/context/now?format=voice returns only rendered text while other formats keep the ledger JSON', async () => {
+  setSystemTime(new Date('2026-10-03T04:00:00.000Z'));
   const root = mkdtempSync(join(tmpdir(), 'context-now-voice-'));
   const previous = { config: process.env.ELANOUS_CONFIG_DIR, state: process.env.ELANOUS_STATE_DIR };
   process.env.ELANOUS_CONFIG_DIR = root;
@@ -123,6 +306,7 @@ test('GET /v1/context/now?format=voice returns only rendered text while other fo
     expect(await (await run('?format=card'))?.json()).toEqual(answer);
     expect(await (await run('?format=voice', 'wrong-token'))?.json()).toEqual({ error: 'unauthorized' });
   } finally {
+    setSystemTime();
     resetElanousConfigDir();
     if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
     if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;

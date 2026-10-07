@@ -495,3 +495,149 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
     expect(measured([], JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: 'bad', cpu: '32' } } }] })).members[0]?.allocatableMemoryBytes).toBeNull();
   });
 });
+
+describe('POD-ADMIT-BY-USAGE — admission by observed Pod usage', () => {
+  const mi = 1024 ** 2;
+  // OP 10-07 14:4x node-b: 18 Running harness Pods (request 6Gi · limit 16Gi) using 0.3–2.6GiB, one 10GiB.
+  const usageMi = [300, 290, 640, 600, 1050, 310, 2650, 290, 290, 590, 580, 580, 810, 570, 2880, 560, 500, 10240];
+  const harnessPod = (name: string, phase = 'Running') => ({
+    metadata: { namespace: 'elanous-test', name, labels: { 'elanous.substrate': 'pod', 'elanous.job': 'harness-job' } },
+    status: { phase }, spec: { nodeName: 'node-1', containers: [{ resources: { requests: { memory: '6Gi' }, limits: { memory: '16Gi' } } }] },
+  });
+  // Unrelated workloads on the same node reserve 180Gi — with 18 × 16Gi limits the node has 12Gi left: today's code admits 0.
+  const other = { metadata: { namespace: 'kube-system', name: 'big', labels: {} }, status: { phase: 'Running' },
+    spec: { nodeName: 'node-1', containers: [{ resources: { requests: { memory: '180Gi' }, limits: { memory: '180Gi' } } }] } };
+  const pods = [...usageMi.map((_, i) => harnessPod(`si-task-${i}`)), other];
+  const nodes = JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '480Gi', cpu: '64' }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
+  const topPods = (names = usageMi.map((_, i) => `si-task-${i}`)) => ['client 0m 0Mi', 'ref-mirror-abc 0m 0Mi',
+    ...names.map((name) => `${name}   12m   ${usageMi[Number(name.split('-').pop())]}Mi`)].join('\n');
+  const cluster = (top: { status: number; stdout: string; stderr: string } | null, list: object[] = pods, topNodes = 'node-1   6291m   19%   61440Mi   12%'): { kubectl: PoolKubectl; calls: string[][] } => {
+    const calls: string[][] = [];
+    return { calls, kubectl: (args) => {
+      calls.push([...args]);
+      if (args.includes('top')) return args.includes('nodes') ? { status: 0, stdout: topNodes, stderr: '' } : top ?? { status: 1, stdout: '', stderr: 'error: Metrics API not available' };
+      if (args.includes('nodes')) return { status: 0, stdout: nodes, stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }] }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: list }), stderr: '' };
+    } };
+  };
+  const measure = (kubectl: PoolKubectl, measureUsage = true) => measurePoolLease(parsePodPool('node-b:25'), { kubectl, dns: () => 'ready', measureUsage });
+  const decide = (m: PoolLeaseMeasure) => recommendConcurrency(m, { capacity: 25, accounts: 0, perAccount: 0 });
+
+  test('18 Running Pods using 0.3–2.6GiB (one 10GiB) leave room that limit reservations call 0', () => {
+    const today = decide(measure(cluster(null).kubectl, false));
+    expect(today.recommended).toBe(0);
+    expect(today.limitedBy).toBe('memory');
+    const log = spyOn(debug, 'log');
+    try {
+      const { kubectl, calls } = cluster({ status: 0, stdout: topPods(), stderr: '' });
+      const m = measure(kubectl);
+      expect(calls.find((a) => a.includes('top') && a.includes('pods'))).toEqual(['--context', 'node-b', '--request-timeout=10s', '-n', 'elanous-test', 'top', 'pods', '--no-headers']);
+      expect(m.members[0]!.harnessUsageBytes).toHaveLength(18); // client/ref-mirror are not harness Pods
+      // 17 × max(6Gi, usage×1.5) = 6Gi each · the 10GiB Pod reserves 15Gi (< 16Gi limit).
+      expect(m.members[0]!.memoryReservedBytes).toBe(17 * 6 * gi + 15 * gi);
+      expect(m.members[0]!.memoryLimitBytes).toBe(18 * 16 * gi);
+      const now = decide(m);
+      expect(now.admission).toEqual({ samples: 18, p95Bytes: 10 * gi, admitBytes: 15 * gi, fallback: null });
+      expect(now.recommended).toBeGreaterThan(0);
+      expect(now.recommended).toBe(7); // capacity 25 − 18 Running
+      expect(now.limitedBy).toBe('capacity');
+      // node: 480 − 117 − 180 = 183Gi free, keeps 48Gi (10%) → 9 goals at 15Gi
+      expect(now.placeableSlots).toBe(7);
+      expect(log.mock.calls.filter((c) => c[0] === 'pod-lease' && c[1] === 'admit-by-usage')).toHaveLength(1);
+    } finally { log.mockRestore(); }
+  });
+
+  test('the node real-usage floor keeps 10% of allocatable free', () => {
+    // top nodes says the node already uses 400Gi: 480 − 400 − 48 = 32Gi → 2 goals at 15Gi, whatever the bookkeeping says.
+    const now = decide(measure(cluster({ status: 0, stdout: topPods(), stderr: '' }, pods, 'node-1 1m 1% 409600Mi 85%').kubectl));
+    expect(now.recommended).toBe(2);
+    expect(now.limitedBy).toBe('memory');
+  });
+
+  test('top unavailable (no metrics-server) is identical to today and says why', () => {
+    for (const list of [pods, pods.slice(0, 3), [pods[0]!, pods[1]!]]) {
+      const today = decide(measure(cluster(null, list).kubectl, false));
+      const now = decide(measure(cluster(null, list).kubectl));
+      const { admission, ...rest } = now;
+      const { admission: before, ...todayRest } = today;
+      expect(rest).toEqual(todayRest);
+      expect(before?.fallback).toBe('usage not measured');
+      expect(admission?.fallback).toContain('top pods unavailable: error: Metrics API not available');
+      expect(admission?.admitBytes).toBe(16 * gi);
+    }
+    // Unparseable output is also unavailable, never a partial read.
+    expect(decide(measure(cluster({ status: 0, stdout: '{"items":[]}', stderr: '' }).kubectl)).admission?.fallback).toContain('unparseable');
+  });
+
+  test('top nodes unavailable (the real-usage floor cannot be read) is also identical to today', () => {
+    const today = decide(measure(cluster(null).kubectl, false));
+    const { kubectl } = cluster({ status: 0, stdout: topPods(), stderr: '' });
+    const noNodes: PoolKubectl = (args) => args.includes('top') && args.includes('nodes') ? { status: 1, stdout: '', stderr: 'error: metrics not available yet' } : kubectl(args);
+    const { admission, ...rest } = decide(measure(noNodes));
+    const { admission: _before, ...todayRest } = today;
+    expect(rest).toEqual(todayRest);
+    expect(admission).toMatchObject({ samples: 0, admitBytes: 16 * gi });
+    expect(admission?.fallback).toContain('top nodes unavailable: error: metrics not available yet');
+  });
+
+  test('one pool member without metrics keeps the whole pool on the conservative size', () => {
+    const good = cluster({ status: 0, stdout: topPods(), stderr: '' }).kubectl;
+    const bad = cluster(null).kubectl;
+    const kubectl: PoolKubectl = (args) => (args[1] === 'node-c' ? bad : good)(args);
+    const members = parsePodPool('node-b:25,node-c:5');
+    const usage = measurePoolLease(members, { kubectl, dns: () => 'ready', measureUsage: true });
+    const limits = measurePoolLease(members, { kubectl, dns: () => 'ready' });
+    const now = recommendConcurrency(usage, { capacity: 30, accounts: 0, perAccount: 0 });
+    const today = recommendConcurrency(limits, { capacity: 30, accounts: 0, perAccount: 0 });
+    // New goals count at 16Gi again; the unread member's Pods stay at their limits.
+    expect(now.admission).toMatchObject({ samples: 18, admitBytes: 16 * gi });
+    expect(now.admission?.fallback).toContain('node-c: top pods unavailable');
+    expect(usage.members[1]!.availableMemoryByNodeBytes).toEqual(limits.members[1]!.availableMemoryByNodeBytes);
+    expect(usage.members[1]!.memoryReservedBytes).toBe(limits.members[1]!.memoryLimitBytes);
+    // node-b (usage read) keeps its node floor at the 16Gi goal size: (183 − 48)/16 = 8 → capacity 7. node-c is today's.
+    expect(now.placeableSlots).toBe(7 + today.placeableSlots!);
+  });
+
+  test('the node floor holds even when the goal size falls back (explicit per-goal size)', () => {
+    const small = JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '30Gi', cpu: '8' }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
+    const { kubectl } = cluster({ status: 0, stdout: topPods(['si-task-0', 'si-task-1']), stderr: '' }, [harnessPod('si-task-0'), harnessPod('si-task-1')], 'node-1 1m 1% 2048Mi 5%');
+    const withNodes: PoolKubectl = (args) => args.includes('get') && args.includes('nodes') ? { status: 0, stdout: small, stderr: '' } : kubectl(args);
+    const m = measure(withNodes);
+    expect(m.members[0]!.availableMemoryByNodeBytes).toEqual([18 * gi]); // 30 − 2 × 6Gi
+    // 18Gi free fits one 16Gi goal, but it would leave 2Gi (< 3Gi = 10%): admit none.
+    const explicit = recommendConcurrency(m, { capacity: 25, perGoalMemory: '16Gi', accounts: 0, perAccount: 0 });
+    expect(explicit.admission?.fallback).toBe('explicit perGoalMemory');
+    expect(explicit.placeableSlots).toBe(0);
+    expect(explicit.recommended).toBe(0);
+  });
+
+  test('top nodes missing a schedulable node keeps the member on limits', () => {
+    const two = JSON.stringify({ items: ['node-1', 'node-2'].map((name) => ({ metadata: { name }, status: { allocatable: { memory: '480Gi', cpu: '64' }, conditions: [{ type: 'Ready', status: 'True' }] } })) });
+    const { kubectl } = cluster({ status: 0, stdout: topPods(), stderr: '' });
+    const partial: PoolKubectl = (args) => args.includes('get') && args.includes('nodes') ? { status: 0, stdout: two, stderr: '' } : kubectl(args);
+    const limits: PoolKubectl = (args) => args.includes('top') ? { status: 1, stdout: '', stderr: 'x' } : partial(args);
+    const m = measure(partial);
+    expect(m.members[0]!.usageReason).toBe('top nodes: no reading for node-2');
+    expect(m.members[0]!.harnessUsageBytes).toBeNull();
+    const { admission, ...rest } = decide(m);
+    const { admission: _a, ...today } = decide(measure(limits, false));
+    expect(rest).toEqual(today);
+    expect(admission?.admitBytes).toBe(16 * gi);
+  });
+
+  test('a Pod whose usage is unmeasured is reserved at max(request, limit)', () => {
+    const two = [harnessPod('si-task-0'), harnessPod('si-task-1')];
+    const m = measure(cluster({ status: 0, stdout: topPods(['si-task-0']), stderr: '' }, two).kubectl).members[0]!;
+    expect(m.harnessUsageBytes).toEqual([300 * mi]);
+    expect(m.memoryReservedBytes).toBe(6 * gi + 16 * gi);
+    expect(m.availableMemoryByNodeBytes).toEqual([480 * gi - 6 * gi - 16 * gi]);
+  });
+
+  test('an explicit per-goal size (OOM retry tier) and a run with no samples stay on the conservative size', () => {
+    const m = measure(cluster({ status: 0, stdout: topPods(), stderr: '' }).kubectl);
+    expect(recommendConcurrency(m, { capacity: 25, perGoalMemory: '16Gi', accounts: 0, perAccount: 0 }).admission).toMatchObject({ admitBytes: 16 * gi, fallback: 'explicit perGoalMemory' });
+    expect(decide(measure(cluster({ status: 0, stdout: 'client 0m 0Mi', stderr: '' }, [other]).kubectl)).admission)
+      .toMatchObject({ samples: 0, admitBytes: 16 * gi, fallback: 'no Running harness Pod usage samples' });
+  });
+});

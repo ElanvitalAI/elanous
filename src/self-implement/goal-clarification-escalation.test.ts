@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,7 @@ import {
   writePendingQuestion,
 } from '../ask-user-question/pending-questions.js';
 import { debug } from '../debug/log.js';
+import { defaultGoalAuthorSelfResolve, parseGoalDocumentClarifications } from './goal-author-clarification.js';
 
 const unresolvedGoal = [
   'Goal',
@@ -66,6 +67,54 @@ describe('mapClarificationDeliveryIds', () => {
 });
 
 describe('escalateGoalDocumentClarifications', () => {
+  test('canary without a preservation-contract line self-answers through the existing escalation caller', async () => {
+    const document = [
+      '대상 경로: src/self-implement/goal-author-clarification.ts, src/self-implement/goal-clarification-escalation.ts',
+      ...Array.from({ length: 20 }, (_, index) => `- evidence: src/self-implement/goal-author-clarification.ts:${index + 1}: exported API names only`),
+      '## WHAT TO BUILD', 'Question: NOT-GROUNDED — Which preservation contract?',
+      'Answer: UNANSWERED — preservation_contract', '',
+      '- Clarification:', '  - id: preservation_contract', '  - header: Clarification',
+      '  - question: Which preservation contract?', '  - options:',
+      '    - label: Failing test', '      description: Name a failing test.',
+      '  - includeOther: true', '  - answer: DEFERRED-UNTIL: Which preservation contract?', '',
+    ].join('\n');
+    const file = goalFile(document);
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    const priorRunId = process.env.ELANOUS_RUN_ID;
+    delete process.env.ELANOUS_RUN_ID;
+    try {
+      const result = await escalateGoalDocumentClarifications({
+        goalFile: file.path, runId: 'run-canary', selfAnswerPath: 'say-first',
+        selfResolveClarification: (context) => defaultGoalAuthorSelfResolve(context, {
+          stream: async () => '{"answer":null}',
+        }),
+        dispatch: async () => { throw new Error('should not ask a human'); },
+      });
+      expect(result).toMatchObject({ outcome: 'skipped', unanswered: 0, answeredBy: 'agent' });
+      const updated = readFileSync(file.path, 'utf8');
+      expect(updated).toContain('  - provenance.source: default');
+      expect(updated).toContain('기존 공개 동작');
+      expect(updated).toContain('goal-author-clarification.ts: selfAnswerGoalDocumentClarifications');
+      expect(updated).toContain('goal-clarification-escalation.ts: escalateGoalDocumentClarifications');
+      expect(updated).not.toContain('Answer: UNANSWERED — preservation_contract');
+      // Exactly one default event, and the goal file the implementation stage reads carries no unanswered question.
+      expect(log.mock.calls.filter(([category, event]) => category === 'goal-author' && event === 'self-answer-default-applied'))
+        .toEqual([['goal-author', 'self-answer-default-applied', {
+          runId: 'run-canary', questionId: 'preservation_contract', exportCount: expect.any(Number),
+        }]]);
+      expect(parseGoalDocumentClarifications(updated).filter((item) => !item.answered)).toHaveLength(0);
+      // observeGoalAuthor mirrors each goal-author event once into harness.author: across every debug.log call
+      // the default is recorded exactly once per category, never more.
+      expect(log.mock.calls.filter(([, event]) => event === 'self-answer-default-applied').map(([category]) => category))
+        .toEqual(['goal-author', 'harness.author']);
+    } finally {
+      if (priorRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+      else process.env.ELANOUS_RUN_ID = priorRunId;
+      log.mockRestore();
+      file.clean();
+    }
+  });
+
   test('attempts self-answer before missing-delivery-resolver fallback in rework', async () => {
     const file = goalFile(`${unresolvedGoal}\n  - evidence: src/example.ts: grounded`);
     const sequence: string[] = [];

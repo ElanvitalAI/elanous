@@ -1,7 +1,35 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
-import { executeNextAction, type ActionDeps, type NextAction } from './actions.js';
+import { executeNextAction, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
+
+test('deliver live copies and checks evidence then proposes green without PR; shadow copies nothing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'action-deliver-'));
+  const worktreePath = join(root, 'worktree');
+  const projectTarget = join(root, 'project');
+  mkdirSync(worktreePath);
+  writeFileSync(join(worktreePath, 'report.md'), '# 조사\n출처 https://one.example/a https://two.example/b\n## 반대 근거\n반론');
+  const delivery = { kind: 'research-report' as const, worktreePath, projectTarget, files: ['report.md'] };
+  const action: NextAction = { kind: 'deliver', taskId: 'ta-1', rationale: 'deliver', pr: 0, runId: 'run-1', original: 'ask', checklistId: '', delivery };
+  const events: Array<{ result: string; reason: string }> = [];
+  const deps: ActionDeps = { mode: 'shadow', observe: (_event, data) => { events.push(data); }, command: async () => { throw new Error('must not run'); } };
+  expect(await executeNextAction(action, deps)).toBe('shadow');
+  const output = join(projectTarget, 'elanous-out', 'ta-1', 'report.md');
+  expect(existsSync(output)).toBe(false);
+  expect(events[0]!.reason).toContain(join(projectTarget, 'elanous-out', 'ta-1'));
+  deps.mode = 'live';
+  expect(await executeNextAction(action, deps)).toBe('done');
+  expect(existsSync(output)).toBe(true);
+  expect(readFileSync(output, 'utf8')).toContain('반대 근거');
+  expect(events.at(-1)!.reason).toContain('propose-green');
+  writeFileSync(join(worktreePath, 'report.md'), '출처 1개');
+  expect(readDeliveryEvidence('research-report', worktreePath, [join(worktreePath, 'report.md')])).toMatchObject({ ok: false, reason: expect.stringContaining('출처') });
+  expect(await executeNextAction(action, deps)).toBe('waiting');
+  expect(events.at(-1)!.reason).toContain('wait:');
+});
 
 const INPUT = 'a'.repeat(40);
 const LANDED = 'b'.repeat(40);

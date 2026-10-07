@@ -75,3 +75,42 @@ export function kindRouteTarget(cfg: UserConfig, kind?: string): { botToken: str
   if (!ch || !Number.isFinite(ch.chatId)) return null;
   return { botToken: ch.botToken, chatId: ch.chatId };
 }
+
+export type ReportRouteReason =
+  | 'routed' | 'report-role-missing' | 'no-role-channel'
+  | 'no-report-channel' | 'report-bot-not-distinct' | 'report-chat-invalid' | 'no-main-home';
+
+/** Why a kind has (or lacks) a delivery target — no logging, no sending. Mirrors
+ *  `resolveReportTarget` so a skipped send can say *which* rule closed it instead of
+ *  «no report channel configured» (BRIEF-DELIVERY-1007: a channels table without a
+ *  `report` role closed the morning brief for four days while reportChannel was set). */
+export function explainReportRoute(cfg: UserConfig, kind?: string): { reason: ReportRouteReason; role: string; hint: string } {
+  const role = roleForKind(cfg, kind);
+  const trading = isTradingKind(kind);
+  if (cfg.telegram.channels?.length) {
+    if (kindRouteTarget(cfg, kind)) return { reason: 'routed', role, hint: '' };
+    const hasRole = resolveTelegramChannels(cfg.telegram).some(c => c.roles.includes(role));
+    if (trading && !hasRole && cfg.telegram.reportChannel) {
+      return {
+        reason: 'report-role-missing', role,
+        hint: `채널 표에 «${role}» 역할 칸이 없다 — telegram.reportChannel 은 채널 표가 있으면 쓰지 않는다. `
+          + `telegram.channels[].roles 에 "${role}" 를 더하거나 telegram.kindRoles.${kind ?? '<kind>'} 로 있는 역할을 고른다`,
+      };
+    }
+    return { reason: 'no-role-channel', role, hint: `채널 표에 «${role}» 역할을 가진 허용된 봇 칸이 없다 — telegram.channels 를 확인` };
+  }
+  if (!trading) {
+    return mainHomeTarget(cfg)
+      ? { reason: 'routed', role, hint: '' }
+      : { reason: 'no-main-home', role, hint: '운영 봇 또는 telegram.homeChannel·allowedUsers 가 없다' };
+  }
+  const rc = cfg.telegram.reportChannel;
+  if (!rc) return { reason: 'no-report-channel', role, hint: 'telegram.reportChannel 이 없다' };
+  const mainToken = resolveChannelBotToken('telegram', cfg).token;
+  if (!rc.botToken || rc.botToken === mainToken) {
+    return { reason: 'report-bot-not-distinct', role, hint: 'telegram.reportChannel 의 봇이 없거나 운영 봇과 같다 — 매매 보고는 별도 봇만 쓴다' };
+  }
+  return Number.isFinite(rc.chatId)
+    ? { reason: 'routed', role, hint: '' }
+    : { reason: 'report-chat-invalid', role, hint: 'telegram.reportChannel.chatId 가 숫자가 아니다' };
+}

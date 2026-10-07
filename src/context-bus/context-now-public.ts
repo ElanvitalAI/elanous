@@ -72,7 +72,7 @@ export function filterPublicDemoContext(answer: ContextNowAnswer, brandCheck: ty
           id: fact.id ? (rulesMissing || privateIds.has(fact.id) ? '내부 항목' : safe(fact.id, '공개 항목')) : null,
           title: fact.title === null ? null : rulesMissing ? internalItem(1) : privateIds.has(fact.id ?? '') ? '내부 항목' : safe(fact.title, '공개 항목'),
           source: source(fact.source) });
-      } else facts.push({ ...fact, version: safe(fact.version, '공개 판'), source: source(fact.source) });
+      } else if (fact.kind === 'version') facts.push({ ...fact, version: safe(fact.version, '공개 판'), source: source(fact.source) });
     }
     for (const kind of ['cell', 'decision'] as const) {
       if (!collapsed[kind]) continue;

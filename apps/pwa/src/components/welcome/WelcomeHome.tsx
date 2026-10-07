@@ -13,6 +13,7 @@ import { setupModeRedirect } from '@/lib/setup-mode';
 import {
   NON_MENU_SIDEBAR_ROUTES,
   SIDEBAR_NAV_ITEMS,
+  isSidebarViewLink,
   type SidebarRouteHref,
 } from '@/components/shell/sidebar-nav-items';
 
@@ -46,7 +47,8 @@ function toSidebarRouteHref(href: string): SidebarRouteHref {
  * destination users should be sent to.
  */
 export const ROUTE_GUIDANCE_ITEMS: readonly RouteGuidanceItem[] = [
-  ...SIDEBAR_NAV_ITEMS.map((item): RouteGuidanceItem => ({
+  // 보기 링크(`/loops?view=interact`)는 이미 센 경로의 한 보기라 주소 안내에 다시 올리지 않는다.
+  ...SIDEBAR_NAV_ITEMS.filter((item) => !isSidebarViewLink(item.href)).map((item): RouteGuidanceItem => ({
     href: toSidebarRouteHref(item.href),
     label: item.label,
     navigable: true,

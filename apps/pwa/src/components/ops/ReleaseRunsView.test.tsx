@@ -25,20 +25,22 @@ describe('OPS1 release runs', () => {
     expect(currentNodeId(run)).toBe('waiting');
     expect(currentNodeId({ ...run, nodes: run.nodes.map((node) => ({ ...node, ok: true })) })).toBe('last');
   });
-  test('renders status/time, node rows in path order, icons and one current marker', () => {
+  test('renders status/time, node flow in path order with state words and one current step', () => {
     const html = render({ kind: 'ready', data: [run] });
-    expect(html).toContain('2026-10-02T00:00:00Z');
+    expect(html).toContain('dateTime="2026-10-02T00:00:00Z"');
+    expect(html).toMatch(/2026\. 10\. 2\. 09:00 KST/);
     expect(html).toContain('running');
-    expect(html.indexOf('first')).toBeLessThan(html.indexOf('waiting'));
-    expect(html.indexOf('waiting')).toBeLessThan(html.indexOf('last'));
-    expect(html).toContain('✅'); expect(html).toContain('⏳'); expect(html).toContain('진행 중');
-    expect(html.match(/지금 위치/g)?.length).toBe(1);
-    expect(render({ kind: 'ready', data: [{ ...run, nodes: run.nodes.map((node) => ({ ...node, ok: false })) }] })).toContain('❌');
+    expect(html.indexOf('title="first"')).toBeLessThan(html.indexOf('title="waiting"'));
+    expect(html.indexOf('title="waiting"')).toBeLessThan(html.indexOf('title="last"'));
+    expect(html).toContain('끝남'); expect(html).toContain('지금'); expect(html).toContain('남음');
+    expect(html.match(/aria-current="step"/g)?.length).toBe(1);
+    expect(render({ kind: 'ready', data: [{ ...run, nodes: run.nodes.map((node) => ({ ...node, ok: false })) }] })).toContain('실패');
   });
-  test('expanded node shows a contained horizontally scrollable monospaced log', () => {
+  test('opened node shows a detail panel with the summary and a contained horizontally scrollable monospaced log', () => {
     const html = render({ kind: 'ready', data: [run] }, 'waiting', { kind: 'ready', data: { log: 'full log tail' } });
     expect(html).toContain('full log tail');
-    expect(html).toContain('overflow-x-auto');
+    expect(html).toContain('aria-label="노드 상세"');
+    expect(html).toContain('overflow-auto');
     expect(html).toContain('font-mono');
     expect(html).toContain('aria-expanded="true"');
     expect(render({ kind: 'ready', data: [run] })).not.toContain('full log tail');
@@ -123,7 +125,42 @@ describe('OPS1 release runs', () => {
       expect(calls).toEqual(['/v1/ops/release/runs']);
       expect(tree!.root.findByProps({ 'aria-label': '판' }).props.value).toBe('0.2.9');
       expect(tree!.root.findAllByType('button').filter((button) => button.props['aria-pressed'] === true)).toHaveLength(1);
-      expect(JSON.stringify(tree!.toJSON())).toContain('진행 중');
+      expect(JSON.stringify(tree!.toJSON())).toContain('waiting');
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
+    }
+  });
+  test('the strip and flow follow the same run across latest, list selection and version changes', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { search: '' }, setInterval: () => 1, clearInterval: () => {} } });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } });
+    const recent = { ...run, runId: 'recent', version: '0.3.0', startedAt: new Date(Date.now() - 60_000).toISOString(), path: ['recent-node'], nodes: [{ nodeId: 'recent-node', ok: null, summary: '최근' }] };
+    const older = { ...run, runId: 'older', startedAt: new Date(Date.now() - 120_000).toISOString(), path: ['older-node'], nodes: [{ nodeId: 'older-node', ok: null, summary: '이전' }] };
+    const sameVersion = { ...run, runId: 'same-version', version: '0.3.0', startedAt: new Date(Date.now() - 180_000).toISOString(), path: ['same-version-node'], nodes: [{ nodeId: 'same-version-node', ok: null, summary: '같은 판' }] };
+    const client = { fetchResponse: async (path: string) => new Response(JSON.stringify(path.includes('version=') ? path.includes('0.3.0') ? [sameVersion, recent] : path.includes('0.4.0') ? [] : [older] : [older, sameVersion, recent])) };
+    const daemon = { config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, client: client as never, sessionId: 'test', setSessionId: () => {} };
+    let tree: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
+      const stripNode = () => tree!.root.findByProps({ 'aria-label': '발행 노드 순서' });
+      const flowNode = () => tree!.root.findByProps({ 'aria-label': '노드 흐름' });
+      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('recent-node'))).toBe(true);
+      expect(flowNode().findAllByProps({ title: 'recent-node' })).toHaveLength(1);
+      const otherButton = tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button').find((button) => button.props['aria-pressed'] === false)!;
+      await act(async () => { otherButton.props.onClick(); });
+      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('same-version-node'))).toBe(true);
+      expect(flowNode().findAllByProps({ title: 'same-version-node' })).toHaveLength(1);
+      await act(async () => { tree!.root.findByProps({ 'aria-label': '판' }).props.onChange({ target: { value: '0.2.9' } }); });
+      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('older-node'))).toBe(true);
+      expect(flowNode().findAllByProps({ title: 'older-node' })).toHaveLength(1);
+      expect(flowNode().findAllByProps({ title: 'recent-node' })).toHaveLength(0);
+      await act(async () => { tree!.root.findByProps({ 'aria-label': '판' }).props.onChange({ target: { value: '0.4.0' } }); });
+      expect(tree!.root.findAllByProps({ 'aria-label': '발행 진행' })).toHaveLength(0);
+      expect(tree!.root.findAllByProps({ 'aria-label': '노드 흐름' })).toHaveLength(0);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
       Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });

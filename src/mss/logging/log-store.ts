@@ -26,6 +26,7 @@ import type { LogSink } from './sink.js';
 import { setInstanceName, resolveInstanceName } from '../../instance-identity.js';
 import * as nestDepth from '../../agent/nest-depth.js';
 import { debug } from '../../debug/log.js';
+import { assertNotTestWritingOps } from '../../instance/test-write-guard.js';
 
 /** 스토어 경로 — `ELANOUS_STATE_DIR` 존중(격리 테스트/`nexus run --test` 의
  *  기존 knob 그대로), 기본 `~/.elanous/logs/logs.db`. lazy 함수 — env 를
@@ -209,6 +210,8 @@ export class LogStore {
       this.db.run(`PRAGMA busy_timeout = ${LOG_STORE_READONLY_BUSY_TIMEOUT_MS}`);
       return;
     }
+    // TEST-PROD-LEAK: a test process never opens the ops logs.db for write, preload or not.
+    assertNotTestWritingOps(path, 'open logs.db for write');
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     const openedAt = Date.now();
     for (let attempt = 0; ; attempt++) {

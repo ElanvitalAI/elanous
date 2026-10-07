@@ -1,4 +1,29 @@
-export type NextActionKind = 'review' | 'land' | 'retry' | 'green' | 'decision';
+import { copyFileSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { join, relative, resolve, sep } from 'node:path';
+import { debug } from '../debug/log.js';
+import { judgeNextMove } from './judge.js';
+import { checkCompletionEvidence } from './completion-evidence.js';
+
+export type DeliveryKind = 'research-report' | 'artifact' | 'content';
+export interface DeliveryEvidence { ok: boolean; files: string[]; reason: string }
+
+/**
+ * DEFAULT-HANDS-a: 판독은 복사된 최종 산출물에서만 하고, 규칙은 `completion-evidence.ts` 의
+ * `checkCompletionEvidence` 하나를 쓴다(종류별 규칙을 여기서 다시 짓지 않는다).
+ * 후보 중 하나라도 그 종류의 증거를 다 갖추면 ok — 후보 목록엔 곁 파일(미리보기 등)도 섞인다.
+ */
+export function readDeliveryEvidence(kind: DeliveryKind, outputDir: string, files: readonly string[]): DeliveryEvidence {
+  if (!files.length) return { ok: false, files: [], reason: '전달 후보 없음' };
+  const missing = new Set<string>();
+  for (const file of files) {
+    const verdict = checkCompletionEvidence(kind, { dir: outputDir, ref: relative(outputDir, file) });
+    if (verdict.ok) return { ok: true, files: [...files], reason: `전달 산출물 확인: ${verdict.ref}` };
+    for (const item of verdict.missing) missing.add(item);
+  }
+  return { ok: false, files: [...files], reason: `전달 증거 부족: ${[...missing].join(', ')}` };
+}
+
+export type NextActionKind = 'review' | 'land' | 'retry' | 'green' | 'decision' | 'deliver';
 /**
  * `retry` 의 갈래(RFC §A9 G1·G2). 없으면 종전 그대로 «must-fix 로 좁힌 재발사»다(must-fix 가 없으면 카드).
  * - narrow: 범위를 좁혀 한 번 재발사(must-fix 없이도 간다 — no-progress)
@@ -22,6 +47,7 @@ export interface NextAction {
   mustFix?: string[];
   cwd?: string;
   risk?: 'money' | 'security' | 'irreversible-publication';
+  delivery?: { kind: DeliveryKind; worktreePath: string; projectTarget: string; files: string[] };
 }
 export interface ActionDeps {
   command(args: string[]): Promise<{ status: number; stdout: string; stderr?: string }>;
@@ -63,7 +89,11 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     deps.observe('task-agent.action', { taskId: action.taskId, kind: action.kind, result, reason });
     return result;
   };
-  if (deps.mode !== 'live') return record('shadow', `would ${action.kind}${action.variant ? `:${action.variant}` : ''}: ${action.rationale}`);
+  if (deps.mode !== 'live') {
+    const destination = action.delivery && action.kind === 'deliver'
+      ? ` → ${join(action.delivery.projectTarget, 'elanous-out', action.taskId)}/${action.delivery.files.join(', ')}` : '';
+    return record('shadow', `would ${action.kind}${action.variant ? `:${action.variant}` : ''}: ${action.rationale}${destination}`);
+  }
   const card = async (reason: string) => {
     const evidence = JSON.stringify({ runId: action.runId, pr: action.pr, mustFix: action.mustFix ?? [], history: action.history ?? [], selected: action.kind, reason });
     const result = await deps.command(['decisions', 'raise', '--title', `${action.taskId}: ${reason}`, '--category', action.risk === 'money' ? 'money' : action.risk === 'security' ? 'security' : action.risk === 'irreversible-publication' ? 'publish' : 'other', '--s', `Task ${action.taskId} needs a decision.`, '--c', reason, '--ref', evidence, '--q', 'Which action should be taken?', '--option', 'h=Keep on hold:no automatic execution', '--option', 'p=Approve action:execute after approval', '--skip-recommend', 'requires human decision', '--no-xcheck', 'automated escalation']);
@@ -87,6 +117,37 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     if (deps.reserveLanding ? !deps.reserveLanding(day, limit) : (deps.landingsToday ?? 0) >= limit) return card('daily landing limit');
   }
   if (action.kind === 'decision') return card(action.rationale);
+  if (action.kind === 'deliver') {
+    const delivery = action.delivery;
+    if (!delivery?.files.length) return record('waiting', '전달 후보 없음');
+    if (!/^[a-zA-Z0-9_-]+$/.test(action.taskId)) return record('failed', 'invalid delivery taskId');
+    const output = join(delivery.projectTarget, 'elanous-out', action.taskId);
+    const copied: string[] = [];
+    try {
+      mkdirSync(output, { recursive: true });
+      // 경로 비교는 «실경로끼리» 한다 — macOS 의 /var→/private/var 처럼 조상 링크가 있으면 resolve() 와 realpath 가 늘 갈린다.
+      const outputReal = realpathSync(output);
+      if (outputReal !== join(realpathSync(delivery.projectTarget), 'elanous-out', action.taskId)) throw new Error('delivery output points outside target');
+      const root = realpathSync(delivery.worktreePath) + sep;
+      for (const name of delivery.files) {
+        const source = resolve(root, name);
+        if (!source.startsWith(root) || !lstatSync(source).isFile() || !realpathSync(source).startsWith(root)) throw new Error(`invalid delivery file: ${name}`);
+        const destination = resolve(output, name);
+        if (!destination.startsWith(resolve(output) + sep)) throw new Error(`invalid destination: ${name}`);
+        mkdirSync(join(destination, '..'), { recursive: true });
+        const parent = realpathSync(join(destination, '..'));
+        if (parent !== outputReal && !parent.startsWith(outputReal + sep)) throw new Error(`invalid destination parent: ${name}`);
+        try { if (!lstatSync(destination).isFile()) throw new Error(`invalid destination: ${name}`); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        copyFileSync(source, destination);
+        copied.push(destination);
+      }
+    } catch (error) { return record('failed', `delivery copy failed: ${String(error)}`); }
+    const evidence = readDeliveryEvidence(delivery.kind, resolve(output), copied);
+    debug.log('task-agent', 'deliver', { taskId: action.taskId, kind: delivery.kind, files: copied, evidenceOk: evidence.ok });
+    const judgement = judgeNextMove({ deliveryEvidence: evidence });
+    return record(judgement.move === 'propose-green' ? 'done' : 'waiting', `${judgement.move}: ${judgement.reason}`);
+  }
   if (action.kind === 'green') return card('green requires a verified landing in this execution');
   // G1 — 기다림은 발사가 아니다: 대기 표지만 남기고 다음 틱이 다시 판단한다(카드로 올리지 않는다).
   if (action.kind === 'retry' && action.variant === 'wait') return record('waiting', `wait marker: ${action.rationale}`);

@@ -1,13 +1,16 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { addSource, listSources } from '../intake-plane/intake-sources.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { Command } from 'commander';
 import { formatDoctorReport, registerDoctorCommand, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
 import { applyClaudePluginSetup, planClaudePluginSetup } from './claude-plugin-setup.js';
 import { recommendedSetup } from './setup-recommend.js';
 import { detectSkillCliAuth, type CliAuthStatus } from '../onboarding/cli-auth-status.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig, saveUserConfig, userConfigPath, type UserConfig } from '../user-config.js';
 
 const ELANOUS_LOGIN_COMMAND = 'elanous login openai-codex';
 const PROVIDER_COMMAND = 'elanous config set llm.provider openai-codex';
@@ -29,6 +32,9 @@ export interface SetupCliDeps extends DoctorOptions {
   homeDir?: () => string;
   getUserConfig?: () => UserConfig;
   saveUserConfig?: (config: UserConfig) => void;
+  watchRoot?: string;
+  /** Test seam: injected configs are treated as already provisioned unless explicitly first-run. */
+  firstRunTopics?: boolean;
   planClaudePluginSetup?: typeof planClaudePluginSetup;
   applyClaudePluginSetup?: typeof applyClaudePluginSetup;
   prompt?: (message: string) => Promise<string | undefined>;
@@ -209,6 +215,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         setExitCode(1);
         return;
       }
+      const isFirstRun = deps.firstRunTopics ?? (!deps.getUserConfig && !existsSync(userConfigPath()));
       let steps = setupSteps(deps);
       const provider = steps[1]!;
       if (!provider.complete) {
@@ -224,6 +231,29 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       out.log(formatSetupReport(doctor, steps, false));
       showCliSkills(false);
       for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
+      let configured = (deps.getUserConfig ?? getUserConfig)();
+      if (!configured.starter?.topics && configured.watch?.enabled !== false
+        && isFirstRun
+        && isStdinTty() && !opts.yes) {
+        const answer = (await prompt('관심 주제는 무엇인가요? (쉼표로 구분 · 건너뛰려면 Enter) '))?.trim();
+        if (answer) {
+          configured = { ...configured, starter: { topics: answer.split(',').map((topic) => topic.trim()).filter(Boolean) } };
+          (deps.saveUserConfig ?? saveUserConfig)(configured);
+        }
+      }
+      const starter = configured.starter;
+      if (Array.isArray(starter?.topics) && configured.watch?.enabled !== false) {
+        const root = deps.watchRoot ?? effectiveInstanceRoot();
+        const existing = listSources({ seat: 'user' }, root);
+        for (const rawTopic of starter.topics) {
+          if (typeof rawTopic !== 'string' || !rawTopic.trim()) continue;
+          const topic = rawTopic.trim();
+          if (existing.some((source) => source.kind === 'github-query' && source.spec === topic)) continue;
+          const id = `watch-${createHash('sha256').update(topic).digest('hex').slice(0, 12)}`;
+          if (listSources({}, root).some((source) => source.id === id)) continue;
+          existing.push(addSource({ id, seat: 'user', kind: 'github-query', spec: topic, every: '1d', why: 'starter.topics' }, root));
+        }
+      }
       const accepted = opts.yes || (isStdinTty() && /^(?:y|yes)?$/i.test((await prompt('추천대로 켤까요? [Y/n] '))?.trim() ?? 'n'));
       if (accepted) {
         const runDoctorFix = deps.runDoctorFix ?? (async (args: readonly string[]) => {

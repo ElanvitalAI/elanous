@@ -6,6 +6,7 @@
  */
 import type { SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import type { NextActionKind, RetryVariant } from './actions.js';
+import type { CompletionKind } from './task-hand.js';
 
 export type TaskMove =
   | 'propose-green'
@@ -27,6 +28,11 @@ export interface TaskJudgeInput {
   mustFix?: readonly string[];
   /** 수마다 누적 실패 수. */
   failures?: Partial<Record<TaskMove, number>>;
+  deliveryEvidence?: { ok: boolean; files: readonly string[]; reason: string };
+  /** 과제 종결 종류(§A4b③) — 비거나 code-pr 이면 종전처럼 PR 병합이 종결이다. */
+  completion?: CompletionKind;
+  /** code-pr 밖 종류의 확인 증거(`completion-evidence.ts` 판독). 비면 «아직 못 받았다» — 통과로 읽지 않는다. */
+  evidence?: { ok: boolean; ref: string };
 }
 
 export interface TaskJudgement {
@@ -64,7 +70,19 @@ const EXECUTOR_VARIANT: Partial<Record<TaskMove, RetryVariant>> = {
 };
 
 function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
+  if (input.deliveryEvidence) return input.deliveryEvidence.ok
+    ? { move: 'propose-green', stage: 'closing', reason: `전달 근거 확인: ${input.deliveryEvidence.files.join(', ')}` }
+    : { move: 'wait', stage: 'waiting', reason: input.deliveryEvidence.reason };
   const stop = input.stopReason;
+  const kind = input.completion;
+  if (kind !== undefined && kind !== 'code-pr') {
+    const ref = input.evidence?.ref?.trim() ?? '';
+    // green 은 추적 가능한 근거(비지 않은 ref)가 있을 때만 — ok 인데 ref 가 비면 «증거 없음»으로 읽는다.
+    if (input.evidence?.ok === true && ref) return { move: 'propose-green', stage: 'closing', reason: `확인 증거 ${ref} 근거로 칸 green 제안 — ${kind}` };
+    if (input.evidence?.ok === false) return { move: 'narrow-relaunch', stage: 'repairing', reason: `확인 증거 미충족(${ref || '근거 없음'}) — ${kind} · 범위를 좁혀 재발사` };
+    // 증거가 아직 없다 — 완주·종료 미관측이면 증거를 기다린다(PR 병합은 이 종류의 종결이 아니다). 그 밖의 종료 어휘는 아래 표 그대로.
+    if (stop === 'converged' || stop === undefined) return { move: 'wait', stage: 'observing', reason: `확인 증거 대기 — ${kind}${input.evidence?.ok === true ? ' (ref 비어 있음)' : ''}` };
+  }
   const merged = input.prState === 'MERGED' && input.pr !== undefined && input.pr !== '';
   if (merged) {
     return { move: 'propose-green', stage: 'closing', reason: `병합된 PR ${input.pr} 근거로 칸 green 제안` };

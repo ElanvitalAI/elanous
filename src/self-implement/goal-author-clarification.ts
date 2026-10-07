@@ -1,3 +1,6 @@
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve, relative, isAbsolute } from 'node:path';
+import ts from 'typescript';
 import { tierModel } from '../llm/model-defaults.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
@@ -42,7 +45,7 @@ export function parseGoalAuthorParent(document: string): GoalAuthorParent | null
   return matches.length === 1 ? matches[0] : null;
 }
 
-export type GoalAuthorClarificationAnswerSource = 'injected' | 'recommended' | 'self-authored';
+export type GoalAuthorClarificationAnswerSource = 'injected' | 'recommended' | 'self-authored' | 'default';
 
 export interface GoalAuthorClarificationProvenance {
   source: GoalAuthorClarificationAnswerSource;
@@ -78,8 +81,8 @@ export interface GoalAuthorSelfResolutionContext {
 }
 
 export type GoalAuthorSelfResolution =
-  | { answer: string; evidence: readonly string[] }
-  | { answer?: undefined; evidence?: undefined };
+  | { answer: string; evidence: readonly string[]; declined?: undefined }
+  | { answer?: undefined; evidence?: undefined; declined?: boolean };
 
 export interface GoalAuthorClarificationResolutionDeps {
   /** Elanousic authoring seam; it must return no answer when the available evidence is insufficient. */
@@ -189,7 +192,7 @@ export async function defaultGoalAuthorSelfResolve(
   const usages: LLMUsage[] = [];
   if (context.evidence.length === 0) {
     observeSelfResolve('self-resolve-no-evidence', context, startedAt, { usage: deriveUsage(usages) });
-    return {};
+    return context.questionId === 'preservation_contract' ? { declined: true } : {};
   }
   const controller = new AbortController();
   const timeout = setTimeout(
@@ -230,7 +233,7 @@ export async function defaultGoalAuthorSelfResolve(
       evidenceCount: context.evidence.length,
       usage: deriveUsage(usages),
     });
-    return {};
+    return answer === null && context.questionId === 'preservation_contract' ? { declined: true } : {};
   } catch (error) {
     observeSelfResolve(
       isSelfResolutionTimeout(error, controller.signal) ? 'self-resolve-timeout' : 'self-resolve-error',
@@ -471,6 +474,57 @@ interface GoalAuthorClarificationSeed {
   parent: GoalAuthorParent;
 }
 
+const PRESERVATION_DEFAULT = '대상 경로의 기존 공개 동작(내보내는 함수 시그니처 · CLI 인자·출력·종료 코드)은 그대로 유지한다 · 바뀌는 것은 골이 명시한 동작뿐';
+
+function preservationDefault(ask: string): { answer: string; exportCount: number } {
+  const request = /Original ask \(verbatim, unmodified\):\s*```\r?\n([\s\S]*?)\r?\n```/.exec(ask)?.[1] ?? ask;
+  // Every `대상 경로:` line counts, plain or as a Markdown list item; backticks around a path are cosmetic.
+  const paths = [...new Set(request.split(/\r?\n/).flatMap((line) => {
+    const match = /^\s*(?:(?:[-*+]|\d+[.)])\s+)?대상 경로:\s*(.*)$/.exec(line);
+    return match ? match[1].split(/\s*[,·]\s*/).map((path) => path.trim().replace(/^`|`$/g, '')) : [];
+  }))];
+  const exports: string[] = [];
+  for (const path of paths) {
+    if (!/^[\w./-]+\.[cm]?[jt]sx?$/.test(path) || path.startsWith('/') || path.split('/').includes('..')) continue;
+    const absolute = resolve(process.cwd(), path);
+    try {
+      const actual = realpathSync(absolute);
+      const withinRepo = relative(realpathSync(process.cwd()), actual);
+      if (withinRepo === '..' || withinRepo.startsWith('../') || isAbsolute(withinRepo)) continue;
+      const source = ts.createSourceFile(path, readFileSync(actual, 'utf8'), ts.ScriptTarget.Latest, true);
+      for (const statement of source.statements) {
+        if (ts.isExportDeclaration(statement)) {
+          if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+            for (const element of statement.exportClause.elements) exports.push(`${path}: ${element.name.text}`);
+          } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) {
+            exports.push(`${path}: ${statement.exportClause.name.text}`);
+          } else if (!statement.exportClause && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+            // Names re-exported by `export *` are not resolved here; record the re-export itself so the preserved surface is explicit.
+            exports.push(`${path}: * from ${statement.moduleSpecifier.text}`);
+          }
+        } else if (ts.isExportAssignment(statement)) {
+          exports.push(`${path}: ${statement.isExportEquals ? 'export =' : 'default'}`);
+        } else if (ts.canHaveModifiers(statement) && ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+          if (ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)) {
+            exports.push(`${path}: default`);
+          } else if (ts.isVariableStatement(statement)) {
+            const bindingNames = (name: ts.BindingName): string[] => ts.isIdentifier(name)
+              ? [name.text]
+              : name.elements.flatMap((element) => ts.isOmittedExpression(element) ? [] : bindingNames(element.name));
+            for (const declaration of statement.declarationList.declarations) {
+              for (const exported of bindingNames(declaration.name)) exports.push(`${path}: ${exported}`);
+            }
+          } else if ('name' in statement && statement.name && ts.isIdentifier(statement.name as ts.Node)) {
+            exports.push(`${path}: ${(statement.name as ts.Identifier).text}`);
+          }
+        }
+      }
+    } catch { /* An unavailable target cannot supply verified export names. */ }
+  }
+  const names = [...new Set(exports)];
+  return { answer: names.length ? `${PRESERVATION_DEFAULT} · export 이름: ${names.join(', ')}` : PRESERVATION_DEFAULT, exportCount: names.length };
+}
+
 const DEFERRED_ANSWER = 'DEFERRED-UNTIL: ';
 const DEFERRED_ANSWER_PREFIX = 'DEFERRED-UNTIL';
 
@@ -515,7 +569,7 @@ export function parseGoalDocumentClarifications(document: string): GoalDocumentC
         readingOptions = false;
         continue;
       }
-      const provenanceSource = /^  - provenance\.source: (injected|recommended|self-authored)$/.exec(line);
+      const provenanceSource = /^  - provenance\.source: (injected|recommended|self-authored|default)$/.exec(line);
       if (provenanceSource) {
         fields.set('provenanceSource', provenanceSource[1]);
         provenanceLines.push(index);
@@ -692,6 +746,7 @@ export async function selfAnswerGoalDocumentClarifications(
     ask?: string;
     evidence?: readonly string[];
     resolver?: GoalClarificationSelfResolver;
+    runId?: string;
   },
 ): Promise<{ document: string; asked: number; answered: number; unanswered: number; newlyAnswered: number }> {
   const clarifications = parseGoalDocumentClarifications(document);
@@ -699,7 +754,7 @@ export async function selfAnswerGoalDocumentClarifications(
   // The first say pass may already have self-answered some questions while authoring: count those,
   // never re-ask them, and still attempt every question that is left unanswered.
   const alreadySelfAnswered = options.path === 'say-first'
-    ? clarifications.filter((item) => item.answered && item.provenanceSource === 'self-authored').length
+    ? clarifications.filter((item) => item.answered && (item.provenanceSource === 'self-authored' || item.provenanceSource === 'default')).length
     : 0;
   let updated = document;
   let answered = 0;
@@ -709,6 +764,7 @@ export async function selfAnswerGoalDocumentClarifications(
   for (const item of pending) {
     if (parseGoalDocumentClarifications(updated).filter((entry) => entry.questionId === item.questionId).length !== 1) continue;
     let response: Awaited<ReturnType<typeof resolveGoalAuthorClarification>>;
+    let declined = false;
     try { response = await resolveGoalAuthorClarification({
       questionId: item.questionId,
       kind: 'scope',
@@ -717,7 +773,11 @@ export async function selfAnswerGoalDocumentClarifications(
       options: item.options.map((option) => ({ label: option.label, description: option.description })),
       blocking: false,
     }, {
-      selfResolve: options.resolver ?? defaultGoalAuthorSelfResolve,
+      selfResolve: async (context) => {
+        const resolution = await (options.resolver ?? defaultGoalAuthorSelfResolve)(context);
+        declined = resolution.declined === true;
+        return resolution;
+      },
       evidence,
       ask: options.ask,
       selfResolutionSelected: true,
@@ -725,11 +785,19 @@ export async function selfAnswerGoalDocumentClarifications(
       // A resolver failure leaves this question unanswered; the remaining questions are still attempted.
       continue;
     }
-    if (response.answer === null || response.provenance?.source !== 'self-authored'
+    let defaultExportCount: number | undefined;
+    if (response.answer === null && item.questionId === 'preservation_contract'
+      && declined) {
+      const fallback = preservationDefault(options.ask ?? document);
+      response = { ...response, answer: fallback.answer, status: 'ANSWERED', provenance: { source: 'default' } };
+      defaultExportCount = fallback.exportCount;
+    }
+    if (response.answer === null || (response.provenance?.source !== 'self-authored' && response.provenance?.source !== 'default')
       || response.answer.startsWith(DEFERRED_ANSWER_PREFIX)) continue;
+    const answerSource = response.provenance.source;
     try {
       if (!response.answer.trim() || /[\r\n]/.test(response.answer)
-        || (!item.includeOther && !item.options.some((option) => option.label === response.answer))) continue;
+        || (answerSource !== 'default' && !item.includeOther && !item.options.some((option) => option.label === response.answer))) continue;
       const current = findUnansweredGoalDocumentClarification(updated, item.questionId);
       const lines = updated.split(/\r?\n/);
       const provenanceLines = current.provenanceLines ?? [];
@@ -737,15 +805,22 @@ export async function selfAnswerGoalDocumentClarifications(
       const answerLine = current.answerLine - provenanceLines.filter((line) => line < current.answerLine).length;
       lines[answerLine] = `  - answer: ${response.answer}`;
       lines.splice(answerLine + 1, 0,
-        '  - provenance.source: self-authored',
-        ...response.provenance.evidence!.map((entry) => `  - evidence: ${entry.replace(/[\r\n]/g, ' ')}`));
+        `  - provenance.source: ${answerSource}`,
+        ...(response.provenance.evidence ?? []).map((entry) => `  - evidence: ${entry.replace(/[\r\n]/g, ' ')}`));
       updateWhatToBuildRenderAnswers(lines, item.questionId, response.answer);
       if (hasWhatToBuildUnansweredRenderAnswer(lines, item.questionId)) continue;
       const candidate = lines.join(document.includes('\r\n') ? '\r\n' : '\n');
       if (!parseGoalDocumentClarifications(candidate).some((entry) => entry.questionId === item.questionId
-        && entry.answered && entry.answer === response.answer && entry.provenanceSource === 'self-authored')) continue;
+        && entry.answered && entry.answer === response.answer && entry.provenanceSource === answerSource)) continue;
       updated = candidate;
       answered += 1;
+      if (defaultExportCount !== undefined) {
+        observeGoalAuthor('goal-author', 'self-answer-default-applied', {
+          runId: options.runId ?? process.env.ELANOUS_RUN_ID,
+          questionId: item.questionId,
+          exportCount: defaultExportCount,
+        });
+      }
     } catch {
       // Leave malformed or disallowed answers deferred.
     }

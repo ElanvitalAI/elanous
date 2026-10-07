@@ -34,6 +34,9 @@ import type { KeyEvent } from './display/types.js';
 import type { ThemeTokens } from './theme/tokens.js';
 import { debug } from './debug/log.js';
 import { abortTurnOnly } from './turn-abort-scope.js';
+import { SELF_IMPLEMENT_TOOL_NAMES } from './boot/daemon-tools/self-implement-names.js';
+
+export const DASHBOARD_CLARIFICATION_REQUEST = Symbol.for('elanous.dashboard.clarification-request');
 
 export interface EscAbortGateDeps {
   abortCtrl: AbortController;
@@ -87,8 +90,14 @@ export async function routeStreamingEscapeKey(
   gate: Pick<EscAbortGate, 'handleEscape' | 'handleKey' | 'isGateOpen'>,
   gateEvent: KeyEvent,
   consumeDragEscape: () => Promise<boolean>,
+  consumeTopModalEscape: () => boolean | 'passthrough' = () => false,
 ): Promise<boolean> {
   if (key.kind && key.kind !== 'press') return false;
+  if (key.name === 'escape') {
+    const modalResult = consumeTopModalEscape();
+    if (modalResult === true) return true;
+    if (modalResult === 'passthrough') return false;
+  }
   if (gate.isGateOpen()) {
     gate.handleKey(gateEvent);
     return true;
@@ -97,6 +106,41 @@ export async function routeStreamingEscapeKey(
   if (await consumeDragEscape()) return true;
   gate.handleEscape();
   return true;
+}
+
+export function consumeStreamingTopModalEscape(input: {
+  modal: Pick<ModalSurface, 'id' | 'onKey'> | null;
+  abortGateModalId: string | null;
+  event: KeyEvent;
+  question?: { id: string; dispose(cancelled: boolean): void; isClarification: boolean };
+  onClarificationClosed(): void;
+  topModalId(): string | null;
+  redraw(): void;
+}): boolean | 'passthrough' {
+  const { modal, question } = input;
+  if (!modal || modal.id === input.abortGateModalId) return false;
+  if (modal.id === question?.id) {
+    question.dispose(true);
+    if (question.isClarification) input.onClarificationClosed();
+    input.redraw();
+    return true;
+  }
+  if (!modal.onKey) return 'passthrough';
+  modal.onKey(input.event);
+  input.redraw();
+  return input.topModalId() === modal.id ? 'passthrough' : true;
+}
+
+export function createHarnessEscHint(pushLine: (line: string) => void): (targets: readonly string[]) => boolean {
+  let shown = false;
+  return (targets) => {
+    if (!targets.some(name => (SELF_IMPLEMENT_TOOL_NAMES as readonly string[]).includes(name))) return false;
+    if (!shown) {
+      pushLine('하니스 런은 따로 계속 돈다 — 멈추려면 /harness stop <space-id> · 목록은 /harness runs');
+      shown = true;
+    }
+    return true;
+  };
 }
 
 export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {

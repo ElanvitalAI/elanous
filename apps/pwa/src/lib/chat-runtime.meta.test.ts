@@ -220,6 +220,9 @@ describe('PWA slash-command boundary', () => {
   it('submits local slash commands through mounted PWA chat input without an LLM request', async () => {
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
     const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    // ⛔ 기계에 떠 있는 실 데몬(localhost:31415)에 닿지 않게 한다 — `:model` 이 실 fetch 를 하면 응답 시간이 시험을 좌우한다(0.2.19 게이트).
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new TypeError('fetch blocked in test'); }) as unknown as typeof fetch;
     const values = new Map<string, string>();
     const storage = {
       getItem: (key: string) => values.get(key) ?? null,
@@ -311,6 +314,7 @@ describe('PWA slash-command boundary', () => {
       else delete (globalThis as { window?: Window }).window;
       if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
       else delete (globalThis as { localStorage?: Storage }).localStorage;
+      globalThis.fetch = originalFetch;
     }
   });
 

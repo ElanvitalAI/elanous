@@ -32,6 +32,201 @@ const invoke = async (root: string, runId: string, window: '08' | '12' | '18', d
   return final!;
 };
 
+describe('orchestrator degradation and per-tick cap', () => {
+  test('L1 makes one rule-only cell per card, grades its body, never calls split and leads the briefing', async () => fixture(async (root, id, logged) => {
+    const store = new CardStore(root);
+    store.appendSection(id, { key: 'intake:wish:1', owner: 'steward', content: '설명\n루브릭: A3 E3 R2 D2 M2 B1 S2 X1' });
+    const other = store.createCard({ goalId: 'wish:third', title: '두 번째' });
+    store.close();
+    let calls = 0;
+    let printed = '';
+    const state = await invoke(root, 'l1', '08', { mode: 'shadow', degradation: () => ({ llm: false, board: true }),
+      split: () => { calls++; return []; }, print: line => { printed = line; }, loadAdapter: async () => undefined }, logged);
+    expect(calls).toBe(0);
+    expect(state.cells.map(cell => ({ id: cell.id, origin: cell.origin, priority: cell.priority }))).toEqual([
+      { id: other.id, origin: 'candidate', priority: 'P2' }, { id, origin: 'candidate', priority: 'P1' },
+    ]);
+    expect(state.missing).not.toContain('flow1a-absent');
+    expect(printed.split('\n')[0]).toBe('강등 L1: LLM 불가');
+  }));
+
+  test('L2 skips new delegation and launch, but still reconciles and reports', async () => fixture(async (root, id, logged) => {
+    let turns = 0;
+    let printed = '';
+    const state = await invoke(root, 'l2', '08', { mode: 'shadow', degradation: () => ({ llm: true, board: false }),
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }],
+      seatTurn: async () => { turns++; return { status: 'queued' }; }, print: line => { printed = line; } }, logged);
+    expect(state.wouldDelegate).toBe(0);
+    expect(state.launched).toEqual([]);
+    expect(turns).toBe(0);
+    expect(logged.filter(row => row.event === 'degraded-skip')).toEqual([
+      { event: 'degraded-skip', reason: 'place' },
+      { event: 'degraded-skip', reason: 'delegate' },
+      { event: 'degraded-skip', reason: 'launch' },
+    ]);
+    expect(state.nodes.reconcile).toBe('skipped');
+    const noon = await invoke(root, 'l2-noon', '12', { mode: 'shadow', degradation: () => ({ llm: true, board: false }),
+      print: line => { printed = line; } }, logged);
+    expect(noon.nodes.reconcile).toBe('ok');
+    expect(noon.reconciled.unknown).toBe(1);
+    expect(printed.startsWith('강등 L2: board 불가\n')).toBe(true);
+    const bothDown = await invoke(root, 'l2-both', '12', { mode: 'shadow',
+      degradation: () => ({ llm: false, board: false }), print: line => { printed = line; } }, logged);
+    expect(bothDown.degradation).toEqual({ level: 2, reason: 'LLM·board 불가' });
+    expect(printed.startsWith('강등 L2: LLM·board 불가\n')).toBe(true);
+  }));
+
+  test('configured cap defers two of three cells and carries them to the following tick', async () => fixture(async (root, id, logged) => {
+    const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+    setElanousConfigDir(configDir);
+    try {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+      const deps: TickDeps = { mode: 'shadow', gridHosts: [], split: () => ['C1', 'C2', 'C3'].map(cell => ({ id: cell, title: cell, seat: 'MK' })),
+        placeCell: () => null };
+      const first = await invoke(root, 'cap-first', '08', deps, logged);
+      expect(first.wouldDelegate).toBe(1);
+      expect(first.deferredCells?.map(cell => cell.id)).toEqual(['C2', 'C3']);
+      expect(logged.filter(row => row.event === 'cap-deferred').map(row => row.reason)).toEqual([`orch:${id}:C2`, `orch:${id}:C3`]);
+      const next = await invoke(root, 'cap-next', '08', deps, logged);
+      expect(next.wouldDelegate).toBe(1);
+      expect(next.delegatedKeys).toEqual([`orch:${id}:C2`]);
+      expect(next.deferredCells?.map(cell => cell.id)).toEqual(['C3']);
+      const last = await invoke(root, 'cap-last', '08', deps, logged);
+      expect(last.delegatedKeys).toEqual([`orch:${id}:C3`]);
+      expect(last.deferredCells).toEqual([]);
+      const fourth = await invoke(root, 'cap-fourth', '08', deps, logged);
+      expect(fourth.wouldDelegate).toBe(0);
+      expect(fourth.deferredCells).toEqual([]);
+    } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+  }), 30_000);
+
+  test('deferred cells from a prior day are drained before fresh cells, even when the current cap is unset', async () => fixture(async (root, id, logged) => {
+    const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+    setElanousConfigDir(configDir);
+    try {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 0 } } }));
+      const first = await invoke(root, 'carry-first', '08', { mode: 'shadow', gridHosts: [],
+        split: () => [{ id: 'C1', title: '미룬 칸', seat: 'MK' }] }, logged);
+      expect(first.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: {} } }));
+      const store = new CardStore(root);
+      const fresh = store.createCard({ goalId: 'wish:fresh', title: '새 칸' });
+      store.close();
+      let state;
+      for (const node of stages) state = await runOrchestratorNode(node, { root, runId: 'carry-second', window: '08', mode: 'shadow',
+        now: new Date('2026-10-05T00:00:00Z'), split: card => [{ id: card.id, title: card.title, seat: 'TC' }],
+        placeCell: () => null, gridHosts: [], loadAdapter: async () => undefined, print: () => {} });
+      expect(state!.cells.map(cell => cell.id)).toEqual(['C1', fresh.id, id]);
+      expect(state!.wouldDelegate).toBe(3);
+      expect(state!.deferredCells).toEqual([]);
+    } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+  }), 30_000);
+
+  test('a new card never overtakes deferred work at the cap', async () => fixture(async (root, id, logged) => {
+    const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+    setElanousConfigDir(configDir);
+    try {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+      const first = await invoke(root, 'queue-first', '08', { mode: 'shadow', gridHosts: [],
+        split: () => [{ id: 'C1', title: '먼저', seat: 'MK' }, { id: 'C2', title: '이월', seat: 'TC' }], placeCell: () => null }, logged);
+      expect(first.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+      const store = new CardStore(root);
+      const fresh = store.createCard({ goalId: 'wish:latest', title: '새 카드' });
+      store.close();
+      const next = await invoke(root, 'queue-next', '08', { mode: 'shadow', gridHosts: [],
+        split: card => [{ id: card.id, title: card.title, seat: 'UX' }], placeCell: () => null }, logged);
+      expect(next.delegatedKeys).toEqual([`orch:${id}:C2`]);
+      expect(next.deferredCells?.map(cell => cell.id).sort()).toEqual([fresh.id, id].sort());
+    } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+  }), 30_000);
+
+  test('L1 live rule-only split does not write a split journal or request a seat turn', async () => fixture(async (root, id, logged) => {
+    let turns = 0;
+    const state = await invoke(root, 'l1-live', '08', { mode: 'live', degradation: () => ({ llm: false, board: true }),
+      split: () => { throw new Error('split must not run'); }, placeCell: () => { throw new Error('unowned cell must not be placed'); },
+      gridHosts: [], seatTurn: async () => { turns++; return { status: 'queued' }; } }, logged);
+    expect(state.cells).toEqual([{ cardId: id, id, title: '새 카드', origin: 'candidate', priority: 'P2' }]);
+    expect(turns).toBe(0);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+    expect(readFileSync(join(root, 'task-cards', `${id}.jsonl`), 'utf8')).not.toContain('orch:split');
+  }));
+
+  test('L0 explicit healthy signal leaves the original splitter and report unchanged', async () => fixture(async (root, id, logged) => {
+    let splitCalls = 0;
+    let printed = '';
+    const state = await invoke(root, 'healthy', '08', { mode: 'shadow',
+      degradation: () => ({ llm: true, board: true }),
+      split: () => { splitCalls++; return [{ id: 'C1', title: '칸', seat: 'MK' }]; },
+      placeCell: () => null, print: line => { printed = line; } }, logged);
+    expect(splitCalls).toBe(1);
+    expect(state.cells).toEqual([{ cardId: id, id: 'C1', title: '칸', origin: 'flow1a', seat: 'MK' }]);
+    expect(state.wouldDelegate).toBe(1);
+    expect(printed).toBe('orchestrator 08 cards=1 cells=1 placed=0 delegated=would 1 reconciled=0/0/0/0 mode=shadow');
+  }));
+
+  test('live board outage does not launch queued work; recovery carries its unassigned cells forward', async () => fixture(async (root, id, logged) => {
+    const pending = join(root, 'seat-requests', 'requests.jsonl');
+    mkdirSync(join(root, 'seat-requests'), { recursive: true });
+    writeFileSync(pending, `${JSON.stringify({ key: 'orch:older:C1', seat: 'MK', status: 'queued' })}\n`);
+    let turns = 0;
+    const deps: TickDeps = { root, runId: 'board-down', window: '08', mode: 'live',
+      now: new Date('2026-10-04T00:00:00Z'), degradation: () => ({ llm: true, board: true }),
+      split: () => [{ id: 'C2', title: '나중에 배정', seat: 'TC' }], placeCell: () => ({ version: '0.2.14' }),
+      seatTurn: async () => { turns++; return { status: 'queued' }; }, print: () => {},
+      observe: (event, data) => logged.push({ event, reason: data.reason }) };
+    for (const node of ['intake', 'split', 'place'] as const) await runOrchestratorNode(node, deps);
+    deps.degradation = () => ({ llm: true, board: false });
+    let degraded;
+    for (const node of ['delegate', 'launch', 'reconcile', 'report'] as const) degraded = await runOrchestratorNode(node, deps);
+    expect(degraded!.delegated).toBe(0);
+    expect(degraded!.launched).toEqual([]);
+    expect(degraded!.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+    expect(turns).toBe(0);
+    expect(logged.filter(row => row.event === 'degraded-skip').map(row => row.reason)).toEqual(['delegate', 'launch']);
+    const recovered = await invoke(root, 'board-recovered', '08', { mode: 'live',
+      split: () => { throw new Error('already split'); }, placeCell: () => ({ version: '0.2.14' }),
+      seatTurn: async () => { turns++; return { status: 'queued' }; } }, logged);
+    expect(recovered.delegated).toBe(1);
+    expect(recovered.delegatedKeys).toEqual([`orch:${id}:C2`]);
+    expect(turns).toBe(1);
+  }), 30_000);
+
+  test('live cap queues only one placed request and never launches a deferred seat early', async () => fixture(async (root, id, logged) => {
+    const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+    setElanousConfigDir(configDir);
+    try {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+      const seats: string[] = [];
+      const state = await invoke(root, 'live-cap', '08', { mode: 'live', gridHosts: [],
+        split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }],
+        placeCell: () => ({ version: '0.2.14' }),
+        seatTurn: async seat => { seats.push(seat); return { status: 'queued' }; } }, logged);
+      expect(state.delegated).toBe(1);
+      expect(state.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+      expect(seats).toEqual(['MK']);
+      expect(logged.filter(row => row.event === 'cap-deferred')).toEqual([{ event: 'cap-deferred', reason: `orch:${id}:C2`, targetLoopId: 'tc-seat' }]);
+      const firstRows = readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n');
+      expect(firstRows).toHaveLength(1);
+      const next = await invoke(root, 'live-cap-next', '08', { mode: 'live', gridHosts: [],
+        split: () => { throw new Error('already split'); }, seatTurn: async seat => { seats.push(seat); return { status: 'queued' }; } }, logged);
+      expect(next.delegated).toBe(1);
+      expect(seats).toEqual(['MK', 'TC']);
+      expect(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
+    } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+  }), 30_000);
+
+  test('no signal and no cap preserve cells, would-delegate count and exact report text', async () => fixture(async (root, id, logged) => {
+    let printed = '';
+    const state = await invoke(root, 'unchanged', '08', { mode: 'shadow',
+      split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], print: line => { printed = line; },
+      placeCell: () => null }, logged);
+    expect(state.cells).toEqual([{ cardId: id, id: 'C1', title: '칸', origin: 'flow1a', seat: 'MK' }]);
+    expect(state.wouldDelegate).toBe(1);
+    expect(printed).toBe('orchestrator 08 cards=1 cells=1 placed=0 delegated=would 1 reconciled=0/0/0/0 mode=shadow');
+    expect(state.degradation).toBeUndefined();
+  }));
+});
+
 describe('orchestrator graph command nodes', () => {
   test('configuration defaults to shadow and accepts only explicit live/off', async () => fixture(async (root) => {
     const path = join(root, 'config.json');
@@ -164,6 +359,37 @@ describe('orchestrator graph command nodes', () => {
     expect(state.steps.map((step: { node: Node }) => step.node)).toContain('split');
     expect(state.steps.map((step: { node: Node }) => step.node)).toContain('place');
     expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  }), 60_000);
+
+  test('ORCH-LIVE-1008: graph recipes take the window from ELANOUS_ORCH_WINDOW; set-but-invalid exits 2; --window wins', async () => fixture(async (root) => {
+    const context = join(root, 'graph-context.json');
+    writeFileSync(context, JSON.stringify({ graphId: 'orchestrator', runId: 'env08' }));
+    const graphDir = resolve(import.meta.dir, '../../../graphs/orchestrator');
+    const recipes = parseYaml(readFileSync(join(graphDir, 'recipes.yaml'), 'utf8'));
+    const env = { ...process.env, ELANOUS_GRAPH_DIR: graphDir, ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root };
+    for (const node of ['intake', 'split']) {
+      const result = spawnSync('bash', ['-c', recipes[`orchestrator-${node}`].command], { env: { ...env, ELANOUS_ORCH_WINDOW: '08' }, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+    }
+    const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'env08.json'), 'utf8'));
+    expect(state.window).toBe('08');
+    expect(state.nodes).toMatchObject({ intake: 'ok', split: 'ok' });
+    const bad = spawnSync('bash', ['-c', recipes['orchestrator-intake'].command], { env: { ...env, ELANOUS_ORCH_WINDOW: '09' }, encoding: 'utf8' });
+    expect(bad.status).toBe(2);
+    expect(bad.stderr).toContain('ELANOUS_ORCH_WINDOW');
+    for (const value of ['', '  ', ' 08 ']) {
+      const blank = spawnSync('bash', ['-c', recipes['orchestrator-intake'].command], { env: { ...env, ELANOUS_ORCH_WINDOW: value }, encoding: 'utf8' });
+      expect(blank.status).toBe(2);
+      expect(blank.stderr).toContain('ELANOUS_ORCH_WINDOW');
+    }
+    // The flag wins over the variable: a 12 flag with ELANOUS_ORCH_WINDOW=08 writes a 12-window run.
+    const flagContext = join(root, 'graph-context-flag.json');
+    writeFileSync(flagContext, JSON.stringify({ graphId: 'orchestrator', runId: 'flag12' }));
+    const flagWins = spawnSync('bash', ['-c', `${recipes['orchestrator-intake'].command} --window 12`], { env: { ...env, ELANOUS_GRAPH_CONTEXT: flagContext, ELANOUS_ORCH_WINDOW: '08' }, encoding: 'utf8' });
+    expect(flagWins.status).toBe(0);
+    expect(JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'flag12.json'), 'utf8')).window).toBe('12');
+    const bare = spawnSync('bash', ['-c', `${recipes['orchestrator-intake'].command} --window`], { env, encoding: 'utf8' });
+    expect(bare.status).toBe(2);
   }), 60_000);
 
   test('live writes two append-only requests once; noon skips intake and delegate and reconciles persisted cells', async () => fixture(async (root, id, logged) => {
@@ -828,4 +1054,190 @@ test('ORCH-TA-HAND: a shadow hand that fails after writing its card keeps the cl
   expect(calls).toBe(1);
   expect(agentCards(root)).toHaveLength(1);
   expect(ledgerRows(root).map(row => row.status)).toEqual(['claimed']);
+}));
+
+// COORD-HA ② × ORCH-TA-HAND: a live hand is an assignment — it counts toward the per-tick cap, and L2 hands nothing.
+test('COORD-HA × ORCH-TA-HAND: a live hand uses the per-tick cap; L2 never hands', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+    const launches: string[][] = [];
+    const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
+    const state = await invoke(root, 'capHand', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined,
+      handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    expect(launches).toHaveLength(1);
+    expect(state.delegatedKeys).toEqual([`orch:${id}:C1`]);
+    expect(state.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+    expect(logged.filter(row => row.event === 'cap-deferred').map(row => row.reason)).toEqual([`orch:${id}:C2`]);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA × ORCH-TA-HAND: a placed cell reaching delegate at L2 (board down) is deferred — the live hand is not attempted', async () => fixture(async (root, id, logged) => {
+  const base: TickDeps = { root, runId: 'l2Hand', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
+    observe: (event, data) => logged.push({ event, reason: data.reason }), seatTurn: async () => ({ status: 'skipped-empty' }),
+    split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }], placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+  for (const node of ['intake', 'split', 'place'] as const) await runOrchestratorNode(node, base);
+  let hands = 0;
+  const state = await runOrchestratorNode('delegate', { ...base, degradation: () => ({ llm: true, board: false }),
+    handToTaskAgent: 'live', handTask: async () => { hands++; throw new Error('must not hand at L2'); } });
+  expect(state.cells.map(cell => cell.version)).toEqual(['0.2.19']);
+  expect(hands).toBe(0);
+  expect(state.handed).toBeUndefined();
+  expect(state.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
+}));
+
+test('COORD-HA: a cell split normally that meets L2 at placement is carried and delegated on the next tick', async () => fixture(async (root, id, logged) => {
+  // (L2 from the very start splits rule-only and marks nothing on the card, so the card simply splits again next tick.)
+  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
+  const base: TickDeps = { root, runId: 'l2place', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
+    observe: (event, data) => logged.push({ event, reason: data.reason }), seatTurn: async () => ({ status: 'skipped-empty' }),
+    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+  for (const node of ['intake', 'split'] as const) await runOrchestratorNode(node, base);
+  const degraded: TickDeps = { ...base, degradation: () => ({ llm: true, board: false }) };
+  await runOrchestratorNode('place', degraded);
+  const down = await runOrchestratorNode('delegate', degraded);
+  expect(down.cells.map(cell => cell.version)).toEqual([undefined]);
+  expect(down.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
+  for (const node of ['launch', 'reconcile', 'report'] as const) await runOrchestratorNode(node, degraded);
+  // Next tick, board back: the card is already split (no new cells), yet the carried cell is placed and delegated.
+  const back = await invoke(root, 'l2back', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined }, logged);
+  expect(back.delegated).toBe(1);
+  expect(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8')).toContain(`orch:${id}:C1`);
+}));
+
+test('COORD-HA × ORCH-TA-HAND: a capped cell still gets its shadow card; an unplaced cell is never handed live even with cap 0', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 0 } } }));
+    const launches: string[][] = [];
+    const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
+    const capped = await invoke(root, 'capShadow', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined,
+      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    expect(launches).toHaveLength(0);
+    expect(capped.handed?.map(row => [row.cell, row.mode])).toEqual([['C1', 'shadow']]);
+    expect(capped.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA × ORCH-TA-HAND: with cap 0 an unplaced cell in a live tick is never launched (shadow card only)', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 0 } } }));
+    const launches: string[][] = [];
+    const state = await invoke(root, 'capUnplaced', '08', { mode: 'live', split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }], placeCell: () => null,
+      loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    expect(launches).toHaveLength(0);
+    expect(state.handed?.every(row => row.mode === 'shadow' && !row.launched)).toBe(true);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA: a degradation applied at split stays on the report even if the signal recovers before report', async () => fixture(async (root, id, logged) => {
+  let llm = false;
+  let printed = '';
+  const state = await invoke(root, 'recover', '08', { mode: 'shadow', degradation: () => ({ llm, board: true }),
+    split: () => { throw new Error('split must not be called at L1'); }, loadAdapter: async () => undefined,
+    print: line => { printed = line; },
+    observe: (event, data) => { logged.push({ event, reason: data.reason }); if (data.node === 'split') llm = true; } }, logged);
+  expect(state.degradation).toBeUndefined();
+  expect(printed.split('\n')[0]).toBe('강등 L1: LLM 불가');
+}));
+
+test('COORD-HA: a capped cell carried over keeps priority over a newly split cell on the next tick', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+    let cells = [{ id: 'C1', title: 'C1', seat: 'MK' }, { id: 'C2', title: 'C2', seat: 'MK' }];
+    const deps = (): TickDeps => ({ mode: 'shadow', gridHosts: [], split: () => cells, placeCell: () => null });
+    const first = await invoke(root, 'prio-first', '08', deps(), logged);
+    expect(first.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+    // Shadow never marks the card split, so the next tick re-splits the same card — now as C0 then C2 (same key as the
+    // carried C2). The carried C2 must still go first.
+    cells = [{ id: 'C0', title: 'C0', seat: 'MK' }, { id: 'C2', title: 'C2', seat: 'MK' }];
+    const next = await invoke(root, 'prio-next', '08', deps(), logged);
+    expect(next.delegatedKeys).toEqual([`orch:${id}:C2`]);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA: only the 08 window delegates — 12 and 18 neither assign nor carry, so carry-over always follows the last 08 run', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+    const deps: TickDeps = { mode: 'shadow', gridHosts: [], split: () => ['C1', 'C2'].map(cell => ({ id: cell, title: cell, seat: 'MK' })), placeCell: () => null };
+    const morning = await invoke(root, 'day-08', '08', deps, logged);
+    expect(morning.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
+    for (const window of ['12', '18'] as const) {
+      const later = await invoke(root, `day-${window}`, window, deps, logged);
+      expect(later.nodes.delegate).toBe('skipped');
+      expect(later.delegatedKeys).toBeUndefined();
+      expect(later.deferredCells).toBeUndefined();
+    }
+    const nextMorning = await invoke(root, 'day2-08', '08', deps, logged);
+    expect(nextMorning.delegatedKeys).toEqual([`orch:${id}:C2`]);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA: a bad signal seen only at intake (not applied) does not mark the report degraded', async () => fixture(async (root, id, logged) => {
+  let llm = false;
+  let printed = '';
+  await invoke(root, 'intake-only', '08', { mode: 'shadow', degradation: () => ({ llm, board: true }), loadAdapter: async () => undefined,
+    split: () => [{ id: 'C1', title: 'C1', seat: 'MK' }], print: line => { printed = line; },
+    observe: (event, data) => { logged.push({ event, reason: data.reason }); if (data.node === 'intake') llm = true; } }, logged);
+  expect(printed.startsWith('강등')).toBe(false);
+}));
+
+test('COORD-HA: removing the cap returns shadow to the legacy count — earlier would-delegates are not treated as assigned', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+    const deps: TickDeps = { mode: 'shadow', gridHosts: [], split: () => ['C1', 'C2'].map(cell => ({ id: cell, title: cell, seat: 'MK' })), placeCell: () => null };
+    const capped = await invoke(root, 'uncap-1', '08', deps, logged);
+    expect(capped.wouldDelegate).toBe(1);
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: {} } }));
+    const uncapped = await invoke(root, 'uncap-2', '08', deps, logged);
+    expect(uncapped.wouldDelegate).toBe(2);
+    expect(logged.filter(row => row.event === 'would-delegate').slice(-2).map(row => row.reason.split(' ')[0]).sort())
+      .toEqual([`orch:${id}:C1`, `orch:${id}:C2`]);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA: a delegate retried after assigning under cap 1 (state not saved) still assigns one in total', async () => fixture(async (root, id, logged) => {
+  const configDir = mkdtempSync(join(tmpdir(), 'orch-config-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 1 } } }));
+    const deps: TickDeps = { mode: 'live', split: () => [{ id: 'C1', title: 'C1', seat: 'MK' }, { id: 'C2', title: 'C2', seat: 'TC' }],
+      placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+    await invoke(root, 'retry-cap', '08', deps, logged);
+    const journal = join(root, 'seat-requests', 'requests.jsonl');
+    expect(readFileSync(journal, 'utf8').trim().split('\n').map(line => JSON.parse(line).cell)).toEqual(['C1']);
+    // Simulate a death after the C1 row but before the run state recorded it: wipe the state's usage and re-enter delegate.
+    const statePath = join(root, 'loop', 'orchestrator', 'retry-cap.json');
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    delete saved.nodes.delegate; saved.delegatedKeys = []; saved.deferredCells = [];
+    writeFileSync(statePath, JSON.stringify(saved));
+    await runOrchestratorNode('delegate', { ...deps, root, runId: 'retry-cap', window: '08', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {} });
+    expect(readFileSync(journal, 'utf8').trim().split('\n').map(line => JSON.parse(line).cell)).toEqual(['C1']);
+  } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+}));
+
+test('COORD-HA: board down only during place (back by delegate) still carries the unplaced cell', async () => fixture(async (root, id, logged) => {
+  const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
+  const base: TickDeps = { root, runId: 'placeOnly', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {},
+    observe: (event, data) => logged.push({ event, reason: data.reason }), seatTurn: async () => ({ status: 'skipped-empty' }),
+    split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined };
+  for (const node of ['intake', 'split'] as const) await runOrchestratorNode(node, base);
+  await runOrchestratorNode('place', { ...base, degradation: () => ({ llm: true, board: false }) });
+  const delegated = await runOrchestratorNode('delegate', { ...base, degradation: () => ({ llm: true, board: true }) });
+  expect(delegated.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
+  for (const node of ['launch', 'reconcile', 'report'] as const) await runOrchestratorNode(node, base);
+  const next = await invoke(root, 'placeOnly-next', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined }, logged);
+  expect(next.delegated).toBe(1);
 }));

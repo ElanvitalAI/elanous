@@ -15,12 +15,13 @@ export function latestReleaseRun(result: OpsResult<ReleaseRun[]> | null, now: nu
   return latest;
 }
 
-export function ReleaseStrip({ result, onSelect, now = Date.now() }: {
+export function ReleaseStrip({ result, onSelect, selectedRun, now = Date.now() }: {
   result: OpsResult<ReleaseRun[]> | null;
   onSelect: (run: ReleaseRun) => void;
+  selectedRun?: ReleaseRun | null;
   now?: number;
 }): React.ReactNode {
-  const run = latestReleaseRun(result, now);
+  const run = selectedRun === undefined ? latestReleaseRun(result, now) : selectedRun;
   if (!run) return null;
   const index = Math.max(0, run.path.findIndex((id) => run.nodes.find((node) => node.nodeId === id)?.ok !== true));
   const currentIndex = run.path.length > 0 && run.path.every((id) => run.nodes.find((node) => node.nodeId === id)?.ok === true)

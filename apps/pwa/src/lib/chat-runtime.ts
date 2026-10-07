@@ -533,7 +533,7 @@ const HELP_TEXT = [
 const TUI_SLASH_NAMES = new Set([
   'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now', 'wish',
   'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
-  'ad', 'design', 'design-check',
+  'ad', 'design', 'design-check', 'decide', 'dec',
   'local', 'll', 'session', 'sess', 'persona', 'fork', 'rewind', 'mission',
   'resume-turn', 'context', 'ctx', 'paste', 'sync', 's', 'plugin',
   'plugins', 'widget', 'widgets', 'log', 'loops', 'memory', 'mem', 'export',

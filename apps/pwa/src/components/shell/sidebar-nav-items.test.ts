@@ -13,6 +13,9 @@ import {
   NAV_GROUPS,
   NON_MENU_SIDEBAR_ROUTES,
   SIDEBAR_NAV_ITEMS,
+  isSidebarViewLink,
+  navItemActive,
+  sidebarRoutePath,
   visibleNavGroups,
   type SidebarRouteHref,
 } from './sidebar-nav-items';
@@ -95,7 +98,8 @@ function expectCompleteRouteAccounting(
   builtHrefs: readonly SidebarRouteHref[],
   guidance: readonly { href: SidebarRouteHref; navigable: boolean }[],
 ): void {
-  const menu = SIDEBAR_NAV_ITEMS.map((item) => item.href);
+  // 보기 링크(경로 ⊕ `?view=`)는 주소가 아니다 — 경로만 센다(아래 «보기 링크» 시험이 그 경로가 메뉴에 있음을 잰다).
+  const menu = SIDEBAR_NAV_ITEMS.filter((item) => !isSidebarViewLink(item.href)).map((item) => item.href);
   const nonMenu = NON_MENU_SIDEBAR_ROUTES.map((item) => item.href);
   const accounted = [...menu, ...nonMenu];
   const built = new Set<string>(builtHrefs);
@@ -142,7 +146,7 @@ const expectedGroups = [
   ['make', '만들기', true, ['/term', '/editor', '/design-check', '/workspace']],
   ['files', '자료', false, ['/vault', '/field', '/market']],
   ['settings', '설정', false, ['/settings']],
-  ['ops', '운영🔒', false, ['/ceo', '/loops', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
+  ['ops', '운영🔒', false, ['/ceo', '/loops', '/loops?view=interact', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
 ] as const;
 
 describe('NAV1a menu', () => {
@@ -158,7 +162,7 @@ describe('NAV1a menu', () => {
       '/autopilot': '미션', '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
       '/term': '터미널', '/editor': '편집기', '/design-check': '디자인', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
-      '/ceo': '대표 조망판', '/loops': '루프 현황', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
+      '/ceo': '대표 조망판', '/loops': '루프 현황', '/loops?view=interact': '루프 상호작용', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
       '/observatory': '관측', '/worktrees': '작업 트리', '/control': '제어',
     });
     for (const item of SIDEBAR_NAV_ITEMS) {
@@ -177,15 +181,28 @@ describe('NAV1a menu', () => {
     expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/editor')?.activeAlso).toEqual(['/workflows']);
   });
 
+  test('view links (path ⊕ query) open a view of a menu path and stay out of address accounting', () => {
+    const views = SIDEBAR_NAV_ITEMS.filter((item) => isSidebarViewLink(item.href));
+    expect(views.map((item) => [item.group, item.href, item.label])).toEqual([['ops', '/loops?view=interact', '루프 상호작용']]);
+    for (const item of views) {
+      expect(SIDEBAR_NAV_ITEMS.some((menu) => menu.href === sidebarRoutePath(item.href))).toBe(true);
+      expect(ROUTE_GUIDANCE_ITEMS.some((route) => route.href === item.href)).toBe(false);
+    }
+    expect(sidebarRoutePath('/loops?view=interact')).toBe('/loops');
+    expect(sidebarRoutePath('/loops')).toBe('/loops');
+    expect(isSidebarViewLink('/loops')).toBe(false);
+  });
+
   test('operator controls ops regardless of role and Labs; other entries keep visibility and role filtering', () => {
     const off = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: true, showHidden: true }, 'owner', false);
     expect([...off.main, ...off.labs, ...off.hidden].filter((item) => item.group === 'ops')).toEqual([]);
     for (const role of ['owner', 'contributor', 'general'] as const) {
       const on = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false }, role, true);
-      expect(on.main.filter((item) => item.group === 'ops').map((item) => item.href)).toEqual([...expectedGroups[6][3]]);
+      expect(on.main.filter((item) => item.group === 'ops').map((item) => item.href))
+        .toEqual([...expectedGroups[6][3], ...PRIVATE_SIDEBAR_NAV_ITEMS.filter((item) => item.group === 'ops').map((item) => item.href)]);
     }
     expect(off.labs.map((item) => item.href).sort()).toEqual(['/board', '/editor', '/showroom', '/workspace'].sort());
-    expect(off.hidden.map((item) => item.href).sort()).toEqual(['/tasks', '/sessions', '/reflection', ...PRIVATE_SIDEBAR_NAV_ITEMS.map((item) => item.href)].sort());
+    expect(off.hidden.map((item) => item.href).sort()).toEqual(['/tasks', '/sessions', '/reflection', ...PRIVATE_SIDEBAR_NAV_ITEMS.filter((item) => item.group !== 'ops').map((item) => item.href)].sort());
     const general = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false }, 'general');
     expect(general.main.some((item) => item.href === '/scheduler')).toBe(false);
     expect(general.main.some((item) => item.href === '/chat')).toBe(true);
@@ -303,5 +320,24 @@ describe('탭 다이어트 — 메뉴 노출 등급', () => {
   test('Design 은 비메뉴 목록에서 빠지고 메뉴로 올라왔다', () => {
     expect(NON_MENU_SIDEBAR_ROUTES.some((route) => route.href === '/design-check')).toBe(false);
     expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/design-check' && item.label === '디자인')).toBe(true);
+  });
+});
+
+describe('LOOP-NAV-ACTIVE — 보기 링크(?view=)의 강조는 하나', () => {
+  const activeLabels = (path: string, search: string) =>
+    SIDEBAR_NAV_ITEMS.filter((item) => navItemActive(item, path, search, SIDEBAR_NAV_ITEMS)).map((item) => item.label);
+
+  test('/loops?view=interact 에서 강조는 «루프 상호작용» 하나뿐이다', () => {
+    expect(activeLabels('/loops', 'view=interact')).toEqual(['루프 상호작용']);
+    expect(activeLabels('/loops', 'view=interact&journey=card-1')).toEqual(['루프 상호작용']);
+  });
+
+  test('기본 /loops 에선 «루프 현황» 강조 그대로 · 다른 경로 판정도 그대로', () => {
+    expect(activeLabels('/loops', '')).toEqual(['루프 현황']);
+    expect(activeLabels('/loops', 'view=other')).toEqual(['루프 현황']);
+    expect(navItemActive({ href: '/' }, '/', '', SIDEBAR_NAV_ITEMS)).toBe(true);
+    expect(navItemActive({ href: '/' }, '/loops', '', SIDEBAR_NAV_ITEMS)).toBe(false);
+    expect(navItemActive({ href: '/ops' }, '/ops/release', '', SIDEBAR_NAV_ITEMS)).toBe(true);
+    expect(navItemActive({ href: '/x', activeAlso: ['/y'] }, '/y/z', '', SIDEBAR_NAV_ITEMS)).toBe(true);
   });
 });

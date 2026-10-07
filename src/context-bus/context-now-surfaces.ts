@@ -34,6 +34,9 @@ function factText(fact: ContextFact): string {
     case 'cell': return `${fact.id} ${fact.title} (${fact.status})`;
     case 'decision': return `${fact.id} ${fact.title} (${fact.status})`;
     case 'seat': return `${fact.seat} ${fact.id ?? ''} ${fact.title ?? ''} (${fact.status})`.trim();
+    case 'run': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.goal} · ${fact.phase} · ${fact.elapsed}`;
+    case 'release': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.version} · ${fact.node} · ${fact.status}`;
+    case 'schedule-late': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.count}개 · ${fact.names.join(', ') || '없음'}`;
   }
 }
 
@@ -61,20 +64,27 @@ export function renderTuiNow(input: ContextNowAnswer, audience: ContextNowAudien
     if (source.startsWith('elanous://release/')) return '원장';
     return Array.from(source).slice(0, 40).join('');
   };
-  const factLabels = { version: '판', cell: '칸', decision: '결정', seat: '자리' } as const;
+  const factLabels = { run: '도는 런', release: '발행 런', 'schedule-late': '지연 스케줄', version: '판', cell: '칸', decision: '결정', seat: '자리' } as const;
   const eventLabels: Record<string, string> = { report: '보고', dispatch: '발사', decision: '결정' };
   const events = answer.events.slice().sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
   const rows = [
-    ...answer.facts.map(f => [factLabels[f.kind], shortText(factText(f)), shortSource(f.source)]),
+    ...answer.facts.slice().sort((a, b) => {
+      const priority = (kind: ContextFact['kind']) => ({ run: 0, release: 1, 'schedule-late': 2 } as Partial<Record<ContextFact['kind'], number>>)[kind] ?? 3;
+      return priority(a.kind) - priority(b.kind);
+    }).map(f => [factLabels[f.kind], shortText(factText(f)), shortSource(f.source)]),
     ...events.slice(0, 8).map(e => [eventLabels[e.kind] ?? '소식', shortText(e.summary), shortSource(e.source)]),
     ...answer.guide.map(guide => ['안내', guide, '']),
     ...(events.length > 8 ? [['안내', `… 사건 ${events.length - 8}개 더(/now <주제> 로 좁히기)`, '']] : []),
   ];
+  const clean = (text: string) => text.replaceAll('|', ' ').replaceAll(/\r?\n/g, ' ');
+  const width = (text: string) => Array.from(text).reduce((total, char) => total + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe6f\uff01-\uff60\uffe0-\uffe6]/u.test(char) ? 2 : 1), 0);
+  const data = [['종류', '사실', '출처'], ...rows].map(row => row.map(clean));
+  const widths = [0, 1].map(i => Math.max(...data.map(row => width(row[i] ?? ''))));
+  const format = (row: string[]) => `${row[0]}${' '.repeat(widths[0]! - width(row[0]!) + 2)}${row[1]}${' '.repeat(widths[1]! - width(row[1]!) + 2)}${row[2]}`;
+  const time = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(answer.at));
   return [
-    `지금${answer.topic ? ` · ${answer.topic}` : ''} (${answer.at})`,
-    '| 종류 | 사실 | 출처 |',
-    '| --- | --- | --- |',
-    ...rows.map(row => `| ${row.map(cell => cell.replaceAll('|', '\\|').replaceAll(/\r?\n/g, ' ')).join(' | ')} |`),
+    `지금${answer.topic ? ` · ${answer.topic}` : ''} (${time} KST)`,
+    ...data.map(format),
   ];
 }
 

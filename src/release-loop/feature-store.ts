@@ -5,6 +5,8 @@ import { Database } from 'bun:sqlite';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
+import { hqSeenGenerationPath, readHqLease, readSeenGeneration } from '../hq/hq.js';
 import { devVersion, type Checklist, type ChecklistHistory, type ChecklistItem } from './checklist.js';
 
 export function validateVersion(version: string): void {
@@ -32,7 +34,7 @@ export function releasedVersion(ledgerRoot = releaseLedgerRoot()): string {
 const walWait = new Int32Array(new SharedArrayBuffer(4));
 const SCHEMA_COLUMNS: Record<string, readonly string[]> = {
   imported_versions: ['json_hash', 'imported_at'],
-  events: ['reason'],
+  events: ['reason', 'generation'],
   assignments: ['priority', 'predecessors', 'deadline_version', 'ceo_minutes', 'ceo_date', 'accelerator', 'refs'],
   release_schedules: ['freeze_from', 'freeze_until'],
 };
@@ -72,7 +74,9 @@ function open(root = releaseLedgerRoot()): Database {
       const columns = db.query('PRAGMA table_info(imported_versions)').all() as Array<{ name: string }>;
       if (!columns.some((column) => column.name === 'json_hash')) db.exec('ALTER TABLE imported_versions ADD COLUMN json_hash TEXT');
       if (!columns.some((column) => column.name === 'imported_at')) db.exec('ALTER TABLE imported_versions ADD COLUMN imported_at TEXT');
-      if (!(db.query('PRAGMA table_info(events)').all() as Array<{ name: string }>).some((column) => column.name === 'reason')) db.exec('ALTER TABLE events ADD COLUMN reason TEXT');
+      const eventColumns = db.query('PRAGMA table_info(events)').all() as Array<{ name: string }>;
+      if (!eventColumns.some((column) => column.name === 'reason')) db.exec('ALTER TABLE events ADD COLUMN reason TEXT');
+      if (!eventColumns.some((column) => column.name === 'generation')) db.exec('ALTER TABLE events ADD COLUMN generation INTEGER');
       db.exec('CREATE TABLE IF NOT EXISTS release_schedules (version TEXT PRIMARY KEY, cut_at TEXT NOT NULL, land_by TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)');
       const assignmentColumns = db.query('PRAGMA table_info(assignments)').all() as Array<{ name: string }>;
       for (const [name, sql] of [['priority', 'TEXT'], ['predecessors', 'TEXT'], ['deadline_version', 'TEXT'], ['ceo_minutes', 'INTEGER'], ['ceo_date', 'TEXT'], ['accelerator', 'INTEGER'], ['refs', 'TEXT']] as const) {
@@ -155,15 +159,15 @@ function readTransaction<T>(db: Database, work: () => T): T {
   catch (error) { db.exec('ROLLBACK'); throw error; }
 }
 
-type EventRow = { seq: number; at: string; by: string; feature_id: string; version: string; field: string; from: string; to: string; released: string; dev: string; reason: string | null };
+type EventRow = { seq: number; at: string; by: string; feature_id: string; version: string; field: string; from: string; to: string; released: string; dev: string; reason: string | null; generation: number | null };
 function decode(value: string | null): unknown { return value === null ? null : JSON.parse(value); }
 function historyRow(row: EventRow): ChecklistHistory {
   return { at: row.at, by: row.by, id: row.feature_id, field: row.field, from: decode(row.from), to: decode(row.to), released: row.released, dev: row.dev,
-    ...(row.reason !== null ? { reason: row.reason } : {}) };
+    ...(row.reason !== null ? { reason: row.reason } : {}), ...(row.generation !== null ? { generation: row.generation } : {}) };
 }
 function record(db: Database, version: string, entry: ChecklistHistory): void {
-  db.query('INSERT INTO events (at, by, feature_id, version, field, "from", "to", released, dev, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(entry.at, entry.by, entry.id, version, entry.field, JSON.stringify(entry.from ?? null), JSON.stringify(entry.to ?? null), entry.released, entry.dev, entry.reason ?? null);
+  db.query('INSERT INTO events (at, by, feature_id, version, field, "from", "to", released, dev, reason, generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(entry.at, entry.by, entry.id, version, entry.field, JSON.stringify(entry.from ?? null), JSON.stringify(entry.to ?? null), entry.released, entry.dev, entry.reason ?? null, entry.generation ?? null);
 }
 function evidenceRefs(db: Database, version: string, id: string): string[] {
   return (db.query('SELECT ref FROM evidence WHERE feature_id = ? AND version = ? ORDER BY rowid').all(id, version) as Array<{ ref: string }>).map((row) => row.ref);
@@ -334,6 +338,30 @@ export interface ChecklistCollision { version: string; owner?: string; title: st
 
 export function mutate(version: string, released: string, dev: string, apply: (data: Checklist, otherItems: (id: string) => ChecklistCollision[]) => boolean): Checklist {
   validateVersion(version);
+  // COORD-HA ①(RFC-loop-agent-map §A8b): a write carries the generation this process saw; a stale one is refused only
+  // under hq.boardFencing 'enforce' (default shadow = write and log). The lease is read ONCE, before the write transaction —
+  // with an ssh arbiter a lease read inside the transaction would hold the ledger write lock across the network.
+  // Only 'enforce' (opt-in) re-reads once inside the transaction just before writing, so a lease taken over meanwhile
+  // still rolls the write back; shadow never touches the lease under the lock.
+  const hq = getUserConfig().hq;
+  const writerGeneration = hq ? readSeenGeneration(hqSeenGenerationPath(hq)) : null;
+  let recordedGeneration: number | null = null;
+  let firstMeasured = false;
+  if (hq) {
+    let lease: ReturnType<typeof readHqLease>['record'] | undefined;
+    try { lease = readHqLease({ config: hq }).record; }
+    catch (error) { debug.log('hq.fence', 'board-lease-unmeasured', { writer: writerGeneration, version, reason: String(error).slice(0, 200) }); }
+    // A missing lease (null) and a broken one (parseLease throws → caught above with its reason) are both «unmeasured».
+    if (lease === null) debug.log('hq.fence', 'board-lease-unmeasured', { writer: writerGeneration, version, reason: 'no-lease' });
+    if (lease) {
+      firstMeasured = true;
+      recordedGeneration = writerGeneration;
+      if (writerGeneration !== null && writerGeneration < lease.generation) {
+        debug.log('hq.fence', 'board-stale-write', { writer: writerGeneration, lease: lease.generation, version });
+        if (hq.boardFencing === 'enforce') throw new CliUserError(`낡은 세대 ${writerGeneration} < ${lease.generation} — 쓰기 거부`);
+      }
+    }
+  }
   const db = open();
   try {
     let imported = false;
@@ -352,6 +380,22 @@ export function mutate(version: string, released: string, dev: string, apply: (d
             return { version: item.version, ...(item.owner !== null ? { owner: item.owner } : {}), title: item.title };
           });
       })) {
+        if (hq?.boardFencing === 'enforce') {
+          let late: ReturnType<typeof readHqLease>['record'] = null;
+          let lateReason = 'no-lease';
+          try { late = readHqLease({ config: hq }).record; }
+          catch (error) { late = null; lateReason = String(error).slice(0, 200); }
+          if (!late) {
+            // Unmeasured right before the write: the write still goes through, but carries no generation it cannot vouch for.
+            // (Logged only when the first read had measured — an unmeasured first read was already logged once.)
+            if (firstMeasured) debug.log('hq.fence', 'board-lease-unmeasured', { writer: writerGeneration, version, reason: lateReason, phase: 'before-write' });
+            recordedGeneration = null;
+          }
+          if (late && writerGeneration !== null && writerGeneration < late.generation) {
+            debug.log('hq.fence', 'board-stale-write', { writer: writerGeneration, lease: late.generation, version });
+            throw new CliUserError(`낡은 세대 ${writerGeneration} < ${late.generation} — 쓰기 거부`);
+          }
+        }
         for (const item of data.items) if (before.get(item.id) !== JSON.stringify(item)) {
           const previous = before.get(item.id);
           const evidenceChanged = previous && (JSON.parse(previous) as ChecklistItem).evidence !== item.evidence;
@@ -365,7 +409,10 @@ export function mutate(version: string, released: string, dev: string, apply: (d
           db.query('DELETE FROM evidence WHERE feature_id = ? AND version = ?').run(id, version);
           db.query('DELETE FROM assignments WHERE feature_id = ? AND version = ?').run(id, version);
         }
-        for (const entry of data.history.slice(count)) record(db, version, entry);
+        for (const entry of data.history.slice(count)) {
+          if (recordedGeneration !== null) entry.generation = recordedGeneration;
+          record(db, version, entry);
+        }
       }
       return data;
     });

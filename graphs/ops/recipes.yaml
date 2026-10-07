@@ -9,3 +9,6 @@ publish-approval:
 secret-exposure-scan:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/guardian/secret-exposure-scan.ts"'
   timeout_ms: 120000
+guardian-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" guardian tick'
+  timeout_ms: 120000

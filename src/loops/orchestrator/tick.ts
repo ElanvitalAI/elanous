@@ -1,11 +1,12 @@
 import { withFileLockSync } from '../../storage/file-lock.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
 import { Database } from 'bun:sqlite';
 import { type ChecklistItem } from '../../release-loop/checklist.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, type OrchestratorLoopConfig } from '../../user-config.js';
+import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug } from '../../debug/log.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../self-dev/run-store.js';
 import { planAction, runSeatLoopOnce, type SeatDeps, type SeatItem } from '../../seat-loop/seat-loop.js';
@@ -19,12 +20,19 @@ export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
 export type Mode = 'off' | 'shadow' | 'live';
 const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cmo-seat', TC: 'tc-seat', UX: 'ux-seat' };
-export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2'; predecessors?: string[] }
+export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[] }
 export interface TickState {
   runId: string; window: Window; mode: Mode; day: string;
   cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number; rebalanceBlocked?: Array<{ id: string; reason: string }>;
   reconciled: { reached: number; progressing: number; blocked: number; unknown: number };
   runSummaries?: string[];
+  degradation?: { level: 1 | 2; reason: string };
+  /** The highest degradation actually applied in this run — the report keeps it even if the signal recovers before report. */
+  degradationPeak?: { level: 1 | 2; reason: string };
+  deferredCells?: Cell[];
+  /** place ran at L2 (skipped) in this run — its unplaced cells are carried even if the board is back by delegate. */
+  placeDegraded?: boolean;
+  delegatedKeys?: string[];
   launched?: Array<{ seat: string; status: string; key?: string; queueId?: string; runId?: string }>;
   /** ORCH-TA-HAND — cells handed to TASK-AGENT this run (card id · mode · launched). */
   handed?: Array<{ key: string; cell: string; cardId: string; mode: 'shadow' | 'live'; launched: boolean }>;
@@ -42,6 +50,7 @@ export type RebalanceAdapter = (version: string) => Promise<{ decisions: unknown
 export interface TickDeps {
   root?: string; now?: Date; mode?: Mode; runId?: string; window?: Window;
   cards?: () => TaskCard[]; split?: SplitAdapter; placeCell?: PlaceAdapter;
+  degradation?: () => { llm: boolean; board: boolean };
   gridHosts?: readonly GridHost[];
   seatTurn?: (seat: string, root: string, host?: string, options?: Pick<SeatDeps, 'enqueue'>) => Promise<{ status: string; queueId?: string; runId?: string; item?: { source: string; id: string } }>;
   queueOutcome?: (queueId: string, root: string) => 'pending' | 'unknown' | 'retryable' | 'succeeded';
@@ -132,7 +141,9 @@ export function reportLine(state: TickState): string {
   const r = state.reconciled;
   const line = `orchestrator ${state.window} cards=${state.cards.length} cells=${state.cells.length} placed=${state.missing.includes('relplan1-absent') ? 'missing' : state.placed} delegated=${state.mode === 'shadow' ? `would ${state.wouldDelegate}` : state.delegated} reconciled=${r.reached}/${r.progressing}/${r.blocked}/${r.unknown} mode=${state.mode}`;
   const details = [...(state.rebalanceBlocked ?? []).map(row => `⛔ 이월 거부 ${row.id}: ${row.reason}`), ...(state.runSummaries ?? [])];
-  return details.length ? `${line}\n${details.join('\n')}` : line;
+  const body = details.length ? `${line}\n${details.join('\n')}` : line;
+  const applied = state.degradationPeak ?? state.degradation;
+  return applied ? `강등 L${applied.level}: ${applied.reason}\n${body}` : body;
 }
 function readCardSnapshot(root: string): { cards: TaskCard[]; skippedCards: TickState['skippedCards'] } {
   const dir = taskCardsDir(root);
@@ -321,6 +332,22 @@ function restorePrevious(root: string, day: string, mode: Mode): Pick<TickState,
   }
   return { cards: [...cards.values()], cells: [...cells.values()], launched: [...launched.values()] };
 }
+function previousDelegations(root: string, day: string, mode: Mode, runId: string): { deferred: Cell[]; keys: string[] } {
+  const dir = join(root, 'loop', 'orchestrator');
+  if (!existsSync(dir)) return { deferred: [], keys: [] };
+  const states = readdirSync(dir).filter(name => /^[a-zA-Z0-9._-]+\.json$/.test(name))
+    .flatMap(name => {
+      try {
+        const path = join(dir, name);
+        const state = JSON.parse(readFileSync(path, 'utf8')) as TickState;
+        return state.runId !== runId && state.day <= day && state.mode === mode && state.window === '08' &&
+          state.nodes?.delegate === 'ok' && Array.isArray(state.deferredCells)
+          ? [{ name, state, mtime: statSync(path).mtimeMs }] : [];
+      } catch { return []; }
+    });
+  states.sort((a, b) => a.state.day.localeCompare(b.state.day) || a.mtime - b.mtime || a.name.localeCompare(b.name));
+  return { deferred: states.at(-1)?.state.deferredCells ?? [], keys: states.flatMap(({ state }) => Array.isArray(state.delegatedKeys) ? state.delegatedKeys : []) };
+}
 function initial(runId: string, window: Window, mode: Mode, day: string): TickState {
   return { runId, window, mode, day, cards: [], skippedCards: [], cells: [], placed: 0, delegated: 0, wouldDelegate: 0,
     reconciled: { reached: 0, progressing: 0, blocked: 0, unknown: 0 }, steps: [], nodes: {}, missing: [] };
@@ -349,11 +376,20 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   const root = deps.root ?? effectiveInstanceRoot();
   const runId = deps.runId ?? graphRunId() ?? `${kstDay(now)}-${window}`;
   const path = stateFile(root, runId);
-  const configured = deps.mode ?? getUserConfig().loops?.orchestrator?.mode;
+  const orchestratorConfig = getUserConfig().loops?.orchestrator;
+  const configured = deps.mode ?? orchestratorConfig?.mode;
   const mode: Mode = configured === 'off' || configured === 'live' ? configured : 'shadow';
   const state: TickState = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as TickState : initial(runId, window, mode, kstDay(now));
   state.steps ??= [];
   if (state.window !== window || state.mode !== mode) throw new Error('orchestrator run window/mode changed');
+  if (deps.degradation) {
+    const signal = deps.degradation();
+    state.degradation = !signal.board ? { level: 2, reason: signal.llm ? 'board 불가' : 'LLM·board 불가' }
+      : !signal.llm ? { level: 1, reason: 'LLM 불가' } : undefined;
+    // Only nodes that act on the degradation (split · place · delegate · launch) count toward the reported peak.
+    const applies = (['split', 'place', 'delegate', 'launch'] as Node[]).includes(node) && activeNode(node, window);
+    if (applies && state.degradation && (!state.degradationPeak || state.degradation.level >= state.degradationPeak.level)) state.degradationPeak = state.degradation;
+  }
   const predecessor: Partial<Record<Node, Node>> = { split: 'intake', place: 'split', delegate: 'place', launch: 'delegate', reconcile: 'launch', report: 'reconcile' };
   const preceding = predecessor[node];
   if (preceding && !state.nodes[preceding]) throw new Error(`orchestrator ${node}: missing ${preceding} result`);
@@ -380,14 +416,17 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
       observe('exchange', 'wish-cards', state.cards.length);
     } else if (node === 'split') {
       // Shadow also asks the splitter (it only proposes cells); only live records `orch:split` on the card.
-      const split = deps.split ?? await adapter<SplitAdapter>('../../flow-loop/split.js', 'splitCard');
-      if (!split) { state.missing.push('flow1a-absent'); observe('node-missing', 'flow1a-absent', state.cards.length); }
+      const ruleOnly = (state.degradation?.level ?? 0) >= 1;
+      const split = ruleOnly ? undefined : deps.split ?? await adapter<SplitAdapter>('../../flow-loop/split.js', 'splitCard');
+      if (!split && !ruleOnly) { state.missing.push('flow1a-absent'); observe('node-missing', 'flow1a-absent', state.cards.length); }
       state.cells = [];
       for (const card of state.cards) {
-        const cells = split ? await split(card, { shadow: mode === 'shadow' }) : [{ id: card.id, title: card.title }];
+        const cells = ruleOnly ? [{ id: card.id, title: card.title }] : split ? await split(card, { shadow: mode === 'shadow' }) : [{ id: card.id, title: card.title }];
         for (const cell of cells) {
           if (!cell.id?.trim() || !cell.title?.trim()) throw new Error('invalid split cell');
-          state.cells.push({ cardId: card.id, id: cell.id, title: cell.title, origin: split ? 'flow1a' : 'candidate', ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.seat ? { seat: cell.seat } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}) });
+          state.cells.push({ cardId: card.id, id: cell.id, title: cell.title, origin: split ? 'flow1a' : 'candidate',
+            ...(ruleOnly ? { priority: rubricPriority(card.sections.map(section => section.content).join('\n')) } : {}),
+            ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.seat ? { seat: cell.seat } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}) });
         }
         observe('exchange', `split:${card.id}`, cells.length);
         if (split && cells.length && mode === 'live') {
@@ -398,33 +437,54 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         }
       }
     } else if (node === 'place') {
-      const gridHosts = resolveGridHosts(deps, observe);
-      refreshGridHosts(state.cells, gridHosts, mode, root, observe);
-      if (mode === 'live') await syncQueuedPoolHints(root, state.launched ?? [], deps, observe);
-      const place = deps.placeCell ?? await adapter<PlaceAdapter>('../../release-loop/placement.js', 'placeCell');
-      const available = typeof place === 'function';
-      if (!available) { state.missing.push('relplan1-absent'); observe('node-missing', 'relplan1-absent', state.cells.length); }
-      if (mode === 'shadow' && deps.placeCell) observe('exchange', 'relplan1-shadow-not-invoked', state.cells.length);
-      // 담당 없는 칸은 배치를 부르든 안 부르든 센다 — 배치 호출 여부와 집계를 묶지 않는다.
-      for (const cell of state.cells) {
-        if (cell.origin === 'flow1a' && (!cell.seat || !SEAT_LOOP_IDS[cell.seat])) { state.unplaced = (state.unplaced ?? 0) + 1; observe('exchange', 'unplaced-no-owner', 1); }
+      // Carry unfinished assignments into the same place/delegate path before applying this tick's cap.
+      const carry = previousDelegations(root, state.day, mode, runId).deferred;
+      if (carry.length) {
+        // Carried cells keep their place ahead of this tick's new cells (deduplicated) — a cell deferred by the cap is not
+        // pushed back again by a newly split cell.
+        const carried = new Set(carry.map(cell => `orch:${cell.cardId}:${cell.id}`));
+        state.cells = [...carry, ...state.cells.filter(cell => !carried.has(`orch:${cell.cardId}:${cell.id}`))];
       }
-      if (available && (mode === 'live' || !deps.placeCell)) for (const cell of state.cells) {
-        if (cell.origin !== 'flow1a' || !cell.seat || !SEAT_LOOP_IDS[cell.seat]) continue;
-        // RELPLAN's dryRun calculates the same release without writing a checklist in shadow.
-        try {
-          const placed = await place({ id: cell.id, title: cell.title, owner: cell.seat, priority: cell.priority ?? 'P2', predecessors: cell.predecessors ?? [] }, { dryRun: mode === 'shadow', now });
-          if (validVersion(placed?.version)) {
-            cell.version = placed.version;
-            state.placed++;
-            observe('exchange', mode === 'shadow' ? `would-place:${cell.id}:${cell.version}` : `placed:${cell.id}:${cell.version}`, 1);
-          } else { state.unplaced = (state.unplaced ?? 0) + 1; observe('exchange', 'unplaced-no-release', 1); }
-        } catch (error) {
-          state.unplaced = (state.unplaced ?? 0) + 1;
-          observe('exchange', `unplaced:${cell.id}:${String(error).slice(0, 160)}`, 1);
+      if (state.degradation?.level === 2) {
+        state.placeDegraded = true;
+        observe('degraded-skip', 'place', 0);
+      } else {
+        const gridHosts = resolveGridHosts(deps, observe);
+        refreshGridHosts(state.cells, gridHosts, mode, root, observe);
+        if (mode === 'live') await syncQueuedPoolHints(root, state.launched ?? [], deps, observe);
+        const place = deps.placeCell ?? await adapter<PlaceAdapter>('../../release-loop/placement.js', 'placeCell');
+        const available = typeof place === 'function';
+        if (!available) { state.missing.push('relplan1-absent'); observe('node-missing', 'relplan1-absent', state.cells.length); }
+        if (mode === 'shadow' && deps.placeCell) observe('exchange', 'relplan1-shadow-not-invoked', state.cells.length);
+        // 담당 없는 칸은 배치를 부르든 안 부르든 센다 — 배치 호출 여부와 집계를 묶지 않는다.
+        for (const cell of state.cells) {
+          if (cell.origin === 'flow1a' && (!cell.seat || !SEAT_LOOP_IDS[cell.seat])) { state.unplaced = (state.unplaced ?? 0) + 1; observe('exchange', 'unplaced-no-owner', 1); }
+        }
+        if (available && (mode === 'live' || !deps.placeCell)) for (const cell of state.cells) {
+          if (cell.origin !== 'flow1a' || !cell.seat || !SEAT_LOOP_IDS[cell.seat]) continue;
+          // RELPLAN's dryRun calculates the same release without writing a checklist in shadow.
+          try {
+            const priority = cell.priority === 'P3' || cell.priority === 'P4' ? 'P2' : cell.priority ?? 'P2';
+            const placed = await place({ id: cell.id, title: cell.title, owner: cell.seat, priority, predecessors: cell.predecessors ?? [] }, { dryRun: mode === 'shadow', now });
+            if (validVersion(placed?.version)) {
+              cell.version = placed.version;
+              state.placed++;
+              observe('exchange', mode === 'shadow' ? `would-place:${cell.id}:${cell.version}` : `placed:${cell.id}:${cell.version}`, 1);
+            } else { state.unplaced = (state.unplaced ?? 0) + 1; observe('exchange', 'unplaced-no-release', 1); }
+          } catch (error) {
+            state.unplaced = (state.unplaced ?? 0) + 1;
+            observe('exchange', `unplaced:${cell.id}:${String(error).slice(0, 160)}`, 1);
+          }
         }
       }
     } else if (node === 'delegate') {
+      if (state.degradation?.level === 2) observe('degraded-skip', 'delegate', 0);
+      const cap = orchestratorConfig?.maxDelegatePerTick;
+      const previous = previousDelegations(root, state.day, mode, runId);
+      if (cap !== undefined || state.degradation?.level === 2 || state.placeDegraded || previous.deferred.length) {
+        state.deferredCells = [];
+        state.delegatedKeys = [];
+      }
       const path = journal(root);
       // 모드와 칸 필터는 따로 푼다 — 주입으로 모드만 줘도 설정의 칸 필터는 그대로 먹는다.
       const handConfig: Partial<OrchestratorLoopConfig> = deps.handToTaskAgent !== undefined && deps.handToTaskAgentCell !== undefined ? {} : getUserConfig().loops?.orchestrator ?? {};
@@ -432,7 +492,9 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
       // ⭐ 넘김 claim 과 자리 저널 기록은 «같은 잠금»(자리 저널 잠금) 아래에서 서로를 다시 읽는다 — 동시 틱이 낡은 값을 보지 않게.
       const ledger = handedLedger(root);
       const liveHanded = handedKeys(ledger);
-      const keys = new Set(readRequests(root).map(row => row.key));
+      // Earlier runs' (would-)assignments only count while a cap is configured — they are what the cap carried over.
+      // With no cap the tick behaves as before: shadow would-delegates every cell again, live dedups on the seat journal.
+      const keys = new Set([...readRequests(root).map(row => row.key), ...(cap !== undefined ? previous.keys : [])]);
       // 넘김 뒤 상태 저장 전에 죽은 같은 run 이 다시 돌면 원장에서 handed[] 를 되살린다.
       const ledgerHanded = handedRows(ledger);
       const restoreHanded = (handKey: string, key: string, rows: Map<string, HandedRow> = handedRows(ledger)): void => {
@@ -441,6 +503,26 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         if (!row || row.runId !== runId || (state.handed ?? []).some(entry => entry.key === key && entry.mode === row.mode)) return;
         (state.handed ??= []).push({ key, cell: row.cell, cardId: row.cardId, mode: row.mode, launched: row.launched });
       };
+      // A retried delegate (died after assigning, before saving state) rebuilds this run's cap usage from what it already
+      // wrote: seat rows tagged with this run and live hands claimed by this run.
+      if (cap !== undefined && state.delegatedKeys) {
+        const used = new Set(state.delegatedKeys);
+        if (existsSync(path)) for (const line of readFileSync(path, 'utf8').split('\n')) {
+          if (!line) continue;
+          let row: { key?: unknown; source?: unknown; orchRunId?: unknown };
+          try { row = JSON.parse(line) as typeof row; } catch { throw new Error('invalid seat request journal'); }
+          if (row.source === 'orchestrator' && row.orchRunId === runId && typeof row.key === 'string') used.add(row.key);
+        }
+        for (const row of handedRows(ledger).values()) if (row.runId === runId && row.mode === 'live') used.add(row.key);
+        if (existsSync(ledger)) for (const line of readFileSync(ledger, 'utf8').split('\n')) {
+          if (!line) continue;
+          try {
+            const claim = JSON.parse(line) as { key?: unknown; runId?: unknown; mode?: unknown; status?: unknown };
+            if (claim.runId === runId && claim.mode === 'live' && claim.status === 'claimed' && typeof claim.key === 'string') used.add(claim.key);
+          } catch { /* handedKeys already rejects a broken ledger */ }
+        }
+        state.delegatedKeys = [...used];
+      }
       const journalHas = (key: string): boolean => {
         if (!existsSync(path)) return false;
         return readFileSync(path, 'utf8').split('\n').some(line => {
@@ -458,13 +540,24 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         restoreHanded(`shadow:${key}`, key, ledgerHanded);
         if (keys.has(key)) continue;
         if (liveHanded.has(key)) { keys.add(key); observe('exchange', `handed-to-task-agent:${key}`, 1, 'task-agent'); continue; }
+        // COORD-HA ②: a live tick skips unplaced cells for assignment; L2 assigns nothing new (live hands included) and the
+        // per-tick cap defers the rest to the next tick — both before the TASK-AGENT hand so a hand never bypasses them.
+        const unplacedLive = mode === 'live' && !validVersion(cell.version);
+        // L2 carries every cell — placed or not — to the next tick: split already marked the card, so a cell skipped here
+        // would never be split again.
+        if (state.degradation?.level === 2 || (unplacedLive && state.placeDegraded)) {
+          state.deferredCells?.push(cell);
+          continue;
+        }
+        // The cap limits assignments (a live hand or a seat row); a shadow card is not an assignment and is still written.
+        const capped = !unplacedLive && cap !== undefined && state.delegatedKeys!.length >= cap;
         // ORCH-TA-HAND: hand the picked cell to TASK-AGENT. shadow = card only (the seat path below is unchanged);
         // live (tick live ⊕ hand live) = launch through TASK-AGENT and skip the seat journal so the cell launches once.
         const handMode = deps.handToTaskAgent ?? handConfig.handToTaskAgent ?? 'off';
         const handCell = deps.handToTaskAgentCell ?? handConfig.handToTaskAgentCell;
         if (handMode !== 'off' && (!handCell || handCell === cell.id) && (TASK_SEATS as readonly string[]).includes(cell.seat)) {
           // live 는 tick 도 live 이고 배치(유효한 판)가 된 칸만 — 나머지는 카드만(shadow · 배치 전 칸도 표본이 된다).
-          const handLive = handMode === 'live' && mode === 'live' && validVersion(cell.version);
+          const handLive = handMode === 'live' && mode === 'live' && validVersion(cell.version) && !capped;
           // shadow 표본은 따로 센다 — 자리 경로로 아직 안 간 칸(shadow 틱·배치 전)이 나중에 live 로 바뀌면 그때 뜬다.
           // ⚠️ 이미 자리 저널에 들어간 칸은 live 로 바꿔도 다시 안 넘긴다(keys.has 에서 끝) — 한 칸의 발사 주체는 하나다(의도).
           const handKey = handLive ? key : `shadow:${key}`;
@@ -482,12 +575,13 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
               const result = await (deps.handTask ?? (async (opts: HandTaskOptions) => (await import('../../task-agent/task-hand.js')).handTask(opts)))({
                 text: cell.title, seat: cell.seat as TaskSeat, checklistId: cell.id, live: handLive, now: () => now,
                 statePath: join(root, 'task-agent-actions.json'),
-                ...(handLive ? { launcher: deps.taskLauncher ?? (async (args: string[]) => (await import('../../cli/tasks-cli.js')).defaultTaskLauncher(args)) } : {}),
+                ...(handLive ? { launcher: deps.taskLauncher ?? (async (args: string[], _cwd?: string, context?: Parameters<TaskLauncher>[2]) => (await import('../../cli/tasks-cli.js')).defaultTaskLauncher(args, undefined, context)) } : {}),
               });
               withFileLockSync(`${path}.lock`, () => appendFileSync(ledger, `${JSON.stringify({ key: handKey, cell: cell.id, cardId: result.card.id, mode: result.mode, launched: result.launched, status: 'handed', runId, at: now.toISOString() })}\n`));
               (state.handed ??= []).push({ key, cell: cell.id, cardId: result.card.id, mode: result.mode, launched: result.launched });
               observe('hand-to-task-agent', `${key}:${result.card.id}:${result.mode}${result.launched ? ':launched' : ''}`, 1, 'task-agent');
-              if (handLive) { keys.add(key); continue; }
+              // A live hand is an assignment: it counts toward maxDelegatePerTick like a seat row (COORD-HA ②).
+              if (handLive) { keys.add(key); state.delegatedKeys?.push(key); continue; }
             } catch (error) {
               observe('hand-to-task-agent-failed', `${key}:${String(error).slice(0, 160)}`, 1, 'task-agent');
               // A failed live hand stays claimed (no relaunch loop) and does not fall back to the seat path — one launcher per cell.
@@ -514,11 +608,17 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
             if (handLive) { keys.add(key); continue; }
           }
         }
-        if (!validVersion(cell.version)) {
-          if (mode === 'shadow') { keys.add(key); state.wouldDelegate++; observe('would-delegate', `${key} (unplaced)`, 1, targetLoopId); }
+        if (capped) {
+          state.deferredCells!.push(cell);
+          observe('cap-deferred', key, 1, targetLoopId);
           continue;
         }
-        if (mode === 'shadow') { keys.add(key); state.wouldDelegate++; observe('would-delegate', key, 1, targetLoopId); continue; }
+        if (unplacedLive) continue;
+        if (!validVersion(cell.version)) {
+          if (mode === 'shadow') { keys.add(key); state.wouldDelegate++; state.delegatedKeys?.push(key); observe('would-delegate', `${key} (unplaced)`, 1, targetLoopId); }
+          continue;
+        }
+        if (mode === 'shadow') { keys.add(key); state.wouldDelegate++; state.delegatedKeys?.push(key); observe('would-delegate', key, 1, targetLoopId); continue; }
         keys.add(key);
         mkdirSync(dirname(path), { recursive: true });
         // TC review must-fix ①: the seat-requests journal contract needs receiptId, and appends are serialized under the
@@ -527,19 +627,23 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           if (journalHas(key)) return false;
           // 잠금 안에서 다시 본다 — 동시 틱이 이 칸을 방금 live 로 넘겼으면 자리 경로로 보내지 않는다.
           if (handedKeys(ledger).has(key)) return 'handed';
-          appendFileSync(path, `${JSON.stringify({ key, receiptId: key, seat: cell.seat, ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}), ...(cell.gridHost ? { gridHost: true } : {}), loopId: targetLoopId, text: cell.title, status: 'queued', queuedAt: now.toISOString(), source: 'orchestrator', cell: cell.id, version: cell.version })}\n`);
+          appendFileSync(path, `${JSON.stringify({ key, receiptId: key, seat: cell.seat, ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}), ...(cell.gridHost ? { gridHost: true } : {}), loopId: targetLoopId, text: cell.title, status: 'queued', queuedAt: now.toISOString(), source: 'orchestrator', cell: cell.id, version: cell.version, orchRunId: runId })}\n`);
           return true;
         });
         if (appended === 'handed') { observe('exchange', `seat-suppressed-handed:${key}`, 1, 'task-agent'); continue; }
         if (!appended) continue;
         state.delegated++;
+        state.delegatedKeys?.push(key);
         observe('exchange', 'queued', 1, targetLoopId);
       }
     } else if (node === 'launch') {
+      if (state.degradation?.level === 2) observe('degraded-skip', 'launch', 0);
       // shadow 는 저널을 읽지 않는다 — 깨진 live 저널이 관측 전용 틱을 넘어뜨리지 않게.
-      const latestRequests = new Map(mode === 'live' ? readRequests(root).map(row => [row.key, row]) : []);
-      const eligible = state.cells.filter(cell => cell.origin === 'flow1a' && cell.seat && SEAT_LOOP_IDS[cell.seat]
-        && validVersion(cell.version) && (mode === 'shadow' || latestRequests.get(`orch:${cell.cardId}:${cell.id}`)?.status === 'queued'));
+      const latestRequests = new Map(mode === 'live' && state.degradation?.level !== 2 ? readRequests(root).map(row => [row.key, row]) : []);
+      const eligible = state.cells.filter(cell => state.degradation?.level !== 2 && cell.origin === 'flow1a' && cell.seat && SEAT_LOOP_IDS[cell.seat]
+        && validVersion(cell.version) && (mode === 'shadow' || latestRequests.get(`orch:${cell.cardId}:${cell.id}`)?.status === 'queued')
+        && (orchestratorConfig?.maxDelegatePerTick === undefined || state.delegatedKeys?.includes(`orch:${cell.cardId}:${cell.id}`)
+          || (mode === 'live' && latestRequests.has(`orch:${cell.cardId}:${cell.id}`))));
       const seats = [...new Set(eligible.map(cell => cell.seat!))];
       state.launched = [];
       for (const seat of seats) {
@@ -637,19 +741,36 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   return state;
 }
 
+/** COORD-HA — the production supply of `TickDeps.degradation` (config `loops.orchestrator.degradationSignal`). Shadow (the
+ *  default) probes and logs what the tick would have done; only live hands the signal to the tick. */
+export async function degradationDeps(node: Node, deps: { config?: () => Partial<OrchestratorLoopConfig> | undefined; root?: string;
+  probe?: (root: string) => { llm: boolean; board: boolean; why: string[] } } = {}): Promise<Pick<TickDeps, 'degradation'>> {
+  const mode = (deps.config ?? (() => getUserConfig().loops?.orchestrator))()?.degradationSignal ?? 'shadow';
+  if (mode === 'off') return {};
+  const root = deps.root ?? effectiveInstanceRoot();
+  const signal = (deps.probe ?? (await import('./degradation.js')).probeDegradation)(root);
+  const level = !signal.board ? 2 : !signal.llm ? 1 : 0;
+  debug.log('loop.orchestrator', 'degradation-signal', { node, mode, llm: signal.llm, board: signal.board, level, why: signal.why });
+  return mode === 'live' ? { degradation: () => ({ llm: signal.llm, board: signal.board }) } : {};
+}
+
 if (import.meta.main) {
   const node = process.argv[2];
   const index = process.argv.indexOf('--window');
-  const window = index < 0 ? undefined : process.argv[index + 1];
+  // ORCH-LIVE-1008: `graph run` recipes pass no flags, so a manual/rehearsal tick picks its window through the
+  // environment (`ELANOUS_ORCH_WINDOW=08 elanous graph run graphs/orchestrator/orchestrator.yaml`). The flag wins.
+  const window = index < 0 ? process.env.ELANOUS_ORCH_WINDOW : process.argv[index + 1];
+  // A given flag (even without a value) or a set variable must name a real window — never fall back to «now».
+  const windowGiven = index >= 0 || process.env.ELANOUS_ORCH_WINDOW !== undefined;
   if (!['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'].includes(node ?? '') ||
-      (window !== undefined && !['08', '12', '18'].includes(window))) {
-    console.error('orchestrator: expected <intake|split|place|delegate|launch|reconcile|report> [--window 08|12|18]');
+      (windowGiven && !['08', '12', '18'].includes(window ?? ''))) {
+    console.error('orchestrator: expected <intake|split|place|delegate|launch|reconcile|report> [--window 08|12|18] (or ELANOUS_ORCH_WINDOW=08|12|18)');
     process.exitCode = 2;
   } else {
     void (async () => {
       try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
       catch { /* local execution can still use the per-run file */ }
-      await runOrchestratorNode(node as Node, { window: window as Window | undefined });
+      await runOrchestratorNode(node as Node, { window: window as Window | undefined, ...await degradationDeps(node as Node) });
     })().catch(error => { console.error(`orchestrator ${node}: ${String(error)}`); process.exitCode = 1; });
   }
 }

@@ -108,7 +108,7 @@ function resolve(deps: HqDeps = {}): Resolved {
     ssh,
     probe: deps.probe ?? tailnetProbe(config),
     localPath: deps.localPath ?? join(getElanousConfigDir(), 'hq', 'local.json'),
-    seenPath: deps.seenPath ?? config.seenGenerationFile ?? (deps.localPath ? `${deps.localPath}.seen-generation` : join(homedir(), '.elanous-hq', 'seen-generation')),
+    seenPath: deps.seenPath ?? (deps.localPath && !config.seenGenerationFile ? `${deps.localPath}.seen-generation` : hqSeenGenerationPath(config)),
     now: deps.now ?? (() => Math.floor(Date.now() / 1000)),
     log,
   };
@@ -161,6 +161,11 @@ function writeLocal(path: string, state: LocalHqState): void {
 }
 
 /** Highest lease generation this host ever observed (null = never). */
+/** The seen-generation marker this host keeps (hq.seenGenerationFile · default ~/.elanous-hq/seen-generation). */
+export function hqSeenGenerationPath(config: Pick<HqConfig, 'seenGenerationFile'>): string {
+  return config.seenGenerationFile ?? join(homedir(), '.elanous-hq', 'seen-generation');
+}
+
 export function readSeenGeneration(path: string): number | null {
   try {
     if (!existsSync(path)) return null;

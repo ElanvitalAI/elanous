@@ -48,9 +48,9 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 // POD-DIET (10-06 03:47~05:18 · node-b goal Pods · 89 one-minute samples · 42 Pods): per-Pod observed max median 4.6Gi ·
 // p75 6.2Gi · p90 11.7Gi — 23/42 went above the old 4Gi request, so the scheduler over-packed. 6Gi ≈ p75; limits stay.
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
-export const POD_CHILD_REQUESTS = { cpu: '1', memory: '6Gi' } as const;
 import type { PodPoolMember, PodPoolScheduler } from './pod-pool.js';
-import { measurePoolLease, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
+export { POD_CHILD_REQUESTS } from './pod-lease.js';
+import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_HOST_LEASE_ANNOTATION, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

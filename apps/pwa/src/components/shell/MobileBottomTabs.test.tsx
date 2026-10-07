@@ -120,7 +120,9 @@ test('multi-item tab opens its visible items; more groups files and settings, op
   act(() => tree!.unmount());
   operator = true;
   mount();
-  expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정', '운영🔒']);
+  // RELEASE-LIVE2: 운영자에겐 운영 칸이 시트 맨 위 — 홈에서 «더보기 → 릴리스» 2탭이 접힘 없이 닿는다.
+  expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['운영🔒', '자료', '설정']);
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href).indexOf('/ops/release')).toBeLessThan(4);
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ops/release');
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/loops');
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ceo');

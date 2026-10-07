@@ -7,6 +7,13 @@ import { join } from 'node:path';
 import { dlopen } from 'bun:ffi';
 import { hostLeaseBaseDir, type PendingJobIdentity } from '../../pod-lease/host-lease.js';
 
+/** The harness Pod's container requests (self-implement-pod Job manifest). Lives here so admission reuses the real request. */
+export const POD_CHILD_REQUESTS = { cpu: '1', memory: '6Gi' } as const;
+/** POD-ADMIT-BY-USAGE — observed usage is scaled by this before it reserves memory. */
+const POD_USAGE_HEADROOM = 1.5;
+/** POD-ADMIT-BY-USAGE — a node keeps at least this share of allocatable memory free (real usage and bookkeeping). */
+const POD_NODE_FREE_FLOOR_RATIO = 0.1;
+
 /** Persisted on a Job admitted through the host lease; the file lease remains until its Pod is observed Running or terminal. */
 export const POD_HOST_LEASE_ANNOTATION = 'elanous.dev/host-lease-admitted';
 
@@ -39,6 +46,27 @@ export interface PodLeaseMember {
   /** Node-by-node memory left after all assigned Pod requests and harness Running limits. */
   availableMemoryByNodeBytes: number[] | null;
   reason: string | null;
+  /**
+   * POD-ADMIT-BY-USAGE (only when measured with `measureUsage`): observed memory of Running harness Pods
+   * (`kubectl top pods`). null = metrics unreadable (see usageReason) — every Pod is then reserved at its limit, as before.
+   */
+  harnessUsageBytes?: number[] | null;
+  usageReason?: string | null;
+  /** Pool-wide harness reservation: Σ min(limit, max(request, usage×1.5)), or max(request, limit) when the Pod's usage is unmeasured. */
+  memoryReservedBytes?: number | null;
+  /** Parallel to availableMemoryByNodeBytes: each schedulable node's allocatable memory. */
+  allocatableMemoryByNodeBytes?: number[] | null;
+  /** Parallel to availableMemoryByNodeBytes: each node's real memory use (`kubectl top nodes`), null when unmeasured. */
+  usedMemoryByNodeBytes?: Array<number | null> | null;
+}
+
+/** POD-ADMIT-BY-USAGE — how much memory one new goal is counted at, and why. */
+export interface PodAdmissionByUsage {
+  samples: number;
+  p95Bytes: number | null;
+  admitBytes: number;
+  /** Why admission stayed on the conservative per-goal size; null when usage drove it. */
+  fallback: string | null;
 }
 
 export interface PoolLeaseMeasure {
@@ -61,6 +89,28 @@ export interface PoolLeaseRecommendation {
   pendingJobs?: PendingJobIdentity[];
   /** Absent only for injected legacy status fixtures; real measurements always report a number or null. */
   unleasedRunning?: number | null;
+  /** POD-ADMIT-BY-USAGE — the per-goal size this recommendation used. */
+  admission?: PodAdmissionByUsage;
+}
+
+/** `kubectl top … --no-headers` → name → memory bytes; null when any line cannot be read (fail conservative). */
+function topMemory(stdout: string, column: number): Map<string, number> | null {
+  const out = new Map<string, number>();
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const cols = line.trim().split(/\s+/u);
+    const bytes = cols.length > column ? quantity(cols[column]!, 'memory') : null;
+    if (bytes === null || out.has(cols[0]!)) return null;
+    out.set(cols[0]!, bytes);
+  }
+  return out;
+}
+
+/** Nearest-rank p95. */
+function p95(values: readonly number[]): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)]!;
 }
 
 /** Kubernetes quantity to bytes (memory) or millicores (CPU). */
@@ -238,7 +288,7 @@ function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
 }
 
 /** Each cluster reads resource reservations; DNS requires a bounded disposable Pod. */
-export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; /** Read-only snapshots must not create the disposable DNS Pod or update its cache. */ skipDnsProbe?: boolean } = {}): PoolLeaseMeasure {
+export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; /** Read-only snapshots must not create the disposable DNS Pod or update its cache. */ skipDnsProbe?: boolean; /** POD-ADMIT-BY-USAGE — also read `kubectl top` so Running harness Pods reserve by observed usage. */ measureUsage?: boolean } = {}): PoolLeaseMeasure {
   const kubectl = deps.kubectl ?? leaseKubectl;
   return { members: members.map((member) => {
     const base = ['--context', member.context, '--request-timeout=10s'];
@@ -249,6 +299,26 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
       // All namespaces are necessary: unrelated workloads also reserve memory on these nodes.
       const pods = kubectl([...base, 'get', 'pods', '--all-namespaces', '-o', 'json']);
       const reasons: string[] = [];
+      // POD-ADMIT-BY-USAGE: metrics are optional — a failed `top` leaves every reservation at today's limit.
+      let podUsage: Map<string, number> | null = null;
+      let nodeUsage: Map<string, number> | null = null;
+      if (deps.measureUsage) {
+        const top = kubectl([...base, '-n', 'elanous-test', 'top', 'pods', '--no-headers']);
+        podUsage = top.status === 0 ? topMemory(top.stdout, 2) : null;
+        result.usageReason = podUsage ? null
+          : `top pods unavailable: ${top.status === 0 ? 'unparseable output' : top.stderr.trim().split('\n').pop() || `rc=${top.status}`}`.slice(0, 160);
+        if (podUsage) {
+          const topNodes = kubectl([...base, 'top', 'nodes', '--no-headers']);
+          nodeUsage = topNodes.status === 0 ? topMemory(topNodes.stdout, 3) : null;
+          // The node real-usage floor needs node metrics: without them stay on today's limit reservations.
+          if (!nodeUsage) {
+            podUsage = null;
+            result.usageReason = `top nodes unavailable: ${topNodes.status === 0 ? 'unparseable output' : topNodes.stderr.trim().split('\n').pop() || `rc=${topNodes.status}`}`.slice(0, 160);
+          }
+        }
+      }
+      const harnessUsage: number[] = [];
+      const nodeAllocatable = new Map<string, number>();
       const parsedItems = (response: ReturnType<PoolKubectl>): Record<string, unknown>[] | null => {
         if (response.status !== 0) return null;
         try { return items(JSON.parse(response.stdout)); } catch { return null; }
@@ -280,12 +350,15 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           }
           nodeNames.add(name);
           const repels = taintList.some((t) => t!.effect === 'NoSchedule' || t!.effect === 'NoExecute');
-          if (spec?.unschedulable !== true && !repels && object(ready[0])?.status === 'True') nodeFree.set(name, mem);
+          if (spec?.unschedulable !== true && !repels && object(ready[0])?.status === 'True') { nodeFree.set(name, mem); nodeAllocatable.set(name, mem); }
           memory += mem; cpu += cores;
         }
         if (valid) { result.allocatableMemoryBytes = memory; result.allocatableCpuMillicores = cpu; }
-        else { nodeFree.clear(); nodeNames.clear(); reasons.push('cluster nodes: invalid name/allocatable memory/cpu/readiness'); }
+        else { nodeFree.clear(); nodeAllocatable.clear(); nodeNames.clear(); reasons.push('cluster nodes: invalid name/allocatable memory/cpu/readiness'); }
       }
+      // POD-ADMIT-BY-USAGE: every schedulable node needs a real-usage reading, or the member stays on limits.
+      const unreadNode = podUsage && nodeUsage ? [...nodeFree.keys()].find((n) => !nodeUsage!.has(n)) : undefined;
+      if (unreadNode !== undefined) { podUsage = null; result.usageReason = `top nodes: no reading for ${unreadNode}`.slice(0, 160); }
       const jobItems = parsedItems(jobs);
       const podItems = parsedItems(pods);
       if (!jobItems) reasons.push(`cluster jobs: ${jobs.status === 0 ? 'invalid response' : jobs.stderr.trim().split('\n').pop() || `rc=${jobs.status}`}`);
@@ -303,7 +376,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (object(meta.annotations)?.[POD_HOST_LEASE_ANNOTATION] === 'true') leasedJobs.add(meta.name);
         }
         if (!jobsValid) reasons.push('cluster jobs: missing name/labels');
-        let running = 0, pending = 0, unleasedRunning = 0, limits = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
+        let running = 0, pending = 0, unleasedRunning = 0, limits = 0, reserved = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
         const pendingJobs = new Map<string, PendingJobIdentity>();
         let unknownPhase = false;
         const seenPods = new Set<string>();
@@ -324,6 +397,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
             (labels?.['elanous.substrate'] === 'pod' || jobNames.has(String(labels?.['elanous.job'] ?? '')));
           const spec = object(pod.spec);
           let limit: number | null = null;
+          let reserve: number | null = null;
           if (harness) {
             if (phase === 'Pending') {
               pending++;
@@ -338,7 +412,15 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
               if (typeof jobName !== 'string' || !leasedJobs.has(jobName)) unleasedRunning++;
               limit = spec ? runningLimit(spec) : null;
               if (limit === null) limitsValid = false;
-              else limits += limit;
+              else {
+                limits += limit;
+                // Measured usage: max(request, usage×1.5) capped at the limit. Unmeasured: max(request, limit) (today's node reservation).
+                const used = typeof metadata.name === 'string' ? podUsage?.get(metadata.name) : undefined;
+                const request = spec ? requestedMemory(spec) : null;
+                if (used !== undefined) harnessUsage.push(used);
+                reserve = used !== undefined && request !== null ? Math.min(limit, Math.max(request, Math.ceil(used * POD_USAGE_HEADROOM))) : Math.max(request ?? 0, limit);
+                reserved += reserve;
+              }
             }
           }
           // Pending Pods with no assigned node have no node reservation yet. They already occupy a pool slot.
@@ -347,13 +429,22 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
               requestedMemory(spec) !== null) continue;
           const requested = spec ? requestedMemory(spec) : null;
           if (typeof nodeName !== 'string' || !nodeNames.has(nodeName) || requested === null) { reservationsValid = false; continue; }
-          if (nodeFree.has(nodeName)) nodeFree.set(nodeName, nodeFree.get(nodeName)! - Math.max(requested, limit ?? 0));
+          if (nodeFree.has(nodeName)) nodeFree.set(nodeName, nodeFree.get(nodeName)! - Math.max(requested, reserve ?? limit ?? 0));
         }
         if (unknownPhase) reasons.push('cluster pods: missing/Unknown phase');
         if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; result.pendingJobs = [...pendingJobs.values()]; result.unleasedRunning = unleasedRunning; }
-        if (limitsValid && jobsValid && !unknownPhase) result.memoryLimitBytes = limits;
+        if (limitsValid && jobsValid && !unknownPhase) {
+          result.memoryLimitBytes = limits;
+          if (deps.measureUsage) { result.memoryReservedBytes = reserved; result.harnessUsageBytes = podUsage ? harnessUsage : null; }
+        }
         else if (!limitsValid) reasons.push('cluster pods: Running Pod memory limit missing/invalid');
-        if (reservationsValid && limitsValid && jobsValid && !unknownPhase) result.availableMemoryByNodeBytes = [...nodeFree.values()];
+        if (reservationsValid && limitsValid && jobsValid && !unknownPhase) {
+          result.availableMemoryByNodeBytes = [...nodeFree.values()];
+          if (deps.measureUsage) {
+            result.allocatableMemoryByNodeBytes = [...nodeFree.keys()].map((n) => nodeAllocatable.get(n)!);
+            result.usedMemoryByNodeBytes = [...nodeFree.keys()].map((n) => nodeUsage?.get(n) ?? null);
+          }
+        }
         else if (!reservationsValid && !unknownPhase) reasons.push('cluster reservations: node assignment or memory request/limit missing/invalid');
       }
       result.reason = reasons.length ? reasons.join('; ').slice(0, 240) : null;
@@ -366,6 +457,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
     } catch (error) {
       result.running = null; result.pending = null; result.unleasedRunning = null; result.memoryLimitBytes = null;
       result.allocatableMemoryBytes = null; result.allocatableCpuMillicores = null; result.availableMemoryByNodeBytes = null;
+      if (deps.measureUsage) { result.memoryReservedBytes = null; result.harnessUsageBytes = null; result.allocatableMemoryByNodeBytes = null; result.usedMemoryByNodeBytes = null; }
       result.reason = `cluster: ${error instanceof Error ? error.message : String(error)}`.split('\n')[0]!.slice(0, 240);
     }
     return result;
@@ -377,7 +469,9 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   const empty: PoolLeaseRecommendation = { recommended: null, limitedBy: null, reason: null, capacitySlots: null, memorySlots: null, liteMemorySlots: null, placeableSlots: null, accountSlots: null, running: null, pending: null, unleasedRunning: null };
   const goalBytes = quantity(options.perGoalMemory ?? '16Gi', 'memory');
   if (goalBytes === null || goalBytes <= 0) return { ...empty, reason: '측정 불가: perGoalMemory' };
+  const admission = admissionByUsage(measure, goalBytes, options.perGoalMemory !== undefined);
   if (!measure.members.length || measure.members.some((m) => m.running === null || m.pending === null || m.unleasedRunning === null || m.allocatableMemoryBytes === null || m.memoryLimitBytes === null || m.allocatableCpuMillicores === null || m.availableMemoryByNodeBytes === null)) {
+    debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended: null, limitedBy: null });
     return { ...empty, reason: `측정 불가: cluster${measure.members.map((m) => m.reason ? ` ${m.context}: ${m.reason}` : '').join('')}` };
   }
   if (!Number.isSafeInteger(options.capacity) || options.capacity < 0) return { ...empty, reason: '측정 불가: capacity' };
@@ -392,12 +486,25 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   const eligibleOccupied = measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.min(m.capacity, m.running! + m.pending!)), 0);
   const capacitySlots = Math.max(0, Math.min(options.capacity - eligibleOccupied,
     memberFree.reduce((sum, free) => sum + free, 0)));
-  const memberMemorySlots = measure.members.map((m) => m.availableMemoryByNodeBytes!.reduce(
-    (sum, bytes) => sum + Math.max(0, Math.floor(bytes / goalBytes)), 0));
+  // The goal size may fall back to the conservative size pool-wide; the node floor is separate and follows each
+  // member: once its Running Pods reserve by usage (usage read), its nodes keep 10% free in bookkeeping and real use.
+  const admitBytes = admission.admitBytes;
+  const usageRead = (m: PodLeaseMember) => Array.isArray(m.harnessUsageBytes);
+  const memberMemorySlots = measure.members.map((m) => m.availableMemoryByNodeBytes!.reduce((sum, bytes, i) => {
+    if (!usageRead(m)) return sum + Math.max(0, Math.floor(bytes / admitBytes));
+    const allocatable = m.allocatableMemoryByNodeBytes?.[i];
+    const used = m.usedMemoryByNodeBytes?.[i];
+    // A usage-read member always carries both per-node readings; anything missing admits nothing on that node.
+    if (typeof allocatable !== 'number' || typeof used !== 'number') return sum;
+    const floor = allocatable * POD_NODE_FREE_FLOOR_RATIO;
+    const slots = Math.min(Math.floor((bytes - floor) / admitBytes), Math.floor((allocatable - used - floor) / admitBytes));
+    return sum + Math.max(0, slots);
+  }, 0));
   // Preserve the requested allocatable-minus-harness-limit metric. The node-local
   // placement bound additionally accounts for every namespace's reservations.
-  const memorySlots = measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.max(0,
-    Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / goalBytes))), 0);
+  const memorySlots = measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.max(0, usageRead(m)
+    ? Math.floor((m.allocatableMemoryBytes! * (1 - POD_NODE_FREE_FLOOR_RATIO) - (m.memoryReservedBytes ?? m.memoryLimitBytes!)) / admitBytes)
+    : Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / admitBytes))), 0);
   const placeableSlots = measure.members.reduce((sum, m, i) => sum + Math.min(
     Math.max(0, m.capacity - m.running! - m.pending!), memberMemorySlots[i]!,
   ), 0);
@@ -411,5 +518,27 @@ export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capac
   const recommended = Math.max(0, Math.min(capacitySlots, memoryBound) - eligibleUnleasedRunning);
   const limitedBy = memoryBound < capacitySlots ? 'memory' : 'capacity';
   if (unleasedRunning > 0) debug.log('pod-lease', 'unleased', { unleasedRunning, running, recommended });
-  return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, pendingJobs, unleasedRunning };
+  debug.log('pod-lease', 'admit-by-usage', { samples: admission.samples, p95Bytes: admission.p95Bytes, admitBytes: admission.admitBytes, fallback: admission.fallback, recommended, limitedBy });
+  return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, pendingJobs, unleasedRunning, admission };
+}
+
+/**
+ * POD-ADMIT-BY-USAGE — one new goal counts at max(the Pod's memory request, p95 of Running harness Pod usage × 1.5),
+ * capped at the per-goal size. No samples (metrics unreadable, nothing running, or an explicit per-goal size such as an
+ * OOM retry tier) keeps the conservative per-goal size.
+ */
+function admissionByUsage(measure: PoolLeaseMeasure, goalBytes: number, explicit: boolean): PodAdmissionByUsage {
+  const live = measure.members.filter((m) => m.reason !== 'dns');
+  const samples = live.flatMap((m) => m.harnessUsageBytes ?? []);
+  const p95Bytes = p95(samples);
+  const requestBytes = quantity(POD_CHILD_REQUESTS.memory, 'memory')!;
+  // Any live member whose usage was not read keeps the whole pool on today's per-goal size (fail conservative).
+  const fallback = explicit ? 'explicit perGoalMemory'
+    : live.every((m) => m.harnessUsageBytes === undefined) ? 'usage not measured'
+      : live.some((m) => m.harnessUsageBytes == null) ? (live.map((m) => m.harnessUsageBytes == null ? `${m.context}: ${m.usageReason ?? 'usage not measured'}` : '').filter(Boolean).join('; '))
+        : p95Bytes === null ? 'no Running harness Pod usage samples'
+          : null;
+  const admitBytes = fallback !== null || p95Bytes === null ? goalBytes
+    : Math.min(goalBytes, Math.max(requestBytes, Math.ceil(p95Bytes * POD_USAGE_HEADROOM)));
+  return { samples: samples.length, p95Bytes, admitBytes, fallback };
 }

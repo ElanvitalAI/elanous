@@ -10,6 +10,16 @@ import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
+test('child ok and worktreePath cross the orchestrator boundary for delivery selection', async () => {
+  const [result] = await orchestrateSelfDev({
+    goals: [{ feature: 'research report' }],
+    spawn: (input) => ({ address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+      stage: 'worktree-completed', ok: true, branch: 'research/report', worktreePath: '/isolated/report',
+    } }) }),
+  });
+  expect(result).toMatchObject({ ok: true, worktreePath: '/isolated/report', branch: 'research/report' });
+});
+
 test('pushed harvestable child crosses the disposition boundary and is not relaunched on resume', async () => {
   const disposition = { stage: 'timed-out', branch: 'self-impl/finished', harvestable: true as const, ok: false };
   const [result] = await orchestrateSelfDev({

@@ -2,6 +2,7 @@ import { createWorktree, type CreateWorktreeResult } from '../git-fs/worktree.js
 import { runGitCommand } from '../git-fs/runner.js';
 import { configuredWorktreeRoot } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { join, resolve } from 'node:path';
 
 const OWNER_CONFIG_KEY = 'elanous.harness.owner';
 const COMMAND_CONFIG_KEY = 'elanous.harness.command';
@@ -87,8 +88,75 @@ function restoreWorktreeProvenance(worktreePath: string, snapshot: WorktreeConfi
   }
 }
 
+/** Keys that must leave the shared config once `extensions.worktreeConfig` is on (`git help worktree` §CONFIGURATION FILE).
+ *  `core.bare=false` is harmless when shared (linked trees default to non-bare), so only a true value moves. */
+const MAIN_TREE_ONLY_CONFIG_KEYS = ['core.bare', 'core.worktree'] as const;
+
+/** Moves `core.bare=true` / `core.worktree` from `$GIT_COMMON_DIR/config` to `$GIT_COMMON_DIR/config.worktree`.
+ *  Runs every time (also when the extension is already on) and throws before the caller enables the extension.
+ *  Incident 10-07 (HQ-WORKTREE-CONFIG): a shared `core.bare=true` made every linked worktree of a bare repo unusable. */
+/** Values are moved byte-for-byte (a `core.worktree` path may carry edge whitespace), so read them NUL-terminated. */
+function nulTerminatedValue(stdout: unknown, key: string): string {
+  const text = String(stdout ?? '');
+  if (!text.endsWith('\0')) throw new Error(`harness worktree ${key} read failed — git config emitted an unterminated value`);
+  return text.slice(0, -1);
+}
+
+function moveMainTreeOnlyConfig(worktreePath: string): void {
+  const common = gitAt(worktreePath, ['rev-parse', '--git-common-dir']);
+  const commonOut = String(common.stdout ?? '').trim();
+  if (common.status !== 0 || !commonOut) {
+    throw new Error(`harness worktree common git dir lookup failed — ${gitConfigFailure(common)}`);
+  }
+  const commonDir = resolve(worktreePath, commonOut);
+  const shared = join(commonDir, 'config');
+  const perTree = join(commonDir, 'config.worktree');
+  // `null` = absent. Typed reads judge meaning (`yes`/`TRUE` are true); raw reads carry the bytes that move.
+  const readValue = (file: string, key: string, typed: boolean): string | null => {
+    const read = gitAt(worktreePath, ['config', '--file', file, ...(typed ? ['--type=bool'] : []), '--null', '--get', key]);
+    if (read.status === 1) return null;
+    if (read.status !== 0) throw new Error(`harness worktree ${key} read failed (${file}) — ${gitConfigFailure(read)}`);
+    return nulTerminatedValue(read.stdout, key);
+  };
+  for (const key of MAIN_TREE_ONLY_CONFIG_KEYS) {
+    const typed = key === 'core.bare';
+    const meaning = readValue(shared, key, typed);
+    if (meaning === null) continue;
+    if (typed && meaning !== 'true') continue;
+    const raw = typed ? readValue(shared, key, false) : meaning;
+    if (raw === null) throw new Error(`harness worktree shared ${key} vanished during the move`);
+    // A valueless `bare` means true; writing its empty raw form would mean false.
+    const value = typed && raw === '' ? 'true' : raw;
+    // A conflicting per-tree value would flip the main tree once the extension is on — refuse instead of guessing.
+    // Every per-tree value must agree (not just the last one), so a mixed list also fails closed.
+    const existingRead = gitAt(worktreePath, ['config', '--file', perTree, ...(typed ? ['--type=bool'] : []), '--null', '--get-all', key]);
+    if (existingRead.status !== 0 && existingRead.status !== 1) {
+      throw new Error(`harness worktree ${key} read failed (${perTree}) — ${gitConfigFailure(existingRead)}`);
+    }
+    const existingValues = existingRead.status === 0 ? nulTerminatedValue(existingRead.stdout, key).split('\0') : [];
+    if (existingValues.some((existing) => existing !== meaning)) {
+      throw new Error(`harness worktree ${key} conflict — ${shared} has ${JSON.stringify(meaning)} but ${perTree} has ${JSON.stringify(existingValues)}; resolve by hand before enabling extensions.worktreeConfig`);
+    }
+    const existingMeaning = existingValues.length > 0 ? meaning : null;
+    if (existingMeaning === null) {
+      const write = gitAt(worktreePath, ['config', '--file', perTree, key, value]);
+      if (write.status !== 0) throw new Error(`harness worktree ${key} move failed — ${gitConfigFailure(write)}`);
+    }
+    const unset = gitAt(worktreePath, ['config', '--file', shared, '--unset-all', key]);
+    if (unset.status !== 0) throw new Error(`harness worktree shared ${key} unset failed — ${gitConfigFailure(unset)}`);
+    debug.log('harness.worktree', 'core-bare-moved', {
+      key,
+      value,
+      commonDir,
+      perTreeHadValue: existingMeaning !== null,
+      worktreePath,
+    }, { level: 'warn' });
+  }
+}
+
 /** Records the shared worktree-scoped provenance used by both manual and self-implement creation paths. */
 export function recordHarnessWorktreeProvenance(worktreePath: string, provenance: HarnessWorktreeProvenance): void {
+  moveMainTreeOnlyConfig(worktreePath);
   const enable = gitAt(worktreePath, ['config', 'extensions.worktreeConfig', 'true']);
   if (enable.status !== 0) {
     throw new Error(`harness worktree owner declaration failed — ${gitConfigFailure(enable)}`);
