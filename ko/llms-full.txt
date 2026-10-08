@@ -2511,6 +2511,10 @@ with their user id and the command to register it
 (`elanous config set telegram.allowedUsers '[<id>]'`), and does nothing
 else until you do.
 
+## Check running harness runs
+
+Send `/runs` to see which harness runs are running now. The reply is the same text the TUI prints for `/harness runs`: the running count, then one line per assessed run. Long replies arrive in several messages.
+
 ## Away mode — follow a release from Telegram only
 
 When you step away, away mode sends every release-run transition to Telegram so you never have to open the dashboard to know where a release is.
@@ -2668,6 +2672,7 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 |---|---|---|
 | **Chat** | Stable | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](/surfaces/pwa-chat). |
 | **Terminal** | Stable | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](/surfaces/pwa-terminal). |
+| **Editor** | Stable | *Since 0.2.21 in the default menu (Create).* Write and edit workflows and harness run graphs on a canvas — add nodes, connect them, and save them. Starting a run from the editor and watching each node's status needs operator access. |
 | **Intake** | Experimental | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](/using-elanous/tasks-and-intake). |
 | **Approvals** | Tool | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
 | **Live** | Stable | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](/surfaces/pwa-live). |
@@ -4964,6 +4969,35 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.20
+
+Source: https://docs.elanous.ai/releases/0-2-20/
+
+## Behavior changes
+
+- The PWA run-graph editor can start a new graph on an editable canvas: add nodes from the palette (drag or tap), connect outcome edges (ok, rework, fail), edit node properties, mark start and end nodes, check it with a separate validate button, and save it.
+- The PWA run-graph editor can run a saved graph as a demo run (operator only, built-in side-effect-free recipes) and colours each node on the canvas as it runs, finishes or fails.
+- In PWA chat, picking a skill from the `$` picker after typing a task now builds `/run-skill <skill> <task>` so the skill actually runs instead of sending a plain prompt.
+- TUI `/help` fits its overlay on wide terminals again (adds columns before falling back to the chat log), so Esc closes it.
+- `elanous retro facts --since 24h --json` lists retrospective facts from the log store: draft PR births and supersede deaths, supervisor stop reasons and task-agent outcomes (read-only).
+- In the PWA graph editor, each node keeps its demo-run state on the canvas (running, done, failed) as a coloured ring and a word after the run ends.
+- A harness run that ends parked now records the parked outcome by editing its single PR status comment instead of posting a second comment, so the PR author gets one notification email per PR.
+- The release screen and away alerts say a gate shard is running past its plan instead of showing «0 minutes left».
+- PWA chat no longer turns a multi-line message that starts with the harness trigger phrase into a one-line harness ask; it stays a normal chat turn.
+- On the PWA loop activity map, a launch edge with no run edge for the same ref after 10 minutes is now labelled a ghost (ghost, no run ledger for N minutes) with a red dotted line and no moving packet, so it no longer looks like it is running.
+- The PWA loop map no longer marks every launch older than 10 minutes as a ghost: the edges API now attaches the bound run id to a launch edge, and only a launch with no bound run and no same-ref run edge after 10 minutes is shown as ghost.
+- The PWA release strip no longer shows a red "blocked" line for a failed node in a run whose status is done; it shows an amber "node failure reported, run finished" warning instead (running and failed runs keep the blocked line). Run-list start times carry a KST label.
+- The PWA decisions screen gains a notices and opinions tab: it lists messages that seats and loops sent to the CEO inbox (read-only; the CEO cursor is not advanced), and a reply is posted to the original sender's inbox. The route `/v1/ops-board/notices` requires owner auth and answers only on localhost or tailnet hosts.
+- `elanous config drift` and `elanous config explain <key>` show, read-only, which config keys differ between the production config and derived test-universe copies (counts and example paths, unreadable configs reported separately, secret values masked).
+- Telegram /runs lists running harness runs like the TUI.
+- When a harness PR merges, open harness sibling PRs that touch the same files are told right away: a live owning run gets one rebase-and-regate memo in its control inbox, and a PR with no live run gets the `elanous:needs-rebase` label (no PR comments, at most 10 siblings per merge).
+- Sibling resync after a harness merge no longer fetches the file list of every open harness PR: already-marked PRs are skipped, branches sharing path tokens with the merged files go first, at most `harness.siblingResync.maxFetch` (default 40) file lists are fetched per merge with 6 in flight, and the summary event records files fetched, skipped counts and duration.
+- Harness runs that stop (merge held, implement aborted, blocked draft PR open failed, nonzero Pod exit, or a task-launched child exiting nonzero right after launch) now append one `stop` line to the run ledger with a closed class, a one-line cause of at most 120 characters, an evidence reference and a next move; existing ledger entries, PR bodies and log events are unchanged.
+
+Plus 73 internal changes.
+
+---
+
 # 0.2.19
 
 Source: https://docs.elanous.ai/releases/0-2-19/
@@ -4981,6 +5015,12 @@ Source: https://docs.elanous.ai/releases/0-2-19/
 - TUI chat routes lookup, settings, research and scheduling questions to a quick single turn with matching tools instead of the coding goal loop.
 - `elanous away on|off|status` (and Telegram `/away`) turns on away mode: while you are away every release-run node transition, gate result (introduced count and any waiver), block with the next move, and completion is sent to Telegram, with a one-line heartbeat every 60 minutes; blocks go out even in quiet hours. Telegram `/release` shows the current run and node on demand.
 - The release gate's Pod shards count only the gate's own Jobs against its pool cap again, so the gate fans out instead of launching one shard at a time while goal Pods fill the cluster.
+
+## Known issues
+
+The following issues are known in this release.
+
+- In the TUI, `/help` prints the help into the chat history instead of opening an overlay, so Esc does not dismiss it. Keep typing in the input line as usual; the help simply stays in the scrollback.
 
 Plus 71 internal changes.
 
