@@ -143,6 +143,16 @@ test('mounted chat attaches the progress block to the acceptance message without
   await act(async () => { input.props.onSubmit('그냥 질문'); });
   expect(prompts).toHaveLength(1);
   expect(prompts[0]).toMatchObject({ userText: '그냥 질문' });
+  await act(async () => { input.props.onSubmit('/harness 버튼 고쳐'); });
+  expect(requests.filter(({ path }) => path === '/v1/harness/ask')).toHaveLength(2);
+  expect(JSON.parse(requests.filter(({ path }) => path === '/v1/harness/ask')[1]!.init!.body as string)).toEqual({ text: '버튼 고쳐' });
+  expect(prompts).toHaveLength(1);
+  expect(requests.filter(({ path }) => path === '/v1/harness/ask').map(({ init }) =>
+    JSON.parse(init!.body as string))).toEqual([
+    { text: '하니스로 버튼 고쳐' }, { text: '버튼 고쳐' },
+  ]);
+  expect((tree!.root.findByType(ChatHistory).props.messages as ChatMessage[]).at(-1)!.blocks)
+    .toEqual([{ kind: 'harness_ask', acceptanceId: 'abcdefgh-1234' }]);
 });
 
 test('polling stops at 60 minutes without scheduling another request', async () => {

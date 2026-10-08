@@ -36,6 +36,13 @@ describe('OPS1 release runs', () => {
     expect(html.match(/aria-current="step"/g)?.length).toBe(1);
     expect(render({ kind: 'ready', data: [{ ...run, nodes: run.nodes.map((node) => ({ ...node, ok: false })) }] })).toContain('실패');
   });
+  test('run list converts UTC across the date boundary to KST while retaining the source datetime', () => {
+    const markup = render({ kind: 'ready', data: [{ ...run, startedAt: '2026-10-02T16:45:00Z' }] });
+    expect(markup).toContain('aria-label="시작 시각 (KST)"');
+    expect(markup).toContain('dateTime="2026-10-02T16:45:00Z"');
+    expect(markup).toMatch(/2026\. 10\. 3\. 01:45 KST/);
+    expect(markup).not.toContain('2026-10-02T16:45:00Z</time>');
+  });
   test('opened node shows a detail panel with the summary and a contained horizontally scrollable monospaced log', () => {
     const html = render({ kind: 'ready', data: [run] }, 'waiting', { kind: 'ready', data: { log: 'full log tail' } });
     expect(html).toContain('full log tail');

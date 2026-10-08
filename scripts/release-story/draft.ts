@@ -55,7 +55,7 @@ function userFacingLines(markdown: string): { lines: string[]; internalDropped: 
 }
 
 function firstPhrase(title: string): string {
-  let quote: '»' | '"' | '`' | undefined;
+  let quote: '»' | '"' | '`' | '”' | '’' | '」' | undefined;
   let angleStart = -1;
   for (let i = 0; i < title.length; i++) {
     const char = title[i]!;
@@ -64,6 +64,10 @@ function firstPhrase(title: string): string {
       continue;
     }
     if (char === '«') { quote = '»'; angleStart = i; continue; }
+    if (char === '“') { quote = '”'; continue; }
+    // 여는 ‘ 는 생략 부호로 안 쓰이니 짝을 기다린다 — ASCII ' 는 한국어 생략 부호라 짝으로 보지 않는다.
+    if (char === '‘') { quote = '’'; continue; }
+    if (char === '「') { quote = '」'; continue; }
     if (char === '"' || char === '`') { quote = char; continue; }
     if (/[:：]/.test(char) || (/[—·–]/.test(char) && /\s/.test(title[i - 1] ?? '') && /\s/.test(title[i + 1] ?? ''))) {
       return title.slice(0, i).trim();

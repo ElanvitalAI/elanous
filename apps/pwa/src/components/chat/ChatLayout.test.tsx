@@ -81,6 +81,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     close: () => {},
     send: async (method: string, body: unknown) => {
       requests.push({ method, body });
+      if (method === 'elanous/skills/list') return { entries: [{ name: 'omni-crawl', description: '웹 수집' }] };
       return { stopReason: 'end_turn' };
     },
   };
@@ -127,6 +128,54 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
 }
 
 test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
+
+test('PCH-12 submitted skill command runs through ChatLayout without a plain ACP or prompt turn', async () => {
+  const { input, requests, streams } = await mount({ acp: false });
+  const calls: Array<{ url: string; body?: unknown }> = [];
+  const id = '123e4567-e89b-12d3-a456-426614174000';
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    return Response.json(init?.body ? { id } : { status: 'done', ok: true, output: '수집 완료' }, { status: init?.body ? 202 : 200 });
+  }) as typeof fetch;
+  await act(async () => { input.props.onSubmit('/run-skill omni-crawl 오늘 뉴스'); });
+  expect(calls).toEqual([
+    { url: 'http://localhost:31415/v1/skills/exec', body: { skill: 'omni-crawl', task: '오늘 뉴스' } },
+    { url: `http://localhost:31415/v1/skills/exec/${id}` },
+  ]);
+  expect(streams).toHaveLength(0);
+  expect(requests).toHaveLength(0);
+  expect(JSON.stringify(tree!.root.findByType(ChatHistory).props)).toContain('수집 완료');
+});
+
+test('PCH-12 ACP skill picker commits a task-first prompt and ChatLayout runs the skill locally', async () => {
+  const previousFrame = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame');
+  globalThis.requestAnimationFrame = (callback) => { callback(0); return 1; };
+  try {
+    const { input, requests, streams } = await mount({ acp: true });
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const id = '123e4567-e89b-12d3-a456-426614174000';
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+      return Response.json(init?.body ? { id } : { status: 'done', ok: true, output: '수집 완료' }, { status: init?.body ? 202 : 200 });
+    }) as typeof fetch;
+    await act(async () => { input.findByType('textarea').props.onChange({ target: { value: '오늘 뉴스 $omni' } }); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 230)); });
+    expect(requests).toContainEqual({ method: 'elanous/skills/list', body: { sessionId: 'session-1', query: 'omni' } });
+    await act(async () => { input.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+    expect(input.findByType('textarea').props.value).toBe('/run-skill omni-crawl 오늘 뉴스 ');
+    await act(async () => { input.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+    expect(calls).toEqual([
+      { url: 'http://localhost:31415/v1/skills/exec', body: { skill: 'omni-crawl', task: '오늘 뉴스' } },
+      { url: `http://localhost:31415/v1/skills/exec/${id}` },
+    ]);
+    expect(streams).toHaveLength(0);
+    expect(requests.some(({ method }) => method === 'session/prompt')).toBe(false);
+    expect(JSON.stringify(tree!.root.findByType(ChatHistory).props)).toContain('수집 완료');
+  } finally {
+    if (previousFrame) Object.defineProperty(globalThis, 'requestAnimationFrame', previousFrame);
+    else delete (globalThis as { requestAnimationFrame?: typeof requestAnimationFrame }).requestAnimationFrame;
+  }
+});
 
 test('pending composer queues FIFO, holds one turn at a time, and chips remove or clear queued turns', async () => {
   const { streams, turns, input } = await mount({ acp: false, deferred: true });

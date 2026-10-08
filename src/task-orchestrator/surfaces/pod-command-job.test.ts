@@ -85,6 +85,24 @@ describe('pod command job manifest', () => {
     expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
   });
 
+  test('GATE-INSTALL-CACHE: install slots mount a hostPath and a root init container hands the host dirs to uid 1000', () => {
+    const original = manifest({ clone: true });
+    const slotted = manifest({ clone: true, bunCache: '/srv/bun-cache', installSlots: '/var/lib/elanous/gate-install-slots' });
+    const spec = (slotted.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }>; initContainers: Array<Record<string, unknown>> } } }).template.spec;
+    expect(spec.volumes).toContainEqual({ name: 'install-slots', hostPath: { path: '/var/lib/elanous/gate-install-slots', type: 'DirectoryOrCreate' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'install-slots', mountPath: '/gate-install-slots', readOnly: false });
+    expect(spec.initContainers[0]!.name).toBe('isolation-gate');
+    const init = spec.initContainers[1]!;
+    expect(init).toMatchObject({ name: 'host-dirs', securityContext: { runAsUser: 0 } });
+    expect(init.volumeMounts).toEqual([
+      { name: 'bun-cache', mountPath: '/bun-cache', readOnly: false },
+      { name: 'install-slots', mountPath: '/gate-install-slots', readOnly: false },
+    ]);
+    expect(String((init.args as string[])[0])).toContain('chown 1000:1000');
+    expect(String((init.args as string[])[0])).toContain('exit 0');
+    expect(JSON.stringify(manifest({ clone: true, installSlots: undefined }))).toBe(JSON.stringify(original));
+  });
+
   test('GATE-SPEED A3①: cpu omitted keeps request 1 / limit 4 and the pre-change bytes; cpu override reaches the Job spec', () => {
     const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
     const original = manifest({ clone: true });

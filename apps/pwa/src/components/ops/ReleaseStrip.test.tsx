@@ -45,6 +45,26 @@ test('현재 실패 노드 또는 실패·막힘 상태에서 summary 첫 줄만
   expect(html([run])).not.toContain('막힘:');
 });
 
+test('done 런의 실패 노드는 경고로 보이고 running·failed 런은 막힘을 유지한다', () => {
+  const nodes = run.nodes.map((node) => node.nodeId === 'publish' ? { ...node, ok: false, summary: 'npm-publish 시간초과\n민감한 로그' } : node);
+  const done = renderToStaticMarkup(<ReleaseStrip result={ready([])} selectedRun={{ ...run, status: 'done', nodes }} onSelect={() => {}} now={now} />);
+  expect(done).toContain('상태: done');
+  expect(done).toContain('role="status"');
+  expect(done).toContain('text-amber-700');
+  expect(done).toContain('경고: 노드 실패 보고 · 런은 끝남');
+  expect(done).not.toContain('막힘:');
+  expect(done).not.toContain('text-red-600');
+  expect(done).not.toContain('민감한 로그');
+  for (const status of ['running', 'failed']) {
+    const markup = html([{ ...run, status, nodes }]);
+    expect(markup).toContain('role="alert"');
+    expect(markup).toContain('text-red-600');
+    expect(markup).toContain('막힘: npm-publish 시간초과');
+    expect(markup).not.toContain('경고: 노드 실패 보고 · 런은 끝남');
+    expect(markup).not.toContain('민감한 로그');
+  }
+});
+
 test('24시간 초과 완료/실패한 최신 런은 숨기고 더 오래된 진행 중 런으로 대체하지 않는다', () => {
   for (const status of ['done', 'completed', 'failed', 'success', 'error']) {
     const finished = { ...run, status, startedAt: '2026-10-05T11:59:59Z' };

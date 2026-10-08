@@ -45,6 +45,7 @@ import type { PrereleaseKind } from '../../scripts/release-loop/release-version.
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
 import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
+import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
@@ -609,6 +610,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     }
     return hqCliWriteAllowed(command, override, ledgerFenceDeps());
   };
+  // PUBLISH-TIME-FROM-GATE: the measured cut→publish window comes from the same ledger as the schedule (prod by default).
+  const publishMeasure = () => measurePublishWindow({ root: defaultReleaseGraphRunsRoot(scheduleLedgerRoot()) });
   schedule.command('list').option('--json', '결과 JSON').action((o: { json?: boolean }) => {
     const rows = listSchedules(scheduleLedgerRoot());
     if (o.json) console.log(JSON.stringify(rows));
@@ -618,15 +621,27 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action((o: { version: string; json?: boolean }) => {
       const row = getSchedule(o.version, scheduleLedgerRoot());
       if (!row) throw new CliUserError(`없는 판 일정: ${o.version}`, '판 일정 등록: elanous release schedule set --version <v> --cut-at <iso> --land-by <iso>');
-      if (o.json) console.log(JSON.stringify(row)); else console.log(formatSchedule(row));
+      const measure = publishMeasure();
+      const proposedPublishAt = proposePublishAt(row.cutAt, measure);
+      if (o.json) console.log(JSON.stringify({ ...row, proposedPublishAt, measuredPublishMedianSeconds: measure.medianSeconds, measuredPublishSamples: measure.samples.map(({ version, seconds }) => ({ version, seconds })) }));
+      else { console.log(formatSchedule(row)); console.log(formatPublishProposal(row.cutAt, measure)); }
     });
   schedule.command('set').requiredOption('--version <v>', '갱신할 판')
     .option('--cut-at <iso>', '오프셋 포함 컷 시각').option('--land-by <iso>', '오프셋 포함 착지 마감')
-    .option('--freeze-from <iso>', '동결 시작').option('--freeze-until <iso>', '동결 종료').option('--json', '결과 JSON').option('--hq-override')
-    .action((o: { version: string; cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; json?: boolean; hqOverride?: boolean }) => {
-      if (o.cutAt === undefined && o.landBy === undefined && o.freezeFrom === undefined && o.freezeUntil === undefined) throw new CliUserError('갱신할 시각을 지정하라', '--cut-at <iso> 또는 --land-by <iso>');
+    .option('--freeze-from <iso>', '동결 시작').option('--freeze-until <iso>', '동결 종료')
+    .option('--publish-at <iso>', '오프셋 포함 발행 시각(실측 컷→발행 중앙값보다 짧으면 경고 · 제안은 schedule show)')
+    .option('--json', '결과 JSON').option('--hq-override')
+    .action((o: { version: string; cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string; json?: boolean; hqOverride?: boolean }) => {
+      if (o.cutAt === undefined && o.landBy === undefined && o.freezeFrom === undefined && o.freezeUntil === undefined && o.publishAt === undefined) throw new CliUserError('갱신할 시각을 지정하라', '--cut-at <iso> 또는 --land-by <iso> 또는 --publish-at <iso>');
       if (!mayWriteLedger('release schedule set', Boolean(o.hqOverride), scheduleLedgerRoot())) return;
-      const row = setSchedule(o.version, { cutAt: o.cutAt, landBy: o.landBy, freezeFrom: o.freezeFrom, freezeUntil: o.freezeUntil }, process.env.ELANOUS_TRACK || 'cli', scheduleLedgerRoot());
+      const row = setSchedule(o.version, { cutAt: o.cutAt, landBy: o.landBy, freezeFrom: o.freezeFrom, freezeUntil: o.freezeUntil, publishAt: o.publishAt }, process.env.ELANOUS_TRACK || 'cli', scheduleLedgerRoot());
+      // A stored publish time shorter than the measured median warns on stderr (one line) — --json stdout stays parseable.
+      if (row.publishAt && (o.publishAt !== undefined || o.cutAt !== undefined)) {
+        const measure = publishMeasure();
+        const warning = publishWindowWarning(row.cutAt, row.publishAt, measure);
+        debug.log('release.schedule', 'publish-window', { version: row.version, cutAt: row.cutAt, publishAt: row.publishAt, medianSeconds: measure.medianSeconds, samples: measure.samples.length, warned: warning !== null });
+        if (warning) console.error(warning);
+      }
       if (o.json) console.log(JSON.stringify(row)); else console.log(formatSchedule(row));
     });
   release.command('place <id>').description('칸의 우선순위·마감·용량으로 판 배치')

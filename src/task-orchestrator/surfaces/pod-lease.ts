@@ -52,6 +52,18 @@ export interface PodLeaseMember {
    */
   harnessUsageBytes?: number[] | null;
   usageReason?: string | null;
+  /** GATE-RESERVE-AUTO — non-terminal release-gate shard Jobs (`gate-<uuid>`, kind=command). */
+  gateJobs?: number | null;
+  /** GATE-RESERVE-AUTO — of those, Jobs whose Pod is not bound to a node yet (not created, or Pending unscheduled). */
+  gateUnboundJobs?: number | null;
+  /** GATE-RESERVE-AUTO — CPU requested by the non-terminal gate Jobs' Pod templates (observability; Infinity: unreadable). */
+  gateCpuMillicores?: number | null;
+  /** GATE-RESERVE-AUTO — allocatable CPU of the schedulable (Ready, untainted, cordon-free) nodes. */
+  schedulableCpuMillicores?: number | null;
+  /** GATE-RESERVE-AUTO — per schedulable node: allocatable CPU − requests of every non-terminal Pod bound to it (gate Pods too). */
+  cpuFreeByNodeMillicores?: number[] | null;
+  /** GATE-RESERVE-AUTO — CPU requested by harness Pods still waiting for a node (they take CPU somewhere once bound). */
+  pendingHarnessCpuMillicores?: number | null;
   /** Pool-wide harness reservation: Σ min(limit, max(request, usage×1.5)), or max(request, limit) when the Pod's usage is unmeasured. */
   memoryReservedBytes?: number | null;
   /** Parallel to availableMemoryByNodeBytes: each schedulable node's allocatable memory. */
@@ -138,16 +150,19 @@ function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-/** Effective scheduling reservation: max(sum of app requests, largest init request, Pod-level request) + overhead. */
-function requestedMemory(spec: Record<string, unknown>): number | null {
+/**
+ * Effective scheduling reservation: max(sum of app requests, largest init request, Pod-level request) + overhead.
+ * A container without a request reserves its limit (Kubernetes defaults the request to the limit), or 0 with neither.
+ */
+function requestedResource(spec: Record<string, unknown>, unit: 'memory' | 'cpu'): number | null {
   const request = (resources: unknown): number | null => {
     const r = object(resources);
     if (resources !== undefined && !r) return null;
     const requests = object(r?.requests);
     const limits = object(r?.limits);
     if ((r?.requests !== undefined && !requests) || (r?.limits !== undefined && !limits)) return null;
-    const raw = requests?.memory ?? limits?.memory;
-    return raw === undefined ? 0 : typeof raw === 'string' ? quantity(raw, 'memory') : null;
+    const raw = requests?.[unit] ?? limits?.[unit];
+    return raw === undefined ? 0 : typeof raw === 'string' ? quantity(raw, unit) : null;
   };
   const containers = spec.containers;
   if (!Array.isArray(containers) || !containers.length) return null;
@@ -167,11 +182,15 @@ function requestedMemory(spec: Record<string, unknown>): number | null {
     init = Math.max(init, v);
   }
   const pod = spec.resources === undefined ? 0 : request(spec.resources);
-  const overheadRaw = object(spec.overhead)?.memory;
+  const overheadRaw = object(spec.overhead)?.[unit];
   const overhead = spec.overhead !== undefined && !object(spec.overhead) ? null
-    : overheadRaw === undefined ? 0 : typeof overheadRaw === 'string' ? quantity(overheadRaw, 'memory') : null;
+    : overheadRaw === undefined ? 0 : typeof overheadRaw === 'string' ? quantity(overheadRaw, unit) : null;
   return pod === null || overhead === null ? null : Math.max(app, init, pod) + overhead;
 }
+
+const requestedMemory = (spec: Record<string, unknown>): number | null => requestedResource(spec, 'memory');
+/** GATE-RESERVE-AUTO — the CPU the scheduler reserves for a Pod (same rule as memory). */
+const requestedCpu = (spec: Record<string, unknown>): number | null => requestedResource(spec, 'cpu');
 
 function runningLimit(spec: Record<string, unknown>): number | null {
   if (!Array.isArray(spec.containers) || !spec.containers.length) return null;
@@ -325,6 +344,8 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
       };
       const nodeItems = parsedItems(nodes);
       const nodeFree = new Map<string, number>();
+      let schedulableCpu = 0;
+      const nodeCpuFree = new Map<string, number>();
       const nodeNames = new Set<string>();
       if (!nodeItems?.length) reasons.push(`cluster nodes: ${nodes.status === 0 ? 'invalid/empty response' : nodes.stderr.trim().split('\n').pop() || `rc=${nodes.status}`}`);
       else {
@@ -350,11 +371,11 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           }
           nodeNames.add(name);
           const repels = taintList.some((t) => t!.effect === 'NoSchedule' || t!.effect === 'NoExecute');
-          if (spec?.unschedulable !== true && !repels && object(ready[0])?.status === 'True') { nodeFree.set(name, mem); nodeAllocatable.set(name, mem); }
+          if (spec?.unschedulable !== true && !repels && object(ready[0])?.status === 'True') { nodeFree.set(name, mem); nodeAllocatable.set(name, mem); nodeCpuFree.set(name, cores); schedulableCpu += cores; }
           memory += mem; cpu += cores;
         }
-        if (valid) { result.allocatableMemoryBytes = memory; result.allocatableCpuMillicores = cpu; }
-        else { nodeFree.clear(); nodeAllocatable.clear(); nodeNames.clear(); reasons.push('cluster nodes: invalid name/allocatable memory/cpu/readiness'); }
+        if (valid) { result.allocatableMemoryBytes = memory; result.allocatableCpuMillicores = cpu; result.schedulableCpuMillicores = schedulableCpu; }
+        else { nodeFree.clear(); nodeAllocatable.clear(); nodeCpuFree.clear(); nodeNames.clear(); reasons.push('cluster nodes: invalid name/allocatable memory/cpu/readiness'); }
       }
       // POD-ADMIT-BY-USAGE: every schedulable node needs a real-usage reading, or the member stays on limits.
       const unreadNode = podUsage && nodeUsage ? [...nodeFree.keys()].find((n) => !nodeUsage!.has(n)) : undefined;
@@ -366,6 +387,8 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
       if (podItems && jobItems) {
         const jobNames = new Set<string>();
         const leasedJobs = new Set<string>();
+        const gateJobs = new Map<string, number>();
+        const boundGateJobs = new Set<string>();
         let jobsValid = true;
         for (const job of jobItems) {
           const meta = object(job.metadata);
@@ -373,12 +396,27 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (object(meta.labels)?.['elanous.substrate'] !== 'pod') continue;
           if (typeof meta.name !== 'string' || !meta.name) { jobsValid = false; continue; }
           jobNames.add(meta.name);
+          // GATE-RESERVE-AUTO: a release-gate shard Job (`gate-<uuid>`, kind=command) reserves its Pod template's CPU
+          // from creation until it is terminal — also while its Pod is still Pending or not created yet.
+          if (meta.name.startsWith('gate-') && object(meta.labels)?.['elanous.kind'] === 'command') {
+            const status = object(job.status);
+            const conditions = Array.isArray(status?.conditions) ? status.conditions as unknown[] : [];
+            const terminal = !!status?.completionTime || Number(status?.succeeded) > 0 ||
+              conditions.some((c) => (object(c)?.type === 'Failed' || object(c)?.type === 'Complete') && object(c)?.status === 'True');
+            if (!terminal) {
+              const spec = object(object(object(job.spec)?.template)?.spec);
+              // An unreadable request cannot be reserved as 0: it blocks harness admission until the gate ends.
+              gateJobs.set(meta.name, (spec ? requestedCpu(spec) : null) ?? Number.POSITIVE_INFINITY);
+            }
+          }
           if (object(meta.annotations)?.[POD_HOST_LEASE_ANNOTATION] === 'true') leasedJobs.add(meta.name);
         }
         if (!jobsValid) reasons.push('cluster jobs: missing name/labels');
         let running = 0, pending = 0, unleasedRunning = 0, limits = 0, reserved = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
         const pendingJobs = new Map<string, PendingJobIdentity>();
         let unknownPhase = false;
+        let pendingHarnessCpu = 0;
+        let cpuValid = true;
         const seenPods = new Set<string>();
         for (const pod of podItems) {
           const metadata = object(pod.metadata);
@@ -393,7 +431,9 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
             if (seenPods.has(identity)) { reservationsValid = false; continue; }
             seenPods.add(identity);
           } else reservationsValid = false;
-          const harness = metadata?.namespace === 'elanous-test' && labels?.['elanous.probe'] !== 'dns' &&
+          const ownerJob = String(labels?.['elanous.job'] ?? labels?.['job-name'] ?? '');
+          const gatePod = metadata?.namespace === 'elanous-test' && gateJobs.has(ownerJob);
+          const harness = metadata?.namespace === 'elanous-test' && labels?.['elanous.probe'] !== 'dns' && !gatePod &&
             (labels?.['elanous.substrate'] === 'pod' || jobNames.has(String(labels?.['elanous.job'] ?? '')));
           const spec = object(pod.spec);
           let limit: number | null = null;
@@ -425,6 +465,17 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           }
           // Pending Pods with no assigned node have no node reservation yet. They already occupy a pool slot.
           const nodeName = spec?.nodeName;
+          // GATE-RESERVE-AUTO: CPU is placed per node (a free core split across two nodes is not one slot). Every Pod
+          // bound to a schedulable node — gate Pods too — takes its request there; harness Pods without a node yet
+          // take CPU somewhere once bound. A gate Pod bound to any node marks its Job as placed.
+          const boundNode = typeof nodeName === 'string' && nodeName !== '' ? nodeName : null;
+          if (gatePod && boundNode !== null && nodeNames.has(boundNode)) boundGateJobs.add(ownerJob);
+          if ((boundNode !== null && nodeCpuFree.has(boundNode)) || (boundNode === null && harness && phase === 'Pending')) {
+            const cpu = spec ? requestedCpu(spec) : null;
+            if (cpu === null) cpuValid = false;
+            else if (boundNode !== null) nodeCpuFree.set(boundNode, nodeCpuFree.get(boundNode)! - cpu);
+            else pendingHarnessCpu += cpu;
+          }
           if ((nodeName === undefined || nodeName === '') && phase === 'Pending' && spec && typeof metadata?.namespace === 'string' &&
               requestedMemory(spec) !== null) continue;
           const requested = spec ? requestedMemory(spec) : null;
@@ -432,6 +483,15 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (nodeFree.has(nodeName)) nodeFree.set(nodeName, nodeFree.get(nodeName)! - Math.max(requested, reserve ?? limit ?? 0));
         }
         if (unknownPhase) reasons.push('cluster pods: missing/Unknown phase');
+        if (jobsValid && !unknownPhase && result.schedulableCpuMillicores !== undefined) {
+          result.gateJobs = gateJobs.size;
+          result.gateUnboundJobs = [...gateJobs.keys()].filter((job) => !boundGateJobs.has(job)).length;
+          result.gateCpuMillicores = [...gateJobs.values()].reduce((sum, cpu) => sum + cpu, 0);
+        }
+        if (cpuValid && !unknownPhase && result.schedulableCpuMillicores !== undefined) {
+          result.cpuFreeByNodeMillicores = [...nodeCpuFree.values()];
+          result.pendingHarnessCpuMillicores = pendingHarnessCpu;
+        }
         if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; result.pendingJobs = [...pendingJobs.values()]; result.unleasedRunning = unleasedRunning; }
         if (limitsValid && jobsValid && !unknownPhase) {
           result.memoryLimitBytes = limits;
@@ -462,6 +522,29 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
     }
     return result;
   }) };
+}
+
+/**
+ * GATE-RESERVE-AUTO — while a release-gate shard Job is not terminal, how many more harness Pods (each requesting
+ * `POD_CHILD_REQUESTS.cpu`) fit beside it. The gate gets its CPU first: while any gate shard is still waiting for a
+ * node, no harness Pod is admitted (the scheduler may place new harness Pods where the shard would have gone). Once
+ * every shard is bound its CPU sits on its node, and the answer is Σ per-node ⌊free ÷ request⌋ minus the harness Pods
+ * still waiting for a node. `undefined`: no gate Job is active (normal admission) · `null`: a gate is active but CPU
+ * could not be measured — a Pod's or a gate template's request is unreadable (admit nothing more). The count comes from this one reading, never from earlier ones.
+ */
+export function harnessCpuSlotsBesideGate(measure: PoolLeaseMeasure): number | null | undefined {
+  if (!measure.members.some((m) => (m.gateJobs ?? 0) > 0)) return undefined;
+  const perPod = quantity(POD_CHILD_REQUESTS.cpu, 'cpu')!;
+  let slots = 0;
+  for (const m of measure.members) {
+    if (m.gateJobs == null || m.gateUnboundJobs == null || m.cpuFreeByNodeMillicores == null || m.pendingHarnessCpuMillicores == null) return null;
+    // A gate Job whose Pod template CPU cannot be read is unmeasured even when its Pod is bound (fail closed).
+    if (m.gateCpuMillicores == null || !Number.isFinite(m.gateCpuMillicores)) return null;
+    if (m.gateUnboundJobs > 0) return 0;
+    const placeable = m.cpuFreeByNodeMillicores.reduce((sum, free) => sum + Math.max(0, Math.floor(free / perPod)), 0);
+    slots += Math.max(0, placeable - Math.ceil(m.pendingHarnessCpuMillicores / perPod));
+  }
+  return slots;
 }
 
 /** Per-node memory and per-member slots cannot be exchanged across nodes/clusters. */

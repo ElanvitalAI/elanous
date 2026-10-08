@@ -15,6 +15,8 @@ export interface ActivityEdge {
   cell?: string;
   move?: string;
   tick?: string;
+  /** launch 간선만 — 서버가 그 카드에 묶은 런 원장 runId. */
+  run?: string;
 }
 
 export interface ActivityNode {
@@ -55,6 +57,16 @@ export function applyLoopOwners(rows: readonly LoopRow[], owners: readonly LoopO
 
 export const ACTIVITY_WINDOW_MS = 60 * 60 * 1000;
 export const EDGE_HIGHLIGHT_MS = 1_500;
+export const GHOST_LAUNCH_AFTER_MS = 10 * 60 * 1000;
+
+/** 발사 뒤 10분이 지나도 런 원장이 없으면 유령. 런 원장 = 서버가 묶은 `run`(launch 간선 ref 는 카드 id, run 간선 ref 는 runId 라
+ *  ref 만으로는 둘이 안 만난다) 또는 같은 ref 의 run 간선. 원천 간선은 변경하지 않는다. */
+export function isGhostLaunch(edge: ActivityEdge, edges: readonly ActivityEdge[], now: number): boolean {
+  if (edge.kind !== 'launch' || (typeof edge.run === 'string' && edge.run !== '')) return false;
+  const at = Date.parse(edge.at);
+  return Number.isFinite(at) && now - at >= GHOST_LAUNCH_AFTER_MS
+    && !edges.some(other => other.kind === 'run' && other.ref === edge.ref);
+}
 export const SEAT_NAMES: Record<string, string> = { OP: 'COO', MK: 'CMO', TC: 'CTO', UX: 'CXO' };
 const SEATS = ['OP', 'MK', 'TC', 'UX'];
 /** 서버 LoopEdge.kind 와 같은 목록 — 여기 없는 kind 는 소리 없이 버려진다(LOOP-INTERACT 조각 C 가 hand·launch·move 를 더함). */
@@ -254,10 +266,10 @@ export interface NodeDetailSource { now?: string; running?: number | '못 읽음
 export interface NearDetail { now: string | null; recent: string[]; running: number | '못 읽음' | null; waiting: number | '못 읽음' | null }
 
 /** near 노드 안쪽 — 이미 LoopAgentsScene 이 읽은 자리·런 데이터 ⊕ 그 노드에 닿은 최근 간선 다섯(새 것 먼저). */
-export function nearDetail(id: string, edges: readonly ActivityEdge[], source: NodeDetailSource | undefined, labelOf: (id: string) => string): NearDetail {
+export function nearDetail(id: string, edges: readonly ActivityEdge[], source: NodeDetailSource | undefined, labelOf: (id: string) => string, now?: number): NearDetail {
   const recent = edges.filter(edge => edge.from === id || edge.to === id)
     .sort((a, b) => b.at.localeCompare(a.at)).slice(0, 5)
-    .map(edge => `${KIND_WORDS[edge.kind]} ${edge.from === id ? '→' : '←'} ${toPublicText(labelOf(edge.from === id ? edge.to : edge.from))}`);
+    .map(edge => `${now !== undefined && isGhostLaunch(edge, edges, now) ? '발사 · 유령' : KIND_WORDS[edge.kind]} ${edge.from === id ? '→' : '←'} ${toPublicText(labelOf(edge.from === id ? edge.to : edge.from))}`);
   return { now: source?.now ? toPublicText(source.now) : null, recent, running: source?.running ?? null, waiting: source?.waiting ?? null };
 }
 

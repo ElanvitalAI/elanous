@@ -114,10 +114,7 @@ export function recordDocsFollow(root: string, manifest: ReleaseManifest, items:
   const journal = join(root, 'seat-requests', 'requests.jsonl');
   withSeatRequestLedgerLock(journal, () => {
     const known = new Set(listSeatRequests(root).map((row) => row.key));
-    const missing = [
-      ...report.pending.map((item) => ({ id: item.id, text: `문서 반영 대기 목록 v${manifest.version} · ${item.id}: ${item.missing.join(', ')} — 착지 ${item.sha}; docs·홈 실측 뒤 닫기` })),
-      ...report.unassessed.map((id) => ({ id, text: `문서 반영 대기 목록 v${manifest.version} · ${id}: 착지·green·EXPOSE-RUBRIC 근거 미판정 — 확인 전 공개 문면 금지` })),
-    ];
+    const missing = report.pending.map((item) => ({ id: item.id, text: `문서 반영 대기 목록 v${manifest.version} · ${item.id}: ${item.missing.join(', ')} — 착지 ${item.sha}; docs·홈 실측 뒤 닫기` }));
     const rows = missing.filter((item) => !known.has(`docs-follow:${manifest.version}:${item.id}`)).map((item) => ({
       key: `docs-follow:${manifest.version}:${item.id}`, seat: 'MK', status: 'queued' as const,
       text: item.text, queuedAt: now.toISOString(), ref: `release:${manifest.version}:docs-follow`,

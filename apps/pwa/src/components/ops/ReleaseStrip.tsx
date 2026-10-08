@@ -28,7 +28,8 @@ export function ReleaseStrip({ result, onSelect, selectedRun, now = Date.now() }
     ? run.path.length - 1 : index;
   const id = run.path[currentIndex];
   const current = run.nodes.find((node) => node.nodeId === id);
-  const blocked = current?.ok === false || BLOCKED.test(run.status);
+  const doneWithFailedNode = run.status.toLowerCase() === 'done' && current?.ok === false;
+  const blocked = !doneWithFailedNode && (current?.ok === false || BLOCKED.test(run.status));
   const summary = blocked ? current?.summary.split(/\r?\n/, 1)[0]?.trim() : null;
   const elapsed = Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
   return <section aria-label="발행 진행" className="min-w-0 rounded-2xl border bg-card p-3 text-foreground">
@@ -47,6 +48,7 @@ export function ReleaseStrip({ result, onSelect, selectedRun, now = Date.now() }
       </span>
     </button>
     <p className="mt-1 text-xs text-muted-foreground">상태: {run.status}</p>
+    {doneWithFailedNode && <p role="status" className="truncate text-sm text-amber-700 dark:text-amber-400">경고: 노드 실패 보고 · 런은 끝남</p>}
     {summary && <p role="alert" className="truncate text-sm text-red-600 dark:text-red-400">막힘: {summary}</p>}
   </section>;
 }

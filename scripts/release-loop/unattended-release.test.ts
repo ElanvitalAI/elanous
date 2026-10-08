@@ -71,15 +71,18 @@ test('dry run reports input but never invokes the checklist or graph; execution 
     record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
     let graphCalls = 0;
     let checklistCalls = 0;
+    const pins: unknown[] = [];
     const deps = { ledgerRoot: root, config: { gatePodPool: 'pool' },
       checklist: () => { checklistCalls++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
-      graph: async (_path: string, options: { input: unknown }) => { graphCalls++; return { input: options.input, status: 'done' } as never; } };
+      graph: async (_path: string, options: { input: unknown; pinChildUniverse?: boolean; deps?: { root?: string } }) => { graphCalls++; pins.push([options.pinChildUniverse, options.deps?.root]); return { input: options.input, status: 'done' } as never; } };
     const preview = await runUnattendedRelease({ version: '0.2.4', dryRun: true }, deps);
     expect(preview).toMatchObject({ dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' } });
     expect([checklistCalls, graphCalls]).toEqual([0, 0]);
     const run = await runUnattendedRelease({ version: '0.2.4' }, deps);
     expect(run).toMatchObject({ dryRun: false, state: { status: 'done', input: preview.input } });
     expect([checklistCalls, graphCalls]).toEqual([1, 1]);
+    // RELEASE-LEDGER-UNIVERSE: every node subprocess is pinned to the run's universe, not re-resolved from its cwd tree.
+    expect(pins).toEqual([[true, root]]);
     await expect(runUnattendedRelease({ version: '0.2.4' }, { ...deps, checklist: () => ({ ok: false, red: ['K13'], undecided: [], blocked: [], moved: [], knownIssues: [] }) })).rejects.toThrow('K13');
     expect(graphCalls).toBe(1);
     for (const invalid of [{}, { gatePodPool: '  ' }]) {
@@ -136,6 +139,22 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
     expect(inputs).toHaveLength(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('GATE-MEM-ADMIT: release.loop.gatePodAdmissionWaitSeconds becomes graph input, and the gate reads it as the shard admission bound', () => fixture((root) => {
+  record(root, '0.2.98', { version: '0.2.98', publishedAt: 'now' });
+  const input = buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45 } });
+  expect(input).toMatchObject({ gatePodPool: 'pool-x@h:1', gatePodAdmissionWaitSeconds: 45 });
+  const context = join(root, 'graph-context.json');
+  writeFileSync(context, JSON.stringify({ input, outputs: {} }));
+  const opts = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
+  if (opts === 'help') throw new Error('unexpected help');
+  expect(opts.pod).toMatchObject({ pool: 'pool-x@h:1', admissionWaitSeconds: 45 });
+  // Omitted config: no bound reaches the gate, which then uses GATE_ADMISSION_WAIT_SECONDS_DEFAULT.
+  writeFileSync(context, JSON.stringify({ input: buildReleaseRunInput('0.2.99', { ledgerRoot: root, config: { gatePodPool: 'pool-x@h:1' } }), outputs: {} }));
+  const plain = parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context });
+  if (plain === 'help') throw new Error('unexpected help');
+  expect(plain.pod?.admissionWaitSeconds).toBeUndefined();
+}));
 
 test('GATE-SPEED A3①: release.loop.gatePodCpu becomes graph input gatePodCpu, and the gate reads it as shard cpu request/limit', () => fixture((root) => {
   record(root, '0.2.98', { version: '0.2.98', publishedAt: 'now' });

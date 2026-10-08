@@ -19,6 +19,8 @@ import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { runPodCommand, parsePodCpu, resolvePodCpu, type RunPodCommandOptions, type PodCommandResult, type PodCpu } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
+import { gateShardsPath, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
 interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean }
@@ -51,7 +53,16 @@ export interface GateOptions {
      *  with these is not re-run in isolation; the verdict still classifies them against the baseline as before. */
     knownFailures?: readonly string[];
     /** GATE-SPEED A3① — shard Pod CPU request/limit (`release.loop.gatePodCpu`); omitted = request 1 / limit 4. */
-    cpu?: PodCpu };
+    cpu?: PodCpu;
+    /** GATE-INSTALL-CACHE — concurrent `bun install`s per node (`release.loop.gatePodInstallSlots`); omitted = 4 · 0 = off. */
+    installSlots?: number;
+    /** GATE-MEM-ADMIT — seconds a shard waits for pool admission (memory headroom) before it launches anyway with
+     *  `admission-timeout` (`release.loop.gatePodAdmissionWaitSeconds`); omitted = {@link GATE_ADMISSION_WAIT_SECONDS_DEFAULT} · 0 = off. */
+    admissionWaitSeconds?: number;
+    /** GATE-MEM-ADMIT — an injected admission (tests · embedders); config never sets it. Absent = the gate's own pool's. */
+    admission?: GateAdmission;
+    /** GATE-LIVE-OBS — the shard state file (`gateShardsPath(version)`) this sweep keeps current; absent = not written. */
+    shardsFile?: { path: string; version: string } };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
@@ -70,7 +81,7 @@ export interface GateResult {
   baselineDeferred?: { cutFiles: number; swept: number };
   durationMs: number;
   error?: string;
-  stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
+  stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed' | 'timeout'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
   partialSummary?: { pass: number; fail: number; errors: number; ran: number; files: number };
   /** GATE-PARTIAL — this verdict re-ran only these files and carried the prior gate's results for the rest. */
   partial?: { priorCommit: string; files: number };
@@ -204,6 +215,138 @@ export const POD_MEMORY_SOURCE = 'docs/measurements/td1-whole-gate-mechanical-20
  *  mbp at the cut instead (TD1 moves it to the integration line). Keep this list short and explained. */
 /** GT1 — files per retry chunk when a root shard fails (0.2.7: bundles of 54+ files OOMed at 16Gi, smaller passed). */
 export const POD_SHARD_FILE_CAP = 27;
+
+/** GATE-TIMEOUT-HEAL (0.2.20) — the per-shard Job deadline is the shard's planned wall-clock × 1.5, never under the
+ *  configured floor (`release.loop.gatePodShardTimeoutSeconds` · default 1200 s) and never over the cap (or the floor,
+ *  if that is higher). 0.2.19: the largest shard was planned at 18.9 min, ran 20–27 min (install 220–340 s under load)
+ *  and 11 of 24 shards were cut at the flat 1200 s with nothing left to read. */
+export const POD_SHARD_TIMEOUT_FLOOR_SECONDS = 1200;
+export const POD_SHARD_TIMEOUT_CAP_SECONDS = 3600;
+export function shardDeadlineSeconds(plannedSeconds: number, configured?: number): number {
+  const floor = configured ?? POD_SHARD_TIMEOUT_FLOOR_SECONDS;
+  const scaled = Number.isFinite(plannedSeconds) && plannedSeconds > 0 ? Math.ceil(plannedSeconds * 1.5) : 0;
+  return Math.min(Math.max(floor, POD_SHARD_TIMEOUT_CAP_SECONDS), Math.max(floor, scaled));
+}
+/** Seconds the Pod keeps after the in-shell soft deadline: kill grace, artifact emission, and slack for what the Job
+ *  deadline counts before the shell starts and the shell cannot see (scheduling · init containers). */
+export const POD_SHARD_EMIT_RESERVE_SECONDS = 120;
+export const softDeadlineSeconds = (deadline: number) => deadline > 2 * POD_SHARD_EMIT_RESERVE_SECONDS
+  ? deadline - POD_SHARD_EMIT_RESERVE_SECONDS : Math.max(1, Math.floor(deadline * 0.8));
+/** GATE-TIMEOUT-HEAL ② — a shard runs as consecutive parts of about this many planned seconds (at most
+ *  {@link POD_SHARD_FILE_CAP} files), each with its own log and junit, so a shard cut by its deadline still leaves the
+ *  results of every part that finished (F1/F2 read them) instead of nothing. */
+export const POD_SHARD_PART_SECONDS = 120;
+export function shardParts(paths: readonly string[], seconds: (file: string) => number, target = POD_SHARD_PART_SECONDS): string[][] {
+  const parts: string[][] = [];
+  let current: string[] = [];
+  let sum = 0;
+  for (const file of paths) {
+    current.push(file);
+    sum += seconds(file);
+    if (sum >= target || current.length >= POD_SHARD_FILE_CAP) { parts.push(current); current = []; sum = 0; }
+  }
+  if (current.length) parts.push(current);
+  return parts;
+}
+/**
+ * The shard's Pod shell. Install once (behind the node's install slots), then run each part under the soft deadline,
+ * leaving `install.log`/`install.rc`, `part-<i>.log`/`.rc`/`.junit.xml`, and `shard.timeout` (the part index) when the
+ * deadline cut the shard. A part without `.rc` did not finish. The shell itself always exits 0 (as before).
+ */
+export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPatterns: readonly string[]; softSeconds: number; cachePrefix: string; installSlots: number }): string {
+  const run = o.parts.map((part, index) => {
+    const ignores = o.cdpPatterns.filter((pattern) => part.includes(pattern)).flatMap((pattern) => ['--path-ignore-patterns', pattern]);
+    return `run_part ${index} ${['bun', 'run', 'test:deterministic', ...ignores, ...part.map(asPath)].map(quote).join(' ')}`;
+  }).join(' && ');
+  return [
+    'mkdir -p "$HOME/outbox"; O="$HOME/outbox"',
+    ...(o.cachePrefix ? [o.cachePrefix] : []),
+    // Seconds since this container's PID 1 started (the clone ran before this shell) — 0 when /proc cannot tell.
+    `pod_age=$(awk -v t="$(cut -d' ' -f22 /proc/1/stat 2>/dev/null)" -v hz="$(getconf CLK_TCK 2>/dev/null)" '{ if (t > 0 && hz > 0) print int($1 - t / hz); else print 0 }' /proc/uptime 2>/dev/null)`,
+    'case "$pod_age" in ""|*[!0-9]*) pod_age=0;; esac',
+    `gate_end=$(( $(date +%s) + ${Math.max(1, Math.floor(o.softSeconds))} - pod_age ))`,
+    ...(o.installSlots > 0 ? [installSlotScript({ slots: o.installSlots })] : []),
+    'run_part() {',
+    '  local i=$1; shift',
+    '  local left=$(( gate_end - $(date +%s) ))',
+    '  if [ "$left" -le 0 ]; then echo "$i" > "$O/shard.timeout"; return 1; fi',
+    '  timeout -k 10 "$left" "$@" --reporter=junit --reporter-outfile="$O/part-$i.junit.xml" > "$O/part-$i.log" 2>&1',
+    '  local prc=$?',
+    '  if [ "$(date +%s)" -ge "$gate_end" ] && { [ "$prc" -eq 124 ] || [ "$prc" -eq 137 ] || [ "$prc" -eq 143 ]; }; then echo "$i" > "$O/shard.timeout"; return 1; fi',
+    '  echo "$prc" > "$O/part-$i.rc"',
+    '}',
+    'if cd .. && cd repo; then',
+    ...(o.installSlots > 0 ? ['  install_slot_acquire >> "$O/install.log" 2>&1'] : []),
+    '  { bun install && (cd apps/pwa && bun install); } >> "$O/install.log" 2>&1; irc=$?',
+    ...(o.installSlots > 0 ? ['  install_slot_release'] : []),
+    '  echo "$irc" > "$O/install.rc"',
+    `  if [ "$irc" -eq 0 ]; then ${run || 'true'}; fi`,
+    'else echo 5 > "$O/install.rc"; fi',
+    'true',
+  ].join('\n');
+}
+/** Removes bun's own summary lines so one summary over several runs can follow (same rule as the sweep's merge). */
+const stripSummary = (output: string) => output.replace(/(?:^|\n)\s*\d+ (?:pass|fail|errors?)\s*(?=\n|$)/g, '\n').replace(/Ran \d+ tests? across \d+ files?\.?/g, '');
+export interface ShardArtifacts {
+  /** The verdict text: install log ⊕ every finished part (its summary removed) ⊕ one summary over the finished parts. */
+  output?: string;
+  junit?: string;
+  /** 0|1 when every part finished · the failing part's exit when one crashed · undefined when the deadline cut the shard. */
+  rc?: number;
+  timedOut: boolean;
+  /** Files of the parts that finished with a readable summary. */
+  finished: string[];
+  /** Raw logs of the parts that did not finish (diagnostics · last started file). */
+  unfinishedLog?: string;
+}
+/** Reads a shard Pod's outbox: the part layout ({@link gateShardShell}) or the older single-run one (shard.log · shard.rc · junit.xml). */
+export function readShardArtifacts(dir: string, parts: readonly (readonly string[])[]): ShardArtifacts {
+  const read = (name: string) => { const path = join(dir, name); return existsSync(path) ? readFileSync(path, 'utf8') : undefined; };
+  const rcOf = (text: string | undefined) => { const value = text?.trim() ?? ''; return /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : undefined; };
+  const installRc = rcOf(read('install.rc'));
+  const install = read('install.log');
+  if (installRc === undefined && install === undefined) {
+    const junit = read('junit.xml');
+    const rc = rcOf(read('shard.rc'));
+    return { output: read('shard.log'), ...(junit !== undefined ? { junit } : {}), ...(rc !== undefined ? { rc } : {}), timedOut: false, finished: [] };
+  }
+  const timedOut = read('shard.timeout') !== undefined;
+  if (installRc !== 0) return { output: install, ...(installRc !== undefined ? { rc: installRc } : {}), timedOut, finished: [] };
+  const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[] }> = [];
+  const bad: string[] = [];
+  let badRc: number | undefined;
+  parts.forEach((files, index) => {
+    const log = read(`part-${index}.log`);
+    const rc = rcOf(read(`part-${index}.rc`));
+    const clean = log?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+    if (clean !== undefined && (rc === 0 || rc === 1) && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/)) {
+      const junit = read(`part-${index}.junit.xml`);
+      good.push({ log: clean, rc, files, ...(junit !== undefined ? { junit } : {}) });
+      return;
+    }
+    if (log !== undefined) bad.push(`# part ${index} (${rc === undefined ? 'unfinished' : `rc=${rc}`})\n${log}`);
+    // A finished part without a readable summary is not a verdict: its exit, or 2 when it claimed 0|1.
+    if (rc !== undefined && badRc === undefined) badRc = rc === 0 || rc === 1 ? 2 : rc;
+  });
+  const total = good.reduce((sum, part) => {
+    const n = (label: string) => { const value = summaryCount(part.log, label); return Number.isNaN(value) ? 0 : value; };
+    const ran = lastMatch(part.log, /Ran (\d+) tests? across (\d+) files?/)!;
+    return { pass: sum.pass + n('pass'), fail: sum.fail + n('fail'), errors: sum.errors + n('error'), ran: sum.ran + Number(ran[1]), files: sum.files + Number(ran[2]) };
+  }, { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
+  const output = [install ?? '', ...good.map((part) => stripSummary(part.log)),
+    ...(good.length ? [`${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n`] : [])].join('\n');
+  const junits = good.flatMap((part) => part.junit !== undefined ? [part.junit] : []);
+  const complete = good.length === parts.length;
+  const rc = complete ? (good.some((part) => part.rc === 1) ? 1 : 0) : timedOut && badRc === undefined ? undefined : (badRc ?? 2);
+  return {
+    output,
+    ...(junits.length ? { junit: junits.join('\n') } : {}),
+    ...(rc !== undefined ? { rc } : {}),
+    timedOut: !complete && timedOut && badRc === undefined,
+    finished: good.flatMap((part) => [...part.files]),
+    ...(bad.length ? { unfinishedLog: bad.join('\n') } : {}),
+  };
+}
 
 // review-model-ab: Pod 에서 출력 없이 멈춤 2/2(10-04 0.2.11 · 로컬 단독 4/0 · 1.7s) — GATE-STALL 수리 전까지 Pod 밖.
 export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts', 'scripts/review-model-ab.test.ts'];
@@ -368,6 +511,54 @@ export function limitedLocalCommand(cmd: string, args: string[], cwd: string, li
   });
 }
 
+/**
+ * GATE-MEM-ADMIT (0.2.20) — the gate's shard Jobs ask the same pool admission harness goal Pods ask
+ * (`PodPoolScheduler.acquireAdmission` · memory headroom by observed usage · `limitedBy`). 0.2.19: 8 shards sat Pending
+ * for CPU (requests 31.2/32) because harness Pods held the node and the gate counted only its own Jobs (#24698).
+ * The gate never deadlocks on it: after {@link GATE_ADMISSION_WAIT_SECONDS_DEFAULT} it launches anyway and records
+ * `admission-timeout`; an admission error launches at once (`admission-error`). Harness launches wait without a bound,
+ * so the gate keeps priority.
+ */
+export interface GateAdmission {
+  acquire(signal: AbortSignal): Promise<() => void>;
+  /** The pool-wide reading admission waits on (recommended · limitedBy · memorySlots); null before any reading. */
+  waitReason(): string | null;
+}
+export const GATE_ADMISSION_WAIT_SECONDS_DEFAULT = 300;
+export type GateAdmissionOutcome = 'granted' | 'admission-timeout' | 'admission-error' | 'off';
+export interface GateAdmissionResult { outcome: GateAdmissionOutcome; waitedMs: number; reason?: string; release: () => void }
+export const gateAdmissionWaitText = (reading: string | null) => `메모리 여유 대기(admission) · ${reading ?? '측정 전'}`.slice(0, 160);
+export function poolGateAdmission(pool: PodPoolScheduler): GateAdmission {
+  return { acquire: (signal) => pool.acquireAdmission(signal, undefined, { gate: true }), waitReason: () => pool.waitReason() };
+}
+export async function admitGateShard(admission: GateAdmission | undefined, o: { waitMs: number; onWait: (reason: string) => void; reasonPollMs?: number; firstReasonMs?: number }): Promise<GateAdmissionResult> {
+  const noop = () => {};
+  if (!admission || !(o.waitMs > 0)) return { outcome: 'off', waitedMs: 0, release: noop };
+  const started = Date.now();
+  const controller = new AbortController();
+  let timedOut = false;
+  let lastReason: string | undefined;
+  const tell = () => { lastReason = gateAdmissionWaitText(admission.waitReason()); o.onWait(lastReason); };
+  const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, o.waitMs);
+  // A grant inside the first moment never touches the shard row (no flapping in shards.json).
+  let ticker: ReturnType<typeof setInterval> | undefined;
+  const first = setTimeout(() => { tell(); ticker = setInterval(tell, o.reasonPollMs ?? 15_000); }, o.firstReasonMs ?? 1_000);
+  try {
+    const granted = await admission.acquire(controller.signal);
+    // Released at placement and again after the Job (the launch may fail before placement): only the first counts.
+    let released = false;
+    const release = () => { if (!released) { released = true; granted(); } };
+    return { outcome: 'granted', waitedMs: Date.now() - started, ...(lastReason ? { reason: lastReason } : {}), release };
+  } catch (error) {
+    if (timedOut) return { outcome: 'admission-timeout', waitedMs: Date.now() - started, reason: lastReason ?? gateAdmissionWaitText(admission.waitReason()), release: noop };
+    return { outcome: 'admission-error', waitedMs: Date.now() - started, reason: (error instanceof Error ? error.message : String(error)).slice(0, 160), release: noop };
+  } finally {
+    clearTimeout(deadline);
+    clearTimeout(first);
+    if (ticker) clearInterval(ticker);
+  }
+}
+
 export function createGateRunner(repo: string, remote?: string, commandOverride?: GateRunner['command'], podCommand: (options: RunPodCommandOptions) => Promise<PodCommandResult> = runPodCommand, poolOverride?: PodPoolScheduler, podLogTail?: (job: PodCommandResult) => string): GateRunner {
   let remoteMirror: string | undefined;
   const localCommand: GateRunner['localCommand'] = async (cmd, args, cwd, limitMs) => {
@@ -391,7 +582,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     : localCommand);
   const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>, only?: readonly string[]): Promise<CommandResult> => {
     const shardCount = pod.shards ?? 24;
-    const deadlineSeconds = pod.shardTimeoutSeconds ?? 1200;
+    // GATE-TIMEOUT-HEAL ①: the configured value is the floor; each shard's own deadline is shardDeadlineSeconds(planned).
+    const deadlineSeconds = pod.shardTimeoutSeconds ?? POD_SHARD_TIMEOUT_FLOOR_SECONDS;
     if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
       || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1) throw new Error('invalid pod sweep options');
     const head = await command('git', ['rev-parse', 'HEAD'], tree);
@@ -449,7 +641,17 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const envCache = process.env[POD_BUN_CACHE_HOST_PATH]?.trim();
     const bunCache = configCache || envCache || undefined;
     debug.log('release-loop.gate', 'pod-bun-cache', { source: configCache ? 'config' : envCache ? 'env' : 'none' });
-    const cachePrefix = bunCache ? `${podBunCacheVolume(bunCache).shellPrefix} ` : '';
+    const cachePrefix = bunCache ? podBunCacheVolume(bunCache).shellPrefix : '';
+    // GATE-INSTALL-CACHE: node-wide install slots (see pod-install-slots.ts for the measured cause and the safety argument).
+    const installSlots = pod.installSlots ?? POD_INSTALL_SLOTS_DEFAULT;
+    if (!Number.isSafeInteger(installSlots) || installSlots < 0) throw new Error('invalid pod sweep options');
+    debug.log('release-loop.gate', 'pod-install-slots', { slots: installSlots, source: pod.installSlots !== undefined ? 'config' : 'default' });
+    // GATE-MEM-ADMIT: every shard Job (retries and splits too) asks pool admission before it is placed.
+    const admissionWaitSeconds = pod.admissionWaitSeconds ?? GATE_ADMISSION_WAIT_SECONDS_DEFAULT;
+    if (!Number.isSafeInteger(admissionWaitSeconds) || admissionWaitSeconds < 0) throw new Error('invalid pod sweep options');
+    // An injected pool (tests) runs without admission unless `pod.admission` is passed; the gate's own pool asks it.
+    const gateAdmission = pod.admission ?? (poolOverride ? undefined : poolGateAdmission(poolScheduler));
+    debug.log('release-loop.gate', 'pod-admission', { waitSeconds: admissionWaitSeconds, source: pod.admissionWaitSeconds !== undefined ? 'config' : 'default', enabled: !!gateAdmission && admissionWaitSeconds > 0 });
     const jobLogTail = (job: PodCommandResult): string => {
       if (podLogTail) return podLogTail(job);
       for (const member of poolScheduler.members) {
@@ -469,22 +671,57 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     }, 0);
     const knownTimes = assignable.map((file) => durations.get(file)).filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
     const unknownSeconds = knownTimes.length ? (knownTimes[Math.floor((knownTimes.length - 1) / 2)]! + knownTimes[Math.floor(knownTimes.length / 2)]!) / 2 : 1;
+    // GATE-LIVE-OBS — one row per root shard in the release ledger's shards.json (UX contract · src/release-loop/gate-shards.ts).
+    // Retries and splits of a shard update its row. A write failure is logged and never stops the gate.
+    const board: GateShard[] = shards.map((item, index) => ({ id: `pod-${index}`, state: 'pending', plannedMin: Math.round(item.plannedSeconds / 6) / 10 }));
+    const flushBoard = () => {
+      if (!pod.shardsFile) return;
+      try { writeGateShards(pod.shardsFile.path, { v: 1, version: pod.shardsFile.version, updatedAt: new Date().toISOString(), shards: board }); }
+      catch (error) { debug.log('release-loop.gate', 'shards-write-failed', { path: pod.shardsFile.path, error: String(error) }); }
+    };
+    const markShard = (shard: number, patch: Partial<GateShard>, clear: Array<keyof GateShard> = []) => {
+      const row = board[shard];
+      if (!row) return;
+      const next: GateShard = { ...row, ...patch };
+      for (const key of clear) delete next[key];
+      if (JSON.stringify(next) === JSON.stringify(row)) return;
+      board[shard] = next;
+      flushBoard();
+    };
+    flushBoard();
+    /** The gate's scheduler, seen through one shard: a slot wait and the Pod start become row states. */
+    // GATE-MEM-ADMIT: `placed` releases the shard's admission once a member is chosen — from then on the Job is
+    // Pending/Running in the cluster and the next admission reading counts it, so holding the lease would count it twice.
+    const trackedPool = (shard: number, retry: boolean, placed: () => void = () => {}): PodPoolScheduler => ({
+      members: poolScheduler.members,
+      tryAcquire: async (...args: Parameters<PodPoolScheduler['tryAcquire']>) => {
+        const member = await poolScheduler.tryAcquire(...args);
+        if (member) placed();
+        if (member) markShard(shard, { state: retry ? 'retry' : 'running', startedAt: board[shard]?.startedAt ?? new Date().toISOString() }, ['waitReason']);
+        else markShard(shard, { waitReason: 'Pod 자리 대기' });
+        return member;
+      },
+      release: (member: Parameters<PodPoolScheduler['release']>[0]) => poolScheduler.release(member),
+    }) as unknown as PodPoolScheduler;
     const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
-      const ignores = cdpPatterns.filter((pattern) => paths.includes(pattern))
-        .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
-      const args = ['bun', 'run', 'test:deterministic', ...ignores, ...paths.map(asPath)].map(quote).join(' ')
-        + ' --reporter=junit --reporter-outfile="$HOME/outbox/junit.xml"';
+      // GATE-TIMEOUT-HEAL: parts (each with its own junit) under a soft deadline inside this shard's own Job deadline.
+      const shardDeadline = shardDeadlineSeconds(estimated(paths), deadlineSeconds);
+      const parts = shardParts(paths, (file) => estimated([file]));
       const memoryLimit = paths.length === 1 && (depth >= 1 || heavy.has(paths[0]!)) ? POD_ISOLATION_MEMORY_LIMIT : undefined;
-      const podShell = `mkdir -p "$HOME/outbox"; ${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`;
-      const runKey = createHash('sha256').update(JSON.stringify({ pool: pod.pool, podShell, memoryLimit: memoryLimit ?? null, deadlineSeconds, bunCache: bunCache ?? null })).digest('hex');
-      const start = Date.now();
+      const podShell = gateShardShell({ parts, cdpPatterns, softSeconds: softDeadlineSeconds(shardDeadline), cachePrefix, installSlots });
+      const runKey = createHash('sha256').update(JSON.stringify({ pool: pod.pool, podShell, memoryLimit: memoryLimit ?? null, deadlineSeconds: shardDeadline, bunCache: bunCache ?? null })).digest('hex');
+      let start = Date.now();
+      let admitted: GateAdmissionResult | undefined;
       let output: string | undefined;
       let junit: string | undefined;
       let rc: number | undefined;
       let jobExitCode: number | undefined;
       let lastFile: string | undefined;
       let jobFailed = false;
+      let timedOut = false;
+      let finished: string[] = [];
+      let unfinishedLog: string | undefined;
       // The way down a previous attempt took wins over its own log: that log was not a verdict, or it would have no children.
       // The split this shard would take if it failed here — the same rule as the split code below (isolation at depth 2 ·
       // cap chunks for a big root shard · halves otherwise · none for one file).
@@ -512,9 +749,15 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         jobExitCode = 0;
         lastFile = lastStartedTestFile(output, paths);
       } else try {
+        admitted = await admitGateShard(gateAdmission, { waitMs: admissionWaitSeconds * 1000, onWait: (reason) => markShard(shard, { waitReason: reason }) });
+        if (admitted.outcome !== 'off') debug.log('release-loop.gate', 'shard-admission', { shard, branch, outcome: admitted.outcome, waitedMs: admitted.waitedMs, ...(admitted.reason ? { reason: admitted.reason } : {}) },
+          admitted.outcome === 'granted' ? undefined : { level: 'warn' });
+        // The admission wait is not the shard's run time: deadline/timeout judgment and the measured duration start here.
+        start = Date.now();
         const job = await podCommand({
-          pool: pod.pool, poolScheduler, clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds,
+          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', admitted.release), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
           ...(bunCache ? { bunCache } : {}),
+          ...(installSlots > 0 ? { installSlots: POD_INSTALL_SLOTS_HOST_PATH } : {}),
           ...(pod.cpu ? { cpu: pod.cpu } : {}),
           // 실패 뒤 다시 도는 파일 하나짜리 Job 은 메모리 한도를 올린다 — 16Gi 에선 무거운 한 파일이 혼자서도 OOM 이었다(09-30 `unwired-exports`).
           ...(memoryLimit ? { memoryLimit } : {}),
@@ -522,14 +765,11 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           command: ['bash', '-lc', podShell],
         });
         jobExitCode = job.exitCode;
-        const logPath = join(job.artifactsDir, 'shard.log');
-        const rcPath = join(job.artifactsDir, 'shard.rc');
-        output = existsSync(logPath) ? readFileSync(logPath, 'utf8') : undefined;
-        const junitPath = join(job.artifactsDir, 'junit.xml');
-        junit = existsSync(junitPath) ? readFileSync(junitPath, 'utf8') : undefined;
-        const rcText = existsSync(rcPath) ? readFileSync(rcPath, 'utf8').trim() : '';
-        rc = /^\d+$/.test(rcText) && Number.isSafeInteger(Number(rcText)) ? Number(rcText) : undefined;
-        lastFile = output === undefined ? undefined : lastStartedTestFile(output, paths);
+        const read = readShardArtifacts(job.artifactsDir, parts);
+        ({ output, junit, rc, timedOut, finished, unfinishedLog } = read);
+        // A Job the cluster cut at its own deadline leaves no outbox at all: past the deadline with nothing is a timeout too.
+        if (!timedOut && output === undefined && job.exitCode !== 0 && Date.now() - start >= shardDeadline * 1000) timedOut = true;
+        lastFile = output === undefined && unfinishedLog === undefined ? undefined : lastStartedTestFile(`${output ?? ''}\n${unfinishedLog ?? ''}`, paths);
         if (!lastFile && (job.exitCode !== 0 || rc === undefined || (rc !== 0 && rc !== 1))) {
           try { lastFile = lastStartedTestFile(jobLogTail(job).split(/\r?\n/).slice(-200).join('\n'), paths); }
           catch { /* Log retrieval is diagnostic; do not hide the stalled shard. */ }
@@ -537,6 +777,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       } catch {
         jobFailed = true;
       }
+      // A launch that failed before placement still gives its admission back (release is idempotent).
+      admitted?.release();
       const durationMs = Date.now() - start;
       // A reused shard keeps its files as they are — rewriting would replace the measured durationMs the next release plans by.
       if (logDir && !reused && !descent) {
@@ -550,9 +792,17 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         const junitDestination = join(logDir, `pod-${shard}${branch}.junit.xml`);
         if (junit !== undefined) writeFileSync(junitDestination, junit, { mode: 0o600 });
         else rmSync(junitDestination, { force: true });
-        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths), shardCount: shards.length, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed }) + '\n', { mode: 0o600 });
+        const unfinishedDestination = join(logDir, `pod-${shard}${branch}.unfinished.log`);
+        if (unfinishedLog !== undefined) writeFileSync(unfinishedDestination, unfinishedLog, { mode: 0o600 });
+        else rmSync(unfinishedDestination, { force: true });
+        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, ...(timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}), files: paths, plannedSeconds: estimated(paths), deadlineSeconds: shardDeadline, shardCount: shards.length, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed,
+          ...(admitted && admitted.outcome !== 'off' ? { admission: admitted.outcome, admissionWaitMs: admitted.waitedMs } : {}) }) + '\n', { mode: 0o600 });
       }
-      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds: parseInstallSeconds(output ?? '') });
+      const installSeconds = parseInstallSeconds(output ?? '');
+      // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
+      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, deadlineSeconds: shardDeadline, parts: parts.length,
+        ...(timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}) });
+      if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) });
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
       const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
       const passes = clean === undefined ? NaN : summaryCount(clean, 'pass');
@@ -562,6 +812,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let namedFailures: number | undefined;
       let unattributedDetail: string | undefined;
       if (descent === 'split') reason = 'incomplete';
+      else if (timedOut) reason = 'timeout';
       else if (jobFailed || (jobExitCode !== undefined && jobExitCode !== 0) || (rc !== undefined && rc !== 0 && rc !== 1)) reason = 'job-failed';
       else if (!clean || rc === undefined) reason = 'no-output';
       else if (!ran || !Number.isFinite(passes) || !Number.isFinite(fails)
@@ -598,7 +849,12 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         debug.log('release-loop.gate', 'pod-shard-resume-miss', { shard, branch, reason });
         return runShard(paths, shard, depth, branch, retriedNoOutput, true, parentAttempt);
       }
-      if (reason === 'no-output' && !retriedNoOutput) {
+      // GATE-TIMEOUT-HEAL ④: a Pod that died before any test ran (no outbox · jobExitCode≠0 — 0.2.19: isolated retries
+      // ending with exit 5, the source checkout) gets the same one fresh retry as «no output» instead of stalling the sweep.
+      // 137 (killed · OOM) keeps the isolation path: re-running an OOM file only re-measures the same kill.
+      const diedBeforeTests = reason === 'job-failed' && output === undefined && !jobFailed && jobExitCode !== undefined && jobExitCode !== 0
+        && jobExitCode !== 137 && (paths.length === 1 || jobExitCode === 5);
+      if ((reason === 'no-output' || diedBeforeTests) && !retriedNoOutput) {
         const retry = await runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId);
         debug.log('release-loop.gate', 'pod-shard-retry', { shard, files: paths, reason, outcome: retry.stalled[0]?.reason ?? 'ok' });
         return retry;
@@ -675,7 +931,17 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
     };
     // 모든 조각이 끝난 뒤 판정한다 — 한 조각의 예외로 먼저 돌아가면 다른 Pod 가 도는 채로 정리가 시작된다(#22002 리뷰 R3).
-    const settled = await Promise.allSettled(shards.map((item, shard) => runShard(item.files, shard)));
+    const settled = await Promise.allSettled(shards.map(async (item, shard) => {
+      try {
+        const done = await runShard(item.files, shard);
+        const state = !done.stalled.length ? 'done' as const : done.stalled.some((stall) => stall.reason === 'timeout') ? 'timeout' as const : 'failed' as const;
+        markShard(shard, { state, endedAt: new Date().toISOString() }, ['waitReason']);
+        return done;
+      } catch (error) {
+        markShard(shard, { state: 'failed', endedAt: new Date().toISOString() }, ['waitReason']);
+        throw error;
+      }
+    }));
     const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected) throw rejected.reason;
     const results = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
@@ -949,7 +1215,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       } catch (error) { debug.log('release-loop.gate', 'known-failures-unavailable', { error: String(error) }); }
     }
     const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', partial ? 'cut-partial' : 'cut'),
-      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), ...(knownFailures.length ? { knownFailures } : {}) } : undefined,
+      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), ...(knownFailures.length ? { knownFailures } : {}),
+        // GATE-LIVE-OBS: the release ledger's shards.json (UX #24782) — never the run tree's universe; an explicit
+        // --ledger-root (tests) keeps it in that ledger.
+        shardsFile: { path: opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version), version: opts.version } } : undefined,
       partial?.files);
     const localStalled = async (run: CommandResult, tree: string, commit: string, label: string) => {
       const stalled = run.stalledEnv ?? [];
@@ -1219,6 +1488,8 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       ...(fromGraph.gatePodShards !== undefined ? { shards: Number(fromGraph.gatePodShards) } : {}),
       ...(fromGraph.gatePodShardTimeoutSeconds !== undefined ? { shardTimeoutSeconds: Number(fromGraph.gatePodShardTimeoutSeconds) } : {}),
       ...(typeof fromGraph.gatePodBunCache === 'string' && fromGraph.gatePodBunCache.trim() ? { bunCache: fromGraph.gatePodBunCache } : {}),
+      ...(fromGraph.gatePodInstallSlots !== undefined ? { installSlots: Number(fromGraph.gatePodInstallSlots) } : {}),
+      ...(fromGraph.gatePodAdmissionWaitSeconds !== undefined ? { admissionWaitSeconds: Number(fromGraph.gatePodAdmissionWaitSeconds) } : {}),
       ...(fromGraph.gatePodFreshShards === true ? { freshShards: true } : {}),
       ...((cpu) => cpu ? { cpu } : {})(parsePodCpu(fromGraph.gatePodCpu, 'release.loop.gatePodCpu')),
     } : undefined,

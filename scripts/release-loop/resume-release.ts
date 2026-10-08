@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
 
@@ -165,10 +166,12 @@ function savedGraphPath(statePath: string): string | undefined {
 /** Refresh the branch tip, then restart the failed run at `from` with the saved graph snapshot. */
 export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
+  // RELEASE-LEDGER-UNIVERSE: decide the universe once; the run lookup and every resumed node use it.
+  deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const tip = refreshReleaseBranchTip(opts.runId, deps, opts.from);
   const partial = preparePartial(tip, opts, deps);
   // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
-  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, ...(deps.root || deps.runBash ? { deps: { ...(deps.root ? { root: deps.root } : {}), ...(deps.runBash ? { runBash: deps.runBash } : {}) } } : {}) });
+  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true, deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };
 }

@@ -2,7 +2,12 @@ import { inQuietHours, kstMinutes, sendOutbound, setInProcessOutbound } from './
 import { setUserConfigOverlay } from '../user-config.js';
 
 // Focused subprocess fixture: isolated state/config roots and a fake curl on PATH.
-setUserConfigOverlay(cfg => ({ ...cfg, telegram: { ...cfg.telegram, botToken: '123456:private-secret', homeChannel: 98765 } }));
+// Hermetic: the shared `.elanous-test` config may carry a routing table another test left behind (a declared
+// `channels` table is authoritative and never falls back to the main home), so the fixture owns every routing key.
+setUserConfigOverlay(cfg => ({ ...cfg, telegram: {
+  ...cfg.telegram, channels: undefined, reportChannel: undefined, testChannel: undefined,
+  botToken: '123456:private-secret', homeChannel: 98765,
+} }));
 process.env.SEND_VIA_ELANOUS = '0';
 // Quiet hours (00:00~06:30 KST) defer instead of sending, so a gate run at night saw no `sent` row.
 // Shift this fixture's clock back to 23:59 KST of the previous day; the shift stays inside this process.

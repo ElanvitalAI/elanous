@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_SWEEP_CLOSE_CAP, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_SWEEP_CLOSE_CAP, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
 
@@ -226,6 +226,204 @@ describe('supersedeDraftsOnMerge', () => {
     expect(failedResult.closed).toEqual([]);
     expect(failures.calls.filter((call) => call.startsWith('label:'))).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
     expect(failedResult.kept).toHaveLength(rows.length);
+  });
+});
+
+describe('draft metrics', () => {
+  it('counts open inventory, oldest age and missing claim owner; converts only merged PRs within 48h of creation', async () => {
+    const rows = [draft(1, { createdAt: '2026-09-29T00:00:00Z' }),
+      draft(2, { createdAt: '2026-09-26T00:00:00Z' }),
+      draft(3, { branch: 'human/other', labels: [], createdAt: '2026-09-29T00:00:00Z' })];
+    const fixture = make(rows);
+    fixture.adapters.getActiveClaimOwner = async (_repo, number) => number === 1 ? 'OP' : undefined;
+    fixture.adapters.listRecentClosed = async () => [
+      { number: 10, title: 'converted', branch: 'self-impl/converted', draft: true, labels: [], createdAt: '2026-09-27T00:00:00Z', mergedAt: '2026-09-28T23:00:00Z' },
+      { number: 11, title: 'late', branch: 'self-impl/late', draft: true, labels: [], createdAt: '2026-09-27T23:00:00Z', mergedAt: '2026-09-30T00:00:00Z' },
+    ];
+    expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
+      inventory: 2, oldestAgeHours: 96, needsOwner: 1, converted48h: 1, cohort48h: 3, conversion48h: 1 / 3,
+    });
+    expect(draftSweepDaily(rows, [], now, new Map())).toEqual({ date: '2026-09-30', over24h: 2, closable: 0, harvestable: 0, blocked: 0 });
+    fixture.adapters.listRecentClosed = async () => [{ number: 12, title: 'labelled', branch: 'topic/labelled', draft: true,
+      labels: ['elanous:running'], createdAt: '2026-09-27T00:00:00Z', mergedAt: '2026-09-28T00:00:00Z' }];
+    expect((await collectDraftMetrics('owner/repo', fixture.adapters, now)).conversion48h).toBe(0.5);
+    fixture.adapters.listRecentClosed = async () => [{ number: 13, title: 'closed without merging', branch: 'self-impl/closed', draft: true,
+      labels: [], createdAt: '2026-09-27T00:00:00Z' }];
+    expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toMatchObject({
+      cohort48h: 2, converted48h: 0, conversion48h: 0,
+    });
+    fixture.adapters.listRecentClosed = async () => [{ number: 14, title: 'bad ordering', branch: 'self-impl/invalid',
+      labels: [], createdAt: '2026-09-27T00:00:00Z', mergedAt: '2026-09-26T00:00:00Z' }];
+    expect((await collectDraftMetrics('owner/repo', fixture.adapters, now)).converted48h).toBe(0);
+  });
+
+  it('does not invent a conversion when no cohort exists, and fails closed on missing owner or merged source', async () => {
+    const fixture = make([]);
+    fixture.adapters.listRecentClosed = async () => [];
+    fixture.adapters.getActiveClaimOwner = async () => undefined;
+    expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
+      inventory: 0, oldestAgeHours: null, needsOwner: 0, converted48h: 0, cohort48h: 0, conversion48h: null,
+    });
+    fixture.adapters.listRecentClosed = undefined;
+    expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('48h closed cohort unavailable');
+    fixture.adapters.listRecentClosed = async () => [];
+    fixture.adapters.listDrafts = async () => [draft(5)];
+    fixture.adapters.getActiveClaimOwner = undefined;
+    expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Draft owner lookup unavailable');
+    fixture.adapters.getActiveClaimOwner = async () => undefined;
+    fixture.adapters.listRecentClosed = async () => [{ number: 5, title: 'duplicate', branch: 'self-impl/duplicate', draft: true,
+      labels: [], createdAt: '2026-09-28T00:00:00Z' }];
+    expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Overlapping draft metric inventory');
+  });
+});
+
+describe('overlap metrics', () => {
+  // Shaped like the real 2026-10-07 rows: Pod-forwarded, payload as a JSON string, axis summaries not lists.
+  const payload = (runId: string | null, warnings: Array<{ kind: string; name: string }>, extra: Record<string, unknown> = {}) => ({
+    inputSource: 'say', goalFile: '/home/ubuntu/repo/docs/goals/GOAL-src-a-ts-ed9934a2-2026-09-29.md', paths: ['src/a.ts'],
+    invokerBehindDefaultBranch: false, blockers: [], warnings, plannedBranchStatus: 'resolved',
+    siblingPrCount: warnings.filter((w) => w.kind === 'sibling-pr').length,
+    openPrs: { state: 'checked', count: 41 }, liveRuns: { state: 'checked', count: 0 }, unreadableRuns: 0, liveRunWindowMs: 1_800_000,
+    forceRequested: false, bypassed: false, ...(runId ? { runId } : {}), ...extra,
+  });
+  const pod = (ts: string, data: Record<string, unknown> | string): OverlapPreflightRow =>
+    ({ ts, data: { origin: 'pod', podJob: 'si-task-02a19f3aba1d-67b8d2dd', originalData: typeof data === 'string' ? data : JSON.stringify(data) } });
+  const capped = { kind: 'open-pr', name: '(열린 PR 조회 상한 200)' };
+  const truncated = { openPrs: { state: 'truncated', count: 200, limit: 200 } };
+  const overlapAdapters = (rows: readonly OverlapPreflightRow[] | null, prs: SweepMergedPr[], drafts: SweepDraft[] = [],
+    salvaged: readonly OverlapPreflightRow[] | null = []): OverlapMetricAdapters => ({
+    listPreflightRows: async () => rows,
+    listSalvagedRows: async () => salvaged,
+    listDrafts: async (page) => page === 1 ? drafts : [],
+    listRecentClosed: async () => prs.filter((pr) => pr.number >= 100),
+    getPr: async (_repo, number) => prs.find((pr) => pr.number === number),
+  });
+  const first = (number: number, slug: string): SweepMergedPr => ({ number, title: slug, branch: `self-impl/${slug}-1111aaaa`, labels: [], createdAt: '2026-09-29T00:00:00Z' });
+  const none = { linked: null, autoLanded: null, autoRate: null, secondSiblingMedianHours: null, salvaged: null, salvageUnmeasured: null };
+
+  it('reads Pod-forwarded string payloads, counts named overlaps once per run, and keeps capped scans unmeasured', async () => {
+    const a = pod('2026-09-29T02:00:00Z', payload('run-aaaaaa11-1111', [{ kind: 'open-pr', name: '#1' }, { kind: 'recent-change', name: 'src/a.ts' }]));
+    const rows = [
+      a,
+      { ...a },   // the same prod file reached through a second registered name — one launch
+      // Capped scan that still named an overlapping PR: proven.
+      pod('2026-09-29T04:00:00Z', payload('run-bbbbbb22-2222', [capped, { kind: 'open-pr', name: '#2' }], truncated)),
+      // Capped scan with no named PR: blind, not «no overlap».
+      pod('2026-09-29T05:00:00Z', payload('run-dddddd44-4444', [capped], truncated)),
+      // Fully checked, only a recent-change warning: measured clean.
+      pod('2026-09-29T06:00:00Z', payload('run-eeeeee55-5555', [{ kind: 'recent-change', name: 'src/a.ts' }])),
+      // Local (not forwarded) row with a named sibling and no runId: linked through the sibling's lineage.
+      { ts: '2026-09-29T09:00:00Z', data: payload(null, [{ kind: 'sibling-pr', name: '#5' }]) },
+      // Forced past a live-run blocker: proven overlap, but no PR of its own yet.
+      pod('2026-09-29T10:00:00Z', payload('run-cccccc33-3333', [], { blockers: [{ kind: 'live-run', name: 'run-x' }], forceRequested: true, bypassed: true })),
+      // Not counted: blocked, or outside the window.
+      pod('2026-09-29T11:00:00Z', payload('run-ffffff66-6666', [{ kind: 'open-pr', name: '#9' }], { blockers: [{ kind: 'no-target-paths', name: '(대상 경로 0)' }] })),
+      pod('2026-09-28T23:00:00Z', payload('run-gggggg77-7777', [{ kind: 'open-pr', name: '#9' }])),
+    ];
+    const prs = [first(1, 'x'), first(2, 'y'), first(5, 'd'),
+      { number: 100, title: 'a', branch: 'self-impl/goalid-aa-src-a-ts-1234abcd-raaaaaa', labels: [], createdAt: '2026-09-29T02:30:00Z', mergedAt: '2026-09-29T05:00:00Z' },
+      { number: 101, title: 'b', branch: 'self-impl/goalid-bb-src-a-ts-2345bcde-rbbbbbb', labels: ['elanous:idea-approval'], createdAt: '2026-09-29T04:30:00Z', mergedAt: '2026-09-29T08:00:00Z' },
+      { number: 103, title: 'd', branch: 'self-impl/d-5555eeee', labels: [], createdAt: '2026-09-29T09:30:00Z', mergedAt: '2026-09-29T10:30:00Z' }];
+    expect(await collectOverlapMetrics('owner/repo', overlapAdapters(rows, prs), now)).toEqual({
+      launches24h: 4, launched: 6, unmeasured: 1, sourceIncomplete: false,
+      linked: 3, autoLanded: 2, autoRate: 2 / 3, secondSiblingMedianHours: 3, salvaged: 0, salvageUnmeasured: 0,
+    });
+  });
+
+  it('says «source incomplete» instead of zero for unreadable, empty or unparsable sources', async () => {
+    const incomplete = { launches24h: null, launched: null, unmeasured: null, sourceIncomplete: true, ...none };
+    expect(await collectOverlapMetrics('owner/repo', overlapAdapters(null, []), now)).toEqual(incomplete);
+    expect(await collectOverlapMetrics('owner/repo', overlapAdapters([], []), now)).toEqual(incomplete);
+    const good = pod('2026-09-29T02:00:00Z', payload('run-aaaaaa11', [{ kind: 'open-pr', name: '#1' }]));
+    for (const bad of [pod('2026-09-29T03:00:00Z', '{"warnings": ['), { ts: 'not a time', data: payload('run-b', []) },
+      pod('2026-09-29T03:00:00Z', { runId: 'run-no-arrays' })]) {
+      expect(await collectOverlapMetrics('owner/repo', overlapAdapters([good, bad], []), now)).toEqual(incomplete);
+    }
+  });
+
+  it('keeps counts but leaves landing unmeasured when nothing links or GitHub fails', async () => {
+    const clean = [pod('2026-09-29T08:00:00Z', payload('run-aaaaaa11', [{ kind: 'recent-change', name: 'src/a.ts' }]))];
+    expect(await collectOverlapMetrics('owner/repo', overlapAdapters(clean, []), now)).toEqual({
+      launches24h: 0, launched: 1, unmeasured: 0, sourceIncomplete: false, linked: 0, autoLanded: 0, autoRate: null, secondSiblingMedianHours: null,
+      salvaged: 0, salvageUnmeasured: 0,
+    });
+    const liveOnly = [{ ts: '2026-09-29T08:00:00Z', data: payload(null, [{ kind: 'live-run', name: 'run-x' }]) }];
+    expect(await collectOverlapMetrics('owner/repo', overlapAdapters(liveOnly, []), now)).toEqual({ launches24h: 1, launched: 1, unmeasured: 0, sourceIncomplete: false, ...none });
+    const named = [pod('2026-09-29T08:00:00Z', payload('run-aaaaaa11', [{ kind: 'open-pr', name: '#7' }]))];
+    const failing = { ...overlapAdapters(named, [first(7, 'e')]), listRecentClosed: async () => { throw new Error('GitHub 502'); } };
+    expect(await collectOverlapMetrics('owner/repo', failing, now)).toEqual({ launches24h: 1, launched: 1, unmeasured: 0, sourceIncomplete: false, ...none });
+  });
+});
+
+describe('overlap metrics — DRAFT-NOT-ARCHIVE salvage siblings', () => {
+  const payload = (runId: string | null, warnings: Array<{ kind: string; name: string }>) => ({
+    goalFile: 'docs/goals/GOAL-src-a-ts.md', paths: ['src/a.ts'], blockers: [], warnings,
+    openPrs: { state: 'checked', count: 41 }, liveRuns: { state: 'checked', count: 0 }, bypassed: false, ...(runId ? { runId } : {}),
+  });
+  // Shaped like orchestrator `observe('salvaged', { ...stopCard, salvageBranch }, { category: 'self-implement.draft-not-archive' })`.
+  const salvagedEvent = (runId: string, branch: string, salvageBranch: string) => ({
+    stage: 'abandoned', mode: 'needs-owner-only', stopClass: 'harvestable', classification: 'implementation-deficit',
+    reason: 'gate red', nextMove: '수확 가지에서 이어 받는다', branch, salvageBranch, prBodyArtifactPath: '/tmp/body.md', runId,
+  });
+  const pod = (ts: string, data: Record<string, unknown>): OverlapPreflightRow =>
+    ({ ts, data: { origin: 'pod', podJob: 'si-task-02a19f3aba1d-67b8d2dd', originalData: JSON.stringify(data) } });
+  const adapters = (salvaged: readonly OverlapPreflightRow[] | null, prs: SweepMergedPr[]): OverlapMetricAdapters => ({
+    listPreflightRows: async () => [
+      // A: own run, no PR of its own — only a salvage branch.
+      pod('2026-09-29T02:00:00Z', payload('run-aaaaaa11-1111', [{ kind: 'open-pr', name: '#1' }])),
+      // B: sibling lineage `d`; its salvage branch later landed through a PR.
+      { ts: '2026-09-29T04:00:00Z', data: payload(null, [{ kind: 'sibling-pr', name: '#5' }]) },
+      // C: its only salvage event predates the launch — not its sibling.
+      pod('2026-09-29T06:00:00Z', payload('run-cccccc33-3333', [{ kind: 'open-pr', name: '#1' }])),
+    ],
+    listSalvagedRows: async () => salvaged,
+    listDrafts: async () => [],
+    listRecentClosed: async () => prs.filter((pr) => pr.number >= 100),
+    getPr: async (_repo, number) => prs.find((pr) => pr.number === number),
+  });
+  const firsts: SweepMergedPr[] = [
+    { number: 1, title: 'x', branch: 'self-impl/x-1111aaaa', labels: [], createdAt: '2026-09-28T00:00:00Z' },
+    { number: 5, title: 'd', branch: 'self-impl/d-1111aaaa', labels: [], createdAt: '2026-09-28T00:00:00Z' },
+  ];
+  const rowsA = pod('2026-09-29T03:00:00Z', salvagedEvent('run-aaaaaa11-1111', 'self-impl/goalid-aa-src-a-ts-1234abcd-raaaaaa',
+    'salvage/run-aaaaaa/self-impl-goalid-aa-src-a-ts-1234abcd-raaaaaa'));
+  const rowsB = { ts: '2026-09-29T05:00:00Z', data: salvagedEvent('run-123456ab', 'self-impl/d-9999ffff-r123456', 'salvage/run-123456/self-impl-d-9999ffff-r123456') };
+  const rowsC = pod('2026-09-29T05:30:00Z', salvagedEvent('run-cccccc33-3333', 'self-impl/c-2222bbbb-rcccccc', 'salvage/run-cccccc/self-impl-c-2222bbbb-rcccccc'));
+  const landedB: SweepMergedPr = { number: 104, title: 'd', branch: 'salvage/run-123456/self-impl-d-9999ffff-r123456', labels: [],
+    createdAt: '2026-09-29T06:00:00Z', mergedAt: '2026-09-29T07:00:00Z' };
+
+  it('links a salvage-only sibling as «salvaged — not landed», and a later PR from that branch through its merge', async () => {
+    expect(await collectOverlapMetrics('owner/repo', adapters([rowsA, rowsB, rowsC], [...firsts, landedB]), now)).toEqual({
+      launches24h: 3, launched: 3, unmeasured: 0, sourceIncomplete: false,
+      linked: 2, autoLanded: 1, autoRate: 0.5, secondSiblingMedianHours: 3, salvaged: 1, salvageUnmeasured: 0,
+    });
+    // Before B's salvage branch got a PR: both siblings salvaged, neither auto-landed.
+    expect(await collectOverlapMetrics('owner/repo', adapters([rowsA, rowsB, rowsC], firsts), now)).toMatchObject({
+      linked: 2, autoLanded: 0, autoRate: 0, secondSiblingMedianHours: null, salvaged: 2, salvageUnmeasured: 0,
+    });
+  });
+
+  it('counts launches with no PR sibling as unmeasured when the salvage source is unreadable, absent or unparsable', async () => {
+    const unmeasured = { linked: 0, autoLanded: 0, autoRate: null, salvaged: null, salvageUnmeasured: 3 };
+    expect(await collectOverlapMetrics('owner/repo', adapters(null, firsts), now)).toMatchObject(unmeasured);
+    const { listSalvagedRows: _drop, ...absent } = adapters([], firsts);
+    expect(await collectOverlapMetrics('owner/repo', absent, now)).toMatchObject(unmeasured);
+    const throwing = { ...adapters([], firsts), listSalvagedRows: async () => { throw new Error('logs.db locked'); } };
+    expect(await collectOverlapMetrics('owner/repo', throwing, now)).toMatchObject(unmeasured);
+    const broken = pod('2026-09-29T03:00:00Z', { stage: 'abandoned', runId: 'run-aaaaaa11' });
+    expect(await collectOverlapMetrics('owner/repo', adapters([rowsA, broken], firsts), now)).toMatchObject(unmeasured);
+    // A PR-found sibling never needs the salvage source.
+    expect(await collectOverlapMetrics('owner/repo', adapters(null, [...firsts, { ...landedB, branch: 'self-impl/d-9999ffff-r123456' }]), now))
+      .toMatchObject({ linked: 1, autoLanded: 1, salvaged: null, salvageUnmeasured: 2 });
+  });
+
+  it('countSalvagedToday: distinct salvage branches since the day start; unreadable or unparsable gives null, not 0', () => {
+    const dayStart = new Date('2026-09-29T03:00:00Z');
+    expect(countSalvagedToday([rowsA, { ...rowsA }, rowsB, rowsC, pod('2026-09-29T02:59:59Z', salvagedEvent('run-dddddd', 'b', 'salvage/run-dddddd/b'))], dayStart, now)).toBe(3);
+    expect(countSalvagedToday([], dayStart, now)).toBe(0);
+    expect(countSalvagedToday(null, dayStart, now)).toBeNull();
+    expect(countSalvagedToday([rowsA, { ts: 'not a time', data: rowsA.data }], dayStart, now)).toBeNull();
+    expect(countSalvagedToday([{ ts: '2026-09-29T04:00:00Z', data: { origin: 'pod', originalData: '{"salvageBranch": ' } }], dayStart, now)).toBeNull();
   });
 });
 

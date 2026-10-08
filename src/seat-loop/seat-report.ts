@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig, type SeatLoopConfig } from '../user-config.js';
+import { collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type DraftMetrics, type OverlapMetrics } from '../self-dev/draft-sweep.js';
 import { seatDay, seatLedgerPath, type OpCandidate, type SeatEntry } from './seat-loop.js';
 
 export type SeatReportDeps = {
@@ -16,6 +17,10 @@ export type SeatReportDeps = {
   config?: SeatLoopConfig;
   post?: boolean;
   send?: (body: string, seat: string, pr: number) => Promise<void> | void;
+  draftMetrics?: (now: Date) => Promise<DraftMetrics>;
+  overlapMetrics?: (now: Date) => Promise<OverlapMetrics>;
+  /** DRAFT-NOT-ARCHIVE salvage branches since the KST day start; null = unreadable. */
+  salvagedToday?: (dayStart: Date, now: Date) => Promise<number | null>;
 };
 export type SeatReportResult = { seat: string; date: string; body: string; posted: boolean };
 const repoRoot = resolve(import.meta.dir, '../..');
@@ -34,6 +39,21 @@ function opJudgment(candidate: OpCandidate): { kind: 'card' | 'todo'; text: stri
   const text = `결정 대리 ${candidate.id} ${candidate.title ?? ''}`.trim();
   return { kind: candidate.category && ['irreversible', 'money', 'security', 'secret', 'publish'].includes(candidate.category) ? 'card' : 'todo',
     text: `${text} (${candidate.category ?? '범주 없음'})` };
+}
+
+/** OVERLAP-METRIC line; ⛔ an unmeasured value says so instead of printing 0. */
+function overlapLine(metrics: OverlapMetrics): string {
+  if (metrics.sourceIncomplete || metrics.launches24h === null) return ' · 겹침 발사 24h 못 잼(원천 불완전)';
+  const launched = metrics.launched === null ? '' : metrics.unmeasured
+    ? ` 이상 (발사 ${metrics.launched} 중 ${metrics.unmeasured} 못 잼)` : ` (발사 ${metrics.launched})`;
+  const rate = metrics.autoRate === null || metrics.linked === null || metrics.autoLanded === null
+    ? (metrics.linked === 0 ? '표본 없음' : '못 잼')
+    : `${(metrics.autoRate * 100).toFixed(1)}% (${metrics.autoLanded}/${metrics.linked})`;
+  const median = metrics.secondSiblingMedianHours === null ? (metrics.linked === null ? '못 잼' : '표본 없음')
+    : `${metrics.secondSiblingMedianHours.toFixed(1)}h`;
+  const salvage = (metrics.salvaged ? ` · 수확 가지 형제 ${metrics.salvaged}(미착지)` : '')
+    + (metrics.salvageUnmeasured ? ` · 수확 가지 ${metrics.salvageUnmeasured} 못 잼` : '');
+  return ` · 겹침 발사 24h ${metrics.launches24h}${launched} · 겹침 자동 착지 ${rate} · 둘째 형제 착지 중앙값 ${median}${salvage}`;
 }
 
 async function defaultSend(body: string, seat: string, pr: number, repo: string): Promise<void> {
@@ -58,8 +78,13 @@ export async function seatReport(seat: string, deps: SeatReportDeps = {}): Promi
   // One line per item, its last state wins: an `attempting` row followed by `launched` is not «unconfirmed».
   const latest = new Map<string, SeatEntry>();
   const judgments = new Map<string, OpCandidate>();
+  const filtered = { auto: 0, route: 0 };
   for (const entry of entries) {
-    if (seat === 'OP' && entry.candidate) {
+    if (entry.candidate?.kind === 'decision-filter') {
+      filtered[entry.candidate.verdict] += 1;
+      continue;
+    }
+    if (seat === 'OP' && entry.candidate && 'verdict' in entry.candidate) {
       if (entry.candidate.verdict === 'none') {
         if (entry.candidate.id) {
           const key = entry.candidate.kind === 'unassigned-cell'
@@ -89,8 +114,38 @@ export async function seatReport(seat: string, deps: SeatReportDeps = {}): Promi
     return `건너뜀 ${entry.status} ${label}`;
   });
   const classified = [...judgments.values()].map(opJudgment).filter((row): row is NonNullable<typeof row> => row !== null);
-  const opDetail = classified.length ? ` · 결정 카드 후보: ${classified.filter((row) => row.kind === 'card').map((row) => row.text).join(' / ') || '없음'} · OP 가 할 일: ${classified.filter((row) => row.kind === 'todo').map((row) => row.text).join(' / ') || '없음'}` : '';
-  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}`;
+  const opDetail = (classified.length ? ` · 결정 카드 후보: ${classified.filter((row) => row.kind === 'card').map((row) => row.text).join(' / ') || '없음'} · OP 가 할 일: ${classified.filter((row) => row.kind === 'todo').map((row) => row.text).join(' / ') || '없음'}` : '')
+    + (filtered.auto + filtered.route ? ` · 카드 거르기: 자동 ${filtered.auto} · 넘김 ${filtered.route}` : '');
+  let draftDetail = '';
+  if (seat === 'OP') {
+    try {
+      const metrics = await (deps.draftMetrics ?? (async (clock: Date) => {
+        const [{ resolveRepositoryName }, { githubDraftSweepAdapters }] = await Promise.all([
+          import('../harness/repository-name.js'), import('../harness/harness-cli-command.js'),
+        ]);
+        return collectDraftMetrics(resolveRepositoryName({}), githubDraftSweepAdapters(), clock);
+      }))(now);
+      draftDetail = ` · draft 재고 ${metrics.inventory} · 최장 나이 ${metrics.oldestAgeHours === null ? '해당 없음' : `${metrics.oldestAgeHours.toFixed(1)}h`} · needs-owner ${metrics.needsOwner} · 48h 전환율 ${metrics.conversion48h === null ? '표본 없음' : `${(metrics.conversion48h * 100).toFixed(1)}% (${metrics.converted48h}/${metrics.cohort48h})`}`;
+    } catch { draftDetail = ' · draft 지표 못 읽음'; }
+    try {
+      const overlap = await (deps.overlapMetrics ?? (async (clock: Date) => {
+        const [{ resolveRepositoryName }, { githubDraftSweepAdapters }, { readAskPreflightRowsSince, readSalvagedRowsSince }] = await Promise.all([
+          import('../harness/repository-name.js'), import('../harness/harness-cli-command.js'), import('../self-dev/ask-launch-io.js'),
+        ]);
+        return collectOverlapMetrics(resolveRepositoryName({}), { ...githubDraftSweepAdapters(), listPreflightRows: readAskPreflightRowsSince, listSalvagedRows: readSalvagedRowsSince }, clock);
+      }))(now);
+      draftDetail += overlapLine(overlap);
+    } catch { draftDetail += ' · 겹침 지표 못 읽음'; }
+    let salvagedToday: number | null = null;
+    try {
+      salvagedToday = await (deps.salvagedToday ?? (async (dayStart: Date, clock: Date) => {
+        const { readSalvagedRowsSince } = await import('../self-dev/ask-launch-io.js');
+        return countSalvagedToday(await readSalvagedRowsSince(dayStart), dayStart, clock);
+      }))(new Date(`${date}T00:00:00+09:00`), now);
+    } catch { salvagedToday = null; }
+    draftDetail += ` · 수확 가지 오늘 ${salvagedToday === null ? '못 잼' : salvagedToday}`;
+  }
+  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}${draftDetail}`;
   const pr = (deps.config ?? getUserConfig().loops?.seat)?.reportPr;
   const posted = deps.post === true && pr !== undefined;
   if (posted) await (deps.send ?? ((text, id, number) => defaultSend(text, id, number, deps.repo ?? repoRoot)))(body, seat, pr);

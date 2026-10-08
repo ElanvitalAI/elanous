@@ -28,6 +28,10 @@ with their user id and the command to register it
 (`elanous config set telegram.allowedUsers '[<id>]'`), and does nothing
 else until you do.
 
+## Check running harness runs
+
+Send `/runs` to see which harness runs are running now. The reply is the same text the TUI prints for `/harness runs`: the running count, then one line per assessed run. Long replies arrive in several messages.
+
 ## Away mode — follow a release from Telegram only
 
 When you step away, away mode sends every release-run transition to Telegram so you never have to open the dashboard to know where a release is.

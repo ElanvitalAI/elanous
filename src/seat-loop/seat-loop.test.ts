@@ -19,7 +19,7 @@ import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { writePersonaTodos } from '../persona/persona-todo.js';
-import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, type SeatDeps } from './seat-loop.js';
+import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, type SeatDeps } from './seat-loop.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -2414,5 +2414,32 @@ test('a seat question left awaiting a neighbor resolution escalates to a CEO car
     expect((await runSeatLoopOnce('MK', mk)).status).toBe('hitl');
     const raise = f.calls.find((args) => args[0] === 'decisions')!;
     expect(raise[raise.indexOf('--xcheck') + 1]).toContain('120분 안 해소 안 됨');
+  } finally { f.close(); }
+});
+
+test('SEAT-FORBID-NEGATION: a forbidden word next to a negation is not a decision; real requests stay flagged with a judgment line', async () => {
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const cases: Array<[string, 'decision' | 'harness']> = [
+      ['비밀 0', 'harness'], ['비밀 0 으로 칸을 닫는다', 'harness'], ['비밀 제외', 'harness'], ['비밀 없이 진행', 'harness'],
+      ['비밀 빼고 문서만', 'harness'], ['비밀은 금지', 'harness'], ['비밀 없음', 'harness'], ['자격 증명 빼고 설치', 'harness'],
+      ['no secret in logs', 'harness'], ['without credential', 'harness'], ['excluding secret values', 'harness'], ['secret: none', 'harness'],
+      ['비밀 키를 붙여라', 'decision'], ['토큰 출력', 'decision'], ['토큰을 노출', 'decision'], ['비밀 키 공유', 'decision'],
+      ['secret 값을 붙여라', 'decision'], ['비밀 0 · main 에 병합해라', 'decision'], ['자격 증명을 파일로', 'decision'], ['secret 0x1f 를 붙여라', 'decision'],
+    ];
+    for (const [text, kind] of cases)
+      expect({ text, kind: planAction({ source: 'request', id: 'neg', title: '요청', text }).kind }).toEqual({ text, kind });
+  } finally { spy.mockRestore(); }
+  const f = fixture();
+  try {
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => {
+      calls.push(args);
+      return args[1] === 'budget' ? '{"outcome":"proceed"}' : '{"id":"dec-test"}';
+    } };
+    writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'), JSON.stringify({ key: 'leak', seat: 'TC', text: '비밀 키를 붙여라', status: 'pending', queuedAt: now.toISOString() }) + '\n');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
+    const raise = calls.find(args => args[1] === 'raise')!;
+    expect(raise[raise.indexOf('--pending-question') + 1]).toContain(FORBID_JUDGMENT_LINE('비밀'));
   } finally { f.close(); }
 });

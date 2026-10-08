@@ -112,7 +112,7 @@ test('docs-follow writes measured report and idempotent MK queue only after veri
     expect(first.pending).toHaveLength(1);
     recordDocsFollow(root, manifest, items, new Date('2026-10-05T01:00:00Z'));
     const row = listSeatRequests(root, { seat: 'MK', status: 'queued' });
-    expect(row).toHaveLength(3);
+    expect(row).toHaveLength(1);
     expect(row[0]).toMatchObject({ key: 'docs-follow:9.9.9:F1', seat: 'MK', status: 'queued' });
     expect(row[0]!.text).toContain('docs, homepage, readme');
     closeSeatRequests(root, [row[0]!.key], { reason: 'MK verified', status: 'done' });
@@ -122,7 +122,22 @@ test('docs-follow writes measured report and idempotent MK queue only after veri
     const saved = JSON.parse(readFileSync(join(root, 'release/9.9.9/docs-follow.json'), 'utf8'));
     expect(saved.pending).toMatchObject([{ id: 'F1' }]);
     expect(saved.verdict).toBe('unmeasured');
-    expect(listSeatRequests(root, { seat: 'MK' }).some((entry) => entry.key === 'docs-follow:9.9.9:landing:fix')).toBe(true);
+    expect(saved.unassessed).toEqual(['landing:fix', 'landing:security']);
+    expect(listSeatRequests(root, { seat: 'MK' }).map((entry) => entry.key)).toEqual(['docs-follow:9.9.9:F1']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('unassessed-only follow-up remains in the per-release report without MK work, even on retry', () => {
+  const root = mkdtempSync(join(tmpdir(), 'docs-follow-unassessed-'));
+  try {
+    const release = { ...manifest, in: [manifest.in[0]!] };
+    const items = [{ id: 'F1', status: 'green', sha: 'feature' }];
+    const first = recordDocsFollow(root, release, items, new Date('2026-10-05T00:00:00Z'));
+    expect(first).toMatchObject({ pending: [], unassessed: ['F1'], verdict: 'unmeasured' });
+    recordDocsFollow(root, release, items, new Date('2026-10-05T01:00:00Z'));
+    expect(listSeatRequests(root)).toEqual([]);
+    const saved = JSON.parse(readFileSync(join(root, 'release/9.9.9/docs-follow.json'), 'utf8'));
+    expect(saved).toMatchObject({ pending: [], unassessed: ['F1'], verdict: 'unmeasured', measuredAt: '2026-10-05T01:00:00.000Z' });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

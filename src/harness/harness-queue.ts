@@ -1,9 +1,11 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
+import { findTreeRoot } from '../cli/test-flag.js';
+import { readLogInstances, type LogInstanceView } from '../mss/logging/instance-registry.js';
 import { effectiveInstanceRoot, prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { listChecklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { readLandingFreeze } from '../release-loop/landing-freeze.js';
@@ -29,11 +31,17 @@ export type QueueItem = {
   priority?: number;
 };
 export type QueuePool = { running: number; pending: number; reserved: number; limit: number };
-export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string };
+export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string;
+  /** QUEUE-BURST: every row this tick launched, first one = `item` (present only on a scheduled tick that launched). */ launched?: QueueItem[] };
 /** progressAt = newest run-ledger updatedAt among the tree's members; stopReason = the ledger's supervisor stop (SEAT-CAP-STALE).
  *  ledgerRunIds = run ids of the members' ledger records — the `elanous.run` label of their Pod Jobs (SEAT-CAP-STALE2). */
 export type QueueProcess = { pid: number; seat?: QueueSeat; launchId?: string; runId?: string; rootPid?: number;
-  progressAt?: number; stopReason?: string; ledgerRunIds?: string[] };
+  progressAt?: number; stopReason?: string; ledgerRunIds?: string[];
+  /** CHILD-UNIV-COUNT: present only when a member's ledger record lives in a derived child universe (not the parent's). */
+  universe?: 'child' };
+/** CHILD-UNIV-COUNT: the host inventory plus which derived child universes it read. `unreadable` roots are «못 읽음» —
+ *  their runs may hold a seat but cannot be attributed, so the count is not trusted as complete. */
+export type QueueInventory = { processes: readonly QueueProcess[]; childUniverses: { roots: readonly string[]; unreadable: readonly string[] } };
 type ProcessProbe = {
   run?: typeof spawnSync; platform?: NodeJS.Platform;
   cwd?: (pid: number) => string;
@@ -41,6 +49,11 @@ type ProcessProbe = {
   runsDir?: string;
   environ?: (pid: number) => string;
   birthId?: (pid: number) => string | undefined;
+  /** CHILD-UNIV-COUNT: derived child universe roots whose self-dev ledgers are read with the parent's. Default:
+   *  `harnessQueueChildUniverseRoots` (never in a test process). */
+  childUniverseRoots?: () => readonly string[];
+  /** Extra launch trees (queue rows' launchCwd) whose derived universes the default enumeration includes. */
+  launchTrees?: readonly string[];
 };
 const queueSeatNames = ['OP', 'TC', 'MK', 'UX'] as const;
 
@@ -65,8 +78,23 @@ export interface HarnessQueueDeps {
   afterEnqueue?: (item: QueueItem) => void | Promise<void>;
   /** Script the default launcher runs under the queue child wrapper (default bin/elanous.mjs). */
   launchCommand?: string;
+  /** QUEUE-BURST: most launches one scheduled tick makes. Absent = `harness.queue.burstMax`, else 5. A requested (direct) tick always launches at most one. */
+  burstMax?: number;
+  /** QUEUE-BURST: least gap between two queue launches, across ticks and processes (default 30 s — simultaneous Pod launches died in a chain). */
+  launchStaggerMs?: number;
+  /** Test seam: the wait between burst launches (default Bun.sleep). */
+  sleep?: (ms: number) => Promise<void>;
   alive?: (pid: number) => boolean;
   processes?: () => readonly QueueProcess[];
+  /** CHILD-UNIV-COUNT: inventory with child-universe coverage; wins over `processes`. A `processes`-only seam reads no
+   *  child universe, so its limit line stays parent-only. */
+  inventory?: (launchTrees: readonly string[]) => QueueInventory;
+  /** Production freeze root a tick also honors (a work-tree launch ticks in its test universe). Default: prodInstanceRoot(),
+   *  except in a test process where it is the tick's own root. */
+  prodFreezeRoot?: string;
+  /** CHILD-UNIV-HOLD: ops-health alert for a universe unreadable over an hour (default: sendOutbound 'ops-health'; none in
+   *  a test process). */
+  unreadableAlert?: (text: string) => void | Promise<void>;
   receipt?: (root: string, launchId: string) => 'started' | 'finished' | 'not-started' | null;
   now?: () => Date;
   authorShadow?: (root: string, now: Date) => void | Promise<void>;
@@ -199,11 +227,20 @@ function lastLaunchedSeat(path: string): QueueSeat | undefined {
   return (value as { lastSeat: QueueSeat }).lastSeat;
 }
 
-function saveLastLaunchedSeat(path: string, lastSeat: QueueSeat): void {
+/** QUEUE-BURST: when the queue last launched (epoch ms), from the round-robin marker. Missing or unreadable = unknown. */
+function lastQueueLaunchAt(path: string): number | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(`${path}.round-robin.json`, 'utf8'));
+    const at = value && typeof value === 'object' ? (value as { lastLaunchAt?: unknown }).lastLaunchAt : undefined;
+    return typeof at === 'number' && Number.isFinite(at) ? at : undefined;
+  } catch { return undefined; }
+}
+
+function saveLastLaunchedSeat(path: string, lastSeat: QueueSeat, lastLaunchAt?: number): void {
   const marker = `${path}.round-robin.json`;
   const temporary = `${marker}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(temporary, JSON.stringify({ lastSeat }), { flag: 'wx', mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify({ lastSeat, ...(lastLaunchAt === undefined ? {} : { lastLaunchAt }) }), { flag: 'wx', mode: 0o600 });
     renameSync(temporary, marker);
   } catch (error) {
     try { unlinkSync(temporary); } catch { /* write did not finish */ }
@@ -537,8 +574,60 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/** CHILD-UNIV-COUNT: derived child universes a tick reads with its own — never a glob of home directories. Sources: the
+ *  instance registry's live local test universes (`~/.elanous/logs/instances.json`), the derived universe
+ *  (`<tree>/.elanous-test`) of every seat tree, of every queue row's launch tree and of this process's own tree. A derived
+ *  root that does not exist was never a child universe and is skipped; the parent root itself is never a child. */
+export function harnessQueueChildUniverseRoots(input: {
+  parentRoot: string;
+  seatTrees?: Partial<Record<QueueSeat, string[]>>;
+  launchTrees?: readonly string[];
+  registry?: () => readonly Pick<LogInstanceView, 'stateDir' | 'kind' | 'liveness'>[];
+  exists?: (path: string) => boolean;
+  ownTree?: string | null;
+}): string[] {
+  const exists = input.exists ?? existsSync;
+  const parent = resolve(input.parentRoot);
+  const roots = new Set<string>();
+  const add = (root: string | null | undefined): void => {
+    if (!root || !root.startsWith('/')) return;
+    const resolved = resolve(root);
+    if (resolved !== parent && exists(resolved)) roots.add(resolved);
+  };
+  const derived = (tree: string): string | null => {
+    if (!tree.startsWith('/')) return null;
+    const top = findTreeRoot(tree);
+    return top ? join(top, '.elanous-test') : null;
+  };
+  try {
+    for (const entry of (input.registry ?? readLogInstances)()) {
+      if (entry.kind === 'test' && entry.liveness === 'alive') add(entry.stateDir);
+    }
+  } catch (error) {
+    try { debug.log('harness.queue', 'child-universe-registry-unavailable', { error: String(error).slice(0, 240) }, { level: 'warn' }); }
+    catch { /* Observation cannot affect dispatch. */ }
+  }
+  for (const trees of Object.values(input.seatTrees ?? {})) for (const tree of trees ?? []) add(derived(tree));
+  for (const tree of input.launchTrees ?? []) add(derived(tree));
+  add(input.ownTree === undefined ? derived(process.cwd()) : input.ownTree);
+  return [...roots].sort();
+}
+
+/** A child universe's self-dev ledgers; a store that exists but cannot be listed is «unreadable», never «none». */
+function readChildUniverseRuns(root: string): ReturnType<typeof listSelfDevRuns> | 'unreadable' {
+  const dir = selfDevRunsDir(root);
+  try { statSync(dir); readdirSync(dir); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? [] : 'unreadable'; }
+  return listSelfDevRuns(dir);
+}
+
 /** Host inventory includes harness authoring before it has a run ledger. Unattributed processes count for every seat. */
 export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly QueueProcess[] {
+  return readHarnessQueueInventory(probe).processes;
+}
+
+/** CHILD-UNIV-COUNT: the host inventory with the parent's ledgers ⊕ the derived child universes' ledgers. */
+export function readHarnessQueueInventory(probe: ProcessProbe = {}): QueueInventory {
   const run = probe.run ?? spawnSync;
   const platform = probe.platform ?? process.platform;
   const result = run('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
@@ -572,7 +661,23 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
   const births = new Map<number, string | undefined>();
   const ledgerProgress = new Map<number, { at: number; stopReason?: string }>();
   const ledgerRunIds = new Map<number, Set<string>>();
-  for (const record of listSelfDevRuns(probe.runsDir ?? selfDevRunsDir())) {
+  const childPids = new Set<number>();
+  const testProcess = process.env.NODE_ENV === 'test' || Boolean(process.env.ELANOUS_TEST_HOME);
+  const childRoots = (probe.childUniverseRoots ?? (testProcess ? () => [] : () => harnessQueueChildUniverseRoots({
+    parentRoot: effectiveInstanceRoot(), seatTrees: trees, launchTrees: probe.launchTrees ?? [] })))();
+  const unreadable: string[] = [];
+  const sources: { records: ReturnType<typeof listSelfDevRuns>; child: boolean }[] = [
+    { records: listSelfDevRuns(probe.runsDir ?? selfDevRunsDir()), child: false }];
+  for (const root of childRoots) {
+    const records = readChildUniverseRuns(root);
+    if (records === 'unreadable') unreadable.push(root);
+    else sources.push({ records, child: true });
+  }
+  if (unreadable.length) {
+    try { debug.log('harness.queue', 'child-universe-unreadable', { roots: unreadable, read: childRoots.length - unreadable.length }, { level: 'warn' }); }
+    catch { /* Observation cannot affect dispatch. */ }
+  }
+  for (const { records, child } of sources) for (const record of records) {
     const pid = record.pid;
     if (!pid || !candidatePids.has(pid) || !record.pidStart) continue;
     if (!births.has(pid)) {
@@ -580,6 +685,7 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
       catch { births.set(pid, undefined); }
     }
     if (births.get(pid) !== record.pidStart) continue;
+    if (child) childPids.add(pid);
     if (record.runId) ledgerRunIds.set(pid, (ledgerRunIds.get(pid) ?? new Set<string>()).add(record.runId));
     // Newest updatedAt is the process's latest progress; it is stopped only when every matched record stopped.
     if (Number.isFinite(record.updatedAt)) {
@@ -659,9 +765,10 @@ export function readHarnessQueueProcesses(probe: ProcessProbe = {}): readonly Qu
     catch { /* Observation does not block inventory. */ }
     rows.push({ pid: root.pid, ...(assigned ? { seat: assigned.seat } : {}), ...(launchId ? { launchId } : {}),
       ...(runId ? { runId } : {}), ...(progressAt !== undefined ? { progressAt } : {}), ...(stopReason ? { stopReason } : {}),
-      ...(runIds.length ? { ledgerRunIds: runIds } : {}) });
+      ...(runIds.length ? { ledgerRunIds: runIds } : {}),
+      ...(members.some(({ process: { pid } }) => childPids.has(pid)) ? { universe: 'child' as const } : {}) });
   }
-  return rows;
+  return { processes: rows, childUniverses: { roots: childRoots, unreadable } };
 }
 
 export function harnessQueueReceiptPath(root: string, launchId: string): string {
@@ -770,7 +877,9 @@ function warnLegacySeatCap(path: string): void {
 
 type QueueRun = { seat?: QueueSeat; launchIds: Set<string>; pids: Set<number>; runIds: Set<string>; progressAt?: number; stopReason?: string;
   /** Every run id of the group (env and ledger) — matched against Pod Job labels only, never used for grouping. */
-  podRunIds: Set<string> };
+  podRunIds: Set<string>;
+  /** CHILD-UNIV-COUNT: some member's ledger lives in a derived child universe. */
+  universe?: 'child' };
 
 function groupQueueRuns(processes: readonly QueueProcess[]): QueueRun[] {
   const groups: { seats: Set<QueueSeat>; unknown: boolean; launchIds: Set<string>; keys: Set<string>; rows: QueueProcess[] }[] = [];
@@ -806,6 +915,7 @@ function groupQueueRuns(processes: readonly QueueProcess[]): QueueRun[] {
       runIds: new Set(group.rows.flatMap((row) => row.runId ? [row.runId] : [])),
       podRunIds: new Set(group.rows.flatMap((row) => [...(row.runId ? [row.runId] : []), ...(row.ledgerRunIds ?? [])])),
       ...(progressAt !== undefined ? { progressAt } : {}), ...(stopReason ? { stopReason } : {}),
+      ...(group.rows.some((row) => row.universe === 'child') ? { universe: 'child' as const } : {}),
     };
   });
 }
@@ -941,18 +1051,145 @@ export function requestIdleSeats(root: string, now: Date, items: readonly QueueI
 }
 
 /** ORCH2 ③ — 발사를 막는 동결이면 사유(waitingReason)와 관측 칸을, 아니면 null. 동결 파일을 못 읽으면 닫힌 쪽(막는다). */
-function launchFreezeHold(root: string, now: Date): { reason: string; freezeReason: string; until: string | null } | null {
-  let freeze: ReturnType<typeof readLandingFreeze>;
-  try { freeze = readLandingFreeze(root, now); }
+type UnreadableUniverseState = { holding: boolean; penalty: number };
+/** CHILD-UNIV-HOLD: ticks a newly unreadable child universe holds every launch before the pool penalty takes over. */
+export const UNREADABLE_UNIVERSE_HOLD_TICKS = 2;
+/** CHILD-UNIV-HOLD: a universe unreadable this long raises one ops-health alert per universe per (KST) day. */
+export const UNREADABLE_UNIVERSE_ALERT_MS = 60 * 60 * 1_000;
+
+export function unreadableUniverseStatePath(root: string): string {
+  return join(root, 'harness', 'child-universe-unreadable.sqlite');
+}
+
+/** CHILD-UNIV-HOLD — the «못 읽음» hold is finite. Per unreadable universe the queue state keeps when it first became
+ *  unreadable and how many ticks it held: the first `UNREADABLE_UNIVERSE_HOLD_TICKS` scheduled/direct passes hold every
+ *  launch; afterwards launches go on with one pool slot charged per unreadable universe. A universe readable again (or no
+ *  longer enumerated) drops its row. Unpersistable state never holds (a hold that cannot count its ticks would be endless). */
+async function trackUnreadableUniverses(root: string, unreadable: readonly string[], now: Date, followUp: boolean,
+  deps: HarnessQueueDeps): Promise<UnreadableUniverseState> {
+  const nowMs = now.getTime();
+  const day = new Date(nowMs + 9 * 3_600_000).toISOString().slice(0, 10);
+  const alerts: string[] = [];
+  let holding = false;
+  let rows: { universe: string; firstAt: number; heldTicks: number }[] = [];
+  try {
+    mkdirSync(join(root, 'harness'), { recursive: true, mode: 0o700 });
+    const db = new Database(unreadableUniverseStatePath(root), { create: true, strict: true });
+    try {
+      db.exec('CREATE TABLE IF NOT EXISTS unreadable_universe (universe TEXT PRIMARY KEY, first_at INTEGER NOT NULL, held_ticks INTEGER NOT NULL, alerted_day TEXT)');
+      const known = db.query('SELECT universe, first_at AS firstAt, held_ticks AS heldTicks, alerted_day AS alertedDay FROM unreadable_universe')
+        .all() as { universe: string; firstAt: number; heldTicks: number; alertedDay: string | null }[];
+      const current = new Set(unreadable);
+      const cleared = known.filter((row) => !current.has(row.universe)).map((row) => row.universe);
+      for (const universe of cleared) db.query('DELETE FROM unreadable_universe WHERE universe = ?').run(universe);
+      if (cleared.length) {
+        try { debug.log('harness.queue', 'unreadable-universe-cleared', { universes: cleared }); }
+        catch { /* Observation cannot affect dispatch. */ }
+      }
+      for (const universe of unreadable) {
+        db.query('INSERT OR IGNORE INTO unreadable_universe (universe, first_at, held_ticks, alerted_day) VALUES (?, ?, 0, NULL)').run(universe, nowMs);
+      }
+      const live = db.query('SELECT universe, first_at AS firstAt, held_ticks AS heldTicks, alerted_day AS alertedDay FROM unreadable_universe')
+        .all() as { universe: string; firstAt: number; heldTicks: number; alertedDay: string | null }[];
+      holding = live.some((row) => row.heldTicks < UNREADABLE_UNIVERSE_HOLD_TICKS);
+      // A burst follow-up pass belongs to a tick already counted.
+      if (holding && !followUp) db.query('UPDATE unreadable_universe SET held_ticks = held_ticks + 1 WHERE held_ticks < ?').run(UNREADABLE_UNIVERSE_HOLD_TICKS);
+      for (const row of live) {
+        if (nowMs - row.firstAt < UNREADABLE_UNIVERSE_ALERT_MS || row.alertedDay === day) continue;
+        db.query('UPDATE unreadable_universe SET alerted_day = ? WHERE universe = ?').run(day, row.universe);
+        alerts.push(row.universe);
+      }
+      rows = live;
+    } finally { db.close(); }
+  } catch (error) {
+    holding = false;
+    try { debug.log('harness.queue', 'unreadable-universe-state-unavailable', { error: String(error).slice(0, 240), universes: unreadable }, { level: 'warn' }); }
+    catch { /* Observation cannot affect dispatch. */ }
+  }
+  const penalty = holding ? 0 : unreadable.length;
+  if (unreadable.length) {
+    try { debug.log('harness.queue', 'unreadable-universe', { universes: unreadable, holding, penalty,
+      rows: rows.map((row) => ({ universe: row.universe, firstAt: new Date(row.firstAt).toISOString(), heldTicks: row.heldTicks })) }, { level: 'warn' }); }
+    catch { /* Observation cannot affect dispatch. */ }
+  }
+  for (const universe of alerts) {
+    const first = rows.find((row) => row.universe === universe)?.firstAt ?? nowMs;
+    const text = `⚠️ 하니스 대기열: 자식 우주를 ${Math.floor((nowMs - first) / 60_000)}분째 못 읽는다 — ${universe} · 발사는 Pod 풀 여유에서 1칸 보수 차감 중`;
+    try {
+      const send = deps.unreadableAlert ?? (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME ? () => {}
+        : async (body: string) => { (await import('../domains/outbound-alert.js')).sendOutbound(body, 'ops-health'); });
+      await send(text);
+      debug.log('harness.queue', 'unreadable-universe-alert', { universe, firstAt: new Date(first).toISOString(), day });
+    } catch (error) {
+      try { debug.log('harness.queue', 'unreadable-universe-alert-failed', { universe, error: String(error).slice(0, 240) }, { level: 'warn' }); }
+      catch { /* Observation cannot affect dispatch. */ }
+    }
+  }
+  return { holding, penalty };
+}
+
+/** CHILD-UNIV-COUNT: the production freeze binds a tick in any universe (a work-tree launch ticks in its derived test
+ *  universe and used not to see it); the tick's own root still counts. A test process defaults to its own root only. */
+function queueProdFreezeRoot(root: string, deps: HarnessQueueDeps): string {
+  if (deps.prodFreezeRoot !== undefined) return deps.prodFreezeRoot;
+  return process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME ? root : prodInstanceRoot();
+}
+
+function launchFreezeHold(root: string, now: Date, prodRoot: string = root): { reason: string; freezeReason: string; until: string | null } | null {
+  let freeze: ReturnType<typeof readLandingFreeze> = null;
+  try {
+    for (const authority of new Set([prodRoot, root])) {
+      const found = readLandingFreeze(authority, now);
+      if (found?.holdLaunches === true) { freeze = found; break; }
+    }
+  }
   catch { return { reason: '동결 상태 읽기 실패', freezeReason: '동결 상태 읽기 실패', until: null }; }
   if (freeze?.holdLaunches !== true) return null;
   return { reason: `동결 — ${freeze.reason}${freeze.until ? ` · ~${freeze.until}` : ''}`, freezeReason: freeze.reason, until: freeze.until };
 }
 
+/** QUEUE-BURST default: five launches 30 s apart fit one two-minute cron interval. */
+export const QUEUE_BURST_MAX_DEFAULT = 5;
+export const QUEUE_LAUNCH_STAGGER_MS = 30_000;
+const queueStaggerPrefix = '발사 간격';
+
+/**
+ * One scheduled tick launches several queued heads when seats and the Pod pool have room (QUEUE-BURST). Each launch is its
+ * own locked pass that re-measures seat counts, pool headroom, the finish gate and the freeze, so the pool headroom is what
+ * bounds the burst; launches are `launchStaggerMs` apart. A requested tick (direct `harness say|ask`) launches at most its row.
+ */
 export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?: string): Promise<QueueTick> {
+  if (requestedId) return tickHarnessQueueOnce(deps, requestedId, false);
+  const first = await tickHarnessQueueOnce(deps, undefined, false);
+  if (first.outcome !== 'launched' || !first.item) return first;
+  const configured = deps.burstMax ?? (deps.configPath === undefined ? getUserConfig() : getUserConfig(deps.configPath)).harness?.queue?.burstMax;
+  const burstMax = typeof configured === 'number' && Number.isSafeInteger(configured) && configured > 0 ? configured : QUEUE_BURST_MAX_DEFAULT;
+  const stagger = deps.launchStaggerMs ?? QUEUE_LAUNCH_STAGGER_MS;
+  const launched: QueueItem[] = [first.item];
+  let stop = burstMax <= 1 ? 'burst-max' : '';
+  while (!stop && launched.length < burstMax) {
+    // Nothing left to launch: end the burst without spending the stagger wait.
+    if (!listHarnessQueue(deps).some((row) => row.status === 'queued')) { stop = 'empty'; break; }
+    if (stagger > 0) await (deps.sleep ?? ((ms: number) => Bun.sleep(ms)))(stagger);
+    let next: QueueTick;
+    // Launches already made stand: a failing follow-up pass ends the burst (its own row stays for reconcile) instead of
+    // turning the whole tick into an error.
+    try { next = await tickHarnessQueueOnce(deps, undefined, true); }
+    catch (error) { stop = `follow-up failed: ${String(error).slice(0, 240)}`; break; }
+    if (next.outcome !== 'launched' || !next.item) { stop = next.reason.split('\n')[0] ?? next.outcome; break; }
+    launched.push(next.item);
+  }
+  try { debug.log('harness.queue', 'burst', { launched: launched.length, burstMax, staggerMs: stagger, stop: stop || 'burst-max',
+    ids: launched.map((row) => row.id), seats: launched.map((row) => row.seat) }); }
+  catch { /* Observation cannot change launches already made. */ }
+  return { ...first, launched };
+}
+
+async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string | undefined, followUp: boolean): Promise<QueueTick> {
   const root = deps.root ?? effectiveInstanceRoot();
   return locked(root, async (path) => {
-    try {
+    // A burst follow-up already ran the author shadow and the idle request in this tick's first pass.
+    if (!followUp) try {
       const now = (deps.now ?? (() => new Date()))();
       // A test process must not run the real author shadow — it reads operational ledgers and blew the 5s test budget (10-05 P0).
       if (!deps.authorShadow && process.env.ELANOUS_AUTHOR_SHADOW_LIVE !== '1' && (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME)) {
@@ -967,7 +1204,7 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
     }
     const items = read(path);
     // ORCH2 ③ 동결 창의 «발사» 절반 — `freeze on --hold-launches` 면 이 틱은 발사 0. 동결 파일을 못 읽으면 착지 쪽과 같이 닫힌 쪽(발사 0).
-    const hold = launchFreezeHold(root, (deps.now ?? (() => new Date()))());
+    const hold = launchFreezeHold(root, (deps.now ?? (() => new Date()))(), queueProdFreezeRoot(root, deps));
     if (hold) {
       const reason = hold.reason;
       const queued = items.filter((item) => item.status === 'queued');
@@ -982,7 +1219,7 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
       return subject ? { outcome: 'waiting', item: { ...subject, waitingReason: reason }, reason }
         : { outcome: 'skipped', reason: requestedId ? '이미 처리됨 또는 항목 없음' : 'empty' };
     }
-    try { await (deps.idleRequest ?? requestIdleSeats)(root, (deps.now ?? (() => new Date()))(), items, deps); }
+    if (!followUp) try { await (deps.idleRequest ?? requestIdleSeats)(root, (deps.now ?? (() => new Date()))(), items, deps); }
     catch (error) {
       try { debug.log('loop.orchestrator', 'idle-request-failed', { reason: String(error) }); }
       catch { /* Idle observation cannot affect queue dispatch. */ }
@@ -1043,7 +1280,22 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
     }
     let current = items;
     let processes: readonly QueueProcess[];
-    try { processes = (deps.processes ?? readHarnessQueueProcesses)(); }
+    let childUniverses: QueueInventory['childUniverses'] | undefined;
+    let unreadableState: UnreadableUniverseState = { holding: false, penalty: 0 };
+    try {
+      const launchTrees = [...new Set(items.flatMap((row) => row.launchCwd ? [row.launchCwd] : []))];
+      const inventory: QueueInventory = deps.inventory ? deps.inventory(launchTrees)
+        : deps.processes ? { processes: deps.processes(), childUniverses: { roots: [], unreadable: [] } }
+        : readHarnessQueueInventory({ launchTrees });
+      processes = inventory.processes;
+      // A seam or host that read no child universe keeps the parent-only line; any consulted universe shows the split.
+      if (inventory.childUniverses.roots.length || inventory.childUniverses.unreadable.length) childUniverses = inventory.childUniverses;
+      // CHILD-UNIV-HOLD: a `processes`-only seam consulted no child universe, so it neither sets nor clears the state.
+      if (deps.inventory || !deps.processes) {
+        unreadableState = await trackUnreadableUniverses(root, inventory.childUniverses.unreadable,
+          (deps.now ?? (() => new Date()))(), followUp, deps);
+      }
+    }
     catch (error) {
       for (const item of candidates) {
         const injectedCap = deps.cap?.(item.seat);
@@ -1176,11 +1428,35 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
     let pool: QueuePool | undefined;
     let poolReason: string | undefined;
     let finishHeld: string | null | undefined;
+    // CHILD-UNIV-COUNT: a seat's live runs whose ledger lives in a derived child universe (a work-tree launch's children).
+    const childActive = (seat: QueueSeat): number => runs.filter((run) => run.seat === seat && run.universe === 'child'
+      && !runVerdict(run, seat)).length;
+    const universeSplit = (seat: QueueSeat, active: number): string => {
+      if (!childUniverses) return '';
+      const child = childActive(seat);
+      const parent = active - child;
+      const n = childUniverses.unreadable.length;
+      return !n ? ` · 부모 ${parent} ⊕ 자식 우주 ${child}`
+        : unreadableState.holding ? ` · 부모 ${parent} ⊕ 자식 우주 ${child} ⊕ 못 읽음 ${n}곳`
+        : ` · 부모 ${parent} ⊕ 자식 우주 ${child} ⊕ 못 읽음 ${n}곳(보수 차감)`;
+    };
+    const seatLine = (seat: QueueSeat, active: number, details: ReturnType<typeof seatCapDetails>): string =>
+      `${seatCapReason(seat, active, details)}${universeSplit(seat, active)}`;
+    if (childUniverses?.unreadable.length && unreadableState.holding) {
+      // «못 읽음» is not «0»: an unreadable child universe may hold this seat's runs, so no seat launches on a partial count —
+      // but only for the first ticks (CHILD-UNIV-HOLD); afterwards the pool headroom is reduced instead.
+      for (const item of candidates) {
+        const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap: deps.cap?.(item.seat) });
+        const active = seatActive(item.seat);
+        blocked.set(item.seat, { reason: `${seatLine(item.seat, active, details)} — 자식 우주 못 읽음: ${childUniverses.unreadable.join(', ')}`, active });
+      }
+      return waiting();
+    }
     for (const item of candidates) {
       const injectedCap = deps.cap?.(item.seat);
       const details = seatCapDetails({ seat: item.seat, caps, gate, injectedCap });
       const active = seatActive(item.seat);
-      if (active >= details.cap) { blocked.set(item.seat, { reason: seatCapReason(item.seat, active, details), active }); continue; }
+      if (active >= details.cap) { blocked.set(item.seat, { reason: seatLine(item.seat, active, details), active }); continue; }
       if (!pool && !poolReason) {
         try { pool = (deps.pool ?? readHarnessQueuePool)(); }
         catch (error) { poolReason = `pod lease status unavailable: ${String(error)}`; }
@@ -1189,20 +1465,22 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
         }
         if (pool && !poolReason) {
           const queueLaunching = current.filter((row) => row.status === 'launching' || row.status === 'launched').length;
-          if (pool.running + pool.pending + pool.reserved + queueLaunching >= pool.limit) {
-            poolReason = `pool: ${pool.running}+${pool.pending}+${pool.reserved}+${queueLaunching}/${pool.limit}`;
+          // CHILD-UNIV-HOLD: each unreadable child universe is charged one pool slot (conservative), never a seat slot.
+          const penalty = unreadableState.penalty;
+          if (pool.running + pool.pending + pool.reserved + queueLaunching + penalty >= pool.limit) {
+            poolReason = `pool: ${pool.running}+${pool.pending}+${pool.reserved}+${queueLaunching}${penalty ? `+못 읽음 ${penalty}곳(보수 차감)` : ''}/${pool.limit}`;
           }
         }
       }
       if (poolReason) { blocked.set(item.seat, { reason: poolReason, active }); continue; }
       const budget = decideSpawn({ seat: item.seat, running: active, caps, gate, injectedCap });
       if (!budget.allow) {
-        blocked.set(item.seat, { reason: `${budget.reason}: ${seatCapReason(item.seat, active, details)}`, active });
+        blocked.set(item.seat, { reason: `${budget.reason}: ${seatLine(item.seat, active, details)}`, active });
         continue;
       }
       if (finishHeld === undefined) {
         finishHeld = await finishGateReason(root, (deps.now ?? (() => new Date()))(), config.loops?.orchestrator?.finishGate ?? 'shadow',
-          pool!.running + pool!.pending + pool!.reserved
+          pool!.running + pool!.pending + pool!.reserved + unreadableState.penalty
           + current.filter((row) => row.status === 'launching' || row.status === 'launched').length, pool!.limit, deps);
       }
       if (finishHeld) { blocked.set(item.seat, { reason: finishHeld, active }); continue; }
@@ -1214,9 +1492,9 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
           const ownCap = deps.cap?.(requested.seat);
           const details = seatCapDetails({ seat: requested.seat, caps, gate, injectedCap: ownCap });
           const active = seatActive(requested.seat);
-          if (active >= details.cap) return seatCapReason(requested.seat, active, details);
+          if (active >= details.cap) return seatLine(requested.seat, active, details);
           const budget = decideSpawn({ seat: requested.seat, running: active, caps, gate, injectedCap: ownCap });
-          return budget.allow ? undefined : `${budget.reason}: ${seatCapReason(requested.seat, active, details)}`;
+          return budget.allow ? undefined : `${budget.reason}: ${seatLine(requested.seat, active, details)}`;
         })();
         const reason = own ?? `다른 자리 차례 — ${item.seat}`;
         if (requested.waitingReason !== reason) save(path, current.map((row) => row.id === requestedId ? { ...row, waitingReason: reason } : row));
@@ -1224,13 +1502,25 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
         return { outcome: 'waiting', item: { ...requested, waitingReason: reason }, reason };
       }
       // 발사 직전 다시 본다 — 틱 앞의 확인과 여기 사이에 await(idleRequest·pool·finish 측정)가 있어 그새 켜진 동결을 놓치지 않게.
-      const lateHold = launchFreezeHold(root, (deps.now ?? (() => new Date()))());
+      const lateHold = launchFreezeHold(root, (deps.now ?? (() => new Date()))(), queueProdFreezeRoot(root, deps));
       if (lateHold) {
         save(path, current.map((row) => row.id === item.id ? { ...row, waitingReason: lateHold.reason } : row));
         observe('waiting', { id: item.id, seat: item.seat, reason: lateHold.reason }, deps);
         try { debug.log('loop.orchestrator', 'freeze-held-launch', { reason: lateHold.freezeReason, until: lateHold.until, queued: 1, phase: 'pre-launch' }); }
         catch { /* Observation cannot affect dispatch. */ }
         return { outcome: 'waiting', item: { ...item, waitingReason: lateHold.reason }, reason: lateHold.reason };
+      }
+      // QUEUE-BURST: scheduled launches stay `launchStaggerMs` after the last queue launch — any tick or process, a direct
+      // launch included — so an overlapping cron tick cannot double a burst. A requested (direct say/ask) tick keeps its
+      // launch-at-once contract (ONEDOOR-2) and only records its time for the next scheduled tick.
+      const stagger = requestedId ? 0 : deps.launchStaggerMs ?? QUEUE_LAUNCH_STAGGER_MS;
+      const lastAt = stagger > 0 ? lastQueueLaunchAt(path) : undefined;
+      const sinceLast = lastAt === undefined ? undefined : (deps.now ?? (() => new Date()))().getTime() - lastAt;
+      if (sinceLast !== undefined && sinceLast >= 0 && sinceLast < stagger) {
+        const reason = `${queueStaggerPrefix} — 마지막 발사 ${Math.floor(sinceLast / 1000)}s 전 · ${Math.round(stagger / 1000)}s 간격`;
+        save(path, current.map((row) => row.id === item.id ? { ...row, waitingReason: reason } : row));
+        observe('waiting', { id: item.id, seat: item.seat, reason, sinceLastMs: sinceLast, staggerMs: stagger }, deps);
+        return { outcome: 'waiting', item: { ...item, waitingReason: reason }, reason };
       }
       // UUIDv7 carries the launch time, so the dead-row grace can run from launch without a new queue field.
       const launching: QueueItem = { ...item, status: 'launching', launchId: `hq-${Bun.randomUUIDv7()}` };
@@ -1241,7 +1531,7 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
         if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('launcher returned no pid');
         const launched: QueueItem = { ...launching, pid, status: 'launched' };
         save(path, current.map((row) => row.id === item.id ? launched : row));
-        try { saveLastLaunchedSeat(path, item.seat); }
+        try { saveLastLaunchedSeat(path, item.seat, (deps.now ?? (() => new Date()))().getTime()); }
         catch (error) {
           try { debug.log('harness.queue', 'round-robin-save-failed', { id: item.id, seat: item.seat, reason: String(error) }, { level: 'warn' }); }
           catch { /* Observation cannot change an already persisted launch. */ }

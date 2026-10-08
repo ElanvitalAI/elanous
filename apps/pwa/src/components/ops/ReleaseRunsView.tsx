@@ -44,7 +44,7 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
         {filtered.map((run) => <button key={run.runId} type="button" aria-pressed={selected?.runId === run.runId} onClick={() => onRun(run.runId)}
           className="block w-full min-w-0 rounded-md border p-3 text-left hover:bg-muted aria-pressed:border-primary">
           <span className="block truncate font-medium">{run.version ?? '판 미상'} · {run.status}</span>
-          <time className="block break-all text-sm text-muted-foreground" dateTime={run.startedAt}>{Number.isFinite(Date.parse(run.startedAt)) ? `${runClock.format(new Date(run.startedAt))} KST` : '시각 미기록'}</time>
+          <time aria-label="시작 시각 (KST)" className="block break-all text-sm text-muted-foreground" dateTime={run.startedAt}>{Number.isFinite(Date.parse(run.startedAt)) ? `${runClock.format(new Date(run.startedAt))} KST` : '시각 미기록'}</time>
         </button>)}
       </section>
       {selected && <section className="min-w-0 space-y-3" aria-label="노드 진행">

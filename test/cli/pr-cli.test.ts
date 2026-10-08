@@ -388,6 +388,7 @@ describe('elanous pr land', () => {
         '✓ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts PASS — no new hardcoded model id.',
         '✓ daemon-port-gate: scripts/ci-daemon-port-gate.ts PASS — no new daemon port literals.',
         '[test-interference-gate] 해당 없음 — 변경 시험 파일 0개 (간섭 검사는 2개 이상 필요).',
+        '[land-global-checks] 해당 없음 — 바뀐 파일 0개가 전역 검사 표(4줄)의 꼴에 안 걸린다.',
         // ⭐ 안드로이드를 안 만진 착지라 게이트가 «깨어나지 않았다»고 «말한다».
         //    ⛔ 그 자리에 「PASS — 실제로 돌았다」가 오면 안 된다 — 안 돌았기 때문이다.
         '[android-gate] 해당 없음 — 변경 0개 중 apps/android/ 아래 파일 0개.',
@@ -456,6 +457,47 @@ describe('elanous pr land', () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('LAND-GLOBAL-CHECKS: forwards changed paths to the global-checks gate and blocks landing before find when a pulled test fails', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const received: string[][] = [];
+    const cwd = mkdtempSync(join(tmpdir(), 'pr-land-global-checks-'));
+    try {
+      const code = await runPrLand({ cwd }, {
+        ...baseDeps,
+        manager,
+        out: sink.out,
+        run: statusRun(' M apps/pwa/src/app/page.tsx\0 M release/next.md\0'),
+        runTestInterferenceGate: async () => 0,
+        runLandGlobalChecks: (_gateOut, changedFiles) => { received.push([...changedFiles]); return false; },
+      });
+
+      expect(code).toBe(1);
+      expect(calls).toEqual([]);
+      expect(received).toEqual([['apps/pwa/src/app/page.tsx', 'release/next.md']]);
+      expect(sink.errors.join('\n')).toContain('✗ land-global-checks: scripts/land-global-checks.ts blocked pr land');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('LAND-GLOBAL-CHECKS: a passing pulled test lets landing continue and says which tests ran', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const code = await runPrLand({ dryRun: true }, {
+      ...baseDeps,
+      manager,
+      out: sink.out,
+      run: statusRun(' M docs/ops/machines.yaml\0'),
+      runTestInterferenceGate: async () => 0,
+      runLandGlobalChecks: () => true,
+    });
+
+    expect(code).toBe(0);
+    expect(calls).toEqual(['find']);
+    expect(sink.logs).toContain('✓ land-global-checks: scripts/land-global-checks.ts PASS — 끌려온 전역 시험 test/machines-ledger-data.test.ts 실패 0.');
   });
 
   it('records an unmeasured throwing interference gate under its own label and continues dry-run landing', async () => {

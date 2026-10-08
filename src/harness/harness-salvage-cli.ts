@@ -6,6 +6,18 @@ import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { normalizeRunId } from './harness-space.js';
 import { loadFederatedRunLedger } from '../self-implement/run-ledger.js';
+import { getUserConfig } from '../user-config.js';
+import { resolveRepositoryName } from './repository-name.js';
+import {
+  classifySalvageRetention,
+  formatSalvageRetention,
+  listDatedSalvageRefs,
+  listOpenPrRefs,
+  type DatedSalvageRef,
+  type SalvageReferenceSources,
+  type SalvageRetentionMode,
+  type SalvageRetentionReport,
+} from '../self-implement/salvage-retention.js';
 import {
   decideRunSalvage,
   findRunSalvageBranches,
@@ -74,5 +86,55 @@ export function installHarnessSalvageCommand(harnessCmd: Command, deps: HarnessS
       if (opts.json) print(JSON.stringify(verdicts.map(({ line: _line, ...rest }) => rest)));
       else for (const verdict of verdicts) print(verdict.line);
       if (verdicts.some((verdict) => verdict.outcome === 'unknown')) process.exitCode = 1;
+    });
+}
+
+export interface HarnessSalvageRetentionDeps {
+  repository?: () => string;
+  listRefs?: (repository: string) => DatedSalvageRef[];
+  listOpenPrs?: (repository: string) => SalvageReferenceSources['openPrs'];
+  listCards?: () => SalvageReferenceSources['cards'];
+  mode?: () => SalvageRetentionMode;
+  now?: () => Date;
+  print?: (line: string) => void;
+}
+
+async function defaultCards(): Promise<SalvageReferenceSources['cards']> {
+  const { readTaskAgentState, taskAgentStatePath } = await import('../task-agent/task-hand.js');
+  const tasks = readTaskAgentState<{ tasks?: Record<string, { id: string; runId?: string }> }>(taskAgentStatePath()).tasks ?? {};
+  return Object.values(tasks).map((card) => ({ id: card.id, ...(card.runId ? { runId: card.runId } : {}), text: JSON.stringify(card) }));
+}
+
+/** SALVAGE-RETENTION — 그림자 보고(지우지 않는다). 조회가 하나라도 실패하면 수를 내지 않고 실패로 끝난다(⛔ 부분 수를 «전체»로 안 읽는다). */
+export async function runHarnessSalvageRetention(deps: HarnessSalvageRetentionDeps = {}): Promise<SalvageRetentionReport> {
+  const repository = (deps.repository ?? (() => resolveRepositoryName({})))();
+  let mode: SalvageRetentionMode = 'shadow';
+  try {
+    mode = deps.mode ? deps.mode() : (getUserConfig().tools?.selfImplement?.salvageRetention?.mode ?? 'shadow');
+  } catch { mode = 'shadow'; }
+  const refs = (deps.listRefs ?? ((repo: string) => listDatedSalvageRefs(repo)))(repository);
+  const openPrs = (deps.listOpenPrs ?? ((repo: string) => listOpenPrRefs(repo)))(repository);
+  const cards = deps.listCards ? deps.listCards() : await defaultCards();
+  const report = classifySalvageRetention({ refs, sources: { openPrs, cards }, now: (deps.now ?? (() => new Date()))(), mode });
+  debug.log('self-implement.salvage-retention', 'shadow-report', { repository, ...report, openPrs: openPrs.length, cards: cards.length });
+  return report;
+}
+
+export function installHarnessSalvageRetentionCommand(harnessCmd: Command, deps: HarnessSalvageRetentionDeps = {}): Command {
+  return harnessCmd
+    .command('salvage-retention')
+    .description('원격 salvage/* 가지 보존 규칙(14일 초과 ⊕ 열린 PR·카드 참조 0) — 그림자: 지울 후보 수만 보고하고 지우지 않는다')
+    .option('--json', '{ mode, total, older, referenced, candidates, unknownAge, sample, deleted } JSON')
+    .action(async (opts: { json?: boolean }) => {
+      const print = deps.print ?? ((line: string) => console.log(line));
+      try {
+        const report = await runHarnessSalvageRetention(deps);
+        print(opts.json ? JSON.stringify(report) : formatSalvageRetention(report));
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        debug.log('self-implement.salvage-retention', 'shadow-report-failed', { error: reason });
+        print(`수확 가지 보존: 못 잼 — ${reason}`);
+        process.exitCode = 1;
+      }
     });
 }

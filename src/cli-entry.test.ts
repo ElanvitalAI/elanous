@@ -1,5 +1,5 @@
 import { setDefaultTimeout, describe, expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawnRealCli } from './testing/real-cli-spawn.js';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,8 @@ import { dirname, join, resolve } from 'node:path';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+// ⏱️ 테스트 타임아웃은 «대기열 몫»까지 둔다 — spawn 자체의 60초 타임아웃은 슬롯을 얻은 뒤부터 잰다(real-cli-spawn.ts).
+const CONCURRENT_TEST_TIMEOUT_MS = 600_000;
 
 /**
  * GIT-T13 회귀 방어 — **배포 엔트리(`bin/elanous.mjs`)가 실제로 dispatch 하는가.**
@@ -29,11 +31,12 @@ const PKG_VERSION = (
   JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf8')) as { version?: string }
 ).version;
 
-function runBin(args: string[], env: NodeJS.ProcessEnv = {}): { stdout: string; stderr: string; status: number | null } {
-  const r = spawnSync('bun', [BIN, ...args], {
+// ⏱️ GATE-SPEED ③ — 실물 spawn 은 «그대로»다. 기다리는 방식만 비동기 ⊕ 상한 있는 동시성(`describe.concurrent`)으로
+//   바꿨다 — 순차 `spawnSync` 45회가 이 파일을 게이트 임계 경로(0.2.18 컷 391초)로 만들었다.
+async function runBin(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string; status: number | null }> {
+  const r = await spawnRealCli(['bun', BIN, ...args], {
     cwd: REPO_ROOT,
-    encoding: 'utf8',
-    timeout: 60_000,
+    timeoutMs: 60_000,
     // 격리 — 이 테스트는 산출의 **유무**만 재므로 운영 스토어에 닿을 이유가 없다.
     env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ...env },
   });
@@ -49,16 +52,15 @@ function runBin(args: string[], env: NodeJS.ProcessEnv = {}): { stdout: string; 
 //    **타임아웃이 곧 0바이트**라 죽은 엔트리와 구분이 안 된다 — 명시 상향한다.
 const SPAWN_TIMEOUT_MS = 60_000;
 
-function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): { bytes: number; validJson: boolean; stderr: string; status: number | null } {
+async function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ bytes: number; validJson: boolean; stderr: string; status: number | null }> {
   // The consumer does not attach stdin until its timeout elapses. Running this through
   // `sh` preserves the kernel pipe's backpressure; spawning the producer directly would
   // let Bun drain its stdout pipe before this test begins consuming it.
   const consumer = "setTimeout(() => { let text = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => { text += chunk; }); process.stdin.on('end', () => { let validJson = true; try { JSON.parse(text); } catch { validJson = false; } process.stdout.write(JSON.stringify({ bytes: Buffer.byteLength(text), validJson }) + '\\n'); }); }, 1200);";
-  const result = spawnSync('sh', ['-c', '"$@" | bun -e "$ELANOUS_DELAYED_STDOUT_CONSUMER"', 'sh', 'bun', BIN, ...args], {
+  const result = await spawnRealCli(['sh', '-c', '"$@" | bun -e "$ELANOUS_DELAYED_STDOUT_CONSUMER"', 'sh', 'bun', BIN, ...args], {
     cwd: REPO_ROOT,
     env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_DELAYED_STDOUT_CONSUMER: consumer, ...env },
-    encoding: 'utf8',
-    timeout: SPAWN_TIMEOUT_MS,
+    timeoutMs: SPAWN_TIMEOUT_MS,
   });
   if (result.error) throw new Error(`slow consumer pipeline failed to spawn: ${result.error.message}`);
   return {
@@ -68,70 +70,70 @@ function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): {
   };
 }
 
-describe('배포 엔트리 bin/elanous.mjs', () => {
-  test('release checklist 중복 칸과 없는 칸은 두 줄의 사용자 오류만 stderr로 낸다', () => {
+describe.concurrent('배포 엔트리 bin/elanous.mjs', () => {
+  test('release checklist 중복 칸과 없는 칸은 두 줄의 사용자 오류만 stderr로 낸다', async () => {
     const id = `cli-user-error-${process.pid}-${Date.now()}`;
     const version = '99.99.99';
-    const added = runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'test item']);
+    const added = await runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'test item']);
     expect(added.status).toBe(0);
     try {
-      const duplicate = runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'again']);
+      const duplicate = await runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'again']);
       expect(duplicate.status).toBe(1);
       expect(duplicate.stdout).toBe('');
       expect(duplicate.stderr.trim()).toBe(`❌ 이미 있는 칸: ${id}\n  ↳ set <id> 로 고친다`);
       expect(duplicate.stderr).not.toMatch(/^\s*at\s|^Bun v/m);
 
-      const missing = runBin(['--test', 'release', 'checklist', '--version', version, 'set', `${id}-absent`, '--status', 'red']);
+      const missing = await runBin(['--test', 'release', 'checklist', '--version', version, 'set', `${id}-absent`, '--status', 'red']);
       expect(missing.status).toBe(1);
       expect(missing.stdout).toBe('');
       expect(missing.stderr.trim()).toBe(`❌ 없는 칸: ${id}-absent\n  ↳ list 로 칸 목록을 본다`);
       expect(missing.stderr).not.toMatch(/^\s*at\s|^Bun v/m);
     } finally {
-      const removed = runBin(['--test', 'release', 'checklist', '--version', version, 'rm', id]);
+      const removed = await runBin(['--test', 'release', 'checklist', '--version', version, 'rm', id]);
       expect(removed.status).toBe(0);
     }
-  }, SPAWN_TIMEOUT_MS * 4);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('예상하지 못한 예외는 코드 프레임과 스택을 보존한다', () => {
+  test('예상하지 못한 예외는 코드 프레임과 스택을 보존한다', async () => {
     const missing = join(tmpdir(), `missing-checklist-seed-${process.pid}-${Date.now()}.md`);
-    const result = runBin(['--test', 'release', 'checklist', 'seed', '--from', missing]);
+    const result = await runBin(['--test', 'release', 'checklist', 'seed', '--from', missing]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('ENOENT');
     expect(result.stderr).toMatch(/^\s*at\s/m);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('--version 이 산출을 낸다 (조용한 no-op 이 아니다)', () => {
-    const { stdout, stderr, status } = runBin(['--version']);
+  test('--version 이 산출을 낸다 (조용한 no-op 이 아니다)', async () => {
+    const { stdout, stderr, status } = await runBin(['--version']);
     // ⛔ exit 0 만으로는 못 가른다 — 죽은 엔트리도 exit 0 였다. 산출을 재야 한다.
     expect(`${stdout}${stderr}`.trim().length).toBeGreaterThan(0);
     expect(PKG_VERSION).toBeTruthy();
     expect(stdout).toContain(PKG_VERSION!);
     expect(status).toBe(0);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('알 수 없는 명령은 조용히 성공하지 않는다 (commander dispatch 도달)', () => {
-    const { stdout, stderr, status } = runBin(['__no_such_command__']);
+  test('알 수 없는 명령은 조용히 성공하지 않는다 (commander dispatch 도달)', async () => {
+    const { stdout, stderr, status } = await runBin(['__no_such_command__']);
     // 죽은 엔트리는 무엇을 줘도 0바이트 · exit 0 였다. 거부는 시끄러워야 한다.
     expect(`${stdout}${stderr}`).toContain('__no_such_command__');
     expect(status).not.toBe(0);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test.each(['--resume', '--bogus-flag'])('self goal-run-search가 %s를 Commander의 unknown option으로 거부한다', (flag) => {
-    const { stdout, stderr, status } = runBin(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ']);
+  test.each(['--resume', '--bogus-flag'])('self goal-run-search가 %s를 Commander의 unknown option으로 거부한다', async (flag) => {
+    const { stdout, stderr, status } = await runBin(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ']);
     expect(`${stdout}${stderr}`).toContain('unknown option');
     expect(status).not.toBe(0);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('harness ask --graph is no longer accepted', () => {
-    const { stdout, stderr, status } = runBin(['--test', 'harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run']);
+  test('harness ask --graph is no longer accepted', async () => {
+    const { stdout, stderr, status } = await runBin(['--test', 'harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run']);
     expect(status).toBe(1);
     expect(stdout).toBe('');
     expect(stderr).toContain("error: unknown option '--graph'");
     expect(stderr).not.toMatch(/\bat\s+.*\(/);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test.each(['repro', 'eval-prompt'])('%s 는 LLM 실행 없이 attach 대체 경로를 안내한다', (command) => {
-    const { stdout, stderr, status } = runBin([command, '문장']);
+  test.each(['repro', 'eval-prompt'])('%s 는 LLM 실행 없이 attach 대체 경로를 안내한다', async (command) => {
+    const { stdout, stderr, status } = await runBin([command, '문장']);
     const output = `${stdout}${stderr}`;
     expect(output).toContain('repro is retired');
     expect(output).toContain('elanous attach --message');
@@ -139,45 +141,45 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     expect(output).toContain('--assert-tool-max');
     expect(output).toContain('--assert-text-contains');
     expect(status).not.toBe(0);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
   // ⛔⭐⭐ 되돌릴 수 없는 소비의 «유일한» 안전장치라 회귀를 코드로 잠근다(1R must-fix).
   //   ⚠️ 이 테스트는 «네트워크를 치지 않는다** — 가드가 그 «전에» 끊는 것이 요구사항 자체다.
-  test('provider codex reset-credits redeem 은 --yes 없이 거부하고 exit 2 를 낸다 (fail-closed)', () => {
-    const r = spawnSync('bun', [BIN, 'provider', 'codex', 'reset-credits', 'redeem'], {
-      encoding: 'utf8', timeout: 60_000,
+  test('provider codex reset-credits redeem 은 --yes 없이 거부하고 exit 2 를 낸다 (fail-closed)', async () => {
+    const r = await spawnRealCli(['bun', BIN, 'provider', 'codex', 'reset-credits', 'redeem'], {
+      timeoutMs: 60_000,
     });
     expect(r.status).toBe(2);                       // ⛔ 0 이면 소비가 통과했다는 뜻이다
     expect(`${r.stderr}`).toContain('--yes');
     // 소비 경로로 «들어가지 않았다»는 증거 — 성공 안내문이 안 나온다
     expect(`${r.stdout}`).not.toContain('usedPercent');
-  });
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('repro 는 일반 도움말 명령 목록에 노출되지 않는다', () => {
-    const { stdout, stderr, status } = runBin(['--help']);
+  test('repro 는 일반 도움말 명령 목록에 노출되지 않는다', async () => {
+    const { stdout, stderr, status } = await runBin(['--help']);
     expect(status).toBe(0);
     expect(`${stdout}${stderr}`).not.toMatch(/^\s*repro(?:\||\s|$)/m);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('top-level help advertises ACP server and websocket transport', () => {
-    const { stdout, status } = runBin(['--test', '--help']);
+  test('top-level help advertises ACP server and websocket transport', async () => {
+    const { stdout, status } = await runBin(['--test', '--help']);
     expect(status).toBe(0);
     expect(stdout).toContain('--acp-server');
     expect(stdout).toContain('--transport=websocket');
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', () => {
-    const { stdout, stderr, status } = runBin(['nexus', 'run', '--help']);
+  test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', async () => {
+    const { stdout, stderr, status } = await runBin(['nexus', 'run', '--help']);
     const output = `${stdout}${stderr}`;
     expect(status).toBe(0);
     expect(output).toMatch(/Hidden options \(7\):\s*--headless, --foreground, --bg, --http-port, --http-host, --tools, --history-dir\s*$/);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('self entrances --json은 1.2초 늦게 읽는 실제 stdout 파이프 소비자에게도 대용량 JSON을 끝까지 출력한다', () => {
+  test('self entrances --json은 1.2초 늦게 읽는 실제 stdout 파이프 소비자에게도 대용량 JSON을 끝까지 출력한다', async () => {
     // `self entrances`는 fixture를 스캔하지 않고 1.2초 지연 전에 대용량 JSON을 쓴다.
     // 따라서 실제 셸 파이프에서 non-blocking stdout short-write를 재현한다.
-    const piped = runBinWithDelayedStdout(['self', 'entrances', '--json']);
-    const redirected = runBin(['self', 'entrances', '--json']);
+    const piped = await runBinWithDelayedStdout(['self', 'entrances', '--json']);
+    const redirected = await runBin(['self', 'entrances', '--json']);
     expect(piped.status).toBe(0);
     expect(piped.stderr).toBe('');
     expect(redirected.status).toBe(0);
@@ -186,31 +188,10 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
     expect(piped.validJson).toBe(true);
     JSON.parse(redirected.stdout);
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('self running-runs --json은 한 줄과 끝 개행을 보존하고 늦은 파이프 소비자에도 같은 바이트를 낸다', () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'elanous-running-runs-small-'));
-    const args = ['self', 'running-runs', '--json'];
-    const env = { ELANOUS_STATE_DIR: stateDir };
-    try {
-      const piped = runBinWithDelayedStdout(args, env);
-      const redirected = runBin(args, env);
-      expect(piped.status).toBe(0);
-      expect(piped.stderr).toBe('');
-      expect(redirected.status).toBe(0);
-      expect(redirected.stderr).toBe('');
-      expect(redirected.stdout.endsWith('\n')).toBe(true);
-      expect(redirected.stdout.split('\n')).toHaveLength(2);
-      expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
-      expect(piped.validJson).toBe(true);
-      JSON.parse(redirected.stdout);
-    } finally {
-      rmSync(stateDir, { recursive: true, force: true });
-    }
-  }, SPAWN_TIMEOUT_MS);
-
-  test('self parked 도움말은 JSON 출력의 updatedAt 필드를 명시한다', () => {
-    const { stdout, stderr, status } = runBin(['self', 'parked', '--help']);
+  test('self parked 도움말은 JSON 출력의 updatedAt 필드를 명시한다', async () => {
+    const { stdout, stderr, status } = await runBin(['self', 'parked', '--help']);
     expect(status).toBe(0);
     // ⛔⭐ Commander 가 도움말을 «폭에 맞춰 접는다» — 줄바꿈이 필드 사이 «아무 데나» 들어간다.
     //   ⇒ 공백을 먼저 «한 칸으로 접고» 문다. 안 그러면 이 시험이 「문면」이 아니라
@@ -219,9 +200,9 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     // ⛔ 봉투만 적혀 있으면 도구를 쓰는 사람이 parked[] «안»을 모른다 — 둘 다 문다.
     expect(help).toContain('{parked, counts, displayLimit, omittedCount, population, stores, limitation}');
     expect(help).toContain('[{feature, status, stage?, error?, runId, branch?, updatedAt, source}]');
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('self parked는 사람용 행에 갱신 나이를 싣고 JSON parked 계약은 보존한다', () => {
+  test('self parked는 사람용 행에 갱신 나이를 싣고 JSON parked 계약은 보존한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'elanous-self-parked-'));
     const runsDir = join(stateDir, 'self-dev-runs');
     mkdirSync(runsDir, { recursive: true });
@@ -238,14 +219,14 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     writeFileSync(join(runsDir, 'parked-run.json'), JSON.stringify(checkpoint));
     try {
       const env = { ELANOUS_STATE_DIR: stateDir };
-      const human = runBin(['self', 'parked'], env);
+      const human = await runBin(['self', 'parked'], env);
       expect(human.status).toBe(0);
       // 🪞 2026-08-26 — 사람 행이 ***[self-dev-run] 접두***를 얻었다(모집단 표시).
       //   ⛔ 늙은 기대가 아니라 «현재 계약»을 문다 — 그 접두가 곧 「어느 모집단인가」이고,
       //   그것이 오늘 수리 신호 축이 갈린 바로 그 값이다.
       expect(human.stdout).toContain('⚠️ [self-dev-run] failed/gate-failed · Parked feature — SELF_IMPL_FAILED  [run parked-run] · 1d ago');
 
-      const json = runBin(['self', 'parked', '--json'], env);
+      const json = await runBin(['self', 'parked', '--json'], env);
       expect(json.status).toBe(0);
       // 🪞 2026-08-26 — `--json` 이 ***맨 배열에서 «봉투»로*** 바뀌었고 원소에 `source` 가 붙었다.
       //   ⛔ 늙은 기대(맨 배열)를 되살리지 마라 — 봉투가 담은 counts/omittedCount 가
@@ -266,7 +247,7 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
       expect(human.stdout).toContain('원장 상태=interrupted');
       expect(human.stdout).toContain('이 자는 현재 self-dev run 저장소와 self-implement 원장만 읽고 다른 우주는 보지 않으며, 그 런이 아직 열려 있는지도 보지 않습니다.');
 
-      const resolved = runBin(['self', 'parked', '--resolve', 'parked-run', '--reason', 'succeeded later'], env);
+      const resolved = await runBin(['self', 'parked', '--resolve', 'parked-run', '--reason', 'succeeded later'], env);
       expect(resolved.status).toBe(0);
       expect(resolved.stdout).toContain('parked run 처리 완료 표시: parked-run — succeeded later');
       expect(JSON.parse(readFileSync(join(runsDir, 'parked-run.json'), 'utf8'))).toMatchObject({
@@ -275,7 +256,7 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
         parkedResolution: { reason: 'succeeded later' },
       });
 
-      const afterResolution = runBin(['self', 'parked', '--json'], env);
+      const afterResolution = await runBin(['self', 'parked', '--json'], env);
       expect(afterResolution.status).toBe(0);
       // ⭐ 처리 표시 «뒤»에도 봉투는 그대로다 — 「비었다」가 «맨 배열»로 퇴화하지 않는다.
       //   ⛔ counts 가 사라지면 「0건」과 「안 봤다」가 다시 같은 모양이 된다.
@@ -289,22 +270,22 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
         limitation: '이 자는 현재 self-dev run 저장소와 self-implement 원장만 읽고 다른 우주는 보지 않으며, 그 런이 아직 열려 있는지도 보지 않습니다.',
       });
 
-      const absent = runBin(['self', 'parked', '--resolve', 'unknown-run', '--reason', 'reviewed'], env);
+      const absent = await runBin(['self', 'parked', '--resolve', 'unknown-run', '--reason', 'reviewed'], env);
       expect(absent.status).not.toBe(0);
       expect(`${absent.stdout}${absent.stderr}`).toContain('self-dev run not found: unknown-run');
 
       const victim = join(stateDir, 'victim.json');
       writeFileSync(victim, '{"preserve":true}', 'utf8');
-      const traversal = runBin(['self', 'parked', '--resolve', '../victim', '--reason', 'reviewed'], env);
+      const traversal = await runBin(['self', 'parked', '--resolve', '../victim', '--reason', 'reviewed'], env);
       expect(traversal.status).not.toBe(0);
       expect(`${traversal.stdout}${traversal.stderr}`).toContain('invalid self-dev run ID: ../victim');
       expect(readFileSync(victim, 'utf8')).toBe('{"preserve":true}');
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('self parked는 숫자가 아닌 updatedAt을 사람용 행에 덧붙이지 않는다', () => {
+  test('self parked는 숫자가 아닌 updatedAt을 사람용 행에 덧붙이지 않는다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'elanous-self-parked-invalid-age-'));
     const runsDir = join(stateDir, 'self-dev-runs');
     mkdirSync(runsDir, { recursive: true });
@@ -313,16 +294,16 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
       results: [{ taskId: 'invalid-task', feature: 'Invalid timestamp', status: 'cancelled' }],
     }));
     try {
-      const result = runBin(['self', 'parked'], { ELANOUS_STATE_DIR: stateDir });
+      const result = await runBin(['self', 'parked'], { ELANOUS_STATE_DIR: stateDir });
       expect(result.status).toBe(0);
       expect(result.stdout).toContain('⚠️ [self-dev-run] cancelled · Invalid timestamp  [run invalid-age]');
       expect(result.stdout).not.toMatch(/\[run invalid-age\].*ago/);
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('self participants는 tracked·empty·legacy·absent run을 서로 다른 stdout 문면으로 조회한다', () => {
+  test('self participants는 tracked·empty·legacy·absent run을 서로 다른 stdout 문면으로 조회한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'elanous-self-participants-'));
     const runsDir = join(stateDir, 'self-dev-runs');
     mkdirSync(runsDir, { recursive: true });
@@ -340,46 +321,46 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     writeFileSync(join(runsDir, 'legacy.json'), JSON.stringify(checkpoint('legacy')));
     try {
       const env = { ELANOUS_STATE_DIR: stateDir };
-      const tracked = runBin(['self', 'participants', 'tracked'], env);
+      const tracked = await runBin(['self', 'participants', 'tracked'], env);
       expect(tracked.status).toBe(0);
       expect(tracked.stdout).toContain('scope: run-participation');
       expect(tracked.stdout).toContain('note: 프로세스 조상과 후손은 elanous pty lineage가 답합니다.');
       expect(tracked.stdout).toContain('id=process:42 kind=process runIdSource=generated');
 
-      const empty = runBin(['self', 'participants', 'empty'], env);
+      const empty = await runBin(['self', 'participants', 'empty'], env);
       expect(empty.status).toBe(0);
       expect(empty.stdout).toContain('참가자 없음: participant tracking은 사용했지만 기록된 참가자가 없습니다.');
 
-      const legacy = runBin(['self', 'participants', 'legacy'], env);
+      const legacy = await runBin(['self', 'participants', 'legacy'], env);
       expect(legacy.status).toBe(0);
       expect(legacy.stdout).toContain('participants 축 없음: 옛 기록은 participant tracking을 사용하지 않았습니다.');
 
-      const absent = runBin(['self', 'participants', 'absent'], env);
+      const absent = await runBin(['self', 'participants', 'absent'], env);
       expect(absent.status).toBe(0);
       expect(absent.stdout).toContain('run 없음: absent');
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 });
 
-describe('config set llm.provider — provider별 자격증명 동기화', () => {
+describe.concurrent('config set llm.provider — provider별 자격증명 동기화', () => {
   const oldKey = 'old-openai-secret-for-cli-test';
   const rotationKey = 'anthropic-rotation-secret-for-cli-test';
   const envKey = 'anthropic-env-secret-for-cli-test';
 
-  function withConfig(
+  async function withConfig(
     llm: Record<string, unknown>,
-    run: (configPath: string, env: NodeJS.ProcessEnv) => void,
+    run: (configPath: string, env: NodeJS.ProcessEnv) => Promise<void>,
     env: NodeJS.ProcessEnv = {},
-  ): void {
+  ): Promise<void> {
     const root = mkdtempSync(join(tmpdir(), 'config-set-provider-credential-'));
     const xdgConfigHome = join(root, 'cfg');
     const configPath = join(xdgConfigHome, 'elanous', 'config.json');
     try {
       mkdirSync(join(xdgConfigHome, 'elanous'), { recursive: true });
       writeFileSync(configPath, JSON.stringify({ llm }), 'utf8');
-      run(configPath, {
+      await run(configPath, {
         HOME: root,
         XDG_CONFIG_HOME: xdgConfigHome,
         ELANOUS_STATE_DIR: join(root, 'state'),
@@ -397,11 +378,11 @@ describe('config set llm.provider — provider별 자격증명 동기화', () =>
     }
   }
 
-  test('rotation은 env보다 우선해 저장하고 출력은 키 값을 노출하지 않는다', () => {
-    withConfig(
+  test('rotation은 env보다 우선해 저장하고 출력은 키 값을 노출하지 않는다', async () => {
+    await withConfig(
       { provider: 'openai-codex', apiKey: oldKey, rotation: [{ provider: 'anthropic', apiKey: rotationKey }] },
-      (configPath, env) => {
-        const switched = runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
+      async (configPath, env) => {
+        const switched = await runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
         expect(switched.status).toBe(0);
         expect(switched.stdout).toContain('provider credential updated: anthropic via rotation');
         expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { provider: 'anthropic', apiKey: rotationKey } });
@@ -411,56 +392,56 @@ describe('config set llm.provider — provider별 자격증명 동기화', () =>
         expect(output).not.toContain(envKey);
       },
     );
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('rotation이 없으면 provider 환경변수 키를 저장한다', () => {
-    withConfig(
+  test('rotation이 없으면 provider 환경변수 키를 저장한다', async () => {
+    await withConfig(
       { provider: 'openai-codex', apiKey: oldKey, rotation: [] },
-      (configPath, env) => {
-        const switched = runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
+      async (configPath, env) => {
+        const switched = await runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
         expect(switched.status).toBe(0);
         expect(switched.stdout).toContain('provider credential updated: anthropic via env');
         expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { provider: 'anthropic', apiKey: envKey } });
         expect(`${switched.stdout}\n${switched.stderr}`).not.toContain(envKey);
       },
     );
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('같은 provider는 자격증명을 갱신하거나 설정 파일을 다시 쓰지 않는다', () => {
-    withConfig(
+  test('같은 provider는 자격증명을 갱신하거나 설정 파일을 다시 쓰지 않는다', async () => {
+    await withConfig(
       { provider: 'anthropic', apiKey: rotationKey, model: 'claude-test', rotation: [{ provider: 'anthropic', apiKey: rotationKey }] },
-      (configPath, env) => {
+      async (configPath, env) => {
         const before = readFileSync(configPath, 'utf8');
-        const same = runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
+        const same = await runBin(['config', 'set', 'llm.provider', 'anthropic'], { ...env, ANTHROPIC_API_KEY: envKey });
         expect(same.status).toBe(0);
         expect(`${same.stdout}\n${same.stderr}`).not.toContain('provider credential updated:');
         expect(readFileSync(configPath, 'utf8')).toBe(before);
       },
     );
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 
-  test('자격증명 없음은 경고와 기존 키 유지를, keyless와 다른 경로는 무경고 키 유지를 보장한다', () => {
-    withConfig(
+  test('자격증명 없음은 경고와 기존 키 유지를, keyless와 다른 경로는 무경고 키 유지를 보장한다', async () => {
+    await withConfig(
       { provider: 'openai-codex', apiKey: oldKey, model: 'gpt-5', rotation: [] },
-      (configPath, env) => {
-        const unavailable = runBin(['config', 'set', 'llm.provider', 'grok'], env);
+      async (configPath, env) => {
+        const unavailable = await runBin(['config', 'set', 'llm.provider', 'grok'], env);
         expect(unavailable.status).toBe(0);
         expect(unavailable.stdout).toContain('provider credential unavailable: grok');
         expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { provider: 'grok', apiKey: oldKey } });
 
-        const keyless = runBin(['config', 'set', 'llm.provider', 'local'], env);
+        const keyless = await runBin(['config', 'set', 'llm.provider', 'local'], env);
         expect(keyless.status).toBe(0);
         expect(`${keyless.stdout}\n${keyless.stderr}`).not.toContain('provider credential unavailable:');
         expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { provider: 'local', apiKey: oldKey } });
 
-        const model = runBin(['config', 'set', 'llm.model', 'manually-selected-model'], env);
+        const model = await runBin(['config', 'set', 'llm.model', 'manually-selected-model'], env);
         expect(model.status).toBe(0);
         expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { model: 'manually-selected-model', apiKey: oldKey } });
         const output = `${unavailable.stdout}\n${unavailable.stderr}\n${keyless.stdout}\n${keyless.stderr}\n${model.stdout}\n${model.stderr}`;
         expect(output).not.toContain(oldKey);
       },
     );
-  }, SPAWN_TIMEOUT_MS);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 });
 
 // ⛔⭐⭐⭐⭐ `provider codex status` — 리뷰 must-fix. 이 명령의 값은 «세 수»에 있고,
@@ -469,8 +450,8 @@ describe('config set llm.provider — provider별 자격증명 동기화', () =>
 //   ② 임계가 «판정기가 실제로 쓴» 정규화 값인가(raw config 를 찍으면 0·101·NaN 에서 거짓말한다)
 //   ③ 신호 «나이»가 JSON 에 있는가(핵심 진단 항목인데 텍스트에만 있으면 도구가 못 읽는다)
 //   ⛔ 이 셋은 in-process 로 못 문다 — 실제로 그 명령이 떠서 그 값을 내야 한다.
-describe('provider codex status — 실물 산출', () => {
-  test('우주·임계·신호 나이를 «값으로» 낸다', () => {
+describe.concurrent('provider codex status — 실물 산출', () => {
+  test('우주·임계·신호 나이를 «값으로» 낸다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'codex-status-cli-'));
     try {
       // ⛔⭐ 홈도 «격리»한다(리뷰 must-fix) — 종전엔 실제 ~/.codex 에 의존해 깨끗한 CI 에서 깨졌다.
@@ -483,7 +464,7 @@ describe('provider codex status — 실물 산출', () => {
       mkdirSync(join(isoCfg, 'elanous'), { recursive: true });
       writeFileSync(join(isoCfg, 'elanous', 'auth.json'), JSON.stringify({ providers: {} }), 'utf8');
       const isoEnv = { HOME: root, ELANOUS_STATE_DIR: join(root, 'unrelated-instance-state'), CODEX_HOME: isoHome, XDG_CONFIG_HOME: isoCfg, ELANOUS_SUPPRESS_XDG_WARNING: '1' };
-      const r = runBin(['provider', 'codex', 'status', '--json'], isoEnv);
+      const r = await runBin(['provider', 'codex', 'status', '--json'], isoEnv);
       if (r.status !== 0) throw new Error(`status 가 실패했다(회귀): ${r.stderr.slice(0, 300)}`);
       const out = JSON.parse(r.stdout) as {
         universe: { instanceRoot: string; signalDir: string; authStore: string };
@@ -515,7 +496,7 @@ describe('provider codex status — 실물 산출', () => {
         mkdirSync(join(cfgDir, 'elanous'), { recursive: true });
         writeFileSync(join(cfgDir, 'elanous', 'config.json'),
           JSON.stringify({ llm: { codexAccountRotationThresholdPercent: 0 } }), 'utf8');
-        const bad = runBin(['provider', 'codex', 'status', '--json'],
+        const bad = await runBin(['provider', 'codex', 'status', '--json'],
           { ...isoEnv, XDG_CONFIG_HOME: cfgDir });
         if (bad.status !== 0) throw new Error(`status 실패(회귀): ${bad.stderr.slice(0, 300)}`);
         const parsedBad = JSON.parse(bad.stdout) as { rotation: { thresholdPercent: number } };
@@ -529,7 +510,7 @@ describe('provider codex status — 실물 산출', () => {
         //   ***임계 설정이 통째로 no-op 이었다.*** 이 줄이 그것을 잡는다.
         writeFileSync(join(cfgDir, 'elanous', 'config.json'),
           JSON.stringify({ llm: { codexAccountRotationThresholdPercent: 42 } }), 'utf8');
-        const ok = runBin(['provider', 'codex', 'status', '--json'],
+        const ok = await runBin(['provider', 'codex', 'status', '--json'],
           { ...isoEnv, XDG_CONFIG_HOME: cfgDir });
         if (ok.status !== 0) throw new Error(`status 실패(회귀): ${ok.stderr.slice(0, 300)}`);
         expect((JSON.parse(ok.stdout) as { rotation: { thresholdPercent: number } }).rotation.thresholdPercent).toBe(42);
@@ -558,7 +539,7 @@ describe('provider codex status — 실물 산출', () => {
           observedAt: new Date(Date.now() - 3 * 24 * 3600_000).toISOString(),
           measuredHome: home,
         }), 'utf8');
-        const stale = runBin(['provider', 'codex', 'status', '--json'], isoEnv);
+        const stale = await runBin(['provider', 'codex', 'status', '--json'], isoEnv);
         if (stale.status !== 0) throw new Error(`status 실패(회귀): ${stale.stderr.slice(0, 300)}`);
         const p2 = JSON.parse(stale.stdout) as { current: { signalAgeMinutes: number | null; signalFresh: boolean } };
         // ⭐ 만료지만 «나이는 있다» — 종전엔 둘 다 접혀 null 이었다
@@ -568,5 +549,30 @@ describe('provider codex status — 실물 산출', () => {
     } finally {
       try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
-  }, 60_000);
+  }, CONCURRENT_TEST_TIMEOUT_MS);
+});
+
+// ⛔ 이 시험만 «순차»로 남긴다 — `self running-runs` 는 살아 있는 프로세스 표를 읽으므로, 같은 파일의
+//   동시 spawn 이 겹치면 piped/redirected 두 번의 산출 바이트가 «시험 자신 때문에» 갈린다.
+describe('배포 엔트리 bin/elanous.mjs — 순차', () => {
+  test('self running-runs --json은 한 줄과 끝 개행을 보존하고 늦은 파이프 소비자에도 같은 바이트를 낸다', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'elanous-running-runs-small-'));
+    const args = ['self', 'running-runs', '--json'];
+    const env = { ELANOUS_STATE_DIR: stateDir };
+    try {
+      const piped = await runBinWithDelayedStdout(args, env);
+      const redirected = await runBin(args, env);
+      expect(piped.status).toBe(0);
+      expect(piped.stderr).toBe('');
+      expect(redirected.status).toBe(0);
+      expect(redirected.stderr).toBe('');
+      expect(redirected.stdout.endsWith('\n')).toBe(true);
+      expect(redirected.stdout.split('\n')).toHaveLength(2);
+      expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
+      expect(piped.validJson).toBe(true);
+      JSON.parse(redirected.stdout);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }, CONCURRENT_TEST_TIMEOUT_MS);
 });

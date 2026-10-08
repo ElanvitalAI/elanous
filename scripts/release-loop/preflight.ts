@@ -27,7 +27,7 @@ export interface PreflightResult {
   blockers: number;
   warnings: number;
   findings: PreflightFinding[];
-  schedule: { cutAt: string; landBy: string | null; publishAt: string | null; publishAtSource: 'option' | 'cadence' | null } | null;
+  schedule: { cutAt: string; landBy: string | null; publishAt: string | null; publishAtSource: 'option' | 'schedule' | 'cadence' | null } | null;
   /** The immediately previous release (by version order) whose gate is compared. */
   previousVersion: string | null;
   gateMeasure: GateMeasure | null;
@@ -206,15 +206,17 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
     findings.push({ level: 'warn', check: 'schedule', message: `판 일정 없음 — elanous release schedule set --version ${version} --cut-at <iso> --land-by <iso>` });
   } else {
     const cut = Date.parse(schedule.cutAt);
-    const publishAt = deps.publishAt ? new Date(deps.publishAt).toISOString() : cadencePublishAt(schedule.cutAt);
-    scheduleOut = { cutAt: schedule.cutAt, landBy: schedule.landBy, publishAt, publishAtSource: deps.publishAt ? 'option' : 'cadence' };
+    // --publish-at > the stored schedule publish time (`release schedule set --publish-at`) > the October cadence.
+    const publishAtSource = deps.publishAt ? 'option' : schedule.publishAt ? 'schedule' : 'cadence';
+    const publishAt = deps.publishAt ? new Date(deps.publishAt).toISOString() : schedule.publishAt ?? cadencePublishAt(schedule.cutAt);
+    scheduleOut = { cutAt: schedule.cutAt, landBy: schedule.landBy, publishAt, publishAtSource };
     if (!schedule.landBy) findings.push({ level: 'warn', check: 'schedule', message: `착지 마감 없음 — 컷 ${formatKst(schedule.cutAt)} · 규칙은 컷 − 30분` });
     else if (cut - Date.parse(schedule.landBy) < 30 * 60_000) findings.push({ level: 'warn', check: 'schedule', message: `착지 마감 ${formatKst(schedule.landBy)} 이 컷 − 30분보다 늦다(컷 ${formatKst(schedule.cutAt)})` });
     else findings.push({ level: 'ok', check: 'schedule', message: `일정 — 착지 마감 ${formatKst(schedule.landBy)} · 컷 ${formatKst(schedule.cutAt)}` });
     gateMeasure = previousVersion ? releaseGateMeasure({ version: previousVersion }, deps.graphRunsRoot) : null;
     if (!gateMeasure) fallbackGateMeasure = releaseGateMeasure({ below: version }, deps.graphRunsRoot);
     const windowSeconds = Math.round((Date.parse(publishAt) - cut) / 1000);
-    const publishLabel = `발행 ${formatKst(publishAt)}${deps.publishAt ? '' : '(기본: 판 주기 07·18시 · --publish-at 로 바꾼다)'}`;
+    const publishLabel = `발행 ${formatKst(publishAt)}${publishAtSource === 'cadence' ? '(기본: 판 주기 07·18시 · --publish-at 로 바꾼다)' : publishAtSource === 'schedule' ? '(판 일정)' : ''}`;
     if (!gateMeasure) {
       const fallback = fallbackGateMeasure ? ` · 참고: 가장 최근 실측은 ${fallbackGateMeasure.version} 게이트 ${minutes(fallbackGateMeasure.gateSeconds)}(직전 판 아님)` : ' · 게이트 실측 없음';
       findings.push({ level: 'warn', check: 'schedule', message: `직전 판${previousVersion ? `(${previousVersion})` : ''} 실측 없음 — 컷→${publishLabel} 창 ${minutes(windowSeconds)}${fallback}` });

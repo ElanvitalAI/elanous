@@ -71,7 +71,7 @@ test('hand, launch, run, pr and green move chain in time order without prose', a
     const { raw, edges } = await edgesOf(windowed, deps);
     expect([...edges].reverse()).toEqual([
       { at: at(10), kind: 'hand', from: 'loop:orchestrator', to: 'agent:task-agent', ref: 'ta-piece', cell: 'LOOP-INTERACT' },
-      { at: at(20), kind: 'launch', from: 'agent:task-agent', to: 'UX', ref: 'ta-piece' },
+      { at: at(20), kind: 'launch', from: 'agent:task-agent', to: 'UX', ref: 'ta-piece', run: RUN },
       { at: at(30), kind: 'run', from: 'UX', to: `loop:${RUN}`, ref: RUN },
       { at: at(40), kind: 'run', from: `loop:${RUN}`, to: 'pr:24619', ref: RUN },
       { at: at(60), kind: 'move', from: 'agent:task-agent', to: 'release:LOOP-INTERACT', ref: 'ta-mission', move: 'green-proposal' },

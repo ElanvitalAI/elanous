@@ -15,6 +15,10 @@ import { appendRunLedgerEntry, type RunLedgerWriter } from './run-ledger.js';
 
 export interface ExecutionClarificationContext {
   runId: string;
+  outsideFiles?: readonly string[];
+  /** Full outside count — when larger than `outsideFiles`, the card says how many names it does not show. */
+  outsideCount?: number;
+  declaredPaths?: readonly string[];
   budget?: ClarificationContext['budget'];
   pendingQuestionCount?: number;
   config?: { hitl?: { executionDeadlineMinutes?: number } };
@@ -71,6 +75,13 @@ export async function askAtExecution(
 
   const request = toAskUserQuestionRequest(decision);
   if (!request) throw new Error('Execution clarification policy approved a question without a valid wire request.');
+  if (candidate.id === 'execution_scope' && ctx.outsideFiles) {
+    const sibling = (file: string) => ctx.declaredPaths === undefined ? 'unknown'
+      : file.endsWith('.test.ts') && ctx.declaredPaths.includes(file.replace(/\.test\.ts$/, '.ts')) ? 'yes' : 'no';
+    const hidden = Math.max(0, (ctx.outsideCount ?? ctx.outsideFiles.length) - ctx.outsideFiles.length);
+    const details = `Run ID: ${ctx.runId}\nOutside files:\n${ctx.outsideFiles.map(file => `- ${file} (declared-path sibling test: ${sibling(file)})`).join('\n')}${hidden > 0 ? `\n- … ${hidden} more outside file(s) not shown — inspect the worktree diff before expanding scope` : ''}`;
+    for (const question of request.questions) question.question += `\n\n${details}`;
+  }
   const configured = ctx.config === undefined
     ? getUserConfig().hitl?.executionDeadlineMinutes
     : ctx.config.hitl?.executionDeadlineMinutes;

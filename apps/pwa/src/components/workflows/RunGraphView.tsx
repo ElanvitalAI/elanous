@@ -72,7 +72,14 @@ function errorText(error: unknown): string {
 }
 
 /** Core graphs offer clone-to-edit. Mine graphs edit the document tree and save through PUT. */
-export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palette?: GraphKindEntry[]; initialGraphId?: string } = {}) {
+export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGraph, onOpenInCanvas }: {
+  palette?: GraphKindEntry[];
+  initialGraphId?: string;
+  /** CGE-EDIT — start an empty graph on the editing canvas. */
+  onNewGraph?: () => void;
+  /** CGE-EDIT — open this «mine» graph's working copy on the editing canvas. */
+  onOpenInCanvas?: (id: string, yaml: string) => void;
+} = {}) {
   const client = useNexusClient();
   const queries = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -187,7 +194,10 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palet
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
       <aside className="w-56 shrink-0 overflow-y-auto border-r border-border" aria-label="실행 그래프 목록">
-        <h2 className="px-3 py-3 text-xs font-semibold">실행 그래프</h2>
+        <div className="flex items-center justify-between gap-2 px-3 py-3">
+          <h2 className="text-xs font-semibold">실행 그래프</h2>
+          {onNewGraph && <button type="button" onClick={onNewGraph} className="rounded bg-primary px-2 py-1 text-xs text-primary-foreground">새 그래프</button>}
+        </div>
         {list.isLoading && <p className="px-3 text-xs text-text-tertiary">불러오는 중…</p>}
         {list.isError && <p role="alert" className="px-3 text-xs text-error">그래프 목록을 불러오지 못했습니다.</p>}
         {list.data?.graphs.length === 0 && <p className="px-3 text-xs text-text-tertiary">그래프가 없습니다.</p>}
@@ -220,6 +230,10 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palet
           {summary && !summary.editable && (
             <button type="button" onClick={() => clone.mutate()} disabled={clone.isPending}
               className="rounded border border-border px-2 py-1 text-xs">복제해서 고치기</button>
+          )}
+          {editable && onOpenInCanvas && selected && currentYaml !== null && (
+            <button type="button" onClick={() => onOpenInCanvas(selected, currentYaml)}
+              className="rounded border border-primary px-2 py-1 text-xs text-primary">캔버스에서 편집</button>
           )}
           {editable && (
             <>

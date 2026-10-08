@@ -74,6 +74,21 @@ function setup(impact: ClarificationCandidate['impact'], minutes?: number, answe
 }
 
 describe('askAtExecution', () => {
+  test('scope card marks sibling status unknown when declared paths were not supplied', async () => {
+    const { ctx, deps, written } = setup('high');
+    deps.resolverDeps.readAnswer = () => ({ ok: true, answer: { id: 'pending-execution-1', result: { answers: { scope_change: 'a', execution_scope: 'a' } } } });
+    await askAtExecution({ ...candidate('high'), id: 'execution_scope' }, { ...ctx, outsideFiles: ['src/example.test.ts'] }, deps);
+    expect(written[0]?.questions[0]?.question).toContain('- src/example.test.ts (declared-path sibling test: unknown)');
+  });
+
+  test('scope card states how many outside files it does not list when the name list is capped', async () => {
+    const { ctx, deps, written } = setup('high');
+    deps.resolverDeps.readAnswer = () => ({ ok: true, answer: { id: 'pending-execution-1', result: { answers: { scope_change: 'a', execution_scope: 'a' } } } });
+    await askAtExecution({ ...candidate('high'), id: 'execution_scope' }, { ...ctx, outsideFiles: ['src/a.ts'], outsideCount: 3, declaredPaths: [] }, deps);
+    expect(written[0]?.questions[0]?.question).toContain('- src/a.ts (declared-path sibling test: no)');
+    expect(written[0]?.questions[0]?.question).toContain('- … 2 more outside file(s) not shown');
+  });
+
   test('low impact assumes immediately, writes no question, and records the assumption', async () => {
     const { ctx, deps, written, ledger } = setup('low');
     expect(await askAtExecution(candidate('low'), ctx, deps)).toEqual({ choice: 'a', by: 'assumed' });
@@ -336,6 +351,8 @@ describe('askAtExecution', () => {
       expect(result).toMatchObject({ ok: false, stage: 'soft-stopped' });
       expect(questions).toHaveLength(1);
       expect(questions[0]).toMatchObject({ runId: 'run-real-scope', questions: [{ id: 'execution_scope', impact: 'high', recommendedIndex: 0 }] });
+      expect(questions[0]!.questions[0]!.question).toContain('Run ID: run-real-scope');
+      expect(questions[0]!.questions[0]!.question).toContain('- LICENSE (declared-path sibling test: no)');
       expect(gates).toBe(gatesBefore);
       expect(opened).toBe(openedBefore);
     } finally {

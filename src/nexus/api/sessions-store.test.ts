@@ -22,6 +22,7 @@ import {
   appendMessage,
   createSession,
   isHarnessSessionOrigin,
+  forkSessionById as realForkSessionById,
   type forkSessionById,
 } from '../../session/index.js';
 import type { MetaApiOpts } from './meta-api.js';
@@ -103,6 +104,43 @@ describe('handleSessionsStoreFork — beforeUser 파라미터', () => {
     const j = await res.json() as { ok: boolean; error: string };
     expect(j.ok).toBe(false);
     expect(j.error).toBe('not_found');
+  });
+});
+
+describe('handleSessionsStoreFork → real forkSessionById (PCH-11 daemon half)', () => {
+  it('full fork copies the conversation; beforeUser=3 drops the last user turn; source is untouched', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pch-11-branch-'));
+    try {
+      const original = createSession({ origin: 'pwa', title: 'original' }, root);
+      for (const [role, content] of [
+        ['user', 'first'], ['assistant', 'first answer'],
+        ['user', 'second'], ['assistant', 'second answer'], ['user', 'last'],
+      ] as const) {
+        appendMessage(original.id, { role, content, ts: new Date().toISOString() }, root);
+      }
+      const before = loadSession(original.id, root)!;
+      const fork = async (body?: string) => {
+        const req = new Request(`http://localhost/v1/sessions/store/${original.id}/fork`, {
+          method: 'POST', ...(body !== undefined ? { headers: { 'content-type': 'application/json' }, body } : {}),
+        });
+        const res = await handleSessionsStoreFork(req, original.id, OPTS, {
+          fork: (id, opts) => realForkSessionById(id, opts, root),
+        });
+        expect(res.status).toBe(200);
+        return ((await res.json()) as { id: string }).id;
+      };
+      const full = await fork();
+      const rewound = await fork(JSON.stringify({ beforeUser: 3 }));
+      expect(full).not.toBe(rewound);
+      expect(loadSession(full, root)!.messages.map(({ role, content }) => ({ role, content })))
+        .toEqual(before.messages.map(({ role, content }) => ({ role, content })));
+      expect(loadSession(rewound, root)!.messages.map(({ content }) => content))
+        .toEqual(['first', 'first answer', 'second', 'second answer']);
+      for (const id of [full, rewound]) expect(loadSession(id, root)!.meta.forkedFromId).toBe(original.id);
+      expect(loadSession(original.id, root)).toEqual(before);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

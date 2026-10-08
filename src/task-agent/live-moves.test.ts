@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { defaultPrHead, defaultRequestReview, liveReviewArgs, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
+import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveReview, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 
@@ -341,8 +341,8 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
       };
       expect(await defaultPrHead(5, '/tmp/wt-5', gh)).toEqual({ head: HEAD_A, state: 'OPEN' });
       expect(calls).toEqual([
-        { args: ['pr', 'view', '5', '--json', 'headRefOid,state'], proxy: 'http://proxy.invalid:1', cwd: '/tmp/wt-5' },
-        { args: ['pr', 'view', '5', '--json', 'headRefOid,state'], proxy: undefined, cwd: '/tmp/wt-5' },
+        { args: ['pr', 'view', '5', '--json', 'headRefOid,headRefName,state,url'], proxy: 'http://proxy.invalid:1', cwd: '/tmp/wt-5' },
+        { args: ['pr', 'view', '5', '--json', 'headRefOid,headRefName,state,url'], proxy: undefined, cwd: '/tmp/wt-5' },
       ]);
       expect(await defaultPrHead(5, undefined, () => ({ status: 0, stdout: JSON.stringify({ headRefOid: 'short', state: 'OPEN' }) }))).toBeNull();
       expect(await defaultPrHead(5, undefined, () => ({ status: 1, stdout: '' }))).toBeNull();
@@ -406,4 +406,125 @@ test('ORCH-LIVE-1008: the default live review entry is the elanous CLI, not the 
     await defaultRequestReview(7, 'intent', undefined, { spawn: fakeSpawn, configDir: '/universe' });
     expect(seen[0]?.[1]).toBe(ELANOUS_CLI_ENTRY);
   } finally { process.argv[1] = started; }
+});
+
+describe('TA-LIVE-REVIEW-POD — 작업 트리 없는 런(Pod)의 live review 는 «런이 낸 PR 머리»가 확인되는 저장소에서만', () => {
+  const PR_URL = 'https://github.com/owner/repo/pull/24738';
+  const BRANCH = 'self-impl/goalid-pod-r1';
+  function podFixture(view: (cwd?: string) => PrHeadView | null, candidates: ReviewRepoCandidate[]) {
+    const f = fixture();
+    const { EventEmitter } = require('node:events') as typeof import('node:events');
+    const spawned: Array<{ args: string[]; options: Record<string, unknown> }> = [];
+    const fakeSpawn = ((_command: string, args: string[], options: Record<string, unknown>) => {
+      spawned.push({ args, options });
+      const child = Object.assign(new EventEmitter(), { pid: 4343, unref: () => {} });
+      queueMicrotask(() => child.emit('spawn'));
+      return child;
+    }) as never;
+    const viewed: Array<string | undefined> = [];
+    const deps = f.deps(['review']);
+    const live = {
+      ...deps.live,
+      prHead: async (_pr: number, cwd?: string) => { viewed.push(cwd); return view(cwd); },
+      requestReview: (pr: number, intent: string, cwd?: string) => defaultRequestReview(pr, intent, cwd, { spawn: fakeSpawn, entry: '/repo/bin/elanous.mjs', configDir: '/universe' }),
+      repoCandidates: () => candidates,
+    };
+    return { f, spawned, viewed, deps: { ...deps, live } };
+  }
+  const liveMoveLog = (f: ReturnType<typeof fixture>) => f.logs.find((entry) => entry.event === 'live-move')!.data;
+
+  test('Pod 런(작업 트리 없음) · 저장소 PR 머리 sha 가 런의 머리와 같다 → 리뷰를 그 저장소 cwd 에서 실제로 띄운다', async () => {
+    const t = podFixture(() => ({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'harness.defaultRepo', cwd: '/tmp/repo-default' }]);
+    const out = await run('needs-human', [job({ prNumber: 24738, checkedHeadCommit: HEAD_A, branch: BRANCH, prUrl: PR_URL })], t.deps);
+    expect(out.liveMove).toMatchObject({ kind: 'review', executed: true, ok: true, reviewRepo: { resolved: true, source: 'harness.defaultRepo', cwd: '/tmp/repo-default', proof: 'head-sha' } });
+    expect(t.spawned).toHaveLength(1);
+    expect(t.spawned[0]!.args.slice(0, 6)).toEqual(['/repo/bin/elanous.mjs', '--config-dir', '/universe', 'self', 'review', '24738']);
+    expect(t.spawned[0]!.options).toMatchObject({ cwd: '/tmp/repo-default', detached: true });
+    expect(readTaskCard('ta-live-1', t.f.statePath)!.reviewRequests).toEqual([expect.objectContaining({ pr: 24738, head: HEAD_A })]);
+    expect(t.f.logs.find((entry) => entry.event === 'shadow-move')!.data).toMatchObject({ live: true, liveExecuted: true, liveOk: true });
+  });
+
+  test('런이 sha 를 안 남겼으면 런의 브랜치로 확인한다 · 첫 후보가 어긋나면 다음 후보(카드 대상 → 기본 저장소)', async () => {
+    const t = podFixture((cwd) => cwd === '/tmp/card-target'
+      ? { head: HEAD_B, state: 'OPEN', branch: 'someone-else', url: PR_URL }
+      : { head: HEAD_B, state: 'OPEN', branch: BRANCH, url: PR_URL },
+    [{ source: 'card.project', cwd: '/tmp/card-target' }, { source: 'harness.defaultRepo', cwd: '/tmp/repo-default' }]);
+    const out = await run('harvestable-awaiting-human', [job({ prNumber: 24738, harvestable: true, branch: BRANCH, prUrl: PR_URL })], t.deps);
+    expect(out.liveMove).toMatchObject({ executed: true, reviewRepo: { resolved: true, source: 'harness.defaultRepo', proof: 'branch' } });
+    expect(t.viewed).toEqual(['/tmp/card-target', '/tmp/repo-default']);
+    expect(t.spawned.map((entry) => entry.options.cwd)).toEqual(['/tmp/repo-default']);
+  });
+
+  test('머리 불일치 · 브랜치 불일치 · 다른 저장소 URL · 읽기 실패 · 후보 없음 · 런 머리 없음 → 그림자 그대로 · 이유 한 줄 관측', async () => {
+    const cases: Array<[string, (cwd?: string) => PrHeadView | null, ReviewRepoCandidate[], Partial<SupervisorJobResult>, string]> = [
+      ['head mismatch', () => ({ head: HEAD_B, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }], { checkedHeadCommit: HEAD_A, branch: BRANCH }, `host: head ${HEAD_B.slice(0, 12)} ≠ run ${HEAD_A.slice(0, 12)}`],
+      ['branch mismatch', () => ({ head: HEAD_B, state: 'OPEN', branch: 'other', url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }], { branch: BRANCH, prUrl: PR_URL }, `host: branch other ≠ run ${BRANCH}`],
+      ['other repository', () => ({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: 'https://github.com/else/where/pull/24738' }), [{ source: 'host', cwd: '/tmp/h' }], { checkedHeadCommit: HEAD_A, prUrl: PR_URL }, 'host: PR url https://github.com/else/where/pull/24738 ≠ run'],
+      ['unreadable', () => null, [{ source: 'card.project', cwd: '/tmp/c' }], { checkedHeadCommit: HEAD_A }, 'card.project: PR #24738 unreadable'],
+      ['no candidates', () => ({ head: HEAD_A, state: 'OPEN' }), [], { checkedHeadCommit: HEAD_A }, 'no target repository'],
+      ['no produced head', () => ({ head: HEAD_A, state: 'OPEN' }), [{ source: 'host', cwd: '/tmp/h' }], {}, 'run result carries no PR head or branch'],
+      ['branch only, run url missing', () => ({ head: HEAD_B, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }], { branch: BRANCH }, 'branch matches but PR url unconfirmed (run none'],
+      ['branch only, repo url missing', () => ({ head: HEAD_B, state: 'OPEN', branch: BRANCH }), [{ source: 'host', cwd: '/tmp/h' }], { branch: BRANCH, prUrl: PR_URL }, 'repo none)'],
+      ['empty recorded head (no branch fallback)', () => ({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }], { checkedHeadCommit: '', branch: BRANCH, prUrl: PR_URL }, 'is not a full commit sha'],
+      ['malformed recorded head (no branch fallback)', () => ({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }], { checkedHeadCommit: 'abc123', branch: BRANCH }, 'is not a full commit sha'],
+    ];
+    for (const [name, view, candidates, over, reason] of cases) {
+      const t = podFixture(view, candidates);
+      const out = await run('needs-human', [job({ prNumber: 24738, ...over })], t.deps);
+      expect({ name, liveMove: out.liveMove }).toMatchObject({ name, liveMove: { executed: false, ok: false, detail: 'PR #24738 worktree unknown — stays shadow', reviewRepo: { resolved: false } } });
+      expect(out.liveMove!.reviewRepo!.reason).toContain(reason);
+      expect(liveMoveLog(t.f)).toMatchObject({ executed: false, reviewRepo: { resolved: false, reason: expect.stringContaining(reason) } });
+      expect(t.spawned).toHaveLength(0);
+      expect(readTaskCard('ta-live-1', t.f.statePath)!.reviewRequests).toBeUndefined();
+    }
+  });
+
+  test('기본 후보 배선 — 후보를 주입하지 않으면 실제 호스트 checkout 뿌리에서 PR 을 확인하고 그 cwd 로 띄운다', async () => {
+    const { findGitDir } = await import('../git-fs/locate.js');
+    const hostRoot = findGitDir(process.cwd())!.root;
+    const t = podFixture((cwd) => cwd === hostRoot ? { head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL } : null, []);
+    const { repoCandidates: _drop, ...live } = t.deps.live;
+    const out = await run('needs-human', [job({ prNumber: 24738, checkedHeadCommit: HEAD_A, prUrl: PR_URL })], { ...t.deps, live });
+    expect(t.viewed).toContain(hostRoot);
+    expect(out.liveMove).toMatchObject({ executed: true, reviewRepo: { resolved: true, cwd: hostRoot } });
+    expect(t.spawned.map((entry) => entry.options.cwd)).toEqual([hostRoot]);
+  });
+
+  test('호출자가 런 근거(produced)를 안 넘기면 «미제공»으로 적고 그림자 — PR 을 조회하지 않는다', async () => {
+    const t = podFixture(() => ({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL }), [{ source: 'host', cwd: '/tmp/h' }]);
+    const card = readTaskCard('ta-live-1', t.f.statePath)!;
+    const out = await executeLiveReview(card, 24738, { runId: 'run-x', stopReason: 'needs-human' }, { ...t.deps.live, log: t.deps.log });
+    expect(out).toMatchObject({ executed: false, ok: false, detail: 'PR #24738 worktree unknown — stays shadow', reviewRepo: { resolved: false, reason: 'caller passed no run evidence (produced) — head/branch not checked' } });
+    expect(liveMoveLog(t.f)).toMatchObject({ reviewRepo: { reason: expect.stringContaining('caller passed no run evidence') } });
+    expect(t.viewed).toEqual([]);
+    expect(t.spawned).toHaveLength(0);
+  });
+
+  test('작업 트리가 있으면 종전 그대로 — 후보 저장소를 보지 않는다', async () => {
+    const t = podFixture(() => ({ head: HEAD_A, state: 'OPEN' }), [{ source: 'host', cwd: '/tmp/never' }]);
+    const out = await run('needs-human', [job({ prNumber: 30, worktreePath: '/tmp/wt-30', branch: BRANCH })], t.deps);
+    expect(out.liveMove).toMatchObject({ executed: true });
+    expect(out.liveMove!.reviewRepo).toBeUndefined();
+    expect(t.viewed).toEqual(['/tmp/wt-30']);
+  });
+
+  test('기본 후보 — 카드 대상 → harness.defaultRepo → 호스트 checkout · 없는 디렉터리·중복·상대 경로는 뺀다', () => {
+    const a = mkdtempSync(join(tmpdir(), 'ta-pod-a-'));
+    const b = mkdtempSync(join(tmpdir(), 'ta-pod-b-'));
+    const card: TaskCard = { id: 'c', text: 't', createdAt: '', status: 'launched', history: [], project: { target: a } };
+    expect(defaultReviewRepoCandidates(card, { defaultRepo: () => b, hostRoot: () => a })).toEqual([
+      { source: 'card.project', cwd: a }, { source: 'harness.defaultRepo', cwd: b },
+    ]);
+    expect(defaultReviewRepoCandidates({ ...card, project: { target: join(a, 'missing') } }, { defaultRepo: () => 'relative/path', hostRoot: () => b })).toEqual([
+      { source: 'host', cwd: b },
+    ]);
+    expect(defaultReviewRepoCandidates({ ...card, project: { target: 'relative/target' } }, { defaultRepo: () => `${b}/./`, hostRoot: () => undefined })).toEqual([
+      { source: 'harness.defaultRepo', cwd: b },
+    ]);
+  });
+
+  test('PR 머리 조회는 브랜치·URL 도 싣는다', async () => {
+    const gh = () => ({ status: 0, stdout: JSON.stringify({ headRefOid: HEAD_A, headRefName: BRANCH, state: 'OPEN', url: PR_URL }) });
+    expect(await defaultPrHead(24738, '/tmp/x', gh)).toEqual({ head: HEAD_A, state: 'OPEN', branch: BRANCH, url: PR_URL });
+  });
 });

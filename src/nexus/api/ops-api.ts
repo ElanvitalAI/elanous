@@ -1,7 +1,8 @@
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug, redactSecretText } from '../../debug/log.js';
-import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
+import { gateShardsPath, readGateShards, summarizeShards, type GateShardsFile, type GateShardsSummary } from '../../release-loop/gate-shards.js';
 import { listChecklist } from '../../release-loop/checklist.js';
 import { getSchedule } from '../../release-loop/release-schedule.js';
 import { jsonResponse } from './json-response.js';
@@ -123,13 +124,25 @@ export function releaseNodeFacts(output: unknown): ReleaseNodeFacts {
 }
 export interface ReleaseRunView {
   runId: string; status: string; startedAt: string; version: string | null; path: string[]; nodes: ReleaseRunNodeView[];
+  /** GATE-LIVE-OBS — 지금 gate 노드에 있는 런에만 싣는다(발행 원장 `gate-logs/cut/shards.json`). 파일이 없으면 생략. */
+  gateShards?: GateShardsFile & { summary: GateShardsSummary };
+}
+
+/** 도는 gate 노드의 조각 표 — 다른 판의 파일을 붙이지 않게 version 이 같을 때만. */
+function gateShardsFor(version: string | null, status: string, nodes: ReleaseRunNodeView[], ledgerRoot: string, now: number):
+  ReleaseRunView['gateShards'] | undefined {
+  if (!version || status !== 'running' || !nodes.some((node) => node.nodeId === 'gate' && node.ok === null)) return undefined;
+  const file = readGateShards(gateShardsPath(version, ledgerRoot));
+  if (!file || file.version !== version) return undefined;
+  return { ...file, shards: file.shards.map((shard) => shard.waitReason ? { ...shard, waitReason: redactSecretText(shard.waitReason) } : shard),
+    summary: summarizeShards(file, now) };
 }
 
 /** The release run ledger as `/v1/ops/release/runs` serves it (newest 20) — shared with Telegram /release and away mode
  *  so every surface reads the same verdicts. `'unavailable'` = the directory exists but cannot be read. */
 export function readReleaseRuns(version: string | null = null,
   dir: string = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop'),
-  opts: { facts?: boolean } = {}): ReleaseRunView[] | 'unavailable' {
+  opts: { facts?: boolean; ledgerRoot?: string; now?: number } = {}): ReleaseRunView[] | 'unavailable' {
   let filenames: string[];
   try {
     filenames = readdirSync(dir, { withFileTypes: true })
@@ -146,15 +159,17 @@ export function readReleaseRuns(version: string | null = null,
     if (!run) return [];
     const v = runVersion(run.input);
     if (version !== null && v !== version) return [];
+    const nodes: ReleaseRunNodeView[] = [...run.nodes.filter((node) => node && typeof node.nodeId === 'string').map((node) => ({
+      nodeId: redactSecretText(node.nodeId), ok: typeof node.ok === 'boolean' ? node.ok : null,
+      summary: nodeSummary(node.output), ...nodeTimes(node),
+      ...(opts.facts ? { facts: releaseNodeFacts(node.output) } : {}),
+    })), ...runningNode(run, run.nodes.length)];
+    const gateShards = gateShardsFor(v, run.status, nodes, opts.ledgerRoot ?? releaseLedgerRoot(), opts.now ?? Date.now());
     return [{
       runId: redactSecretText(filename.slice(0, -5)), status: redactSecretText(run.status),
       startedAt: redactSecretText(run.startedAt), version: v,
       path: run.path.filter((step): step is string => typeof step === 'string').map(redactSecretText),
-      nodes: [...run.nodes.filter((node) => node && typeof node.nodeId === 'string').map((node) => ({
-        nodeId: redactSecretText(node.nodeId), ok: typeof node.ok === 'boolean' ? node.ok : null,
-        summary: nodeSummary(node.output), ...nodeTimes(node),
-        ...(opts.facts ? { facts: releaseNodeFacts(node.output) } : {}),
-      })), ...runningNode(run, run.nodes.length)],
+      nodes, ...(gateShards ? { gateShards } : {}),
     }];
   }).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 20);
 }

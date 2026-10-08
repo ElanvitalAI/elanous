@@ -16,6 +16,7 @@ import { kindRouteTarget, mainHomeTarget } from '../../src/domains/telegram-kind
 import { recordOutbound } from '../../src/domains/outbound-alert.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../src/self-dev/run-store.js';
 import { runDraftSweep } from '../../src/self-dev/draft-sweep.js';
+import { retroBriefingLines } from '../../src/retro/daily.js';
 
 export type Section<T> = { status: 'ok'; value: T } | { status: 'unreadable'; reason: string };
 export type Landing = { title: string; seat: string; mergedAt: string; prNumber?: number };
@@ -529,6 +530,10 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     .map(suggestion => `- ${suggestion.title} — ${suggestion.reason} (${suggestion.source}) [proact:${suggestion.key}]`).join('\n');
   const recorded = [retained, newSuggestions].filter(Boolean).join('\n');
   if (recorded) review.markdown += `\n## PROACT1-LITE 제안\n${recorded}\n`;
+  // RETRO-DAILY — 어젯밤 22:40 회고가 live 로 쓴 세 줄만 싣는다(shadow 회고는 브리핑에 안 나간다).
+  const retroLines = retroBriefingLines(deps.root ?? effectiveInstanceRoot(), kstDay(new Date(now.getTime() - 86_400_000)));
+  const retroBlock = retroLines.length ? `\n\n## 회고 세 줄\n${retroLines.map(line => `- ${line}`).join('\n')}` : '';
+  if (retroBlock) review.markdown += `${retroBlock.slice(1)}\n`;
   const file = join(deps.root ?? effectiveInstanceRoot(), 'rhythm', 'daily', `${kstDay(now)}.md`);
   if (!options.dryRun) {
     mkdirSync(dirname(file), { recursive: true });
@@ -548,7 +553,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
   let chars = 0;
   let target = 'unknown';
   if (!options.dryRun && options.stage !== 'collect' && enabled) {
-    const text = `${review.header}\n\n## 위험 톱 5\n${review.risks.map((r, i) => `${i + 1}. ${r.name} — ${r.score}점 · ${r.reason}`).join('\n') || '확인된 위험 없음'}${recorded ? `\n\n## PROACT1-LITE 제안\n${recorded}` : ''}\n\n${file}`;
+    const text = `${review.header}\n\n## 위험 톱 5\n${review.risks.map((r, i) => `${i + 1}. ${r.name} — ${r.score}점 · ${r.reason}`).join('\n') || '확인된 위험 없음'}${recorded ? `\n\n## PROACT1-LITE 제안\n${recorded}` : ''}${retroBlock}\n\n${file}`;
     chars = `${text}\n${receiptKey}`.length;
     let resolved: ReturnType<typeof recipient> = null;
     try { resolved = recipient(deps); }

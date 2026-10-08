@@ -27,6 +27,7 @@
 // crashed wizard cannot corrupt an existing file. Mode 0600 when the
 // telegram bot token is present.
 
+import { DRAFT_ON_STOP_MODES, parseDraftOnStopMode, type DraftOnStopMode } from './self-implement/blocked-draft-policy.js';
 import { isCodexQuotaPolicy } from './oauth/codex-quota-policy.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
 import {
@@ -1146,6 +1147,12 @@ export interface SelfImplementToolConfig {
   decompositionShadow: SelfImplementDecompositionShadowConfig;
   /** Opt-in delivery of authored goal clarifications from unattended dev runs. */
   clarificationEscalation: SelfImplementClarificationEscalationConfig;
+  /** RUN-TTL: hours an open self-impl PR may go without a commit before the draft sweep asks for a rebase. Absent or invalid = 24. */
+  runTtlHours?: number;
+  /** RUN-TTL sweep step: `shadow` (default) only logs; `live` sends the resync memo / adds `elanous:needs-rebase`. Cap absent or invalid = 30. */
+  runTtl?: { mode: 'shadow' | 'live'; cap?: number };
+  /** STOP-AUTOHEAL: `shadow` (default) only records what the stop dispatcher would do (`event='autoheal'`); `live` runs the injected heal seams once per run per stop class. */
+  autoheal?: { mode: 'shadow' | 'live' };
   /** 사용자 자식 모델 선호. 없으면 해석기가 auto + fallbackChain 으로 만든다.
    *  Overload failover (OVERLOAD-FAILOVER) may move an unpinned codex child to
    *  grok. A pinned codex provider is never moved. */
@@ -1165,6 +1172,11 @@ export interface SelfImplementToolConfig {
    *  clean)로 남는다 — draft PR 은 닫고 브랜치를 지우면 되돌릴 수 있지만 병합은 아니다.
    *  `false` 로 두면 종전대로 `ux.confirm`(채널 없으면 fail-closed). */
   autoOpenPr: boolean;
+  /** DRAFT-NOT-ARCHIVE — 멈춘 런의 산출을 어디에 남기나. `'always'`(기본 · 종전) = draft PR ·
+   *  `'needs-owner-only'` = 사람 판단이 필요한 멈춤만 draft PR(⊕ 주인 자리 라벨), 나머지는 수확 가지 `salvage/run-<6hex>/…` ⊕ 런 원장. */
+  draftOnStop?: DraftOnStopMode;
+  /** SALVAGE-RETENTION — 원격 `salvage/*` 보존 규칙(14일 초과 ⊕ 열린 PR·카드 참조 0). `'shadow'`(기본) = 수만 보고 · `'live'` = 다음 조각에서 삭제. */
+  salvageRetention?: { mode: 'shadow' | 'live' };
 }
 
 export interface RunDevHarnessToolConfig {
@@ -2670,6 +2682,18 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     ...(clarificationTimeoutMs === undefined ? {} : { timeoutMs: clarificationTimeoutMs }),
   };
   const childLlm = parseChildLlmPreference(selfImplRaw.childLlm);
+  const runTtlHoursRaw = selfImplRaw.runTtlHours;
+  const runTtlHours = typeof runTtlHoursRaw === 'number' && Number.isFinite(runTtlHoursRaw) && runTtlHoursRaw > 0 ? runTtlHoursRaw : undefined;
+  const runTtlRaw = selfImplRaw.runTtl && typeof selfImplRaw.runTtl === 'object' && !Array.isArray(selfImplRaw.runTtl)
+    ? selfImplRaw.runTtl as Record<string, unknown> : undefined;
+  const runTtl = runTtlRaw ? {
+    mode: runTtlRaw.mode === 'live' ? 'live' as const : 'shadow' as const,
+    ...(typeof runTtlRaw.cap === 'number' && Number.isSafeInteger(runTtlRaw.cap) && runTtlRaw.cap >= 0 ? { cap: runTtlRaw.cap } : {}),
+  } : undefined;
+  const autohealRaw = selfImplRaw.autoheal && typeof selfImplRaw.autoheal === 'object' && !Array.isArray(selfImplRaw.autoheal)
+    ? selfImplRaw.autoheal as Record<string, unknown> : undefined;
+  // ⛔ 모르는 값은 좁은 쪽(shadow) — 오타가 live 를 켜면 안 된다.
+  const autoheal = autohealRaw ? { mode: autohealRaw.mode === 'live' ? 'live' as const : 'shadow' as const } : undefined;
   // ⭐ 관측(리뷰 should-fix) — 오타/비-boolean 은 기본값(ON)으로 수렴하는데, 그게 조용하면
   //   "껐다고 믿었는데 자동 개설되는" 운영 사고가 된다. 값이 **있는데 boolean 이 아닐 때만**
   //   경고한다(부재는 정상). 로거 대신 stderr — 이 파일의 기존 경고와 동형(부트 시점·의존 0).
@@ -2686,13 +2710,26 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
   const autoOpenPr = autoOpenPrRaw === false
     ? false
     : TOOLS_DEFAULTS.selfImplement.autoOpenPr;
+  const draftOnStopParsed = parseDraftOnStopMode((selfImplRaw as { draftOnStop?: unknown }).draftOnStop);
+  if (draftOnStopParsed.invalid) {
+    try {
+      process.stderr.write(`[user-config] tools.selfImplement.draftOnStop 값이 알 수 없습니다(${JSON.stringify((selfImplRaw as { draftOnStop?: unknown }).draftOnStop)}) — 'always' 로 진행합니다. 허용값: ${DRAFT_ON_STOP_MODES.join(' | ')}\n`);
+    } catch { /* swallow */ }
+  }
+  const draftOnStop = draftOnStopParsed.mode;
+  const salvageRetentionRaw = (selfImplRaw as { salvageRetention?: unknown }).salvageRetention;
+  const salvageRetentionModeRaw = salvageRetentionRaw && typeof salvageRetentionRaw === 'object' ? (salvageRetentionRaw as { mode?: unknown }).mode : undefined;
+  if (salvageRetentionModeRaw !== undefined && salvageRetentionModeRaw !== 'shadow' && salvageRetentionModeRaw !== 'live') {
+    try { process.stderr.write(`[user-config] tools.selfImplement.salvageRetention.mode 값이 알 수 없습니다(${JSON.stringify(salvageRetentionModeRaw)}) — 'shadow' 로 진행합니다. 허용값: shadow | live\n`); } catch { /* swallow */ }
+  }
+  const salvageRetention = { mode: salvageRetentionModeRaw === 'live' ? 'live' as const : 'shadow' as const };
   return {
     deferred: { mode },
     agentSpawn: { hopCap },
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 
@@ -3564,6 +3601,8 @@ export interface SeatLoopConfig {
   stall?: { parents?: Record<string, string>; redMinutes?: number; blockedMinutes?: number };
   /** Unlanded attempts of the same seat cell before the loop stops relaunching and asks a person. Absent or invalid means 3. */
   repeatStop?: number;
+  /** OP-LOOP-DECIDE: OP seat filters open decision cards (repeat-stop → b · harness scope → b unless money/security/secret/public paths). shadow records only; live decides/routes. Absent = shadow. */
+  opDecide?: { mode: 'shadow' | 'live' };
 }
 
 export type EventSeat = 'OP' | 'TC' | 'MK' | 'UX';
@@ -3729,7 +3768,7 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
   /** Maximum nested elanous depth; safe positive integer, default 2. */
@@ -4686,6 +4725,12 @@ function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
     })(),
     ...(typeof values.repeatStop === 'number' && Number.isSafeInteger(values.repeatStop) && values.repeatStop > 0
       ? { repeatStop: values.repeatStop } : {}),
+    ...(() => {
+      const raw = values.opDecide;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+      const mode = (raw as Record<string, unknown>).mode;
+      return mode === 'shadow' || mode === 'live' ? { opDecide: { mode } } : {};
+    })(),
   };
 }
 
@@ -4925,8 +4970,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ...(() => {
         const queue = harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
           ? harness.queue as Record<string, unknown> : {};
-        const stale = queue.staleRunMinutes, unknownCap = queue.unknownSeatCap;
+        const stale = queue.staleRunMinutes, unknownCap = queue.unknownSeatCap, burstMax = queue.burstMax;
         return {
+          ...(typeof burstMax === 'number' && Number.isSafeInteger(burstMax) && burstMax > 0 ? { burstMax } : {}),
           ...(typeof stale === 'number' && Number.isSafeInteger(stale) && stale > 0 ? { staleRunMinutes: stale } : {}),
           ...(typeof unknownCap === 'number' && Number.isSafeInteger(unknownCap) && unknownCap >= 0 ? { unknownSeatCap: unknownCap } : {}),
         };
@@ -4952,6 +4998,12 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       })(),
       ...(harness.authorGrade === 'lite' || harness.authorGrade === 'full' ? { authorGrade: harness.authorGrade } : {}),
       ...(harness.authorOnPod === true ? { authorOnPod: true } : {}),
+      ...(() => {
+        const sibling = harness.siblingResync && typeof harness.siblingResync === 'object' && !Array.isArray(harness.siblingResync)
+          ? harness.siblingResync as Record<string, unknown> : undefined;
+        const maxFetch = sibling?.maxFetch;
+        return typeof maxFetch === 'number' && Number.isSafeInteger(maxFetch) && maxFetch >= 0 ? { siblingResync: { maxFetch } } : {};
+      })(),
       ...(harness.nestedElanous === 'allow' || harness.nestedElanous === 'refuse'
         ? { nestedElanous: harness.nestedElanous } : {}),
       nestedElanousMaxDepth: typeof harness.nestedElanousMaxDepth === 'number'
@@ -6259,6 +6311,7 @@ export function saveUserConfig(
         ...(cfg.loops.seat.reportPr === undefined ? {} : { reportPr: cfg.loops.seat.reportPr }),
         ...(cfg.loops.seat.stall ? { stall: cfg.loops.seat.stall } : {}),
         ...(cfg.loops.seat.repeatStop === undefined ? {} : { repeatStop: cfg.loops.seat.repeatStop }),
+        ...(cfg.loops.seat.opDecide ? { opDecide: cfg.loops.seat.opDecide } : {}),
       } } : {}),
     } } : {}),
     ...(cfg.autopilot ? { autopilot: {

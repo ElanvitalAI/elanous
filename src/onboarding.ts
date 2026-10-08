@@ -59,7 +59,7 @@ import type {
 import { showStepOr, chooseFrom } from './onboarding/io-extended.js';
 import { askWithHelp } from './onboarding/wire-helpers.js';
 import { stepTransition } from './onboarding/transition.js';
-import { unattendedSetupHint } from './onboarding/entry-hints.js';
+import { unattendedNextStepLine, unattendedSetupHint } from './onboarding/entry-hints.js';
 import { continueHereLines } from './onboarding/continue-here.js';
 import type { NexusShowResult } from './cli/nexus-show.js';
 import type { TailscaleProbe } from './nexus/onboarding/tailscale-probe.js';
@@ -1370,15 +1370,33 @@ export class OnboardingRefusedError extends Error {
   }
 }
 
-/** Handle only typed refusals; the agent setup hint applies to its non-TTY path alone. */
-export function handleOnboardingRefusal(error: unknown, entrance: 'agent' | 'other'): boolean {
+export interface OnboardingRefusalIO {
+  printError: (line: string) => void;
+  setExitCode: (code: number) => void;
+}
+
+const defaultRefusalIO: OnboardingRefusalIO = {
+  printError: (line) => console.error(line),
+  setExitCode: (code) => { process.exitCode = code; },
+};
+
+/** Handle only typed refusals; the agent setup hint applies to its non-TTY path alone.
+ *  FIRST-CHAT-NONTTY: on the non-TTY path of any other entrance the refusal ends with a
+ *  one-line next step (`unattendedNextStepLine()`), so a script or app that called first knows
+ *  what to run. The exit code stays 2. */
+export function handleOnboardingRefusal(
+  error: unknown,
+  entrance: 'agent' | 'other',
+  io: OnboardingRefusalIO = defaultRefusalIO,
+): boolean {
   if (!(error instanceof OnboardingRefusedError) || error.code !== 'onboarding-refused') return false;
   if (entrance === 'agent' && error.reason === 'non-tty') {
-    console.error(`elanous agent needs a configured LLM. Run \`elanous onboarding\` in a terminal, or ${unattendedSetupHint()} for unattended setup.`);
+    io.printError(`elanous agent needs a configured LLM. Run \`elanous onboarding\` in a terminal, or ${unattendedSetupHint()} for unattended setup.`);
   } else {
-    console.error(error.message);
+    io.printError(error.message);
+    if (error.reason === 'non-tty') io.printError(unattendedNextStepLine());
   }
-  process.exitCode = 2;
+  io.setExitCode(2);
   return true;
 }
 

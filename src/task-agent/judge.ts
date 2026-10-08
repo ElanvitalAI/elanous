@@ -4,6 +4,7 @@
  * RFC-task-agent-any-task-to-completion-2026-10-06 §A2 표를 순수 함수로 옮긴다.
  * 부작용이 없다(발사·리뷰·착지는 실행부 `actions.ts` 의 몫). 수확 원천 = run-c9ad6d6d `chooseTaskAction`.
  */
+import { STOP_CLASS_POD_FAILURE, STOP_CLASS_NO_LAUNCH } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import type { SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import type { NextActionKind, RetryVariant } from './actions.js';
 import type { CompletionKind } from './task-hand.js';
@@ -33,6 +34,8 @@ export interface TaskJudgeInput {
   completion?: CompletionKind;
   /** code-pr 밖 종류의 확인 증거(`completion-evidence.ts` 판독). 비면 «아직 못 받았다» — 통과로 읽지 않는다. */
   evidence?: { ok: boolean; ref: string };
+  /** Only classified terminal evidence; an absent input preserves the existing stop-reason table. */
+  terminalRun?: { kind: typeof STOP_CLASS_POD_FAILURE | typeof STOP_CLASS_NO_LAUNCH; reason: string; hasPr: boolean; hasHarvestBranch: boolean };
 }
 
 export interface TaskJudgement {
@@ -73,6 +76,10 @@ function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
   if (input.deliveryEvidence) return input.deliveryEvidence.ok
     ? { move: 'propose-green', stage: 'closing', reason: `전달 근거 확인: ${input.deliveryEvidence.files.join(', ')}` }
     : { move: 'wait', stage: 'waiting', reason: input.deliveryEvidence.reason };
+  if (input.terminalRun && !input.terminalRun.hasPr && !input.terminalRun.hasHarvestBranch) {
+    const disposition = input.terminalRun.kind === STOP_CLASS_POD_FAILURE ? 'needs-owner' : 'needs-relaunch';
+    return { move: 'wait', stage: 'escalated', reason: `failed/${disposition} — ${input.terminalRun.reason.replace(/[\r\n]+/gu, ' ').trim() || input.terminalRun.kind}` };
+  }
   const stop = input.stopReason;
   const kind = input.completion;
   if (kind !== undefined && kind !== 'code-pr') {

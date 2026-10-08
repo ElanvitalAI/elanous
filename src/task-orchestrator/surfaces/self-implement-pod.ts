@@ -48,7 +48,7 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 // POD-DIET (10-06 03:47~05:18 · node-b goal Pods · 89 one-minute samples · 42 Pods): per-Pod observed max median 4.6Gi ·
 // p75 6.2Gi · p90 11.7Gi — 23/42 went above the old 4Gi request, so the scheduler over-packed. 6Gi ≈ p75; limits stay.
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
-import type { PodPoolMember, PodPoolScheduler } from './pod-pool.js';
+import type { PodPlacement, PodPlacementKind, PodPoolMember, PodPoolScheduler } from './pod-pool.js';
 export { POD_CHILD_REQUESTS } from './pod-lease.js';
 import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_HOST_LEASE_ANNOTATION, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
@@ -654,6 +654,16 @@ export function parsePodMemoryTier(v: string | undefined): PodMemoryTier | null 
   return t && (POD_MEMORY_TIERS as readonly string[]).includes(t) ? (t as PodMemoryTier) : null;
 }
 
+/**
+ * POOL-LITE (10-07): which pool member a Job prefers. Lite tier, or a docs/measurement goal not raised to `high`,
+ * goes small-first (node-c); everything else is an implementation Job and goes big-first (node-b).
+ */
+export function podPlacementKind(tier: PodMemoryTier, declared: DeclaredGoalType | null, requestKind: string | null): PodPlacementKind {
+  if (tier === 'lite') return 'lite';
+  if (tier !== 'high' && (declared === 'document' || declared === 'research' || requestKind === 'docs')) return 'lite';
+  return 'standard';
+}
+
 function parsePodGoalType(value: string | undefined): DeclaredGoalType | null {
   return value === 'implement' || value === 'research' || value === 'document' || value === 'operate' ? value : null;
 }
@@ -991,6 +1001,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       // pool-slot reason = what THIS launch saw on its last empty tryAcquire; admission reason = the pool-wide lease measurement (one pool, one reading).
       const stageReason: { 'pool-slot'?: string | null } = {};
       const unfitContexts = new Set<string>();
+      // POOL-LITE (10-07): the last placement of this launch — printed at launch and journaled with the Job.
+      let lastPlacement = null as PodPlacement | null;
       const watchStall = (stage: 'admission' | 'pool-slot'): (() => void) => {
         const started = Date.now();
         const timer = setTimeout(() => {
@@ -1026,9 +1038,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           for (;;) {
             if (input.signal?.aborted) return null;
             // The reason comes back inside this call, so a concurrent launch cannot overwrite it.
-            const acquired = await options.pool.tryAcquire(unfitContexts, (reason) => { stageReason['pool-slot'] = reason; });
+            const kind = podPlacementKind(oomRetried ? retryTier : memoryTier, selectedGoalType, requestKind);
+            const acquired = await options.pool.tryAcquire(unfitContexts, (reason) => { stageReason['pool-slot'] = reason; },
+              { kind, onPlacement: (placement) => { lastPlacement = placement; } });
             if (acquired) {
-              debug.log('self-implement.pod', 'pool-slot', { spaceId: input.spaceId, context: acquired.context, inflight: options.pool.snapshot() });
+              debug.log('self-implement.pod', 'pool-slot', { spaceId: input.spaceId, context: acquired.context, inflight: options.pool.snapshot(), ...(lastPlacement ? { placement: lastPlacement } : {}) });
+              if (lastPlacement) console.warn(`[pod] 배치: ${lastPlacement.reason}`);
               return acquired;
             }
             await sleep(options.pollMs ?? 15_000);
@@ -1451,6 +1466,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         try {
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, attempt: oomRetried ? 2 : 1, ...(goalFile ? { goalFile } : {}) } }, ledgerDir);
+          if (lastPlacement) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-placement', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, member: lastPlacement.member, kind: lastPlacement.kind, outcome: lastPlacement.outcome, preferred: lastPlacement.preferred, reason: lastPlacement.reason } }, ledgerDir);
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-memory-selected', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, limit: memoryLimit, ...(appliedMemoryRequest ? { request: appliedMemoryRequest } : {}), tier: oomRetried ? retryTier : memoryTier, source: oomRetried ? 'oom-retry' : memorySource, reason: oomRetried ? 'OOMKilled' : memoryReason, declaredGoalType: selectedGoalType } }, ledgerDir);
           if (oomRetried && retryFromChildRunId) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry', data: { attempt: 2, from: retryFromMemoryLimit ?? selectedMemoryLimit, to: memoryLimit, tier: retryTier, reason: 'OOMKilled', job: name, childRunId: liveChildRunId, fromChildRunId: retryFromChildRunId } }, ledgerDir);
         } catch (error) {

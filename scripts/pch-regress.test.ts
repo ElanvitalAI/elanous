@@ -21,6 +21,15 @@ test('every mapped file exists inside apps/pwa and only documented slots are pre
   }
 });
 
+test('PCH-11 runs full-copy and turn-bearing branch checks through the real runner', () => {
+  expect(PCH_REGRESS_MAP['PCH-11']).toEqual(['src/lib/chat-fork.test.ts', 'src/lib/chat-branch.test.ts']);
+  const result = runPchRegressRaw(['--only', 'PCH-11']);
+  expect(result.exitCode).toBe(0);
+  expect(result.results).toEqual([{
+    id: 'PCH-11', files: PCH_REGRESS_MAP['PCH-11'], status: 'pass', failure: '',
+  }]);
+});
+
 test('injected executor produces pass, fail, 시험 없음 table and exit 1 in slot order', () => {
   const calls: string[] = [];
   const fake: TestExecutor = (files, cwd) => {

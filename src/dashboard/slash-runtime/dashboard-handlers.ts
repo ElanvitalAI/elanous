@@ -1505,15 +1505,16 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
 
   registry.register(['help', '?'], (_args, ctx) => {
     const { cols, rows } = termSize();
+    // The transient modal paints only height - 2 content rows and does not scroll.
+    // The builder adds columns to fit that budget; only when it still overflows, use the scrollable chat log.
+    const minHeight = Math.min(6, Math.max(3, rows - 2));
+    const modalContentRows = Math.max(minHeight, Math.min(rows - 4, Math.floor(rows * 0.7))) - 2;
     const lines = buildEssentialHelpLines({
       names: registry.names(),
       descriptions: SLASH_COMMANDS,
       width: Math.max(1, Math.floor(cols * 0.7) - 2),
+      maxRows: modalContentRows,
     });
-    // The transient modal paints only height - 2 content rows and does not scroll.
-    // When the catalog outgrows it, use the scrollable chat log instead of hiding keys.
-    const minHeight = Math.min(6, Math.max(3, rows - 2));
-    const modalContentRows = Math.max(minHeight, Math.min(rows - 4, Math.floor(rows * 0.7))) - 2;
     if (ctx.showHelpModal && lines.length <= modalContentRows) {
       ctx.showHelpModal({ title: 'Dashboard help', lines });
     } else {

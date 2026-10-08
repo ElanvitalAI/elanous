@@ -58,6 +58,24 @@ const referencesDraft = (text: string, number: number): boolean =>
 const landingCommentReferencesDraft = (text: string, number: number): boolean =>
   new RegExp(`\\blanding-verified\\s*:\\s*(?:draft|superseded|수확)\\s*#${number}(?!\\d)\\b`, 'i').test(text);
 
+/**
+ * Merged PRs that can cover a draft's files (all-files-landed): merged after the draft was created, on the same
+ * goal lineage, slot or branch stem. Empty ⇒ all-files-landed cannot fire, so the draft's per-file history is not needed.
+ */
+export function laterMergedTwins(draft: DraftTriagePr, mergedTwins: readonly DraftTriagePr[]): DraftTriagePr[] {
+  const lineage = goalId(draft.branch);
+  const draftSlot = slot(draft.body);
+  const stem = branchStem(draft.branch);
+  const created = Date.parse(draft.createdAt ?? '');
+  const compatible = (pr: DraftTriagePr): boolean =>
+    !(lineage && goalId(pr.branch) && goalId(pr.branch) !== lineage)
+    && !(draftSlot && slot(pr.body) && slot(pr.body) !== draftSlot);
+  return mergedTwins.filter((pr) => pr.number !== draft.number && Number.isFinite(created)
+    && Number.isFinite(Date.parse(pr.mergedAt ?? '')) && Date.parse(pr.mergedAt!) > created
+    && compatible(pr) && ((lineage && goalId(pr.branch) === lineage)
+      || (draftSlot && slot(pr.body) === draftSlot) || (stem && branchStem(pr.branch) === stem)));
+}
+
 export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHours, liveBranches, finalRunResult }: DraftTriageInput): DraftDecision {
   const held = draft.labels?.find((label) => PROTECTED_LABELS.has(label));
   if (held) return { action: 'keep', reason: `label:${held}` };
@@ -90,10 +108,7 @@ export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHour
   if (harvest) return { action: 'close', reason: `superseded-by #${harvest.number} (harvest #${draft.number})` };
   const created = Date.parse(draft.createdAt ?? '');
   const files = draft.changedFiles;
-  const later = mergedTwins.filter((pr) => pr.number !== draft.number && Number.isFinite(created)
-    && Number.isFinite(Date.parse(pr.mergedAt ?? '')) && Date.parse(pr.mergedAt!) > created
-    && compatible(pr) && ((lineage && goalId(pr.branch) === lineage)
-      || (draftSlot && slot(pr.body) === draftSlot) || (stem && branchStem(pr.branch) === stem)));
+  const later = laterMergedTwins(draft, mergedTwins);
   if (files?.length && files.every((file) => {
     const changed = Date.parse(draft.latestFileChanges?.[file] ?? '');
     return Number.isFinite(changed) && changed >= created && later.some((pr) =>

@@ -111,6 +111,8 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.harvestable === true && r.branch ? { harvestable: true } : {}),
     ...(r.worktreePath ? { worktreePath: r.worktreePath } : {}),
     ...(r.prUrl ? { prUrl: r.prUrl } : {}),
+    // TA-LIVE-REVIEW-POD — 작업 트리 없는 런(Pod)의 live review 가 «런이 낸 PR 머리»를 확인하는 근거.
+    ...(r.checkedHeadCommit !== undefined ? { checkedHeadCommit: r.checkedHeadCommit } : {}),
     ...(r.merged !== undefined ? { merged: r.merged } : {}),
     ...(r.mergeReason ? { mergeReason: r.mergeReason } : {}),
     ...(r.completionDisposition ? { completionDisposition: r.completionDisposition } : {}),

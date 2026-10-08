@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, type GateRunner } from './gate-node';
+import { createGateRunner, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, type GateAdmission, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -11,7 +11,9 @@ import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { planPartialRegate, writePartialPlan } from './gate-partial';
 import { parseFailures, parseTimedOutFailures } from './gate-diff';
 import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
-import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { PodPoolScheduler, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { HostPoolLease } from '../../src/pod-lease/host-lease.js';
+import { gateShardsPath, readGateShards } from '../../src/release-loop/gate-shards.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -1055,13 +1057,14 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     expect(peak).toBe(3);
     expect(invoked.every((o) => o.pool === 'pool-test' && o.clone === true && o.deadlineSeconds === 1200 && JSON.stringify(o.source) === JSON.stringify({ kind: 'commit', sha: treeHead }))).toBe(true);
     expect(new Set(invoked.map((o) => o.name)).size).toBe(3);
-    expect(new Set(invoked.map((o) => o.poolScheduler)).size).toBe(1);
+    // GATE-LIVE-OBS: each shard sees the one gate scheduler through its own tracking view (same members, same slots).
+    expect(new Set(invoked.map((o) => o.poolScheduler!.members)).size).toBe(1);
     expect(invoked.map((o) => sortedFiles.filter((f) => o.command[2]!.includes(`'./${f}'`)))).toEqual([
       [sortedFiles[0], sortedFiles[3], sortedFiles[6], sortedFiles[9]],
       [sortedFiles[1], sortedFiles[4], sortedFiles[7]], [sortedFiles[2], sortedFiles[5], sortedFiles[8]],
     ]);
-    expect(invoked[0]!.command[2]).toContain('cd repo && bun install && (cd apps/pwa && bun install) &&');
-    expect(invoked[0]!.command[2]).toContain('2>&1 | tee "$HOME/outbox/shard.log"; echo ${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"');
+    expect(invoked[0]!.command[2]).toContain('{ bun install && (cd apps/pwa && bun install); } >> "$O/install.log" 2>&1; irc=$?');
+    expect(invoked[0]!.command[2]).toContain('> "$O/part-$i.log" 2>&1');
     const logs = join(instanceRoot, 'release/1.0.1/gate-logs/cut');
     for (let i = 0; i < 3; i++) {
       expect(existsSync(join(logs, `pod-${i}.log`))).toBe(true);
@@ -1069,11 +1072,15 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     }
     expect(observed.filter((item) => item.category === 'release-loop.gate' && item.event === 'pod-shard')).toHaveLength(3);
     expect(observed.filter((item) => item.event === 'pod-shard').map((item) => item.data)).toEqual([
-      { shard: 0, files: sortedFiles.filter((_, index) => index % 3 === 0), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null },
-      { shard: 1, files: sortedFiles.filter((_, index) => index % 3 === 1), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null },
-      { shard: 2, files: sortedFiles.filter((_, index) => index % 3 === 2), durationMs: expect.any(Number), rc: 1, attempt: 1, installSeconds: null },
+      { shard: 0, files: sortedFiles.filter((_, index) => index % 3 === 0), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
+      { shard: 1, files: sortedFiles.filter((_, index) => index % 3 === 1), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
+      { shard: 2, files: sortedFiles.filter((_, index) => index % 3 === 2), durationMs: expect.any(Number), rc: 1, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
     ]);
     expect(calls.filter((call) => call.startsWith('sweep '))).toHaveLength(0);
+    // GATE-LIVE-OBS: the release ledger (here the explicit test ledger) holds one finished row per shard.
+    const board = readGateShards(gateShardsPath('1.0.1', join(dirname(instanceRoot), 'machine-ledger')));
+    expect(board?.shards.map((row) => [row.id, row.state])).toEqual([['pod-0', 'done'], ['pod-1', 'done'], ['pod-2', 'done']]);
+    expect(board?.shards.every((row) => typeof row.endedAt === 'string')).toBe(true);
   } finally { log.mockRestore(); }
 });
 
@@ -1106,14 +1113,14 @@ test('Pod sweep opts into the Bun cache and records the first install timing', a
     expect(uncached.rc).toBe(0);
     expect(invoked[0]!.bunCache).toBeUndefined();
     expect(invoked[0]!.command[2]).not.toContain('BUN_INSTALL_CACHE_DIR');
-    expect(invoked[0]!.command[2]).toContain('(cd .. && cd repo && bun install && (cd apps/pwa && bun install) &&');
+    expect(invoked[0]!.command[2]).toContain('{ bun install && (cd apps/pwa && bun install); } >> "$O/install.log"');
     process.env.POD_BUN_CACHE_HOST_PATH = '  /srv/bun-cache  ';
     const cached = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
     expect(cached).toEqual(uncached);
     expect(invoked).toHaveLength(2);
     expect(invoked[1]!.bunCache).toBe('/srv/bun-cache');
-    const cachePrefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi; ';
-    expect(invoked[1]!.command[2]).toContain(`${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) &&`);
+    const cachePrefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;\n';
+    expect(invoked[1]!.command[2]).toContain(`O="$HOME/outbox"\n${cachePrefix}`);
     expect(invoked[1]!.command[2]!.replace(cachePrefix, '')).toBe(invoked[0]!.command[2]);
     expect(observed).toEqual([
       { event: 'pod-bun-cache', data: { source: 'none' } },
@@ -1166,9 +1173,9 @@ test('graph pod cache wins over env, and blank graph cache falls back to env', a
     expect((await sweepGraph('  ')).rc).toBe(0);
     delete process.env.POD_BUN_CACHE_HOST_PATH;
     expect((await sweepGraph(undefined)).rc).toBe(0);
-    const prefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi; ';
+    const prefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;\n';
     expect(invoked.map((o) => o.bunCache)).toEqual(['/var/cache/elanous-bun', '/var/cache/elanous-bun', '/srv/env-cache', undefined]);
-    for (const o of invoked.slice(0, 3)) expect(o.command[2]).toContain(`${prefix}(cd .. && cd repo && bun install`);
+    for (const o of invoked.slice(0, 3)) expect(o.command[2]).toContain(`O="$HOME/outbox"\n${prefix}`);
     expect(invoked[3]!.command[2]).not.toContain('BUN_INSTALL_CACHE_DIR');
     expect(sources).toEqual([{ source: 'config' }, { source: 'config' }, { source: 'env' }, { source: 'none' }]);
   } finally {
@@ -2443,7 +2450,7 @@ test('Pod shards ask bun for a junit report and keep it beside the shard log, wi
   const logDir = join(root, 'logs');
   const result = await runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1 });
   expect(result.output).toContain('Ran 2 tests across 2 files.');
-  expect(commands.every((command) => command.includes('--reporter=junit --reporter-outfile="$HOME/outbox/junit.xml"'))).toBe(true);
+  expect(commands.every((command) => command.includes('--reporter=junit --reporter-outfile="$O/part-$i.junit.xml"'))).toBe(true);
   expect(readFileSync(join(logDir, 'pod-0.junit.xml'), 'utf8')).toContain('file="src/b.test.ts" time="1.5"');
 });
 
@@ -3024,4 +3031,145 @@ test('GATE-SHARD-RESUME: a fresh run that fails while replacing a shard log leav
   await expect(runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1, freshShards: true })).rejects.toThrow();
   expect(existsSync(join(logDir, 'pod-0.json'))).toBe(false);
   expect(previousShardResult(logDir, 'pod-0', CUT, files, 'any')).toBeUndefined();
+});
+
+// ── GATE-MEM-ADMIT (0.2.20): gate shard Jobs ask pool admission like harness goal Pods ────────────────────────────
+const admitStatus = (recommended: number) => ({ recommended, accountSlots: 0, limitedBy: 'memory' as const, reason: null,
+  capacitySlots: 24, memorySlots: recommended, placeableSlots: recommended, running: 0, pending: 0 });
+function admitPool(free: () => number) {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-mem-admit-lease-'));
+  scratch.push(dir);
+  return new PodPoolScheduler(parsePodPool('pool-test:24'), { hostLease: new HostPoolLease('pool-test', { dir }), pollMs: 5, status: () => admitStatus(free()) });
+}
+
+test('GATE-MEM-ADMIT: admission granted at once → launch with no wait reason written', async () => {
+  const waits: string[] = [];
+  const result = await admitGateShard(poolGateAdmission(admitPool(() => 3)), { waitMs: 5_000, onWait: (r) => waits.push(r) });
+  expect(result.outcome).toBe('granted');
+  expect(waits).toEqual([]);
+  result.release();
+  result.release();
+});
+
+test('GATE-MEM-ADMIT: no room → the wait reason (recommended · limitedBy) is recorded → granted when memory frees', async () => {
+  let free = 0;
+  const waits: string[] = [];
+  const pool = admitPool(() => free);
+  const result = await admitGateShard(poolGateAdmission(pool), { waitMs: 10_000, firstReasonMs: 1, reasonPollMs: 5, onWait: (r) => { waits.push(r); free = 1; } });
+  expect(result.outcome).toBe('granted');
+  expect(waits[0]).toContain('메모리 여유 대기(admission)');
+  expect(waits[0]).toContain('recommended=0 limitedBy=memory');
+  expect(result.reason).toBe(waits.at(-1));
+  result.release();
+});
+
+test('GATE-MEM-ADMIT: bounded wait → proceeds with admission-timeout and leaves no queued waiter (no deadlock)', async () => {
+  const pool = admitPool(() => 0);
+  const started = Date.now();
+  const result = await admitGateShard(poolGateAdmission(pool), { waitMs: 60, firstReasonMs: 1, reasonPollMs: 5, onWait: () => {} });
+  expect(result.outcome).toBe('admission-timeout');
+  expect(result.reason).toContain('limitedBy=memory');
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(pool.admissionSnapshot().queued).toBe(0);
+  expect(pool.admissionSnapshot({ gate: true }).queued).toBe(0);
+  expect(() => result.release()).not.toThrow();
+});
+
+test('GATE-ADMIT-EXEMPT: the gate shard admission asks the pool as a gate caller (exempt from its own GATE-RESERVE CPU bound)', async () => {
+  const pool = admitPool(() => 1);
+  const result = await admitGateShard(poolGateAdmission(pool), { waitMs: 5_000, onWait: () => {} });
+  expect(result.outcome).toBe('granted');
+  expect(pool.admissionSnapshot({ gate: true }).active).toBe(1);
+  expect(pool.admissionSnapshot().active).toBe(0);
+  result.release();
+  expect(pool.admissionSnapshot({ gate: true }).active).toBe(0);
+});
+
+test('GATE-MEM-ADMIT: an admission error launches at once; no admission or 0 s is off', async () => {
+  const broken: GateAdmission = { acquire: async () => { throw new Error('lease dir unreadable'); }, waitReason: () => null };
+  expect(await admitGateShard(broken, { waitMs: 5_000, onWait: () => {} })).toMatchObject({ outcome: 'admission-error', reason: 'lease dir unreadable' });
+  expect((await admitGateShard(undefined, { waitMs: 5_000, onWait: () => {} })).outcome).toBe('off');
+  expect((await admitGateShard(broken, { waitMs: 0, onWait: () => {} })).outcome).toBe('off');
+  expect(GATE_ADMISSION_WAIT_SECONDS_DEFAULT).toBe(300);
+});
+
+test('GATE-MEM-ADMIT: sweep — the shard waits with a visible reason, then launches; timeout and grant are journaled; config reaches it', async () => {
+  const { root } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const shardsPath = join(root, 'shards.json');
+  const command: GateRunner['command'] = async (cmd, args) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'src/a.test.ts\n' };
+    return { rc: 0, output: '' };
+  };
+  const seenWaits: Array<string | undefined> = [];
+  let launched = 0;
+  const pod = async () => {
+    launched++;
+    const artifactsDir = join(root, `admit-shard-${launched}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  };
+  const observed: Array<{ event: string; data: unknown; level?: string }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data, opts) => {
+    if (category === 'release-loop.gate' && (event === 'shard-admission' || event === 'pod-admission')) observed.push({ event, data, ...(opts?.level ? { level: opts.level } : {}) });
+  });
+  try {
+    // ① never any room: the row says why while it waits, and after the bound the shard launches with admission-timeout.
+    let aborted = false;
+    const never: GateAdmission = {
+      acquire: (signal) => new Promise((_, reject) => signal.addEventListener('abort', () => { aborted = true; reject(new Error('pod lease admission aborted')); })),
+      waitReason: () => 'recommended=0 limitedBy=memory memorySlots=0',
+    };
+    const watch = setInterval(() => { seenWaits.push(readGateShards(shardsPath)?.shards[0]?.waitReason); }, 100);
+    const runner = createGateRunner(repo, undefined, command, pod, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const logs = join(root, 'logs-timeout');
+    const swept = await runner.sweep(repo, logs, { pool: 'pool-test', shards: 1, admissionWaitSeconds: 2, admission: never, shardsFile: { path: shardsPath, version: '1.0.1' } });
+    clearInterval(watch);
+    expect(swept.rc).toBe(0);
+    expect(aborted).toBe(true);
+    expect(launched).toBe(1);
+    expect(seenWaits).toContain('메모리 여유 대기(admission) · recommended=0 limitedBy=memory memorySlots=0');
+    expect(readGateShards(shardsPath)?.shards[0]).toMatchObject({ id: 'pod-0', state: 'done' });
+    expect(readGateShards(shardsPath)?.shards[0]?.waitReason).toBeUndefined();
+    const shardJson = JSON.parse(readFileSync(join(logs, 'pod-0.json'), 'utf8')) as { admission: string; admissionWaitMs: number; durationMs: number };
+    expect(shardJson.admission).toBe('admission-timeout');
+    expect(shardJson.admissionWaitMs).toBeGreaterThanOrEqual(1_900);
+    // The admission wait is not the shard's run time (the next release plans by durationMs).
+    expect(shardJson.durationMs).toBeLessThan(1_500);
+    expect(observed).toContainEqual({ event: 'shard-admission', data: expect.objectContaining({ shard: 0, outcome: 'admission-timeout' }), level: 'warn' });
+    expect(observed).toContainEqual({ event: 'pod-admission', data: { waitSeconds: 2, source: 'config', enabled: true } });
+    // ② room: granted, and the admission goes back once the member is chosen (not held through the Job) — exactly once,
+    // though the gate releases it at placement and again after the Job. The fake Pod places itself through the pool it is given.
+    let releases = 0;
+    const room: GateAdmission = { acquire: async () => () => { releases++; }, waitReason: () => null };
+    let releasesAtPlacement = -1;
+    const placingPod = async (o: RunPodCommandOptions) => {
+      const member = await o.poolScheduler!.tryAcquire(undefined, undefined, { selfCapped: true });
+      expect(member?.context).toBe('pool-test');
+      releasesAtPlacement = releases;
+      const done = await pod();
+      o.poolScheduler!.release(member!);
+      return done;
+    };
+    const granted = createGateRunner(repo, undefined, command, placingPod, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const logs2 = join(root, 'logs-granted');
+    expect((await granted.sweep(repo, logs2, { pool: 'pool-test', shards: 1, admission: room })).rc).toBe(0);
+    expect(releasesAtPlacement).toBe(1);
+    expect(releases).toBe(1);
+    expect(JSON.parse(readFileSync(join(logs2, 'pod-0.json'), 'utf8'))).toMatchObject({ admission: 'granted' });
+    // ③ an injected pool without an injected admission (every existing gate test) stays admission-free.
+    const plain = createGateRunner(repo, undefined, command, pod, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const logs3 = join(root, 'logs-plain');
+    expect((await plain.sweep(repo, logs3, { pool: 'pool-test', shards: 1 })).rc).toBe(0);
+    expect(JSON.parse(readFileSync(join(logs3, 'pod-0.json'), 'utf8')).admission).toBeUndefined();
+  } finally { log.mockRestore(); }
+  // release.loop.gatePodAdmissionWaitSeconds → graph input → shard admission bound.
+  const context = join(root, 'admit-context.json');
+  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'p', gatePodAdmissionWaitSeconds: 45 }, outputs: {} }));
+  expect(parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context })).toMatchObject({ pod: { pool: 'p', admissionWaitSeconds: 45 } });
 });

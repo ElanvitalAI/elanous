@@ -99,3 +99,14 @@ describe('OPS read-only daemon API', () => {
       .toEqual({ kind: 'error', status: 200 });
   });
 });
+
+describe('GATE-LIVE-OBS gate shards on a run', () => {
+  const summary = { total: 1, counts: { pending: 0, running: 1, done: 0, retry: 0, timeout: 0, failed: 0 }, waitReasons: [], etaMin: 5, staleMin: 0 };
+  const gateShards = { version: '0.2.9', updatedAt: '2026-10-02T00:10:00Z', shards: [{ id: 'pod-0', state: 'running' as const, plannedMin: 5 }], summary };
+  test('a well-formed shard table rides along; a broken one is dropped without failing the run list', async () => {
+    const calls: Array<{ path: string; method: string }> = [];
+    expect(await getReleaseRuns(client(async () => json([{ ...RUN, gateShards }]), calls))).toEqual({ kind: 'ready', data: [{ ...RUN, gateShards }] });
+    const broken = { ...gateShards, shards: [{ id: 'pod-0', state: 'exploded' }] };
+    expect(await getReleaseRuns(client(async () => json([{ ...RUN, gateShards: broken }]), calls))).toEqual({ kind: 'ready', data: [RUN] });
+  });
+});

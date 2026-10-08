@@ -1,9 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asideBackend, claudeTrustChoice, submitSeparately, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
+import { asideBackend, claudeTrustChoice, submitSeparately, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, setAgentMissionTimingForTest, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
 import { emitPtyEvent } from '../pty-shell/registry.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { createWorktree, gateWorktreeReuse } from '../git-fs/worktree.js';
@@ -34,6 +34,12 @@ const observation = {
   }),
   changed: false,
 };
+
+// ⭐ GATE-SPEED ③(2026-10-08): 가짜 PTY 는 처음부터 조용하다 — 운영 대기(준비 1.5 s · 키 간격 0.8 s ·
+//   폴링 0.3 s)를 시험마다 실제로 잘 이유가 없다(74건 · 게이트 423 s). 순서·문면 단언은 그대로 문다.
+let restoreMissionTiming: (() => void) | undefined;
+beforeAll(() => { restoreMissionTiming = setAgentMissionTimingForTest({ readyQuietMs: 20, pollMs: 5, keystrokeGapMs: 0 }); });
+afterAll(() => { restoreMissionTiming?.(); });
 
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -166,12 +172,16 @@ describe('pre-mission resource ladder on PTY dispatch', () => {
     const original = debug.log;
     const logs: unknown[][] = [];
     debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    // ⭐ 시한 «값»(20 s)은 타이머에 건네진 ms 로 재고, 발화는 즉시 시킨다 — 20 s 를 실제로 자지 않는다.
+    const scheduled: number[] = [];
+    const restore = setAgentMissionTimingForTest({ scheduleTimeout: (fn, ms) => { scheduled.push(ms); return setTimeout(fn, 0); } });
     try {
       const { result, writes } = await launch({}, { planMissionResources: async () => new Promise<ResourcePlan>(() => {}) });
       expect(result.ok).toBe(true);
       expect(writes).toEqual(['List skills', '\r']);
+      expect(scheduled).toEqual([20_000]);
       expect(logs).toContainEqual(['agent-mission.resources', 'plan-failed', { reason: 'resource ladder timeout (20s)' }, { level: 'warn' }]);
-    } finally { debug.log = original; }
+    } finally { restore(); debug.log = original; }
   }, 30_000);
 
   test('suggested installer exception does not prevent mission dispatch', async () => {

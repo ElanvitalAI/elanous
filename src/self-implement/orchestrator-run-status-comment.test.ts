@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { runSelfImplement } from './orchestrator.js';
+import { runSelfImplement, type SelfImplementReview } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import type { RunLedgerEntry } from './run-ledger.js';
 
@@ -233,8 +233,10 @@ describe('PR run-status comment', () => {
     expect(posts.some((body) => body.includes('Rework salvage status: launched.'))).toBe(true);
   });
 
-  test('parked salvage remains a separate comment after a successful status flush', async () => {
+  test('parked salvage is folded into the status comment by edit, not posted as a second comment', async () => {
     const posts: string[] = [];
+    const edits: string[] = [];
+    let status: { id: number; body: string } | undefined;
     const result = await runSelfImplement({
       feature: 'parked salvage comment',
       runId: 'run-status-parked-salvage',
@@ -242,15 +244,16 @@ describe('PR run-status comment', () => {
       seams: seams({
         gateResults: [false],
         diagnose: async () => 'BUDGET: EXTEND\nREASON: retry',
-        findPrComment: async () => undefined,
-        editPrComment: async () => { throw new Error('unexpected edit'); },
-        postPrComment: async ({ body }) => { posts.push(body); },
+        findPrComment: async () => status,
+        editPrComment: async ({ id, body }) => { edits.push(body); status = { id, body }; },
+        postPrComment: async ({ body }) => { posts.push(body); if (body.includes(marker)) status = { id: 42, body }; },
       }),
     });
     expect(result.salvage).toBe('parked');
-    expect(posts.filter((body) => body.includes(marker))).toHaveLength(1);
-    expect(posts).toHaveLength(2);
-    expect(posts[1]).toContain('Rework salvage status: parked.\n\n- reason: no-goal-file');
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toContain(marker);
+    expect(edits).toHaveLength(1);
+    expect(edits[0]).toContain('Rework salvage status: parked.\n\n- reason: no-goal-file');
   });
 
   test('a stale lookup after successful creation never creates a second marked status', async () => {
@@ -299,5 +302,97 @@ describe('PR run-status comment', () => {
     expect(posts).toHaveLength(3);
     expect(posts.every((body) => !body.includes(marker))).toBe(true);
     expect(modes).toEqual(['individual-fallback']);
+  });
+});
+
+// QUIET-PR-COMMENTS 판정선: PR 한 건이 리뷰 3라운드를 돌아도 새 하니스 코멘트는 ≤1 (나머지는 edit — 메일 안 감).
+describe('QUIET-PR-COMMENTS — three review rounds create at most one PR comment', () => {
+  function statefulCommentClient() {
+    const created: string[] = [];
+    const edited: string[] = [];
+    let status: { id: number; body: string } | undefined;
+    return {
+      created,
+      edited,
+      current: () => status?.body ?? '',
+      seams: {
+        findPrComment: async ({ marker: search }: { marker: string }) => (status?.body.includes(search) ? status : undefined),
+        editPrComment: async ({ id, body }: { id: number; body: string }) => { expect(id).toBe(42); edited.push(body); status = { id, body }; },
+        postPrComment: async ({ body }: { body: string }) => { created.push(body); if (body.includes(marker)) status ??= { id: 42, body }; },
+      },
+    };
+  }
+  const reviewRounds = (findings: readonly string[]) => {
+    let call = 0;
+    return async (): Promise<SelfImplementReview> => {
+      const finding = findings[call++];
+      return finding
+        ? { verdict: 'fail', mustFix: [finding], shouldFix: [], summary: `round finding: ${finding}`, reviewed: true, diffTruncated: false }
+        : { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false };
+    };
+  };
+
+  test('3 must-fix review rounds then a passing final round: 1 created status comment, round history inside it', async () => {
+    const client = statefulCommentClient();
+    const result = await runSelfImplement({
+      feature: 'three review rounds',
+      runId: 'run-quiet-three-reviews',
+      maxReworkRounds: 3,
+      seams: seams({
+        gateResults: [true],
+        diagnose: async () => 'BUDGET: EXTEND\nREASON: distinct findings',
+        reviewDiff: reviewRounds(['first finding', 'second finding', 'third finding']),
+        ...client.seams,
+      }),
+    });
+    expect(result.stage).toBe('pr-opened');
+    expect(client.created).toHaveLength(1);
+    expect(client.created[0]).toContain(marker);
+    for (const r of [0, 1, 2]) expect(client.current()).toContain(`Round ${r}: reviewer requested 1 must-fix change(s).`);
+    expect(client.current()).toContain('Round 3: review completed (pass).');
+  });
+
+  test('3 failing rounds ending parked: 1 created status comment, the parked outcome lands as an edit', async () => {
+    const client = statefulCommentClient();
+    const result = await runSelfImplement({
+      feature: 'three rounds then parked',
+      runId: 'run-quiet-three-parked',
+      maxReworkRounds: 2,
+      seams: seams({
+        gateResults: [false, false, false],
+        diagnose: async () => 'BUDGET: EXTEND\nREASON: retry',
+        ...client.seams,
+      }),
+    });
+    expect(result.salvage).toBe('parked');
+    expect(client.created).toHaveLength(1);
+    expect(client.edited.length).toBeGreaterThanOrEqual(1);
+    for (const r of [0, 1, 2]) expect(client.current()).toContain(`Round ${r}: child implementation completed.`);
+    expect(client.current()).toContain('Rework salvage status: parked.');
+  });
+
+  test('3 runs on the same PR (salvage relaunches) still create only the first status comment', async () => {
+    const client = statefulCommentClient();
+    for (const n of [1, 2, 3]) {
+      const result = await runSelfImplement({
+        feature: `relaunch ${n}`,
+        goalFile: 'src/self-implement/orchestrator-run-status-comment.test.ts',
+        writeGoalExecutionRecord: () => {},
+        writeGoalRunRecord: () => {},
+        runId: `run-quiet-relaunch-${n}`,
+        maxReworkRounds: 0,
+        seams: seams({
+          gateResults: [false],
+          diagnose: async () => 'BUDGET: EXTEND\nREASON: retry',
+          readReworkSalvageEvidence: async () => ({ clean: true, aheadCommits: 1 }),
+          launchReworkSalvage: async () => {},
+          ...client.seams,
+        }),
+      });
+      expect(result.salvage).toBe('launched');
+    }
+    expect(client.created).toHaveLength(1);
+    expect(client.edited.length).toBeGreaterThanOrEqual(3);
+    for (const n of [1, 2, 3]) expect(client.current()).toContain(`run=run-quiet-relaunch-${n}`);
   });
 });

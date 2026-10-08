@@ -296,7 +296,7 @@ export function recordPieceRef(pieceId: string, ref: { pr?: number; goalId?: str
 
 /** 이미 넘긴 조각인가 — live 는 live 넘김·발사·발사 실패면 다시 안 넘긴다 · shadow 는 어떤 넘김이든 있으면 안 넘긴다. */
 function alreadyHanded(card: TaskCard, mode: 'shadow' | 'live'): boolean {
-  if (card.status === 'launched' || card.status === 'launch-failed') return true;
+  if (card.status === 'launched' || card.status === 'launch-failed' || card.status === 'failed') return true;
   if (!card.handed) return false;
   return mode === 'shadow' || card.handed.mode === 'live';
 }

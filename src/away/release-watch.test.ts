@@ -140,3 +140,34 @@ describe('AWAY-MODE-1 — 원장 실물 꼴', () => {
     expect(h.sent).toEqual([]);
   });
 });
+
+describe('GATE-LIVE-OBS — 외출 알림의 조각 줄', () => {
+  const shards = (timeout: number) => {
+    const list = [
+      ...Array.from({ length: 3 }, (_, i) => ({ id: `pod-${i}`, state: 'running' as const, plannedMin: 20 })),
+      ...Array.from({ length: 2 }, (_, i) => ({ id: `pod-w${i}`, state: 'pending' as const, waitReason: 'CPU 부족', plannedMin: 10 })),
+      ...Array.from({ length: timeout }, (_, i) => ({ id: `pod-t${i}`, state: 'timeout' as const, plannedMin: 20 })),
+    ];
+    const counts = { pending: 2, running: 3, done: 0, retry: 0, timeout, failed: 0 };
+    return { v: 1 as const, version: '0.2.19', updatedAt: new Date(T0).toISOString(), shards: list,
+      summary: { total: list.length, counts, waitReasons: [{ reason: 'CPU 부족', count: 2 }], etaMin: 27, staleMin: 0, overrunMin: 0 } };
+  };
+
+  test('잘림·실패 조각이 늘 때만 한 줄 · 같은 수면 조용하다', () => {
+    const first = run({ ended: 2, gateShards: shards(0) });
+    const mark = markOf(first, new Date(T0).toISOString());
+    expect(mark.shardsBad).toBe(0);
+    expect(diffRun(mark, first, T0 + 60_000).lines).toEqual([]);
+    const worse = run({ ended: 2, gateShards: shards(2) });
+    const { lines, changed } = diffRun(mark, worse, T0 + 60_000);
+    expect(changed).toBe(true);
+    expect(lines).toEqual(['⚠️ gate 조각 잘림·실패 2 · 조각 7 · 돌기 3 · 대기 2(CPU 부족 2) · 잘림 2 · 남은 약 27분']);
+    expect(diffRun(markOf(worse, new Date(T0).toISOString()), worse, T0 + 60_000).lines).toEqual([]);
+  });
+
+  test('/release 지금 요약에 조각 줄이 붙는다', () => {
+    const text = releaseNowText([run({ ended: 2, gateShards: shards(1) })], T0);
+    expect(text).toContain('지금: gate');
+    expect(text).toContain('조각 6 · 돌기 3 · 대기 2(CPU 부족 2) · 잘림 1 · 남은 약 27분');
+  });
+});

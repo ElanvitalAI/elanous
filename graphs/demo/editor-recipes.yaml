@@ -1,0 +1,22 @@
+# CGE-RUN — 그래프 편집기 «데모 실행» 레시피. 편집기 실행(POST /v1/graphs/<id>/run)은 이 파일의 레시피만 돌린다.
+# 부작용 0(PR·병합·발송·파일 쓰기 없음 — 런 맥락 폴더의 표지 하나뿐) · 노드마다 몇 초 걸려 화면에서 «도는 중 → 끝»이 보인다.
+# 이름은 recipes.yaml 이 아니다 — 그래프 목록·실행기가 이 폴더를 그래프 묶음으로 읽지 않게.
+plan:
+  command: 'sleep 3; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+build:
+  command: 'sleep 4; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+review:
+  command: 'sleep 3; if [ -f "${ELANOUS_GRAPH_CONTEXT%/*}/review-seen" ]; then printf ''{"outcome":"ok"}\n''; else : > "${ELANOUS_GRAPH_CONTEXT%/*}/review-seen"; printf ''{"outcome":"rework"}\n''; fi'
+  timeout_ms: 30000
+publish:
+  command: 'sleep 2; printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+# 편집기는 모든 노드에 레시피를 준다(끝 노드도 cmd:done) — 끝 노드는 즉시 통과.
+done:
+  command: 'printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000
+failed:
+  command: 'printf ''{"outcome":"ok"}\n'''
+  timeout_ms: 30000

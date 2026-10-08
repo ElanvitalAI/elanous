@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parsePodPool, type PoolKubectl } from './pod-pool.js';
-import { measurePoolLease, probePoolDns, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
+import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
 import { podJobManifest } from './self-implement-pod.js';
 import { debug } from '../../debug/log.js';
 
@@ -40,6 +40,94 @@ const measured = (pods: ReturnType<typeof pod>[], nodes = node()) => measurePool
 const recommend = (pods: ReturnType<typeof pod>[], accounts = 10, nodes = node()) => recommendConcurrency(measured(pods, nodes), { capacity: 20, accounts, perAccount: 4 });
 
 describe('pod lease measurement and recommendation', () => {
+  // GATE-RESERVE-AUTO — fixtures: a release-gate shard Job (`gate-<uuid>`, kind=command) and Pods with explicit CPU.
+  const object = (v: unknown) => (v && typeof v === 'object' ? v as Record<string, unknown> : null);
+  const gateJob = (cpu: Record<string, unknown>, status: Record<string, unknown> = { active: 1 }, extra: Record<string, unknown> = {}) => ({
+    metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } },
+    spec: { template: { spec: { containers: [{ resources: cpu }], ...extra } } }, status,
+  });
+  const cpuPod = (name: string, resources: Record<string, unknown>, labels: Record<string, string>, extra: { namespace?: string; nodeName?: string | null; phase?: string } = {}) => ({
+    metadata: { namespace: extra.namespace ?? 'elanous-test', name, labels },
+    status: { phase: extra.phase ?? 'Running' },
+    spec: { ...(extra.nodeName === null ? {} : { nodeName: extra.nodeName ?? 'node-1' }), containers: [{ resources: { ...resources, limits: { memory: '2Gi', ...(object(resources.limits) ?? {}) }, requests: { memory: '1Gi', ...(object(resources.requests) ?? {}) } } }] },
+  });
+  const gatePodOf = (cpu: string, nodeName: string | null = 'node-1') => cpuPod('gate-pod', { requests: { cpu } }, { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' }, { nodeName, ...(nodeName === null ? { phase: 'Pending' } : {}) });
+  const harnessLabels = { 'elanous.substrate': 'pod', 'elanous.job': 'harness-job' };
+  const nodesOf = (cpus: string[]) => JSON.stringify({ items: cpus.map((cpu, i) => ({ metadata: { name: i === 0 ? 'node-1' : `node-${i + 1}` }, status: { allocatable: { memory: '128Gi', cpu }, conditions: [{ type: 'Ready', status: 'True' }] } })) });
+  const gateMember = (jobs: unknown[], pods: unknown[], cpus: string[] = ['4']) => measurePoolLease(parsePodPool('node-b:4'), { kubectl: (args) => {
+    if (args.includes('nodes')) return { status: 0, stdout: nodesOf(cpus), stderr: '' };
+    if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: jobs }), stderr: '' };
+    return { status: 0, stdout: JSON.stringify({ items: pods }), stderr: '' };
+  }, dns: () => 'ready' }).members[0]!;
+  const slots = (member: ReturnType<typeof gateMember>) => harnessCpuSlotsBesideGate({ members: [member] });
+
+  test('GATE-RESERVE-AUTO: a bound gate Pod takes its CPU on its node and is not a harness Pod slot', () => {
+    const member = gateMember([gateJob({ requests: { cpu: '2' } })], [gatePodOf('2')]);
+    expect(member).toMatchObject({ running: 0, gateJobs: 1, gateUnboundJobs: 0, gateCpuMillicores: 2000, schedulableCpuMillicores: 4000, cpuFreeByNodeMillicores: [2000], pendingHarnessCpuMillicores: 0 });
+    expect(recommendConcurrency({ members: [member] }, { capacity: 4, accounts: 0, perAccount: 0 }).recommended).toBe(4);
+    expect(slots(member)).toBe(2);
+    // No gate Job: normal admission (no CPU bound at all).
+    expect(slots(gateMember([], [cpuPod('h', { requests: { cpu: '3' } }, harnessLabels)]))).toBeUndefined();
+  });
+
+  test('GATE-RESERVE-AUTO: a gate shard waiting for a node gets the CPU first — no harness admission until it is bound, then the rest', () => {
+    // Two 2-core nodes, a 2-core shard: summing free CPU would admit two 1-core harness Pods, and the scheduler can put
+    // one on each node so the shard stays Pending. While the shard is unbound nothing is admitted.
+    for (const pods of [[], [gatePodOf('2', null)]]) {
+      const member = gateMember([gateJob({ requests: { cpu: '2' } })], pods, ['2', '2']);
+      expect(member).toMatchObject({ gateJobs: 1, gateUnboundJobs: 1 });
+      expect(slots(member)).toBe(0);
+    }
+    expect(slots(gateMember([gateJob({ requests: { cpu: '2' } })], [gatePodOf('2', 'node-2')], ['2', '2']))).toBe(2);
+  });
+
+  test('GATE-RESERVE-AUTO: CPU is counted per node — half-free cores on two nodes are not one slot', () => {
+    const member = gateMember([gateJob({ requests: { cpu: '500m' } })], [gatePodOf('500m'), cpuPod('other', { requests: { cpu: '500m' } }, {}, { namespace: 'other', nodeName: 'node-2' })], ['2', '2']);
+    expect(member.cpuFreeByNodeMillicores).toEqual([1500, 1500]);
+    expect(slots(member)).toBe(2);   // Σ⌊1.5⌋ — not ⌊3⌋
+  });
+
+  test('GATE-RESERVE-AUTO: gate CPU counts init containers and overhead before its Pod exists, and ends when the Job is terminal', () => {
+    const job = (status: Record<string, unknown>) => gateJob({ requests: { cpu: '500m' } }, status, { initContainers: [{ resources: { requests: { cpu: '2' } } }], overhead: { cpu: '250m' } });
+    expect(gateMember([job({ failed: 1, active: 1 })], [])).toMatchObject({ gateJobs: 1, gateCpuMillicores: 2250 });
+    for (const terminal of [{ failed: 1, conditions: [{ type: 'Failed', status: 'True' }] }, { succeeded: 1 }, { conditions: [{ type: 'Complete', status: 'True' }] }]) {
+      const member = gateMember([job(terminal)], []);
+      expect(member).toMatchObject({ gateJobs: 0, gateCpuMillicores: 0 });
+      expect(slots(member)).toBeUndefined();
+    }
+  });
+
+  test('GATE-RESERVE-AUTO: a container without a CPU request reserves its CPU limit, or nothing — the reading stays measurable', () => {
+    const pods = [
+      gatePodOf('1'),
+      cpuPod('limit-only', { limits: { cpu: '1500m' } }, {}, { namespace: 'other' }),
+      cpuPod('no-cpu', {}, {}, { namespace: 'other' }),
+      cpuPod('harness', { requests: { cpu: '1' } }, harnessLabels),
+    ];
+    const member = gateMember([gateJob({ requests: { cpu: '1' } })], pods, ['8']);
+    // 8 − gate 1 − 1.5 − 0 − harness 1 = 4.5 cores → 4 more harness Pods at 1 core.
+    expect(member.cpuFreeByNodeMillicores).toEqual([4500]);
+    expect(slots(member)).toBe(4);
+    // A gate Pod without any CPU request is still an active gate, reserving 0 — never «unmeasured».
+    const bare = gateMember([gateJob({})], [cpuPod('gate-pod', {}, { 'elanous.job': 'gate-shard' })], ['8']);
+    expect(bare).toMatchObject({ gateJobs: 1, gateCpuMillicores: 0, cpuFreeByNodeMillicores: [8000] });
+    expect(slots(bare)).toBe(8);
+  });
+
+  test('GATE-RESERVE-AUTO: a harness Pod not bound to a node yet already counts its CPU; an unreadable quantity is unmeasured', () => {
+    const unbound = cpuPod('waiting', { requests: { cpu: '1' } }, harnessLabels, { phase: 'Pending', nodeName: null });
+    const member = gateMember([gateJob({ requests: { cpu: '1' } })], [gatePodOf('1'), unbound]);
+    expect(member).toMatchObject({ cpuFreeByNodeMillicores: [3000], pendingHarnessCpuMillicores: 1000 });
+    expect(slots(member)).toBe(2);
+    const broken = gateMember([gateJob({ requests: { cpu: '1' } })], [gatePodOf('1'), cpuPod('broken', { requests: { cpu: 'lots' } }, {}, { namespace: 'other' })]);
+    expect(broken.cpuFreeByNodeMillicores).toBeUndefined();
+    expect(slots(broken)).toBeNull();
+    // An unreadable gate template request is unmeasured even when its (readable) Pod is already bound.
+    const template = gateMember([gateJob({ requests: { cpu: 'lots' } })], [gatePodOf('1')]);
+    expect(template).toMatchObject({ gateJobs: 1, gateUnboundJobs: 0, cpuFreeByNodeMillicores: [3000] });
+    expect(slots(template)).toBeNull();
+  });
+
   test('DNS probe requires Ready coredns and one successful in-Pod lookup, then deletes the probe', () => {
     for (const [ready, succeeded] of [[0, true], [1, false], [1, true]] as const) {
       const calls: string[][] = [];

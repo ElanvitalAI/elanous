@@ -1,0 +1,24 @@
+collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" collect'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" collect'
+  timeout_ms: 600000
+cluster:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" cluster'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" cluster'
+  timeout_ms: 60000
+recur:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" recur'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" recur'
+  timeout_ms: 60000
+insight:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" insight'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" insight'
+  timeout_ms: 60000
+act:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" act'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" act'
+  timeout_ms: 60000
+report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" report'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/retro/daily.ts" report'
+  timeout_ms: 60000

@@ -22,6 +22,7 @@ import { exportLeakCheck, publicExportChangedFiles, type ExportLeakCheck } from 
 import { exportImportCheck, type ExportImportCheck } from '../../scripts/ci-public-export-import-gate.js';
 import { checkCommands, extractElanousCommands, type Finding as DocsCliFinding } from '../../scripts/docs-cli-check.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
+import { landGlobalChecks, runLandGlobalChecksGate } from '../../scripts/land-global-checks.js';
 import { isGoalDocumentFileName } from '../self-implement/goal-document.js';
 import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from '../self-implement/run-ledger.js';
 import { queryRunningRuns, type RunningRunsResult } from '../self-implement/running-runs.js';
@@ -120,6 +121,8 @@ export interface PrLandDeps {
   runDocsCliCheck?: (docFiles: readonly string[]) => DocsCliFinding[];
   /** 변경 시험 파일 간 간섭 검사 심(시험 주입용). */
   runTestInterferenceGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => Promise<number>;
+  /** 전역 검사 게이트 심(시험 주입용) — 바뀐 파일 꼴로 끌려온 전역 시험(scripts/land-global-checks.ts)을 돌린다. */
+  runLandGlobalChecks?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   /** 안드로이드 단위 시험 게이트 심(시험 주입용). */
   runAndroidGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   /** iOS 시험 게이트 심(시험 주입용). */
@@ -1471,6 +1474,23 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out,
   );
   record('test-interference-gate', true, { measured: testInterference.measured });
+  // LAND-GLOBAL-CHECKS — 바뀐 파일의 경로 꼴이 부르는 «전역 검사»를 끌어와 돌린다(표 = scripts/land-global-checks.ts).
+  //   시험이 실패하면 막는다 · 러너가 못 돌았으면 「검사 못 함」으로 말하고 통과시킨다(gateVerdict).
+  const landGlobal = gateVerdict(
+    'land-global-checks',
+    deps.runLandGlobalChecks
+      ? (o) => deps.runLandGlobalChecks!(o, changedPaths)
+      : (o) => runLandGlobalChecksGate({ changedFiles: changedPaths, cwd, log: o.log, error: o.error }),
+    out,
+  );
+  record('land-global-checks', landGlobal.ok, { measured: landGlobal.measured });
+  if (!landGlobal.ok) {
+    out.error('✗ land-global-checks: scripts/land-global-checks.ts blocked pr land — 바뀐 파일이 끌어온 전역 시험이 실패했다.');
+    return 1;
+  }
+  if (landGlobal.measured && landGlobalChecks(changedPaths).length > 0) {
+    out.log(`✓ land-global-checks: scripts/land-global-checks.ts PASS — 끌려온 전역 시험 ${landGlobalChecks(changedPaths).join(' · ')} 실패 0.`);
+  }
 
   const androidGate = gateVerdict(
     'android-gate',

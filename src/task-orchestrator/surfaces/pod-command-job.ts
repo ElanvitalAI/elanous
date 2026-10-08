@@ -14,6 +14,7 @@ import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
+import { podHostDirsInit, podInstallSlotsVolume } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
@@ -176,6 +177,8 @@ export interface PodCommandJobInput {
   clone?: boolean;
   hostMirror?: string;
   bunCache?: string;
+  /** GATE-INSTALL-CACHE — hostPath of the node-wide install tokens (release gate shards only · `pod-install-slots.ts`). */
+  installSlots?: string;
   /** 컨테이너 메모리 한도(기본 16Gi) — 게이트가 파일 하나 격리 Job 에 올린다. */
   memoryLimit?: string;
   /** GATE-SPEED A3①: CPU request/limit override (release gate shards only). Omitted = request 1 / limit 4. */
@@ -197,6 +200,9 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   }
   const grok = o.llm === 'grok';
   const bunCache = o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
+  const installSlots = o.installSlots ? podInstallSlotsVolume(o.installSlots) : undefined;
+  // hostPath directories the uid-1000 child writes: a root init container hands them over (DirectoryOrCreate is root 0755).
+  const hostDirMounts = [...(bunCache ? [bunCache.volumeMount] : []), ...(installSlots ? [installSlots.volumeMount] : [])];
   const cpu = resolvePodCpu(o.cpu);
   const quotedArgs = o.command.map(bashSingleQuote).join(' ');
   const credLines = [
@@ -233,7 +239,10 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
-          initContainers: [{ name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] }],
+          initContainers: [
+            { name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] },
+            ...(hostDirMounts.length ? [podHostDirsInit(o.image, o.imagePullPolicy ?? 'Never', hostDirMounts)] : []),
+          ],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
             resources: { requests: { ...POD_CHILD_REQUESTS, cpu: cpu.request, memory: memoryRequestWithin(o.memoryLimit) }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: cpu.limit } },
@@ -243,16 +252,17 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
             ],
-            ...(secretKeys || o.hostMirror || bunCache ? { volumeMounts: [
+            ...(secretKeys || o.hostMirror || hostDirMounts.length ? { volumeMounts: [
               ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
               ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
-              ...(bunCache ? [bunCache.volumeMount] : []),
+              ...hostDirMounts,
             ] } : {}),
           }],
-          ...(secretKeys || o.hostMirror || bunCache ? { volumes: [
+          ...(secretKeys || o.hostMirror || hostDirMounts.length ? { volumes: [
             ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
             ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
             ...(bunCache ? [bunCache.volume] : []),
+            ...(installSlots ? [installSlots.volume] : []),
           ] } : {}),
         },
       },
@@ -321,6 +331,8 @@ export interface RunPodCommandOptions {
   clone?: boolean;
   hostMirror?: string;
   bunCache?: string;
+  /** GATE-INSTALL-CACHE — hostPath of the node-wide install tokens (absolute). */
+  installSlots?: string;
   /** 컨테이너 메모리 한도(기본 16Gi · lite 면 2Gi). */
   memoryLimit?: string;
   /** GATE-SPEED A3①: CPU request/limit override — only the release gate passes it. Omitted = request 1 / limit 4. */
@@ -410,6 +422,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const bunCache = options.bunCache?.trim() || undefined;
   if (bunCache && !isAbsolute(bunCache)) throw new Error('pod.bunCache must be an absolute directory path');
+  const installSlots = options.installSlots?.trim() || undefined;
+  if (installSlots && !isAbsolute(installSlots)) throw new Error('pod installSlots must be an absolute directory path');
   // Fail before any Secret/Job is applied — a bad quantity must not reach the cluster.
   if (options.cpu) resolvePodCpu(options.cpu);
 
@@ -486,7 +500,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       name, namespace, launch, image: imageRef ?? image,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);

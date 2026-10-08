@@ -98,6 +98,9 @@ test('readyPieces(②의 자리) — 선행이 모두 착지한 미착지 조각
   // 발사 실패한 조각도 선행이 먼저다 — 재발사는 선행 착지 뒤.
   expect(nextMoveFor({ ...card, status: 'launch-failed' }, new Set())).toEqual({ kind: 'wait', reason: 'after m-1' });
   expect(nextMoveFor({ ...card, status: 'launch-failed' }, new Set(['m-1'])).kind).toBe('launch');
+  // TA-JUDGE-DEAD-RUN: 죽은 런으로 failed 가 된 카드는 자동 재발사하지 않고 사유 한 줄로 기다린다.
+  const dead = { ...card, status: 'failed' as const, history: [{ at: '', event: 'failed', detail: 'failed/needs-owner — exit 1' }] };
+  expect(nextMoveFor(dead, new Set(['m-1']))).toEqual({ kind: 'wait', reason: 'failed/needs-owner — exit 1' });
 });
 
 test('shadow --mission → 미션 카드 1 ⊕ 조각 카드 4 · 같은 상태 파일 · 선행 없는 조각만 launch 수 · 나머지 wait after', async () => {

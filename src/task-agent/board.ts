@@ -56,7 +56,7 @@ function aggregate(node: BoardNode): void {
 }
 
 function cardStatus(card: TaskCard): BoardStatus {
-  if (card.status === 'launch-failed') return 'blocked';
+  if (card.status === 'launch-failed' || card.status === 'failed') return 'blocked';
   return card.greenProposal ? 'done' : 'open';
 }
 

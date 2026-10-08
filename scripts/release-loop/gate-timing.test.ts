@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { formatGateTiming, gateTiming, resolveGateLogDir } from './gate-timing';
+import { formatGateTiming, formatGateTimingScan, gateTiming, resolveGateLogDir, scanGateTiming } from './gate-timing';
 
 const dirs: string[] = [];
 function fixture(files: Record<string, unknown>): string {
@@ -70,5 +71,122 @@ describe('resolveGateLogDir', () => {
     expect(resolveGateLogDir('0.2.18', '/L')).toBe('/L/release/0.2.18/gate-logs/cut');
     expect(resolveGateLogDir('/x/y', '/L')).toBe('/x/y');
     expect(resolveGateLogDir('./rel', '/L')).toBe('./rel');
+  });
+});
+
+// ── LOGS-DEFAULT-ALL (0.2.20) — 기본 = 전 우주 ─────────────────────────────
+// 실측 사건(0.2.19): 게이트 로그가 ⟨test:wt-release⟩ 의 `.elanous-test/release/0.2.19/gate-logs/cut` 에만
+// 있었고, 운영 원장만 보는 도구가 «측정 없음»을 냈다. 옵션 없이 시험 우주가 보여야 한다.
+function universe(version: string, pods: Record<string, unknown>): string {
+  const root = mkdtempSync(join(tmpdir(), 'gate-timing-universe-'));
+  dirs.push(root);
+  const cut = join(root, 'release', version, 'gate-logs', 'cut');
+  mkdirSync(cut, { recursive: true });
+  for (const [name, body] of Object.entries(pods)) writeFileSync(join(cut, name), JSON.stringify(body));
+  return root;
+}
+function emptyRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), 'gate-timing-prod-'));
+  dirs.push(root);
+  return root;
+}
+
+describe('scanGateTiming — 기본 = 전 우주', () => {
+  test('시험 우주에만 있는 게이트 로그가 옵션 없이 보인다', () => {
+    const prod = emptyRoot();
+    const wt = universe('0.2.19', { 'pod-0.json': { durationMs: min(12), rc: 0, files: ['a'] } });
+    const scan = scanGateTiming('0.2.19', {}, {
+      ledgerRoot: prod,
+      readInstances: () => ({ instances: [{ name: 'test:wt-release', stateDir: wt }], queryStatus: { registeredStores: true } }),
+    });
+    expect(scan.scope).toEqual({ roots: 2, registry: 'read', prodOnly: false, found: 1 });
+    expect(scan.reports.map((r) => [r.universe, r.measured, r.firstPass.sumMin])).toEqual([['test:wt-release', true, 12]]);
+    expect(formatGateTimingScan(scan)).toContain('⟨test:wt-release⟩ 게이트 시간');
+  });
+
+  test('--prod-only 는 운영 원장만 본다 — 시험 우주의 로그는 숨고 레지스트리도 안 읽는다', () => {
+    const prod = emptyRoot();
+    const wt = universe('0.2.19', { 'pod-0.json': { durationMs: min(12), rc: 0 } });
+    let read = 0;
+    const scan = scanGateTiming('0.2.19', { prodOnly: true }, {
+      ledgerRoot: prod,
+      readInstances: () => { read += 1; return { instances: [{ name: 'test:wt-release', stateDir: wt }], queryStatus: { registeredStores: true } }; },
+    });
+    expect(read).toBe(0);
+    expect(scan.scope.registry).toBe('skipped');
+    expect(scan.reports).toEqual([]);
+    expect(formatGateTimingScan(scan)).toContain('측정 없음');
+  });
+
+  test('운영과 시험 둘 다 있으면 판마다 따로 낸다 · 같은 물리 루트(심링크)는 한 번만 센다', () => {
+    const prod = universe('0.2.19', { 'pod-0.json': { durationMs: min(3), rc: 0 } });
+    const alias = join(tmpdir(), `gate-timing-alias-${process.pid}-${Date.now()}`);
+    symlinkSync(prod, alias);
+    dirs.push(alias);
+    const wt = universe('0.2.19', { 'pod-0.json': { durationMs: min(7), rc: 0 } });
+    const scan = scanGateTiming('0.2.19', {}, {
+      ledgerRoot: prod,
+      readInstances: () => ({ instances: [
+        { name: 'prod', stateDir: alias },
+        { name: 'test:wt-release', stateDir: wt },
+      ], queryStatus: { registeredStores: true } }),
+    });
+    expect(scan.scope.roots).toBe(2);
+    expect(scan.reports.map((r) => [r.universe, r.firstPass.sumMin])).toEqual([['prod', 3], ['test:wt-release', 7]]);
+  });
+
+  test('레지스트리를 못 읽으면 «없다»가 아니라 «못 셈»으로 표시한다', () => {
+    const partial = universe('0.2.19', { 'pod-0.json': { durationMs: min(1), rc: 0 } });
+    const scan = scanGateTiming('0.2.19', {}, {
+      ledgerRoot: emptyRoot(),
+      // 못 읽은 판이 부분 목록을 돌려줘도 쓰지 않는다(표시 = 실제 본 범위)
+      readInstances: () => ({ instances: [{ name: 'test:partial', stateDir: partial }], queryStatus: { registeredStores: false } }),
+    });
+    expect(scan.scope.registry).toBe('unreadable');
+    expect(scan.scope.roots).toBe(1);
+    expect(scan.reports).toEqual([]);
+    const text = formatGateTimingScan(scan);
+    expect(text).toContain('못 셈');
+    expect(text).toContain('시험 우주는 못 셌다');
+    // 못 센 상태에서 «어디에도 없다»고 단정하지 않는다
+    expect(text).not.toContain('어디에도');
+  });
+});
+
+describe('gate-timing CLI', () => {
+  const script = join(import.meta.dir, 'gate-timing.ts');
+  const run = (args: string[], home: string) => spawnSync(process.execPath, [script, ...args], {
+    env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 30_000,
+  });
+
+  test('--help 첫 줄 = «기본 = 전 우주»', () => {
+    const r = run(['--help'], emptyRoot());
+    expect(r.status).toBe(0);
+    expect(r.stdout.split('\n')[0]).toContain('기본 = 전 우주');
+  });
+
+  test('옵션 없이 시험 우주(레지스트리 등록)의 게이트 로그를 읽는다 · --prod-only 면 숨는다', () => {
+    const home = emptyRoot();
+    const wt = universe('0.2.19', { 'pod-0.json': { durationMs: min(12), rc: 0 } });
+    mkdirSync(join(home, '.elanous', 'logs'), { recursive: true });
+    writeFileSync(join(home, '.elanous', 'logs', 'instances.json'), JSON.stringify({ instances: [
+      { name: 'test:wt-release', stateDir: wt, pid: 999999, startedAt: '2026-10-07T00:00:00Z', kind: 'test' },
+    ] }));
+    const all = run(['0.2.19', '--json'], home);
+    expect(all.status).toBe(0);
+    const scan = JSON.parse(all.stdout) as { reports: Array<{ universe: string; measured: boolean }> };
+    expect(scan.reports.map((r) => [r.universe, r.measured])).toEqual([['test:wt-release', true]]);
+    const text = run(['0.2.19'], home);
+    expect(text.status).toBe(0);
+    expect(text.stdout).toContain('⟨test:wt-release⟩ 게이트 시간');
+    const narrow = run(['0.2.19', '--prod-only'], home);
+    expect(narrow.status).toBe(1);
+    expect(narrow.stdout).toContain('측정 없음');
+  });
+
+  test('모르는 옵션은 삼키지 않고 거부한다', () => {
+    const r = run(['0.2.19', '--prod'], emptyRoot());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('알 수 없는 옵션');
   });
 });

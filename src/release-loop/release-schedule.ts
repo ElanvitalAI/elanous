@@ -35,12 +35,13 @@ export function listSchedules(root?: string): ReleaseSchedule[] {
   return schedules;
 }
 
-export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string }, by: string, root?: string): ReleaseSchedule {
+export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string }, by: string, root?: string): ReleaseSchedule {
   const schedule = writeSchedule(version, {
     ...(patch.cutAt !== undefined ? { cutAt: utcIso(patch.cutAt) } : {}),
     ...(patch.landBy !== undefined ? { landBy: utcIso(patch.landBy) } : {}),
     ...(patch.freezeFrom !== undefined ? { freezeFrom: utcIso(patch.freezeFrom) } : {}),
     ...(patch.freezeUntil !== undefined ? { freezeUntil: utcIso(patch.freezeUntil) } : {}),
+    ...(patch.publishAt !== undefined ? { publishAt: utcIso(patch.publishAt) } : {}),
   }, by, root);
   debug.log('release.schedule', 'set', { version, cutAt: schedule.cutAt, landBy: schedule.landBy });
   return schedule;
@@ -51,5 +52,8 @@ export function formatSchedule(schedule: ReleaseSchedule): string {
   const deadline = schedule.landBy ? formatKst(schedule.landBy) : null;
   const sameDay = schedule.landBy && new Date(Date.parse(schedule.landBy) + 9 * 60 * 60_000).toISOString().slice(0, 10)
     === new Date(Date.parse(schedule.cutAt) + 9 * 60 * 60_000).toISOString().slice(0, 10);
-  return `${schedule.version} 컷 ${cut}${deadline ? ` · 착지 마감 ${sameDay ? deadline.split(' ')[1] : deadline}` : ''}`;
+  const publish = schedule.publishAt ? formatKst(schedule.publishAt) : null;
+  const publishSameDay = schedule.publishAt && new Date(Date.parse(schedule.publishAt) + 9 * 60 * 60_000).toISOString().slice(0, 10)
+    === new Date(Date.parse(schedule.cutAt) + 9 * 60 * 60_000).toISOString().slice(0, 10);
+  return `${schedule.version} 컷 ${cut}${deadline ? ` · 착지 마감 ${sameDay ? deadline.split(' ')[1] : deadline}` : ''}${publish ? ` · 발행 ${publishSameDay ? publish.split(' ')[1] : publish}` : ''}`;
 }

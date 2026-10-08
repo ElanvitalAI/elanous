@@ -1423,6 +1423,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const { supersedeMergedGoalDrafts } = await import('../harness/harness-cli-command.js');
       await supersedeMergedGoalDrafts(number, cwd);
     },
+    resyncSiblingsOnMerge: async (number, cwd) => {
+      const { resyncMergedSiblings } = await import('../harness/harness-cli-command.js');
+      await resyncMergedSiblings(number, cwd);
+    },
     followUp: {
       mode: readFollowUpMode(),
       stateRoot: elanousStateRoot(),

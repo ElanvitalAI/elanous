@@ -425,7 +425,8 @@ describe('release schedule CLI', () => {
       await run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T08:00+09:00', '--land-by', '2026-10-03T06:30+09:00');
       expect(lines.at(-1)).toBe('0.2.10 컷 10-03(토) 08:00 KST · 착지 마감 06:30');
       await run('show', '--version', '0.2.10');
-      expect(lines.at(-1)).toBe(lines.at(-2));
+      expect(lines.at(-2)).toBe(lines.at(-3));
+      expect(lines.at(-1)).toStartWith('발행 제안 — 실측 없음');
       await run('show', '--version', '0.2.10', '--json');
       expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '0.2.10', cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z', updatedBy: 'OP' });
       await run('list', '--json');

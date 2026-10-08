@@ -44,8 +44,12 @@ export interface TaskCard {
   goal?: string;
   milestone?: string;
   createdAt: string;
-  /** launch-failed = 발사기가 띄우기에 실패했다(사유는 history 마지막 칸) — 다음 수는 다시 발사. */
-  status: 'handed' | 'launched' | 'launch-failed';
+  /**
+   * launch-failed = 발사기가 띄우기에 실패했다(사유는 history 마지막 칸) — 다음 수는 다시 발사.
+   * failed = 발사된 런이 PR·수확 가지 없이 죽었거나 끝내 안 떴다(TA-JUDGE-DEAD-RUN · `card-evidence.ts`) — 사유
+   * (`failed/needs-owner|needs-relaunch — …`)는 history 마지막 칸 · 자동 재발사하지 않는다(사람/판단부 몫).
+   */
+  status: 'handed' | 'launched' | 'launch-failed' | 'failed';
   history: TaskCardEvent[];
   /** 미션 카드만 — 조각 카드 id(순서대로) · 쪼갠 출처(`mission.ts` splitMission). */
   pieces?: string[];
@@ -178,6 +182,7 @@ export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>): TaskC
   if (card.status !== 'launched' && unmet.length > 0) return { kind: 'wait', reason: `after ${unmet.join(', ')}${landed ? '' : ' · 착지 미확인'}` };
   if (card.status === 'handed') return { kind: 'launch', command: launchArgs(card), reason: '넘겨받은 과제 — 첫 발사' };
   if (card.status === 'launch-failed') return { kind: 'launch', command: launchArgs(card), reason: '직전 발사 실패 — 다시 발사' };
+  if (card.status === 'failed') return { kind: 'wait', reason: card.history.at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
   return { kind: 'wait', reason: '발사됨 — 런 멈춤을 슈퍼바이저 그림자 판단(task-agent.shadow-move)이 받는다' };
 }
 

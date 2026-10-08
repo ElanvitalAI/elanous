@@ -217,3 +217,27 @@ test('TUI-SLASH-DECIDE-NOW C: every registered command sits in exactly one group
   const lone = buildEssentialHelpLines({ names: ['zz-unmapped'], descriptions: [{ name: 'zz-unmapped', description: 'Unmapped' }], width: 80, audience: { role: 'owner', showBeta: false } });
   expect(lone.slice(1, lone.indexOf(''))).toEqual(['▸ 그 밖', '/zz-unmapped  Unmapped']);
 });
+
+test('TUI-HELP-OVERLAY: with the modal row budget the full owner catalog fits — more columns before the chat-log fallback', () => {
+  const all = { names: SLASH_COMMANDS.map(({ name }) => name), descriptions: SLASH_COMMANDS };
+  // The 0.2.19 release tui node drew two columns of ~43 rows against a 40-row modal and fell back to the chat log.
+  for (const [width, maxRows] of [[152, 40], [140, 38], [120, 33]] as const) {
+    for (const showBeta of [false, true]) {
+      const unbounded = buildEssentialHelpLines({ ...all, width, audience: { role: 'owner', showBeta } });
+      const fitted = buildEssentialHelpLines({ ...all, width, maxRows, audience: { role: 'owner', showBeta } });
+      expect(fitted.length).toBeLessThanOrEqual(maxRows);
+      // Nothing disappears to make it fit: every command and every group head is still there.
+      for (const { name } of SLASH_COMMANDS) {
+        if (unbounded.some((line) => line.includes(`/${name} `) || line.includes(`/${name}  `))) {
+          expect(fitted.some((line) => line.includes(`/${name}`))).toBe(true);
+        }
+      }
+      for (const group of HELP_GROUP_ORDER.filter((g) => unbounded.some((line) => line.includes(`▸ ${g}`)))) {
+        expect(fitted.join('\n')).toContain(`▸ ${group}`);
+      }
+    }
+  }
+  // A budget that fits already changes nothing.
+  expect(buildEssentialHelpLines({ ...all, width: 152, maxRows: 500, audience: { role: 'owner', showBeta: false } }))
+    .toEqual(buildEssentialHelpLines({ ...all, width: 152, audience: { role: 'owner', showBeta: false } }));
+});

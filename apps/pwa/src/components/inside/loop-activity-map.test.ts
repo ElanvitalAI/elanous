@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import type { LoopRow } from '@/components/loops/loop-status';
-import { activityEdgeKey, activityEdges, activityNodes, activityTraceTarget, applyLoopOwners, EDGE_HIGHLIGHT_MS, isRoundTrip, journeyEdges, journeyAliases, journeyResponseEdges, journeyStages, nearDetail, newlySeenEdges, PACKET_SHAPES, zoomTier } from './loop-activity-map';
+import { activityEdgeKey, activityEdges, activityNodes, activityTraceTarget, applyLoopOwners, EDGE_HIGHLIGHT_MS, GHOST_LAUNCH_AFTER_MS, isGhostLaunch, isRoundTrip, journeyEdges, journeyAliases, journeyResponseEdges, journeyStages, nearDetail, newlySeenEdges, PACKET_SHAPES, zoomTier } from './loop-activity-map';
 import { leaksInternal } from './public-text';
 
 const now = Date.parse('2026-10-05T10:00:00Z');
@@ -100,6 +100,37 @@ test('journeyEdges reads tick → TASK-AGENT → run → PR → green in time or
   // JOURNEY-EMPTY-STATE: 사건 0 이면 «지금»(●) 없이 다섯 단계 모두 «남음»(○) — 간선 있는 여정 판정은 그대로(위 셋)
   expect(journeyStages([], 'card-1').map(s => s.state)).toEqual(['pending', 'pending', 'pending', 'pending', 'pending']);
   expect(journeyStages([{ ...journey[0]!, ref: 'other-card' }], 'card-1').every(s => s.state === 'pending')).toBe(true);
+});
+
+test('launch without a same-ref run becomes ghost at exactly 10 minutes, not before', () => {
+  // 10-07 리허설 2 대상 ta-20261007-7e0794/run-c5fadaf5: 기대 런 원장 부재 입력.
+  const launch = { at: '2026-10-07T06:00:00Z', kind: 'launch' as const,
+    from: 'agent:task-agent', to: 'UX', ref: 'ta-20261007-7e0794' };
+  const unrelatedRun = { at: '2026-10-07T06:01:00Z', kind: 'run' as const,
+    from: 'UX', to: 'loop:run-other', ref: 'run-other' };
+  const launchAt = Date.parse(launch.at);
+  expect(GHOST_LAUNCH_AFTER_MS).toBe(600_000);
+  expect(isGhostLaunch(launch, [launch], launchAt + GHOST_LAUNCH_AFTER_MS - 1)).toBe(false);
+  expect(isGhostLaunch(launch, [launch], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(true);
+  expect(isGhostLaunch(launch, [launch, unrelatedRun], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(true);
+  const matchingRun = { ...unrelatedRun, ref: launch.ref, to: 'loop:run-c5fadaf5' };
+  expect(isGhostLaunch(launch, [launch, matchingRun], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  expect(isGhostLaunch(unrelatedRun, [launch], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  const hand = { at: '2026-10-07T05:59:00Z', kind: 'hand' as const,
+    from: 'loop:orchestrator', to: 'agent:task-agent', ref: launch.ref, mode: 'live' as const };
+  expect(isGhostLaunch(launch, [hand, launch], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(true);
+  expect(isGhostLaunch(launch, [hand, launch, matchingRun], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  expect(isGhostLaunch({ ...launch, at: 'invalid' }, [launch], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  // 서버 실물 꼴: launch ref = 카드 id · run ref = runId — 서버가 묶은 run 이 있으면 유령 아님.
+  const boundLaunch = { ...launch, run: 'run-c5fadaf5' };
+  const realRun = { ...unrelatedRun, ref: 'run-c5fadaf5', to: 'loop:run-c5fadaf5' };
+  expect(isGhostLaunch(boundLaunch, [boundLaunch, realRun], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  expect(isGhostLaunch(boundLaunch, [boundLaunch], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(false);
+  expect(isGhostLaunch(launch, [launch, realRun], launchAt + GHOST_LAUNCH_AFTER_MS)).toBe(true);
+  expect(nearDetail('agent:task-agent', [launch], undefined, id => id, launchAt + GHOST_LAUNCH_AFTER_MS).recent)
+    .toEqual(['발사 · 유령 → CXO']);
+  expect(nearDetail('agent:task-agent', [launch, matchingRun], undefined, id => id, launchAt + GHOST_LAUNCH_AFTER_MS).recent)
+    .toEqual(['발사 → CXO']);
 });
 
 test('two zoom tiers split at 0.8 and near detail keeps at most five recent actions', () => {

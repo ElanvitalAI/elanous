@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
@@ -202,4 +203,88 @@ test('ORCH-LIVE-1008: the hand launcher runs the elanous CLI entry, not whatever
     expect(seen[0]!.slice(2)).toContain('harness');
     expect(taskLauncherArgv('/cfg', ['a'])).toEqual([ELANOUS_CLI_ENTRY, '--config-dir', '/cfg', 'a']);
   } finally { process.argv[1] = started; }
+});
+
+/** A fake detached child that writes `stderr` to the fd it was handed and exits with `code` (or stays alive). */
+function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn; stdio: unknown[] } {
+  const stdio: unknown[] = [];
+  const spawn = ((_command: string, _args: string[], options: { stdio: unknown }) => {
+    stdio.push(options.stdio);
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    setTimeout(() => {
+      handlers.spawn?.();
+      if (code === null) return;
+      const fd = (options.stdio as unknown[])[2];
+      if (stderr && typeof fd === 'number') writeSync(fd, stderr);
+      setTimeout(() => handlers.exit?.(code, null), 5);
+    }, 0);
+    return { pid: 9, once: (event: string, fn: (...args: unknown[]) => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
+  }) as unknown as DetachedSpawn;
+  return { spawn, stdio };
+}
+
+const launchContext = (runId: string) => ({ runId, launchId: 'tl-test', env: { ELANOUS_RUN_ID: runId } });
+
+test('STOP-RECORD launch-failed: a child that exits nonzero right after launch writes exactly one stop line and throws', async () => {
+  const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const written: RunLedgerEntry[] = [];
+  const longTail = `error: unknown command 'tick.ts'\n${Array.from({ length: 40 }, (_, i) => `    at frame${i} (x.ts:${i})`).join('\n')}`;
+  const { spawn, stdio } = exitingSpawn(2, longTail);
+  await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0001'),
+    { spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=2');
+  expect((stdio[0] as unknown[]).slice(0, 2)).toEqual(['ignore', 'ignore']);
+  expect(written).toHaveLength(1);
+  expect(written[0]).toMatchObject({ runId: 'run-launchfail-0001', event: 'stop', data: {
+    class: 'launch-failed', cause: "child rc=2: error: unknown command 'tick.ts'", evidenceRef: join(stderrDir, 'run-launchfail-0001.stderr'), nextMove: expect.any(String) } });
+  expect(String(written[0]!.data.cause).length).toBeLessThanOrEqual(120);
+  expect(String(written[0]!.data.cause)).not.toContain('frame');
+});
+
+test('STOP-RECORD launch-failed: a child still running after the window (or exiting 0) records no stop and returns the receipt', async () => {
+  const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const written: RunLedgerEntry[] = [];
+  const alive = await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchok-0001'),
+    { spawn: exitingSpawn(null).spawn, stderrDir, earlyExitWindowMs: 50, writeStop: (entry) => { written.push(entry); } });
+  expect(alive).toEqual({ runId: 'run-launchok-0001' });
+  const clean = await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchok-0002'),
+    { spawn: exitingSpawn(0).spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } });
+  expect(clean).toEqual({ runId: 'run-launchok-0002' });
+  expect(written).toHaveLength(0);
+});
+
+test('STOP-RECORD launch-failed: no stderr still records rc only', async () => {
+  const written: RunLedgerEntry[] = [];
+  await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0002'),
+    { spawn: exitingSpawn(7).spawn, stderrDir: mkdtempSync(join(tmpdir(), 'tasks-cli-launch-')), earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow();
+  expect(written.map((entry) => entry.data.cause)).toEqual(['child rc=7']);
+});
+
+test('STOP-RECORD launch-failed: a rerun truncates the old stderr and an existing stop is not duplicated (review must-fix)', async () => {
+  const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  writeFileSync(join(stderrDir, 'run-launchfail-0003.stderr'), 'stale error from the previous attempt\n');
+  const written: RunLedgerEntry[] = [];
+  await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0003'),
+    { spawn: exitingSpawn(3, 'fresh error\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('fresh error');
+  expect(written.map((entry) => entry.data.cause)).toEqual(['child rc=3: fresh error']);
+  await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-0004'),
+    { spawn: exitingSpawn(3, 'boom\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => true, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('rc=3');
+  expect(written).toHaveLength(1);
+});
+
+test('STOP-RECORD launch-failed: through task hand --live the card is launch-failed, not launched', async () => {
+  const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-card-')), 'task-agent-actions.json');
+  const written: RunLedgerEntry[] = [];
+  const result = await run(['task', 'hand', 'ship it', '--live'], {
+    taskStatePath, registerSink: async () => true,
+    taskLauncher: (args, cwd, context) => defaultTaskLauncher(args, cwd, context,
+      { spawn: exitingSpawn(2, 'error: bad argv\n').spawn, stderrDir, earlyExitWindowMs: 1_000, hasStop: () => false, writeStop: (entry) => { written.push(entry); } }),
+  });
+  expect(result.code).toBe(1);
+  const cards = Object.values(JSON.parse(readFileSync(taskStatePath, 'utf8')).tasks) as Array<{ status: string; history: Array<{ event: string; detail?: string }> }>;
+  expect(cards).toHaveLength(1);
+  expect(cards[0]!.status).toBe('launch-failed');
+  expect(cards[0]!.history[0]!.detail).toContain('child rc=2: error: bad argv');
+  expect(written).toHaveLength(1);
+  expect(written[0]!.data).toMatchObject({ class: 'launch-failed' });
 });

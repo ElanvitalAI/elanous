@@ -7,6 +7,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
+import * as nodeOs from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -713,30 +714,27 @@ describe('Pod child observation gap', () => {
     writeFileSync(join(stateDir, 'logs', 'instances.json'), JSON.stringify({ instances: [{
       name: 'test:fixture', stateDir: testState, kind: 'test', configDir: testState, pid: 0, startedAt: '',
     }] }));
-    const run = (args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--instance', 'prod', '--since', String(start), '--until', String(now), ...args], {
-      cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' },
-      encoding: 'utf8', timeout: 30_000,
-    });
+    // GATE-SPEED ③: in-process(`runLogsInProcess`) — 실물 진입점은 아래 「uses the first run-origin …」 시험(spawn 유지)이 문다.
+    const run = (args: string[]) => runLogsInProcess(['--instance', 'prod', '--since', String(start), '--until', String(now), ...args],
+      { HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' });
     try {
-      const event = run(['--event', 'pre-pr-sync']);
+      const event = await run(['--event', 'pre-pr-sync']);
       expect(event.status).toBe(0);
       expect(event.stderr).toContain('Pod 에서 돈 런 2개');
       expect(event.stderr).toContain('elanous self run-ledger <runId>');
       expect(event.stderr).toContain('(못 읽은 원장 1)');
-      const nexus = run(['--category', 'nexus']);
+      const nexus = await run(['--category', 'nexus']);
       expect(nexus.status).toBe(0);
       expect(nexus.stderr).not.toContain('POD-OBS');
-      const json = run(['--event', 'pre-pr-sync', '--json']);
+      const json = await run(['--event', 'pre-pr-sync', '--json']);
       expect(json.status).toBe(0);
       const meta = json.stdout.trim().split('\n').map((line) => JSON.parse(line)._meta);
       expect(meta[0]).toMatchObject({ type: 'log-query-opened-stores' });
       expect(meta.find((item) => item?.type === 'log-query-pod-observation-gap'))
         .toEqual({ type: 'log-query-pod-observation-gap', podRuns: 2, unreadableLedgers: 1 });
       expect(meta).toContainEqual({ type: 'log-query-multi-surface-duplicates', duplicateGroupCount: 0, surfaceKindCount: 0, surfaces: [], groups: [] });
-      const all = spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--all', '--include-test', '--since', String(start), '--until', String(now), '--event', 'pre-pr-sync', '--json'], {
-        cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' },
-        encoding: 'utf8', timeout: 30_000,
-      });
+      const all = await runLogsInProcess(['--all', '--include-test', '--since', String(start), '--until', String(now), '--event', 'pre-pr-sync', '--json'],
+        { HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir, TZ: 'UTC' });
       expect(all.status).toBe(0);
       expect(all.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)._meta)
         .find((item) => item?.type === 'log-query-pod-observation-gap')?.podRuns).toBe(3);
@@ -827,7 +825,7 @@ describe('Pod child observation gap', () => {
     } finally { rmSync(home, { recursive: true, force: true }); }
   }, 30_000);
 
-  it('counts selected registered instance ledgers without a logs.db, including when no store opens', () => {
+  it('counts selected registered instance ledgers without a logs.db, including when no store opens', async () => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-logs-pod-no-db-')));
     const prodState = join(home, '.elanous');
     const siblingState = join(home, 'ledger-only');
@@ -843,21 +841,19 @@ describe('Pod child observation gap', () => {
     writeFileSync(join(prodState, 'logs', 'instances.json'), JSON.stringify({ instances: [{
       name: 'ledger-only', stateDir: siblingState, kind: 'prod', configDir: siblingState, pid: 0, startedAt: '',
     }] }));
-    const run = (args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', '--since', String(now - 60_000), '--until', String(now), '--event', 'pre-pr-sync', ...args], {
-      cwd: process.cwd(), env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: prodState, ELANOUS_CONFIG_DIR: prodState },
-      encoding: 'utf8', timeout: 30_000,
-    });
+    const run = (args: string[]) => runLogsInProcess(['--since', String(now - 60_000), '--until', String(now), '--event', 'pre-pr-sync', ...args],
+      { HOME: home, ELANOUS_STATE_DIR: prodState, ELANOUS_CONFIG_DIR: prodState });
     try {
-      const missing = run(['--instance', 'ledger-only']);
+      const missing = await run(['--instance', 'ledger-only']);
       expect(missing.status).toBe(1);
       expect(missing.stderr).toContain('열 수 있는 로그 스토어 없음');
       expect(missing.stderr).toContain('Pod 에서 돈 런 1개');
-      const missingJson = run(['--instance', 'ledger-only', '--json']);
+      const missingJson = await run(['--instance', 'ledger-only', '--json']);
       expect(missingJson.status).toBe(1);
       expect(missingJson.stdout.trim().split('\n').map((line) => JSON.parse(line)))
         .toEqual([{ _meta: { type: 'log-query-pod-observation-gap', podRuns: 1, unreadableLedgers: 0 } }]);
       new LogStore(join(prodState, 'logs', 'logs.db')).close();
-      const federated = run(['--all', '--json']);
+      const federated = await run(['--all', '--json']);
       expect(federated.status).toBe(0);
       expect(federated.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)._meta)
         .find((item) => item?.type === 'log-query-pod-observation-gap'))
@@ -866,14 +862,86 @@ describe('Pod child observation gap', () => {
   }, 30_000);
 });
 
+/** ⭐ GATE-SPEED ③(2026-10-08) — `elanous logs …` 를 «같은 프로세스»에서 commander 의 실제 `logs` 명령으로 돌린다.
+ *  초판의 `runLogs` 는 호출마다 `bun bin/elanous.mjs logs …` 를 새로 띄웠다(81회 · 로컬 건당 ≈1~2 s · 게이트 794 s).
+ *  여기서는 같은 조건(HOME · TZ=UTC · 시험이 준 env)을 프로세스 전역에 잠깐 세우고, 이미 import 한 `program` 의
+ *  `logs` 명령(같은 옵션 정의 · 같은 action → `runLogsCli`)을 `parseAsync` 로 부른 뒤 되돌린다.
+ *  stdout/stderr 는 `process.*.write` ⊕ `console.*` 두 채널을 다 받는다(아래 remote describe 의 `captureIo` 와 같은 이유).
+ *  ⛔ 실물 진입점(`bin/elanous.mjs` 기동 · 파이프 · follow · remote LIVE)은 이 파일의 다른 spawn 시험과
+ *    `runLogsReal` 한 건이 계속 문다 — «배선 PR 은 실물을 한 번 돌린다». */
+async function runLogsInProcess(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number; stdout: string; stderr: string }> {
+  const logsCommand = program.commands.find((c) => c.name() === 'logs');
+  if (!logsCommand) throw new Error('logs command is not registered');
+  const savedEnv = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(env)) {
+    if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  const originalOut = process.stdout.write;
+  const originalErr = process.stderr.write;
+  const originalExit = process.exit;
+  const savedExitCode = process.exitCode;
+  const sink = (bucket: string[]) => ((chunk: unknown, encodingOrCb?: unknown, maybeCb?: unknown) => {
+    bucket.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
+    const cb = typeof encodingOrCb === 'function' ? encodingOrCb : maybeCb;
+    if (typeof cb === 'function') (cb as (e?: Error | null) => void)(null);
+    return true;
+  });
+  let status = 0;
+  // ⚠️ Bun 의 `os.homedir()` 는 `process.env.HOME` 을 바꿔도 «안 따라온다»(실측) — 레지스트리
+  //   (`~/.elanous/logs/instances.json`)가 운영 홈을 읽게 된다. ⇒ HOME 을 준 호출은 homedir 도 같이 돌린다.
+  const homeSpy = typeof env.HOME === 'string' ? spyOn(nodeOs, 'homedir').mockReturnValue(env.HOME) : undefined;
+  console.log = ((...items: unknown[]) => { stdout.push(`${items.map(String).join(' ')}\n`); }) as typeof console.log;
+  console.error = ((...items: unknown[]) => { stderr.push(`${items.map(String).join(' ')}\n`); }) as typeof console.error;
+  console.warn = console.error;
+  process.stdout.write = sink(stdout) as typeof process.stdout.write;
+  process.stderr.write = sink(stderr) as typeof process.stderr.write;
+  process.exit = ((code?: number) => { throw Object.assign(new Error('process.exit'), { exitCode: code ?? 0 }); }) as typeof process.exit;
+  logsCommand.exitOverride();
+  try {
+    process.exitCode = 0;
+    await logsCommand.parseAsync(args, { from: 'user' });
+    status = Number(process.exitCode ?? 0);
+  } catch (error) {
+    const exitCode = (error as { exitCode?: number }).exitCode;
+    if (typeof exitCode !== 'number') throw error;
+    status = exitCode;
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    console.warn = originalWarn;
+    process.stdout.write = originalOut;
+    process.stderr.write = originalErr;
+    process.exit = originalExit;
+    homeSpy?.mockRestore();
+    // ⚠️ Bun 은 `process.exitCode = undefined` 로는 안 되돌아간다 — 0 으로 되돌린다.
+    process.exitCode = savedExitCode ?? 0;
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  return { status, stdout: stdout.join(''), stderr: stderr.join('') };
+}
+
 describe('runLogsCli — 사람용 출력 wiring', () => {
   function runLogs(args: string[], home: string, env: NodeJS.ProcessEnv = {}) {
+    return runLogsInProcess(args, { HOME: home, TZ: 'UTC', ...env });
+  }
+  /** 실물 진입점 — `bin/elanous.mjs logs` 가 같은 결과를 내는지(배선) 이 describe 에서 한 번 잰다. */
+  function runLogsReal(args: string[], home: string, env: NodeJS.ProcessEnv = {}) {
     return spawnSync(process.execPath, ['bin/elanous.mjs', 'logs', ...args], {
       cwd: process.cwd(), env: { ...process.env, HOME: home, TZ: 'UTC', ...env }, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
     });
   }
 
-  it('기본 조회와 --all --include-test는 등록 스토어 모집단의 안 본 수를 scope·queryStatus로 같은 값으로 말한다', () => {
+  it('기본 조회와 --all --include-test는 등록 스토어 모집단의 안 본 수를 scope·queryStatus로 같은 값으로 말한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-unopened-stores-'));
     const prodState = join(home, '.elanous');
     const siblingState = join(home, 'sibling-state');
@@ -890,7 +958,8 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ] }));
     try {
       const fixtureEnv = { ELANOUS_STATE_DIR: prodState };
-      const defaultResult = runLogs(['--limit', '1'], home, fixtureEnv);
+      // ⭐ 실물 진입점 한 번 — 아래 in-process 호출들과 같은 계약을 `bin/elanous.mjs` 가 그대로 내는지.
+      const defaultResult = runLogsReal(['--limit', '1'], home, fixtureEnv);
       expect(defaultResult.status).toBe(0);
       expect(defaultResult.stdout).toContain('scope');
       expect(defaultResult.stdout).not.toContain('안 본 스토어');
@@ -899,20 +968,20 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(defaultResult.stderr).toContain('scope={"registeredStores":3,"unopenedStores":2}');
       expect(defaultResult.stderr).toContain('queryStatus={"registeredStores":true}');
 
-      const allResult = runLogs(['--all', '--include-test', '--limit', '1'], home, fixtureEnv);
+      const allResult = await runLogs(['--all', '--include-test', '--limit', '1'], home, fixtureEnv);
       expect(allResult.status).toBe(0);
       expect(allResult.stderr).toContain('열린 로그 스토어 3개');
       expect(allResult.stderr).toContain('안 본 스토어 0개');
       expect(allResult.stderr).toContain('scope={"registeredStores":3,"unopenedStores":0}');
       expect(allResult.stderr).toContain('queryStatus={"registeredStores":true}');
 
-      const defaultJson = runLogs(['--json', '--limit', '1'], home, fixtureEnv);
+      const defaultJson = await runLogs(['--json', '--limit', '1'], home, fixtureEnv);
       const defaultMeta = JSON.parse(defaultJson.stdout.trim().split('\n')[0]!);
       expect(defaultMeta).toEqual({ _meta: {
         type: 'log-query-opened-stores', stores: expect.any(Array),
         scope: { registeredStores: 3, unopenedStores: 2 }, queryStatus: { registeredStores: true },
       } });
-      const allJson = runLogs(['--json', '--all', '--include-test', '--limit', '1'], home, fixtureEnv);
+      const allJson = await runLogs(['--json', '--all', '--include-test', '--limit', '1'], home, fixtureEnv);
       const allMeta = JSON.parse(allJson.stdout.trim().split('\n')[0]!);
       expect(allMeta).toEqual({ _meta: {
         type: 'log-query-opened-stores', stores: expect.any(Array),
@@ -923,12 +992,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('레지스트리 또는 대상 DB가 없으면 등록·안 본 스토어를 0으로 거짓 보고하지 않는다', () => {
+  it('레지스트리 또는 대상 DB가 없으면 등록·안 본 스토어를 0으로 거짓 보고하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-no-registered-store-'));
     const stateDir = join(home, '.elanous');
     try {
       const fixtureEnv = { ELANOUS_STATE_DIR: stateDir };
-      const missingRegistry = runLogs(['--limit', '1'], home, fixtureEnv);
+      const missingRegistry = await runLogs(['--limit', '1'], home, fixtureEnv);
       expect(missingRegistry.status).toBe(1);
       expect(missingRegistry.stderr).toContain('열 수 있는 로그 스토어 없음');
       expect(missingRegistry.stderr).toContain('scope={"registeredStores":0,"unopenedStores":0}');
@@ -938,7 +1007,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       writeFileSync(join(stateDir, 'logs', 'instances.json'), JSON.stringify({ instances: [{
         name: 'prod', stateDir, kind: 'prod', configDir: stateDir, pid: 0, startedAt: '',
       }] }));
-      const missingDb = runLogs(['--limit', '1'], home, fixtureEnv);
+      const missingDb = await runLogs(['--limit', '1'], home, fixtureEnv);
       expect(missingDb.status).toBe(1);
       expect(missingDb.stderr).toContain('열 수 있는 로그 스토어 없음');
       expect(missingDb.stderr).toContain('scope={"registeredStores":0,"unopenedStores":0}');
@@ -948,7 +1017,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('손상되거나 읽을 수 없는 레지스트리는 등록 스토어 0개로 거짓 보고하지 않는다', () => {
+  it('손상되거나 읽을 수 없는 레지스트리는 등록 스토어 0개로 거짓 보고하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-malformed-registry-'));
     const stateDir = join(home, '.elanous');
     const dbPath = join(stateDir, 'logs', 'logs.db');
@@ -957,26 +1026,26 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       const fixtureEnv = { ELANOUS_STATE_DIR: stateDir };
       const registryPath = join(stateDir, 'logs', 'instances.json');
       writeFileSync(registryPath, '{ malformed');
-      const malformed = runLogs(['--limit', '1'], home, fixtureEnv);
+      const malformed = await runLogs(['--limit', '1'], home, fixtureEnv);
       expect(malformed.status).toBe(0);
       expect(malformed.stderr).toContain('안 본 스토어 수 미측정');
       expect(malformed.stderr).toContain('scope={}');
       expect(malformed.stderr).toContain('queryStatus={"registeredStores":false}');
-      const malformedJson = JSON.parse(runLogs(['--json', '--limit', '1'], home, fixtureEnv).stdout.trim().split('\n')[0]!);
+      const malformedJson = JSON.parse((await runLogs(['--json', '--limit', '1'], home, fixtureEnv)).stdout.trim().split('\n')[0]!);
       expect(malformedJson._meta).toMatchObject({ type: 'log-query-opened-stores', scope: {}, queryStatus: { registeredStores: false } });
 
       writeFileSync(registryPath, JSON.stringify({ instances: [
         { name: 'prod', stateDir, kind: 'prod', configDir: stateDir, pid: 0, startedAt: '' },
         { name: 'invalid-entry' },
       ] }));
-      const partial = runLogs(['--limit', '1'], home, fixtureEnv);
+      const partial = await runLogs(['--limit', '1'], home, fixtureEnv);
       expect(partial.status).toBe(0);
       expect(partial.stderr).toContain('scope={"registeredStores":1,"unopenedStores":0}');
       expect(partial.stderr).toContain('queryStatus={"registeredStores":true}');
 
       rmSync(registryPath, { force: true });
       mkdirSync(registryPath);
-      const unreadable = runLogs(['--limit', '1'], home, fixtureEnv);
+      const unreadable = await runLogs(['--limit', '1'], home, fixtureEnv);
       expect(unreadable.status).toBe(0);
       expect(unreadable.stderr).toContain('안 본 스토어 수 미측정');
       expect(unreadable.stderr).toContain('scope={}');
@@ -986,12 +1055,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--explain만으로 축을 모르더라도 발견 목록을 출력한다', () => {
+  it('--explain만으로 축을 모르더라도 발견 목록을 출력한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-axis-discovery-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     try {
-      const discovery = runLogs(['--instance', 'prod', '--explain'], home);
+      const discovery = await runLogs(['--instance', 'prod', '--explain'], home);
       expect(discovery.status).toBe(0);
       expect(discovery.stdout).toContain('알려진 로그 축 2개:');
       expect(discovery.stdout).toContain('dev (5개): dev-pipeline, self-implement');
@@ -1002,7 +1071,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('--axis pty는 접두 밖 네 카테고리를 exact 조회하고 --explain은 세 칸을 낸다', () => {
+  it('--axis pty는 접두 밖 네 카테고리를 exact 조회하고 --explain은 세 칸을 낸다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-axis-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1016,14 +1085,14 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const axis = runLogs(['--instance', 'prod', '--axis', 'pty'], home);
+      const axis = await runLogs(['--instance', 'prod', '--axis', 'pty'], home);
       expect(axis.status).toBe(0);
       expect(axis.stdout).toContain('nexus.pty.write.error');
       expect(axis.stdout).toContain('nexus.pty.resize.error');
       expect(axis.stdout).toContain('nexus.pty.kill.error');
       expect(axis.stdout).toContain('pane-spawner.pty.start');
       expect(axis.stdout).not.toContain('dispatch.continuation.scheduler');
-      const explain = runLogs(['--instance', 'prod', '--axis', 'pty', '--explain'], home);
+      const explain = await runLogs(['--instance', 'prod', '--axis', 'pty', '--explain'], home);
       expect(explain.status).toBe(0);
       expect(explain.stdout).toContain('매핑됨 (pty) 10개:');
       expect(explain.stdout).toContain('dispatch.continuation.scheduler');
@@ -1033,7 +1102,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('연 열린 스토어 수는 항상 안내하고 경로는 일반 조회의 기여 인스턴스만 낸다', () => {
+  it('연 열린 스토어 수는 항상 안내하고 경로는 일반 조회의 기여 인스턴스만 낸다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-opened-store-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const otherState = join(home, 'other-state');
@@ -1046,7 +1115,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'other', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--all', '--category', 'contributing.category'], home);
+      const text = await runLogs(['--all', '--category', 'contributing.category'], home);
       expect(text.status).toBe(0);
       expect(text.stdout).toContain('only-prod');
       expect(text.stderr).toContain('열린 로그 스토어 2개');
@@ -1061,7 +1130,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
         { name: 'prod', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '' },
         { name: 'prod', stateDir: sameNameState, kind: 'prod', configDir: sameNameState, pid: 0, startedAt: '' },
       ] }));
-      const duplicateName = runLogs(['--all', '--category', 'contributing.category'], home);
+      const duplicateName = await runLogs(['--all', '--category', 'contributing.category'], home);
       expect(duplicateName.status).toBe(0);
       expect(duplicateName.stderr).toContain(`log store: ${prodDbPath} (prod)`);
       expect(duplicateName.stderr).not.toContain(`log store: ${otherDbPath} (prod)`);
@@ -1071,19 +1140,19 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
         name: 'other', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '',
       }] }));
 
-      const zero = runLogs(['--all', '--category', 'absent.category'], home);
+      const zero = await runLogs(['--all', '--category', 'absent.category'], home);
       expect(zero.status).toBe(0);
       expect(zero.stdout).toBe('');
       expect(zero.stderr).toContain('열린 로그 스토어 2개');
       expect(zero.stderr).not.toContain('log store:');
       expect(zero.stderr).toContain('(일치하는 로그 없음)');
 
-      const explain = runLogs(['--instance', 'prod', '--explain'], home);
+      const explain = await runLogs(['--instance', 'prod', '--explain'], home);
       expect(explain.status).toBe(0);
       expect(explain.stderr).toContain('열린 로그 스토어 1개');
       expect(explain.stderr).not.toContain('log store:');
 
-      const json = runLogs(['--all', '--json', '--category', 'absent.category'], home);
+      const json = await runLogs(['--all', '--json', '--category', 'absent.category'], home);
       expect(json.status).toBe(0);
       const rows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(rows).toEqual([
@@ -1101,7 +1170,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('rework recurrence disagreement 필터는 최근 절단 배치 밖의 오래된 일치 행까지 페이지로 채운다', () => {
+  it('rework recurrence disagreement 필터는 최근 절단 배치 밖의 오래된 일치 행까지 페이지로 채운다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-rework-recurrence-filter-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1117,7 +1186,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     writer.insertBatch(rows);
     writer.close();
     try {
-      const result = runLogs(['--instance', 'prod', '--json', '--event', 'rework-budget', '--rework-recurrence-disagreement', 'true', '--limit', '1'], home);
+      const result = await runLogs(['--instance', 'prod', '--json', '--event', 'rework-budget', '--rework-recurrence-disagreement', 'true', '--limit', '1'], home);
       expect(result.status).toBe(0);
       const jsonRows = result.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line));
       const payloadRows = jsonRows.filter((row) => row._meta == null);
@@ -1130,7 +1199,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 30_000);
 
-  it('반환된 제한 행의 런 커버리지는 stderr에만 내고 빈 결과와 JSON NDJSON은 바꾸지 않는다', () => {
+  it('반환된 제한 행의 런 커버리지는 stderr에만 내고 빈 결과와 JSON NDJSON은 바꾸지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-run-coverage-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1141,13 +1210,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const text = runLogs(['--instance', 'prod', '--category', 'run-coverage', '--limit', '2'], home);
+      const text = await runLogs(['--instance', 'prod', '--category', 'run-coverage', '--limit', '2'], home);
       expect(text.status).toBe(0);
       expect(text.stderr).toContain('안내: 반환된 2행은 식별 가능한 런 2개에서 왔습니다 (서로 다른 런이 섞임).');
       expect(text.stdout).not.toContain('식별 가능한 런');
       expect(text.stdout).toContain('↳ 상한 2 도달');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--category', 'run-coverage', '--limit', '2'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--category', 'run-coverage', '--limit', '2'], home);
       expect(json.status).toBe(0);
       expect(json.stderr).not.toContain('식별 가능한 런');
       expect(json.stderr).toContain('elanous logs: result may be truncated (limitReached=true)');
@@ -1171,7 +1240,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(cappedPayload.map((entry) => entry.event)).toEqual(['second', 'third']);
       expect(cappedPayload.every((entry) => entry.category === 'run-coverage')).toBe(true);
 
-      const uncapped = runLogs(['--instance', 'prod', '--json', '--category', 'run-coverage', '--limit', '4'], home);
+      const uncapped = await runLogs(['--instance', 'prod', '--json', '--category', 'run-coverage', '--limit', '4'], home);
       expect(uncapped.status).toBe(0);
       expect(uncapped.stderr).not.toContain('elanous logs: result may be truncated');
       const uncappedPayload = payloadRows(uncapped.stdout);
@@ -1179,7 +1248,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(uncappedPayload.map((entry) => entry.event)).toEqual(['first', 'second', 'third']);
       expect(uncappedPayload.every((entry) => entry._meta == null)).toBe(true);
 
-      const empty = runLogs(['--instance', 'prod', '--category', 'absent-run-coverage'], home);
+      const empty = await runLogs(['--instance', 'prod', '--category', 'absent-run-coverage'], home);
       expect(empty.status).toBe(0);
       expect(empty.stderr).toContain('(일치하는 로그 없음)');
       expect(empty.stderr).not.toContain('식별 가능한 런');
@@ -1188,7 +1257,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--json은 같은 ts·category·event의 다중 표면 그룹 메타를 내고 행 자체와 사람용 출력은 접지 않는다', () => {
+  it('--json은 같은 ts·category·event의 다중 표면 그룹 메타를 내고 행 자체와 사람용 출력은 접지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-multi-surface-duplicate-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1199,7 +1268,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const json = runLogs(['--instance', 'prod', '--json', '--category', 'self-implement', '--limit', '10'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--category', 'self-implement', '--limit', '10'], home);
       expect(json.status).toBe(0);
       const rows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       const payloadRows = rows.filter((row) => row._meta == null);
@@ -1225,7 +1294,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(payloadRows.filter((row) => row.event === 'run-status').map((row) => row.surface).sort())
         .toEqual(['harness', 'harness:self-implement']);
 
-      const singleSurface = runLogs(['--instance', 'prod', '--json', '--event', 'single-surface', '--limit', '10'], home);
+      const singleSurface = await runLogs(['--instance', 'prod', '--json', '--event', 'single-surface', '--limit', '10'], home);
       expect(singleSurface.status).toBe(0);
       const singleRows = singleSurface.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(singleRows.find((row) => row._meta?.type === 'log-query-multi-surface-duplicates')).toEqual({ _meta: {
@@ -1233,7 +1302,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       } });
       expect(singleRows.filter((row) => row._meta == null)).toHaveLength(1);
 
-      const text = runLogs(['--instance', 'prod', '--category', 'self-implement', '--limit', '10'], home);
+      const text = await runLogs(['--instance', 'prod', '--category', 'self-implement', '--limit', '10'], home);
       expect(text.status).toBe(0);
       expect(text.stdout).not.toContain('log-query-multi-surface-duplicates');
       expect(text.stdout).toContain('[harness] self-implement run-status');
@@ -1273,7 +1342,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 --event 오타는 찍힌 가까운 이름을 stderr에만 내고 저장소 부재를 단정하지 않는다', () => {
+  it('0건 --event 오타는 찍힌 가까운 이름을 stderr에만 내고 저장소 부재를 단정하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-name-hint-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1283,7 +1352,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const typo = runLogs(['--instance', 'prod', '--event', 'plan-sizin'], home);
+      const typo = await runLogs(['--instance', 'prod', '--event', 'plan-sizin'], home);
       expect(typo.status).toBe(0);
       expect(typo.stdout).toBe('');
       expect(typo.stderr).toContain('(일치하는 로그 없음)');
@@ -1293,7 +1362,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(typo.stderr).not.toContain('이 저장소에 없다');
       expect(typo.stderr).not.toContain('없는 이름');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--event', 'plan-sizin'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--event', 'plan-sizin'], home);
       expect(json.status).toBe(0);
       const jsonRows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(jsonRows).toEqual([
@@ -1302,7 +1371,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       ]);
       expect(json.stderr).not.toContain('이 조회 범위에서 본 적 없다');
 
-      const present = runLogs(['--instance', 'prod', '--event', 'plan-sizing'], home);
+      const present = await runLogs(['--instance', 'prod', '--event', 'plan-sizing'], home);
       expect(present.status).toBe(0);
       expect(present.stdout).toContain('plan-sizing');
       expect(present.stderr).not.toContain('이 조회 범위에서 본 적 없다');
@@ -1312,12 +1381,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('찍힌 이름이 없는 창의 0건 --event는 안내 불가를 말하고 빈 목록만 남기지 않는다', () => {
+  it('찍힌 이름이 없는 창의 0건 --event는 안내 불가를 말하고 빈 목록만 남기지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-name-hint-empty-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     try {
-      const empty = runLogs(['--instance', 'prod', '--event', 'zzz-no-such-event-xyz'], home);
+      const empty = await runLogs(['--instance', 'prod', '--event', 'zzz-no-such-event-xyz'], home);
       expect(empty.status).toBe(0);
       expect(empty.stdout).toBe('');
       expect(empty.stderr).toContain('이 조회 범위에서 본 적 없다');
@@ -1331,12 +1400,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 단일 --event 는 목록에 있는 이름의 판정을 stderr 에 소비한다', () => {
+  it('0건 단일 --event 는 목록에 있는 이름의 판정을 stderr 에 소비한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-verdict-known-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     try {
-      const known = runLogs(['--instance', 'prod', '--event', 'plan-sizing'], home);
+      const known = await runLogs(['--instance', 'prod', '--event', 'plan-sizing'], home);
       expect(known.status).toBe(0);
       expect(known.stderr).toContain('이 저장소가 냅니다');
       expect(known.stderr).toContain("'plan-sizing'");
@@ -1346,12 +1415,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 다중 --event 는 판정을 내지 않는다', () => {
+  it('0건 다중 --event 는 판정을 내지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-verdict-multi-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     try {
-      const multi = runLogs(['--instance', 'prod', '--event', 'plan-sizing,ledger'], home);
+      const multi = await runLogs(['--instance', 'prod', '--event', 'plan-sizing,ledger'], home);
       expect(multi.status).toBe(0);
       expect(multi.stderr).toContain('(일치하는 로그 없음)');
       expect(multi.stderr).not.toContain('이 저장소가 냅니다');
@@ -1362,13 +1431,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 --event 선행·후행 쉼표와 빈 토큰은 판정을 내지 않는다', () => {
+  it('0건 --event 선행·후행 쉼표와 빈 토큰은 판정을 내지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-verdict-comma-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     new LogStore(dbPath).close();
     try {
       for (const event of ['plan-sizing,', ',plan-sizing', 'plan-sizing,,other', 'plan-sizing, ,ledger']) {
-        const result = runLogs(['--instance', 'prod', '--event', event], home);
+        const result = await runLogs(['--instance', 'prod', '--event', event], home);
         expect(result.status).toBe(0);
         expect(result.stderr).toContain('(일치하는 로그 없음)');
         expect(result.stderr).not.toContain('이 저장소가 냅니다');
@@ -1380,7 +1449,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 카테고리 조회는 저장소에 없는 이름만 안내하고 존재하는 이름은 안내하지 않는다', () => {
+  it('0건 카테고리 조회는 저장소에 없는 이름만 안내하고 존재하는 이름은 안내하지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-category-candidate-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1390,16 +1459,16 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const missing = runLogs(['--instance', 'prod', '--category', 'missing.category', '--event', 'none'], home);
+      const missing = await runLogs(['--instance', 'prod', '--category', 'missing.category', '--event', 'none'], home);
       expect(missing.status).toBe(0);
       expect(missing.stderr).toContain('관측된 적 없습니다');
       expect(missing.stderr).toContain("'missing.category'");
 
-      const present = runLogs(['--instance', 'prod', '--category', 'present.prefix', '--event', 'none'], home);
+      const present = await runLogs(['--instance', 'prod', '--category', 'present.prefix', '--event', 'none'], home);
       expect(present.status).toBe(0);
       expect(present.stderr).not.toContain('관측된 적 없습니다');
 
-      const independentlyPresent = runLogs([
+      const independentlyPresent = await runLogs([
         '--instance', 'prod', '--category', 'present.prefix', '--exact-category', 'present.exact', '--event', 'none',
       ], home);
       expect(independentlyPresent.status).toBe(0);
@@ -1409,7 +1478,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('0건 prod 조회는 다른 test 인스턴스의 안전하게 인용된 재조회 힌트를 출력하고 JSON은 불변이다', () => {
+  it('0건 prod 조회는 다른 test 인스턴스의 안전하게 인용된 재조회 힌트를 출력하고 JSON은 불변이다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-cli-'));
     const testState = join(home, 'fixture-state');
     const dbPath = join(testState, 'logs', 'logs.db');
@@ -1423,14 +1492,14 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'test:fixture', stateDir: testState, kind: 'test', configDir: testState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--grep', "foo bar * 'single' \"double\""], home);
+      const text = await runLogs(['--grep', "foo bar * 'single' \"double\""], home);
       expect(text.status).toBe(0);
       expect(text.stdout).toBe('');
       expect(text.stderr).toContain('(일치하는 로그 없음)');
       expect(text.stderr).toContain('test:fixture 1건');
       expect(text.stderr).toContain("--grep 'foo bar * '\\''single'\\'' \"double\"'");
       expect(text.stderr).toContain('OR 검색이 아니라 단일 연속 문자열 검색');
-      const json = runLogs(['--json', '--grep', "foo bar * 'single' \"double\""], home);
+      const json = await runLogs(['--json', '--grep', "foo bar * 'single' \"double\""], home);
       expect(json.status).toBe(0);
       const jsonRows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(jsonRows).toEqual([
@@ -1484,7 +1553,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('JSON 메타는 비-harness 두 표면의 동일 ts·category·event 그룹을 알리고 행은 접지 않는다', () => {
+  it('JSON 메타는 비-harness 두 표면의 동일 ts·category·event 그룹을 알리고 행은 접지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-multi-surface-any-surface-'));
     const stateDir = join(home, '.elanous');
     const writer = new LogStore(join(stateDir, 'logs', 'logs.db'));
@@ -1495,7 +1564,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const result = runLogs(['--instance', 'prod', '--json', '--exact-category', 'same-event', '--limit', '10'], home, { ELANOUS_STATE_DIR: stateDir });
+      const result = await runLogs(['--instance', 'prod', '--json', '--exact-category', 'same-event', '--limit', '10'], home, { ELANOUS_STATE_DIR: stateDir });
       expect(result.status).toBe(0);
       const jsonRows = result.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       const duplicateMeta = jsonRows.find((row) => row._meta?.type === 'log-query-multi-surface-duplicates');
@@ -1520,7 +1589,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('JSON 메타는 비-harness 단일 표면 입력에서도 중복 그룹 0을 명시한다', () => {
+  it('JSON 메타는 비-harness 단일 표면 입력에서도 중복 그룹 0을 명시한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-multi-surface-single-non-harness-'));
     const stateDir = join(home, '.elanous');
     const writer = new LogStore(join(stateDir, 'logs', 'logs.db'));
@@ -1530,7 +1599,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const result = runLogs(['--instance', 'prod', '--json', '--exact-category', 'single-surface', '--limit', '10'], home, { ELANOUS_STATE_DIR: stateDir });
+      const result = await runLogs(['--instance', 'prod', '--json', '--exact-category', 'single-surface', '--limit', '10'], home, { ELANOUS_STATE_DIR: stateDir });
       expect(result.status).toBe(0);
       const jsonRows = result.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       const duplicateMeta = jsonRows.find((row) => row._meta?.type === 'log-query-multi-surface-duplicates');
@@ -1547,7 +1616,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('rework recurrence disagreement 필터는 rework-budget data 값으로 단일 조회 표본을 좁힌다', () => {
+  it('rework recurrence disagreement 필터는 rework-budget data 값으로 단일 조회 표본을 좁힌다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-rework-recurrence-disagreement-'));
     const stateDir = join(home, '.elanous');
     const writer = new LogStore(join(stateDir, 'logs', 'logs.db'));
@@ -1558,7 +1627,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const result = runLogs(['--exact-category', 'self-implement', '--event', 'rework-budget', '--rework-recurrence-disagreement', 'true', '--json', '--json-data'], home, { ELANOUS_STATE_DIR: stateDir });
+      const result = await runLogs(['--exact-category', 'self-implement', '--event', 'rework-budget', '--rework-recurrence-disagreement', 'true', '--json', '--json-data'], home, { ELANOUS_STATE_DIR: stateDir });
       expect(result.status).toBe(0);
       const rows = result.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(rows.filter((row) => row._meta === undefined)).toEqual([
@@ -1574,7 +1643,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('rework recurrence disagreement 필터 helper는 rework-budget 이벤트의 boolean 값만 매칭한다', () => {
+  it('rework recurrence disagreement 필터 helper는 rework-budget 이벤트의 boolean 값만 매칭한다', async () => {
     const base: LogStoreRow = {
       id: 1, ts: '2026-08-23T00:00:00.000Z', ts_ms: 0, level: 'debug', instance: 'test', surface: 'nexus', category: 'self-implement', event: 'rework-budget', session_id: null, trace_id: null, data: '{"recurrenceDisagreement":true}',
     };
@@ -1619,7 +1688,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('--instance와 --all의 비현재 스코프 0건 조회는 발화 ON 단언 대신 억제 상태 미확인을 출력한다', () => {
+  it('--instance와 --all의 비현재 스코프 0건 조회는 발화 ON 단언 대신 억제 상태 미확인을 출력한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-render-gated-instance-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const otherState = join(home, 'other-state');
@@ -1634,7 +1703,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
         ['--instance', 'other', '--category', 'dashboard.chat.stream'],
         ['--all', '--category', 'dashboard.chat.stream'],
       ]) {
-        const result = runLogs(args, home);
+        const result = await runLogs(args, home);
         expect(result.status).toBe(0);
         expect(result.stderr).toContain('렌더 억제 상태는 확인하지 못했다');
         expect(result.stderr).not.toContain('빈 결과라면 실제로 이벤트가 없는 것이다');
@@ -1647,7 +1716,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('실제 연속 문자열과 매치되는 나열형 --grep도 레코드는 stdout, 경고는 stderr에 항상 출력한다', () => {
+  it('실제 연속 문자열과 매치되는 나열형 --grep도 레코드는 stdout, 경고는 stderr에 항상 출력한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-grep-phrase-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1656,7 +1725,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }]);
     writer.close();
     try {
-      const result = runLogs(['--grep', 'headless OR progress'], home);
+      const result = await runLogs(['--grep', 'headless OR progress'], home);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain('headless OR progress');
       expect(result.stderr).toContain('OR 검색이 아니라 단일 연속 문자열 검색');
@@ -1665,7 +1734,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('긴 데이터 행의 절단은 stdout 형식을 유지한 채 stderr로 한 번만 알리고 JSON은 알리지 않는다', () => {
+  it('긴 데이터 행의 절단은 stdout 형식을 유지한 채 stderr로 한 번만 알리고 JSON은 알리지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-truncation-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1680,7 +1749,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       //    `cwd: process.cwd()` 로 CLI 를 띄우므로 실행 트리에 다른 인스턴스가 등록돼 있으면
       //    **연합 조회**가 되어 ①인스턴스 태그가 붙고 ②남의 스토어의 `category=truncate` 레코드가
       //    섞인다. 둘 다 이 테스트를 **실행 환경에 의존하게** 만든다.
-      const text = runLogs(['--instance', 'prod', '--category', 'truncate'], home);
+      const text = await runLogs(['--instance', 'prod', '--category', 'truncate'], home);
       const storedLongData = JSON.stringify(longData);
       const storedShortData = JSON.stringify('short');
       const truncatedData = ` ${storedLongData}`.slice(0, 200);
@@ -1703,7 +1772,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(text.stderr).toContain(warning);
       expect(text.stderr.split(warning).length - 1).toBe(1);
 
-      const json = runLogs(['--instance', 'prod', '--json', '--json-data', '--category', 'truncate'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--json-data', '--category', 'truncate'], home);
       expect(json.status).toBe(0);
       // ⭐ 첫 행만 파싱하면 전체가 순수 NDJSON 인지 보장하지 못한다(리뷰 should-fix).
       const jsonLines = json.stdout.split('\n').filter((line) => line.length > 0);
@@ -1718,7 +1787,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('저장 절단 마커가 있는 긴 데이터는 JSON 복구 안내 대신 비복구 안내를 낸다', () => {
+  it('저장 절단 마커가 있는 긴 데이터는 JSON 복구 안내 대신 비복구 안내를 낸다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-write-truncation-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1728,14 +1797,14 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }]);
     writer.close();
     try {
-      const text = runLogs(['--instance', 'prod', '--category', 'write-truncate'], home);
+      const text = await runLogs(['--instance', 'prod', '--category', 'write-truncate'], home);
       const warning = '경고: 1줄은 저장 전에 잘렸습니다. --json --json-data 로도 원본을 복원할 수 없습니다.';
       expect(text.status).toBe(0);
       expect(text.stdout).toContain('…');
       expect(text.stderr).toContain(warning);
       expect(text.stderr).not.toContain('전체를 보려면 --json --json-data 를 쓰세요.');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--json-data', '--category', 'write-truncate'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--json-data', '--category', 'write-truncate'], home);
       expect(json.status).toBe(0);
       const jsonRows = json.stdout.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as { data?: unknown; _meta?: unknown });
       expect(jsonRows[0]).toEqual(expect.objectContaining({ _meta: expect.objectContaining({ type: 'log-query-opened-stores' }) }));
@@ -1746,7 +1815,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('짧은 데이터만 있으면 절단 경고를 내지 않는다', () => {
+  it('짧은 데이터만 있으면 절단 경고를 내지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-no-truncation-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1755,7 +1824,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     try {
       // ⛔ 형제 테스트와 같은 이유로 단일 스토어 고정 — 연합이면 다른 인스턴스의
       //    `category=short-data` 장문 레코드가 섞여 "경고 없음" 단언이 깨진다(리뷰 must-fix).
-      const result = runLogs(['--instance', 'prod', '--category', 'short-data'], home);
+      const result = await runLogs(['--instance', 'prod', '--category', 'short-data'], home);
       expect(result.status).toBe(0);
       expect(result.stderr).not.toContain('잘렸습니다');
     } finally {
@@ -1763,7 +1832,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('--event에 카테고리를 주어 0건이면 힌트는 stderr에만 출력하고 JSON stdout은 비운다', () => {
+  it('--event에 카테고리를 주어 0건이면 힌트는 stderr에만 출력하고 JSON stdout은 비운다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-event-category-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -1772,13 +1841,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }]);
     writer.close();
     try {
-      const result = runLogs(['--event', 'dev-pipeline'], home);
+      const result = await runLogs(['--event', 'dev-pipeline'], home);
       expect(result.status).toBe(0);
       expect(result.stdout).toBe('');
       expect(result.stderr).toContain('카테고리와 이벤트를 혼동했을 수 있습니다');
       expect(result.stderr).toContain('--category');
 
-      const json = runLogs(['--json', '--event', 'dev-pipeline'], home);
+      const json = await runLogs(['--json', '--event', 'dev-pipeline'], home);
       expect(json.status).toBe(0);
       expect(json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))).toEqual([
         expect.objectContaining({ _meta: expect.objectContaining({ type: 'log-query-opened-stores' }) }),
@@ -1801,7 +1870,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     })));
     writer.close();
     try {
-      const file = runLogs(['--instance', 'prod', '--json', '--category', 'pipe', '--limit', String(expectedCount)], home);
+      const file = await runLogs(['--instance', 'prod', '--json', '--category', 'pipe', '--limit', String(expectedCount)], home);
       expect(file.status).toBe(0);
       const fileLines = file.stdout.trim().split('\n').filter(Boolean);
       expect(fileLines).toHaveLength(expectedCount + 3);
@@ -1875,7 +1944,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('--json은 단일·연합 모두 독립 파싱 가능한 같은 레코드 NDJSON을 순서대로 출력한다', () => {
+  it('--json은 단일·연합 모두 독립 파싱 가능한 같은 레코드 NDJSON을 순서대로 출력한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-json-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const instanceState = join(home, 'instance-state');
@@ -1897,9 +1966,9 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'test:fixture', stateDir: instanceState, kind: 'test', configDir: instanceState, pid: 0, startedAt: '',
     }] }));
     try {
-      const single = runLogs(['--json', '--category', 'shape'], home);
-      const federated = runLogs(['--json', '--all', '--include-test', '--category', 'shape'], home);
-      const parsedData = runLogs(['--json', '--json-data', '--category', 'shape'], home);
+      const single = await runLogs(['--json', '--category', 'shape'], home);
+      const federated = await runLogs(['--json', '--all', '--include-test', '--category', 'shape'], home);
+      const parsedData = await runLogs(['--json', '--json-data', '--category', 'shape'], home);
       expect(single.status).toBe(0);
       expect(federated.status).toBe(0);
       expect(parsedData.status).toBe(0);
@@ -1930,7 +1999,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('손상된 다른 인스턴스 탐침은 빈 결과와 성공 종료코드를 바꾸지 않는다', () => {
+  it('손상된 다른 인스턴스 탐침은 빈 결과와 성공 종료코드를 바꾸지 않는다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-corrupt-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const corruptState = join(home, 'corrupt-state');
@@ -1943,7 +2012,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'test:corrupt', stateDir: corruptState, kind: 'test', configDir: corruptState, pid: 0, startedAt: '',
     }] }));
     try {
-      const result = runLogs(['--instance', 'prod', '--grep', 'absent'], home);
+      const result = await runLogs(['--instance', 'prod', '--grep', 'absent'], home);
       expect(result.status).toBe(0);
       expect(result.stdout).toBe('');
       expect(result.stderr).toContain('(일치하는 로그 없음)');
@@ -1952,7 +2021,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('연합 조회에서 한 인스턴스 읽기가 실패하면 사람·JSON 산출에 이름을 싣고 커서와 같은 종료값 2를 낸다', () => {
+  it('연합 조회에서 한 인스턴스 읽기가 실패하면 사람·JSON 산출에 이름을 싣고 커서와 같은 종료값 2를 낸다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-unreadable-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const unreadableState = join(home, 'unreadable-state');
@@ -1969,14 +2038,14 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'test:unreadable', stateDir: unreadableState, kind: 'test', configDir: unreadableState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--all', '--include-test', '--category', 'unreadable'], home);
+      const text = await runLogs(['--all', '--include-test', '--category', 'unreadable'], home);
       expect(text.status).toBe(2);
       expect(text.stdout).toContain('⚠️ 못 읽은 인스턴스 1개: test:unreadable');
       expect(text.stdout).toContain('prod');
       expect(text.stdout).not.toContain('log-query-unreadable-instances');
       expect(text.stdout).not.toContain('"_meta"');
 
-      const json = runLogs(['--all', '--include-test', '--json', '--category', 'unreadable'], home);
+      const json = await runLogs(['--all', '--include-test', '--json', '--category', 'unreadable'], home);
       expect(json.status).toBe(2);
       const rows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(rows[0]).toEqual(expect.objectContaining({ _meta: expect.objectContaining({ type: 'log-query-opened-stores' }) }));
@@ -1990,7 +2059,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('연합 조회의 모든 인스턴스를 읽으면 실패 머리·JSON 필드 없이 종료값 0을 유지한다', () => {
+  it('연합 조회의 모든 인스턴스를 읽으면 실패 머리·JSON 필드 없이 종료값 0을 유지한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-readable-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const instanceState = join(home, 'readable-state');
@@ -2006,13 +2075,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'test:readable', stateDir: instanceState, kind: 'test', configDir: instanceState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--all', '--include-test', '--category', 'readable'], home);
+      const text = await runLogs(['--all', '--include-test', '--category', 'readable'], home);
       expect(text.status).toBe(0);
       expect(text.stdout).not.toContain('못 읽은 인스턴스');
       expect(text.stdout).toContain('prod');
       expect(text.stdout).toContain('test:readable');
 
-      const json = runLogs(['--all', '--include-test', '--json', '--category', 'readable'], home);
+      const json = await runLogs(['--all', '--include-test', '--json', '--category', 'readable'], home);
       expect(json.status).toBe(0);
       const rows = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
       expect(rows).toHaveLength(4);
@@ -2026,7 +2095,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
-  it('연합 JSON 커서는 중간에 소진된 인스턴스를 보존하며 3쪽 이상에서 누락·중복·순서 역행 없이 이어진다', () => {
+  it('연합 JSON 커서는 중간에 소진된 인스턴스를 보존하며 3쪽 이상에서 누락·중복·순서 역행 없이 이어진다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-federated-cursor-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');
     const instanceState = join(home, 'fixture-state');
@@ -2055,7 +2124,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       const pages: JsonLogRow[][] = [];
       let cursors: Record<string, number> | undefined;
       for (let page = 0; page < 4; page += 1) {
-        const result = runLogs([
+        const result = await runLogs([
           '--all', '--include-test', '--json', '--category', 'federated-page', '--limit', '3',
           ...(cursors ? ['--before', JSON.stringify(cursors)] : []),
         ], home);
@@ -2088,7 +2157,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('상한 도달은 비-JSON stdout과 JSON 마지막 메타 행에 고지하며 JSON stdout은 순수 NDJSON이다', () => {
+  it('상한 도달은 비-JSON stdout과 JSON 마지막 메타 행에 고지하며 JSON stdout은 순수 NDJSON이다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-limit-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2100,7 +2169,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       // ⛔⭐ 2026-07-29 — 옛 기대는 *"--limit 3000 이 1000 으로 잘린다"* 였다. 그 상한이 사고의
       //   원인이라 걷어냈다(HTTP 경계로 이동). ⇒ 이제 3000 요청은 **1201건 전부**를 주고
       //   상한에 **안 걸리지 않는다**. 상한 안내는 요청량이 실제 보유량보다 작을 때만 나온다.
-      const text = runLogs(['--instance', 'prod', '--category', 'limit', '--limit', '3000'], home);
+      const text = await runLogs(['--instance', 'prod', '--category', 'limit', '--limit', '3000'], home);
       expect(text.status).toBe(0);
       expect(text.stdout).not.toContain('상한 1000 도달');
       expect(text.stdout.split('\n').filter((l) => l.includes('[nexus] limit ')).length).toBe(1201);
@@ -2108,7 +2177,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       // ⭐ 상한에 실제로 닿는 조회(요청 < 보유)에서만 안내가 나오고, **다음 쪽 커서**를 준다.
       // 300·1200처럼 사람이 전수로 오독하기 쉬운 상한도 JSON stdout 메타가 반드시 드러낸다.
       for (const requestedLimit of [300, 1200]) {
-        const cappedJson = runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', String(requestedLimit)], home);
+        const cappedJson = await runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', String(requestedLimit)], home);
         expect(cappedJson.status).toBe(0);
         expect(cappedJson.stderr).not.toContain(`상한 ${requestedLimit} 도달`);
         const cappedRows = cappedJson.stdout.trim().split('\n').map((line) => JSON.parse(line));
@@ -2125,13 +2194,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       }
 
       // 메타의 단일 스토어 nextCursor는 기계가 stderr 없이 그대로 다음 쪽 요청에 쓸 수 있다.
-      const firstPage = runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '300'], home);
+      const firstPage = await runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '300'], home);
       expect(firstPage.status).toBe(0);
       const firstPageRows = firstPage.stdout.trim().split('\n').map((line) => JSON.parse(line));
       const firstPageMeta = firstPageRows.at(-1)!._meta as { limitReached: boolean; nextCursor: number };
       expect(firstPageMeta.limitReached).toBe(true);
       expect(firstPageMeta.nextCursor).toEqual(expect.any(Number));
-      const secondPage = runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '300', '--before', String(firstPageMeta.nextCursor)], home);
+      const secondPage = await runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '300', '--before', String(firstPageMeta.nextCursor)], home);
       expect(secondPage.status).toBe(0);
       const secondPageRows = secondPage.stdout.trim().split('\n').map((line) => JSON.parse(line));
       const firstPagePayloadRows = firstPageRows.filter((row) => row._meta == null);
@@ -2140,7 +2209,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(secondPagePayloadRows).toHaveLength(300);
       expect(secondPagePayloadRows.every((row) => !firstPageIds.has(row.id))).toBe(true);
 
-      const completeJson = runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '3000'], home);
+      const completeJson = await runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '3000'], home);
       expect(completeJson.status).toBe(0);
       const completeRows = completeJson.stdout.trim().split('\n').map((line) => JSON.parse(line));
       expect(completeRows).toHaveLength(1203);
@@ -2148,12 +2217,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(completeRows[1]).toEqual({ _meta: { type: 'log-query-multi-surface-duplicates', duplicateGroupCount: 0, surfaceKindCount: 0, surfaces: [], groups: [] } });
       expect(completeRows.slice(2).every((row) => row._meta === undefined)).toBe(true);
 
-      const capped = runLogs(['--instance', 'prod', '--category', 'limit', '--limit', '10'], home);
+      const capped = await runLogs(['--instance', 'prod', '--category', 'limit', '--limit', '10'], home);
       expect(capped.status).toBe(0);
       expect(capped.stdout).toContain('상한 10 도달');
       expect(capped.stdout).toContain('--before ');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '10'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--category', 'limit', '--limit', '10'], home);
       expect(json.status).toBe(0);
       expect(json.stderr).not.toContain('상한 10 도달');
       expect(json.stderr).not.toContain('잘렸다');
@@ -2174,7 +2243,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 30_000);
 
-  it('--json nextCursor는 역순 id·동일 시각에서도 실제 --before 페이지 경계와 일치한다', () => {
+  it('--json nextCursor는 역순 id·동일 시각에서도 실제 --before 페이지 경계와 일치한다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-json-cursor-boundary-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2198,7 +2267,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       const records: JsonLogLine[] = [];
       let cursor: number | undefined;
       for (let page = 0; page < 4; page += 1) {
-        const result = runLogs([
+        const result = await runLogs([
           '--instance', 'prod', '--json', '--category', 'cursor-boundary', '--limit', '3',
           ...(cursor === undefined ? [] : ['--before', String(cursor)]),
         ], home);
@@ -2222,7 +2291,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events lists multiple events in a category by descending count (human and JSON)', () => {
+  it('--list-events lists multiple events in a category by descending count (human and JSON)', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-multi-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2237,13 +2306,13 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const text = runLogs(['--instance', 'prod', '--list-events', '--exact-category', 'harness.boundary'], home);
+      const text = await runLogs(['--instance', 'prod', '--list-events', '--exact-category', 'harness.boundary'], home);
       expect(text.status).toBe(0);
       expect(text.stderr).toContain('이벤트 3개 · 스토어 1개');
       expect(text.stdout).toBe('       3  request-received\n       2  approval-shadow\n       1  main-tree-reject\n');
       expect(text.stdout).not.toContain('unrelated');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary'], home);
       expect(json.status).toBe(0);
       const listing = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
         .find((row) => Array.isArray(row.events));
@@ -2260,7 +2329,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events respects category filters including zero results', () => {
+  it('--list-events respects category filters including zero results', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-zero-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2269,12 +2338,12 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const empty = runLogs(['--instance', 'prod', '--list-events', '--exact-category', 'no-such-category'], home);
+      const empty = await runLogs(['--instance', 'prod', '--list-events', '--exact-category', 'no-such-category'], home);
       expect(empty.status).toBe(0);
       expect(empty.stderr).toContain('이벤트 0개 · 스토어 1개');
       expect(empty.stdout).toBe('');
 
-      const json = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'no-such-category'], home);
+      const json = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'no-such-category'], home);
       expect(json.status).toBe(0);
       const listing = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
         .find((row) => Array.isArray(row.events));
@@ -2284,7 +2353,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events merges counts across stores and keeps descending order', () => {
+  it('--list-events merges counts across stores and keeps descending order', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-merge-'));
     const prodState = join(home, '.elanous');
     const otherState = join(home, 'other-state');
@@ -2305,7 +2374,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'other', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--all', '--list-events', '--exact-category', 'harness.boundary'], home);
+      const text = await runLogs(['--all', '--list-events', '--exact-category', 'harness.boundary'], home);
       expect(text.status).toBe(0);
       expect(text.stderr).toContain('이벤트 3개 · 스토어 2개');
       expect(text.stdout).toBe('       3  request-received\n       1  approval-shadow\n       1  main-tree-reject\n');
@@ -2314,7 +2383,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events surfaces truncation and excludes _meta truncation-warning rows', () => {
+  it('--list-events surfaces truncation and excludes _meta truncation-warning rows', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-trunc-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2327,7 +2396,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     ]);
     writer.close();
     try {
-      const uncapped = runLogs(['--instance', 'prod', '--list-events', '--category', 'harness.boundary'], home);
+      const uncapped = await runLogs(['--instance', 'prod', '--list-events', '--category', 'harness.boundary'], home);
       expect(uncapped.status).toBe(0);
       expect(uncapped.stdout).toContain('request-received');
       expect(uncapped.stdout).toContain('approval-shadow');
@@ -2335,7 +2404,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(uncapped.stdout).not.toMatch(/_meta/);
       expect(uncapped.stderr).not.toContain('result may be truncated');
 
-      const capped = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
+      const capped = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
       expect(capped.status).toBe(0);
       expect(capped.stderr).toContain('elanous logs: result may be truncated (limitReached=true)');
       const listing = capped.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -2347,7 +2416,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events sets truncated only when a probe row exists beyond fetchLimit', () => {
+  it('--list-events sets truncated only when a probe row exists beyond fetchLimit', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-probe-'));
     const dbPath = join(home, '.elanous', 'logs', 'logs.db');
     const writer = new LogStore(dbPath);
@@ -2362,7 +2431,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     const counted = (listing: { events: Array<{ count: number }> }) =>
       listing.events.reduce((sum, row) => sum + row.count, 0);
     try {
-      const under = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '4'], home);
+      const under = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '4'], home);
       expect(under.status).toBe(0);
       expect(under.stderr).not.toContain('result may be truncated');
       const underListing = parseListing(under.stdout);
@@ -2370,7 +2439,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(counted(underListing)).toBe(3);
       expect(underListing.events).toHaveLength(3);
 
-      const exact = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '3'], home);
+      const exact = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '3'], home);
       expect(exact.status).toBe(0);
       expect(exact.stderr).not.toContain('result may be truncated');
       const exactListing = parseListing(exact.stdout);
@@ -2378,7 +2447,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       expect(counted(exactListing)).toBe(3);
       expect(exactListing.events).toHaveLength(3);
 
-      const over = runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
+      const over = await runLogs(['--instance', 'prod', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
       expect(over.status).toBe(0);
       expect(over.stderr).toContain('elanous logs: result may be truncated (limitReached=true)');
       const overListing = parseListing(over.stdout);
@@ -2390,7 +2459,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events continues with a warning when one store fails to read', () => {
+  it('--list-events continues with a warning when one store fails to read', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-failsoft-'));
     const prodState = join(home, '.elanous');
     const otherState = join(home, 'other-state');
@@ -2406,7 +2475,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'other', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '',
     }] }));
     try {
-      const text = runLogs(['--all', '--list-events', '--exact-category', 'harness.boundary'], home);
+      const text = await runLogs(['--all', '--list-events', '--exact-category', 'harness.boundary'], home);
       expect(text.status).not.toBe(1);
       expect(text.stderr).toContain('조회 실패');
       expect(text.stdout).toContain('request-received');
@@ -2415,7 +2484,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   }, 15_000);
 
-  it('--list-events is registered as one adjacent logs option and existing flags stay', () => {
+  it('--list-events is registered as one adjacent logs option and existing flags stay', async () => {
     const logs = program.commands.find((c) => c.name() === 'logs');
     expect(logs).toBeDefined();
     const longs = logs!.options.map((o) => o.long);
@@ -2431,7 +2500,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     expect(help).toContain('--list-categories');
   });
 
-  it('--list-events applies --limit globally after merging stores, not per store', () => {
+  it('--list-events applies --limit globally after merging stores, not per store', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-list-events-global-limit-'));
     const prodState = join(home, '.elanous');
     const otherState = join(home, 'other-state');
@@ -2451,7 +2520,7 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
       name: 'other', stateDir: otherState, kind: 'prod', configDir: otherState, pid: 0, startedAt: '',
     }] }));
     try {
-      const json = runLogs(['--all', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
+      const json = await runLogs(['--all', '--json', '--list-events', '--exact-category', 'harness.boundary', '--limit', '2'], home);
       expect(json.status).toBe(0);
       const listing = json.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
         .find((row) => Array.isArray(row.events));

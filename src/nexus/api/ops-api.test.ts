@@ -10,6 +10,8 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
+import { readReleaseRuns } from './ops-api.js';
+import { gateShardsPath, writeGateShards } from '../../release-loop/gate-shards.js';
 
 const SECRET = 'op-proxy-secret-0123456789abcdef';
 const API_KEY = 'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
@@ -247,4 +249,29 @@ test('GRAPH-NODE-TIMES: run list carries ledger node times and the running node 
     { nodeId: 'gate', ok: null, summary: '', startedAt: '2026-10-07T00:02:01.000Z' },
   ]);
   expect(runs.find((run) => run.runId === 'legacy')?.nodes).toEqual([{ nodeId: 'version-release', ok: false, summary: '' }]);
+});
+
+test('GATE-LIVE-OBS: a run sitting on gate carries the shard table of its own version; other runs and other versions do not', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ops-gate-shards-'));
+  try {
+    const folder = join(root, 'runs');
+    mkdirSync(folder, { recursive: true });
+    const gate = (version: string) => JSON.stringify({ status: 'running', path: ['version-release', 'gate'], startedAt: '2026-10-07T00:00:00.000Z',
+      input: { version }, nodes: [{ nodeId: 'version-release', ok: true, output: '' }], currentNode: { nodeId: 'gate', startedAt: '2026-10-07T00:02:00.000Z' } });
+    writeFileSync(join(folder, 'on-gate.json'), gate('0.2.20'));
+    writeFileSync(join(folder, 'no-file.json'), gate('0.2.21'));
+    writeFileSync(join(folder, 'publishing.json'), JSON.stringify({ status: 'running', path: ['gate', 'publish'], startedAt: '2026-10-06T00:00:00.000Z',
+      input: { version: '0.2.20' }, nodes: [{ nodeId: 'gate', ok: true, output: '' }], currentNode: { nodeId: 'publish', startedAt: '2026-10-06T01:00:00.000Z' } }));
+    writeGateShards(gateShardsPath('0.2.20', root), { v: 1, version: '0.2.20', updatedAt: '2026-10-07T00:30:00.000Z', shards: [
+      { id: 'pod-0', state: 'running', startedAt: '2026-10-07T00:20:00.000Z', plannedMin: 20 },
+      { id: 'pod-1', state: 'pending', waitReason: 'CPU 부족 31.2/32', plannedMin: 10 },
+    ] });
+    const runs = readReleaseRuns(null, folder, { ledgerRoot: root, now: Date.parse('2026-10-07T00:30:00.000Z') });
+    if (runs === 'unavailable') throw new Error('unavailable');
+    const onGate = runs.find((run) => run.runId === 'on-gate');
+    expect(onGate?.gateShards?.shards.map((shard) => shard.state)).toEqual(['running', 'pending']);
+    expect(onGate?.gateShards?.summary).toMatchObject({ total: 2, etaMin: 20, waitReasons: [{ reason: 'CPU 부족 31.2/32', count: 1 }] });
+    expect(runs.find((run) => run.runId === 'no-file')?.gateShards).toBeUndefined();
+    expect(runs.find((run) => run.runId === 'publishing')?.gateShards).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

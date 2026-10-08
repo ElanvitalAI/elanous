@@ -26,6 +26,7 @@ import { answerCrossCheck, answerSeat, askCrossCheck, askSeat, crossCheckAnswer,
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { readSchedules, releasedVersion } from '../release-loop/feature-store.js';
+import { runOpDecide, type OpDecideCandidate } from './op-decide.js';
 
 // `kind`/`createdAt` are the V3 shadow-compare keys (내부 문서 `METHOD-v3-shadow-compare-2026-10-02` · MK 10-02 18:54).
 export type SeatItem = { source: 'request' | 'checklist' | 'hook' | 'seat-question'; kind?: 'request' | 'cell' | 'hook-task' | 'seat-question'; id: string; title: string; text: string; evidence?: string; status?: string; version?: string; seat?: string; evidenceHash?: string; asOf?: string; queuedAt?: string; createdAt?: string; from?: SeatId };
@@ -43,7 +44,7 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'resolved' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
+export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'resolved' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate | OpDecideCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off'; modeDowngradeReason?: string };
 
 export function seatLoopTickLine(result: SeatLoopResult): string {
@@ -99,6 +100,8 @@ export type SeatDeps = {
   /** Judge a decision draft against the receiving seat's evidence; null leaves the request pending. */
   crossCheck?: (seat: SeatId, draft: string, from: SeatId) => Promise<CrossCheckJudgment | null> | CrossCheckJudgment | null;
   decisionsConfig?: UserConfig['decisions'];
+  /** OP-LOOP-DECIDE: who owns a run (for run-blocking cards). Default = today's seat ledgers' launched rows. */
+  runOwner?: (runId: string) => SeatId | undefined;
 };
 
 const repoRoot = resolve(import.meta.dir, '../..');
@@ -291,6 +294,8 @@ function personReopened(ledger: readonly SeatEntry[], seat: string, item: SeatIt
   const ref = decisionRef(seat, item);
   return new DecisionLedger({ stateDir: root }).list({ status: 'all' }).some((card) => {
     if (!card.refs?.includes(ref) || card.status !== 'decided' || !card.decidedAt) return false;
+    // «멈춘다» on a repeat-stop card keeps the cell held — only a reopen (or any other card's decision) frees it (OP-LOOP-DECIDE).
+    if (/ 반복 착지 0$/.test(card.title) && card.options.find((option) => option.key === card.choice)?.label === '멈춘다') return false;
     const decidedAt = Date.parse(card.decidedAt);
     return Number.isFinite(decidedAt) && decidedAt > heldAt;
   });
@@ -549,6 +554,40 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     if (request.source === 'seat-question' && ownedEvidence) request.evidence = ownedEvidence;
   }
   return { requests: pending, checklist, role: read(join(deps.repo ?? repoRoot, 'docs', 'roles', `${seat}.md`)).slice(0, 4_000) };
+}
+
+/** OP-LOOP-DECIDE: filter open decision cards each OP turn. Shadow records; live decides/routes. A failure never blocks the turn. */
+function opDecidePass(config: SeatLoopConfig, deps: SeatDeps, now: Date, path: string, stateRoot: string, ledger: readonly SeatEntry[]): void {
+  const mode = config.opDecide?.mode === 'live' ? 'live' : 'shadow';
+  let owners: Map<string, SeatId> | undefined;
+  try {
+    const append = deps.append ?? defaultAppend;
+    const recorded = new Map<string, OpDecideCandidate[]>();
+    for (const row of ledger) {
+      if (row.candidate?.kind === 'decision-filter') recorded.set(row.candidate.id, [...(recorded.get(row.candidate.id) ?? []), row.candidate]);
+    }
+    runOpDecide({
+      mode,
+      ledger: cardLedger(stateRoot, deps, now),
+      runOwner: deps.runOwner ?? ((runId) => {
+        owners ??= new Map((['OP', 'UX', 'MK', 'TC'] as const).flatMap((owner) =>
+          readSeatLedger(owner, deps, now).filter((row) => row.runId).map((row) => [row.runId!, owner] as const)));
+        return owners.get(runId);
+      }),
+      routeToSeat: (to, card, reason) => {
+        askSeat(stateRoot, 'OP', to, `결정 카드 ${card.id} «${card.title}» — ${reason}. 런 주인이 판단해 elanous decisions decide ${card.id} 로 닫아 주세요.`,
+          `op-decide:${card.id}:${to}`);
+        return true;
+      },
+      recorded: (id) => recorded.get(id) ?? [],
+      record: (candidate) => {
+        append(path, { seat: 'OP', ts: now.toISOString(), at: now.toISOString(),
+          status: mode === 'shadow' ? 'shadow' : candidate.verdict === 'auto' ? 'resolved' : 'hitl',
+          ...(candidate.verdict === 'route' && candidate.to === 'CEO' ? { escalated: true } : {}),
+          candidate, reason: candidate.reason });
+      },
+    });
+  } catch (error) { observe('op-decide', { event: 'pass-failed', mode, error: String(error).slice(0, 200) }); }
 }
 
 const OP_CUTOFF_WINDOW_MS = 2 * 60 * 60_000;
@@ -870,9 +909,24 @@ const SEAT_ACTION_RULES: ReadonlyArray<{ kind: 'wait' | 'harness' | 'decision'; 
   { kind: 'wait', signal: /실측\s*대기|(?:사람|실제)\s*기기(?!\s*(?:(?:실측|측정|확인)\s*)?완료)(?:\s*(?:실측|측정|확인|대기))?|실물\s*측정(?!\s*완료)/iu, source: 'content', resolvedBy: /(?:실측|측정|(?:사람|실제)\s*기기|실물\s*측정)\s*완료/iu },
   { kind: 'wait', signal: /\u{1F451}\s*확인\s*대기/iu, source: 'content', resolvedBy: /\u{1F451}\s*확인\s*완료/iu },
   { kind: 'decision', signal: TRACK_AGENT_FORBIDDEN_ACTION_REGEX, source: 'task' },
+  { kind: 'decision', signal: /토큰\s*(?:을|를)?\s*(?:출력|노출|공개|첨부|붙여)/iu, source: 'task' },
   { kind: 'decision', signal: /(?:마켓|레지스트리)(?:에|로)?\s*(?:게시|등록|발행)|사이트\s*운영\s*반영|SNS(?:에|로)?\s*(?:게시|발행|업로드)|공개\s*발행/iu, source: 'task' },
   { kind: 'harness', signal: /(?:마켓|레지스트리|사이트|SNS|공개)?(?:에|로)?\s*(?:게시|발행|배포|등록|운영\s*반영)(?:를?\s*위한)?\s*(?:준비|초안|원고|자료|구현|점검|테스트)|(?:마켓|레지스트리|사이트|SNS|공개)?(?:에|로)?\s*(?:게시|발행|배포|등록)(?:용|를?\s*위한)\s*(?:초안|원고|자료|코드|기능)/iu, source: 'task' },
 ];
+
+// SEAT-FORBID-NEGATION: «비밀 0» · «비밀 제외» · «no secret» name the word to exclude it, not to act on it.
+// Only a negation right next to the hit (optionally after a short noun such as 키 · 증명 and a particle) clears it;
+// «비밀 키를 붙여라» keeps its imperative and stays a decision.
+const FORBID_NEGATION = '(?:0(?![\\dx.,])|제외|없이|빼고|금지|없음|none\\b|no\\b|without\\b|excluding\\b)';
+const FORBID_NEGATION_AFTER = new RegExp(`^(?:\\s*(?:증명|정보|키|값|토큰|keys?|tokens?)(?![A-Za-z]))?\\s*(?:은|는|이|가|을|를|:)?\\s*${FORBID_NEGATION}`, 'iu');
+const FORBID_NEGATION_BEFORE = /(?:^|[\s(\[«"'·,:])(?:no|without|excluding|none|제외|금지)\s*[:·-]?\s*$/iu;
+
+export const FORBID_JUDGMENT_LINE = (word: string | undefined): string =>
+  `판정 근거: «${word ?? '?'}» 바로 앞뒤에 부정 문면(0·제외·없이·빼고·금지·없음·no·without·excluding)이 없어 실행 요청으로 봤다`;
+
+export function forbiddenHitNegated(text: string, index: number, length: number): boolean {
+  return FORBID_NEGATION_AFTER.test(text.slice(index + length)) || FORBID_NEGATION_BEFORE.test(text.slice(0, index));
+}
 
 export function planAction(item: SeatItem, seat?: string): { kind: 'decision' | 'harness' | 'wait'; text: string; reason?: string } {
   const task = `${item.id}\n${item.title}\n${item.text}`;
@@ -884,7 +938,9 @@ export function planAction(item: SeatItem, seat?: string): { kind: 'decision' | 
     if (resolvedBy?.test(item.evidence ?? '')) return null;
     const hits = [...text.matchAll(new RegExp(signal.source, `${signal.flags.replace('g', '')}g`))];
     const hit = kind === 'decision' ? hits.find((match) => !prepared.some((prep) =>
-      match.index! >= prep.index! && match.index! + match[0].length <= prep.index! + prep[0].length)) : hits[0];
+      match.index! >= prep.index! && match.index! + match[0].length <= prep.index! + prep[0].length)
+      && !(forbiddenHitNegated(text, match.index!, match[0].length)
+        && (observe('forbid-negated', { item: item.id, word: match[0] }), true))) : hits[0];
     return hit ? { kind, reason: hit[0] } : null;
   }).find((hit) => hit !== null);
   const kind = rule?.kind ?? 'harness';
@@ -1004,6 +1060,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   } catch (error) { observe('heartbeat-write-failed', { seat, error: String(error).slice(0, 200) }); }
   const recorded = readSeatLedger(seat, deps, now);
   const ledger = config.mode === 'live-safe' ? reconciledQueueLedger(recorded, stateRoot, deps) : recorded;
+  if (seat === 'OP') opDecidePass(config, deps, now, path, stateRoot, ledger);
   let turnError: unknown;
   try {
   if (config.mode === 'on' && config.questions === 'on') {
@@ -1494,7 +1551,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
             : undefined;
       } catch (error) { observe('decision-source-unreadable', { seat, item: item.id, error: String(error).slice(0, 200) }); }
       const material = decisionCardMaterial({ what: `${seat} 배정 항목: ${item.title} 역할: ${inputs.role || '역할 근거 없음'}`, soFar: `요청 내용: ${item.text}`,
-        current: `밑바탕 재측: ${currentStatus ?? '상태 미확인'}; 요청에서 금지 문면 «${action.reason}» 발견 — 실행 전 사람 승인 필요`,
+        current: `밑바탕 재측: ${currentStatus ?? '상태 미확인'}; 요청에서 금지 문면 «${action.reason}» 발견 — 실행 전 사람 승인 필요; ${FORBID_JUDGMENT_LINE(action.reason)}`,
         question: `금지 문면 «${action.reason}»이 걸린 요청을 승인할까?`, answer: '승인 전에는 집행하지 않고 보류한다',
         options, recommendation, confidence: '높음 — 요청에 금지 문면 직접 일치',
         ifUntouched: '자동 집행되지 않고 해당 칸은 보류 상태로 남는다',

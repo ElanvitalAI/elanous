@@ -5,7 +5,7 @@
 //   72차 판이 복제를 금지했으므로 여기로 옮긴다. CLI 와 TUI 가 «같은 조회»를 쓴다.
 // ⛔ 판정은 여기 없다 — 여기는 「무엇을 조회하는가」뿐이고, 「그래서 막나」는 launch-preflight 가 정한다.
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import {
   parseAskTargetPathHints,
   parseAskTargetPathHintsResult,
@@ -293,6 +293,54 @@ export async function readAskPreflightLogRows(): Promise<AskLogRow[] | null> {
         for (const row of store.query({ exactCategories: ['dev-pipeline'], events: ['ask-preflight', 'ask-pre-preflight'], limit: 300 })) {
           const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
           rows.push({ ts: row.ts, data: (parsed ?? null) as Record<string, unknown> | null });
+        }
+      } finally { store.close?.(); }
+    }
+    return rows;
+  } catch { return null; }
+}
+
+/** Every `ask-preflight` row since `since`, all universes, paged past the 1000-row cap (OVERLAP-METRIC).
+ *  ⛔ Unreadable ⇒ `null` — never an empty list that reads as «no overlap launches». */
+export async function readAskPreflightRowsSince(since: Date): Promise<AskLogRow[] | null> {
+  return readLogRowsSince(since, 'dev-pipeline', 'ask-preflight');
+}
+
+/** Every DRAFT-NOT-ARCHIVE `salvaged` row since `since`, all universes (OVERLAP-METRIC salvage siblings).
+ *  ⛔ Unreadable ⇒ `null` — a salvage branch we could not see is «unmeasured», not «none». */
+export async function readSalvagedRowsSince(since: Date): Promise<AskLogRow[] | null> {
+  return readLogRowsSince(since, 'self-implement.draft-not-archive', 'salvaged');
+}
+
+async function readLogRowsSince(since: Date, category: string, event: string): Promise<AskLogRow[] | null> {
+  try {
+    const [{ resolveLogTargets }, { LogStore }] = await Promise.all([
+      import('../cli/logs-cli.js'),
+      import('../mss/logging/log-store.js'),
+    ]);
+    const { targets } = resolveLogTargets({ all: true, includeTest: true });
+    const rows: AskLogRow[] = [];
+    // ⛔ One store can be registered under two names (`~/.monad` → `~/.elanous` symlink) — read each real file once,
+    //   or every prod row is counted twice (OVERLAP-METRIC 실측: 169 행 중 69 가 같은 prod 파일의 겹침).
+    const seen = new Set<string>();
+    for (const target of targets) {
+      let real = target.dbPath;
+      try { real = realpathSync(target.dbPath); } catch { /* missing store: LogStore below decides */ }
+      if (seen.has(real)) continue;
+      seen.add(real);
+      const store = new LogStore(target.dbPath, { readonly: true });
+      try {
+        let beforeId: number | undefined;
+        for (let page = 0; page < 100; page++) {
+          const batch = store.query({ exactCategories: [category], events: [event], sinceMs: since.getTime(),
+            limit: 1_000, ...(beforeId === undefined ? {} : { beforeId }) });
+          for (const row of batch) {
+            const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+            rows.push({ ts: row.ts, data: (parsed ?? null) as Record<string, unknown> | null });
+          }
+          if (batch.length < 1_000) break;
+          if (page === 99) return null;
+          beforeId = batch.at(-1)!.id;
         }
       } finally { store.close?.(); }
     }

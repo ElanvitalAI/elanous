@@ -227,7 +227,16 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   if (live) {
     if (liveKind === 'review') {
       liveMove = await executeLiveReview(boundCard, prResult?.prNumber,
-        { runId: input.runId, stopReason: input.stopReason, ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}) }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
+        {
+          runId: input.runId, stopReason: input.stopReason,
+          ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}),
+          // TA-LIVE-REVIEW-POD — 작업 트리가 없는 런(Pod)은 «런이 낸 머리»로 리뷰 저장소를 확인한다.
+          ...(prResult && !prResult.worktreePath ? { produced: {
+            ...(prResult.checkedHeadCommit !== undefined ? { headCommit: prResult.checkedHeadCommit } : {}),
+            ...(prResult.branch ? { branch: prResult.branch } : {}),
+            ...(prResult.prUrl ? { prUrl: prResult.prUrl } : {}),
+          } } : {}),
+        }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
     } else {
       const evidence: Record<string, string> = {};
       if (boundCard && !delivery && judgeInput.prState === 'MERGED' && prResult) evidence[boundCard.id] = `#${prResult.prNumber}`;

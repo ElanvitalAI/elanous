@@ -87,10 +87,11 @@ describe('draft-cleanup graph', () => {
       expect(invoked[0]).toContain('bin/elanous.mjs harness drafts sweep --json');
       if (mode === 'live') expect(invoked[1]).toContain('harness drafts sweep --json --apply');
       const githubCalls = readFileSync(invocations, 'utf8').trim().split('\n');
+      // Each sweep lists open PRs once: the RUN-TTL step reuses the draft inventory's listing (DRAFT-SWEEP-SLOW).
       expect(githubCalls.filter((call) => call.includes('pulls?state=open'))).toHaveLength(mode === 'live' ? 2 : 1);
       expect(githubCalls.filter((call) => call.includes('pulls?state=closed'))).toHaveLength(mode === 'live' ? 2 : 1);
-      // Read-only GETs (PR detail, files, commits, reviews, comments, commit status) feed the classifier; only edits/closes are mutations.
-      const readOnly = (call: string) => /^api repos\/[^ ]+\/(?:pulls\/\d+(?:\/(?:files|commits|reviews))?|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(call) && !/\s-X\s|--method/.test(call);
+      // Read-only GETs (PR detail, files, commits, reviews, comments, commit status) and the batched GraphQL `query` feed the classifier; only edits/closes are mutations.
+      const readOnly = (call: string) => /^api graphql -f query=query \{ repository\(/.test(call) || /^api repos\/[^ ]+\/(?:pulls\/\d+(?:\/(?:files|commits|reviews))?|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(call) && !/\s-X\s|--method/.test(call);
       const mutations = githubCalls.filter((call) => !call.startsWith('repo view') && !call.includes('pulls?state=') && !readOnly(call));
       if (mode === 'shadow') expect(mutations).toEqual([]);
       else {

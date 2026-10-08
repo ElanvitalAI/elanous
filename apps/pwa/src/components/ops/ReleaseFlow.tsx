@@ -1,6 +1,7 @@
 'use client';
 
 import type { OpsResult, ReleaseNode, ReleaseRun } from '@/lib/ops-api';
+import { GateShardsPanel, shardTally } from './GateShards';
 
 /** 노드 하나의 자리 — 색과 «글자»를 같이 낸다(색만으로 가르지 않는다). */
 export type NodeState = 'done' | 'failed' | 'current' | 'pending';
@@ -69,7 +70,8 @@ export function ReleaseFlow({ run, openedNodeId, onNode, now = Date.now() }: {
         const node = run.nodes.find((entry) => entry.nodeId === id);
         const state = states[index]!;
         const look = NODE_STATE[state];
-        const shard = node ? shardProgress(node.summary) : null;
+        const gate = id === 'gate' && state === 'current' ? run.gateShards : undefined;
+        const shard = !gate && node ? shardProgress(node.summary) : null;
         const open = openedNodeId === id;
         return <li key={`${id}-${index}`} data-node-state={state} className="flex min-w-0 flex-col md:flex-row md:items-center">
           <button type="button" aria-expanded={open} aria-controls="release-node-detail" aria-current={state === 'current' ? 'step' : undefined}
@@ -85,6 +87,7 @@ export function ReleaseFlow({ run, openedNodeId, onNode, now = Date.now() }: {
                 <span className="font-semibold">{look.word}</span>
                 <span className="text-muted-foreground">{nodeTime(node, now)}</span>
               </span>
+              {gate && <span className="mt-1 block text-xs tabular-nums">{shardTally(gate)}</span>}
               {shard && <span className="mt-1 block text-xs" aria-label={`샤드 ${shard.done}/${shard.total}`}>
                 <span className="tabular-nums">{`샤드 ${shard.done}/${shard.total}`}</span>
                 <span aria-hidden className="mt-0.5 block h-1 overflow-hidden rounded-full bg-muted">
@@ -128,6 +131,7 @@ export function ReleaseNodeDetail({ run, nodeId, log, now = Date.now() }: {
           </div>
         : <p className="text-sm text-muted-foreground">요약 없음</p>}
     </div>
+    {nodeId === 'gate' && state === 'current' && run.gateShards && <GateShardsPanel gate={run.gateShards} />}
     <div className="min-w-0 space-y-1">
       <h4 className="text-xs font-medium text-muted-foreground">로그 꼬리</h4>
       {log?.kind === 'ready'

@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { loadRunLedger as loadRunLedgerSync } from '../self-implement/run-ledger.js';
 import { join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
@@ -8,7 +10,7 @@ import { checklistDevVersion } from '../release-loop/checklist.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
 import { cardPrNumber, COMPLETION_KINDS, handTask, nextMoveFor, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
-import { refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
+import { readCardSalvageBranch, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 
 type TaskRow = Pick<Task, 'id' | 'title' | 'priority' | 'status' | 'createdAt' | 'approval' | 'generatedBy'>;
@@ -82,14 +84,89 @@ export function taskLauncherArgv(configDir: string, args: readonly string[]): st
   return [ELANOUS_CLI_ENTRY, '--config-dir', configDir, ...args];
 }
 
-export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: { spawn?: DetachedSpawn } = {}): Promise<void | TaskLaunchReceipt> {
+/** STOP-RECORD launch-failed: 발사 직후 이 창 안에 자식이 비0 으로 끝나면 «발사 실패»로 본다. */
+export const LAUNCH_EARLY_EXIT_WINDOW_MS = 3_000;
+
+export interface DefaultTaskLauncherDeps {
+  spawn?: DetachedSpawn;
+  /** 조기 종료 감시 창(ms) — context(런 id)가 있을 때만 · 0 이면 감시하지 않는다(옛 동작). */
+  earlyExitWindowMs?: number;
+  /** 자식 stderr 를 받을 디렉토리(시험 주입). 기본 = `<tmpdir>/elanous-task-launch`. */
+  stderrDir?: string;
+  /** stop 줄 기록기(시험 주입). 기본 = 런 원장. */
+  writeStop?: import('../self-implement/run-ledger.js').RunLedgerWriter;
+  /** 이미 stop 이 있나(시험 주입). 기본 = 이 우주 런 원장 ⊕ 이 프로세스 기록. */
+  hasStop?: (runId: string) => boolean;
+}
+
+/** stderr 파일의 첫 비어 있지 않은 줄(최대 4KB 만 읽는다 — 원 로그 꼬리를 싣지 않는다). */
+function firstStderrLine(path: string): string {
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const buf = Buffer.alloc(4096);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      return buf.subarray(0, n).toString('utf8').split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? '';
+    } finally { closeSync(fd); }
+  } catch { return ''; }
+}
+
+export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: DefaultTaskLauncherDeps = {}): Promise<void | TaskLaunchReceipt> {
   const spawn = deps.spawn ?? ((await import('node:child_process')).spawn as unknown as DetachedSpawn);
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { prodInstanceRoot } = await import('../instance/resolve.js');
   const configDir = getElanousConfigDirOverride() ?? prodInstanceRoot();
-  // TA-CARD-RUN-LINK: 런 id 를 자식 환경에 얹는다 — `harness say` 의 런(호스트 orchestrate)이 그 id 를 상속한다.
-  await spawnDetachedConfirmed(spawn, process.execPath, taskLauncherArgv(configDir, args), SPAWN_CONFIRM_TIMEOUT_MS, cwd, context?.env);
-  return context ? { runId: context.runId } : undefined;
+  const argv = taskLauncherArgv(configDir, args);
+  const window = context ? deps.earlyExitWindowMs ?? LAUNCH_EARLY_EXIT_WINDOW_MS : 0;
+  if (!context || window <= 0) {
+    // TA-CARD-RUN-LINK: 런 id 를 자식 환경에 얹는다 — `harness say` 의 런(호스트 orchestrate)이 그 id 를 상속한다.
+    await spawnDetachedConfirmed(spawn, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, context?.env);
+    return context ? { runId: context.runId } : undefined;
+  }
+  // STOP-RECORD launch-failed: stdio 를 버리면 자식이 exit 2 로 죽어도 흔적이 0 이고 카드는 «launched» 로 남는다
+  // (ORCH-LIVE-1008). stderr 만 파일로 받고(파이프는 부모가 먼저 끝나면 자식을 EPIPE 로 죽인다), 짧은 창 안의 종료를 본다.
+  const stderrDir = deps.stderrDir ?? join(tmpdir(), 'elanous-task-launch');
+  mkdirSync(stderrDir, { recursive: true });
+  const stderrPath = join(stderrDir, `${context.runId}.stderr`);
+  // 'w' — 같은 runId 재발사가 지난 시도의 stderr 를 이번 cause 로 읽지 않게(리뷰 must-fix).
+  const fd = openSync(stderrPath, 'w');
+  let exited: Promise<{ code: number | null; signal: string | null }> | undefined;
+  const watched: DetachedSpawn = (command, spawnArgs, options) => {
+    const child = (spawn as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, spawnArgs, { ...options, stdio: ['ignore', 'ignore', fd] });
+    const emitter = child as unknown as { once?: (event: 'exit', listener: (code: number | null, signal: string | null) => void) => unknown };
+    exited = new Promise((done) => { emitter.once?.('exit', (code, signal) => done({ code, signal })); });
+    return child;
+  };
+  try {
+    await spawnDetachedConfirmed(watched, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, context.env);
+  } finally {
+    try { closeSync(fd); } catch { /* the child keeps its own copy */ }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const early = exited
+    ? await Promise.race([exited, new Promise<undefined>((done) => { timer = setTimeout(() => done(undefined), window); })])
+    : undefined;
+  if (timer) clearTimeout(timer);
+  if (early && early.code !== 0) {
+    const first = firstStderrLine(stderrPath);
+    const cause = `child rc=${early.code ?? early.signal ?? 'unknown'}${first ? `: ${first}` : ''}`;
+    const { boundRunStopCause, recordRunStop, runStopRecorded, RUN_STOP_EVENT } = await import('../self-implement/run-stop.js');
+    const hasStop = deps.hasStop ?? ((id: string) => {
+      if (runStopRecorded(id)) return true;
+      try { return (loadRunLedgerSync(id) ?? []).some((entry) => entry.event === RUN_STOP_EVENT); } catch { return false; }
+    });
+    // 자식이 같은 runId 로 이미 stop 을 썼으면 더하지 않는다(런마다 한 줄 · 리뷰 must-fix).
+    if (hasStop(context.runId)) throw new Error(`발사 직후 자식이 종료했다 — ${boundRunStopCause(cause)}`);
+    const entry = recordRunStop({
+      runId: context.runId, site: 'launch-failed', class: 'launch-failed',
+      cause,
+      evidenceRef: stderrPath,
+      nextMove: 'Fix the launch argv/config from the stderr evidence, then re-hand the card',
+    }, ...(deps.writeStop ? [deps.writeStop] : []));
+    // handTask 가 이 예외로 카드를 `launch-failed` 로 적는다(«launched» 로 남지 않게).
+    throw new Error(`발사 직후 자식이 종료했다 — ${String(entry.data.cause)}`);
+  }
+  return { runId: context.runId };
 }
 
 /** `spawn` 의 필요한 면만(시험 주입). */
@@ -523,8 +600,17 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           }
           return;
         }
-        if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card) }));
-        else for (const line of taskCardLines(card)) out(line);
+        // DRAFT-NOT-ARCHIVE: 멈춘 런이 draft PR 대신 남긴 수확 가지(원장 `salvaged`). 못 읽었으면 «못 읽음»(⛔ 없음 아님).
+        let salvage: Awaited<ReturnType<typeof readCardSalvageBranch>> = { salvageBranch: null };
+        try { salvage = await readCardSalvageBranch(card, deps.cardRunEvidence ?? {}); }
+        catch (error) { salvage = { salvageBranch: null, readErrors: [error instanceof Error ? error.message : String(error)] }; }
+        const salvageUnread = !salvage.salvageBranch && !!salvage.readErrors?.length;
+        if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}) }));
+        else {
+          for (const line of taskCardLines(card)) out(line);
+          if (salvage.salvageBranch) out(`수확 가지: ${salvage.salvageBranch} (draft PR 대신)`);
+          else if (salvageUnread) out('수확 가지: 못 읽음(원장 읽기 실패)');
+        }
         return;
       }
       try {

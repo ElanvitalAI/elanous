@@ -74,7 +74,7 @@ export const FEATURE_MATURITY = {
     loops: 'beta', buzz: 'beta', harness: 'stable', self: 'beta', factcheck: 'beta',
     provider: 'stable', 'provider:set': 'beta', 'provider:restore': 'beta',
     'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta',
-    schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', ad: 'beta', docs: 'beta',
+    schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', retro: 'beta', ad: 'beta', docs: 'beta',
     decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta',
     env: 'beta', 'agent-mission': 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
     config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable',
@@ -160,7 +160,7 @@ export const FEATURE_MATURITY = {
     ping: 'stable', provider: 'stable', sessions: 'stable', fork: 'stable', resume: 'stable',
     decisions: 'stable', work: 'stable', cancel: 'stable',
     skills: 'beta', skill: 'beta', digest: 'beta', intake: 'beta', ad: 'beta',
-    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', loops: 'beta', release: 'beta', away: 'beta', project: 'beta', wish: 'beta',
+    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', loops: 'beta', runs: 'beta', release: 'beta', away: 'beta', project: 'beta', wish: 'beta',
     brain: 'tool', cc: 'tool', cdx: 'tool', gem: 'tool', local: 'tool',
     harness: 'ops',
     // Existing commands outside the CXO four-grade menu list are owner-only.

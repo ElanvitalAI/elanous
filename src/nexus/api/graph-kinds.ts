@@ -58,12 +58,18 @@ export async function handleGraphsValidatePost(req: Request, opts: MetaApiOpts):
     return jsonResponse({ error: 'bad_request', reason: 'graph (harness|workflow) and yaml (string) required' }, 400);
   }
   const { graph, yaml } = body as { graph: GraphKind; yaml: string };
+  const { ok, errors, ignoredKeys } = validateGraphYaml(graph, yaml);
+  debug.log('graph.kinds', 'validate', { graph, ok, errors, ignored: ignoredKeys });
+  return jsonResponse({ ok, errors, ignoredKeys }, ok ? 200 : 422);
+}
+
+/** The one validator behind `POST /v1/graphs/validate` and the graph save path. */
+export function validateGraphYaml(graph: GraphKind, yaml: string): { ok: boolean; errors: readonly unknown[]; ignoredKeys: string[]; graphId?: string } {
   const result = graph === 'harness' ? parseGraphTemplateYaml(yaml) : parseWorkflowYaml(yaml);
-  const errors = graph === 'harness' ? (result as ReturnType<typeof parseGraphTemplateYaml>).errors : (result as ReturnType<typeof parseWorkflowYaml>).issues;
+  const errors: readonly unknown[] = graph === 'harness' ? (result as ReturnType<typeof parseGraphTemplateYaml>).errors : (result as ReturnType<typeof parseWorkflowYaml>).issues;
   let input: unknown;
   try { input = parseYaml(yaml); } catch { /* The parser already reports the YAML error. */ }
   const ignoredKeys = ignoredPaths(input, graph === 'harness' ? harnessShape : workflowShape);
-  const ok = errors.length === 0;
-  debug.log('graph.kinds', 'validate', { graph, ok, errors, ignored: ignoredKeys });
-  return jsonResponse({ ok, errors, ignoredKeys }, ok ? 200 : 422);
+  const graphId = graph === 'harness' ? (result as ReturnType<typeof parseGraphTemplateYaml>).template?.graphId : undefined;
+  return { ok: errors.length === 0, errors, ignoredKeys, ...(graphId === undefined ? {} : { graphId }) };
 }

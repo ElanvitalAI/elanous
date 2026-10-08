@@ -1026,11 +1026,12 @@ export async function runAskLaunchFlow(
         ...(candidates.error === undefined ? {} : { error: candidates.error }),
       }, candidates.error === undefined ? 'info' : 'warn');
     }
-    if (candidates.paths.length > 0) {
-      deps.print(`[ask] ⑴ 코드에서 후보 경로 ${candidates.paths.length}개를 찾아 넣고 다시 저작한다: ${candidates.paths.join(' · ')}`);
+    const selectedPaths = candidates.paths.slice(0, 1);
+    if (selectedPaths.length > 0) {
+      deps.print(`[ask] ⑴ 코드에서 후보 경로 ${selectedPaths.length}개를 찾아 넣고 다시 저작한다: ${selectedPaths.join(' · ')}`);
     }
-    authored = await authorAndPreflight(candidates.paths.length > 0
-      ? `대상 경로: ${candidates.paths.join(' · ')}\n${input.askText}`
+    authored = await authorAndPreflight(selectedPaths.length > 0
+      ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`
       : input.askText);
     deps.log('ask-auto-reauthor', {
       candidatePathCount: candidates.paths.length,

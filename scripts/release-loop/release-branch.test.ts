@@ -168,7 +168,7 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
     await expect(resumeReleaseRun({ runId: 'r', from: 'version-release' }, { root, git, isAncestor: () => true, graph: async () => { graphs++; return {} as never; } })).rejects.toThrow('would cut again');
     expect(readFileSync(runFile, 'utf8')).toBe(original);
     const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true,
-      graph: async (_path, options) => { graphs++; expect(options).toMatchObject({ resumeRunId: 'r', fromNodeId: 'gate' }); return { status: 'done', runId: 'r' } as never; } });
+      graph: async (_path, options) => { graphs++; expect(options).toMatchObject({ resumeRunId: 'r', fromNodeId: 'gate', pinChildUniverse: true }); return { status: 'done', runId: 'r' } as never; } });
     expect(resumed.tip).toMatchObject({ changed: true, to: 'b'.repeat(40) });
     expect(graphs).toBe(1);
     write('done');

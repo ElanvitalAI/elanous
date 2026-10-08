@@ -32,6 +32,7 @@ import {
 } from '../src/telegram-commands.js';
 import type { UserConfig } from '../src/user-config.js';
 import type { TgIncoming } from '../src/telegram.js';
+import { renderRunningRuns, type RunningRunsResult } from '../src/self-implement/running-runs.js';
 
 function fakeCtx(text: string, overrides: Partial<TgIncoming> = {}): TgIncoming {
   return {
@@ -512,5 +513,70 @@ describe('toTelegramBotCommands', () => {
     const [out] = toTelegramBotCommands([{ name: 'a', description: long, handler: async () => '' }]);
     expect(out!.description.length).toBeLessThanOrEqual(256);
     expect(out!.description.endsWith('…')).toBe(true);
+  });
+});
+
+describe('/runs — Telegram twin of TUI /harness runs', () => {
+  const observation = { runsNotYetInLedgerDuringAuthoringAreNotCounted: true, includesTest: false } as const;
+  const runs: RunningRunsResult = {
+    entries: [
+      { runId: 'run-live', status: 'running', presence: 'ledger-live-and-pty-observed', reason: 'ledger-live-and-pty-alive', lifecycle: 'live', lastActivityTimestamp: '2026-10-08T00:00:00.000Z', ptyUpdatedAt: null, ledgerDirectories: ['/ledger/a'], ptyRefs: [{ instance: 'prod', id: 'pty_1', kind: 'auto' }] },
+      { runId: 'run-ended', status: 'ended-unclosed', presence: 'ledger-and-pty-observed', reason: 'ledger-positive-termination-evidence', lifecycle: 'human-stopped', lastActivityTimestamp: null, ptyUpdatedAt: null, ledgerDirectories: [], ptyRefs: [] },
+    ],
+    counts: { running: 1, 'probable-running': 0, 'ended-unclosed': 1, unknown: 0 }, total: 2, countedStatuses: ['running', 'probable-running'],
+    observation,
+    quantities: {
+      counts: { value: { running: 1, 'probable-running': 0, 'ended-unclosed': 1, unknown: 0 }, population: 'all assessed runs', observation },
+      total: { value: 2, population: 'all assessed runs', observation },
+      entries: { value: 2, population: 'all assessed runs', observation },
+      running: { value: 1, population: 'assessed runs whose status is in countedStatuses', observation },
+    },
+    ledger: { ledgerDirectories: ['/ledger/a'], unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0, missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0 },
+    pty: { unreadable: [], observedRefCount: 1, withoutRunIdCount: 0, notCountedRefCount: 0 },
+  };
+
+  it('[tg-runs-equals-renderer] /runs replies with exactly renderRunningRuns over the injected query result', async () => {
+    let queries = 0;
+    const commands = defaultTelegramCommands(undefined, SLASH_COMMANDS, FEATURE_MATURITY, () => { queries += 1; return runs; });
+    const out = await dispatchTelegramSlash(fakeCtx('/runs'), { userConfig: baseConfig(), allCommands: commands });
+    expect(out).toEqual({ handled: true, reply: renderRunningRuns(runs) });
+    expect(queries).toBe(1);
+  });
+
+  it('[tg-runs-registered] /runs is graded, listed in /help and published in the bot menu like its siblings', async () => {
+    const commands = defaultTelegramCommands(undefined, SLASH_COMMANDS, FEATURE_MATURITY, () => runs);
+    expect(FEATURE_MATURITY.telegramCommand.runs).toBe('beta');
+    expect(toTelegramBotCommands(commands).map((c) => c.command)).toContain('runs');
+    const help = await dispatchTelegramSlash(fakeCtx('/help'), { userConfig: baseConfig(), allCommands: commands });
+    expect(help.handled && help.reply).toContain('/runs — ');
+  });
+
+  it('[tg-runs-off-thread] without an injected query /runs asks the CLI twin in a child process pinned to this universe, and falls back in-process only if it cannot start', async () => {
+    const { telegramRunsSlash } = await import('../src/telegram-commands.js');
+    const calls: string[][] = [];
+    const out = await telegramRunsSlash([], undefined, async (argv) => { calls.push([...argv]); return { code: 0, stdout: 'Running runs\n- run-1 running\n' }; });
+    expect(out).toBe('Running runs\n- run-1 running');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.slice(0, 1)).toEqual(['--config-dir']);
+    expect(calls[0]!.slice(2)).toEqual(['self', 'running-runs']);
+  });
+
+  it('[tg-runs-event-loop-free] while the slow query runs, the daemon event loop keeps answering (a timer fires within 50 ms)', async () => {
+    const { telegramRunsSlash } = await import('../src/telegram-commands.js');
+    let timerAt = 0;
+    const started = Date.now();
+    const timer = new Promise<void>((resolve) => setTimeout(() => { timerAt = Date.now() - started; resolve(); }, 10));
+    const reply = telegramRunsSlash([], undefined, () => new Promise((resolve) => setTimeout(() => resolve({ code: 0, stdout: 'Running runs\n' }), 400)));
+    await timer;
+    expect(timerAt).toBeLessThan(50);
+    expect(await reply).toBe('Running runs');
+  });
+
+  it('[tg-runs-rejects-args] /runs takes no arguments and does not query', async () => {
+    let queries = 0;
+    const commands = defaultTelegramCommands(undefined, SLASH_COMMANDS, FEATURE_MATURITY, () => { queries += 1; return runs; });
+    const out = await dispatchTelegramSlash(fakeCtx('/runs extra'), { userConfig: baseConfig(), allCommands: commands });
+    expect(out).toEqual({ handled: true, reply: 'Usage: /runs' });
+    expect(queries).toBe(0);
   });
 });

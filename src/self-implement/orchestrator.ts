@@ -64,12 +64,15 @@ import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-ru
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
+import { classifyMergeHoldStop, forgetRunStop, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
+import { autohealFromStop, parseAutohealMode, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
+import { classifyGateEnvDeficit, DEFAULT_GATE_ENV_RETRY, GATE_ENV_DEFICIT_HARVESTABLE_MARK, type GateEnvDeficitKind } from './gate-env-retry.js';
 import { recordFailureEvent } from './heal-intake.js';
 import { classifyReworkCapExhaustion, type ReworkCapHealDecision } from './heal-triage.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
@@ -210,7 +213,7 @@ import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
 import { commitWorktree, defaultBranchRef, preservationHasChanges } from './seams.js';
 import { detectUncommittedWork } from './uncommitted-work.js';
 import { spawnSync } from 'node:child_process';
-import { blockedDraftDisposition } from './blocked-draft-policy.js';
+import { blockedDraftDisposition, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, salvageBranchForRun, type DraftOnStopMode } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
@@ -762,7 +765,8 @@ function changedFileIsInsideDeclaredTarget(changedFile: string, declaredPath: st
   const file = normalizeDeclaredScopePath(changedFile);
   const target = normalizeDeclaredScopePath(declaredPath);
   if (!file || !target) return false;
-  return file === target || file.startsWith(`${target}/`);
+  return file === target || file.startsWith(`${target}/`)
+    || (target.endsWith('.ts') && !target.endsWith('.test.ts') && file === `${target.slice(0, -3)}.test.ts`);
 }
 
 function parseDeclaredTargetPathsFromAsk(askText: string): { readable: boolean; paths: readonly string[] } {
@@ -930,6 +934,12 @@ export type ImplementTerminalStatus = {
 export interface SelfImplementSeams {
   /** Run-observer ledger sink. Tests inject an in-memory sink to avoid touching user state. */
   writeRunLedger?: RunLedgerWriter;
+  /** STOP-AUTOHEAL — heal action seams (live mode only runs actions given here; missing = needs-owner). */
+  stopAutohealActions?: AutohealActions;
+  /** STOP-AUTOHEAL — one-attempt guard reader. Default: real run ledger, or none when `writeRunLedger` is injected. */
+  stopAutohealLoadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
+  /** STOP-AUTOHEAL — observes each dispatcher result (tests). */
+  onStopAutoheal?: (result: AutohealResult) => void;
   /** Optional context-journal sink for isolated runs. */
   emitContextEvent?: (input: SessionEventInput) => void;
   /** Registers this run as an ephemeral loop-agent asset; failures are observed but never affect execution. */
@@ -1028,6 +1038,11 @@ export interface SelfImplementSeams {
   reviewBaselineObservationSource?: (cwd: string, base: string) => Promise<string | undefined>;
   /** ④ gate — cwd 에서 bun test/build. postsync=정합 후 재게이트(merge-base 실행 범위). */
   gate: (cwd: string, ctx?: { runId?: string; mode?: 'postsync'; round?: number }) => Promise<SelfImplementGateResult>;
+  /**
+   * GATE-ENV-RETRY — 환경 결손 gate 실패에 «게이트만» 다시 도는 정책. 생략 시 기본(2회 · 20초).
+   * `attempts: 0` 이면 재시도하지 않는다. 시험은 `sleep` 으로 대기를 주입한다.
+   */
+  gateEnvRetry?: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> };
   /** Gate가 실행된 worktree HEAD가 local origin/main보다 뒤처진 커밋 수. 실패는 undefined(unknown)로 정직하게 남긴다. */
   gateWorktreeBehindMain?: (cwd: string) => Promise<number | undefined>;
   /** 변경 파일 목록 — 게이트 «라우터»가 「코드가 바뀌었나」를 판정하는 입력.
@@ -1068,6 +1083,8 @@ export interface SelfImplementSeams {
   headCommit?: (cwd: string) => string | undefined;
   /** `commit` pins the pushed state; without it the worktree HEAD is pushed. */
   preserveBlockedBranch?: (ctx: { cwd: string; branch: string; title: string; commit?: string }) => boolean | Promise<boolean>;
+  /** DRAFT-NOT-ARCHIVE — `tools.selfImplement.draftOnStop` 읽기 seam. 생략하면 user-config(실패·부재 = 'always' · 종전). */
+  draftOnStopMode?: () => DraftOnStopMode;
   /** Hard-cap salvage evidence: a clean worktree and commits ahead of origin/main. */
   readReworkSalvageEvidence?: (cwd: string) => Promise<ReworkSalvageEvidence>;
   /** Starts exactly one detached `elanous dev --file <goal> --base <branch>` follow-up. */
@@ -1092,6 +1109,8 @@ export interface SelfImplementSeams {
   mergePr?: (opts: { number: number; cwd: string; matchHeadCommit?: string }) => Promise<{ merged: boolean; baseRefName?: string; mergeCommit?: string; detail?: string }>;
   /** Only successful merges trigger this injected, fail-closed draft inventory and mutation seam. */
   supersedeDraftsOnMerge?: (number: number, cwd: string) => Promise<void>;
+  /** SIBLING-RESYNC-ON-MERGE — after a successful merge, tell open sibling PRs on the same paths to rebase + regate now. Failure is observation-only. */
+  resyncSiblingsOnMerge?: (number: number, cwd: string) => Promise<void>;
   /** Post-merge cleanup is opt-in and injectable so tests never touch the filesystem. */
   postMergeCleanup?: {
     enabled: boolean;
@@ -3479,6 +3498,28 @@ function runOriginData(env: NodeJS.ProcessEnv = process.env): RunOriginData {
   };
 }
 
+/**
+ * STOP-AUTOHEAL — a recorded stop goes straight to the dispatcher (shadow by default:
+ * `tools.selfImplement.autoheal.mode`). Never throws and never changes the run outcome.
+ */
+async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementSeams | undefined): Promise<void> {
+  try {
+    const record = readRunStopRecord(stopEntry);
+    if (!record) return;
+    const mode = parseAutohealMode((await import('../user-config.js')).getUserConfig().tools.selfImplement.autoheal?.mode);
+    const loadLedger = s?.stopAutohealLoadLedger ?? (s?.writeRunLedger ? () => null : undefined);
+    const result = await autohealFromStop({ runId: stopEntry.runId, ...(stopEntry.goalId ? { goalId: stopEntry.goalId } : {}), record }, {
+      mode,
+      ...(s?.stopAutohealActions ? { actions: s.stopAutohealActions } : {}),
+      ...(loadLedger ? { loadLedger } : {}),
+      ...(s?.writeRunLedger ? { writeLedger: s.writeRunLedger } : {}),
+    });
+    s?.onStopAutoheal?.(result);
+  } catch (error) {
+    try { debug.log('self-implement.autoheal', 'dispatch-failed', { runId: stopEntry.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+  }
+}
+
 export async function runSelfImplement(opts: SelfImplementOptions): Promise<SelfImplementResult> {
   if (opts.childLlm && (typeof opts.childLlm.provider !== 'string' || !opts.childLlm.provider.trim() || typeof opts.childLlm.model !== 'string' || !opts.childLlm.model.trim())) {
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
@@ -3500,6 +3541,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   const attemptOrdinal = incrementRunAttemptOrdinal(runId);
   const shardIdentity = parseRunShardIdentity(opts.feature);
   const observeOuter = makeRunObserver(runId, opts.goalId, debug.log.bind(debug), opts.seams.writeRunLedger, shardIdentity);
+  forgetRunStop(runId); // STOP-RECORD: one stop per run «attempt» — a rerun with the same id may record again
   try {
     // 10-05 PODPROVIDER: record which child provider this run uses — «default» when the launch named none.
     const launch = opts.launch ?? resolveLaunchStamp();
@@ -4108,6 +4150,21 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       observeOuter('credential-failure-observed', { count: credentialFailureCount, ...lastCredentialFailure });
     }
     terminalResult = withEvidenceCoverage(addressedResult);
+    // runSelfImplement is the terminal caller: retain every existing PR/ledger/log observation and append one stop fact.
+    if ((addressedResult.stage === 'aborted' || (addressedResult.mergeReason && addressedResult.mergeReason !== 'auto')) && !runStopRecorded(runId)) {
+      const reason = addressedResult.mergeReason;
+      const aborted = addressedResult.stage === 'aborted';
+      let stopEntry: RunLedgerEntry | undefined;
+      try {
+        stopEntry = recordRunStop({ runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), shardIdentity,
+          site: aborted ? 'implement-aborted' : 'merge-hold',
+          class: aborted ? 'unclassified' : classifyMergeHoldStop(reason), cause: aborted ? 'implement aborted' : `merge held: ${reason}`,
+          evidenceRef: addressedResult.prUrl ?? `run-ledger:${runId}:${aborted ? 'implemented' : 'merge-decision'}`,
+          nextMove: aborted ? 'Inspect preserved worktree and child summary' : 'Review merge decision and PR before landing',
+        }, opts.seams.writeRunLedger ?? appendRunLedgerEntry);
+      } catch { /* stop observation cannot change the run outcome */ }
+      if (stopEntry) await autohealRecordedStop(stopEntry, opts.seams);
+    }
     observeDeclaredScopeDiff(observeOuter, {
       goalFile: opts.goalFile,
       changedFiles: opts.goalFile && addressedResult.worktreePath
@@ -5134,6 +5191,8 @@ async function runSelfImplementInner(
     limitationCount: number;
   } | undefined;
   let gate!: SelfImplementGateResult;
+  /** GATE-ENV-RETRY: 재시도 뒤에도 남은 환경 결손의 종류. 정의되면 이 라운드의 gate 실패는 «수확 대기»로 끝난다. */
+  let gateEnvDeficitKind: GateEnvDeficitKind | undefined;
   let review: SelfImplementReview | undefined;
   /** Review-budget leftovers and the body that carried them, so a later merge drafts from the same text. */
   let preparedReviewBudgetPrBody: string | undefined;
@@ -5556,6 +5615,15 @@ async function runSelfImplementInner(
     });
   };
   const podReviewBlockedDraft = process.env.ELANOUS_SUBSTRATE === 'pod';
+  /** DRAFT-NOT-ARCHIVE: 멈춤 산출을 PR 대신 수확 가지로 보냈으면 그 가지 — hard-cap 재발사의 base 가 된다. */
+  let salvagedStopBranch: string | undefined;
+  const readDraftOnStopMode = (): DraftOnStopMode => {
+    try {
+      return s.draftOnStopMode ? s.draftOnStopMode() : parseDraftOnStopMode(getUserConfig().tools?.selfImplement?.draftOnStop).mode;
+    } catch {
+      return 'always';
+    }
+  };
   let blockedDraftNoChanges = false;
   let blockedDraftPrFailure: string | undefined;
   const reviewBlockedResult = (pr: { url: string; number: number } | undefined) => ({
@@ -5768,6 +5836,72 @@ async function runSelfImplementInner(
       progress(stage, '보존할 변경이 없어 draft PR을 열지 않음');
       return undefined;
     }
+    // DRAFT-NOT-ARCHIVE (RFC R1): harvestable 멈춤은 draft PR 대신 수확 가지 ⊕ 런 원장(사유·다음 수).
+    // ⛔ Pod review-blocked 는 결과 stage 가 PR 유무로 갈리므로 이 조각에서는 건드리지 않는다.
+    const draftOnStopMode = readDraftOnStopMode();
+    let launchSeat: string | undefined;
+    try { launchSeat = (opts.launch ?? resolveLaunchStamp()).actor; } catch { launchSeat = undefined; }
+    const draftOnStop = decideDraftOnStop({ mode: draftOnStopMode, classification: classificationRecord.classification, seat: launchSeat });
+    const stopCard = {
+      stage,
+      mode: draftOnStop.mode,
+      stopClass: draftOnStop.stopClass,
+      classification: classificationRecord.classification,
+      reason: reason.slice(0, 240),
+      nextMove: nextMoveFor(classificationRecord.classification),
+      branch: wt.branch,
+    };
+    if (draftOnStop.action === 'salvage-branch' && !(stage === 'review-blocked' && podReviewBlockedDraft)) {
+      const salvageBranch = salvageBranchForRun(runId, wt.branch);
+      let artifactPath: string | undefined;
+      let artifactError: string | undefined;
+      try {
+        artifactPath = persistFullPrBody(s.persistPrBodyArtifact, {
+          origin: 'self-implement-draft-not-archive',
+          body: assembled.body,
+          originalChars: assembled.originalChars,
+        });
+      } catch (persistenceError) {
+        artifactError = persistenceError instanceof Error ? persistenceError.message : String(persistenceError);
+      }
+      let salvageError: string | undefined;
+      try {
+        if (s.preserveBlockedBranch) {
+          if (!await s.preserveBlockedBranch({ cwd: wt.path, branch: salvageBranch, title: prTitle(opts.feature) })) throw new Error('수확 가지 push가 성공하지 않았음');
+        } else {
+          if (!existsSync(wt.path)) throw new Error(`worktree not found: ${wt.path}`);
+          const commit = commitWorktree(wt.path, prTitle(opts.feature));
+          if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(`로컬 커밋 실패: ${commit.out}`);
+          const push = runGitCommand(wt.path, ['push', 'origin', `HEAD:refs/heads/${salvageBranch}`]);
+          if (push.status !== 0) throw new Error(push.stderr || push.stdout || 'git push failed');
+        }
+      } catch (error) {
+        salvageError = safeErrorDescription(error);
+      }
+      const artifactFields = { ...(artifactPath ? { prBodyArtifactPath: artifactPath } : {}), ...(artifactError ? { prBodyArtifactError: artifactError } : {}) };
+      if (salvageError === undefined) {
+        salvagedStopBranch = salvageBranch;
+        observe('salvaged', { ...stopCard, salvageBranch, ...artifactFields }, { category: 'self-implement.draft-not-archive' });
+        observe('rework-blocked-draft-pr', { ...observation, skipped: 'draft-not-archive', salvageBranch, nextMove: stopCard.nextMove, ...artifactFields });
+        progress(stage, `멈춤 — draft PR 없이 수확 가지로 보존: ${salvageBranch} · 사유: ${stopCard.reason.slice(0, 160)} · 다음 수: ${stopCard.nextMove}${artifactPath ? ` · 판정 본문: ${artifactPath}` : ''}`);
+        return undefined;
+      }
+      // 수확 가지를 못 남기면 산출을 잃지 않도록 종전대로 draft PR 로 간다.
+      observe('salvage-failed', { ...stopCard, salvageBranch, error: salvageError, fallback: 'open-draft', ...artifactFields }, { category: 'self-implement.draft-not-archive', level: 'warn' });
+    } else if (draftOnStop.mode === 'needs-owner-only') {
+      const ownerLabel = draftOnStop.action === 'open-draft' ? draftOnStop.ownerLabel : undefined;
+      // 자리를 모르면 «모름»으로 남긴다(⛔ OP 로 추측하지 않는다).
+      observe(draftOnStop.stopClass === 'landable' ? 'landable-draft' : 'needs-owner-draft', { ...stopCard, ownerSeat: ownerLabel ? ownerLabel.slice('elanous:seat-'.length) : 'unknown', ...(ownerLabel ? { ownerLabel } : {}) }, { category: 'self-implement.draft-not-archive' });
+    }
+    // 'always' 는 종전 라벨 그대로 · needs-owner-only 의 needs-owner 는 `elanous:needs-owner` ⊕ (아는 경우만) 자리 라벨.
+    // landable(승인된 산출)은 자리 라벨만 — 다음 수가 `pr land` 라 needs-owner 가 아니다.
+    const needsOwnerDraft = draftOnStop.mode === 'needs-owner-only' && draftOnStop.stopClass === 'needs-owner';
+    const seatLabelled = draftOnStop.mode === 'needs-owner-only' && draftOnStop.stopClass !== 'harvestable';
+    const draftLabels = [
+      ...(stage === 'review-blocked' ? ['review-blocked'] : []),
+      ...(seatLabelled && draftOnStop.action === 'open-draft' && draftOnStop.ownerLabel ? [draftOnStop.ownerLabel] : []),
+      ...(needsOwnerDraft ? ['elanous:needs-owner'] : []),
+    ];
     // Pod review-blocked: a failed commit or PR still pushes the branch, and the result detail says what survived.
     const preserveReviewBlockedBranch = async (cause: string, commitFirst: boolean, suffix = ''): Promise<undefined> => {
       let pushed = false;
@@ -5817,7 +5951,7 @@ async function runSelfImplementInner(
         head: wt.branch,
         ...(opts.base ? { base: opts.base } : {}),
         draft: true,
-        ...(stage === 'review-blocked' ? { labels: ['review-blocked'] } : {}),
+        ...(draftLabels.length > 0 ? { labels: draftLabels } : {}),
         cwd: wt.path,
       }), T.pr, 'pr');
     } catch (error) {
@@ -5839,6 +5973,17 @@ async function runSelfImplementInner(
         ...(artifactPath ? { prBodyArtifactPath: artifactPath } : {}),
         ...(artifactError ? { prBodyArtifactError: artifactError } : {}),
       }, { level: 'warn' });
+      // STOP-RECORD: a failed blocked-draft PR open (e.g. same-branch rerun with a PR already open) left no stop reason.
+      let draftStopEntry: RunLedgerEntry | undefined;
+      try {
+        const prExists = /already exists|pull request for branch/i.test(prError);
+        draftStopEntry = recordRunStop({ runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), site: 'draft-pr-open-failed', class: 'unclassified',
+          cause: prExists ? 'draft PR open failed: a PR already exists for this branch' : `draft PR open failed: ${prError}`,
+          evidenceRef: artifactPath ?? `branch:${wt.branch}`,
+          nextMove: prExists ? '기존 PR 갱신 (update the existing PR for this branch)' : 'Retry draft PR open from the preserved branch',
+        }, s.writeRunLedger ?? appendRunLedgerEntry);
+      } catch { /* stop observation cannot change the run outcome */ }
+      if (draftStopEntry) await autohealRecordedStop(draftStopEntry, s);
       if (stage === 'review-blocked' && podReviewBlockedDraft) {
         return preserveReviewBlockedBranch(`draft PR 생성 실패: ${prError}`, true,
           `; ${artifactPath ? `판정 본문: ${artifactPath}` : `판정 본문 보존 실패: ${artifactError ?? 'unknown error'}`}`);
@@ -5871,6 +6016,13 @@ async function runSelfImplementInner(
     if (!s.postPrComment) {
       observe('pr.comment.mode', { number: pr.number, mode: 'seam-missing', salvageAction: action });
       observe('pr.comment.seam-missing', { number: pr.number, salvageAction: action }, { level: 'warn' });
+      return;
+    }
+    // QUIET-PR-COMMENTS: a parked outcome is history of this run, not a new notification — fold it into the
+    // single edited status comment (an edit mails nobody). Without the status seams it stays a separate comment.
+    if (s.findPrComment && s.editPrComment) {
+      bufferPrComment(round, 'author', `Rework salvage status: ${action}.`, reason ? [`reason: ${reason}`] : []);
+      await flushPrComments(pr);
       return;
     }
     const body = [
@@ -6046,7 +6198,7 @@ async function runSelfImplementInner(
     observe('rework-salvage', { action: 'launching', ...launchObservation });
     try {
       if (!s.launchReworkSalvage) throw new Error('launch seam unavailable');
-      await s.launchReworkSalvage({ goalFile: opts.goalFile!, base: wt.branch, salvageAttempt: (opts.salvageAttempt ?? 0) + 1 });
+      await s.launchReworkSalvage({ goalFile: opts.goalFile!, base: salvagedStopBranch ?? wt.branch, salvageAttempt: (opts.salvageAttempt ?? 0) + 1 });
       observe('rework-salvage', { action: 'launched', ...launchObservation });
       await postSalvageStatus(pr, 'launched', environmentReason ?? (hardCapBlockedExtend ? 'hard-cap-extend' : undefined));
       return 'launched';
@@ -6843,7 +6995,7 @@ async function runSelfImplementInner(
             { label: 'Stay in scope', description: 'Do not accept out-of-scope changes.', recommended: true },
             { label: 'Expand scope', description: 'Accept the changed files outside the target paths.' },
           ],
-        }, { runId }, { writeRunLedger: s.writeRunLedger });
+        }, { runId, outsideFiles: scope.outsideNames, outsideCount: scope.outsideCount, declaredPaths: declaredPathsFromGoalDocumentText(goalDocument!).paths }, { writeRunLedger: s.writeRunLedger });
         if ('parked' in result || 'deferred' in result || result.choice !== 'Expand scope') {
           finalizeSupervisorDeliveries('execution-scope-not-approved');
           observe('execution-scope-held', { outsideCount: scope.outsideCount, disposition: 'parked' in result ? 'parked' : 'in-scope-only' });
@@ -6875,6 +7027,31 @@ async function runSelfImplementInner(
         }
         onNodeEntry(node('gate'), round);
         gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
+        // ⭐ GATE-ENV-RETRY — 「잰 쪽」이 넘어진 실패(시험 결과 미수신·index.lock·OOM·측정 불가·네트워크)는
+        //   구현을 버리지 않고 짧게 쉰 뒤 gate «만» 다시 돈다. ⛔ 도입 실패·자식 책임은 판정자가 거짓을 낸다.
+        gateEnvDeficitKind = undefined;
+        let envVerdict = classifyGateEnvDeficit(gate);
+        const envRetryAttempts = Math.max(0, s.gateEnvRetry?.attempts ?? DEFAULT_GATE_ENV_RETRY.attempts);
+        const envRetryDelayMs = Math.max(0, s.gateEnvRetry?.delayMs ?? DEFAULT_GATE_ENV_RETRY.delayMs);
+        const envRetrySleep = s.gateEnvRetry?.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+        for (let attempt = 1; envVerdict.envDeficit && attempt <= envRetryAttempts; attempt++) {
+          const kind = envVerdict.kind;
+          debug.log('self-implement.gate-env-retry', 'retry-scheduled', { runId, round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs });
+          observe('gate-env-retry', { round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs }, { level: 'warn' });
+          progress('gating', `gate 환경 결손(${kind}) — 구현 유지 · ${Math.round(envRetryDelayMs / 1000)}초 뒤 gate 만 재측정 (${attempt}/${envRetryAttempts})`);
+          await envRetrySleep(envRetryDelayMs);
+          gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
+          envVerdict = classifyGateEnvDeficit(gate);
+          debug.log('self-implement.gate-env-retry', 'retry-result', {
+            runId, round, attempt, kind, passed: gate.passed,
+            stillEnvDeficit: envVerdict.envDeficit,
+            ...(envVerdict.envDeficit ? { nextKind: envVerdict.kind } : { verdict: envVerdict.reason }),
+          });
+        }
+        if (envVerdict.envDeficit) {
+          gateEnvDeficitKind = envVerdict.kind;
+          debug.log('self-implement.gate-env-retry', 'exhausted', { runId, round, attempts: envRetryAttempts, kind: envVerdict.kind });
+        }
       } else {
         observe('gate-skipped-by-graph', { ...graphAuthorityFields(graphAuthority, graphTemplate), round, reason: gateRoute.reason, changedFileCount: gateRouteFiles?.length ?? null });
         gate = {
@@ -6961,6 +7138,26 @@ async function runSelfImplementInner(
       // 타임아웃«뿐» — 도입 0 · 미분류 0 · 자식 책임 없음. 재작업으로 보내지 않고 리뷰로 진행한다.
       // 게이트를 통과로 접지하지 않는다(allowsBaselineOnlyFailure 는 그대로 timedOut===0 을 요구).
       // 이 런의 병합은 뒤에서 GATE_TIMEOUT_UNMEASURED_MERGE_REASON 으로 hitl 에 고정한다.
+      if (gateEnvDeficitKind !== undefined) {
+        // ⭐ GATE-ENV-RETRY — 재측정 뒤에도 환경 결손이면 구현을 «버리지 않는다».
+        //   브랜치·draft PR 을 남기고 `harvestable` 로 끝낸다(재작업은 이 신호를 못 바꾼다).
+        const envKind = gateEnvDeficitKind;
+        finalizeSupervisorDeliveries('gate-env-deficit-harvestable');
+        const reason = `gate failed on an environment deficit (${envKind}) after gate-only retries; ${GATE_ENV_DEFICIT_HARVESTABLE_MARK} — implementation kept without rework`;
+        bufferPrComment(round, 'reviewer', `Round ${round}: ${reason}.`, [
+          `Gate: ${gate.log?.trim() || '(gate log unavailable)'}`,
+        ]);
+        observe('gate-env-deficit-harvestable', {
+          round, kind: envKind,
+          ...(facts ? { introduced: facts.introduced, preexisting: facts.preexisting, unknown: facts.unknown } : {}),
+          ...(facts?.unknownReason !== undefined ? { unknownReason: facts.unknownReason } : {}),
+          reason,
+        }, { level: 'warn' });
+        debug.log('self-implement.gate-env-retry', 'harvestable', { runId, round, kind: envKind, branch: wt.branch });
+        progress('gate-failed', `중단 — 환경 결손(${envKind})이 재측정 뒤에도 남음 · 구현 유지 · 수확 대기`);
+        const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: false });
+        return { ok: false, stage: 'gate-failed', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }), harvestable: true, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+      }
       if (isTimeoutOnlyUnmeasuredGate(facts)) {
         observe('gate-timeout-only-continued-to-review', {
           round,
@@ -7537,6 +7734,16 @@ async function runSelfImplementInner(
         sync.status,
       );
       observe('gate.postsync', postSyncGateObservation(regate, wt.branch, hasModuleLoadFailure, sync.status));
+      // MERGE-INTENT-RESOLVE — join the resolver's sibling-intent decisions with the regate verdict (OP metric).
+      if (sync.intentResolve?.length) {
+        debug.log('self-implement.main-sync', 'intent-resolve', {
+          phase: 'regate', runId, branch: wt.branch, mergeTarget,
+          adopted: [...new Set(sync.intentResolve.map((entry) => entry.adopted))],
+          siblingIntentAdopted: sync.intentResolve.some((entry) => entry.adopted === 'sibling-intent'),
+          files: sync.intentResolve,
+          regatePassed: regate.passed,
+        });
+      }
       if (timeoutOnlyPostSync) {
         const facts = regate.reflectGateFacts!;
         observe('post-sync-gate-timeout-only-continued', {
@@ -7859,6 +8066,12 @@ async function runSelfImplementInner(
         await s.supersedeDraftsOnMerge?.(pr.number, wt.path);
       } catch (error) {
         observe('draft-supersede-on-merge-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'warn' });
+      }
+      // Runs after supersede: a sibling the merge already closed is no longer open, so it gets no resync.
+      try {
+        await s.resyncSiblingsOnMerge?.(pr.number, wt.path);
+      } catch (error) {
+        observe('sibling-resync-on-merge-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'warn' });
       }
       const directory = releaseNotesDir(elanousStateRoot());
       const fragment: ReleaseNoteFragment = {

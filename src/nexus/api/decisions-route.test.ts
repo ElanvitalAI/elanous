@@ -3,9 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
+import { MsgStore } from '../../msg/msg-store.js';
 import { debug } from '../../debug/log.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { handleDecisions } from './decisions-route.js';
+import { handleOpsBoard } from './ops-board-route.js';
+import { decide as pwaDecide, listOpenDecisions as pwaListOpenDecisions } from '../../../apps/pwa/src/lib/decisions-api.js';
 import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
 import { isPublicRoute } from './public-routes.js';
 
@@ -30,6 +33,71 @@ function dispatch(ledger: DecisionLedger, path: string, init: RequestInit = {}) 
 }
 const auth = { authorization: 'Bearer owner-token' };
 const post = (choice: string, note?: string) => ({ method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ choice, ...(note ? { note } : {}) }) });
+
+test('notice transport is private; CLI messages appear and owner reply reaches the original seat without touching the ledger', async () => {
+  const { ledger, first } = fixture();
+  const root = mkdtempSync(join(tmpdir(), 'ops-board-'));
+  roots.push(root);
+  const path = join(root, 'messages.db');
+  const store = new MsgStore(path);
+  const notice = store.post({ from: 'TC', to: 'CEO', body: '조율 채널 요약', kind: 'notice' });
+  const unrelated = store.post({ from: 'UX', to: 'MK', body: '비공개' });
+  const seatNotice = store.post({ from: 'OP', to: 'CEO', body: 'OP 자리 공지', kind: 'notice' });
+  const loopNotice = store.post({ from: 'DIG-LOOP', to: 'CEO', body: '루프 보고', kind: 'coordination-summary' });
+  const followUp = store.post({ from: 'TC', to: 'CEO', body: '추가 의견', kind: 'reply' });
+  store.close();
+  const opts = { metaApi: { bearerToken: 'owner-token', noAuth: false }, decisions: { ledger }, opsBoard: { openStore: () => new MsgStore(path) } } as unknown as NexusHttpServerOpts;
+  const request = (init: RequestInit = {}, address = '100.100.1.2', host = '100.100.1.1') => routeRequest(new Request(`http://${host}/v1/ops-board/notices`, init), opts,
+    { requestIP: () => ({ address }) } as never, null, createDevProxyRuntimeRef());
+  expect(isPublicRoute('GET', '/v1/ops-board/notices', { setupMode: false })).toBe(false);
+  expect((await request({ headers: auth }, '203.0.113.5'))?.status).toBe(403);
+  expect((await request({ headers: auth }, '100.63.1.1'))?.status).toBe(403);
+  expect((await request({ headers: auth }, '100.128.0.1'))?.status).toBe(403);
+  expect((await request({ headers: auth }, '100.100.1.2', 'public.example'))?.status).toBe(403);
+  expect((await routeRequest(new Request('http://100.100.1.1/v1/ops-board/notices', { headers: auth }), opts, {} as never, null, createDevProxyRuntimeRef()))?.status).toBe(403);
+  expect((await request())?.status).toBe(401);
+  const noAuthOpts = { ...opts, metaApi: { ...opts.metaApi, noAuth: true } } as NexusHttpServerOpts;
+  expect((await routeRequest(new Request('http://100.100.1.1/v1/ops-board/notices', { headers: auth }), noAuthOpts,
+    { requestIP: () => ({ address: '100.100.1.2' }) } as never, null, createDevProxyRuntimeRef()))?.status).toBe(401);
+  expect((await request({ method: 'POST', body: JSON.stringify({ noticeId: notice.id, body: '답변' }) }))?.status).toBe(401);
+  const listed = await request({ headers: auth });
+  expect((await listed?.json() as { notices: Array<{ id: number }> }).notices.map(row => row.id)).toEqual([notice.id, seatNotice.id, loopNotice.id, followUp.id]);
+  expect((await request({ method: 'POST', headers: auth, body: JSON.stringify({ noticeId: unrelated.id, body: '답변' }) }))?.status).toBe(404);
+  expect((await request({ method: 'POST', headers: auth, body: JSON.stringify({ noticeId: notice.id, body: ' ' }) }))?.status).toBe(400);
+  const loopReply = await request({ method: 'POST', headers: auth, body: JSON.stringify({ noticeId: loopNotice.id, body: '루프 확인' }) });
+  expect(await loopReply?.json()).toMatchObject({ reply: { from: 'CEO', to: 'DIG-LOOP', body: '루프 확인' } });
+  const seatReply = await request({ method: 'POST', headers: auth, body: JSON.stringify({ noticeId: seatNotice.id, body: 'OP 확인' }) });
+  expect(await seatReply?.json()).toMatchObject({ reply: { from: 'CEO', to: 'OP', body: 'OP 확인' } });
+  const replied = await request({ method: 'POST', headers: auth, body: JSON.stringify({ noticeId: notice.id, body: '답변' }) });
+  expect(replied?.status).toBe(201);
+  expect(await replied?.json()).toMatchObject({ reply: { from: 'CEO', to: 'TC', body: '답변', kind: 'reply' } });
+  const verify = new MsgStore(path);
+  expect(verify.list('TC').map(row => row.body)).toEqual(['답변']);
+  expect(verify.list('CEO').map(row => row.id)).toEqual([notice.id, seatNotice.id, loopNotice.id, followUp.id]);
+  expect(verify.list('DIG-LOOP').map(row => row.body)).toEqual(['루프 확인']);
+  expect(verify.list('OP').map(row => row.body)).toEqual(['OP 확인']);
+  expect(verify.getCursor('CEO')).toBe(0);
+  verify.close();
+  expect(ledger.show(first.id).status).toBe('open');
+  expect((await handleOpsBoard(new Request('http://nexus.test/v1/ops-board/notices'), { authorize: () => false })).status).toBe(401);
+});
+
+test('eighteen decision responses are recorded in the temporary ledger without changing the card route', async () => {
+  const { ledger } = fixture();
+  const cards = Array.from({ length: 18 }, (_, index) => ledger.raise({
+    title: `묶음 ${index + 1}`, category: 'other', scqa: { s: '상황', c: '결정 필요' },
+    options: [{ key: 'a', label: '진행', consequence: '진행' }, { key: 'b', label: '대기', consequence: '대기' }],
+    recommendation: { option: 'a', why: '권고 이유' }, raisedBy: { agent: 'OP' },
+  }));
+  const client = { fetchResponse: (path: string, init?: RequestInit) => dispatch(ledger, path, { ...init, headers: { ...auth, ...init?.headers } }).then(response => response!) };
+  const visible = await pwaListOpenDecisions(client);
+  expect(cards.every(card => visible.some(item => item.id === card.id))).toBe(true);
+  for (const card of cards) {
+    expect(await pwaDecide(client, card.id, 'a', '대표 의견')).toHaveProperty('decidedAt');
+  }
+  expect(cards.map(card => ledger.show(card.id).note)).toEqual(Array(18).fill('대표 의견'));
+  expect(cards.every(card => ledger.show(card.id).status === 'decided')).toBe(true);
+});
 
 test('GET is owner-only, open-only, and returns full decision card material', async () => {
   const { ledger, first, second } = fixture();

@@ -30,7 +30,7 @@ const cardEdges: ActivityEdge[] = [
   { at: '2026-10-05T09:59:10Z', kind: 'request', from: 'OP', to: 'TC', ref: 'A' },
 ];
 
-function mountMap(search: string) {
+function mountMap(search: string, mapRows: readonly LoopRow[] = rows) {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   let href = `https://example.test/inside?scene=3${search}`;
   globalThis.window = {
@@ -42,7 +42,7 @@ function mountMap(search: string) {
   } as unknown as Window & typeof globalThis;
   let root: ReturnType<typeof create>;
   const renderMap = (edges: readonly ActivityEdge[] = cardEdges) => <SearchParamsContext.Provider value={new URLSearchParams(new URL(href).search)}>
-    <LoopActivityMap rows={rows} edges={edges} seenAt={{}} now={now} state="ready" />
+    <LoopActivityMap rows={mapRows} edges={edges} seenAt={{}} now={now} state="ready" />
   </SearchParamsContext.Provider>;
   act(() => { root = create(renderMap()); });
   return { root: root!, address: () => href, navigate: (method: 'pushState' | 'replaceState', url: string) => act(() => {
@@ -62,6 +62,31 @@ test('map exposes four seats, unknown owner, red verdict and clickable node list
   expect(html).toContain('grid gap-4 sm:grid-cols-2');
   expect(html).toContain('최근 사건이 없습니다');
   expect(leaksInternal(html)).toEqual([]);
+});
+
+test('a group with nine nodes wraps after eight without overlapping the next seat or moving fixed nodes', () => {
+  const crowded: LoopRow[] = Array.from({ length: 8 }, (_, index) => ({
+    id: `loop:op-${index}`, name: `OP loop ${index}`, layer: 'ops', owner: 'OP', mode: 'cron', lastRun: null, verdict: '꺼짐',
+  }));
+  const { root, updateEdges } = mountMap('', crowded);
+  try {
+    const nodes = root.root.findByType(ReactFlow).props.nodes as Array<{ data: { label: string }; position: { x: number; y: number } }>;
+    const at = (label: string) => nodes.find(node => node.data.label === label)!.position;
+    expect(at('COO')).toEqual({ x: 0, y: 0 });
+    expect(at('COO loop 6')).toEqual({ x: 0, y: 7 * 138 });
+    expect(at('COO loop 7')).toEqual({ x: 220, y: 0 });
+    expect(at('CMO')).toEqual({ x: 440, y: 0 });
+    expect(at('조율')).toEqual({ x: 0, y: -170 });
+    expect(at('TASK-AGENT')).toEqual({ x: 220, y: -170 });
+    const prEdges: ActivityEdge[] = Array.from({ length: 9 }, (_, index) => ({
+      at: '2026-10-05T09:59:00Z', kind: 'run', from: 'TC', to: `pr:${100 + index}`, ref: `run-${index}`,
+    }));
+    updateEdges(prEdges);
+    const prNodes = root.root.findByType(ReactFlow).props.nodes as typeof nodes;
+    const prAt = (label: string) => prNodes.find(node => node.data.label === label)!.position;
+    expect(prAt('PR #100').y).toBe(prAt('PR #108').y);
+    expect(prAt('PR #108').x).toBeGreaterThan(prAt('PR #100').x);
+  } finally { act(() => root.unmount()); }
 });
 
 test('sub-seats remain visible as seat nodes when supplied by ops seats', () => {

@@ -1,8 +1,8 @@
 export function harnessAskText(line: string): string | null {
+  if (/[\r\n\u2028\u2029]/.test(line)) return null;
   const trimmed = line.trim();
-  if (/^\/harness(?:[ \t]|$)/.test(trimmed)) {
-    const text = trimmed.slice('/harness'.length).trim();
-    return /[\r\n]/.test(text) ? null : text;
+  if (/^\/harness(?:\s|$)/.test(trimmed)) {
+    return trimmed.slice('/harness'.length).trim();
   }
   if (/^하니스로\s/.test(trimmed)) return line;
   return null;

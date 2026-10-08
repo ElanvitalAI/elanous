@@ -8,6 +8,8 @@ export interface PreviewOptions {
   scenario?: string;
   /** Main-based combined preview: only existing config paths may be enabled. */
   flags?: readonly string[];
+  /** PR heads to preview together on main when no feature flags exist. */
+  bundlePrs?: readonly number[];
   commentPr?: number;
 }
 export interface PreviewResult {
@@ -35,14 +37,50 @@ export interface PreviewDeps {
   probePwa?: (url: string) => Promise<boolean>;
 }
 
-const SCENARIOS: Record<string, string> = {
-  S2: '/help', S3: '/status', S6: '/now', S7: '/term list', S8: '/model', S9: '/harness',
+const SCENARIOS: Record<string, { input: string; expected: string; matches: (snapshot: string) => boolean }> = {
+  // GOODHART (#24844 review): a group head (`▸ 시작`) or the echoed `/help` is not the list. The /help modal
+  // (help-from-registry.ts) prints one `/name  description` row per command; the «시작» group alone has six.
+  // Pass only when at least three other start-group commands are listed as rows.
+  S2: { input: '/help', expected: 'help command list (/status, /model, /clear ... rows)', matches: (s) =>
+    ['status', 'model', 'clear', 'new', 'resume'].filter((name) => new RegExp(`(?:^|\\s)/${name}(?: \\([^)]*\\))?\\s{2,}\\S`, 'mu').test(s)).length >= 3 },
+  S3: { input: '/status', expected: 'model and connection', matches: (s) => /모델|model/iu.test(s) && /연결|connection/iu.test(s) },
+  S6: { input: '/now', expected: 'current runs or schedules', matches: (s) => /지금|도는 런|스케줄|running|schedule/iu.test(s) },
+  S7: { input: '/term list', expected: 'terminal/PTY list', matches: (s) => /terminal|pty|터미널/iu.test(s) },
+  S8: { input: '/model', expected: 'model choices', matches: (s) => /빠름|보통|깊음|terra|sol|luna|선택/iu.test(s) },
+  S9: { input: '/harness', expected: 'harness usage or stages', matches: (s) => /usage:.*harness|저작|구현|리뷰|착지/iu.test(s) },
 };
+
+/**
+ * Lines of `after` that were not already on `before`'s screen (multiset by line, trailing spaces ignored).
+ * A prefix check is not enough: the PTY re-renders and scrolls, so the previous scenario's answer can
+ * reappear anywhere on the next screen (#24844 review). A repeated line is conservatively treated as old.
+ */
+export function previewFreshLines(before: string, after: string): string {
+  const seen = new Map<string, number>();
+  for (const line of before.split('\n')) {
+    const key = line.trimEnd();
+    if (key) seen.set(key, (seen.get(key) ?? 0) + 1);
+  }
+  return after.split('\n').filter((line) => {
+    const key = line.trimEnd();
+    if (!key) return false;
+    const left = seen.get(key) ?? 0;
+    if (left > 0) { seen.set(key, left - 1); return false; }
+    return true;
+  }).join('\n');
+}
+
+/** Whether a fresh screen region shows the scenario's expected answer (exported for the preview tests). */
+export function previewScenarioMatches(scenario: string, fresh: string): boolean {
+  const entry = Object.hasOwn(SCENARIOS, scenario) ? SCENARIOS[scenario] : undefined;
+  if (!entry) throw new Error(`TUI-COMFORT §4: unsupported scenario ${scenario}`);
+  return entry.matches(fresh);
+}
 
 export function previewScenarioInput(scenario: string): string {
   const text = Object.hasOwn(SCENARIOS, scenario) ? SCENARIOS[scenario] : undefined;
   if (!text) throw new Error(`TUI-COMFORT §4: unsupported scenario ${scenario}; available: ${Object.keys(SCENARIOS).join(', ')}`);
-  return text;
+  return text.input;
 }
 
 const defaultRun: NonNullable<PreviewDeps['run']> = (command, args, cwd, timeoutMs = 120_000) => {
@@ -60,13 +98,18 @@ export async function runPrPreview(options: PreviewOptions, deps: PreviewDeps = 
   if (isPr && !Number.isSafeInteger(Number(target))) throw new Error('preview: invalid PR number');
   if (/^\d+$/u.test(target) && !isPr) throw new Error('preview: invalid PR number');
   if (options.commentPr !== undefined && (!Number.isSafeInteger(options.commentPr) || options.commentPr <= 0)) throw new Error('preview: invalid --comment-pr');
+  const bundlePrs = options.bundlePrs ?? [];
+  if (bundlePrs.length && (target !== 'main' || (options.flags?.length ?? 0) > 0)) throw new Error('preview: --bundle-pr requires main without feature flags');
+  if (bundlePrs.length && (new Set(bundlePrs).size !== bundlePrs.length || bundlePrs.some((pr) => !Number.isSafeInteger(pr) || pr <= 0))) throw new Error('preview: invalid or duplicate --bundle-pr');
   if (target === 'main' && options.commentPr === undefined) throw new Error('preview: main ⊕ flags requires --comment-pr <PR number> to publish the result');
   if (isPr && options.commentPr !== undefined && options.commentPr !== Number(target)) throw new Error('preview: --comment-pr must match the target PR');
   const flags = options.flags ?? [];
   if (flags.length && target !== 'main') throw new Error('preview: --flag requires main (main ⊕ feature flags)');
   if (flags.some((flag) => !/^[a-zA-Z][\w-]*(?:\.[a-zA-Z][\w-]*)+$/u.test(flag))) throw new Error('preview: --flag expects an existing dotted config path');
-  const scenario = options.scenario ?? 'S2';
-  const input = previewScenarioInput(scenario);
+  const scenarios = (options.scenario ?? 'S2').split(',').map((id) => id.trim());
+  if (scenarios.length === 0 || new Set(scenarios).size !== scenarios.length) throw new Error('preview: duplicate or empty scenario');
+  for (const id of scenarios) previewScenarioInput(id);
+  const scenario = scenarios.join(',');
   const check = (command: string, args: readonly string[], cwd: string, timeout?: number): string => {
     const r = run(command, args, cwd, timeout);
     if (r.status !== 0) throw new Error(`preview: ${command} ${args.join(' ')} failed: ${(r.stdout + '\n' + r.stderr).slice(-600)}`);
@@ -99,6 +142,16 @@ export async function runPrPreview(options: PreviewOptions, deps: PreviewDeps = 
     const pr = JSON.parse(check('gh', ['pr', 'view', String(prNumber), '--json', 'headRefOid,headRefName'], root)) as { headRefOid?: string; headRefName?: string };
     if (pr.headRefName !== target || pr.headRefOid !== head || (branchPrHead !== undefined && branchPrHead !== head)) throw new Error('preview: branch does not match the target PR head; use the PR number');
   }
+  const bundleHeads = bundlePrs.map((number) => {
+    const pr = JSON.parse(check('gh', ['pr', 'view', String(number), '--json', 'number,headRefOid'], root)) as { number?: number; headRefOid?: string };
+    if (pr.number !== number || !/^[0-9a-f]{40}$/iu.test(pr.headRefOid ?? '')) throw new Error(`preview: PR #${number} head is unavailable`);
+    const oid = pr.headRefOid!;
+    if (run('git', ['cat-file', '-e', `${oid}^{commit}`], root).status !== 0) {
+      check('git', ['fetch', '--no-tags', 'origin', `pull/${number}/head`], root, 120_000);
+      if (check('git', ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], root) !== oid) throw new Error(`preview: PR #${number} head changed while fetching; retry`);
+    }
+    return { number, oid };
+  });
   const directory = (deps.makeDir ?? (() => {
     const previews = join(root, '.elanous-test', 'previews');
     mkdirSync(previews, { recursive: true });
@@ -112,6 +165,11 @@ export async function runPrPreview(options: PreviewOptions, deps: PreviewDeps = 
   try {
     check('git', ['worktree', 'add', '--detach', worktree, head], root);
     added = true;
+    for (const { number, oid } of bundleHeads) {
+      const current = JSON.parse(check('gh', ['pr', 'view', String(number), '--json', 'number,headRefOid'], root)) as { number?: number; headRefOid?: string };
+      if (current.number !== number || current.headRefOid !== oid) throw new Error(`preview: PR #${number} head changed while preparing bundle; retry`);
+      check('git', ['-c', 'user.name=elanous-preview', '-c', 'user.email=preview@localhost', 'merge', '--no-ff', '--no-edit', oid], worktree, 120_000);
+    }
     check('bun', ['install', '--frozen-lockfile'], worktree, 300_000);
     check('bun', ['install', '--frozen-lockfile'], join(worktree, 'apps/pwa'), 300_000);
     for (const flag of flags) {
@@ -145,17 +203,27 @@ export async function runPrPreview(options: PreviewOptions, deps: PreviewDeps = 
     if (pty.held !== true || !/^pty_[\w-]+$/u.test(pty.ptyId ?? '')) throw new Error('preview: B-1 held TUI did not return a PTY reference');
     heldPty = pty.ptyId;
     const snapshotArgs = ['bin/elanous.mjs', '--test', 'pty', 'snapshot', pty.ptyId!] as const;
-    const before = check('bun', snapshotArgs, worktree);
-    check('bun', ['bin/elanous.mjs', '--test', 'pty', 'text', pty.ptyId!, input, '--enter'], worktree);
-    // A constant sleep misses slow frames under load — poll until the screen answers (≤ 20s).
-    let snapshot = '';
-    for (let attempt = 0; attempt < 20; attempt++) {
-      await wait(1000);
-      snapshot = check('bun', snapshotArgs, worktree);
-      if (snapshot && snapshot !== 'ok' && snapshot !== before) break;
+    const rows: string[] = [];
+    const snapshots: string[] = [];
+    for (const id of scenarios) {
+      const { input, expected, matches } = SCENARIOS[id]!;
+      const before = check('bun', snapshotArgs, worktree);
+      check('bun', ['bin/elanous.mjs', '--test', 'pty', 'text', pty.ptyId!, input, '--enter'], worktree);
+      // A constant sleep misses slow frames under load — poll until this scenario's expected response (≤ 20s).
+      let snapshot = '';
+      let matched = false;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await wait(1000);
+        snapshot = check('bun', snapshotArgs, worktree);
+        const fresh = previewFreshLines(before, snapshot);
+        matched = snapshot !== 'ok' && snapshot !== before && matches(fresh);
+        if (matched) break;
+      }
+      const observed = snapshot && snapshot !== 'ok' && snapshot !== before;
+      rows.push(`| TUI-COMFORT §4 ${id} | \`${input}\` → ${matched ? `expected ${expected} matched` : `friction: expected ${expected} not found${observed ? '' : ' (no response within 20s)'}`} |`);
+      snapshots.push(`<details><summary>Inner PTY snapshot ${id}</summary>\n\n\`\`\`text\n${snapshot.slice(-3000).replaceAll('```', "'''")}\n\`\`\`\n</details>`);
     }
-    if (!snapshot || snapshot === 'ok' || snapshot === before) throw new Error('preview: inner PTY did not show a response to the scenario input within 20s');
-    report = `| Check | Observation |\n|---|---|\n| head | \`${head}\` |\n| B-1 version | ${version.slice(0, 120)} |\n| P-1 PWA | \`${endpoint}/app/\` served the built PWA |\n| TUI-COMFORT §4 ${scenario} | \`${input}\` → snapshot captured |\n\n<details><summary>Inner PTY snapshot</summary>\n\n\`\`\`text\n${snapshot.slice(-3000).replaceAll('```', "'''")}\n\`\`\`\n</details>`;
+    report = `| Check | Observation |\n|---|---|\n| head | \`${head}\` |${bundleHeads.length ? `\n| bundled PR heads | ${bundleHeads.map(({ number, oid }) => `#${number} \`${oid}\``).join(' ⊕ ')} |` : ''}\n| B-1 version | ${version.slice(0, 120)} |\n| P-1 PWA | \`${endpoint}/app/\` served the built PWA |\n${rows.join('\n')}\n\n${snapshots.join('\n\n')}`;
   } catch (error) {
     report = `| Check | Friction |\n|---|---|\n| head | \`${head}\` |\n| TUI-COMFORT §4 ${scenario} | ${String(error).replaceAll('|', '\\|').slice(0, 700)} |`;
   } finally {
@@ -167,7 +235,7 @@ export async function runPrPreview(options: PreviewOptions, deps: PreviewDeps = 
     }
     (deps.dispose ?? ((dir) => rmSync(dir, { recursive: true, force: true })))(directory);
   }
-  const status = report.includes('| Friction |') ? 'friction' : 'passed';
+  const status = report.includes('| Friction |') || report.includes('→ friction:') ? 'friction' : 'passed';
   const body = `## PR preview — ${target} (${status})\n\n${report}`;
   if (prNumber === undefined) throw new Error('preview: cannot comment without a PR number');
   check('gh', ['pr', 'comment', String(prNumber), '--body', body], root);

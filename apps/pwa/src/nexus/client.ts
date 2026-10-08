@@ -159,7 +159,12 @@ export interface NexusClient {
   getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
   getRunGraph(id: string): Promise<RunGraphDetail>;
   getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string }>;
-  putRunGraphYaml(id: string, yaml: string): Promise<{ id: string; source: 'mine'; editable: true; saved: true }>;
+  putRunGraphYaml(id: string, yaml: string): Promise<{ id: string; source: 'mine'; editable: true; saved: true; version?: number; previous?: number | null }>;
+  /** Create a «mine» run graph: 409 when the id exists, 403 for a core id, 400/422 for a bad id or an invalid graph. */
+  createRunGraph(id: string, yaml: string): Promise<{ id: string; source?: 'mine'; editable?: true; version?: number; previous?: number | null }>;
+  /** CGE-RUN — operator-only demo run of a «mine» graph (repository recipes only). */
+  startRunGraphRun(id: string): Promise<{ id: string; runId: string; demo?: boolean }>;
+  getRunGraphRun(id: string, runId: string): Promise<unknown>;
   cloneRunGraph(id: string, newId: string): Promise<{ id: string; source: 'mine'; editable: true; clonedFrom: string }>;
   getGraphKinds(graph: 'workflow' | 'harness'): Promise<{ kinds: GraphKindEntry[] }>;
   validateGraph(graph: 'workflow' | 'harness', yaml: string): Promise<GraphValidationResponse>;
@@ -1279,6 +1284,9 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),
     putRunGraphYaml: (id, yaml) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml }),
     cloneRunGraph: (id, newId) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/clone`, { newId }),
+    createRunGraph: (id, yaml) => request('POST', '/v1/graphs', { id, yaml }),
+    startRunGraphRun: (id) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/run`),
+    getRunGraphRun: (id, runId) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`),
     getGraphKinds: (graph) => request('GET', `/v1/graph/kinds?graph=${graph}`),
     validateGraph: async (graph, yaml) => {
       try {

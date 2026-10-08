@@ -4,6 +4,7 @@ import { debug } from '../debug/log.js';
 import { deliver, inQuietHours, sendOutbound } from '../domains/outbound-alert.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { readReleaseRuns, type ReleaseRunNodeView, type ReleaseRunView } from '../nexus/api/ops-api.js';
+import { shardsLine } from '../release-loop/gate-shards.js';
 import { readPresence, type Presence } from './presence.js';
 
 /** AWAY-MODE-1 — 외출 중 발행 현황 공백 0. 발행 런 원장(`/v1/ops/release/runs` 와 같은 판정)을 직전에 본 것과 견주어
@@ -23,7 +24,14 @@ export interface RunMark {
   running?: string;
   /** 이 런에 대해 마지막으로 보낸 시각(ISO) — 생존 줄 간격의 기준. */
   sentAt: string;
+  /** GATE-LIVE-OBS — 마지막으로 본 잘림·실패 조각 수. 늘면 한 줄. */
+  shardsBad?: number;
 }
+
+const shardsBad = (run: ReleaseRunView): number | undefined => {
+  const counts = run.gateShards?.summary.counts;
+  return counts ? counts.timeout + counts.failed : undefined;
+};
 
 export interface WatchState { runs: Record<string, RunMark> }
 
@@ -104,6 +112,10 @@ export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: num
   if (running && running.nodeId !== prev.running && running.nodeId === 'gate') {
     lines.push(`▶ gate 시작${running.startedAt ? ` · ${new Date(running.startedAt).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hour12: false })} KST` : ''}`);
   }
+  const bad = shardsBad(run);
+  if (run.gateShards && bad !== undefined && bad > (prev.shardsBad ?? 0)) {
+    lines.push(`⚠️ gate 조각 잘림·실패 ${bad} · ${shardsLine(run.gateShards.summary)}`);
+  }
   if (run.status !== prev.status) {
     if (run.status === 'done') {
       const took = minutesSince(run.startedAt, now);
@@ -117,15 +129,19 @@ export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: num
   }
   if (!lines.length && run.status === 'running' && now - Date.parse(prev.sentAt) >= ALIVE_EVERY_MS) {
     const mins = minutesSince(running?.startedAt, now);
-    lines.push(`💓 ${label(run)} 발행 진행 중 · 지금 ${running?.nodeId ?? '다음 노드 준비'}${mins !== null ? `(${mins}분째)` : ''} · 끝난 노드 ${ended.length}/${run.path.filter((step) => !TERMINAL.has(step)).length || ended.length}`);
+    lines.push(`💓 ${label(run)} 발행 진행 중 · 지금 ${running?.nodeId ?? '다음 노드 준비'}${mins !== null ? `(${mins}분째)` : ''} · 끝난 노드 ${ended.length}/${run.path.filter((step) => !TERMINAL.has(step)).length || ended.length}`
+      + (run.gateShards ? `\n   ${shardsLine(run.gateShards.summary)}` : ''));
   }
-  const changed = lines.length > 0 || prev.ended !== ended.length || prev.status !== run.status || prev.running !== running?.nodeId;
+  const changed = lines.length > 0 || prev.ended !== ended.length || prev.status !== run.status || prev.running !== running?.nodeId
+    || (bad !== undefined && bad !== prev.shardsBad);
   return { lines, urgent, changed };
 }
 
 export function markOf(run: ReleaseRunView, sentAt: string): RunMark {
   const running = runningNode(run);
-  return { status: run.status, ended: endedNodes(run).length, ...(running ? { running: running.nodeId } : {}), sentAt };
+  const bad = shardsBad(run);
+  return { status: run.status, ended: endedNodes(run).length, ...(running ? { running: running.nodeId } : {}), sentAt,
+    ...(bad !== undefined ? { shardsBad: bad } : {}) };
 }
 
 /** 따라갈 런 — 최근 36시간 안에 시작한 것만. 원장엔 «running» 인 채 버려진 옛 런이 있어 상태로 고르면 매시간 생존 줄이 샌다. */
@@ -244,6 +260,7 @@ export function releaseNowText(runs: ReleaseRunView[] | 'unavailable', now: numb
   if (running) {
     const mins = minutesSince(running.startedAt, now);
     lines.push(`지금: ${running.nodeId}${mins !== null ? ` (${mins}분째)` : ''}`);
+    if (run.gateShards) lines.push(`   ${shardsLine(run.gateShards.summary)}`);
   }
   const last = ended.at(-1);
   if (last) lines.push(`마지막: ${nodeLine(last)}`);

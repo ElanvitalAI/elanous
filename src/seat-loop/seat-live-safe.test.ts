@@ -384,6 +384,26 @@ test('a person reopening the held cell allows one more launch', async () => {
   } finally { f.close(); }
 });
 
+test('deciding «멈춘다» on the repeat-stop card keeps the cell held (no relaunch)', async () => {
+  const f = fixture('구현');
+  try {
+    let n = 0;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
+      run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; },
+      enqueue: async () => { n += 1; return { id: `hq-40000000-0000-4000-8000-${String(n).padStart(12, '0')}` }; },
+      queueOutcome: () => 'retryable',
+      queueItems: () => [] };
+    for (let i = 0; i < 3; i++) await runSeatLoopOnce('TC', deps);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('held');
+    const ledger = new DecisionLedger({ stateDir: f.root, now: () => new Date('2026-10-04T04:00:00Z'), resolveVersion: f.deps.resolveDecisionVersion });
+    const card = ledger.list({ status: 'open' })[0]!;
+    ledger.decide(card.id, 'b', { kind: 'auto', agent: 'seat-loop:OP', track: 'OP', delegation: '10-06 COO 카드 거르기' }, '멈춘다');
+    const again = await runSeatLoopOnce('TC', { ...deps, now: () => new Date('2026-10-04T05:00:00Z') });
+    expect(again.status).not.toBe('queued');
+    expect(n).toBe(3);
+  } finally { f.close(); }
+});
+
 test('live-safe cannot silently retry when AUTOQ outcome is unknown', async () => {
   const f = fixture('구현');
   try {

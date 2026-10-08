@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setDefaultTimeout, describe, expect, test } from 'bun:test';
+import { runGitCli } from './git-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -50,13 +51,75 @@ function invokeGit(args: string[], env?: NodeJS.ProcessEnv) {
   });
 }
 
+/** ⭐ GATE-SPEED ③(2026-10-08) — `runGitCli()` 를 «같은 프로세스»에서 부른다.
+ *  초판은 시험마다 `bun bin/elanous.mjs --test git …` 를 새로 띄웠다(30개 시험 · 게이트 867s · 로컬 건당 ≈2s).
+ *  대부분의 시험이 재는 것은 CLI 기동이 아니라 `runGitCli` 의 바이트·상태 줄·rc·마커 판정이다.
+ *  ⇒ 그 시험들은 여기서 같은 조건(작업 디렉토리 · PATH 의 가짜 git · 격리 HOME/XDG)을 «프로세스 전역»에
+ *    잠깐 세우고 부른 뒤 되돌린다. `process.stdout/stderr.write` 를 바이트로 받고 `process.exitCode` 를 rc 로 읽는다.
+ *  ⛔ 배선(commander 의 argv 통과 · `--help` 통과 · 파이프 · 실물 충돌 한 건)은 `invokeGit`/`runInRepoReal` 의
+ *    실물 spawn 이 계속 문다 — «배선 PR 은 실물을 한 번 돌린다». */
+function runGitCliInProcess(cwd: string, args: string[], pathPrefix?: string): { status: number; stdout: Buffer; stderr: Buffer } {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-git-cli-home-'));
+  const savedCwd = process.cwd();
+  const envKeys = ['PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME'] as const;
+  const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]])) as Record<(typeof envKeys)[number], string | undefined>;
+  const savedExitCode = process.exitCode;
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
+  const out: Buffer[] = [];
+  const err: Buffer[] = [];
+  const capture = (sink: Buffer[]) => ((chunk: string | Uint8Array, encodingOrCallback?: unknown, callback?: unknown) => {
+    sink.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
+    const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
+    if (typeof done === 'function') (done as () => void)();
+    return true;
+  }) as typeof process.stdout.write;
+  let status: number;
+  try {
+    process.chdir(cwd);
+    if (pathPrefix) process.env.PATH = `${pathPrefix}:${savedEnv.PATH ?? ''}`;
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = join(home, '.config');
+    process.env.XDG_STATE_HOME = join(home, '.local', 'state');
+    process.exitCode = 0;
+    process.stdout.write = capture(out);
+    process.stderr.write = capture(err);
+    try {
+      runGitCli(args);
+    } finally {
+      process.stdout.write = stdoutWrite;
+      process.stderr.write = stderrWrite;
+    }
+    status = Number(process.exitCode ?? 0);
+  } finally {
+    process.chdir(savedCwd);
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    // ⚠️ Bun 은 `process.exitCode = undefined` 로는 안 되돌아간다(실측: 0 fail 인데 rc=1) — 0 으로 되돌린다.
+    process.exitCode = savedExitCode ?? 0;
+    rmSync(home, { recursive: true, force: true });
+  }
+  return { status, stdout: Buffer.concat(out), stderr: Buffer.concat(err) };
+}
+
+function asText(result: { status: number; stdout: Buffer; stderr: Buffer }) {
+  return { status: result.status, stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8') };
+}
+
+/** 격리 git 작업 트리에서 `runGitCli` 를 같은 프로세스로 부른다(문자열 결과). */
+function invokeGitInProcess(args: string[], pathPrefix?: string) {
+  return inIsolatedGitWorktree((cwd) => asText(runGitCliInProcess(cwd, args, pathPrefix)));
+}
+
 function invokeFakeGit(stdout: string, stderr: string, status: number) {
   const binDir = mkdtempSync(join(tmpdir(), 'elanous-git-cli-'));
   const gitPath = join(binDir, 'git');
   writeFileSync(gitPath, `#!/bin/sh\nprintf %s '${stdout}'\nprintf %s '${stderr}' >&2\nexit ${status}\n`);
   chmodSync(gitPath, 0o755);
   try {
-    return invokeGit(['fixture'], { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` });
+    return invokeGitInProcess(['fixture'], binDir);
   } finally {
     rmSync(binDir, { recursive: true, force: true });
   }
@@ -75,19 +138,7 @@ function invokeFakeGitBytes(stdout: Buffer, stderr: Buffer, status: number) {
   writeFileSync(gitPath, `#!/bin/sh\ncat '${outPath}'\ncat '${errPath}' >&2\nexit ${status}\n`);
   chmodSync(gitPath, 0o755);
   try {
-    return inIsolatedGitWorktree((cwd) => {
-      const home = mkdtempSync(join(tmpdir(), 'elanous-git-cli-home-'));
-      try {
-        return spawnSync('bun', [...entrypoint, '--test', 'git', 'fixture'], {
-          cwd,
-          env: isolatedCliEnvironment(home, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
-          timeout: 60_000,
-          maxBuffer: Infinity,
-        });
-      } finally {
-        rmSync(home, { recursive: true, force: true });
-      }
-    });
+    return inIsolatedGitWorktree((cwd) => runGitCliInProcess(cwd, ['fixture'], binDir));
   } finally {
     rmSync(binDir, { recursive: true, force: true });
   }
@@ -158,7 +209,7 @@ describe('elanous git', () => {
   }, 90_000);
 
   test('forwards git failure and exits with git actual exit code', () => {
-    const result = invokeGit(['no-such-subcommand']);
+    const result = invokeGitInProcess(['no-such-subcommand']);
     const output = `${result.stdout}${result.stderr}`;
     expect(result.status).not.toBe(0);
     expect(output).toContain(`[git] no-such-subcommand FAILED rc=${result.status}`);
@@ -211,7 +262,13 @@ describe('elanous git', () => {
     }
   }
 
+  /** 충돌 판정 시험의 기본 경로 — `runGitCli` 를 같은 프로세스에서(위 `runGitCliInProcess` 참조). */
   function runInRepo(cwd: string, args: string[]) {
+    return asText(runGitCliInProcess(cwd, args));
+  }
+
+  /** 실물 진입점(`bun bin/elanous.mjs --test git …`) — 배선을 무는 시험에만. */
+  function runInRepoReal(cwd: string, args: string[]) {
     const home = mkdtempSync(join(tmpdir(), 'elanous-git-cli-home-'));
     try {
       return spawnSync('bun', [...entrypoint, '--test', 'git', ...args], {
@@ -224,7 +281,8 @@ describe('elanous git', () => {
 
   test('진짜 머지 충돌 — 트리에 상태가 «남았다»는 사실을 상태 줄이 말한다', () => {
     inRealConflictRepo((cwd) => {
-      const result = runInRepo(cwd, ['merge', 'other']);
+      // ⭐ 실물 진입점 — 충돌 표지가 CLI 를 거쳐서도 마지막 줄에 남는지(배선) 한 번은 실물로 잰다.
+      const result = runInRepoReal(cwd, ['merge', 'other']);
       expect(result.status).not.toBe(0);
       expect(result.stderr.trimEnd().split(/\r?\n/).at(-1))
         .toBe(`[git] merge FAILED rc=${result.status} worktree-changed=yes reason=merge-conflict`);
@@ -322,7 +380,8 @@ describe('elanous git', () => {
     // ⚠️ 저장소 «밖»에서 돌리면 elanous 의 격리 관문이 먼저 막는다(별개 축) — 그래서 저장소 «안»에서
     //   전역 옵션만 앞에 붙여 «파서»를 잰다. 피연산자를 건너뛰는지가 이 테스트의 대상이다.
     inRealConflictRepo((cwd) => {
-      const result = runInRepo(cwd, ['-c', 'user.name=probe', '-C', cwd, 'merge', 'other']);
+      // ⭐ 실물 진입점 — `-c`·`-C` 가 commander 를 «그대로» 통과하는지도 이 시험의 대상이다.
+      const result = runInRepoReal(cwd, ['-c', 'user.name=probe', '-C', cwd, 'merge', 'other']);
       expect(result.status).not.toBe(0);
       // 하위 명령이 `merge` 로 잡혔다 — `-c` 의 값도 `-C` 의 디렉토리도 «아니다».
       expect(result.stderr.trimEnd().split(/\r?\n/).at(-1))
@@ -383,17 +442,10 @@ describe('elanous git', () => {
       for (const n of names) writeFileSync(join(cwd, n), 'mine\n');
       git('commit', '-qam', 'mine');
 
-      const home = mkdtempSync(join(tmpdir(), 'elanous-git-cli-home-'));
-      try {
-        const result = spawnSync('bun', [...entrypoint, '--test', 'git', 'merge', 'other'], {
-          cwd, encoding: 'utf8', env: isolatedCliEnvironment(home), timeout: 60_000,
-        });
-        expect(result.status).not.toBe(0);
-        expect(result.stderr.trimEnd().split(/\r?\n/).at(-1))
-          .toBe(`[git] merge FAILED rc=${result.status} worktree-changed=yes reason=merge-conflict`);
-      } finally {
-        rmSync(home, { recursive: true, force: true });
-      }
+      const result = asText(runGitCliInProcess(cwd, ['merge', 'other']));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr.trimEnd().split(/\r?\n/).at(-1))
+        .toBe(`[git] merge FAILED rc=${result.status} worktree-changed=yes reason=merge-conflict`);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

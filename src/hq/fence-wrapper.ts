@@ -3,6 +3,9 @@ import { chmodSync, constants, copyFileSync, lstatSync, mkdirSync, mkdtempSync, 
 import { dirname, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createPatch } from 'diff';
+import { debug } from '../debug/log.js';
+import { notifyOwners } from '../loops/checker.js';
+import { FENCE_FAILURE_STREAK, fenceAlertRole, readFenceOutcome } from './fence-outcomes.js';
 
 const quote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
 
@@ -120,4 +123,34 @@ export function installHqFenceWrapper(configDir: string, body: string, yes: bool
     renameSync(temp, path);
   } finally { rmSync(tempDir, { recursive: true, force: true }); }
   return { path, preview, ...(backup ? { backup } : {}) };
+}
+
+export interface FenceAlertDeps { root: string; outcomeDir: string; now?: Date }
+
+/**
+ * The wrapper's owner alert. Returns the number of seat requests queued (0 or 1).
+ * - `fence failed (rc, role)`: queued only when that role's streak reached FENCE_FAILURE_STREAK
+ *   (an unknown streak is not read as «first failure» — it is queued, still capped per role/day).
+ * - Any other wrapper failure (entry missing, bun missing, role missing): queued under `hq-fence:wrapper`.
+ */
+export function hqFenceAlert(reason: string, deps: FenceAlertDeps): number {
+  const now = deps.now ?? new Date();
+  const fenceFailure = /fence failed \(rc=/.test(reason);
+  const role = fenceAlertRole(reason);
+  let streak: number | null = null;
+  let lastAt: string | undefined;
+  if (fenceFailure && role) {
+    const outcome = readFenceOutcome(deps.outcomeDir, role);
+    streak = outcome?.consecutiveFailures ?? null;
+    lastAt = outcome?.lastAt;
+    if (streak !== null && streak < FENCE_FAILURE_STREAK) {
+      debug.log('hq.fence-wrapper', 'alert-suppressed', { role, streak, threshold: FENCE_FAILURE_STREAK, reason });
+      return 0;
+    }
+  }
+  const id = `hq-fence:${fenceFailure && role ? role : 'wrapper'}`;
+  const text = streak !== null ? `${reason} · ${streak} consecutive runs (last ${lastAt ?? 'unknown'})` : reason;
+  const added = notifyOwners([{ id, owner: 'TC', enabled: true, registered: true, state: 'failing', reason: text }], { root: deps.root, now });
+  debug.log('hq.fence-wrapper', added ? 'alert-queued' : 'alert-deduplicated', { id, role, streak, reason });
+  return added;
 }

@@ -24,7 +24,8 @@ import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
 import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
-import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
+import { resetAutohealProcessMemory } from './stop-autoheal.js';
+import { defaultGitMergeSeam, defaultLlmResolve, mergeMainIntoWorktreeWithResolveOptions, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
 import { WORKTREE_BRANCH_PREFIX, plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { branchGoalId } from '../cli/pr-lineage.js';
@@ -67,6 +68,9 @@ const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => bas
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
+// STOP-AUTOHEAL 의 «프로세스 안 한 번» 기억(#24915)은 런 id 로 남는다 — 같은 런 id 를 다시 쓰는 시험이 앞 시험의 기억을 물려받지 않게 비운다.
+beforeEach(() => { resetAutohealProcessMemory(); });
+
 // 이 파일의 재작업 기계 시험은 «예산 기본값»이 아니라 «기계»를 잰다 — 2026-09-24 대표 결정으로 기본값이
 //   { shadowStop:false, maxRounds:3 } 이 됐으므로, 옛 기본(판정만 기록 · 상한 6)을 여기서 고정한다.
 //   기본값 자체는 test/user-config-self-implement-auto-open-pr.test.ts 가 잰다. 자기 오버레이를 거는 시험은 그 값이 이긴다.
@@ -87,6 +91,88 @@ beforeEach(() => {
   }));
 });
 afterEach(() => { setUserConfigOverlay(null); });
+
+describe('run stop ledger attribution', () => {
+  test('implement aborted adds exactly one stop without replacing existing ledger events', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'stop on failed implement', seams: seams({
+      implement: async () => ({ ok: false, summary: 'child failed' }),
+      writeRunLedger: (entry) => { entries.push(entry); },
+    }) });
+    expect(result.stage).toBe('aborted');
+    expect(entries.filter((entry) => entry.event === 'stop')).toHaveLength(1);
+    expect(entries.find((entry) => entry.event === 'stop')!.data).toMatchObject({ class: 'unclassified', cause: 'implement aborted', nextMove: expect.any(String), evidenceRef: expect.any(String) });
+    expect(entries.some((entry) => entry.event === 'implemented')).toBe(true);
+    expect(entries.some((entry) => entry.event === 'run-status')).toBe(true);
+  });
+
+  test('merge hold adds exactly one stop and retains merge decision', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'stop on merge hold', autoMerge: false,
+      seams: seams({ writeRunLedger: (entry) => { entries.push(entry); } }),
+    });
+    expect(result.mergeReason).toBe('no-auto-flag');
+    expect(entries.filter((entry) => entry.event === 'stop')).toHaveLength(1);
+    expect(entries.find((entry) => entry.event === 'stop')!.data).toMatchObject({ class: 'unclassified', cause: 'merge held: no-auto-flag', evidenceRef: expect.any(String), nextMove: expect.any(String) });
+    expect(entries.some((entry) => entry.event === 'merge-decision')).toBe(true);
+  });
+
+  test('blocked draft PR open failure on a same-branch rerun records one stop with «기존 PR 갱신»', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'stop on draft pr exists', maxReworkRounds: 0, seams: seams({
+      gateResults: [false],
+      preservationHasChanges: () => true,
+      openPr: async () => { throw new Error('a pull request for branch "self-impl/x" into branch "main" already exists:\nhttps://github.com/o/r/pull/1'); },
+      persistPrBodyArtifact: () => ({ path: '/tmp/blocked-draft-verdict.md' }),
+      writeRunLedger: (entry) => { entries.push(entry); },
+    }) });
+    expect(result).toMatchObject({ ok: false, stage: 'gate-failed' });
+    const stops = entries.filter((entry) => entry.event === 'stop');
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.data).toMatchObject({ class: 'unclassified', cause: 'draft PR open failed: a PR already exists for this branch', evidenceRef: '/tmp/blocked-draft-verdict.md' });
+    expect(String(stops[0]!.data.nextMove)).toContain('기존 PR 갱신');
+  });
+});
+
+describe('STOP-AUTOHEAL wiring', () => {
+  test('a recorded stop is dispatched in shadow by default — one autoheal line, no action', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const results: unknown[] = [];
+    let called = 0;
+    await runSelfImplement({ feature: 'autoheal shadow on merge hold', autoMerge: false, seams: seams({
+      writeRunLedger: (entry) => { entries.push(entry); },
+      stopAutohealActions: { 'rebase-regate': () => { called += 1; return { ok: true }; } },
+      onStopAutoheal: (r) => { results.push(r); },
+    }) });
+    const heal = entries.filter((entry) => entry.event === 'autoheal');
+    expect(heal).toHaveLength(1);
+    expect(heal[0]!.data).toMatchObject({ class: 'unclassified', action: 'needs-owner', mode: 'shadow', outcome: 'needs-owner' });
+    expect(results).toHaveLength(1);
+    expect(called).toBe(0);
+  });
+
+  test('live mode runs derive-evidence-rejudge once for a required-evidence-uncovered stop', async () => {
+    setUserConfigOverlay((config) => ({
+      ...config,
+      tools: { ...config.tools, selfImplement: { ...config.tools.selfImplement, reworkBudget: { ...PINNED_REWORK_BUDGET }, autoheal: { mode: 'live' } } },
+    }));
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const calls: string[] = [];
+    const goal = ['goal', '## REQUIRED EVIDENCE', '- [wiring] changed unit is reached from the existing caller'].join('\n');
+    const result = await runSelfImplement({ feature: goal, autoMerge: true, seams: seams({
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review pass', reviewed: true, diffTruncated: false }),
+      mergePr: async () => ({ merged: true }),
+      writeRunLedger: (entry) => { entries.push(entry); },
+      stopAutohealActions: { 'derive-evidence-rejudge': (ctx) => { calls.push(ctx.record.class); return { ok: true, detail: 'wiring derived' }; } },
+    }) });
+    expect(result.mergeReason).toBe('required-evidence-uncovered');
+    expect(entries.find((entry) => entry.event === 'stop')!.data.class).toBe('evidence-uncovered');
+    expect(calls).toEqual(['evidence-uncovered']);
+    const heal = entries.filter((entry) => entry.event === 'autoheal');
+    expect(heal.map((entry) => entry.data.phase)).toEqual(['attempt', 'result']);
+    expect(heal[1]!.data).toMatchObject({ action: 'derive-evidence-rejudge', mode: 'live', outcome: 'healed', detail: 'wiring derived' });
+  });
+});
 
 describe('run-origin ledger attribution', () => {
   test('run-origin records the child provider the run will use (10-05 PODPROVIDER)', async () => {
@@ -4957,6 +5043,8 @@ describe('runSelfImplement — traversal shadow wiring', () => {
 
   test('enabling additive traversal instrumentation preserves result and every existing observation', async () => {
     const run = async (observePipeline: SelfImplementSeams['observePipeline']) => {
+      // 두 실행이 같은 런 id 를 쓴다 — 앞 실행의 autoheal «한 번» 기억이 뒤 실행의 관측을 바꾸지 않게 한다.
+      resetAutohealProcessMemory();
       const { events, restore } = capturePipelineEvents();
       const pipelineEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
       try {
@@ -5368,6 +5456,103 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
       event: 'gate-failed-child-unrelated-escalated',
       data: expect.objectContaining({ round: 0, childResponsibility: 'none', introduced: 0, preexisting: 0, unknown: 1, unknownReason: 'module-load-error' }),
     }));
+  });
+
+  // ── GATE-ENV-RETRY (0.2.20 P1) — 10-06 PR #24438 «test-result-unavailable · escalating without rework» 재현 ──
+  test('GATE-ENV-RETRY: 환경 결손(test-result-unavailable) gate 는 구현을 버리지 않고 gate 만 다시 돌아 통과하면 리뷰로 간다', async () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = (debug as { log: typeof debug.log }).log;
+    const features: string[] = [];
+    const sleeps: number[] = [];
+    let gates = 0;
+    let reviews = 0;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = seams({
+        features,
+        gate: async () => gates++ === 0
+          ? { passed: false, log: '[test] result unavailable', reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 1, unknownReason: 'test-result-unavailable', childResponsibility: 'none' } }
+          : { passed: true, log: '[test] PASS' },
+        reviewDiff: async () => { reviews++; return { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'ok', reviewed: true }; },
+      });
+      s.gateEnvRetry = { delayMs: 5, sleep: async (ms) => { sleeps.push(ms); } };
+      const result = await runSelfImplement({ feature: 'F', maxReworkRounds: 2, seams: s });
+      expect(result.stage).toBe('pr-opened');
+      expect(result.harvestable).toBeUndefined();
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(gates).toBe(2);
+    expect(features).toHaveLength(1);
+    expect(sleeps).toEqual([5]);
+    expect(reviews).toBeGreaterThan(0);
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'self-implement.gate-env-retry', event: 'retry-scheduled',
+      data: expect.objectContaining({ round: 0, attempt: 1, kind: 'test-result-unavailable' }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'self-implement.gate-env-retry', event: 'retry-result',
+      data: expect.objectContaining({ attempt: 1, passed: true, stillEnvDeficit: false }),
+    }));
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'gate-failed-child-unrelated-escalated' }));
+  });
+
+  test('GATE-ENV-RETRY: 재측정 뒤에도 환경 결손(index.lock)이면 버리지 않고 PR 을 남겨 harvestable 로 끝낸다', async () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = (debug as { log: typeof debug.log }).log;
+    const features: string[] = [];
+    let gates = 0;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    let result: Awaited<ReturnType<typeof runSelfImplement>>;
+    try {
+      const s = seams({
+        features,
+        gate: async () => {
+          gates++;
+          return { passed: false, log: "fatal: Unable to create '/r/.git/index.lock': File exists.", reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 1, childResponsibility: 'none' } };
+        },
+      });
+      s.gateEnvRetry = { attempts: 2, delayMs: 0, sleep: async () => {} };
+      result = await runSelfImplement({ feature: 'F', maxReworkRounds: 2, seams: s });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(gates).toBe(3);
+    expect(features).toHaveLength(1);
+    expect(result).toMatchObject({ ok: false, stage: 'gate-failed', harvestable: true, prNumber: 7 });
+    expect(result.detail).toContain('env-deficit, harvestable');
+    expect(result.detail).toContain('git-lock');
+    expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement.gate-env-retry', event: 'exhausted', data: expect.objectContaining({ kind: 'git-lock', attempts: 2 }) }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'gate-env-deficit-harvestable', data: expect.objectContaining({ kind: 'git-lock' }) }));
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'gate-failed-child-unrelated-escalated' }));
+  });
+
+  test('GATE-ENV-RETRY: 도입 실패는 로그에 환경 어휘가 있어도 재측정하지 않는다(종전 동작 유지)', async () => {
+    const events: Array<{ category: string; event: string }> = [];
+    const original = (debug as { log: typeof debug.log }).log;
+    let gates = 0;
+    (debug as { log: typeof debug.log }).log = ((category, event) => { events.push({ category, event }); }) as typeof debug.log;
+    try {
+      const s = seams({
+        gate: async () => {
+          gates++;
+          return gates === 1
+            ? { passed: false, log: 'index.lock · 1 fail', reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0 } }
+            : { passed: true, log: '[test] PASS' };
+        },
+      });
+      s.gateEnvRetry = { delayMs: 0, sleep: async () => { throw new Error('must not sleep'); } };
+      const result = await runSelfImplement({ feature: 'F', maxReworkRounds: 1, seams: s });
+      expect(result.stage).toBe('pr-opened');
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(gates).toBe(2);
+    expect(events.filter(({ category }) => category === 'self-implement.gate-env-retry')).toHaveLength(0);
   });
 
   test('실패 시험 0건에 같은 미검증 집합이 두 라운드 연속이면 재작업을 멈추고 사람에게 올린다(run-7dd4cce6)', async () => {
@@ -8589,6 +8774,66 @@ describe('runSelfImplement — G2 PR-直前 main-싱크', () => {
     unavailable.onProgress = ({ message }) => { unavailableProgress.push(message); };
     expect((await runSelfImplement({ feature: 'F', seams: unavailable })).stage).toBe('pr-opened');
     expect(unavailableProgress).toContain('origin/main 충돌해결됨 — llm-resolved; 규모 변화: 못 쟀다 — 통합 결과 full 재-gate…');
+  });
+
+  test('MERGE-INTENT-RESOLVE — main-sync through the real resolver with a merged sibling PR, then full regate in postsync mode', async () => {
+    // Real git conflict: the walker branch and a merged sibling PR (#4242) both rewrote src/a.ts.
+    const repo = realpathSync(mkdtempSync(join(tmpdir(), 'orch-merge-intent-')));
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    };
+    try {
+      git('init', '-q'); git('checkout', '-qb', 'main');
+      git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+      mkdirSync(join(repo, 'src'));
+      writeFileSync(join(repo, 'src/a.ts'), 'base\n');
+      git('add', '.'); git('commit', '-qm', 'base');
+      git('checkout', '-qb', 'feature');
+      writeFileSync(join(repo, 'src/a.ts'), 'walker line\n');
+      git('commit', '-qam', 'feat: walker');
+      git('checkout', '-q', 'main');
+      writeFileSync(join(repo, 'src/a.ts'), 'sibling line\n');
+      git('commit', '-qam', 'feat: retry guard (#4242)');
+      git('checkout', '-q', 'feature');
+
+      const prompts: string[] = [];
+      const stream = (async (messages: Array<{ content: string }>) => { prompts.push(messages[0]!.content); return 'walker line\nsibling line'; }) as typeof import('../llm.js')['streamLLM'];
+      const order: string[] = [];
+      const gateContexts: Array<{ runId?: string; mode?: 'postsync' } | undefined> = [];
+      const s = g2Seams({ mergeStatus: 'merged', gateResults: [true, true], order, gateContexts });
+      s.mergeMain = async () => {
+        order.push('mergeMain');
+        return mergeMainIntoWorktreeWithResolveOptions(repo, 'main', {
+          mode: 'off', stream,
+          siblingLookup: async () => ({ title: 'retry guard', body: 'Keep the retry guard on every send.' }),
+        });
+      };
+      const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+      const original = debug.log;
+      (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+        events.push({ category, event, data: data as Record<string, unknown> });
+      }) as typeof debug.log;
+      let r: Awaited<ReturnType<typeof runSelfImplement>>;
+      try { r = await runSelfImplement({ feature: 'F', seams: s }); }
+      finally { (debug as { log: typeof debug.log }).log = original; }
+      const intentEvents = events.filter((entry) => entry.category === 'self-implement.main-sync' && entry.event === 'intent-resolve');
+      expect(intentEvents.map((entry) => entry.data.phase)).toEqual(['resolve', 'regate']);
+      expect(intentEvents[0]!.data).toMatchObject({ adopted: 'sibling-intent', prs: [4242] });
+      expect(intentEvents[1]!.data).toMatchObject({
+        phase: 'regate', adopted: ['sibling-intent'], siblingIntentAdopted: true, regatePassed: true,
+        files: [{ file: 'src/a.ts', adopted: 'sibling-intent', prs: [4242] }],
+      });
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain('#4242 retry guard');
+      expect(prompts[0]).toContain('Keep the retry guard on every send.');
+      expect(readFileSync(join(repo, 'src/a.ts'), 'utf8')).toBe('walker line\nsibling line\n');
+      expect(r.stage).toBe('pr-opened');
+      expect(order).toEqual(['gate:true', 'commit', 'mergeMain', 'gate:true', 'openPr']);
+      expect(gateContexts.map((ctx) => ctx?.mode)).toEqual([undefined, 'postsync']);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   test('llm-resolved(충돌해결) → full 재-gate·통과 시 PR (통합 리스크 큼)', async () => {
@@ -15858,6 +16103,15 @@ describe('declaredScopeUnmadeLine — ***「하나도 안 만들었나」만 말
 });
 
 describe('detectDeclaredScopeDiff — 선언한 대상 밖 변경', () => {
+  test('declared source includes its exact sibling test, not other tests', () => {
+    const scope = detectDeclaredScopeDiff({
+      goalDocument: goalDocumentWithDeclaredTargets('src/in.ts'),
+      changedFiles: ['src/in.test.ts', 'src/other.test.ts'],
+    });
+    expect(scope.outsideNames).toEqual(['src/other.test.ts']);
+    expect(scope.outsideCount).toBe(1);
+    expect(scope.unmadeCount).toBe(0);
+  });
   test('대상 밖 파일이 바뀌면 수와 이름을 남긴다', () => {
     const diff = detectDeclaredScopeDiff({
       goalDocument: goalDocumentWithDeclaredTargets('src/in.ts · src/also.ts'),

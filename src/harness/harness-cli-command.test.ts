@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
+import { loadRunLedger, runLedgerDir, appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
 import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
@@ -836,6 +837,74 @@ describe('harness CLI command', () => {
     expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1(dry-run) · 처리 중 1 · 표식 만료 1 · 24h 넘음 2 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
   });
 
+  test('RUN-TTL GitHub adapters: open self-impl listing, head commit time, and a durable memo journal', async () => {
+    const { githubRunTtlAdapters } = await import('./harness-cli-command.js');
+    const root = mkdtempSync(join(tmpdir(), 'run-ttl-adapter-'));
+    const calls: string[][] = [];
+    const execute = (args: string[]) => {
+      calls.push(args);
+      if (args[1]?.includes('pulls?state=open')) return JSON.stringify([
+        { number: 5, title: 't', draft: true, state: 'open', head: { ref: 'self-impl/a', sha: 'abc' }, base: { ref: 'main' }, labels: [], created_at: '2026-10-01T00:00:00Z', merged_at: null },
+        { number: 6, title: 't', draft: true, state: 'open', head: { ref: 'feature/x', sha: 'def' }, base: { ref: 'main' }, labels: [], created_at: '2026-10-01T00:00:00Z', merged_at: null },
+      ]);
+      if (args[1]?.includes('commits?sha=abc')) return JSON.stringify([{ sha: 'abc', commit: { committer: { date: '2026-10-02T00:00:00Z' } } }]);
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    };
+    try {
+      const adapters = await githubRunTtlAdapters('my/repo', execute, async (args) => execute(args), root);
+      const open = await adapters.listOpenPrs();
+      expect(open).toEqual([{ number: 5, branch: 'self-impl/a', labels: [], createdAt: '2026-10-01T00:00:00Z', headSha: 'abc' }]);
+      expect(await adapters.lastCommitAt(open[0]!)).toBe('2026-10-02T00:00:00Z');
+      expect(adapters.memoSent!('5:abc')).toBe(false);
+      adapters.recordMemoSent!('5:abc');
+      const reopened = await githubRunTtlAdapters('my/repo', execute, async (args) => execute(args), root);
+      expect(reopened.memoSent!('5:abc')).toBe(true);
+      expect(reopened.memoSent!('5:new')).toBe(false);
+      // An unreadable journal (here: a directory where the file should be) cannot prove «once».
+      const broken = mkdtempSync(join(tmpdir(), 'run-ttl-adapter-broken-'));
+      mkdirSync(join(broken, 'run-ttl', 'memos.jsonl'), { recursive: true });
+      const unreadable = await githubRunTtlAdapters('my/repo', execute, async (args) => execute(args), broken);
+      expect(() => unreadable.memoSent!('5:abc')).toThrow();
+      rmSync(broken, { recursive: true, force: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('draft sweep runs the RUN-TTL step: shadow by default (no writes), live from tools.selfImplement.runTtl', async () => {
+    const lines: string[] = [];
+    const now = Date.now();
+    const labels: unknown[] = [];
+    const memos: unknown[] = [];
+    const adapters = {
+      listDrafts: async () => [], listMerged: async () => [],
+      getRunStatus: async () => undefined, listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {}, closeDraft: async () => {},
+    };
+    const runTtl = {
+      listOpenPrs: async () => [{ number: 7, branch: 'self-impl/old', labels: [], createdAt: new Date(now - 72 * 3_600_000).toISOString(), headSha: 'abc' }],
+      lastCommitAt: async () => new Date(now - 48 * 3_600_000).toISOString(),
+      resolveRun: async () => ({ alive: false as const, reason: 'owner-run-unknown' }),
+      sendMemo: (...args: unknown[]) => { memos.push(args); },
+      addLabel: (...args: unknown[]) => { labels.push(args); },
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, runTtl, repository: () => 'my/repo', write: (line) => lines.push(line) });
+    try {
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+      expect(JSON.parse(lines.at(-1)!).runTtl).toMatchObject({ mode: 'shadow', stale: [7], label: [7] });
+      expect(labels).toEqual([]);
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, runTtl: { mode: 'live' } } } }));
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+      expect(JSON.parse(lines.at(-1)!).runTtl).toMatchObject({ mode: 'live', label: [7] });
+      expect(labels).toEqual([[7, 'elanous:needs-rebase']]);
+      expect(memos).toEqual([]);
+    } finally {
+      setUserConfigOverlay(null);
+    }
+  });
+
   test('draft sweep apply transitions stale running label before close and dry-run leaves both untouched', async () => {
     const labels: unknown[] = [];
     const closed: unknown[] = [];
@@ -1650,6 +1719,38 @@ describe('harness CLI command', () => {
       dispatch.mockRestore();
       log.mockRestore();
       process.exitCode = previousExit;
+    }
+  });
+
+  test('nonzero Pod exit appends one stop and preserves the previous ledger and exit classification', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-run-stop-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    const exit = process.exitCode;
+    const runId = 'run-12345678-1234-1234-1234-123456789abc';
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((_args, callbacks) => {
+      callbacks?.onOutput?.(`[self-dev] 1 goal 병렬 실행 · run ${runId}\n${JSON.stringify([{ error: { code: 'pod-job-failed', message: 'pod-job-failed: childError=OOMKilled' } }])}`);
+      return 1;
+    });
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      appendRunLedgerEntry({ runId, event: 'start', data: { original: true } }, runLedgerDir(root));
+      const { program } = install(async () => {}, async () => {}, undefined, undefined, undefined, undefined, undefined,
+        async () => ({ cardId: 'card', mode: 'observe', decisions: {} as never }));
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'a request', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      const ledger = loadRunLedger(runId, runLedgerDir(root))!;
+      expect(ledger.filter((entry) => entry.event === 'stop')).toHaveLength(1);
+      expect(ledger[0]).toMatchObject({ event: 'start', data: { original: true } });
+      expect(ledger[1]).toMatchObject({ event: 'stop', data: { class: 'pod-died', cause: 'Pod exit 1: pod-failure — OOMKilled', evidenceRef: expect.any(String), nextMove: expect.any(String) } });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified', expect.objectContaining({ runId, reason: 'pod-failure', status: 1 }));
+      expect(process.exitCode).toBe(1);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'a request', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      expect(loadRunLedger(runId, runLedgerDir(root))!.filter((entry) => entry.event === 'stop')).toHaveLength(1);
+    } finally {
+      dispatch.mockRestore(); log.mockRestore(); process.exitCode = exit;
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

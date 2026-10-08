@@ -5,7 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { Background, Controls, Handle, Position, ReactFlow, type Edge, type EdgeTypes, type Node, type NodeProps, type NodeTypes } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { LoopRow } from '@/components/loops/loop-status';
-import { activityEdgeKey, activityNodes, activityTraceTarget, cardPathEdges, EDGE_HIGHLIGHT_MS, FIXED_NODES, isRoundTrip, journeyEdges, journeyParam, journeyStages, KIND_WORDS, nearDetail, PACKET_SHAPES, RUNS_NODE, SEAT_NAMES, zoomTier, type ActivityEdge, type ActivityNode, type NearDetail, type NodeDetailSource } from './loop-activity-map';
+import { activityEdgeKey, activityNodes, activityTraceTarget, cardPathEdges, EDGE_HIGHLIGHT_MS, FIXED_NODES, isGhostLaunch, isRoundTrip, journeyEdges, journeyParam, journeyStages, KIND_WORDS, nearDetail, PACKET_SHAPES, RUNS_NODE, SEAT_NAMES, zoomTier, type ActivityEdge, type ActivityNode, type NearDetail, type NodeDetailSource } from './loop-activity-map';
 import { toPublicText } from './public-text';
 import { PacketEdge, PACKET_MS, type PacketData } from './PacketEdge';
 import { NODE_STATE } from '@/components/ops/ReleaseFlow';
@@ -62,7 +62,8 @@ function prefersReducedMotion(): boolean {
 function handStyle(edge: ActivityEdge): 'broken' | 'shadow' | 'live' | null {
   return edge.kind === 'hand' ? edge.broken ? 'broken' : edge.mode === 'shadow' ? 'shadow' : 'live' : null;
 }
-function edgeWord(edge: ActivityEdge): string {
+function edgeWord(edge: ActivityEdge, ghost: boolean, now: number): string {
+  if (ghost) return `${KINDS.launch} · 유령 · 런 원장 없음 ${Math.floor((now - Date.parse(edge.at)) / 60_000)}분`;
   const hand = handStyle(edge);
   return hand === 'broken' ? `${KINDS.hand} · 끊김 ✕` : hand === 'shadow' ? `${KINDS.hand} · 그림자` : KINDS[edge.kind];
 }
@@ -123,12 +124,13 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
   const runCount = new Set(edges.filter(edge => edge.kind === 'run' && edge.to.startsWith('loop:')).map(edge => edge.to)).size;
   const detailOf = (id: string): NearDetail | undefined => {
     if (tier !== 'near') return undefined;
-    const detail = nearDetail(id, edges, id === RUNS_NODE ? { running: runCount, ...details?.[id] } : details?.[id], labelOf);
+    const detail = nearDetail(id, edges, id === RUNS_NODE ? { running: runCount, ...details?.[id] } : details?.[id], labelOf, now);
     // 보일 것이 하나도 없는 노드엔 상자를 안 붙인다(빈 상자가 이웃 노드를 덮는다).
     return detail.now === null && detail.running === null && detail.waiting === null && detail.recent.length === 0 ? undefined : detail;
   };
-  const flowNodes: Node<MapData>[] = groups.flatMap(({ column, nodes: group }) => group.map((node, index) => ({
-    id: nodeKeys.get(node.id)!, type: 'activity', position: { x: column * 220, y: index * 138 },
+  const groupStarts = groups.map((_, index) => groups.slice(0, index).reduce((width, group) => width + Math.ceil(group.nodes.length / 8), 0));
+  const flowNodes: Node<MapData>[] = groups.flatMap(({ nodes: group }, groupIndex) => group.map((node, index) => ({
+    id: nodeKeys.get(node.id)!, type: 'activity', position: { x: (groupStarts[groupIndex]! + Math.floor(index / 8)) * 220, y: (index % 8) * 138 },
     data: { label: node.label, type: node.type, verdict: node.verdict, detail: detailOf(node.id) },
   })));
   FIXED_NODES.forEach((fixed, index) => {
@@ -137,7 +139,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
       data: { label: node.label, type: node.type, verdict: node.verdict, detail: detailOf(node.id) } });
   });
   const others = nodes.filter(node => node.type === 'other');
-  others.forEach((node, index) => flowNodes.push({ id: nodeKeys.get(node.id)!, type: 'activity', position: { x: index * 180, y: Math.max(...groups.map(g => g.nodes.length), 1) * 138 + 40 }, data: { label: node.label, type: node.type, detail: detailOf(node.id) } }));
+  others.forEach((node, index) => flowNodes.push({ id: nodeKeys.get(node.id)!, type: 'activity', position: { x: Math.floor(index / 8) * 180, y: Math.max(...groups.map(g => Math.min(g.nodes.length, 8)), 1) * 138 + 40 + (index % 8) * 138 }, data: { label: node.label, type: node.type, detail: detailOf(node.id) } }));
   const flowEdges: Edge<PacketData & { edge: ActivityEdge }>[] = edges.filter(edge => nodeKeys.has(edge.from) && nodeKeys.has(edge.to)).map((edge, index) => {
     const key = activityEdgeKey(edge);
     const age = now - (seenAt[key] ?? 0);
@@ -146,22 +148,23 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
     const dim = focusKeys !== null && !picked;
     // 넘김: 그림자 = 흐린 점선 · 실발사 = 실선 · 끊김 = 붉은 짧은 점선 ⊕ 문면 «끊김»(색만으로 가르지 않는다).
     const hand = handStyle(edge);
-    const label = edgeWord(edge);
+    const ghost = isGhostLaunch(edge, edges, now);
+    const label = edgeWord(edge, ghost, now);
     const baseOpacity = hand === 'shadow' ? 0.35 : 0.55;
-    const packet = !reduced && age < PACKET_WINDOW_MS
+    const packet = !ghost && !reduced && age < PACKET_WINDOW_MS
       ? { key, shape: PACKET_SHAPES[edge.kind], word: KINDS[edge.kind], roundTrip: isRoundTrip(edge, edges) } : null;
     return { id: `edge-${index}`, type: 'packet', source: nodeKeys.get(edge.from)!, target: nodeKeys.get(edge.to)!, label,
       data: { edge, packet, hand }, animated: false, focusable: true, interactionWidth: 24,
-      style: { stroke: hand === 'broken' ? '#fca5a5' : picked || (!dim && fresh) ? '#7dd3fc' : '#7492a8', strokeWidth: picked || (!dim && fresh) ? 4 : 2,
+      style: { stroke: ghost || hand === 'broken' ? '#fca5a5' : picked || (!dim && fresh) ? '#7dd3fc' : '#7492a8', strokeWidth: picked || (!dim && fresh) ? 4 : 2,
         opacity: dim ? 0.16 : picked || fresh ? 1 : baseOpacity,
-        ...(hand === 'shadow' ? { strokeDasharray: '6 5' } : hand === 'broken' ? { strokeDasharray: '2 7' } : {}),
+        ...(ghost || hand === 'broken' ? { strokeDasharray: '2 7' } : hand === 'shadow' ? { strokeDasharray: '6 5' } : {}),
         transition: 'stroke 1.5s ease, stroke-width 1.5s ease, opacity 1.5s ease' },
-      labelStyle: { fill: dim ? '#7492a8' : hand === 'broken' ? '#fecaca' : picked || fresh ? '#e0f2fe' : '#a8b7c7', fontSize: 12, opacity: dim ? 0.4 : 1 },
+      labelStyle: { fill: dim ? '#7492a8' : ghost || hand === 'broken' ? '#fecaca' : picked || fresh ? '#e0f2fe' : '#a8b7c7', fontSize: 12, opacity: dim ? 0.4 : 1 },
     };
   });
   return <section aria-label="루프 활동 지도" className="min-w-0 space-y-3">
     <p className="text-sm text-slate-300">자리(큰 원) · 루프(작은 원) · 최근 60분 실제 사건. 노드나 간선을 누르면 Trace로 이동합니다.</p>
-    <p className="text-xs text-slate-400">꾸러미 모양 · 요청 ● 결정 ◆ 보고 ■ 넘김 ▲ 발사 ★ 판단 ⬟ · 넘김 실선 = 실발사 · 점선 = 그림자 · ✕ = 끊김 · 확대하면 노드 안 지금 일이 보입니다.</p>
+    <p className="text-xs text-slate-400">꾸러미 모양 · 요청 ● 결정 ◆ 보고 ■ 넘김 ▲ 발사 ★ 판단 ⬟ · 넘김 실선 = 실발사 · 점선 = 그림자 · ✕ = 끊김 · 유령 = 발사 뒤 10분간 같은 ref 런 간선 없음 · 확대하면 노드 안 지금 일이 보입니다.</p>
     {demo !== null && <section aria-label="데모 여정" className="rounded-xl border border-sky-500/50 bg-[#173556] p-3">
       <h3 className="font-semibold">여정 · {toPublicText(demo)}</h3>
       {state === 'ready' && journeyKeys.size === 0 && <p role="status" className="mt-1 text-sm text-slate-300">아직 사건 없음 — 틱이 이 카드를 집으면 1단계부터 채워집니다</p>}
@@ -212,7 +215,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
     <ul aria-label="최근 간선 사건" className="space-y-2">{edges.map((edge, index) => <li key={`edge-${index}`}>
       <button type="button" onClick={() => window.location.assign(activityTraceTarget(edge.to, edge))}
         className={`block w-full min-w-0 break-words rounded-lg border border-slate-600 px-3 py-2 text-left text-sm focus-visible:outline-2 focus-visible:outline-sky-400 ${selectedCard !== null ? pathKeys.has(activityEdgeKey(edge)) ? 'border-sky-300 bg-sky-500/30 text-sky-100' : 'bg-slate-800/30 text-slate-400 opacity-40' : now - (seenAt[activityEdgeKey(edge)] ?? 0) < EDGE_HIGHLIGHT_MS ? 'bg-sky-500/20 text-sky-100 transition-colors duration-[1500ms] motion-reduce:transition-none' : 'bg-slate-800/50 text-slate-300'}`}>
-        {toPublicText(nodes.find(n => n.id === edge.from)?.label ?? '출발')} → {toPublicText(nodes.find(n => n.id === edge.to)?.label ?? '도착')} · {edgeWord(edge)} · <time dateTime={edge.at}>{new Date(edge.at).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul' })}</time>
+        {toPublicText(nodes.find(n => n.id === edge.from)?.label ?? '출발')} → {toPublicText(nodes.find(n => n.id === edge.to)?.label ?? '도착')} · {edgeWord(edge, isGhostLaunch(edge, edges, now), now)} · <time dateTime={edge.at}>{new Date(edge.at).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul' })}</time>
       </button>
     </li>)}</ul>
     {state === 'ready' && edges.length === 0 && <p role="status" className="text-slate-300">최근 사건이 없습니다.</p>}

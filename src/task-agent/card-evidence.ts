@@ -7,9 +7,15 @@
  * - 관측: `debug.log('task-agent', 'card-pr-bound', {card, runId, pr})`.
  */
 import { existsSync } from 'node:fs';
+import { STOP_CLASS_POD_FAILURE, STOP_CLASS_NO_LAUNCH } from '../task-orchestrator/surfaces/pod-failure-reason.js';
+import { readLaunchBinding } from '../harness/launch-registry.js';
+import { readRunExits, type RunExit } from '../harness/harness-incidents.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { cardPrNumber, taskAgentStatePath, updateTaskCard, readTaskCard, type TaskCard } from './task-hand.js';
+import { judgeNextMove } from './judge.js';
 
 const GOAL_ID = /^[a-f0-9]{16}$/;
 const PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)$/;
@@ -19,7 +25,7 @@ const RUN_ID = /^run-[A-Za-z0-9_-]{4,64}$/;
 export interface CardRunSnapshot {
   host: readonly RunLedgerEntry[] | null;
   children: Readonly<Record<string, readonly RunLedgerEntry[] | null>>;
-  podFinishes?: ReadonlyArray<{ childRunId: string; prUrl: string }>;
+  podFinishes?: ReadonlyArray<{ childRunId: string; prUrl: string; state?: string; childError?: string }>;
   /** 읽기 «실패»(원장·logs) — 부재(null)와 갈린다. 있으면 refresh 가 card-bind-failed 를 남긴다. */
   readErrors?: readonly string[];
 }
@@ -92,11 +98,39 @@ export function bindCardEvidence(card: Pick<TaskCard, 'runId'>, snapshot: CardRu
   return { ledgerFound: true, ...(goalId ? { goalId } : {}), ...(pr ? { pr } : {}), ...(childRunId ? { childRunId } : {}) };
 }
 
+/** DRAFT-NOT-ARCHIVE — 원장의 마지막 `salvaged`(self-implement.draft-not-archive) 줄이 남긴 수확 가지. 없으면 undefined. */
+export function salvageBranchOf(entries: readonly RunLedgerEntry[] | null | undefined): string | undefined {
+  return lastSalvaged(entries)?.branch;
+}
+
+function lastSalvaged(entries: readonly RunLedgerEntry[] | null | undefined): { branch: string; at: number; order: number } | undefined {
+  for (let at = (entries?.length ?? 0) - 1; at >= 0; at--) {
+    const entry = entries![at]!;
+    const branch = entry.event === 'salvaged' ? entry.data?.salvageBranch : undefined;
+    if (typeof branch === 'string' && branch.startsWith('salvage/')) return { branch, at: Date.parse(entry.timestamp ?? ''), order: at };
+  }
+  return undefined;
+}
+
+/** 카드 런(호스트 → 자식 나중 것부터)의 수확 가지. 원장을 못 읽었으면 `readErrors` 로 갈린다(⛔ «없음» 이 아니다). */
+export async function readCardSalvageBranch(card: Pick<TaskCard, 'runId' | 'createdAt'>, deps: CardRunEvidenceDeps = {}): Promise<{ salvageBranch: string | null; readErrors?: readonly string[] }> {
+  if (!card.runId) return { salvageBranch: null };
+  const snapshot = await readCardRunSnapshot(card, { ...deps, podFinishes: () => [] });
+  // 호스트 ⊕ Pod 자식 원장 전체에서 «가장 나중»(타임스탬프) 수확 가지. 시각이 같거나 못 읽으면 호스트가 이긴다.
+  const candidates = [lastSalvaged(snapshot.host), ...podChildRunIds(snapshot.host, card.runId).map((id) => lastSalvaged(snapshot.children[id]))]
+    .filter((row): row is NonNullable<typeof row> => row !== undefined);
+  const latest = candidates.reduce<typeof candidates[number] | undefined>((best, row) => !best || (Number.isFinite(row.at) && (!Number.isFinite(best.at) || row.at > best.at)) ? row : best, undefined);
+  return { salvageBranch: latest?.branch ?? null, ...(snapshot.readErrors?.length ? { readErrors: snapshot.readErrors } : {}) };
+}
+
 /** 원장·logs 읽기(시험 주입). */
 export interface CardRunEvidenceDeps {
   loadLedger?: (runId: string) => RunLedgerEntry[] | null;
-  podFinishes?: (childRunIds: readonly string[], sinceIso: string) => Array<{ childRunId: string; prUrl: string }>;
+  podFinishes?: (childRunIds: readonly string[], sinceIso: string) => Array<{ childRunId: string; prUrl: string; state?: string; childError?: string }>;
   now?: () => Date;
+  launchBound?: (runId: string) => boolean;
+  dispatchPod?: (runId: string, sinceIso: string) => boolean;
+  runExit?: (runId: string) => RunExit | undefined;
 }
 
 async function defaultLoadLedger(): Promise<(runId: string) => RunLedgerEntry[] | null> {
@@ -120,20 +154,30 @@ export function ledgerLoader(dirs: readonly string[], load: (runId: string, dir:
   };
 }
 
+function defaultDispatchPod(runId: string, sinceIso: string): boolean {
+  const path = logsDbPath();
+  if (!existsSync(path)) return false;
+  const store = LogStore.openReadOnly(path);
+  try {
+    const sinceMs = Date.parse(sinceIso);
+    return store.queryAll({ exactCategories: ['harness.substrate'], events: ['dispatch-pod'], ...(Number.isFinite(sinceMs) ? { sinceMs } : {}) })
+      .some((row) => { try { return (JSON.parse(row.data ?? '{}') as { runId?: string }).runId === runId; } catch { return false; } });
+  } finally { store.close(); }
+}
+
 async function defaultPodFinishes(): Promise<NonNullable<CardRunEvidenceDeps['podFinishes']>> {
-  const { LogStore, logsDbPath } = await import('../mss/logging/log-store.js');
   return (childRunIds, sinceIso) => {
     const path = logsDbPath();
     if (!childRunIds.length || !existsSync(path)) return [];
     const store = LogStore.openReadOnly(path);
     try {
       const wanted = new Set(childRunIds);
-      const rows: Array<{ childRunId: string; prUrl: string }> = [];
+      const rows: Array<{ childRunId: string; prUrl: string; state?: string; childError?: string }> = [];
       const sinceMs = Date.parse(sinceIso);
       for (const row of store.queryAll({ exactCategories: ['self-implement.pod'], events: ['job-finished'], ...(Number.isFinite(sinceMs) ? { sinceMs } : {}) })) {
-        let data: { childRunId?: unknown; prUrl?: unknown } | null = null;
+        let data: { childRunId?: unknown; prUrl?: unknown; state?: unknown; childError?: unknown } | null = null;
         try { data = row.data ? JSON.parse(row.data) : null; } catch { continue; }
-        if (typeof data?.childRunId === 'string' && wanted.has(data.childRunId) && typeof data.prUrl === 'string') rows.push({ childRunId: data.childRunId, prUrl: data.prUrl });
+        if (typeof data?.childRunId === 'string' && wanted.has(data.childRunId)) rows.push({ childRunId: data.childRunId, prUrl: typeof data.prUrl === 'string' ? data.prUrl : '', ...(typeof data.state === 'string' ? { state: data.state } : {}), ...(typeof data.childError === 'string' ? { childError: data.childError } : {}) });
       }
       return rows;
     } finally { store.close(); }
@@ -150,10 +194,9 @@ export async function readCardRunSnapshot(card: Pick<TaskCard, 'runId' | 'create
   const host = safe(card.runId);
   const childIds = podChildRunIds(host, card.runId);
   const children = Object.fromEntries(childIds.map((id) => [id, safe(id)]));
-  let podFinishes: Array<{ childRunId: string; prUrl: string }> = [];
-  const missing = childIds.filter((id) => !children[id] || !lastPr(children[id]!));
-  if (missing.length && (!host || !lastPr(host))) {
-    try { podFinishes = (deps.podFinishes ?? await defaultPodFinishes())(missing, card.createdAt); } catch (error) { readErrors.push(`logs: ${reason(error)}`); }
+  let podFinishes: NonNullable<CardRunSnapshot['podFinishes']> = [];
+  if (childIds.length && (!host || !lastPr(host))) {
+    try { podFinishes = (deps.podFinishes ?? await defaultPodFinishes())(childIds, card.createdAt); } catch (error) { readErrors.push(`logs: ${reason(error)}`); }
   }
   return { host, children, podFinishes, ...(readErrors.length ? { readErrors } : {}) };
 }
@@ -171,6 +214,52 @@ export async function refreshCardRunBinding(cardId: string, statePath = taskAgen
     try { debug.log('task-agent', 'card-bind-failed', { card: cardId, runId: card.runId, errors: snapshot.readErrors }); } catch { /* fail-soft */ }
   }
   const evidence = bindCardEvidence(card, snapshot);
+  if (card.status === 'launched' && !card.pr && !evidence.pr && !snapshot.readErrors?.length) {
+    const rows = [...(snapshot.host ?? []), ...Object.values(snapshot.children).flatMap((entries) => entries ?? [])];
+    let exit: RunExit | undefined;
+    let exitReadFailed = false;
+    try { exit = (deps.runExit ?? ((id) => readRunExits(effectiveInstanceRoot()).find((row) => row.runId === id)))(card.runId); }
+    catch { exitReadFailed = true; }
+    const finished = [...(snapshot.podFinishes ?? [])].reverse().find((item) => item.state === 'failed');
+    const parentTerminal = [...(snapshot.host ?? [])].reverse().find((item) => item.event === 'run-status');
+    const parentFailed = parentTerminal?.data?.runStatus === 'failed';
+    const boundAt = card.history.find((item) => item.event === 'run-bound')?.at;
+    const elapsed = boundAt ? (deps.now ?? (() => new Date()))().getTime() - Date.parse(boundAt) : NaN;
+    const launched = rows.some((entry) => entry.event === 'pod-child-run');
+    let dispatched = false;
+    let dispatchReadFailed = false;
+    try { dispatched = (deps.dispatchPod ?? defaultDispatchPod)(card.runId, boundAt ?? card.createdAt); }
+    catch { dispatchReadFailed = true; }
+    let launchBound = false;
+    let launchReadFailed = false;
+    try { launchBound = (deps.launchBound ?? ((id) => !!readLaunchBinding(id)))(card.runId); }
+    catch { launchReadFailed = true; }
+    const timedOut = !finished && !launched && !dispatched && !dispatchReadFailed && !exit && !exitReadFailed && !launchBound && !launchReadFailed && Number.isFinite(elapsed) && elapsed >= 600_000;
+    const hasPr = !!card.pr || !!evidence.pr;
+    const exitHarvestBranch = exit?.lastLines?.some((line) => /(?:수확할 브랜치: |ELANOUS_POD_SALVAGE )(?:salvage\/|self-impl\/)[^\s]+/.test(line)) ?? false;
+    const ledgerFailure = rows.find((entry) => entry.event === 'run-status' && entry.data?.runStatus === 'failed'
+      && (entry.data?.failureKind === STOP_CLASS_POD_FAILURE || entry.data?.stop_class === STOP_CLASS_POD_FAILURE));
+    const resultFailure = rows.find((entry) => entry.event === 'result-without-error' && entry.data?.ok === false);
+    const noLaunchExit = exit?.reason === STOP_CLASS_NO_LAUNCH && exit.status !== null && exit.status !== 0 && !launched && !dispatched && !dispatchReadFailed;
+    // 발사 근거가 있는 런이 nonzero 로 끝났고 분류기가 pod-failure 나 unknown(원인 미상)을 냈다 = 죽은 런(TA-JUDGE-DEAD-RUN ③ «exit 1 · unknown/pod-failure»).
+    const deadExit = (exit?.reason === STOP_CLASS_POD_FAILURE || exit?.reason === 'unknown') && exit.status !== null && exit.status !== 0;
+    const podFailure = !noLaunchExit && (launched || dispatched) && (parentFailed && (finished || !!ledgerFailure || !!resultFailure) || deadExit)
+      && (finished || ledgerFailure || resultFailure || deadExit);
+    const failure = podFailure ? judgeNextMove({ terminalRun: {
+      kind: STOP_CLASS_POD_FAILURE,
+      reason: finished?.childError || (exit?.status != null ? `exit ${exit.status} · ${exit.reason || STOP_CLASS_POD_FAILURE}` : resultFailure ? 'result-without-error · failed' : finished ? `job-finished failed · ${STOP_CLASS_POD_FAILURE}` : `run-status failed · ${STOP_CLASS_POD_FAILURE}`),
+      hasPr,
+      hasHarvestBranch: exitHarvestBranch || rows.some((entry) => typeof entry.data?.harvestBranch === 'string' && !!entry.data.harvestBranch) || !!salvageBranchOf(rows),
+    } }) : noLaunchExit ? judgeNextMove({ terminalRun: { kind: STOP_CLASS_NO_LAUNCH, reason: `exit ${exit!.status} · ${exit!.reason}`, hasPr, hasHarvestBranch: false } })
+      : timedOut ? judgeNextMove({ terminalRun: { kind: STOP_CLASS_NO_LAUNCH, reason: 'card-run-bound 뒤 10분 동안 Pod 발사 근거 없음', hasPr: false, hasHarvestBranch: false } }) : undefined;
+    if (failure?.reason.startsWith('failed/')) {
+      const at = (deps.now ?? (() => new Date()))().toISOString();
+      const next = updateTaskCard(statePath, cardId, (current) => current?.status === 'launched' && current.runId === card.runId && !current.pr && current.refSource !== 'manual' ? {
+        ...current, status: 'failed', history: [...current.history, { at, event: 'failed', detail: failure.reason, runId: card.runId }],
+      } : undefined);
+      return { card: next, evidence };
+    }
+  }
   // 이미 묶인 PR 이 있으면 «같은» PR(번호 ⊕ 낸 자식)을 다시 찾았을 때만 뒤늦은 골을 채운다.
   const samePr = (current: TaskCard) => current.pr === undefined
     || (evidence.pr !== undefined && cardPrNumber(current) === evidence.pr.number && current.runChildId === evidence.childRunId);

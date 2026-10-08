@@ -9,6 +9,7 @@ import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
@@ -18,7 +19,12 @@ export interface ReleaseLoopConfig {
   gatePodPool?: string;
   gatePodBunCache?: string;
   gatePodShards?: number;
+  /** GATE-TIMEOUT-HEAL — the per-shard deadline floor; each shard gets planned × 1.5 above it (capped). */
   gatePodShardTimeoutSeconds?: number;
+  /** GATE-INSTALL-CACHE — concurrent `bun install`s per gate node (default 4 · 0 = off). */
+  gatePodInstallSlots?: number;
+  /** GATE-MEM-ADMIT — seconds a gate shard waits for pool admission (memory headroom) before launching anyway with `admission-timeout` (default 300 · 0 = off). */
+  gatePodAdmissionWaitSeconds?: number;
   /** GATE-SPEED A3①: gate shard Pod CPU — `2` (request = limit) or `{ request, limit }`. Omitted = request 1 / limit 4. */
   gatePodCpu?: number | string | { request?: number | string; limit?: number | string };
   gateRemote?: string;
@@ -42,7 +48,7 @@ export interface UnattendedReleaseDeps {
   ledgerRoot?: string;
   config?: ReleaseLoopConfig;
   configPath?: string;
-  graph?: (path: string, options: { input: ReleaseRunInput }) => Promise<GraphRunState>;
+  graph?: (path: string, options: { input: ReleaseRunInput; pinChildUniverse?: boolean; deps?: { root?: string } }) => Promise<GraphRunState>;
   checklist?: (version: string) => Pick<ReturnType<typeof cutChecklistGate>, 'ok' | 'red' | 'undecided' | 'blocked'>;
   freezeRoot?: string;
   /** Names already taken for prerelease numbering (remote release branches and tags). */
@@ -142,7 +148,9 @@ export async function runUnattendedRelease(
   }
   const beforeGraph = readLandingFreeze(deps.freezeRoot);
   if (beforeGraph && !opts.forceFreeze) throw new LandingFrozenError(beforeGraph);
-  const state = await (deps.graph ?? runGraph)(GRAPH, { input });
+  // RELEASE-LEDGER-UNIVERSE: one universe for the run ledger, the release ledger and every node subprocess.
+  const root = releaseRunUniverse({ root: deps.ledgerRoot });
+  const state = await (deps.graph ?? runGraph)(GRAPH, { input, pinChildUniverse: true, deps: { root } });
   // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
   // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.
   if (state.status === 'failed' && !opts.forceFreeze) {

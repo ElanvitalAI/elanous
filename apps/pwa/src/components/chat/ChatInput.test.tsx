@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'bun:test';
 import { act, create } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
-import { META_COMMANDS } from '@/lib/chat-runtime';
+import { dispatchMeta, META_COMMANDS } from '@/lib/chat-runtime';
 import { ChatInput } from './ChatInput';
 import { DaemonClient, SeatRequestError } from '@/lib/daemon-client';
 
@@ -399,6 +399,82 @@ describe('ChatInput · local command menu', () => {
       }
       if (originalLocalStorage) Object.defineProperty(globalThis, 'localStorage', originalLocalStorage);
       else delete (globalThis as { localStorage?: Storage }).localStorage;
+    }
+  });
+});
+
+describe('ChatInput · PCH-12 skill confirmation', () => {
+  test('selecting a $ skill sends the explicit /run-skill command with the typed task, not a plain prompt', async () => {
+    const originalFrame = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame');
+    globalThis.requestAnimationFrame = (callback) => { callback(0); return 1; };
+    const sent: string[] = [];
+    const queries: string[] = [];
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ skill: string; task: string }> = [];
+    const urls: string[] = [];
+    const id = '123e4567-e89b-12d3-a456-426614174000';
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      urls.push(String(input));
+      expect((init?.headers as Record<string, string>).authorization).toBe('Bearer secret');
+      if (init?.body) requests.push(JSON.parse(String(init.body)));
+      return Response.json(init?.body ? { id } : { status: 'done', ok: true, output: '수집 완료' }, { status: init?.body ? 202 : 200 });
+    }) as typeof fetch;
+    const daemon = {
+      client: { listSeatRequests: async () => ({ items: [], seats: [] }) } as never,
+      config: { baseUrl: '', token: '', provider: '' },
+      sessionId: '', setSessionId: () => {}, setConfig: () => {},
+    };
+    let tree: ReturnType<typeof create> | undefined;
+    let executed: ReturnType<typeof dispatchMeta> | undefined;
+    try {
+      await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatInput
+        onSubmit={(text) => {
+          sent.push(text);
+          if (text.includes('오늘 뉴스')) executed = dispatchMeta(text, {
+            client: daemon.client, sessionId: 'test', provider: '', setSessionId: () => {},
+            daemon: { baseUrl: 'http://fake', token: 'secret' },
+          });
+        }}
+        onListSkills={async (query) => { queries.push(query); return { entries: [{ name: 'omni-crawl', description: '웹 수집' }] }; }}
+      /></DaemonContext.Provider>); });
+      await act(async () => { tree!.root.findByType('textarea').props.onChange({ target: { value: '$omni' } }); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 230)); });
+      expect(queries).toEqual(['omni']);
+      if (!tree) throw new Error('ChatInput did not mount');
+      const mounted = tree;
+      const entry = mounted.root.findAllByType('li').find((node) => node.findAllByType('span').some((span) => span.children.join('') === 'omni-crawl'))!;
+      await act(async () => { entry.props.onMouseDown({ preventDefault() {} }); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(mounted.root.findByType('textarea').props.value).toBe('/run-skill omni-crawl ');
+      await act(async () => { mounted.root.findByType('textarea').props.onChange({ target: { value: '/run-skill omni-crawl 오늘 뉴스' } }); });
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+      expect(sent).toEqual(['/run-skill omni-crawl 오늘 뉴스']);
+      expect(mounted.root.findByType('textarea').props.value).toBe('');
+      await act(async () => { mounted.root.findByType('textarea').props.onChange({ target: { value: '오늘 뉴스 $omni' } }); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 230)); });
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+      expect(mounted.root.findByType('textarea').props.value).toBe('/run-skill omni-crawl 오늘 뉴스 ');
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+      expect(sent).toEqual(['/run-skill omni-crawl 오늘 뉴스', '/run-skill omni-crawl 오늘 뉴스']);
+      await act(async () => { mounted.root.findByType('textarea').props.onChange({ target: { value: '오늘 뉴스 $omni' } }); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 230)); });
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Tab', shiftKey: false, preventDefault() {} }); });
+      expect(mounted.root.findByType('textarea').props.value).toBe('오늘 뉴스 $omni-crawl');
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+      expect(mounted.root.findByType('textarea').props.value).toBe('/run-skill omni-crawl 오늘 뉴스 ');
+      await act(async () => { mounted.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); });
+      expect(sent).toEqual(Array(3).fill('/run-skill omni-crawl 오늘 뉴스'));
+      expect(await executed).toEqual({ text: '수집 완료' });
+      expect(requests).toEqual(Array(3).fill({ skill: 'omni-crawl', task: '오늘 뉴스' }));
+      expect(urls).toEqual(Array(3).fill(['http://fake/v1/skills/exec', `http://fake/v1/skills/exec/${id}`]).flat());
+    } finally {
+      if (tree) {
+        const mounted = tree;
+        await act(async () => { mounted.unmount(); });
+      }
+      globalThis.fetch = originalFetch;
+      if (originalFrame) Object.defineProperty(globalThis, 'requestAnimationFrame', originalFrame);
+      else delete (globalThis as { requestAnimationFrame?: typeof requestAnimationFrame }).requestAnimationFrame;
     }
   });
 });

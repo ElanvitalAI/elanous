@@ -13,6 +13,7 @@ import { Database } from 'bun:sqlite';
 import * as logsCli from '../cli/logs-cli.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { spawnSync } from 'node:child_process';
+import { spawnRealCli } from '../testing/real-cli-spawn.js';
 import { buildChildLlmSelection, buildDevCliSpec, buildDevCommandInput, buildDevEvidence, CHILD_LLM_PROVIDER_ALIASES, DEV_PLAN_REPLACEMENT, formatChildLlmInterpretationLine, formatDevPlanOptionHelp, normalizeChildLlmProvider, parsePositiveInt, parseActivityGraceSec, readChildLlmConfigFromUserConfig, resolveImplementationChildModel, selectDevAuthorInput, shouldSuppressDevJsonWrapper, type DevCliExecutor, defaultChildLlmModel } from './dev-cli.js';
 import { devResultOk, planDevPipeline, runDevPipeline, toSelfImplementOptions, buildSelfOrchestrateDevSpec, buildSelfImplementPlanDevSpec } from './dev-pipeline.js';
 import { EVIDENCE_LOCATION_REQUIREMENT } from '../self-implement/goal-author.js';
@@ -4040,7 +4041,12 @@ describe('dev --plan help names the replacement door', () => {
   }, 60_000);
 });
 
-describe('dev 은퇴 옵션 실물', () => {
+// ⏱️ GATE-SPEED ③ — 아래 세 describe 는 실물 `bin/elanous.mjs` spawn 을 «그대로» 두고 기다리는 방식만
+//   비동기 ⊕ 상한 있는 동시성(`describe.concurrent` ⊕ `spawnRealCli`)으로 바꿨다. spawn 타임아웃은 슬롯을 얻은
+//   뒤부터 재므로 시험 타임아웃은 대기열 몫까지 넉넉히 둔다.
+const REAL_CLI_TEST_TIMEOUT_MS = 600_000;
+
+describe.concurrent('dev 은퇴 옵션 실물', () => {
   const cli = resolve(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
   const repo = resolve(import.meta.dir, '..', '..');
   const retiredDefaults = {
@@ -4060,7 +4066,7 @@ describe('dev 은퇴 옵션 실물', () => {
     '--rows': '40',
   } as const;
 
-  it('Commander에서 A 옵션 14개를 제거하고 각 옵션의 자동 적용 기본값을 고정한다', () => {
+  it('Commander에서 A 옵션 14개를 제거하고 각 옵션의 자동 적용 기본값을 고정한다', async () => {
     const src = readFileSync(resolve(import.meta.dir, '../index.ts'), 'utf8');
     const devStart = src.indexOf(".command('dev [text...]')");
     const devEnd = src.indexOf('const DEV_PRIMARY_HELP_OPTIONS', devStart);
@@ -4073,57 +4079,57 @@ describe('dev 은퇴 옵션 실물', () => {
     }
   });
 
-  it.each(Object.entries(retiredDefaults))('%s는 unknown option과 자동 적용 기본값을 stderr 한 줄로 함께 알린다', (option, defaultValue) => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', option], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  it.each(Object.entries(retiredDefaults))('%s는 unknown option과 자동 적용 기본값을 stderr 한 줄로 함께 알린다', async (option, defaultValue) => {
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', option], { cwd: repo, timeoutMs: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`unknown option '${option}'`);
     expect(result.stderr).toContain(`⚠️ ${option} 은퇴; 적용 기본값: ${defaultValue}.`);
     expect(result.stderr.split('\n').filter((line) => line.includes(`${option} 은퇴`))).toHaveLength(1);
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   // OLD-DOOR-CLOSE(#24330): 바깥(표지 없는) `dev --ask` 는 은퇴 안내 전에 «닫혔다» 로 거부된다.
-  it('바깥에서 부른 dev --ask 는 닫힌 문으로 거부되고 대응 문을 말한다', () => {
+  it('바깥에서 부른 dev --ask 는 닫힌 문으로 거부되고 대응 문을 말한다', async () => {
     const env = { ...process.env };
     delete env.ELANOUS_HARNESS_ENTRANCE;
-    const result = spawnSync('bun', [cli, '--test', 'dev', '--ask', 'missing goal with spaces.md'], { cwd: repo, env, encoding: 'utf8', timeout: 60_000 });
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', '--ask', 'missing goal with spaces.md'], { cwd: repo, env, timeoutMs: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('elanous dev --ask 는 닫혔습니다 — harness say / harness ask 로');
     expect(result.stderr).not.toContain('ENOENT');
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   // 하니스 안(ELANOUS_HARNESS_ENTRANCE 표지)에서는 옛 동작 그대로 — 은퇴 안내 ⊕ 기존 하위 오류.
   it.each([
     ['--ask', ['--ask', 'missing goal with spaces.md'], "elanous harness ask 'missing goal with spaces.md'", "ENOENT: no such file or directory, open 'missing goal with spaces.md'"],
     ['--file', ['--file', 'missing file with spaces.md'], "elanous harness ask 'missing file with spaces.md'", "ENOENT: no such file or directory, open 'missing file with spaces.md'"],
     ['--say', ['--say', '   '], "elanous harness say '   '", '--say 입력이 비었다'],
-  ] as const)('%s 실행은 대응 명령에 사용자 인자를 보존하고 기존 하위 오류까지 유지한다', (_kind, args, replacement, existingFailure) => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', ...args], { cwd: repo, env: { ...process.env, ELANOUS_HARNESS_ENTRANCE: 'harness-ask' }, encoding: 'utf8', timeout: 60_000 });
+  ] as const)('%s 실행은 대응 명령에 사용자 인자를 보존하고 기존 하위 오류까지 유지한다', async (_kind, args, replacement, existingFailure) => {
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', ...args], { cwd: repo, env: { ...process.env, ELANOUS_HARNESS_ENTRANCE: 'harness-ask' }, timeoutMs: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`이 dev 골-구동 문은 은퇴 예정입니다; 대응 문: ${replacement}`);
     expect(result.stderr).toContain(existingFailure);
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it.each([
     { label: '--plan', commandArgs: ['--plan', 'x'] },
     { label: '--plan --implement', commandArgs: ['--plan', '--implement', 'x'] },
-  ])('$label 입력은 조합 검사와 하위 실행보다 먼저 은퇴 사유와 대응 문으로 거부한다', ({ commandArgs }) => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', ...commandArgs], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  ])('$label 입력은 조합 검사와 하위 실행보다 먼저 은퇴 사유와 대응 문으로 거부한다', async ({ commandArgs }) => {
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', ...commandArgs], { cwd: repo, timeoutMs: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('--plan 은 은퇴했고 명시적으로 거부됨');
     expect(result.stderr).toContain(DEV_PLAN_REPLACEMENT);
     expect(result.stderr).not.toContain('동시 사용 불가');
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('dev --help는 --plan 등록을 남기고 은퇴와 대응 문을 표시한다', () => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', '--help'], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  it('dev --help는 --plan 등록을 남기고 은퇴와 대응 문을 표시한다', async () => {
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', '--help'], { cwd: repo, timeoutMs: 60_000 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(0);
@@ -4131,9 +4137,9 @@ describe('dev 은퇴 옵션 실물', () => {
     const planLine = output.split('\n').find((line) => line.includes('--plan'));
     expect(planLine).toContain('은퇴한 staged 하니스 옵션');
     expect(output.replace(/\s+/g, ' ')).toContain(DEV_PLAN_REPLACEMENT);
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('옵션 생략은 기존 capability resolver 기본값을 실제 파이프라인 계획에 유지한다', () => {
+  it('옵션 생략은 기존 capability resolver 기본값을 실제 파이프라인 계획에 유지한다', async () => {
     const plan = planDevPipeline(buildDevCliSpec(IN, SELF, {}));
     expect(plan).toMatchObject({
       dispatch: 'self-mission',
@@ -4144,23 +4150,23 @@ describe('dev 은퇴 옵션 실물', () => {
     });
   });
 
-  it('--ask --json은 --hold 전용 계약으로 exit 2 거부된다', () => {
-    const result = spawnSync('bun', [cli, '--test', 'dev', '--ask', 'missing.json-goal.md', '--json'], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  it('--ask --json은 --hold 전용 계약으로 exit 2 거부된다', async () => {
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', '--ask', 'missing.json-goal.md', '--json'], { cwd: repo, timeoutMs: 60_000 });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('--json은 --hold 전용입니다');
     expect(result.stdout).toBe('');
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('B/C 옵션은 선언을 유지하고 골 입력이 없으면 은퇴 안내를 내지 않는다', () => {
+  it('B/C 옵션은 선언을 유지하고 골 입력이 없으면 은퇴 안내를 내지 않는다', async () => {
     const src = readFileSync(resolve(import.meta.dir, '../index.ts'), 'utf8');
     for (const option of ['--no-auto-merge', '--force-preflight', '--allow-no-evidence', '--base', '--context', '--role-llm', '--child-llm-provider', '--attach', '--elanous', '--backend']) {
       expect(new RegExp(`(?:\\.option|new Option)\\(\\s*['\"]${option}`).test(src)).toBe(true);
     }
-    const result = spawnSync('bun', [cli, '--test', 'dev', '--backend', 'self', '--transport', 'acp', 'x'], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+    const result = await spawnRealCli(['bun', cli, '--test', 'dev', '--backend', 'self', '--transport', 'acp', 'x'], { cwd: repo, timeoutMs: 60_000 });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('--transport 는 external backend 전용');
     expect(result.stderr).not.toContain('은퇴 예정');
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 // ⛔⭐⭐⭐ 실물 도움말 — **계약 갈림을 먼저 말하는가** (무인 리뷰 must-fix ①②)
@@ -4170,24 +4176,26 @@ describe('dev 은퇴 옵션 실물', () => {
 //   ⇒ 그래서 여기서만 실물 `bin/elanous.mjs` 를 spawn 한다(in-process import 로는 못 잰다).
 //   ⚠️ spawn 1회 ~7초 — per-test 타임아웃을 명시한다(기본 5초면 타임아웃이 곧 빈 출력이 되어
 //     "도움말이 없다" 와 구분이 안 된다 · 2026-08-03 cli-entry.test.ts 와 같은 이유).
-describe('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
+describe.concurrent('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
   const CLI = resolve(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
   // ⚠️ 같은 CLI 를 테스트마다 다시 띄우지 않는다(무인 리뷰 should-fix) — describe 당 **이름별 1회**만
   //   띄우고 캐시한다. 출력은 이 프로세스 안에서 불변이므로 캐시가 판정을 바꾸지 않는다.
-  const cache = new Map<string, string>();
-  function help(name: 'dev' | 'drive'): string {
+  //   ⏱️ 동시 실행이므로 «약속»을 캐시한다 — 같은 이름을 두 시험이 동시에 물어도 spawn 은 1회다.
+  const cache = new Map<string, Promise<string>>();
+  function help(name: 'dev' | 'drive'): Promise<string> {
     const hit = cache.get(name);
     if (hit !== undefined) return hit;
-    const r = spawnSync('bun', [CLI, name, '--help'], { encoding: 'utf8', timeout: 60_000 });
-    if (r.error) throw new Error(`spawn 실패(결함 아님): ${r.error.message}`);
-    if (r.signal) throw new Error(`시그널 종료(타임아웃 의심): ${r.signal}`);
-    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-    cache.set(name, out);
-    return out;
+    const pending = spawnRealCli(['bun', CLI, name, '--help'], { timeoutMs: 60_000 }).then((r) => {
+      if (r.error) throw new Error(`spawn 실패(결함 아님): ${r.error.message}`);
+      if (r.signal) throw new Error(`시그널 종료(타임아웃 의심): ${r.signal}`);
+      return `${r.stdout ?? ''}${r.stderr ?? ''}`;
+    });
+    cache.set(name, pending);
+    return pending;
   }
 
-  it('drive --help 의 설명이 **설명의 첫 줄부터** drive 계약을 말한다', () => {
-    const out = help('drive');
+  it('drive --help 의 설명이 **설명의 첫 줄부터** drive 계약을 말한다', async () => {
+    const out = await help('drive');
     // ⛔ 상대 순서만 재면(무인 리뷰 should-fix) **다른 문구가 새로 앞에 끼어드는 회귀**를 못 막는다.
     //   ⇒ 설명 블록의 **첫 줄 자체**를 단언한다. Commander 는 `Usage:` → 빈 줄 → 설명 순서로 찍으므로
     //     빈 줄을 걷어낸 뒤 `Usage:` 바로 다음 줄이 설명의 첫 줄이다.
@@ -4205,10 +4213,10 @@ describe('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
     expect(driveContractAt).toBeGreaterThanOrEqual(0);
     expect(unifiedDescriptionAt).toBeGreaterThanOrEqual(0);
     expect(driveContractAt).toBeLessThan(unifiedDescriptionAt);
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('⛔ 그 도움말은 dev 전용 옵션도 **여전히 광고한다** — 그래서 공유 사실을 명시해야 한다', () => {
-    const out = help('drive');
+  it('⛔ 그 도움말은 dev 전용 옵션도 **여전히 광고한다** — 그래서 공유 사실을 명시해야 한다', async () => {
+    const out = await help('drive');
     // ⛔⭐ Commander 는 설명을 «단말 너비로» 접는다 ⇒ 낱말 사이에 개행이 들어간다.
     //   문면을 그대로 `toContain` 하면 이 테스트는 「문면이 있나」가 아니라 ***「어디서 접혔나」***를 잰다.
     //   (실측: `도움말을 공유` 가 `도움말을\n공유` 로 갈려 실패했다 — 문면은 «있었다».)
@@ -4219,11 +4227,11 @@ describe('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
     // ⇒ 그렇기 때문에 "도움말을 공유한다 · 아래는 dev 기준" 이 반드시 있어야 한다.
     expect(flat).toContain('도움말을 공유');
     expect(flat).toMatch(/dev` 기준|dev 기준/);
-  }, 60_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('dev --help 와 drive --help 는 실제로 같다 (공유가 사실임을 못 박는다)', () => {
-    expect(help('dev')).toBe(help('drive'));
-  }, 120_000);
+  it('dev --help 와 drive --help 는 실제로 같다 (공유가 사실임을 못 박는다)', async () => {
+    expect(await help('dev')).toBe(await help('drive'));
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 /**
@@ -4249,7 +4257,7 @@ describe('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
  *   - 증거 태그 없는 골 파일        → `runDevPipeline` 안에서 던져 액션 «catch» 로 간다
  *   ⇒ 한쪽에서 `conclude` 를 빼면 그 경로에서만 미결론 줄이 뜬다 = 중복으로 못 속인다.
  */
-describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다»', () => {
+describe.concurrent('dev completion guard — 실물 거부 경로에서 «오탐이 없다»', () => {
   const REPO = resolve(import.meta.dir, '..', '..');
   const CLI = join(REPO, 'bin', 'elanous.mjs');
   // 완료 줄(`[dev] … 완료`)과 형태가 다른, 가드만 찍는 문면.
@@ -4258,13 +4266,12 @@ describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다
   // ⛔⭐⭐ 실물 CLI 를 띄우면 그 자식이 **저장소의 standalone 로그 sink 에 진짜로 쓴다**
   //   (무인 리뷰 must-fix). ⇒ state·config 를 «임시 디렉터리»로 격리하고 끝나면 지운다.
   //   ⚠️ 이 저장소 규율상 둘을 «같이» 줘야 한다 — `ELANOUS_STATE_DIR` 만으로는 config-dir 스코프가 안 갈린다.
-  function runCli(args: string[], extraEnv: Record<string, string> = {}, cwd: string = REPO): { code: number; stderr: string; stdout: string } {
+  async function runCli(args: string[], extraEnv: Record<string, string> = {}, cwd: string = REPO): Promise<{ code: number; stderr: string; stdout: string }> {
     const sandbox = mkdtempSync(join(tmpdir(), 'dev-guard-cli-'));
     try {
-      const r = spawnSync('bun', [CLI, '--config-dir', sandbox, ...args], {
+      const r = await spawnRealCli(['bun', CLI, '--config-dir', sandbox, ...args], {
         cwd,
-        encoding: 'utf8',
-        timeout: 120_000,
+        timeoutMs: 120_000,
         env: { ...process.env, ELANOUS_STATE_DIR: sandbox, ...extraEnv },
       });
       return { code: r.status ?? -1, stderr: r.stderr ?? '', stdout: r.stdout ?? '' };
@@ -4277,76 +4284,83 @@ describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다
   //   ⛔ 아래 두 「부재」 회귀만으로는 «가드를 통째로 지워도» 통과한다(무인 리뷰가 두 번 짚었다).
   //   ⇒ 테스트 전용 seam 으로 「결론 없이 액션이 끝나는」 상황을 «강제»해 양성으로 문다.
   //   ⇒ 이제 `src/index.ts` 에서 가드 설치를 지우면 «이 테스트가 실패한다».
-  it('결론 없이 끝나면 — 실물 CLI 가 산출을 남기고 0 이 아닌 코드로 끝난다', () => {
-    const r = runCli(['dev', 'x'], { ELANOUS_DEV_TEST_UNCONCLUDED_EXIT: '1' });
+  it('결론 없이 끝나면 — 실물 CLI 가 산출을 남기고 0 이 아닌 코드로 끝난다', async () => {
+    const r = await runCli(['dev', 'x'], { ELANOUS_DEV_TEST_UNCONCLUDED_EXIT: '1' });
     expect(r.stderr).toContain('[dev completion guard]');
     expect(r.stderr).toContain('결론 없이 종료');
     // ⛔ 이 한 줄이 B1 의 전부다 — 42차엔 여기가 `0` 이라 «성공처럼» 보였다.
     expect(r.code).not.toBe(0);
     // ⭐ sink 준비 전이면 logs.db 에 «못 남긴다»는 사실도 침묵하지 않는다(`R-GIT11`).
     expect(r.stderr).toContain('관측 sink 준비 전');
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('self-mission의 명시 --role-llm은 실물 dev 진입점에서 child LLM 대안과 함께 거부한다', () => {
-    const r = runCli(['--test', 'dev', '--file', '/dev/null', '--role-llm', 'implement=grok']);
+  it('self-mission의 명시 --role-llm은 실물 dev 진입점에서 child LLM 대안과 함께 거부한다', async () => {
+    const r = await runCli(['--test', 'dev', '--file', '/dev/null', '--role-llm', 'implement=grok']);
     expect(r.code).not.toBe(0);
     expect(r.stderr).toContain('--role-llm');
     expect(r.stderr).toContain('--child-llm-provider');
     expect(r.stderr).toContain('--child-llm-model');
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('명시 --role-llm은 실물 drive 별칭 진입점에서 거부한다', () => {
-    const r = runCli(['--test', 'drive', 'echo hi', '--goal', 'g', '--role-llm', 'implement=grok']);
+  it('명시 --role-llm은 실물 drive 별칭 진입점에서 거부한다', async () => {
+    const r = await runCli(['--test', 'drive', 'echo hi', '--goal', 'g', '--role-llm', 'implement=grok']);
     expect(r.code).not.toBe(0);
     expect(r.stderr).toContain('--role-llm');
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('attach advisory points to the existing PTY command without interrupting the existing validation path', () => {
-    const r = runCli(['dev', '--attach', 'pty-123', 'x']);
+  it('attach advisory points to the existing PTY command without interrupting the existing validation path', async () => {
+    const r = await runCli(['dev', '--attach', 'pty-123', 'x']);
     expect(r.stderr).toContain('elanous pty auto');
     expect(r.stderr).toContain("elanous pty auto 'pty-123'");
     expect(r.stderr).toContain('무효한 옵션: attach');
     expect(r.code).not.toBe(0);
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('attach advisory shell-quotes spaces, quotes, and shell metacharacters as one argument', () => {
-    const r = runCli(['dev', '--attach', "pty ref'; $(unsafe);", 'x']);
+  it('attach advisory shell-quotes spaces, quotes, and shell metacharacters as one argument', async () => {
+    const r = await runCli(['dev', '--attach', "pty ref'; $(unsafe);", 'x']);
     expect(r.stderr).toContain("elanous pty auto 'pty ref'\\''; $(unsafe);'");
     expect(r.stderr).toContain('무효한 옵션: attach');
     expect(r.code).not.toBe(0);
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('external backend advisory points to the existing agent-mission command without interrupting the existing validation path', () => {
-    const r = runCli(['dev', '--backend', 'codex', '--branch', 'wt/advisory', '--evidence', 'invalid', 'x']);
+  it('external backend advisory points to the existing agent-mission command without interrupting the existing validation path', async () => {
+    const r = await runCli(['dev', '--backend', 'codex', '--branch', 'wt/advisory', '--evidence', 'invalid', 'x']);
     expect(r.stderr).toContain('elanous agent-mission mission');
     expect(r.stderr).toContain('elanous agent-mission mission --backend codex');
     expect(r.stderr).toContain('--evidence 는 tsc|doc|test 만');
     expect(r.code).not.toBe(0);
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('default external and observe-only paths remain advisory-free without an explicit backend option', () => {
+  it('default external and observe-only paths remain advisory-free without an explicit backend option', async () => {
+    // ⏱️⛔ GATE-SPEED ③ — 옛 첫 케이스 `['dev', 'x']` 는 «거부 경로가 아니었다»: 기본 self-mission 이
+    //   ***저장소의 진짜 워크트리(2만여 파일)를 만들고 런을 시작***해 120초 spawn 타임아웃으로만 끝났다
+    //   (실측 172초 · 로컬 저장소에 `self-impl/x-2d711642-*` 워크트리·브랜치 26개가 쌓여 있었다).
+    //   ⇒ 같은 기본 경로에 «경로가 받지 않는 옵션» 하나를 더해 `buildDevCliSpec` 에서 정직하게 거부시킨다.
+    //   ⭐ 그 거부는 advisory 판정(`explicitOptions.includes('backend')`) «뒤»에 있으므로 문는 값은 같고,
+    //     아래 `무효한 옵션` 단언이 「advisory 지점을 지나서 거부됐다」를 양성으로 못 박는다.
     for (const args of [
-      ['dev', 'x'],
+      ['dev', '--evidence', 'invalid', 'x'],
       ['dev', '--observe-only', 'x'],
     ]) {
-      const r = runCli(args);
+      const r = await runCli(args);
       expect(r.stderr).not.toContain('elanous agent-mission mission');
+      expect(r.stderr).toContain('무효한 옵션');
       expect(r.code).not.toBe(0);
     }
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('JSON mode is rejected outside hold before attach validation', () => {
-    const r = runCli(['dev', '--json', '--attach', 'pty-123', 'x']);
+  it('JSON mode is rejected outside hold before attach validation', async () => {
+    const r = await runCli(['dev', '--json', '--attach', 'pty-123', 'x']);
     expect(r.code).toBe(2);
     expect(`${r.stdout}${r.stderr}`).toContain('--json은 --hold 전용입니다');
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('elanous hold remains advisory-free on its existing path', () => {
+  it('elanous hold remains advisory-free on its existing path', async () => {
     // ⭐ TUI-ONE-WORD-LAUNCH — 격리 우주에서 `--cwd`·`--worktree` 가 없으면 이제 워크트리를 «스스로» 만든다.
     //    ⛔ 본 저장소에 진짜 워크트리를 만들지 않도록 git 저장소 «밖» 임시 cwd 에서 돌려 사람 문면을 본다.
     const outside = mkdtempSync(join(tmpdir(), 'dev-hold-no-git-'));
     try {
-      const r = runCli(['dev', '--elanous', '--hold', 'x'], {}, outside);
+      const r = await runCli(['dev', '--elanous', '--hold', 'x'], {}, outside);
       expect(r.stderr).not.toContain('elanous pty auto');
       expect(r.stderr).not.toContain('elanous agent-mission mission');
       expect(r.stderr).toContain('작업 디렉토리를 스스로 정하지 못했다');
@@ -4354,28 +4368,28 @@ describe('dev completion guard — 실물 거부 경로에서 «오탐이 없다
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('초입 거부(self + 비-pty transport)는 정직한 결론이므로 미결론 산출이 없다', () => {
-    const r = runCli(['dev', '--backend', 'self', '--transport', 'acp', 'x']);
+  it('초입 거부(self + 비-pty transport)는 정직한 결론이므로 미결론 산출이 없다', async () => {
+    const r = await runCli(['dev', '--backend', 'self', '--transport', 'acp', 'x']);
     expect(r.stderr).toContain('--transport 는 external backend 전용');
     expect(r.code).not.toBe(0);
     expect(`${r.stdout}${r.stderr}`).not.toContain(UNCONCLUDED);
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  it('runDevPipeline 안에서 던진 거부(catch 경로)도 미결론 산출이 없다', () => {
+  it('runDevPipeline 안에서 던진 거부(catch 경로)도 미결론 산출이 없다', async () => {
     const goal = join(tmpdir(), `guard-wiring-no-evidence-${process.pid}.txt`);
     // ⛔ 증거 태그가 «없는» 골 — preflightGoalFileEvidence 가 runDevPipeline 안에서 던진다.
     writeFileSync(goal, '이 골은 요구 증거가 없다. 거부되어야 한다.\n', 'utf8');
     try {
-      const r = runCli(['dev', '--file', goal]);
+      const r = await runCli(['dev', '--file', goal]);
       expect(r.stderr).toContain('요구 증거가 없습니다');
       expect(r.code).not.toBe(0);
       expect(`${r.stdout}${r.stderr}`).not.toContain(UNCONCLUDED);
     } finally {
       rmSync(goal, { force: true });
     }
-  }, 130_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 // ── 감독자 결정이 «사람이 보는 스트림»에 닿는가 ─────────────────────────────

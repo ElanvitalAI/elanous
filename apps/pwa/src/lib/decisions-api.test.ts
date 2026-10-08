@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { decide, listOpenDecisions } from './decisions-api';
+import { decide, listOpenDecisions, listBoardNotices, replyToBoardNotice } from './decisions-api';
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
@@ -21,6 +21,19 @@ test('decide with three args preserves the original request body, optional note 
   expect(calls[0]!.init?.method).toBe('POST');
   expect(await decide(client, 'D/1', 'b', '의견')).toEqual({ decidedAt: '2026-10-05T00:00:00Z' });
   expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ choice: 'b', note: '의견' });
+});
+
+test('notice transport reads CEO notices and replies to their ID without changing decision requests', async () => {
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  const notice = { id: 7, from: 'TC', to: 'CEO', body: '조율 채널 요약', createdAt: '2026-10-07T00:00:00Z' };
+  const client = { fetchResponse: async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
+    return init ? json({ reply: { ...notice, from: 'CEO', to: 'TC', body: '확인' } }, 201) : json({ notices: [notice] });
+  } };
+  expect(await listBoardNotices(client)).toEqual([notice]);
+  expect(await replyToBoardNotice(client, 7, '확인')).toMatchObject({ from: 'CEO', to: 'TC', body: '확인' });
+  expect(calls.map(call => call.path)).toEqual(['/v1/ops-board/notices', '/v1/ops-board/notices']);
+  expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ noticeId: 7, body: '확인' });
 });
 
 test('list and decide expose status on failed reads/writes', async () => {

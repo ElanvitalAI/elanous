@@ -102,6 +102,7 @@ test('pr land emits the next-md warning but still merges with exit code 0', asyn
     runPublicLeakGate: () => 0,
     runExportLeakCheck: () => ({ measured: true, hits: [] }),
     runTestInterferenceGate: async () => 0,
+    runLandGlobalChecks: () => true,
     runAndroidGate: () => true,
     runPwaGate: () => true,
     runIosGate: () => true,
@@ -151,7 +152,7 @@ test('`freeze on` run during an in-flight pr land merge returns only after that 
     queryRunningRuns: () => { throw new Error('observation unavailable'); },
     runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true,
     runDaemonPortGate: () => true, runPublicLeakGate: () => 0, runExportLeakCheck: () => ({ measured: true, hits: [] }),
-    runTestInterferenceGate: async () => 0, runAndroidGate: () => true, runPwaGate: () => true, runIosGate: () => true,
+    runTestInterferenceGate: async () => 0, runLandGlobalChecks: () => true, runAndroidGate: () => true, runPwaGate: () => true, runIosGate: () => true,
     listOpenPrs: () => [],
     out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
     manager: {

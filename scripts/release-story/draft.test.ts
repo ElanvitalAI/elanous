@@ -339,8 +339,22 @@ test('first phrase keeps delimiters inside paired quotes', () => {
   const options = fixture();
   writeFileSync(options.nextPath, '# Next\n## Feat\n- visible\n');
   green('QUOTES', '/v1/outbound 가 «delivered: now — safe» 와 "ready: yes — ok" 및 `done: yes — ok` 를 보여 준다: details');
+  green('CURLY_COLON', '“검색: 빠름”을 보여 준다: details');
+  green('CURLY_DASH', '“검색 — 안전”을 보여 준다: details');
+  green('CURLY_DOT', '“검색 · 공유”를 보여 준다: details');
+  green('CORNER_COLON', '「검색: 빠름」을 보여 준다: details');
+  green('CORNER_DASH', '「검색 — 안전」을 보여 준다: details');
+  green('CORNER_DOT', '「검색 · 공유」를 보여 준다: details');
+  green('SINGLE', "'검색: 빠름 — 안전 · 공유'를 보여 준다: details");
+  green('CURLY_SINGLE', '‘검색: 빠름 — 안전 · 공유’를 보여 준다: details');
   const result = draftReleaseStory(options);
-  expect(readFileSync(result.files[0]!, 'utf8')).toContain('- /v1/outbound 가 «delivered: now — safe» 와 "ready: yes — ok" 및 `done: yes — ok` 를 보여 준다');
+  const lines = readFileSync(result.files[0]!, 'utf8').split('\n');
+  expect(lines).toContain('- /v1/outbound 가 «delivered: now — safe» 와 "ready: yes — ok" 및 `done: yes — ok` 를 보여 준다');
+  for (const title of ['“검색: 빠름”을', '“검색 — 안전”을', '“검색 · 공유”를', '「검색: 빠름」을', '「검색 — 안전」을', '「검색 · 공유」를', '‘검색: 빠름 — 안전 · 공유’를']) {
+    expect(lines).toContain(`- ${title} 보여 준다`);
+  }
+  // ASCII 홑따옴표는 한국어 생략 부호라 짝이 아니다 — 첫 쌍점에서 잘린다.
+  expect(lines).toContain("- '검색");
 });
 
 test('English checklist titles remain in site news while Korean checklist titles stay in announcement', () => {

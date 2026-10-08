@@ -25,7 +25,8 @@ afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: 
 
 function fixture(dir: string, launches: string[][], pool = { running: 0, pending: 0, reserved: 0, limit: 2 }): HarnessQueueDeps {
   let nextPid = 101;
-  return { root: dir, pool: () => pool, cap: () => 2, alive: () => true, processes: () => [],
+  // One launch per tick and no stagger keep the single-launch contracts below; QUEUE-BURST tests opt in.
+  return { root: dir, pool: () => pool, cap: () => 2, alive: () => true, processes: () => [], burstMax: 1, launchStaggerMs: 0,
     authorShadow: () => {}, idleRequest: () => {}, launch: async (_item, args) => { launches.push(args); return nextPid++; }, log: () => {} };
 }
 
@@ -88,6 +89,124 @@ test('queue freeze turned on while the tick awaits (idle request) still holds th
   expect(listHarnessQueue(deps).find((row) => row.id === item.id)).toMatchObject({ status: 'queued', waitingReason: '동결 — late hold' });
 });
 
+/** QUEUE-BURST fixture: a fake clock the injected sleep advances, so the 30 s stagger is real in logic and zero in wall time. */
+function burstFixture(dir: string, launches: string[][], pool: { running: number; pending: number; reserved: number; limit: number }) {
+  const clock = new Date('2026-10-07T00:00:00Z');
+  const sleeps: number[] = [], launchedAt: number[] = [];
+  const base = fixture(dir, launches, pool);
+  const deps: HarnessQueueDeps = { ...base, burstMax: undefined, launchStaggerMs: undefined, cap: () => 5, now: () => new Date(clock),
+    configPath: join(dir, 'config.json'),
+    sleep: async (ms) => { sleeps.push(ms); clock.setTime(clock.getTime() + ms); },
+    launch: async (item, args, path) => { launchedAt.push(clock.getTime()); return base.launch!(item, args, path); } };
+  writeFileSync(deps.configPath!, '{}');
+  return { deps, clock, sleeps, launchedAt };
+}
+
+test('QUEUE-BURST counter-proof: pool headroom 5 · queue 5 → 5 launches in one tick, 30 s apart', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps, sleeps, launchedAt } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 5 });
+  const queued: QueueItem[] = [];
+  for (const seat of ['TC', 'MK', 'UX', 'OP', 'TC'] as const) queued.push(await addHarnessQueue({ seat, say: `${seat} ${queued.length}` }, deps));
+  const tick = await tickHarnessQueue(deps);
+  expect(tick).toMatchObject({ outcome: 'launched', item: { id: queued[0]!.id }, reason: 'spawned' });
+  expect(tick.launched?.map((row) => row.id).sort()).toEqual(queued.map((row) => row.id).sort());
+  expect(launches).toHaveLength(5);
+  expect(sleeps).toEqual([30_000, 30_000, 30_000, 30_000]);
+  expect(launchedAt.slice(1).map((at, index) => at - launchedAt[index]!)).toEqual([30_000, 30_000, 30_000, 30_000]);
+  expect(listHarnessQueue(deps).map((row) => row.status)).toEqual(Array(5).fill('launched'));
+});
+
+test('QUEUE-BURST stops at the pool headroom and leaves the rest queued with the pool reason', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps, sleeps } = burstFixture(dir, launches, { running: 1, pending: 1, reserved: 0, limit: 4 });
+  for (let i = 0; i < 5; i++) await addHarnessQueue({ seat: (['TC', 'MK', 'UX', 'OP', 'TC'] as const)[i]!, say: `item ${i}` }, deps);
+  const tick = await tickHarnessQueue(deps);
+  expect(tick.launched).toHaveLength(2);
+  expect(launches).toHaveLength(2);
+  // One wait between the two launches, one before the pass that found the pool full.
+  expect(sleeps).toEqual([30_000, 30_000]);
+  const rows = listHarnessQueue(deps);
+  expect(rows.filter((row) => row.status === 'launched')).toHaveLength(2);
+  expect(rows.filter((row) => row.status === 'queued').every((row) => row.waitingReason?.startsWith('pool: 1+1+0+2/4'))).toBe(true);
+});
+
+test('QUEUE-BURST keeps each seat within its cap inside one burst', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  deps.cap = (seat) => seat === 'TC' ? 1 : 5;
+  for (let i = 0; i < 3; i++) await addHarnessQueue({ seat: 'TC', say: `tc ${i}` }, deps);
+  await addHarnessQueue({ seat: 'MK', say: 'mk 0' }, deps);
+  const tick = await tickHarnessQueue(deps);
+  expect(tick.launched?.map((row) => row.input)).toEqual(['tc 0', 'mk 0']);
+  expect(listHarnessQueue(deps).filter((row) => row.status === 'queued').map((row) => row.input)).toEqual(['tc 1', 'tc 2']);
+});
+
+test('QUEUE-BURST honours harness.queue.burstMax and an empty queue ends the burst without a wait', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps, sleeps, clock } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  writeFileSync(deps.configPath!, JSON.stringify({ harness: { queue: { burstMax: 2 } } }));
+  expect(getUserConfig(deps.configPath!).harness?.queue?.burstMax).toBe(2);
+  for (let i = 0; i < 4; i++) await addHarnessQueue({ seat: (['TC', 'MK', 'UX', 'OP'] as const)[i]!, say: `item ${i}` }, deps);
+  expect((await tickHarnessQueue(deps)).launched).toHaveLength(2);
+  expect(sleeps).toEqual([30_000]);
+  writeFileSync(deps.configPath!, JSON.stringify({ harness: { queue: { burstMax: 0 } } }));
+  expect(getUserConfig(deps.configPath!).harness?.queue?.burstMax).toBeUndefined();
+  sleeps.length = 0;
+  clock.setTime(clock.getTime() + 120_000);
+  // Two left: both launch (invalid burstMax falls back to 5), and the drained queue ends the burst with no trailing wait.
+  expect((await tickHarnessQueue(deps)).launched).toHaveLength(2);
+  expect(sleeps).toEqual([30_000]);
+  expect(launches).toHaveLength(4);
+});
+
+test('QUEUE-BURST stagger holds across ticks: a tick inside 30 s of the last launch waits, and a requested tick launches one', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps, clock } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  deps.burstMax = 1;
+  await addHarnessQueue({ seat: 'TC', say: 'first' }, deps);
+  const second = await addHarnessQueue({ seat: 'MK', say: 'second' }, deps);
+  const third = await addHarnessQueue({ seat: 'UX', say: 'third' }, deps);
+  expect((await tickHarnessQueue(deps)).launched).toHaveLength(1);
+  clock.setTime(clock.getTime() + 10_000);
+  const held = await tickHarnessQueue(deps);
+  expect(held).toMatchObject({ outcome: 'waiting', item: { id: second.id } });
+  expect(held.reason).toBe('발사 간격 — 마지막 발사 10s 전 · 30s 간격');
+  expect(launches).toHaveLength(1);
+  clock.setTime(clock.getTime() + 20_000);
+  deps.burstMax = 5;
+  const requested = await tickHarnessQueue(deps, second.id);
+  expect(requested).toMatchObject({ outcome: 'launched', item: { id: second.id } });
+  expect(requested.launched).toBeUndefined();
+  expect(listHarnessQueue(deps).find((row) => row.id === third.id)?.status).toBe('queued');
+});
+
+test('QUEUE-BURST: a failing follow-up launch ends the burst and keeps the launches already made', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  const base = deps.launch!;
+  deps.launch = async (item, args, path) => { if (launches.length) throw new Error('spawn failed'); return base(item, args, path); };
+  const first = await addHarnessQueue({ seat: 'TC', say: 'first' }, deps);
+  await addHarnessQueue({ seat: 'MK', say: 'second' }, deps);
+  const tick = await tickHarnessQueue(deps);
+  expect(tick).toMatchObject({ outcome: 'launched', item: { id: first.id } });
+  expect(tick.launched?.map((row) => row.id)).toEqual([first.id]);
+  expect(listHarnessQueue(deps).map((row) => row.status)).toEqual(['launched', 'launching']);
+});
+
+test('QUEUE-BURST CLI tick prints the first launch as before and one line per further launch', async () => {
+  const dir = root(), launches: string[][] = [];
+  const { deps } = burstFixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  const first = await addHarnessQueue({ seat: 'TC', say: 'first' }, deps);
+  const second = await addHarnessQueue({ seat: 'MK', say: 'second' }, deps);
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'cli', queue: deps });
+  const original = console.log, lines: string[] = [];
+  console.log = (line: string) => { lines.push(line); };
+  try { await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'tick']); }
+  finally { console.log = original; }
+  expect(lines).toEqual([`launched ${first.id}: spawned`, `launched ${second.id}: spawned`]);
+});
+
 test('queue admits only the FIFO head when seat cap and running+pending+reservations allow it', async () => {
   const dir = root(), launches: string[][] = [];
   const pool = { running: 1, pending: 1, reserved: 0, limit: 2 };
@@ -144,7 +263,7 @@ test('round robin persists across ticks and preserves FIFO within each seat', as
   const fired = [];
   for (let i = 0; i < 6; i++) fired.push((await tickHarnessQueue({ ...deps })).item?.id);
   expect(fired).toEqual([queued[0]!.id, queued[2]!.id, queued[4]!.id, queued[1]!.id, queued[3]!.id, queued[5]!.id]);
-  expect(JSON.parse(readFileSync(`${harnessQueuePath(dir)}.round-robin.json`, 'utf8'))).toEqual({ lastSeat: 'UX' });
+  expect(JSON.parse(readFileSync(`${harnessQueuePath(dir)}.round-robin.json`, 'utf8'))).toMatchObject({ lastSeat: 'UX' });
   expect(launches).toHaveLength(6);
 });
 

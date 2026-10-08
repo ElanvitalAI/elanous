@@ -24,6 +24,7 @@ import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
 import { buildGridData, type GridDeps } from './grid.js';
 import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
+import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-route.js';
 import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
 import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
@@ -166,7 +167,8 @@ import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEvents
 import { handleLoopEdgesGet } from './loop-edges.js';
 import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
-import { handleMe } from './operator.js';
+import { handleMe, operatorSignal } from './operator.js';
+import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
 import { handleOpsApi } from './ops-api.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
@@ -363,7 +365,7 @@ import {
 } from './workflows.js';
 import { handleTriggersSnapshot } from './triggers.js';
 import { handleWorkflowTemplatesList } from './workflow-templates.js';
-import { handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
+import { handleGraphVersionsGet, handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
 import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
 import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
@@ -484,6 +486,7 @@ export interface NexusHttpServerOpts {
   /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
   grid?: GridDeps;
   decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
+  opsBoard?: Pick<OpsBoardDeps, 'openStore'>;
   cardFollowup?: CardFollowupJobs;
   skillExec?: SkillExecJobs;
   execRequests?: ExecRequestRunner;
@@ -937,6 +940,20 @@ export async function routeRequest(
       return jsonResponse({ error: 'not-found' }, 404);
     }
     return pitch.handlePitchApi(req, opts.metaApi);
+  }
+  // CGE-RUN — 편집기 «실행»은 운영자 전용이다: 사용자 그래프가 셸 노드를 부를 수 있으므로 같은 출처 무토큰 통과는 받지 않는다
+  // (운영자 프록시 헤더 · owner bearer 일치 · owner 가 발급한 짧은 임시 토큰만 — 명시 토큰은 언제나 필요).
+  if (/^\/v1\/graphs\/[^/]+\/(?:run|runs\/[^/]+)$/.test(pathname)) {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    const signal = operatorSignal(req, opts.metaApi);
+    const credential = bearerCredential(req, opts.metaApi);
+    if (!signal.operator || (signal.operatorSource !== 'op-proxy' && credential !== 'bearer-match' && credential !== 'temp-token')) {
+      debug.log('graphs.run', 'refused', { path: pathname, source: signal.operatorSource });
+      return jsonResponse({ error: 'forbidden' }, 403);
+    }
+    const routed = handleGraphRunRoute(method, pathname);
+    if (routed) return routed;
+    return jsonResponse({ error: 'method-not-allowed' }, 405);
   }
 
   // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
@@ -1392,6 +1409,21 @@ export async function routeRequest(
     return (opts.cardFollowup ?? defaultCardFollowupJobs()).get(pathname.slice(CARD_FOLLOWUP_PATH.length + 1));
   }
 
+  if (pathname === OPS_BOARD_PATH && (method === 'GET' || method === 'POST')) {
+    const peerAddress = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+    const host = req.headers.get('host') ?? new URL(req.url).host;
+    const tailnetPeer = peerAddress !== undefined && (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peerAddress)
+      || /^fd7a:115c:a1e0:/i.test(peerAddress));
+    const localPeer = peerAddress === '127.0.0.1' || peerAddress === '::1';
+    const tailnetHost = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
+      || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+    const localHost = /^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(host) || /^\[::1\](?::\d+)?$/.test(host);
+    if ((!tailnetPeer && !localPeer) || (!tailnetHost && !localHost)) return jsonResponse({ error: 'forbidden' }, 403);
+    return handleOpsBoard(req, {
+      authorize: request => !!opts.metaApi && opts.metaApi.noAuth !== true && checkAuth(request, opts.metaApi),
+      ...opts.opsBoard,
+    });
+  }
   if (method === 'GET' && pathname === DECISIONS_PATH) {
     return handleDecisions(req, {
       authorize: request => !!opts.metaApi && checkAuth(request, opts.metaApi),
@@ -1471,7 +1503,7 @@ export async function routeRequest(
       if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
       return handlePluginsRemove(req, pluginRemove[1]!, opts.metaApi, opts.pluginStateRoot);
     }
-    if ((method === 'PUT' || method === 'POST') && pathname.startsWith('/v1/graphs/')) {
+    if ((method === 'PUT' || method === 'POST') && (pathname.startsWith('/v1/graphs/') || pathname === '/v1/graphs')) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const mutated = await handleGraphsMutation(pathname, req);
@@ -2784,6 +2816,9 @@ export async function routeRequest(
   // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.
   if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname))) {
     return handleGraphsGet(pathname);
+  }
+  if (method === 'GET' && /^\/v1\/graphs\/[^/]+\/versions$/.test(pathname)) {
+    return handleGraphVersionsGet(pathname);
   }
   // Archon-port T2.3 (2026-05-08) — workflow GET surface.
   // (POST /validate · POST /:name/run · PUT/DELETE /:name landed

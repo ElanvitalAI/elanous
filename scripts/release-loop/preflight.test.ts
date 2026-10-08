@@ -148,6 +148,23 @@ test('run input errors surface as blockers', () => isolated(async (root) => {
   expect(result.findings.find((f) => f.check === 'run-input')).toMatchObject({ level: 'block' });
 }));
 
+test('the stored schedule publish time (schedule set --publish-at) wins over the cadence; --publish-at still wins over it', () => isolated(async (root) => {
+  const stored = { version: '0.2.18', cutAt: '2026-10-06T21:00:00.000Z', landBy: '2026-10-06T20:30:00.000Z', publishAt: '2026-10-06T23:00:00.000Z', updatedAt: NOW.toISOString(), updatedBy: 'test' };
+  const { publishAt: _publishAt, ...rest } = deps(root, { schedule: () => stored });
+  const fromSchedule = await releasePreflight('0.2.18', rest);
+  expect(fromSchedule.schedule).toMatchObject({ publishAt: '2026-10-06T23:00:00.000Z', publishAtSource: 'schedule' });
+  const fromOption = await releasePreflight('0.2.18', deps(root, { schedule: () => stored }));
+  expect(fromOption.schedule).toMatchObject({ publishAt: '2026-10-06T23:30:00.000Z', publishAtSource: 'option' });
+}));
+
+test('the default path reads the publish time stored by setSchedule (no injected schedule)', () => isolated(async (root) => {
+  setSchedule('0.2.18', { cutAt: '2026-10-07T06:00:00+09:00', landBy: '2026-10-07T05:30:00+09:00', publishAt: '2026-10-07T08:00:00+09:00' }, 'test');
+  const { schedule: _schedule, publishAt: _publishAt, ...rest } = deps(root);
+  const result = await releasePreflight('0.2.18', rest);
+  expect(result.schedule).toMatchObject({ publishAt: '2026-10-06T23:00:00.000Z', publishAtSource: 'schedule' });
+  expect(result.findings.some((f) => f.check === 'schedule' && f.message.includes('(판 일정)'))).toBe(true);
+}));
+
 test('post-publish detection reads the id or a title that starts with the marker', () => {
   expect(isPostPublishCell({ id: 'POSTPUB-VERIFY', title: 'x' })).toBe(true);
   expect(isPostPublishCell({ id: 'X', title: '«발행 뒤» 실측' })).toBe(true);

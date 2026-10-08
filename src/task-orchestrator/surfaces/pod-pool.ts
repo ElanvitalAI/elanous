@@ -9,6 +9,8 @@
  *   - @ssh호스트 원격 클러스터면 그 기계 — 이미지 판 대조·반입(`docker load` ⊕ `k3d image import`)에 쓴다
  *   - 상한      이 노드에 동시에 둘 Job 수(기본 2)
  * Job 마다 «빈 자리 비율»이 가장 큰 노드를 고른다(동률은 앞 순위 · 측정 실패 노드는 측정된 노드가 다 찼을 때만). 다 차면 자리가 날 때까지 기다린다.
+ *   POOL-LITE(10-07): 골 종류를 주면 lite·문서·측정 골은 상한이 가장 작은 노드(node-c), 구현 골은 가장 큰 노드(node-b)를 먼저 쓰고,
+ *   그 노드가 차면 빈 자리 비율로 넘친다. 상한 0 노드는 «꺼짐» — 해석에서 빠지고 절대 고르지 않는다.
  * 노드 선택의 진행 중 수는 로컬 프로세스 기준이다. 발사 허가는 별도의 lease 측정으로
  * 다른 호스트의 Running/Pending 및 메모리 예약까지 고려한다.
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
@@ -21,7 +23,7 @@ import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
 import { HostPoolLease, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
-import { measurePoolLease, recommendConcurrency, type PodLeaseMember, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
+import { harnessCpuSlotsBesideGate, measurePoolLease, recommendConcurrency, type PodLeaseMember, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
 
 export interface PodPoolMember {
   readonly context: string;
@@ -111,7 +113,9 @@ export function parsePodPool(spec: string): PodPoolMember[] {
     const m = MEMBER.exec(part);
     if (!m) throw new Error(`--pod-pool: 못 읽는 노드 「${part}」 — 형식 컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]`);
     const capacity = m[3] === undefined ? 2 : Number(m[3]);
-    if (!Number.isInteger(capacity) || capacity < 1) throw new Error(`--pod-pool: 상한은 1 이상 — 「${part}」`);
+    // POOL-LITE (10-07): `:0` means «this member is off» — a `node-c:0` entry once threw here and broke every launch.
+    //   It is dropped below (never chosen); only a pool with no live member left is an error.
+    if (!Number.isInteger(capacity) || capacity < 0) throw new Error(`--pod-pool: 상한은 1 이상 — 「${part}」`);
     if (m[5] && Number(m[5]) > 65535) throw new Error(`--pod-pool: 레지스트리 포트는 65535 이하 — 「${part}」`);
     const context = m[1]!;
     const k3dCluster = context.startsWith('k3d-') ? context.slice(4) : 'elanous-pool';
@@ -119,7 +123,44 @@ export function parsePodPool(spec: string): PodPoolMember[] {
   });
   if (members.length === 0) throw new Error('--pod-pool: 노드가 없다');
   if (new Set(members.map((m) => m.context)).size !== members.length) throw new Error('--pod-pool: 컨텍스트가 겹친다');
-  return members;
+  const live = members.filter((m) => m.capacity > 0);
+  if (live.length === 0) throw new Error(`--pod-pool: 상한은 1 이상 — 상한 0 이 아닌 노드가 없다 「${spec}」`);
+  if (live.length !== members.length) {
+    debug.log('pod.pool', 'member-disabled', { members: members.filter((m) => m.capacity <= 0).map((m) => m.context), reason: 'capacity-0' });
+  }
+  return live;
+}
+
+/**
+ * POOL-LITE (10-07) — what kind of Job is being placed. `lite` = lite memory tier or a docs/measurement goal;
+ * `standard` = an implementation goal. Absent kind keeps the plain free-share placement unchanged.
+ */
+export type PodPlacementKind = 'lite' | 'standard';
+
+export interface PodPlacement {
+  readonly member: string;
+  readonly kind: PodPlacementKind | null;
+  /** `preferred` = landed on the kind's preferred member · `overflow` = preferred member(s) full/skipped · `share` = no preference applies. */
+  readonly outcome: 'preferred' | 'overflow' | 'share';
+  readonly preferred: readonly string[];
+  /** One line for launch output and the run ledger. */
+  readonly reason: string;
+}
+
+/**
+ * Preferred members for a placement kind: lite → the smallest-capacity member(s) (node-c), standard → the largest (node-b).
+ * Capacity is the operator's own statement of member size (`pool-node-b@node-b:40,pool-node-c@node-c:6`), so no new spec syntax.
+ * When every member has the same capacity there is no small/big member and no preference (empty list).
+ */
+export function preferredMembers(members: readonly PodPoolMember[], kind: PodPlacementKind | null | undefined): string[] {
+  const live = members.filter((m) => m.capacity > 0);
+  if (!kind || live.length < 2) return [];
+  const caps = live.map((m) => m.capacity);
+  const min = Math.min(...caps);
+  const max = Math.max(...caps);
+  if (min === max) return [];
+  const target = kind === 'lite' ? min : max;
+  return live.filter((m) => m.capacity === target).map((m) => m.context);
 }
 
 /** 스펙 해석 순서: 명시 인자 → `ELANOUS_POD_POOL` → 없음(null = 현재 컨텍스트 하나). */
@@ -178,12 +219,21 @@ export function podPoolHostLease(members: readonly PodPoolMember[]): HostPoolLea
 export class PodPoolScheduler {
   private readonly inflight = new Map<string, number>();
   private readonly admission: PodLeaseAdmission;
+  /**
+   * GATE-ADMIT-EXEMPT — the gate's own shard Jobs (GATE-MEM-ADMIT) queue here: memory admission without the
+   * GATE-RESERVE-AUTO CPU bound, which exists to protect the gate from harness Pods, not from itself.
+   */
+  private readonly gateAdmission: PodLeaseAdmission;
   private readonly outstanding = new Set<PodLeaseRelease>();
   private lastFree = 0;
   private budget = 0;
+  /** GATE-RESERVE-AUTO — local permits whose Pod was observed (Running/terminal): already inside the CPU reading. */
+  private seenActive = 0;
   private initialized = false;
   private readonly measure: () => Promise<PoolLeaseRecommendation>;
   private lastRaw: PoolLeaseRecommendation | null = null;
+  /** GATE-ADMIT-EXEMPT — the same reading before the gate CPU cap (memory/limitedBy unchanged); gate callers read it. */
+  private lastUncapped: PoolLeaseRecommendation | null = null;
   private readonly hostLease: HostPoolLease;
   private readonly pollMs: number;
   private readonly occupancy: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>;
@@ -192,19 +242,30 @@ export class PodPoolScheduler {
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
     this.hostLease = options.hostLease ?? podPoolHostLease(members);
-    const measureStatus = options.status ?? (() => {
-      // POD-ADMIT-BY-USAGE: admission reads observed Pod usage (`kubectl top`); tryAcquire's occupancy read does not.
-      const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
-      return recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 });
-    });
-    this.measure = async () => measureStatus();
+    // GATE-RESERVE-AUTO: the gate reservation is returned beside the recommendation, never folded into it — the
+    // delta budget below must not see a gate start/end as a free-slot change (that made the result order-dependent).
+    const measureStatus: () => Promise<{ status: PoolLeaseRecommendation; gateSlots: number | null | undefined }> = options.status
+      ? async () => ({ status: await options.status!(), gateSlots: undefined })
+      : async () => {
+        // POD-ADMIT-BY-USAGE: admission reads observed Pod usage (`kubectl top`); tryAcquire's occupancy read does not.
+        const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
+        return { status: recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), accounts: 0, perAccount: 0 }), gateSlots: harnessCpuSlotsBesideGate(measure) };
+      };
+    /** Cluster-level additional slots for the cross-process host lease: the measured free slots, capped by the gate's CPU. */
+    const capped = ({ status, gateSlots }: { status: PoolLeaseRecommendation; gateSlots: number | null | undefined }): PoolLeaseRecommendation =>
+      gateSlots === undefined || status.recommended === null ? status
+        : gateSlots === null ? { ...status, recommended: null, reason: '측정 불가: gate CPU' }
+          : { ...status, recommended: Math.min(status.recommended, gateSlots) };
+    this.measure = async () => { const reading = await measureStatus(); this.lastUncapped = reading.status; return capped(reading); };
     // An injected status (tests, callers with their own measurement) without memberMemory never shells out to kubectl here.
     this.memberMemory = options.memberMemory ?? (options.status ? (() => []) : () => measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }).members
       .map((m: PodLeaseMember) => ({ context: m.context, allocatableMemoryBytes: m.allocatableMemoryBytes })));
     this.occupancy = options.occupancy ?? (() => measureMemberOccupancy(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }));
-    this.admission = new PodLeaseAdmission({ status: async () => {
-      const measured = await measureStatus();
-      this.lastRaw = measured;
+    const decide = async (gate: boolean): Promise<PoolLeaseRecommendation> => {
+      const reading = await measureStatus();
+      const measured = reading.status;
+      this.lastRaw = capped(reading);
+      this.lastUncapped = measured;
       const pendingJobs = measured.pendingJobs ?? [];
       const ownStart = this.hostLease.selfStart();
       const transferId = process.env.ELANOUS_POD_RESERVED_LEASE;
@@ -220,16 +281,40 @@ export class PodPoolScheduler {
       this.budget = Math.max(0, this.budget + decision.recommended - (this.initialized ? this.lastFree : 0));
       this.initialized = true;
       this.lastFree = decision.recommended;
-      return { ...decision, recommended: this.admission.snapshot().active + this.budget };
-    }, ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: options.dependencyMerged ?? ((after, signal) => predecessorState(after, {}, signal)) });
+      // Each queue's limit is its own permits plus the shared remaining budget (every permit already took one from it).
+      const active = (gate ? this.gateAdmission : this.admission).snapshot().active;
+      const total = active + this.budget;
+      if (reading.gateSlots === undefined) return { ...decision, recommended: total };
+      if (gate) {
+        debug.log('pod.pool', 'gate-reserve', { gateSlots: reading.gateSlots, active, budget: this.budget, recommended: total, exempt: 'gate-caller' });
+        return { ...decision, recommended: total };
+      }
+      // GATE-RESERVE-AUTO: while a gate shard Job is active, harness admission is also bounded by the CPU left after
+      // the gate. The bound is absolute (this reading ⊕ current local permits). Pods already in the reading — observed
+      // ones (`seenActive`) and ones measured Pending (own leases with a pending Pod) — are not subtracted again;
+      // the remaining local permits and other processes' leases without a measured Pod (`others`) are.
+      const ownMeasuredPending = this.hostLease.live().filter((r) => r.pid === process.pid && r.startedAt === ownStart && leaseHasPendingPod(r, pendingJobs)).length;
+      const unseen = Math.max(0, active - this.seenActive - ownMeasuredPending);
+      const cpuFree = reading.gateSlots === null ? 0 : Math.max(0, reading.gateSlots - others + (transferIsOther ? 1 : 0) - unseen);
+      const recommended = Math.min(total, active + cpuFree);
+      if (recommended < total) debug.log('pod.pool', 'gate-reserve', { gateSlots: reading.gateSlots, active, unseen, ownMeasuredPending, others, budget: this.budget, recommended });
+      return reading.gateSlots === null
+        ? { ...decision, recommended, reason: '측정 불가: gate CPU' }
+        : { ...decision, recommended };
+    };
+    const dependencyMerged = options.dependencyMerged ?? ((after: PodLeasePredecessor, signal?: AbortSignal) => predecessorState(after, {}, signal));
+    this.admission = new PodLeaseAdmission({ status: () => decide(false), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged });
+    this.gateAdmission = new PodLeaseAdmission({ status: () => decide(true), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged });
   }
   /** FIFO gate within this process, then a host lease so independent CLI processes cannot over-admit the same pool. */
-  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor): Promise<PodLeaseRelease & { applied: (job: string, context: string, namespace: string) => void; observed: () => void }> {
-    const local = await this.acquireLocalAdmission(signal, after);
+  async acquireAdmission(signal?: AbortSignal, after?: PodLeasePredecessor, opts: { gate?: boolean } = {}): Promise<PodLeaseRelease & { applied: (job: string, context: string, namespace: string) => void; observed: () => void }> {
+    const gate = opts.gate === true;
+    const local = await this.acquireLocalAdmission(signal, after, gate);
     try {
       for (;;) {
         if (signal?.aborted) throw new Error('pod lease admission aborted');
-        const free = this.lastRaw?.recommended ?? null;
+        // GATE-ADMIT-EXEMPT: a gate caller is not bounded by its own gate's CPU reservation (memory still bounds it).
+        const free = (gate ? this.lastUncapped : this.lastRaw)?.recommended ?? null;
         // Same check as the local gate, but atomic across processes: other authoring and pre-Running leases hold slots.
         const reservedId = process.env.ELANOUS_POD_RESERVED_LEASE;
         const transferred = reservedId ? this.hostLease.claim(reservedId) : null;
@@ -242,9 +327,16 @@ export class PodPoolScheduler {
         if (lease) {
           let hostReleased = false;
           const releaseHost = () => { if (!hostReleased) { hostReleased = true; lease(); } };
-          return Object.assign(() => { releaseHost(); local(); }, {
+          // GATE-RESERVE-AUTO: an observed Pod (Running or terminal) is in the CPU reading; until then it is subtracted.
+          let seen = false, done = false;
+          return Object.assign(() => {
+            if (done) return;
+            done = true;
+            if (seen) this.seenActive--;
+            releaseHost(); local();
+          }, {
             applied: (job: string, context: string, namespace: string) => lease.applied(job, context, namespace),
-            observed: releaseHost,
+            observed: () => { if (!seen && !done) { seen = true; this.seenActive++; } releaseHost(); },
           });
         }
         await new Promise<void>((resolve, reject) => {
@@ -252,15 +344,15 @@ export class PodPoolScheduler {
           const onAbort = () => { clearTimeout(timer); reject(new Error('pod lease admission aborted')); };
           signal?.addEventListener('abort', onAbort, { once: true });
         });
-        try { this.lastRaw = await this.measure(); } catch { this.lastRaw = null; }
+        try { this.lastRaw = await this.measure(); } catch { this.lastRaw = null; this.lastUncapped = null; }
       }
     } catch (error) {
       local();
       throw error;
     }
   }
-  private acquireLocalAdmission(signal?: AbortSignal, after?: PodLeasePredecessor): Promise<PodLeaseRelease> {
-    return this.admission.acquire(signal, after).then((release) => {
+  private acquireLocalAdmission(signal?: AbortSignal, after?: PodLeasePredecessor, gate = false): Promise<PodLeaseRelease> {
+    return (gate ? this.gateAdmission : this.admission).acquire(signal, after).then((release) => {
       this.budget = Math.max(0, this.budget - 1);
       this.outstanding.add(release);
       return () => {
@@ -290,8 +382,9 @@ export class PodPoolScheduler {
     if (!r) return null;
     return `recommended=${r.recommended ?? 'unknown'} limitedBy=${r.limitedBy ?? '-'} memorySlots=${r.memorySlots ?? '?'}${r.reason ? ` reason=${r.reason}` : ''}`;
   }
-  admissionSnapshot(): ReturnType<PodLeaseAdmission['snapshot']> {
-    return this.admission.snapshot();
+  /** The harness queue by default; `{ gate: true }` reads the gate-caller queue (GATE-ADMIT-EXEMPT). */
+  admissionSnapshot(opts: { gate?: boolean } = {}): ReturnType<PodLeaseAdmission['snapshot']> {
+    return (opts.gate ? this.gateAdmission : this.admission).snapshot();
   }
   /**
    * Pick the member with the largest free share: (capacity − measured cluster occupancy − this process's inflight) / capacity.
@@ -304,8 +397,11 @@ export class PodPoolScheduler {
    * member the 0.2.15 gate launched its shards one at a time.
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean } = {}): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; onPlacement?: (placement: PodPlacement) => void } = {}): Promise<PodPoolMember | null> {
     const selfCapped = mode.selfCapped === true;
+    const kind = mode.kind ?? null;
+    // POOL-LITE: lite goals try the small member first, implementation goals the big one; full → overflow by free share.
+    const preferred = new Set(preferredMembers(this.members, kind));
     let reading: Record<string, MemberOccupancy>;
     // A self-capped caller's own Jobs are its inflight; other workloads' Pods are not its slots (no cluster read).
     if (selfCapped) reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: 0 }]));
@@ -316,13 +412,17 @@ export class PodPoolScheduler {
     }
     const free: Record<string, number> = {};
     const measured: Record<string, boolean> = {};
-    let best: { member: PodPoolMember; slots: number; measured: boolean } | null = null;
+    let best: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } | null = null;
     // A measured member always beats an unmeasured one (its share would read 100% and draw every Job to a node
     // that did not answer); unmeasured members compete only when no measured member has a free slot.
-    const better = (cand: { member: PodPoolMember; slots: number; measured: boolean }) => !best
+    // Among equally measured members a preferred one (POOL-LITE) beats the rest; then the larger free share wins.
+    const better = (cand: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean }) => !best
       || (cand.measured !== best.measured ? cand.measured
-        : cand.slots / cand.member.capacity > best.slots / best.member.capacity);
+        : cand.preferred !== best.preferred ? cand.preferred
+          : cand.slots / cand.member.capacity > best.slots / best.member.capacity);
     for (const m of this.members) {
+      // A capacity-0 member is off — never chosen (and no division by zero in the share).
+      if (m.capacity <= 0) continue;
       // LAUNCH-STALL: a member this launch cannot fit is skipped for this call only (other launches may fit it).
       if (skip?.has(m.context)) continue;
       const inflight = this.inflight.get(m.context) ?? 0;
@@ -333,17 +433,30 @@ export class PodPoolScheduler {
       const slots = m.capacity - occupied - inflight;
       free[m.context] = slots;
       if (slots <= 0) continue;
-      const cand = { member: m, slots, measured: ok };
+      const cand = { member: m, slots, measured: ok, preferred: preferred.has(m.context) };
       if (better(cand)) best = cand;
     }
     if (!best) {
-      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}`);
+      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}${kind ? ` · kind=${kind}` : ''}`);
       return null;
     }
-    this.inflight.set(best.member.context, (this.inflight.get(best.member.context) ?? 0) + 1);
-    const share = Object.fromEntries(this.members.map((m) => [m.context, Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100]));
-    debug.log('pod.pool', 'member-selected', { member: best.member.context, free, measured, share, ...(selfCapped ? { selfCapped: true } : {}) });
-    return best.member;
+    const chosen: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } = best;
+    this.inflight.set(chosen.member.context, (this.inflight.get(chosen.member.context) ?? 0) + 1);
+    const share = Object.fromEntries(this.members.map((m) => [m.context, m.capacity > 0 ? Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100 : 0]));
+    const outcome: PodPlacement['outcome'] = preferred.size === 0 ? 'share' : chosen.preferred ? 'preferred' : 'overflow';
+    const pref = [...preferred];
+    const why = (c: string) => skip?.has(c) ? 'skipped' : measured[c] === false ? 'unmeasured' : 'full';
+    const reason = outcome === 'share'
+      ? `${chosen.member.context} · free share ${share[chosen.member.context]}${kind ? ` · ${kind} 골 · 선호 멤버 없음(${this.members.filter((m) => m.capacity > 0).length < 2 ? '단일 멤버' : '상한이 같다'})` : ''}`
+      : outcome === 'preferred'
+        ? `${chosen.member.context} · ${kind} 골 선호 멤버 · free share ${share[chosen.member.context]}`
+        : `${chosen.member.context} · ${kind} 골 넘침 — 선호 ${pref.map((c) => `${c}(${why(c)})`).join(',')} · free share ${share[chosen.member.context]}`;
+    const placement: PodPlacement = { member: chosen.member.context, kind, outcome, preferred: pref, reason };
+    debug.log('pod.pool', 'member-selected', { member: chosen.member.context, free, measured, share, ...(selfCapped ? { selfCapped: true } : {}), ...(kind ? { kind, outcome, preferred: pref, reason } : {}) });
+    // The callback only observes the placement — a throwing observer must not leak the slot it was told about.
+    try { mode.onPlacement?.(placement); }
+    catch (error) { debug.log('pod.pool', 'placement-observer-failed', { member: chosen.member.context, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+    return chosen.member;
   }
   release(member: PodPoolMember): void {
     this.inflight.set(member.context, Math.max(0, (this.inflight.get(member.context) ?? 0) - 1));

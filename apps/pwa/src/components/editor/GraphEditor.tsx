@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useCallback, useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'next/navigation';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import type { GraphKindEntry } from '@/nexus/client';
@@ -9,6 +9,13 @@ import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
 import { RunGraphView } from '@/components/workflows/RunGraphView';
 import { CORE_GRAPH_KINDS, CORE_WORKFLOW_KINDS } from '@/lib/run-graph-yaml-edit';
 import { graphEditorHref, resolveGraphEditorMode, type GraphEditorMode } from './graph-editor-mode';
+import { GraphCanvasEditor } from './GraphCanvasEditor';
+import { GraphRunControl } from './GraphRunControl';
+import type { NodeRunStatus } from '@/components/workflows/run-status-helpers';
+import { fromYaml, type CanvasGraph } from './graph-canvas-model';
+
+/** The run-graph tab's working canvas: a new empty graph, or a «mine» graph opened for editing. */
+type CanvasSession = { key: number; graph?: CanvasGraph; saved: boolean };
 
 function PaletteContents({ palette, fallback }: { palette: GraphKindEntry[]; fallback: boolean }) {
   return <>
@@ -41,6 +48,10 @@ export function GraphEditor() {
   const params = useSearchParams();
   const mode = resolveGraphEditorMode(params.get('mode'));
   const client = useOptionalNexusClient();
+  const queries = useQueryClient();
+  const [canvas, setCanvas] = useState<CanvasSession | null>(null);
+  const [runStatus, setRunStatus] = useState<Record<string, NodeRunStatus> | undefined>(undefined);
+  const onRunStatus = useCallback((status: Record<string, NodeRunStatus> | undefined) => setRunStatus(status), []);
   const kinds = useQuery({
     queryKey: ['graph-kinds', mode],
     queryFn: () => client!.getGraphKinds(mode),
@@ -68,8 +79,24 @@ export function GraphEditor() {
         </nav>
       </header>
       <div className="flex min-h-0 flex-1 flex-col">
-        {client && <GraphEditorPalette palette={palette} fallback={fallback} />}
-        {mode === 'workflow' ? <WorkflowsPanel palette={palette} /> : client ? <RunGraphView palette={palette} /> :
+        {client && !(mode === 'harness' && canvas) && <GraphEditorPalette palette={palette} fallback={fallback} />}
+        {mode === 'workflow' ? <WorkflowsPanel palette={palette} /> : client && canvas ? (
+          <>
+            <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
+              <button type="button" onClick={() => { setCanvas(null); setRunStatus(undefined); }} className="rounded px-2 py-1 text-muted-foreground hover:bg-muted">← 그래프 목록</button>
+              {fallback && <span role="status" className="text-amber-500">어휘 목록을 불러오지 못해 코어 팔레트를 씁니다.</span>}
+            </div>
+            <GraphCanvasEditor key={canvas.key} palette={palette} client={client}
+              {...(canvas.graph ? { initialGraph: canvas.graph, initialSaved: canvas.saved } : {})}
+              {...(runStatus ? { nodeStatus: runStatus } : {})}
+              renderActions={(context) => <GraphRunControl context={context} client={client} onStatus={onRunStatus} />}
+              onSaved={() => { void queries.invalidateQueries({ queryKey: ['run-graphs'] }); }} />
+          </>
+        ) : client ? (
+          <RunGraphView palette={palette}
+            onNewGraph={() => setCanvas({ key: Date.now(), saved: false })}
+            onOpenInCanvas={(_id, yaml) => setCanvas({ key: Date.now(), graph: fromYaml(yaml), saved: true })} />
+        ) :
           <p className="p-4 text-sm text-text-tertiary">Daemon 연결이 설정되지 않았습니다. Settings 에서 Base URL 을 입력하세요.</p>}
       </div>
     </div>

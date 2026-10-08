@@ -1,0 +1,25 @@
+graph_id: retro-daily
+version: 1
+loop:
+  title: 매일 회고
+  description: 지난 24시간 사실(retro facts)을 묶어 반복·«초록 뒤 재발»을 먼저 올리고, 사실 id 를 단 인사이트와 조치 초안(≤3)을 낸다 — 기본 shadow(체크리스트·메시지 0)
+  trigger:
+    cron: '40 22 * * *'
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }
+  - { node_id: cluster, kind: agent, recipe: 'cmd:cluster', max_visits: 1 }
+  - { node_id: recur, kind: agent, recipe: 'cmd:recur', max_visits: 1 }
+  - { node_id: insight, kind: agent, recipe: 'cmd:insight', max_visits: 1 }
+  - { node_id: act, kind: agent, recipe: 'cmd:act', max_visits: 1 }
+  - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: collect, on: outcome, map: { ok: cluster, fail: failed } }
+  - { from: cluster, on: outcome, map: { ok: recur, fail: failed } }
+  - { from: recur, on: outcome, map: { ok: insight, fail: failed } }
+  - { from: insight, on: outcome, map: { ok: act, fail: failed } }
+  - { from: act, on: outcome, map: { ok: report, fail: failed } }
+  - { from: report, on: outcome, map: { ok: done, fail: failed } }

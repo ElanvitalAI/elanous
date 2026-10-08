@@ -85,3 +85,49 @@ describe('RELEASE-LIVE2 release node flow', () => {
     await act(async () => { tree!.unmount(); });
   });
 });
+
+describe('GATE-LIVE-OBS gate shard table', () => {
+  const counts = { pending: 2, running: 1, done: 1, retry: 0, timeout: 1, failed: 0 };
+  const gated: ReleaseRun = { ...run, gateShards: {
+    version: '0.2.19', updatedAt: '2026-10-07T00:59:00Z',
+    shards: [
+      { id: 'pod-3', state: 'done', rc: 0 },
+      { id: 'pod-1', state: 'pending', waitReason: 'CPU 부족 31.2/32', plannedMin: 15 },
+      { id: 'pod-2', state: 'pending', waitReason: 'CPU 부족 31.2/32', plannedMin: 15 },
+      { id: 'pod-0', state: 'running', plannedMin: 20 },
+      { id: 'pod-4', state: 'timeout', rc: 124 },
+    ],
+    summary: { total: 5, counts, waitReasons: [{ reason: 'CPU 부족 31.2/32', count: 2 }], etaMin: 75, staleMin: 1 },
+  } };
+  const detail = (r: ReleaseRun) => renderToStaticMarkup(<ReleaseNodeDetail run={r} nodeId="gate" log={null} now={Date.parse('2026-10-07T01:00:00Z')} />);
+
+  test('the current gate chip shows the shard tally instead of the summary-parsed n/m', () => {
+    const html = flow(gated);
+    expect(html).toContain('조각 5 · 잘림 1 · 대기 2 · 돌기 1 · 통과 1');
+    expect(html).not.toContain('샤드 7/24');
+  });
+  test('gate detail lists every shard with a state word, worst first, plus wait reasons and the estimate', () => {
+    const html = detail(gated);
+    const states = [...(html.match(/data-shard-state="([a-z]+)"/g) ?? [])];
+    expect(states).toEqual(['timeout', 'pending', 'pending', 'running', 'done'].map((s) => `data-shard-state="${s}"`));
+    for (const word of ['잘림', '대기', '돌기', '통과']) expect(html).toContain(word);
+    expect(html).toContain('대기 2</span> — CPU 부족 31.2/32');
+    expect(html).toContain('남은 약 1시간 15분');
+    expect(html).not.toContain('갱신 없음');
+  });
+  test('no shard file → the old view, unchanged; a stale file warns', () => {
+    expect(detail(run)).not.toContain('게이트 조각');
+    const stale = { ...gated, gateShards: { ...gated.gateShards!, summary: { ...gated.gateShards!.summary, staleMin: 22, etaMin: null } } };
+    const html = detail(stale);
+    expect(html).toContain('⚠️ 22분째 갱신 없음');
+    expect(html).toContain('남은 시간 추정 불가');
+  });
+});
+
+test('GATE-LIVE-OBS eta text: overrun beats the plan estimate, and 0 minutes with shards still open is not «남은 조각 없음»', async () => {
+  const { etaText } = await import('./GateShards');
+  expect(etaText(0, { overrunMin: 19, open: 1 })).toBe('계획보다 19분 넘게 도는 중 — 남은 시간 추정 불가');
+  expect(etaText(0, { open: 2 })).toBe('곧 끝남(계획상)');
+  expect(etaText(0)).toBe('남은 조각 없음');
+  expect(etaText(75)).toBe('남은 약 1시간 15분');
+});

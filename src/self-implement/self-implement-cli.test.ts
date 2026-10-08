@@ -525,3 +525,11 @@ describe('산출물의 «눈» — «실제 CLI»가 골 문서에서 읽어 판
     expect(decisions[0]!.stopReason).not.toBe('converged');
   });
 });
+
+it('TA-LIVE-REVIEW-POD: the run-produced PR head reaches the supervisor result (Pod runs have no worktree to prove the repository)', () => {
+  const head = 'c'.repeat(40);
+  expect(singleRunAsJobResult('f', RESULT({ checkedHeadCommit: head }))).toMatchObject({ checkedHeadCommit: head });
+  expect(Object.hasOwn(singleRunAsJobResult('f', RESULT()), 'checkedHeadCommit')).toBe(false);
+  // 기록됐지만 빈 값도 그대로 싣는다 — live review 가 «기록된 머리»로 보고 그림자에 둔다(브랜치로 대체하지 않게).
+  expect(singleRunAsJobResult('f', RESULT({ checkedHeadCommit: '' }))).toMatchObject({ checkedHeadCommit: '' });
+});

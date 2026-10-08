@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
-import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
+import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, PodPoolScheduler, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
+import { loadRunLedger } from '../../self-implement/run-ledger.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -124,6 +125,95 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(reads).toBe(1);
   });
 
+  describe('POOL-LITE — placement by goal kind', () => {
+    const SPEC = 'pool-node-b@node-b:40,pool-node-c@node-c:6';
+    const place = async (occ: Record<string, MemberOccupancy>, kind: 'lite' | 'standard' | undefined, spec = SPEC, skip?: Set<string>) => {
+      const pool = new PodPoolScheduler(parsePodPool(spec), { occupancy: () => occ });
+      let placement: PodPlacement | null = null;
+      const member = await pool.tryAcquire(skip, undefined, { kind, onPlacement: (p) => { placement = p; } });
+      return { member: member?.context ?? null, placement: placement as PodPlacement | null };
+    };
+
+    test('a lite goal goes to node-c when it has room — even though node-b has the larger free share', async () => {
+      const r = await place({ 'pool-node-b': { occupied: 10 }, 'pool-node-c': { occupied: 3 } }, 'lite');
+      expect(r.member).toBe('pool-node-c');
+      expect(r.placement).toMatchObject({ member: 'pool-node-c', kind: 'lite', outcome: 'preferred', preferred: ['pool-node-c'] });
+      expect(r.placement!.reason).toContain('lite 골 선호 멤버');
+    });
+
+    test('an implementation goal goes to node-b even when node-c has the larger free share', async () => {
+      const r = await place({ 'pool-node-b': { occupied: 30 }, 'pool-node-c': { occupied: 0 } }, 'standard');
+      expect(r.member).toBe('pool-node-b');
+      expect(r.placement).toMatchObject({ outcome: 'preferred', preferred: ['pool-node-b'] });
+    });
+
+    test('preferred member full → overflow to the other, with the reason', async () => {
+      const lite = await place({ 'pool-node-b': { occupied: 10 }, 'pool-node-c': { occupied: 6 } }, 'lite');
+      expect(lite.member).toBe('pool-node-b');
+      expect(lite.placement).toMatchObject({ outcome: 'overflow' });
+      expect(lite.placement!.reason).toContain('pool-node-c(full)');
+      const impl = await place({ 'pool-node-b': { occupied: 40 }, 'pool-node-c': { occupied: 1 } }, 'standard');
+      expect(impl.member).toBe('pool-node-c');
+      expect(impl.placement!.reason).toContain('pool-node-b(full)');
+      // LAUNCH-STALL skip of the preferred member also overflows, and says so.
+      const skipped = await place({ 'pool-node-b': { occupied: 0 }, 'pool-node-c': { occupied: 0 } }, 'lite', SPEC, new Set(['pool-node-c']));
+      expect(skipped.member).toBe('pool-node-b');
+      expect(skipped.placement!.reason).toContain('pool-node-c(skipped)');
+    });
+
+    test('overflow among several non-preferred members goes by free-slot ratio', async () => {
+      const spec = 'big:40,mid:10,small:4';
+      const r = await place({ big: { occupied: 30 }, mid: { occupied: 2 }, small: { occupied: 4 } }, 'lite', spec);
+      // small full · big 10/40 = 25% · mid 8/10 = 80% → mid.
+      expect(r.member).toBe('mid');
+      expect(r.placement).toMatchObject({ outcome: 'overflow', preferred: ['small'] });
+    });
+
+    test('both full → null; no kind → the unchanged free-share placement', async () => {
+      expect((await place({ 'pool-node-b': { occupied: 40 }, 'pool-node-c': { occupied: 6 } }, 'lite')).member).toBeNull();
+      const plain = await place({ 'pool-node-b': { occupied: 10 }, 'pool-node-c': { occupied: 3 } }, undefined);
+      expect(plain.member).toBe('pool-node-b');   // 75% vs 50% — free share, exactly as before
+      expect(plain.placement).toMatchObject({ kind: null, outcome: 'share', preferred: [] });
+    });
+
+    test('a throwing placement observer does not leak the slot or fail the acquire', async () => {
+      const pool = new PodPoolScheduler(parsePodPool(SPEC), { occupancy: () => ({}) });
+      const got = await pool.tryAcquire(undefined, undefined, { kind: 'lite', onPlacement: () => { throw new Error('observer'); } });
+      expect(got?.context).toBe('pool-node-c');
+      expect(pool.snapshot()).toEqual({ 'pool-node-b': 0, 'pool-node-c': 1 });
+      pool.release(got!);
+      expect(pool.snapshot()).toEqual({ 'pool-node-b': 0, 'pool-node-c': 0 });
+    });
+
+    test('equal capacities give no preference', () => {
+      expect(preferredMembers(parsePodPool('a:4,b:4'), 'lite')).toEqual([]);
+      expect(preferredMembers(parsePodPool(SPEC), 'lite')).toEqual(['pool-node-c']);
+      expect(preferredMembers(parsePodPool(SPEC), 'standard')).toEqual(['pool-node-b']);
+      expect(preferredMembers(parsePodPool(SPEC), null)).toEqual([]);
+    });
+
+    test('a capacity-0 member is dropped at parse and never chosen — it does not break the launch', async () => {
+      expect(parsePodPool('pool-node-b@node-b:40,pool-node-c@node-c:0').map((m) => m.context)).toEqual(['pool-node-b']);
+      expect(() => parsePodPool('pool-node-c@node-c:0')).toThrow('상한은 1 이상');
+      const r = await place({ 'pool-node-b': { occupied: 0 } }, 'lite', 'pool-node-b@node-b:40,pool-node-c@node-c:0');
+      expect(r.member).toBe('pool-node-b');
+      // A directly constructed capacity-0 member (bypassing parse) is skipped too — no share division by zero.
+      const pool = new PodPoolScheduler([{ context: 'off', capacity: 0, k3dCluster: 'x' }, { context: 'on', capacity: 2, k3dCluster: 'x' }], { occupancy: () => ({}) });
+      expect((await pool.tryAcquire(undefined, undefined, { kind: 'lite' }))?.context).toBe('on');
+      expect((await pool.tryAcquire(undefined, undefined, { kind: 'lite' }))?.context).toBe('on');
+      expect(await pool.tryAcquire(undefined, undefined, { kind: 'lite' })).toBeNull();
+    });
+
+    test('goal kind: lite tier and docs/measurement goals are lite; implementation and high are standard', () => {
+      expect(podPlacementKind('lite', 'implement', 'code')).toBe('lite');
+      expect(podPlacementKind('standard', 'document', null)).toBe('lite');
+      expect(podPlacementKind('standard', 'research', null)).toBe('lite');
+      expect(podPlacementKind('standard', null, 'docs')).toBe('lite');
+      expect(podPlacementKind('standard', 'implement', 'code')).toBe('standard');
+      expect(podPlacementKind('high', 'document', 'docs')).toBe('standard');
+    });
+  });
+
   test('occupancy reads Running plus Pending per member and marks a failed member unknown, not zero', () => {
     const members = parsePodPool('node-b:20,node-c:4');
     const kubectl = (args: readonly string[]) => {
@@ -175,6 +265,199 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(calls.length).toBeGreaterThan(3);
     expect(calls.every((c) => c[0] === '--context' && c[1] === 'pool-node-b')).toBe(true);
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
+  test('GATE-RESERVE-AUTO: the gate reservation does not depend on whether two local Pods were observed before, with or after the gate', async () => {
+    // 4 cores · capacity 8 (memory and slots are not the bound) · two local permits whose Pods request 1 core each ·
+    // a 1-core gate shard. 4 − 1 − 2 = 1 core ⇒ exactly one more admission (the third), the fourth waits — every order.
+    const run = async (order: 'pods-first' | 'together' | 'gate-first') => {
+      const dir = mkdtempSync(join(tmpdir(), `gate-order-${order}-`));
+      const hostLease = new HostPoolLease(`gate-order-${order}`, { dir });
+      let gateActive = false;
+      let podsVisible = false;
+      const kubectl = (args: readonly string[]) => {
+        if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node' }, status: { allocatable: { cpu: '4', memory: '512Gi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+        if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: [...(gateActive ? [{ metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } }, spec: { template: { spec: { containers: [{ resources: { requests: { cpu: '1' } } }] } } }, status: { active: 1 } }] : []), { metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { 'elanous.dev/host-lease-admitted': 'true' } } }] }), stderr: '' };
+        if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+        const gatePod = { metadata: { name: 'g', namespace: 'elanous-test', labels: { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' } }, status: { phase: 'Running' }, spec: { nodeName: 'node', containers: [{ resources: { requests: { cpu: '1', memory: '1Gi' }, limits: { memory: '2Gi' } } }] } };
+        return { status: 0, stdout: JSON.stringify({ items: [...(gateActive ? [gatePod] : []), ...(podsVisible ? [0, 1].map((n) => ({ metadata: { name: `h${n}`, namespace: 'elanous-test', labels: { 'elanous.substrate': 'pod', 'elanous.job': 'harness-job' } }, status: { phase: 'Running' }, spec: { nodeName: 'node', containers: [{ resources: { requests: { cpu: '1', memory: '1Gi' }, limits: { memory: '2Gi' } } }] } })) : [])] }), stderr: '' };
+      };
+      // A waiter whose predecessor never merges keeps the admission re-measuring every poll without taking a slot.
+      const pool = new PodPoolScheduler(parsePodPool('gate:8'), { kubectl, dns: () => 'ready', hostLease, pollMs: 2, dependencyMerged: () => 'waiting' });
+      const controller = new AbortController();
+      const watcher = pool.acquireAdmission(controller.signal, 'never-merges').catch(() => null);
+      const releases: Array<() => void> = [];
+      try {
+        const first = await pool.acquireAdmission(controller.signal);
+        const second = await pool.acquireAdmission(controller.signal);
+        releases.push(first, second);
+        const podsUp = () => { podsVisible = true; first.observed(); second.observed(); };
+        if (order === 'pods-first') { podsUp(); await Bun.sleep(15); gateActive = true; }
+        if (order === 'together') { podsUp(); gateActive = true; }
+        if (order === 'gate-first') { gateActive = true; await Bun.sleep(15); podsUp(); }
+        await Bun.sleep(15);
+        const third = await pool.acquireAdmission(controller.signal);
+        releases.push(third);
+        const fourth = pool.acquireAdmission(controller.signal).then((release) => { releases.push(release); return 'admitted'; }, () => 'waiting');
+        await Bun.sleep(30);
+        const snapshot = pool.admissionSnapshot();
+        controller.abort();
+        return { active: snapshot.active, fourth: await fourth };
+      } finally {
+        controller.abort();
+        await watcher;
+        for (const release of releases) release();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    for (const order of ['pods-first', 'together', 'gate-first'] as const) {
+      expect({ order, ...await run(order) }).toEqual({ order, active: 3, fourth: 'waiting' });
+    }
+  });
+
+  test('GATE-RESERVE-AUTO: local Pods measured Pending (not bound yet) are counted once, not again as unseen permits', async () => {
+    // 4 cores · a bound 1-core gate · two local permits whose 1-core Pods are Pending without a node ⇒ 4 − 1 − 2 = 1 more.
+    const dir = mkdtempSync(join(tmpdir(), 'gate-pending-'));
+    const hostLease = new HostPoolLease('gate-pending', { dir });
+    let podsPending = false;
+    const container = (cpu: string) => [{ resources: { requests: { cpu, memory: '1Gi' }, limits: { memory: '2Gi' } } }];
+    const kubectl = (args: readonly string[]) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node' }, status: { allocatable: { cpu: '4', memory: '512Gi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: [
+        { metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } }, spec: { template: { spec: { containers: container('1') } } }, status: { active: 1 } },
+        ...['h-a', 'h-b'].map((name) => ({ metadata: { name, labels: { 'elanous.substrate': 'pod' }, annotations: { 'elanous.dev/host-lease-admitted': 'true' } } })),
+      ] }), stderr: '' };
+      if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+      return { status: 0, stdout: JSON.stringify({ items: [
+        { metadata: { name: 'g', namespace: 'elanous-test', labels: { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' } }, status: { phase: 'Running' }, spec: { nodeName: 'node', containers: container('1') } },
+        ...(podsPending ? ['h-a', 'h-b'].map((job) => ({ metadata: { name: `${job}-pod`, namespace: 'elanous-test', labels: { 'elanous.job': job } }, status: { phase: 'Pending' }, spec: { containers: container('1') } })) : []),
+      ] }), stderr: '' };
+    };
+    const pool = new PodPoolScheduler(parsePodPool('gate:8'), { kubectl, dns: () => 'ready', hostLease, pollMs: 2 });
+    const controller = new AbortController();
+    const releases: Array<() => void> = [];
+    try {
+      // Two local permits; their Jobs are applied and their Pods then show up Pending (no node yet).
+      for (const job of ['h-a', 'h-b']) {
+        const release = await pool.acquireAdmission(controller.signal);
+        release.applied(job, 'gate', 'elanous-test');
+        releases.push(release);
+      }
+      podsPending = true;
+      const third = await pool.acquireAdmission(controller.signal);
+      releases.push(third);
+      const fourth = pool.acquireAdmission(controller.signal).then((r) => { releases.push(r); return 'admitted'; }, () => 'waiting');
+      await Bun.sleep(20);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 3, queued: 1 });
+      controller.abort();
+      expect(await fourth).toBe('waiting');
+    } finally {
+      controller.abort();
+      for (const release of releases) release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('GATE-RESERVE-AUTO: an injected gate shard Job lowers the admitted count while active and the normal share returns when it ends', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-reserve-'));
+    const hostLease = new HostPoolLease('gate-test', { dir });
+    let active = false;
+    const kubectl = (args: readonly string[]) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node' }, status: { allocatable: { cpu: '4', memory: '128Gi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: active ? [{ metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } }, spec: { template: { spec: { containers: [{ resources: { requests: { cpu: '3' } } }] } } }, status: { active: 1 } }] : [] }), stderr: '' };
+      if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+      // The shard's Pod is bound and Running on the node (3 of 4 cores).
+      return { status: 0, stdout: JSON.stringify({ items: active ? [{ metadata: { name: 'g', namespace: 'elanous-test', labels: { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' } }, status: { phase: 'Running' }, spec: { nodeName: 'node', containers: [{ resources: { requests: { cpu: '3', memory: '1Gi' }, limits: { memory: '2Gi' } } }] } }] : [] }), stderr: '' };
+    };
+    const pool = new PodPoolScheduler(parsePodPool('gate:4'), { kubectl, dns: () => 'ready', hostLease, pollMs: 2 });
+    const controller = new AbortController();
+    try {
+      active = true;
+      const first = await pool.acquireAdmission();
+      const second = pool.acquireAdmission(controller.signal);
+      await Bun.sleep(15);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 1, queued: 1 });
+      active = false;
+      const release = await second;
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 0 });
+      // The normal share is back in full: capacity 4 admits the third and fourth too, the fifth waits.
+      const third = await pool.acquireAdmission(controller.signal);
+      const fourth = await pool.acquireAdmission(controller.signal);
+      const fifth = pool.acquireAdmission(controller.signal).then((r) => { r(); return 'admitted'; }, () => 'waiting');
+      await Bun.sleep(15);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 4, queued: 1, recommended: 4 });
+      controller.abort();
+      expect(await fifth).toBe('waiting');
+      third(); fourth(); release();
+      first();
+    } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('GATE-ADMIT-EXEMPT: with an unscheduled gate shard Job active, a gate caller is admitted by memory while a harness caller is bounded to 0', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-exempt-'));
+    const hostLease = new HostPoolLease('gate-exempt-test', { dir });
+    const kubectl = (args: readonly string[]) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node' }, status: { allocatable: { cpu: '4', memory: '128Gi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } }, spec: { template: { spec: { containers: [{ resources: { requests: { cpu: '3' } } }] } } }, status: { active: 1 } }] }), stderr: '' };
+      if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+      // The shard's Pod exists but is not scheduled yet (no nodeName) — GATE-RESERVE-AUTO reads gate CPU as 0 free.
+      return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'g', namespace: 'elanous-test', labels: { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' } }, status: { phase: 'Pending' }, spec: { containers: [{ resources: { requests: { cpu: '3', memory: '1Gi' }, limits: { memory: '2Gi' } } }] } }] }), stderr: '' };
+    };
+    const events: Array<Record<string, unknown>> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((cat: string, ev: string, data?: unknown) => { if (cat === 'pod.pool' && ev === 'gate-reserve') events.push(data as Record<string, unknown>); }) as typeof debug.log;
+    const harnessPool = new PodPoolScheduler(parsePodPool('gate:4'), { kubectl, dns: () => 'ready', hostLease, pollMs: 2 });
+    const gatePool = new PodPoolScheduler(parsePodPool('gate:4'), { kubectl, dns: () => 'ready', hostLease: new HostPoolLease('gate-exempt-test-gate', { dir }), pollMs: 2 });
+    const controller = new AbortController();
+    try {
+      const harness = harnessPool.acquireAdmission(controller.signal).then((r) => { r(); return 'admitted'; }, () => 'waiting');
+      const gate = await Promise.race([gatePool.acquireAdmission(controller.signal, undefined, { gate: true }).then((r) => { r(); return 'admitted'; }), Bun.sleep(500).then(() => 'timeout')]);
+      expect(gate).toBe('admitted');
+      await Bun.sleep(15);
+      expect(harnessPool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1, recommended: 0 });
+      controller.abort();
+      expect(await harness).toBe('waiting');
+      expect(events.some((e) => e.exempt === 'gate-caller')).toBe(true);
+      expect(events.some((e) => e.exempt === undefined && e.recommended === 0)).toBe(true);
+    } finally { (debug as { log: typeof debug.log }).log = original; controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('POOL-LITE: a document launch lands on node-c, prints the placement line, and journals it in the run ledger', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-poollite-'));
+    const warned: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    try {
+      const calls: string[][] = [];
+      const kubectl: Kubectl = (args) => {
+        calls.push([...args]);
+        if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:40,pool-node-c@node-c:6'), {
+        status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 46, memorySlots: 46, placeableSlots: 46, running: 0, pending: 0 }),
+        // node-b has the larger free share (75% vs 50%) — only the goal kind sends this Job to node-c.
+        occupancy: () => ({ 'pool-node-b': { occupied: 10 }, 'pool-node-c': { occupied: 3 } }),
+        hostLease: new HostPoolLease('poollite', { dir: join(root, 'lease') }),
+      });
+      const runId = 'run-poollite-test';
+      const spawn = podSelfImplementSpawn({
+        kubectl, pool, pollMs: 1, imageCommit: null, sleep: async () => {},
+        credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: runId, ELANOUS_POD_MEMORY_TIER: 'lite', ELANOUS_POD_MEMORY_REASON: 'goal-type-default', ELANOUS_POD_GOAL_TYPE: 'document' },
+      });
+      const done = await spawn({ spaceId: 'poollite', feature: 'Write the guide' } as Parameters<typeof spawn>[0]).done;
+      expect(done.exitCode).toBe(0);
+      // The Job itself must have been submitted — and to node-c (an empty call list would pass `every` vacuously).
+      const applies = calls.filter((c) => c.includes('apply'));
+      expect(applies.length).toBeGreaterThan(0);
+      expect(applies.every((c) => c[0] === '--context' && c[1] === 'pool-node-c')).toBe(true);
+      expect(calls.every((c) => c[0] === '--context' && c[1] === 'pool-node-c')).toBe(true);
+      expect(warned.some((line) => line.startsWith('[pod] 배치: pool-node-c · lite 골 선호 멤버'))).toBe(true);
+      expect(loadRunLedger(runId, join(root, 'run-ledger'))).toContainEqual(expect.objectContaining({
+        event: 'pod-placement', data: expect.objectContaining({ member: 'pool-node-c', kind: 'lite', outcome: 'preferred', preferred: ['pool-node-c'] }),
+      }));
+    } finally { console.warn = originalWarn; rmSync(root, { recursive: true, force: true }); }
   });
 
   test('three pooled Job launches share FIFO admission: N=2 holds the third goal', async () => {

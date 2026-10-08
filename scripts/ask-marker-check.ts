@@ -1191,7 +1191,9 @@ export function formatAxisObservations(a: Axis): readonly string[] {
   ];
 }
 
-function main(files: string[]): number {
+/** CLI 본체. ⭐ 시험 심으로 export 한다(GATE-SPEED ③ · 2026-10-08) — 시험이 같은 출력 계약을
+ *  프로세스 하나 안에서 잴 수 있게. 실물 진입점(`import.meta.main`)은 아래 한 줄 그대로다. */
+export function main(files: string[]): number {
   if (files.length === 0) {
     console.error('쓰는 법: bun scripts/ask-marker-check.ts <ask 파일…>');
     return 2;

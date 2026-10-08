@@ -7,6 +7,7 @@ import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-stor
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
 import { registerDocsCommands } from './cli/docs-cli.js';
+import { registerRetroCommands } from './cli/retro-cli.js';
 import { registerA2ACommands } from './cli/a2a-cli.js';
 import { registerPluginCommands } from './cli/plugin-cli.js';
 import { registerMakeCommand } from './cli/make-cli.js';
@@ -219,13 +220,14 @@ program.enablePositionalOptions();
 
 program.command('preview <target>')
   .description('Isolated PR/branch-head TUI + PWA preview; publish the TUI-COMFORT friction table to a PR')
-  .option('--scenario <id>', 'TUI-COMFORT scenario (default S2)', 'S2')
+  .option('--scenario <id>', 'TUI-COMFORT scenario IDs (comma-separated; default S2)', 'S2')
   .option('--flag <path>', 'Enable an existing config feature flag in main-based preview (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+  .option('--bundle-pr <number>', 'Merge PR head into isolated main preview (repeatable; no flags)', (value: string, all: number[]) => [...all, Number(value)], [] as number[])
   .option('--comment-pr <number>', 'PR to receive a branch/main preview report', (value: string) => Number(value))
-  .action(async (target: string, opts: { scenario: string; flag: string[]; commentPr?: number }) => {
+  .action(async (target: string, opts: { scenario: string; flag: string[]; bundlePr: number[]; commentPr?: number }) => {
     try {
       const { runPrPreview } = await import('./self-dev/pr-preview.js');
-      const result = await runPrPreview({ target, repoRoot: process.cwd(), scenario: opts.scenario, flags: opts.flag, ...(opts.commentPr === undefined ? {} : { commentPr: opts.commentPr }) });
+      const result = await runPrPreview({ target, repoRoot: process.cwd(), scenario: opts.scenario, flags: opts.flag, bundlePrs: opts.bundlePr, ...(opts.commentPr === undefined ? {} : { commentPr: opts.commentPr }) });
       console.log(`preview ${result.status} · ${result.head} · PR #${result.prNumber} · comment posted`);
       if (result.status !== 'passed') process.exitCode = 1;
     } catch (error) {
@@ -1059,10 +1061,12 @@ fenceWrapperCmd.command('install').description('래퍼 제안 또는 백업 후 
 fenceWrapperCmd.command('alert <reason>').description('HQ 울타리 실패를 기존 루프 소유자 요청 원장에 적재')
   .action(async (reason: string) => {
     try {
-      const { notifyOwners } = await import('./loops/checker.js');
+      // LOOPCHECK-FENCE: keyed per role (not per pid) and only after consecutive failures of that role.
+      const { fenceOutcomeDir } = await import('./hq/fence-outcomes.js');
+      const { hqFenceAlert } = await import('./hq/fence-wrapper.js');
       const { getElanousConfigDir } = await import('./elanous-config-dir.js');
-      notifyOwners([{ id: `hq-fence:${Date.now()}:${process.pid}`, owner: 'TC', enabled: true, registered: true,
-        state: 'failing', reason }], { root: getElanousConfigDir() });
+      const root = getElanousConfigDir();
+      hqFenceAlert(reason, { root, outcomeDir: fenceOutcomeDir(_joinPath(root, 'hq', 'local.json')) });
     } catch (error) { console.error(`hq fence-wrapper alert: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 hqCmd.command('fence-audit').description('운영 crontab 의 HQ 울타리 밖 쓰기 잡 목록과 감싼 줄 제안(읽기 전용)')
@@ -1905,6 +1909,7 @@ program
   });
 
 registerAutopilotCommands(program);
+registerRetroCommands(program);
 
 // ── memory ──
 const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -7679,6 +7684,11 @@ configCmd
   .description('Print all config or one dotted path, e.g. llm.provider (secrets redacted by default)')
   .option('--reveal', 'Print unredacted output and record the reveal')
   .action(async (path: string | undefined, opts: { reveal?: boolean }) => {
+    const { resolveCurrentInstance } = await import('./instance/current.js');
+    const instance = resolveCurrentInstance();
+    if (instance.kind === 'test' && instance.layer === 'tree-derived') {
+      console.error('⚠️ test 우주의 config를 읽습니다 — 운영 값은 --config-dir ~/.elanous');
+    }
     const cfg = getUserConfig() as unknown as Record<string, unknown>;
     const value = path ? getConfigPath(cfg, path) : cfg;
     if (value === undefined) {
@@ -7771,6 +7781,59 @@ configCmd
       process.exit(1);
     }
     ui.info(`unset ${path}`);
+  });
+
+// ── config drift / explain (CFG-STORE1 · 0.2.20 · 2026-10-08) — 읽기 전용 «유효 config ⊕ 출처» ──
+// 집(~/.elanous)과 파생 시험 우주(<트리>/.elanous-test) config 사본의 드리프트를 한 명령으로.
+// ⛔ 쓰기 0 · 못 읽음 ≠ 같음 · 비밀 값 가림. 계산 = src/cli/config-drift.ts.
+async function configDriftDiscover(o: { registry?: string | boolean; scanRoot?: string[]; treeScan?: boolean }) {
+  const { discoverUniverses } = await import('./cli/config-drift.js');
+  return discoverUniverses({
+    ...(o.registry === false ? { registryPath: null } : typeof o.registry === 'string' ? { registryPath: o.registry } : {}),
+    ...(o.treeScan === false ? { treeScanRoots: [] } : o.scanRoot?.length ? { treeScanRoots: o.scanRoot } : {}),
+  });
+}
+
+configCmd
+  .command('drift')
+  .description('읽기 전용 — 운영 config 와 파생 시험 우주(.elanous-test) config 사본이 다른 키 표 (CFG-STORE1)')
+  .option('--key <key>', '이 키(또는 그 아래)만')
+  .option('--json', 'JSON 출력')
+  .option('--limit <n>', '표시할 키 수 (0=전부 · 기본 50)', '50')
+  .option('--registry <path>', '인스턴스 레지스트리 경로 (기본 ~/.elanous/logs/instances.json)')
+  .option('--scan-root <dir...>', '명시 트리 뿌리 (기본 = config-drift.ts defaultTreeScanRoots)')
+  .option('--no-tree-scan', '트리 뿌리 훑기 끔 — 레지스트리만')
+  .option('--no-registry', '레지스트리 끔 — 명시 트리 뿌리(자리·작업 트리)만')
+  .option('--include-expected', 'sync-test 의 test-safe 변환(비밀 제거·발송 끔)과 _test 메타 키 차이도 드리프트로 센다')
+  .action(async (o: { key?: string; json?: boolean; limit: string; includeExpected?: boolean; registry?: string | boolean; scanRoot?: string[]; treeScan?: boolean }) => {
+    const { computeDrift, renderDrift } = await import('./cli/config-drift.js');
+    const report = computeDrift(await configDriftDiscover(o), { key: o.key, includeExpected: o.includeExpected });
+    debug.log('config.drift', 'computed', {
+      key: o.key ?? null, rows: report.rows.length, prodStatus: report.prodStatus, ...report.universes,
+    });
+    debug.flush();
+    console.log(o.json ? JSON.stringify(report, null, 2) : renderDrift(report, { limit: Number(o.limit) || 0 }));
+    if (report.prodStatus !== 'ok') process.exit(1);
+  });
+
+configCmd
+  .command('explain <key>')
+  .description('읽기 전용 — 운영 값 ⊕ 출처 층 ⊕ 파생 시험 우주별 값 (CFG-STORE1)')
+  .option('--json', 'JSON 출력')
+  .option('--registry <path>', '인스턴스 레지스트리 경로')
+  .option('--scan-root <dir...>', '명시 트리 뿌리')
+  .option('--no-tree-scan', '트리 뿌리 훑기 끔 — 레지스트리만')
+  .option('--no-registry', '레지스트리 끔 — 명시 트리 뿌리만')
+  .action(async (key: string, o: { json?: boolean; registry?: string | boolean; scanRoot?: string[]; treeScan?: boolean }) => {
+    const { computeExplain, renderExplain } = await import('./cli/config-drift.js');
+    const { buildUserConfig } = await import('./user-config.js');
+    const report = computeExplain(await configDriftDiscover(o), key, {
+      codeDefaults: () => buildUserConfig('/nonexistent/elanous-config-drift/config.json'),
+    });
+    debug.log('config.explain', 'computed', { key, layer: report.prod.layer, ...report.universes });
+    debug.flush();
+    console.log(o.json ? JSON.stringify(report, null, 2) : renderExplain(report));
+    if (report.prod.layer === 'prod-unreadable') process.exit(1);
   });
 
 // ── config 격리 sync (ISO-1 · 2026-07-13) — 운영→테스트 물질화 동기화 ──

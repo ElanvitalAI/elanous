@@ -22,6 +22,69 @@ const text = (node: ReactTestRenderer['root'] | ReturnType<ReactTestRenderer['ro
   node.children.map(child => typeof child === 'string' ? child : text(child)).join('');
 const button = (root: ReactTestRenderer['root'], label: string) => root.findAllByType('button').find(node => text(node) === label)!;
 
+test('a batch of eighteen decision cards stays readable while a seat reply travels through the notice tab', async () => {
+  const cards = Array.from({ length: 18 }, (_, index) => item(`batch-${index}`));
+  const requests: Array<{ path: string; body?: unknown }> = [];
+  const root = await mount(async (path, init) => {
+    requests.push({ path, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    if (path === '/v1/ops-board/notices') return init?.method === 'POST'
+      ? json({ reply: { id: 20, from: 'CEO', to: 'MK', body: '의견', createdAt: '2026-10-07T00:00:00Z' } }, 201)
+      : json({ notices: [{ id: 19, from: 'MK', to: 'CEO', body: '공지', createdAt: '2026-10-07T00:00:00Z' }] });
+    if (init?.method === 'POST') return json({ decidedAt: '2026-10-07T00:00:00Z' });
+    return json({ decisions: cards });
+  });
+  expect(root.findAllByType('article')).toHaveLength(18);
+  for (let index = 0; index < 18; index++) {
+    await act(async () => { root.findAllByType('article')[0]!.findAllByType('button')[0]!.props.onClick(); });
+  }
+  expect(requests.filter(request => request.path.endsWith('/decide'))).toHaveLength(18);
+  expect(root.findAllByType('article')).toHaveLength(0);
+  await act(async () => { button(root, '공지 · 의견').props.onClick(); });
+  await act(async () => { root.findByType('textarea').props.onChange({ target: { value: '의견' } }); });
+  await act(async () => { button(root, '답글 보내기').props.onClick(); });
+  expect(requests).toContainEqual({ path: '/v1/ops-board/notices', body: { noticeId: 19, body: '의견' } });
+});
+
+test('rapid repeated reply click writes only once while the first request is in flight', async () => {
+  let finish!: (value: Response) => void;
+  const pending = new Promise<Response>(resolve => { finish = resolve; });
+  const writes: unknown[] = [];
+  const notice = { id: 13, from: 'TC', to: 'CEO', body: '공지', createdAt: '2026-10-07T00:00:00Z' };
+  const root = await mount(async (path, init) => {
+    if (path !== '/v1/ops-board/notices') return json({ decisions: [] });
+    if (!init?.method) return json({ notices: [notice] });
+    writes.push(init.body);
+    return pending;
+  });
+  await act(async () => { button(root, '공지 · 의견').props.onClick(); });
+  await act(async () => { root.findByType('textarea').props.onChange({ target: { value: '답' } }); });
+  await act(async () => {
+    button(root, '답글 보내기').props.onClick();
+    button(root, '답글 보내기').props.onClick();
+  });
+  expect(writes).toHaveLength(1);
+  await act(async () => { finish(json({ reply: { ...notice, from: 'CEO', to: 'TC' } }, 201)); });
+});
+
+test('notice tab reads owner inbox and sends a reply to the originating seat', async () => {
+  const calls: Array<{ path: string; body?: unknown }> = [];
+  const notice = { id: 3, from: 'UX', to: 'CEO', body: '조율 채널 요약', kind: 'notice', createdAt: '2026-10-07T00:00:00Z' };
+  const root = await mount(async (path, init) => {
+    calls.push({ path, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    if (path === '/v1/ops-board/notices') return init?.method === 'POST' ? json({ reply: { ...notice, from: 'CEO', to: 'UX' } }, 201) : json({ notices: [notice] });
+    return json({ decisions: [] });
+  });
+  await act(async () => { button(root, '공지 · 의견').props.onClick(); });
+  expect(text(root)).toContain('조율 채널 요약');
+  expect(root.findByType('textarea').props.value).toBe('');
+  await act(async () => { root.findByType('textarea').props.onChange({ target: { value: '확인했습니다' } }); });
+  await act(async () => { button(root, '답글 보내기').props.onClick(); });
+  expect(calls).toContainEqual({ path: '/v1/ops-board/notices', body: { noticeId: 3, body: '확인했습니다' } });
+  expect(text(root)).toContain('UX 수신함으로 보냄');
+  await act(async () => { button(root, '공지 새로고침').props.onClick(); });
+  expect(calls.filter(call => call.path === '/v1/ops-board/notices' && !call.body)).toHaveLength(2);
+});
+
 test('deadline order places undated cards last; full SCQA, recommendation, checks and folded original question are readable', async () => {
   const root = await mount(async () => json({ decisions: [item('none'), item('late', false, '2026-10-07T00:00:00Z'), item('early', false, '2026-10-06T00:00:00Z')] }));
   expect(sortOpenDecisions([item('none'), item('late', false, '2026-10-07T00:00:00Z'), item('early', false, '2026-10-06T00:00:00Z')]).map(row => row.id)).toEqual(['early', 'late', 'none']);

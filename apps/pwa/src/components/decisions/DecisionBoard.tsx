@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import { decide, listOpenDecisions, type OpenDecision } from '@/lib/decisions-api';
+import { decide, listOpenDecisions, listBoardNotices, replyToBoardNotice, type BoardNotice, type OpenDecision } from '@/lib/decisions-api';
 
 type Outcome = { label: string; at?: string };
 type BoardState = { items: OpenDecision[]; error: string | null; loading: boolean };
@@ -21,6 +21,12 @@ const noteText = (value: string) => value.replace(/\s+/g, ' ').trim().slice(0, 3
 export function DecisionBoard() {
   const { client } = useDaemon();
   const [board, setBoard] = useState<BoardState>({ items: [], error: null, loading: true });
+  const [tab, setTab] = useState<'decisions' | 'notices'>('decisions');
+  const [noticeRefresh, setNoticeRefresh] = useState(0);
+  const [notices, setNotices] = useState<{ items: BoardNotice[]; loading: boolean; error: string | null }>({ items: [], loading: false, error: null });
+  const [replyDrafts, setReplyDrafts] = useState<Record<number, string>>({});
+  const [replyBusy, setReplyBusy] = useState<number | null>(null);
+  const [replyStatus, setReplyStatus] = useState<Record<number, string>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [confirm, setConfirm] = useState<{ id: string; key: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -32,11 +38,44 @@ export function DecisionBoard() {
   activeClient.current = client;
 
   useEffect(() => {
+    if (tab !== 'notices') return;
+    let active = true;
+    setNotices({ items: [], loading: true, error: null });
+    void listBoardNotices(client).then(items => {
+      if (active) setNotices({ items, loading: false, error: null });
+    }).catch(error => {
+      if (active) setNotices({ items: [], loading: false, error: error instanceof Error ? error.message : String(error) });
+    });
+    return () => { active = false; };
+  }, [client, tab, noticeRefresh]);
+
+  const replyPending = useRef(false);
+  const sendReply = async (notice: BoardNotice) => {
+    const body = (replyDrafts[notice.id] ?? '').trim();
+    if (!body || replyPending.current) return;
+    replyPending.current = true;
+    setReplyBusy(notice.id);
+    setReplyStatus(previous => ({ ...previous, [notice.id]: '' }));
+    try {
+      await replyToBoardNotice(client, notice.id, body);
+      if (activeClient.current !== client) return;
+      setReplyDrafts(previous => ({ ...previous, [notice.id]: '' }));
+      setReplyStatus(previous => ({ ...previous, [notice.id]: `${notice.from} 수신함으로 보냄` }));
+    } catch (error) {
+      if (activeClient.current === client) setReplyStatus(previous => ({ ...previous, [notice.id]: `전송 실패 · ${error instanceof Error ? error.message : String(error)}` }));
+    } finally {
+      replyPending.current = false;
+      if (activeClient.current === client) setReplyBusy(null);
+    }
+  };
+
+  useEffect(() => {
     let active = true;
     pending.current = null;
     const sequence = ++readSequence.current;
     setBoard({ items: [], error: null, loading: true });
     setNotes({}); setConfirm(null); setBusy(null); setOutcomes({}); setErrors({});
+    setReplyDrafts({}); setReplyBusy(null); setReplyStatus({});
     void listOpenDecisions(client).then(items => {
       if (active && readSequence.current === sequence) setBoard({ items: sortOpenDecisions(items), error: null, loading: false });
     }).catch(error => {
@@ -76,7 +115,23 @@ export function DecisionBoard() {
 
   return <main className="mx-auto w-full max-w-3xl px-3 py-5 text-foreground sm:px-6">
     <header className="mb-5"><p className="text-xs text-muted-foreground">운영 · 결정</p><h1 className="text-xl font-semibold">결정 대기 카드</h1></header>
-    {board.loading ? <p role="status">읽는 중</p> : board.error ? <p role="alert">못 읽음 · {board.error}</p>
+    <nav aria-label="운영 게시판" className="mb-4 flex gap-2">
+      <button type="button" aria-current={tab === 'decisions' ? 'page' : undefined} onClick={() => setTab('decisions')} className="rounded-md border border-border px-3 py-2">결정</button>
+      <button type="button" aria-current={tab === 'notices' ? 'page' : undefined} onClick={() => setTab('notices')} className="rounded-md border border-border px-3 py-2">공지 · 의견</button>
+      {tab === 'notices' && <button type="button" onClick={() => setNoticeRefresh(value => value + 1)} className="rounded-md border border-border px-3 py-2">공지 새로고침</button>}
+    </nav>
+    {tab === 'notices' ? <section aria-label="공지 · 의견">
+      {notices.loading ? <p role="status">공지 읽는 중</p> : notices.error ? <p role="alert">공지 못 읽음 · {notices.error}</p>
+        : notices.items.length === 0 ? <p>도착한 공지가 없습니다.</p> : <ol className="space-y-4">{notices.items.map(notice => <li key={notice.id} className="rounded-xl border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">{notice.from} → 대표 · {notice.kind ?? '공지'} · <time dateTime={notice.createdAt}>{kst(notice.createdAt)} KST</time></p>
+          <p className="my-3 whitespace-pre-wrap break-words">{notice.body}</p>
+          <label className="block text-sm">{notice.from} 자리에게 답글
+            <textarea maxLength={3000} value={replyDrafts[notice.id] ?? ''} onChange={event => setReplyDrafts(previous => ({ ...previous, [notice.id]: event.target.value }))} className="mt-1 block w-full rounded-md border border-border bg-background px-3 py-2" />
+          </label>
+          <button type="button" disabled={replyBusy !== null || !(replyDrafts[notice.id] ?? '').trim()} onClick={() => { void sendReply(notice); }} className="mt-2 rounded-md border border-border px-3 py-1 disabled:opacity-50">답글 보내기</button>
+          {replyStatus[notice.id] && <p role="status">{replyStatus[notice.id]}</p>}
+        </li>)}</ol>}
+    </section> : board.loading ? <p role="status">읽는 중</p> : board.error ? <p role="alert">못 읽음 · {board.error}</p>
       : board.items.length === 0 ? <p>열린 결정이 없습니다.</p> : <ol className="space-y-4">
         {board.items.map(item => {
           const outcome = outcomes[item.id];

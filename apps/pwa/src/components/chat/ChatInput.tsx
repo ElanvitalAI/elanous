@@ -554,12 +554,13 @@ export function ChatInput({
     insertAtToken(atEntries[idx]);
   };
 
-  // PWA Phase 2·B — `$` picker commit. `/run-skill <name> ` 으로 replace.
+  // PWA Phase 2·B — `$` picker commit. Keep text before the picker as the task,
+  // but put the command first so it reaches the local skill executor.
   const insertSkillToken = (entry: SkillPickerEntry): void => {
     const dollarIdx = value.lastIndexOf('$');
     if (dollarIdx < 0) return;
-    const before = value.slice(0, dollarIdx);
-    setValue(`${before}/run-skill ${entry.name} `);
+    const task = value.slice(0, dollarIdx).trim();
+    setValue(`/run-skill ${entry.name} ${task ? `${task} ` : ''}`);
   };
   const commitSkillSelection = (): void => {
     if (skillEntries.length === 0) return;

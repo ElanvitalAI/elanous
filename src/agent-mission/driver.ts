@@ -63,6 +63,34 @@ import type { IngestionEntry } from '../agent-substrate/execution/ingestion-poli
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** PTY 미션의 «벽시계» 상수 — 기본값이 운영 동작이다.
+ *  ⭐ GATE-SPEED ③(2026-10-08): 가짜 PTY 시험이 시험마다 준비 대기 1.5 s ⊕ 키 간격 0.8 s 를 «실제로» 잤다
+ *  (driver.test.ts 74건 · 게이트 423 s). 시험은 `setAgentMissionTimingForTest` 로 줄이고 끝나면 되돌린다.
+ *  ⛔ 운영 경로는 이 함수를 부르지 않는다 — 값은 아래 기본값 그대로다. */
+interface AgentMissionTiming {
+  /** 준비·신뢰 화면이 «조용해졌다»로 보는 무출력 시간. */
+  readyQuietMs: number;
+  /** waitForQuiet 의 폴링 간격. */
+  pollMs: number;
+  /** 미션 문면과 Enter 사이 간격(TUI 가 붙여넣기를 한 덩어리로 받게). */
+  keystrokeGapMs: number;
+  /** 자원 사다리 시한 타이머 — 시험은 ms 를 기록하고 즉시 쏠 수 있다. */
+  scheduleTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+}
+const DEFAULT_AGENT_MISSION_TIMING: AgentMissionTiming = {
+  readyQuietMs: 1500,
+  pollMs: 300,
+  keystrokeGapMs: 800,
+  scheduleTimeout: (fn, ms) => setTimeout(fn, ms),
+};
+let missionTiming: AgentMissionTiming = DEFAULT_AGENT_MISSION_TIMING;
+/** 시험 전용 심 — 바꾼 값을 되돌리는 함수를 돌려준다. */
+export function setAgentMissionTimingForTest(over: Partial<AgentMissionTiming>): () => void {
+  const previous = missionTiming;
+  missionTiming = { ...previous, ...over };
+  return () => { missionTiming = previous; };
+}
+
 /** Terminate the PTY process and every descendant found before signalling it. */
 export async function terminateMissionProcessTree(rootPid: number, deps: {
   processTable?: () => string;
@@ -647,7 +675,7 @@ async function waitForQuiet(h: PtyHandle, quietMs: number, maxWaitMs: number): P
     const d = h.drainDelta();
     if (d.length > 0) last = Date.now();
     else if (Date.now() - last >= quietMs) return 'quiet';
-    await sleep(300);
+    await sleep(missionTiming.pollMs);
   }
   return 'timeout';
 }
@@ -1871,7 +1899,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   try {
 
   // ready + trust — backend 별 신뢰/권한 프롬프트 처리(codex=1, 이후 백엔드는 자체 handler).
-  await (deps.awaitMission ? deps.awaitMission(waitForQuiet(h, 1500, 20000)) : waitForQuiet(h, 1500, 20000));
+  await (deps.awaitMission ? deps.awaitMission(waitForQuiet(h, missionTiming.readyQuietMs, 20000)) : waitForQuiet(h, missionTiming.readyQuietMs, 20000));
   if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   let screen = await (deps.awaitMission ? deps.awaitMission(capture('ready')) : capture('ready'));
   if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
@@ -1884,7 +1912,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     if (s === '\r') decisionEvent({ step: 'answer', text: 'Answered folder trust prompt', detail: { question: 'Trust this folder?', answer: 'Confirm selected choice' } });
   }); pass++) {
     debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled', pass });
-    const trusted = (async () => { await waitForQuiet(h, 1500, 15000); return capture('trusted'); })();
+    const trusted = (async () => { await waitForQuiet(h, missionTiming.readyQuietMs, 15000); return capture('trusted'); })();
     screen = await (deps.awaitMission ? deps.awaitMission(trusted) : trusted);
   }
 
@@ -1901,7 +1929,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
           resources: spec.resources,
           deadlineMs: 20_000,
         }),
-        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('resource ladder timeout (20s)')), 20_000); }),
+        new Promise<never>((_resolve, reject) => { timer = missionTiming.scheduleTimeout(() => reject(new Error('resource ladder timeout (20s)')), 20_000); }),
       ]);
       debug.log('agent-mission.resources', 'planned', {
         have: resourcePlan.have.length, gaps: resourcePlan.gaps.length,
@@ -1989,11 +2017,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     debug.log('agent-mission', 'mission-send', { via: 'file', file: '.mission-prompt.md', chars: missionText.length, enhanced: enhanceActive });
     submittedCommand = note;
     submittedInputs.push(note);
-    drive(note); await sleep(800); drive('\r');
+    drive(note); await sleep(missionTiming.keystrokeGapMs); drive('\r');
   } else {
     debug.log('agent-mission', 'mission-send', { via: 'type', chars: spec.mission.length });
     submittedInputs.push(spec.mission);
-    drive(spec.mission); await sleep(800); drive('\r');
+    drive(spec.mission); await sleep(missionTiming.keystrokeGapMs); drive('\r');
   }
 
   let usedOmni = false;

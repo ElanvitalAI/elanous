@@ -31,6 +31,8 @@ export interface LoopEdge {
   tick?: string;
   /** live claimed 뒤 handed·released 없이 N분 지남 = 발사 실패(끊긴 넘김). ref = 오케스트레이터 카드 id. */
   broken?: true;
+  /** launch 간선만 — 그 카드에 묶인 런 원장 runId(ID 정규식). 못 묶으면 생략(PWA 가 10분 뒤 «유령»으로 본다). */
+  run?: string;
 }
 
 /** 노드 접두 — 조율 루프는 레지스트리 행 `loop:orchestrator` 그대로 쓴다. `queue:` 는 대기열 대체 간선 자리(조각 A 밖). */
@@ -369,10 +371,10 @@ function taskAgentEdges(deps: LoopEdgesDeps, facts: readonly RunFact[], seats: R
     if (typeof card.mission === 'string' && ID.test(card.mission)) journey.links.push({ from: card.id, to: card.mission, both: false });
     if (Array.isArray(card.pieces)) journey.pieces.set(card.id, card.pieces.filter(piece => typeof piece === 'string' && ID.test(piece)));
     const launches = launchesOf(card);
-    for (const launch of launches) {
-      if (seat(card.seat, seats) && inWindow(launch.at, since, now)) edges.push({ at: launch.at, kind: 'launch', from: TASK_AGENT_NODE, to: card.seat, ref: card.id });
-    }
     const runId = linkedRun(card, launches[0]?.at, launchedTexts, facts, childIds);
+    for (const launch of launches) {
+      if (seat(card.seat, seats) && inWindow(launch.at, since, now)) edges.push({ at: launch.at, kind: 'launch', from: TASK_AGENT_NODE, to: card.seat, ref: card.id, ...(runId ? { run: runId } : {}) });
+    }
     if (runId) journey.links.push({ from: card.id, to: runId, both: true });
     const green = object(card.greenProposal);
     if (green && typeof green.at === 'string' && typeof green.checklistId === 'string' && ID.test(green.checklistId) && inWindow(green.at, since, now)) {

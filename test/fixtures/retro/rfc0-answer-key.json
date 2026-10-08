@@ -1,0 +1,54 @@
+{
+  "source": "docs/RFC-retro-loop-daily-weekly-insight-2026-10-07.md §0",
+  "day": "2026-10-07",
+  "greenCells": [
+    {
+      "id": "DRAFT3",
+      "title": "draft 적체 정리",
+      "status": "done",
+      "version": "0.2.12",
+      "greenAt": "2026-09-29T09:00:00.000Z"
+    },
+    {
+      "id": "DRAFT-TRIAGE",
+      "title": "draft 분류",
+      "status": "green",
+      "version": "0.2.18",
+      "greenAt": "2026-10-06T09:00:00.000Z"
+    },
+    {
+      "id": "PWA-HOOK",
+      "title": "hook order",
+      "status": "green",
+      "version": "0.2.19",
+      "greenAt": "2026-10-07T00:30:00.000Z"
+    }
+  ],
+  "expected": [
+    {
+      "theme": "draft-backlog",
+      "title": "draft 적체",
+      "reBrokeAfterGreen": true
+    },
+    {
+      "theme": "silent-failure",
+      "title": "조용한 실패"
+    },
+    {
+      "theme": "universe-confusion",
+      "title": "우주 혼동"
+    },
+    {
+      "theme": "serialization",
+      "title": "직렬화 재발"
+    },
+    {
+      "theme": "unreadable-stop",
+      "title": "멈춤을 읽을 수 없음"
+    }
+  ],
+  "notRecurring": [
+    "sig:stop:merged",
+    "sig:card:docs:ok"
+  ]
+}

@@ -66,6 +66,12 @@ export interface GraphRunOptions {
   resumeGraphId?: string;
   fromNodeId?: string;
   useCurrentGraph?: boolean;
+  /**
+   * RELEASE-LEDGER-UNIVERSE — stamp every cmd: child with this run's ledger root (`ELANOUS_STATE_DIR`).
+   * Without it a child launched from a non-leader tree (`bun scripts/...` with cwd = that tree) re-resolves
+   * its own universe and lands in the tree-derived test universe while the run ledger is prod.
+   */
+  pinChildUniverse?: boolean;
   deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
 }
 
@@ -714,7 +720,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       // state stamp so a cmd: child resolves its default config in the same universe.
       // The ignored config-dir environment variable must not appear to propagate the flag.
       delete env.ELANOUS_CONFIG_DIR;
-      if (getElanousConfigDirOverride()) {
+      if (options.pinChildUniverse) {
+        // The run's own ledger root is the parent universe — the child writes where the run is recorded.
+        env.ELANOUS_STATE_DIR = root;
+        debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: getElanousConfigDirOverride() ?? null, stateDir: env.ELANOUS_STATE_DIR, why: 'pinChildUniverse' });
+      } else if (getElanousConfigDirOverride()) {
         env.ELANOUS_STATE_DIR = effectiveInstanceRoot();
         debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: getElanousConfigDirOverride(), stateDir: env.ELANOUS_STATE_DIR });
       }

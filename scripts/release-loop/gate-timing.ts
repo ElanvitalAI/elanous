@@ -2,9 +2,15 @@
 // 입력 = 게이트 로그 디렉토리(`<ledger>/release/<version>/gate-logs/cut`)의 `pod-*.json`.
 //   첫 판 샤드 = `pod-<n>.json` · 재시도 = 그 밖의 모든 `pod-*.json`(`-c<k>`·`-c<k>-file-<m>`·`-retry` …).
 // ⛔ 측정이 없으면 `measured:false` 로 표시한다 — 0 을 «잰 값»처럼 내지 않는다.
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+// ⭐ 기본 = 전 우주(LOGS-DEFAULT-ALL · 0.2.20) — 게이트는 실행 트리의 시험 우주(예: ⟨test:wt-release⟩
+//   `<tree>/.elanous-test/release/<v>/gate-logs/cut`)에 쌓인다. 운영 원장만 보면 0.2.19 판처럼
+//   «측정 없음»으로 오판한다. 그래서 버전 인자는 운영 원장 ⊕ 등록된 모든 우주(시험·파생 시험 포함)를
+//   본다 — 우주 열거는 `eln logs --all --include-test` 와 같은 레지스트리(`readLogInstanceScope`)다.
+//   좁히기는 opt-in `--prod-only`(종전 동작: `releaseLedgerRoot()` 하나).
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { releaseLedgerRoot } from '../../src/instance/resolve.js';
+import { readLogInstanceScope } from '../../src/mss/logging/instance-registry.js';
 
 export interface ShardTiming { name: string; min: number; files: number; plannedMin: number | null }
 
@@ -82,10 +88,92 @@ export function gateTiming(dir: string): GateTimingReport {
   };
 }
 
+/** 인자가 버전이 아니라 디렉토리인가 — 경로처럼 보이거나 실제로 있으면. */
+export function isGateLogDirArg(arg: string): boolean {
+  return arg.includes('/') || arg.startsWith('.') || existsSync(arg);
+}
+
 /** `<version>` 이면 원장 루트(`releaseLedgerRoot()`)의 `release/<version>/gate-logs/cut`, 경로처럼 보이면 그대로. */
 export function resolveGateLogDir(arg: string, ledgerRoot: string = releaseLedgerRoot()): string {
-  if (arg.includes('/') || arg.startsWith('.') || existsSync(arg)) return arg;
+  if (isGateLogDirArg(arg)) return arg;
   return join(ledgerRoot, 'release', arg, 'gate-logs', 'cut');
+}
+
+export interface GateLogCandidate { universe: string; dir: string }
+
+export interface GateLogScope {
+  /** 본 후보 원장 루트 수(물리 경로 dedup 뒤). */
+  roots: number;
+  /** 우주 레지스트리 — `read` 읽음 · `unreadable` 못 읽음(«등록 우주 0»이 아니라 «못 셈» — 운영 원장만 봤다)
+   *  · `skipped` `--prod-only` 라 안 읽음. */
+  registry: 'read' | 'unreadable' | 'skipped';
+  /** `--prod-only` 로 좁혔나. */
+  prodOnly: boolean;
+}
+
+export interface GateLogScopeDeps {
+  ledgerRoot?: string;
+  readInstances?: () => { instances: ReadonlyArray<{ name: string; stateDir: string }>; queryStatus: { registeredStores: boolean } };
+}
+
+function physical(path: string): string {
+  try { return realpathSync(path); } catch { return path; }
+}
+
+/** 버전의 게이트 로그 후보 — 운영 원장 루트(`releaseLedgerRoot()`) ⊕ 등록된 모든 우주.
+ *  물리 경로로 dedup 한다(`~/.monad` → `~/.elanous` 심링크가 같은 판을 두 번 세지 않게). */
+export function gateLogCandidates(
+  version: string,
+  opts: { prodOnly?: boolean } = {},
+  deps: GateLogScopeDeps = {},
+): { candidates: GateLogCandidate[]; scope: GateLogScope } {
+  const primary = deps.ledgerRoot ?? releaseLedgerRoot();
+  const roots: Array<{ universe: string; root: string }> = [{ universe: 'prod', root: primary }];
+  let registry: GateLogScope['registry'] = 'skipped';
+  if (!opts.prodOnly) {
+    const scope = (deps.readInstances ?? readLogInstanceScope)();
+    registry = scope.queryStatus.registeredStores ? 'read' : 'unreadable';
+    // 못 읽은 판의 부분 목록은 쓰지 않는다 — «운영만 봤다»는 표시와 실제 본 범위를 일치시킨다.
+    if (registry === 'read') for (const instance of scope.instances) roots.push({ universe: instance.name, root: instance.stateDir });
+  }
+  const seen = new Set<string>();
+  const candidates: GateLogCandidate[] = [];
+  for (const { universe, root } of roots) {
+    const key = physical(root);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({ universe, dir: resolveGateLogDir(version, root) });
+  }
+  return { candidates, scope: { roots: candidates.length, registry, prodOnly: opts.prodOnly === true } };
+}
+
+export interface GateTimingScan {
+  version: string;
+  scope: GateLogScope & { found: number };
+  /** pod-*.json 디렉토리가 «있는» 우주만 — 판마다 따로 낸다(서로 다른 판의 샤드를 섞지 않는다). */
+  reports: Array<GateTimingReport & { universe: string }>;
+}
+
+/** 버전 인자의 기본 동선 — 후보 우주 전부에서 게이트 로그 디렉토리가 있는 것만 보고한다. */
+export function scanGateTiming(version: string, opts: { prodOnly?: boolean } = {}, deps: GateLogScopeDeps = {}): GateTimingScan {
+  const { candidates, scope } = gateLogCandidates(version, opts, deps);
+  const reports = candidates
+    .filter(({ dir }) => existsSync(dir) && statSync(dir).isDirectory())
+    .map(({ universe, dir }) => ({ universe, ...gateTiming(dir) }));
+  return { version, scope: { ...scope, found: reports.length }, reports };
+}
+
+export function formatGateTimingScan(scan: GateTimingScan): string {
+  const s = scan.scope;
+  const head = `게이트 로그 ${scan.version} — ${s.prodOnly ? '운영 원장만(--prod-only)' : '전 우주'} · 본 원장 루트 ${s.roots}개 · 로그 있는 우주 ${s.found}개`
+    + (s.registry === 'unreadable' ? ' · ⚠ 우주 레지스트리를 못 읽었다(운영만 봤다 — «없다»가 아니라 «못 셈»)' : '');
+  if (scan.reports.length === 0) {
+    const where = s.registry === 'read' ? '본 우주 어디에도' : '운영 원장에';
+    const unknown = s.registry === 'unreadable' ? ' · 시험 우주는 못 셌다(있을 수 있다)' : '';
+    return [head, `  게이트 시간 — 측정 없음 · ${where} release/${scan.version}/gate-logs/cut 가 없다${unknown}`,
+      ...(s.prodOnly ? ['  (--prod-only 를 빼면 시험 우주까지 본다)'] : [])].join('\n');
+  }
+  return [head, ...scan.reports.map((r) => `⟨${r.universe}⟩ ${formatGateTiming(r)}`)].join('\n');
 }
 
 export function formatGateTiming(r: GateTimingReport): string {
@@ -106,15 +194,36 @@ export function formatGateTiming(r: GateTimingReport): string {
   return lines.join('\n');
 }
 
+export const GATE_TIMING_USAGE = [
+  '기본 = 전 우주 — 운영 원장 ⊕ 시험 우주(⟨test:wt-release⟩ 등)의 게이트 로그를 옵션 없이 함께 읽는다',
+  '사용법: bun scripts/release-loop/gate-timing.ts <version|dir> [--json] [--prod-only]',
+  '  <version>    등록된 모든 우주의 release/<version>/gate-logs/cut 를 우주마다 따로 보고한다(⟨우주⟩ 태그)',
+  '  <dir>        그 디렉토리 하나만 (종전과 같은 단일 보고)',
+  '  --prod-only  운영 원장 루트(releaseLedgerRoot)만 본다 — 종전 기본',
+  '  --json       구조화 출력 (<version> 이면 { version, scope, reports[] })',
+].join('\n');
+
+const KNOWN_FLAGS = new Set(['--json', '--prod-only', '--help', '-h']);
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) { console.log(GATE_TIMING_USAGE); process.exit(0); }
+  const unknown = args.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a));
+  if (unknown.length) { console.error(`알 수 없는 옵션: ${unknown.join(' ')}\n${GATE_TIMING_USAGE}`); process.exit(2); }
   const json = args.includes('--json');
-  const target = args.find((a) => !a.startsWith('--'));
+  const prodOnly = args.includes('--prod-only');
+  const target = args.find((a) => !a.startsWith('-'));
   if (!target) {
-    console.error('사용법: bun scripts/release-loop/gate-timing.ts <version|dir> [--json]');
+    console.error(GATE_TIMING_USAGE);
     process.exit(2);
   }
-  const report = gateTiming(resolveGateLogDir(target));
-  console.log(json ? JSON.stringify(report, null, 2) : formatGateTiming(report));
-  if (!report.measured) process.exit(1);
+  if (isGateLogDirArg(target)) {
+    const report = gateTiming(target);
+    console.log(json ? JSON.stringify(report, null, 2) : formatGateTiming(report));
+    if (!report.measured) process.exit(1);
+  } else {
+    const scan = scanGateTiming(target, { prodOnly });
+    console.log(json ? JSON.stringify(scan, null, 2) : formatGateTimingScan(scan));
+    if (!scan.reports.some((r) => r.measured)) process.exit(1);
+  }
 }

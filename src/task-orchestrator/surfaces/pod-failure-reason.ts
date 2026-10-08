@@ -1,3 +1,7 @@
+/** STOP-RECORD stop_class values used by the card terminal classifier. */
+export const STOP_CLASS_POD_FAILURE = 'pod-failure' as const;
+export const STOP_CLASS_NO_LAUNCH = 'no-launch' as const;
+
 /** Executor kinds of the dev child's `--json` result line (`src/index.ts` writeStdoutJson · DevExecutor.kind). */
 const CHILD_RESULT_KINDS = new Set(['self', 'external']);
 

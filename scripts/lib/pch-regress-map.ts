@@ -15,7 +15,8 @@ export const PCH_REGRESS_MAP: Record<string, readonly string[]> = {
   'PCH-8': ['src/lib/chat-harness-ask.test.ts', 'src/components/chat/HarnessAskCard.test.tsx'],
   'PCH-9': ['src/components/chat/ChatPendingDecision.test.tsx', 'src/components/chat/ChatDecisionsChip.test.tsx'],
   'PCH-10': ['src/lib/chat-runtime.meta.test.ts'], // /rewind · /undo meta commands.
-  'PCH-11': ['src/lib/chat-fork.test.ts'],
+  // Full fork and turn-bearing rewind/undo branches; live PWA behavior still needs observation.
+  'PCH-11': ['src/lib/chat-fork.test.ts', 'src/lib/chat-branch.test.ts'],
   'PCH-12': ['src/lib/chat-runtime.run-skill.test.ts'],
   'PCH-13': ['src/components/chat/ChatConversationList.test.tsx'], // Chat search; export has no identified PWA test.
   'PCH-14': ['src/lib/compact-mode.test.ts'], // Compact; plan toggle has no identified PWA test.

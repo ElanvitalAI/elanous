@@ -55,6 +55,7 @@ import { createWishCard } from './intake-plane/wish-card.js';
 import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
 import { CardStore } from './task-cards/card-store.js';
 import type { ContextNowDeps } from './context-bus/context-now.js';
+import type { RunningRunsResult } from './self-implement/running-runs.js';
 
 /** How many prior user/assistant turns to pass into `executeSkill` as
  *  the `## Recent conversation` block. Mirrors the dashboard default
@@ -305,6 +306,40 @@ function dropChatSessionReply(ctx: TgIncoming): string {
     : `_Session \`${sess.id.slice(0, 8)}\` was already gone._`;
 }
 
+/** `/runs` — the Telegram twin of TUI `/harness runs`: the same `renderRunningRuns` text over the same
+ *  production-universe query. The query is injectable so a test can prove the reply equals the renderer
+ *  output for one data set. Long replies are chunked by the bot's sender, so no run line is dropped here. */
+export async function telegramRunsSlash(args: readonly string[], query?: () => RunningRunsResult,
+  runCli: (argv: readonly string[]) => Promise<{ code: number | null; stdout: string }> = runSelfCli): Promise<string> {
+  if (args.length > 0) return 'Usage: /runs';
+  const { queryRunningRuns, renderRunningRuns } = await import('./self-implement/running-runs.js');
+  if (query) return renderRunningRuns(query());
+  // The ledger scan is synchronous and took 30–58 s under load (TC 10-07 17:37) — run inside the daemon it would freeze
+  // every bot and HTTP reply for that long. Ask the CLI twin (`self running-runs`, same renderer) in a child process,
+  // pinned to this daemon's universe; fall back in-process only when the child cannot start.
+  const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+  try {
+    const { code, stdout } = await runCli(['--config-dir', effectiveInstanceRoot(), 'self', 'running-runs']);
+    if (code === 0 && stdout.trim()) return stdout.trimEnd();
+  } catch { /* fall through */ }
+  return renderRunningRuns(queryRunningRuns({ includeTest: false, caller: 'telegram' }));
+}
+
+/** Run this same elanous entry as a child (`bun <entry> …`) with a hard time limit. */
+async function runSelfCli(argv: readonly string[]): Promise<{ code: number | null; stdout: string }> {
+  const { spawn } = await import('node:child_process');
+  const entry = process.argv[1];
+  if (!entry) throw new Error('no elanous entry');
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [entry, ...argv], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('timeout')); }, 120_000);
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout }); });
+  });
+}
+
 /** Build the default command set for a Telegram bot wired via
  *  botFromConfig. Returns the array rather than mutating globals so
  *  tests can construct a variant set with stubbed handlers. */
@@ -312,6 +347,7 @@ export function defaultTelegramCommands(
   nowDeps?: ContextNowDeps,
   coreCommands: readonly SlashCommand[] = SLASH_COMMANDS,
   maturity: { tuiSlash: Readonly<Record<string, Maturity>>; telegramCommand: Readonly<Record<string, Maturity>>; discordCommand: Readonly<Record<string, Maturity>> } = FEATURE_MATURITY,
+  runningRunsQuery?: () => RunningRunsResult,
 ): TgSlashCommand[] {
   const handled: TgSlashCommand[] = [
     {
@@ -334,6 +370,11 @@ export function defaultTelegramCommands(
       name: 'loops',
       description: '루프·크론 현황 — 늦음·실패를 먼저 보여줍니다',
       handler: (args) => telegramLoopsStatus(args),
+    },
+    {
+      name: 'runs',
+      description: 'Running harness runs — same output as TUI /harness runs',
+      handler: async (args) => telegramRunsSlash(args, runningRunsQuery),
     },
     {
       name: 'release',

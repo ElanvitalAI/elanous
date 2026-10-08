@@ -10,7 +10,18 @@ describe('harness ask routing', () => {
     expect(harnessAskText('  하니스로 버튼 고쳐  ')).toBe('  하니스로 버튼 고쳐  ');
     expect(harnessAskText('하니스 좋다')).toBeNull();
     expect(harnessAskText('하니스로')).toBeNull();
+    expect(harnessAskText('하니스로 버튼 고쳐\n다음 줄')).toBeNull();
+    expect(harnessAskText('하니스로 버튼\n')).toBeNull();
+    expect(harnessAskText('\n하니스로 버튼')).toBeNull();
+    expect(harnessAskText('하니스로\u00a0버튼')).toBe('하니스로\u00a0버튼');
+    expect(harnessAskText('/harness\u00a0버튼')).toBe('버튼');
+    expect(harnessAskText('/harness 버튼\n')).toBeNull();
+    expect(harnessAskText('\n/harness 버튼')).toBeNull();
     expect(harnessAskText('/harness 첫 줄\n둘째 줄')).toBeNull();
+    expect(harnessAskText('/harness\u2028버튼')).toBeNull();
+    expect(harnessAskText('/harness\u2029버튼')).toBeNull();
+    expect(harnessAskText('하니스로\u2028버튼')).toBeNull();
+    expect(harnessAskText('하니스로\u2029버튼')).toBeNull();
     expect(harnessAskText('/harness')).toBe('');
     expect(harnessAskText('/harness   ')).toBe('');
     expect(harnessAskText('/harnessed 버튼 고쳐')).toBeNull();

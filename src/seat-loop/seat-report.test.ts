@@ -2,8 +2,17 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { seatReport } from './seat-report.js';
+import { seatReport as report } from './seat-report.js';
+import type { SeatReportDeps } from './seat-report.js';
 import { runSeatLoopOnce, seatLedgerPath, type SeatEntry } from './seat-loop.js';
+
+const m = { launches24h: null, launched: null, unmeasured: null, sourceIncomplete: false, linked: null, autoLanded: null, autoRate: null, secondSiblingMedianHours: null, salvaged: null, salvageUnmeasured: null };
+const seatReport = (seat: string, deps: SeatReportDeps = {}) => report(seat, {
+  draftMetrics: async () => ({ inventory: 0, oldestAgeHours: null, needsOwner: 0, converted48h: 0, cohort48h: 0, conversion48h: null }),
+  overlapMetrics: async () => ({ ...m, launches24h: 0, launched: 3, unmeasured: 0, linked: 0, autoLanded: 0 }),
+  salvagedToday: async () => 0,
+  ...deps,
+});
 
 const now = new Date('2026-10-02T23:20:00Z');
 
@@ -33,6 +42,69 @@ test('report: launch, decision, skip in one paragraph; without --post no sending
     writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'outcome-unknown',
       item: { source: 'request', id: 'b', title: 'verify', text: 'verify' } }) + '\n');
     expect((await seatReport('TC', deps)).body).toContain('결과 확인 필요 outcome-unknown b verify');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('hourly OP report reaches draft census and preserves other seat formatting and ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const calls: string[] = [];
+    const draftMetrics = async (clock: Date) => {
+      calls.push(clock.toISOString());
+      return { inventory: 3, oldestAgeHours: 49, needsOwner: 1, converted48h: 2, cohort48h: 4, conversion48h: 0.5 };
+    };
+    const report = await seatReport('OP', { root, now: () => now, draftMetrics, config: { mode: 'shadow' } });
+    expect(calls).toEqual([now.toISOString()]);
+    expect(report.body).toContain('원장 기록 없음 · draft 재고 3 · 최장 나이 49.0h · needs-owner 1 · 48h 전환율 50.0% (2/4)');
+    expect(existsSync(seatLedgerPath('OP', root, now))).toBe(false);
+    expect((await seatReport('TC', { root, now: () => now, draftMetrics, config: { mode: 'shadow' } })).body)
+      .not.toContain('draft 재고');
+    expect(calls).toHaveLength(1);
+    const failed = await seatReport('OP', { root, now: () => now, config: { mode: 'shadow' },
+      draftMetrics: async () => { throw Error('GitHub unavailable'); } });
+    expect(failed.body).toContain('원장 기록 없음 · draft 지표 못 읽음');
+    expect(failed.posted).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('hourly OP report carries the overlap line next to the draft line; unmeasured never prints as 0', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const base = { root, now: () => now, config: { mode: 'shadow' as const } };
+    const measured = await seatReport('OP', { ...base, overlapMetrics: async (clock) => {
+      expect(clock).toEqual(now);
+      return { ...m, launches24h: 4, launched: 10, unmeasured: 0, linked: 3, autoLanded: 2, autoRate: 2 / 3, secondSiblingMedianHours: 3.5 };
+    } });
+    expect(measured.body).toContain('48h 전환율 표본 없음 · 겹침 발사 24h 4 (발사 10) · 겹침 자동 착지 66.7% (2/3) · 둘째 형제 착지 중앙값 3.5h');
+    expect((await seatReport('OP', base)).body).toContain('겹침 발사 24h 0 (발사 3) · 겹침 자동 착지 표본 없음 · 둘째 형제 착지 중앙값 표본 없음');
+    // A capped open-PR scan is «못 잼», so the overlap count is only a lower bound.
+    expect((await seatReport('OP', { ...base, overlapMetrics: async () => ({ ...m, launches24h: 2, launched: 9, unmeasured: 5 }) })).body)
+      .toContain('겹침 발사 24h 2 이상 (발사 9 중 5 못 잼) · 겹침 자동 착지 못 잼 · 둘째 형제 착지 중앙값 못 잼');
+    for (const metrics of [m, { ...m, sourceIncomplete: true }]) {
+      const body = (await seatReport('OP', { ...base, overlapMetrics: async () => metrics })).body;
+      expect(body).toContain('겹침 발사 24h 못 잼(원천 불완전)');
+      expect(body).not.toContain('겹침 발사 24h 0');
+    }
+    const failed = await seatReport('OP', { ...base, overlapMetrics: async () => { throw Error('logs unavailable'); } });
+    expect(failed.body).toContain('48h 전환율 표본 없음 · 겹침 지표 못 읽음');
+    expect((await seatReport('TC', base)).body).not.toContain('겹침');
+    // DRAFT-NOT-ARCHIVE salvage siblings are «not landed»; an unreadable salvage source says «못 잼», never 0.
+    expect((await seatReport('OP', { ...base, overlapMetrics: async () => ({ ...m, launches24h: 3, launched: 5, unmeasured: 0, linked: 2, autoLanded: 1, autoRate: 0.5, secondSiblingMedianHours: 2, salvaged: 1, salvageUnmeasured: 0 }) })).body)
+      .toContain('겹침 자동 착지 50.0% (1/2) · 둘째 형제 착지 중앙값 2.0h · 수확 가지 형제 1(미착지) · 수확 가지 오늘 0');
+    expect((await seatReport('OP', { ...base, overlapMetrics: async () => ({ ...m, launches24h: 1, launched: 1, unmeasured: 0, linked: 0, autoLanded: 0, salvaged: null, salvageUnmeasured: 1 }) })).body)
+      .toContain('수확 가지 1 못 잼');
+    const day = await seatReport('OP', { ...base, salvagedToday: async (dayStart, clock) => {
+      expect(dayStart.toISOString()).toBe('2026-10-02T15:00:00.000Z');
+      expect(clock).toEqual(now);
+      return 4;
+    } });
+    expect(day.body).toContain('수확 가지 오늘 4');
+    for (const salvagedToday of [async () => null, async () => { throw Error('logs unavailable'); }]) {
+      const body = (await seatReport('OP', { ...base, salvagedToday })).body;
+      expect(body).toContain('수확 가지 오늘 못 잼');
+      expect(body).not.toContain('수확 가지 오늘 0');
+    }
+    expect((await seatReport('TC', base)).body).not.toContain('수확 가지');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

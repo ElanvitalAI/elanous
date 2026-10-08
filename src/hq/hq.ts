@@ -10,6 +10,7 @@ import { debug } from '../debug/log.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig, type HqConfig, type HqFenceRole } from '../user-config.js';
+import { fenceOutcomeDir, recordFenceOutcome } from './fence-outcomes.js';
 import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';
 import type { HqOpRequestWriter, PromoteResult } from './promote.js';
 import {
@@ -42,6 +43,8 @@ export interface HqDeps {
   /** Holder/standby views and the arbiter's check use this tailnet probe — never ssh (OP 10-04 09:04). */
   probe?: HostProbe;
   localPath?: string;
+  /** Per-role streak files of wrapped-run rc (LOOPCHECK-FENCE · default next to localPath). */
+  outcomeDir?: string;
   /** Host-local identity, deliberately outside the replicated config/state directory. */
   hostPath?: string;
   /** Seen-generation marker (default hq.seenGenerationFile · ~/.elanous-hq/seen-generation). */
@@ -391,5 +394,12 @@ export function hqFenceRun(role: HqFenceRole, command: string[], deps: HqDeps = 
   const [cmd, ...args] = command;
   if (!cmd) throw new Error('hq fence: command required after --');
   const r = spawnSync(cmd, args, { stdio: 'inherit', env: { ...process.env, ELANOUS_HQ_GENERATION: String(decided.generation ?? '') } });
-  return r.status ?? 1;
+  const rc = r.status ?? 1;
+  // LOOPCHECK-FENCE: the wrapper's alert reads this streak, so a lone failure is not a seat request.
+  try {
+    const dir = deps.outcomeDir ?? fenceOutcomeDir(deps.localPath ?? join(getElanousConfigDir(), 'hq', 'local.json'));
+    const outcome = recordFenceOutcome(dir, role, rc, new Date(deps.now?.() ?? Date.now()));
+    if (rc !== 0) debug.log('hq.fence', 'run-failed', { role, rc, consecutiveFailures: outcome.consecutiveFailures });
+  } catch (error) { try { debug.log('hq.fence', 'outcome-record-failed', { role, rc, error: String(error) }); } catch { /* fail-soft */ } }
+  return rc;
 }

@@ -34,7 +34,17 @@ function isolatedCliEnvironment(home: string, env?: NodeJS.ProcessEnv): NodeJS.P
 
 type Fixture = { stdout?: Buffer; stderr?: Buffer; status?: number; attempts?: Buffer[] };
 
-function invokeGh(args: string[], fixture: Fixture) {
+/**
+ * ⏱️ GATE-SPEED ③ — 실물 엔트리(`bin/elanous.mjs gh`) spawn 은 1회 ~4초(전 모듈 그래프 콜드 스타트)다.
+ *   ⇒ «배선»(Commander dispatch · argv 전달 · `--test-state-dir` 레지스트리 격리 · 종료 코드)을 묻는 케이스만
+ *     `via: 'cli'` 로 실물을 돌리고, «게이트웨이 판정»(재시도·버퍼·개행·PARTIAL_OUTCOME)만 묻는 케이스는
+ *     `via: 'module'` — 같은 `runGhCli` 를 «얇은» 자식 프로세스(`bun -e`)에서 돌린다.
+ *   ⭐ 자식 프로세스는 유지한다 — stdout/stderr «원 바이트»와 `process.exitCode` 를 실제 프로세스 경계에서 재야 해서다.
+ */
+type InvokeVia = 'cli' | 'module';
+const moduleRunnerScript = `const root = process.env.REPOSITORY_ROOT; const { runGhCli } = await import(root + '/src/git-fs/gh-cli.js'); runGhCli(JSON.parse(process.env.GH_ARGS));`;
+
+function invokeGh(args: string[], fixture: Fixture, via: InvokeVia = 'cli') {
   const binDir = mkdtempSync(join(tmpdir(), 'elanous-gh-cli-'));
   const ghPath = join(binDir, 'gh');
   const outPath = join(binDir, 'out.bin');
@@ -56,6 +66,14 @@ function invokeGh(args: string[], fixture: Fixture) {
       try {
         mkdirSync(join(home, '.elanous', 'logs'), { recursive: true });
         writeFileSync(registryPath, JSON.stringify({ instances: [{ stateDir }] }));
+        if (via === 'module') {
+          return spawnSync('bun', ['-e', moduleRunnerScript], {
+            cwd,
+            env: isolatedCliEnvironment(home, { PATH: `${binDir}:${process.env.PATH ?? ''}`, REPOSITORY_ROOT: repositoryRoot, GH_ARGS: JSON.stringify(args) }),
+            timeout: 90_000,
+            maxBuffer: Infinity,
+          });
+        }
         const result = spawnSync('bun', [...entrypoint, '--test-state-dir', stateDir, 'gh', ...args], {
           cwd,
           env: isolatedCliEnvironment(home, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
@@ -193,7 +211,7 @@ describe('elanous gh', () => {
 
   test('reports an unconfirmed primary outcome when local branch deletion fails after gh work', () => {
     const stderr = Buffer.from("failed to delete local branch self-impl/example: cannot delete branch 'self-impl/example' used by worktree at '/tmp/example'");
-    const { result } = invokeGh(['pr', 'merge', '10321', '--squash', '--delete-branch'], { stderr, status: 1 });
+    const { result } = invokeGh(['pr', 'merge', '10321', '--squash', '--delete-branch'], { stderr, status: 1 }, 'module');
     expect(result.status).toBe(1);
     expect(result.stdout.length).toBe(0);
     expect(result.stderr.toString()).toBe(`${stderr.toString()}\n[gh] pr merge PARTIAL_OUTCOME primary-outcome=UNCONFIRMED auxiliary-failure=local-branch-delete rc=1\n`);
@@ -201,7 +219,7 @@ describe('elanous gh', () => {
   }, 90_000);
 
   test('retries transient read calls but does not retry explicit or implicit POST api calls', () => {
-    const read = invokeGh(['pr', 'list'], { attempts: [Buffer.from('temporary network error'), Buffer.alloc(0)] });
+    const read = invokeGh(['pr', 'list'], { attempts: [Buffer.from('temporary network error'), Buffer.alloc(0)] }, 'module');
     expect(read.result.status, `stdout=${read.result.stdout.toString()} stderr=${read.result.stderr.toString()} calls=${read.calls}`).toBe(0);
     expect(read.calls).toBe('2');
 
@@ -213,7 +231,7 @@ describe('elanous gh', () => {
       ['-Ftitle=x'],
       ['--field', 'title=x'],
     ]) {
-      const write = invokeGh(['api', ...fieldOption, '/repos/x/y/issues'], { attempts: [Buffer.from('temporary network error'), Buffer.alloc(0)] });
+      const write = invokeGh(['api', ...fieldOption, '/repos/x/y/issues'], { attempts: [Buffer.from('temporary network error'), Buffer.alloc(0)] }, 'module');
       expect(write.result.status).toBe(1);
       expect(write.calls, fieldOption.join(' ')).toBe('1');
     }
@@ -222,7 +240,7 @@ describe('elanous gh', () => {
   test('preserves stdout and stderr larger than the default 1MB child-process buffer', () => {
     const stdout = Buffer.alloc(1_200_003, 0xff);
     const stderr = Buffer.alloc(1_200_007, 0x80);
-    const { result } = invokeGh(['pr', 'list'], { stdout, stderr });
+    const { result } = invokeGh(['pr', 'list'], { stdout, stderr }, 'module');
     expect(result.status).toBe(0);
     expect(result.stdout.equals(stdout)).toBe(true);
     expect(result.stderr.equals(Buffer.concat([stderr, Buffer.from('\n[gh] pr list ok OUTPUT rc=0\n')]))).toBe(true);
@@ -231,7 +249,7 @@ describe('elanous gh', () => {
   test('does not alter stdout when only stderr lacks a trailing newline', () => {
     const stdout = Buffer.from([0xff, 0x80, 0x0a]);
     const stderr = Buffer.from([0xc0]);
-    const { result } = invokeGh(['pr', 'list'], { stdout, stderr });
+    const { result } = invokeGh(['pr', 'list'], { stdout, stderr }, 'module');
     expect(result.status).toBe(0);
     expect(result.stdout.equals(stdout)).toBe(true);
     expect(result.stderr.equals(Buffer.concat([stderr, Buffer.from('\n[gh] pr list ok OUTPUT rc=0\n')]))).toBe(true);

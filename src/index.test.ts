@@ -10,6 +10,7 @@ import type { KnowFindDeps } from './knowledge/know-find.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-cli-spawn.js';
 import { basename, join, resolve } from 'node:path';
 import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
@@ -22,8 +23,90 @@ import { registerMcpClients } from './nexus/boot/register-mcp-clients.js';
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
 
+// ⏱️ GATE-SPEED ③ — 실물 `bin/elanous.mjs` spawn(1회 ~3–4초 콜드 스타트)을 «그대로» 두되,
+//   ⓐ 같은 argv 의 도움말을 describe 마다 «여러 번» 띄우던 것을 한 번으로 접고(산출은 이 빌드 안에서 불변),
+//   ⓑ 서로 독립인 spawn 은 describe 의 beforeAll 에서 «미리» 상한 있는 동시성으로 띄워 둔다(`prefetchCli`).
+//   시험이 문는 값(실물 프로세스의 종료 코드·stdout·stderr)은 바뀌지 않는다 — 기다리는 방식만 바뀐다.
+//   ⛔ `Bun.spawnSync` 에 env 를 안 주면 «기동 시점» 환경을 쓴다 — 그 의미를 `STARTUP_ENV` 로 보존한다.
+const STARTUP_ENV: Record<string, string | undefined> = { ...process.env };
+const ELANOUS_BIN = new URL('../bin/elanous.mjs', import.meta.url).pathname;
+const REPO_CWD = new URL('../', import.meta.url).pathname;
+type CliEnvMode = 'startup' | 'live';
+const cliOnceCache = new Map<string, Promise<RealCliSpawnBytesResult>>();
+/** 같은 (환경 모드, argv) 는 파일 안에서 한 번만 띄운다. `live` = 호출 시점의 process.env(하니스 내부 표지 포함). */
+function cliOnce(args: readonly string[], mode: CliEnvMode = 'startup'): Promise<RealCliSpawnBytesResult> {
+  const key = JSON.stringify([mode, mode === 'live' ? process.env.ELANOUS_HARNESS_ENTRANCE ?? '' : '', args]);
+  const hit = cliOnceCache.get(key);
+  if (hit) return hit;
+  const pending = spawnRealCliBytes([process.execPath, ELANOUS_BIN, ...args], {
+    cwd: REPO_CWD,
+    env: mode === 'live' ? { ...process.env } : STARTUP_ENV,
+    timeoutMs: 120_000,
+  });
+  cliOnceCache.set(key, pending);
+  return pending;
+}
+/** beforeAll 에서 부른다 — 결과는 `cliOnce` 캐시에 남고 시험은 그것을 await 한다. */
+function prefetchCli(argvs: ReadonlyArray<readonly string[]>, mode: CliEnvMode = 'startup'): void {
+  for (const args of argvs) void cliOnce(args, mode);
+}
+const REAL_CLI_TEST_TIMEOUT_MS = 600_000;
+
 afterEach(() => {
   process.exitCode = 0;
+});
+
+describe.concurrent('config get universe warning', () => {
+  test('tree-derived test warns once on stderr and preserves stdout value', async () => {
+    const env = { ...process.env };
+    delete env.ELANOUS_STATE_DIR;
+    delete env.ELANOUS_CONFIG_DIR;
+    const child = Bun.spawn(['bun', 'bin/elanous.mjs', 'config', 'get', 'llm.provider'], {
+      cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect(code).toBe(0);
+    expect(stderr.trim().split('\n')).toEqual(['⚠️ test 우주의 config를 읽습니다 — 운영 값은 --config-dir ~/.elanous']);
+    expect(stdout.trim()).toBeTruthy();
+
+    const explicit = Bun.spawn(['bun', 'bin/elanous.mjs', '--config-dir', join(process.cwd(), '.elanous-test'), 'config', 'get', 'llm.provider'], {
+      cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [explicitStdout, explicitStderr, explicitCode] = await Promise.all([
+      new Response(explicit.stdout).text(), new Response(explicit.stderr).text(), explicit.exited,
+    ]);
+    expect(explicitCode).toBe(0);
+    expect(explicitStderr).toBe('');
+    expect(explicitStdout).toBe(stdout);
+  });
+
+  test('--config-dir selects the requested config value rather than the default universe', async () => {
+    const firstDir = await mkdtemp(join(tmpdir(), 'elanous-config-first-'));
+    const secondDir = await mkdtemp(join(tmpdir(), 'elanous-config-second-'));
+    const env = { ...process.env };
+    delete env.ELANOUS_STATE_DIR;
+    delete env.ELANOUS_CONFIG_DIR;
+    try {
+      await writeFile(join(firstDir, 'config.json'), JSON.stringify({ llm: { provider: 'anthropic' } }));
+      await writeFile(join(secondDir, 'config.json'), JSON.stringify({ llm: { provider: 'openai' } }));
+      for (const [dir, provider] of [[firstDir, 'anthropic'], [secondDir, 'openai']]) {
+        const child = Bun.spawn(['bun', 'bin/elanous.mjs', '--config-dir', dir, 'config', 'get', 'llm.provider'], {
+          cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe',
+        });
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+        ]);
+        expect(code).toBe(0);
+        expect(stderr).toBe('');
+        expect(stdout.trim()).toBe(provider);
+      }
+    } finally {
+      await rm(firstDir, { recursive: true, force: true });
+      await rm(secondDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('know CLI entry', () => {
@@ -168,7 +251,7 @@ describe('assembleAskLaunchPolicy', () => {
   });
 });
 
-describe('self send superseded explicit target protection', () => {
+describe.concurrent('self send superseded explicit target protection', () => {
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
   const decode = (output: Uint8Array | undefined) => new TextDecoder().decode(output);
@@ -194,12 +277,14 @@ describe('self send superseded explicit target protection', () => {
 
   function invoke(stateDir: string, ...args: string[]) {
     const readWait = (args.includes('--memo') || args.includes('--stop')) && !args.includes('--read-wait') ? ['--read-wait', '0'] : [];
-    return Bun.spawnSync({
-      cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'send', ...args, ...readWait],
+    // ⏱️⛔ GATE-SPEED ③ — `--run` 해석(`queryRunScreenKey`)은 «등록된 모든 로그 우주»(홈의 instances.json ⊕
+    //   운영 logs.db)를 grep 으로 훑는다. 홈을 안 가두면 이 시험이 ***사람·게이트 기계의 실제 로그 전체***를
+    //   스캔했다(실측 1회 18–29초 · CPU 프로파일 87% 가 run-ledger.ts queryAll). 홈을 stateDir 아래로 가둬
+    //   «이 시험이 만든 우주만» 보게 한다 — 판정 대상(현재 우주의 headless.spawn 행·원장)은 그대로다.
+    return spawnRealCliBytes([process.execPath, elanous, `--test=${stateDir}`, 'self', 'send', ...args, ...readWait], {
       cwd,
-      env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      env: { ...process.env, ELANOUS_STATE_DIR: stateDir, HOME: join(stateDir, 'home'), ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+      timeoutMs: 120_000,
     });
   }
 
@@ -234,7 +319,7 @@ describe('self send superseded explicit target protection', () => {
   }
 
   test('rejects a terminal run resolved from a dead heartbeat without inbox records', async () => {
-    await withStateDir((stateDir) => {
+    await withStateDir(async (stateDir) => {
       const runId = 'run-893d29dd-0000-4000-8000-000000000001';
       const target = 'self-impl-dead-run-goal-aaaaaaaa';
       writeScreen(stateDir, target);
@@ -242,17 +327,17 @@ describe('self send superseded explicit target protection', () => {
       writeRunScreen(stateDir, runId, target, '2026-09-14T00:02:00.000Z');
       writeRunLedger(stateDir, runId, [{ event: 'start' }, { event: 'terminal' }]);
 
-      const result = invoke(stateDir, '--run', runId, '--memo', 'must not record');
+      const result = await invoke(stateDir, '--run', runId, '--memo', 'must not record');
 
       expect(result.exitCode).toBe(2);
       expect(decode(result.stderr)).toContain('런이 이미 종료되었습니다');
       expect(decode(result.stderr)).not.toContain('heartbeat alive=false');
       expect(memoRecords(stateDir, target)).toHaveLength(0);
     });
-  }, 20_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   test('records a memo for a continuing run despite its dead child through explicit --run', async () => {
-    await withStateDir((stateDir) => {
+    await withStateDir(async (stateDir) => {
       const runId = 'run-893d29dd-0000-4000-8000-000000000010';
       const target = 'self-impl-continuing-dead-run-aaaaaaaa';
       writeScreen(stateDir, target);
@@ -260,7 +345,7 @@ describe('self send superseded explicit target protection', () => {
       writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
       writeRunLedger(stateDir, runId, [{ event: 'start' }]);
 
-      const result = invoke(stateDir, '--run', runId, '--memo', 'deliver to next iteration');
+      const result = await invoke(stateDir, '--run', runId, '--memo', 'deliver to next iteration');
 
       expect(result.exitCode).toBe(0);
       const ready = inboxReady(stateDir, target);
@@ -272,7 +357,7 @@ describe('self send superseded explicit target protection', () => {
       const frame = JSON.parse(Buffer.from(content.slice('memo:CONTROL_MEMO_FRAME:'.length).trim(), 'base64url').toString('utf8'));
       expect(frame).toEqual({ version: 1, kind: 'supervisor', urgency: 'normal', body: 'deliver to next iteration' });
     });
-  }, 20_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 // OLD-DOOR-CLOSE: these blocks drive dev --ask / self implement / self orchestrate as the harness does,
@@ -283,32 +368,42 @@ function asHarnessInternalCaller(): void {
   afterAll(() => { if (previous === undefined) delete process.env.ELANOUS_HARNESS_ENTRANCE; else process.env.ELANOUS_HARNESS_ENTRANCE = previous; });
 }
 
-describe('root command help dispatch', () => {
+describe.concurrent('root command help dispatch', () => {
   asHarnessInternalCaller();
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
   const decode = (output: Uint8Array | undefined) => new TextDecoder().decode(output);
 
-  function invoke(...args: string[]) {
-    return Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', ...args],
-      cwd,
-      // Bun spawn without env uses the start-up environment — pass the live one so the internal stamp reaches the child.
-      env: { ...process.env },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  // Bun spawn without env uses the start-up environment — pass the live one so the internal stamp reaches the child.
+  //   ⏱️ 상태 없는 호출은 beforeAll 에서 미리 띄운다(`cliOnce(..., 'live')` — 표지가 선 «뒤»에 등록된 훅이다).
+  function invoke(...args: string[]): Promise<RealCliSpawnBytesResult> {
+    return cliOnce(['--test', ...args], 'live');
   }
+  beforeAll(() => {
+    prefetchCli([
+      ['--test', 'zzzznotacommand', '--help'],
+      ['--test', 'harness', 'ask', '/tmp/goal.md', '--graph', 'off', '--dry-run'],
+      ['--test', 'self', '--help'],
+      ['--test', '--help'],
+      ['--test', 'self', 'unfinished-runs-cleanup', '--help'],
+      ...['60s', '1,000', '1oops'].map((age) => ['--test', 'self', 'unfinished-runs-cleanup', '--age', age, '--remove', '--json']),
+      ['--test', 'self', 'implement', '--plan', 'x'],
+      ['--test', 'self', 'implement', '--help'],
+      ['--test', 'dev', '--plan', '--help'],
+      ['--test', 'help', '--help'],
+      ['--test', 'help', 'self', '--help'],
+    ], 'live');
+  });
 
-  test('rejects an unknown first command even when help follows it', () => {
-    const result = invoke('zzzznotacommand', '--help');
+  test('rejects an unknown first command even when help follows it', async () => {
+    const result = await invoke('zzzznotacommand', '--help');
 
     expect(result.exitCode).not.toBe(0);
     expect(decode(result.stderr)).toContain("error: unknown command 'zzzznotacommand'");
   });
 
-  test('harness ask no longer offers a graph authority override', () => {
-    const result = invoke('harness', 'ask', '/tmp/goal.md', '--graph', 'off', '--dry-run');
+  test('harness ask no longer offers a graph authority override', async () => {
+    const result = await invoke('harness', 'ask', '/tmp/goal.md', '--graph', 'off', '--dry-run');
     expect(result.exitCode).not.toBe(0);
     expect(decode(result.stderr)).toContain("error: unknown option '--graph'");
   });
@@ -316,41 +411,39 @@ describe('root command help dispatch', () => {
   // ⚠️ 2026-09-21 `#19291` 재작성으로 `setup` 은 단계 인자·답변 파일(`--config`)을 받지 않는다 — 옛 계약을 재던 시험을 지금 계약으로.
   test('setup prints the non-TTY onboarding refusal without a stack trace, and --non-interactive reports without prompting', async () => {
     const home = await mkdtemp(join(tmpdir(), 'elanous-setup-home-'));
-    const invokeSetup = (...args: string[]) => Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'setup', ...args],
+    // ⏱️ 동시 describe 안이므로 비동기 spawn — stdin 은 TTY 가 아닌 빈 입력(/dev/null)이다(옛 'pipe' 와 같은 «비-TTY»).
+    const invokeSetup = (...args: string[]) => spawnRealCliBytes([process.execPath, elanous, '--test', 'setup', ...args], {
       cwd,
       env: { ...process.env, HOME: home },
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
+      timeoutMs: 120_000,
     });
 
     try {
-      const nonTty = invokeSetup();
+      const nonTty = await invokeSetup();
       const nonTtyOutput = `${decode(nonTty.stdout)}${decode(nonTty.stderr)}`;
       expect(nonTty.exitCode).not.toBe(0);
       expect(nonTtyOutput).toContain('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다.');
       expect(nonTtyOutput).toContain('`elanous setup --non-interactive`를 사용하라.');
       expect(nonTtyOutput).not.toMatch(/\n\s*at\s+/);
 
-      const report = invokeSetup('--non-interactive');
+      const report = await invokeSetup('--non-interactive');
       const reportOutput = `${decode(report.stdout)}${decode(report.stderr)}`;
       expect(report.exitCode).toBe(0);
       expect(reportOutput).not.toMatch(/\n\s*at\s+/);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  test('preserves registered-command and root help', () => {
-    const registered = invoke('self', '--help');
-    const root = invoke('--help');
+  test('preserves registered-command and root help', async () => {
+    const registered = await invoke('self', '--help');
+    const root = await invoke('--help');
 
     expect(registered.exitCode).toBe(0);
     expect(decode(registered.stdout)).toContain('Self-awareness memory');
     expect(root.exitCode).toBe(0);
     expect(decode(root.stdout)).toContain('Usage: elanous [options] [command]');
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   test('self unfinished-runs-cleanup plans by default, removes only on request, and blocks removal for incomplete queries', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'elanous-unfinished-runs-cleanup-'));
@@ -364,19 +457,17 @@ describe('root command help dispatch', () => {
       mkdirSync(ledgerDir, { recursive: true });
       writeFileSync(ledgerPath(runId), `${JSON.stringify({ timestamp, runId, event: 'start', data: {} })}\n`);
     };
-    const cleanup = (...args: string[]) => Bun.spawnSync({
-      cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'unfinished-runs-cleanup', '--json', ...args],
+    const cleanup = (...args: string[]) => spawnRealCliBytes([process.execPath, elanous, `--test=${stateDir}`, 'self', 'unfinished-runs-cleanup', '--json', ...args], {
       cwd,
       env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      timeoutMs: 120_000,
     });
 
     try {
       writeLedger(oldRunId, '2020-01-01T00:00:00.000Z');
       writeLedger(recentRunId, new Date().toISOString());
-      const help = invoke('self', 'unfinished-runs-cleanup', '--help');
-      const planned = cleanup();
+      const help = await invoke('self', 'unfinished-runs-cleanup', '--help');
+      const planned = await cleanup();
       const planOutput = JSON.parse(decode(planned.stdout));
 
       expect(help.exitCode).toBe(0);
@@ -389,7 +480,7 @@ describe('root command help dispatch', () => {
       expect(planOutput.counts.queryUnavailable).toBe(0);
       expect(existsSync(ledgerPath(oldRunId))).toBe(true);
 
-      const removed = cleanup('--remove');
+      const removed = await cleanup('--remove');
       const removeOutput = JSON.parse(decode(removed.stdout));
 
       expect(removed.exitCode).toBe(0);
@@ -399,7 +490,7 @@ describe('root command help dispatch', () => {
 
       writeLedger(blockedRunId, '2020-01-01T00:00:00.000Z');
       writeFileSync(ledgerPath(unreadableRunId), '{not-json}\n');
-      const blocked = cleanup('--remove');
+      const blocked = await cleanup('--remove');
       const blockedOutput = JSON.parse(decode(blocked.stdout));
 
       expect(blocked.exitCode).toBe(0);
@@ -409,21 +500,21 @@ describe('root command help dispatch', () => {
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  test('self unfinished-runs-cleanup rejects malformed age values before cleanup', () => {
+  test('self unfinished-runs-cleanup rejects malformed age values before cleanup', async () => {
     for (const age of ['60s', '1,000', '1oops']) {
-      const result = invoke('self', 'unfinished-runs-cleanup', '--age', age, '--remove', '--json');
+      const result = await invoke('self', 'unfinished-runs-cleanup', '--age', age, '--remove', '--json');
 
       expect(result.exitCode).not.toBe(0);
       expect(decode(result.stderr)).toContain(`--age must be a non-negative number of minutes: ${age}`);
     }
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  test('self implement retains --plan only to reject the retired staged-harness door before standalone-run setup', () => {
-    const rejected = invoke('self', 'implement', '--plan', 'x');
-    const help = invoke('self', 'implement', '--help');
-    const devPlanHelp = invoke('dev', '--plan', '--help');
+  test('self implement retains --plan only to reject the retired staged-harness door before standalone-run setup', async () => {
+    const rejected = await invoke('self', 'implement', '--plan', 'x');
+    const help = await invoke('self', 'implement', '--help');
+    const devPlanHelp = await invoke('dev', '--plan', '--help');
     const indexSource = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
     const action = indexSource.slice(indexSource.indexOf(".command('implement [feature...]')"), indexSource.indexOf('// self orchestrate'));
 
@@ -435,23 +526,23 @@ describe('root command help dispatch', () => {
     expect(decode(help.stdout)).toContain('지정하면 명시적으로 거부됨');
     expect(devPlanHelp.exitCode).toBe(0);
     expect(decode(devPlanHelp.stdout)).toContain('--plan');
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  test('preserves Commander implicit help command dispatch', () => {
-    const help = invoke('help', '--help');
-    const nestedHelp = invoke('help', 'self', '--help');
+  test('preserves Commander implicit help command dispatch', async () => {
+    const help = await invoke('help', '--help');
+    const nestedHelp = await invoke('help', 'self', '--help');
 
     expect(help.exitCode).toBe(1);
     expect(decode(help.stderr)).toContain('Usage: elanous [options] [command]');
     expect(decode(help.stderr)).not.toContain("error: unknown command 'help'");
     expect(nestedHelp.exitCode).toBe(0);
     expect(decode(nestedHelp.stdout)).toContain('Self-awareness memory');
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   test('token rotate uses --config-dir, masks default output, and only reveals on request', async () => {
     const configDir = await mkdtemp(join(tmpdir(), 'elanous-token-rotate-'));
     try {
-      const first = invoke('--config-dir', configDir, 'token', 'rotate');
+      const first = await spawnRealCliBytes([process.execPath, elanous, '--test', '--config-dir', configDir, 'token', 'rotate'], { cwd, env: { ...process.env }, timeoutMs: 120_000 });
       const firstOutput = decode(first.stdout);
       const rawPath = join(configDir, 'acp-token');
       const envelopePath = join(configDir, 'acp-token.json');
@@ -463,7 +554,7 @@ describe('root command help dispatch', () => {
       expect(firstOutput).not.toContain(firstToken);
       expect(JSON.parse(readFileSync(envelopePath, 'utf8')).active).toBe(firstToken);
 
-      const second = invoke('--config-dir', configDir, 'token', 'rotate', '--grace-ms', '0', '--show-token');
+      const second = await spawnRealCliBytes([process.execPath, elanous, '--test', '--config-dir', configDir, 'token', 'rotate', '--grace-ms', '0', '--show-token'], { cwd, env: { ...process.env }, timeoutMs: 120_000 });
       const secondToken = readFileSync(rawPath, 'utf8');
       const envelope = JSON.parse(readFileSync(envelopePath, 'utf8'));
 
@@ -476,7 +567,7 @@ describe('root command help dispatch', () => {
     } finally {
       await rm(configDir, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 describe('mcp serve handshake timeout wiring', () => {
@@ -2706,26 +2797,20 @@ describe('self orchestrate CLI decomposer selection wiring', () => {
       .toEqual({ decomposer: 'default', source: 'default' });
   });
 
-  test('rejects an explicit fabric flag without decomposition with exit code 2', () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'self', 'orchestrate', 'goal', '--fabric-decompose'],
-      cwd,
-      env: { ...process.env },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  beforeAll(() => {
+    prefetchCli([['--test', 'self', 'orchestrate', 'goal', '--fabric-decompose']], 'live');
+    prefetchCli([['--test', 'harness', 'orchestrate', 'goal', '--fabric-decompose']], 'startup');
+  });
+
+  test('rejects an explicit fabric flag without decomposition with exit code 2', async () => {
+    const result = await cliOnce(['--test', 'self', 'orchestrate', 'goal', '--fabric-decompose'], 'live');
 
     expect(result.exitCode).toBe(2);
     expect(new TextDecoder().decode(result.stdout)).toContain('--fabric-decompose 는 --decompose 와 «함께» 쓴다');
   });
 
-  test('harness still rejects fabric decompose because decompose remains outside this landing', () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'harness', 'orchestrate', 'goal', '--fabric-decompose'],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  test('harness still rejects fabric decompose because decompose remains outside this landing', async () => {
+    const result = await cliOnce(['--test', 'harness', 'orchestrate', 'goal', '--fabric-decompose'], 'startup');
     const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
 
     expect(result.exitCode).not.toBe(0);
@@ -2770,16 +2855,12 @@ describe('self orchestrate CLI help tiers', () => {
     expect(existingOptionNames.size).toBe(27);
   });
 
-  function help(...args: string[]): string {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'self', 'orchestrate', ...args],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  async function help(...args: string[]): Promise<string> {
+    const result = await cliOnce(['--test', 'self', 'orchestrate', ...args]);
     expect(result.exitCode).toBe(0);
     return new TextDecoder().decode(result.stdout);
   }
+  beforeAll(() => prefetchCli([['--test', 'self', 'orchestrate', '--help'], ['--test', 'self', 'orchestrate', '--help-all']]));
 
   function optionNames(text: string): Set<string> {
     return new Set(text.split('\n').flatMap((line) => {
@@ -2788,8 +2869,8 @@ describe('self orchestrate CLI help tiers', () => {
     }));
   }
 
-  test('keeps the primary option listing below eighteen lines', () => {
-    const primary = help('--help');
+  test('keeps the primary option listing below eighteen lines', async () => {
+    const primary = await help('--help');
     const optionLines = primary.split('\n').filter((line) => /^\s+-{1,2}[\w-]+/.test(line));
 
     expect(optionLines.length).toBeLessThan(18);
@@ -2805,9 +2886,9 @@ describe('self orchestrate CLI help tiers', () => {
     expect([...available].sort()).toEqual([...existingOptionNames].sort());
   }
 
-  test('preserves the existing option set across primary and extended help', () => {
-    assertExistingOptions(help('--help'), help('--help-all'));
-  }, 30_000);
+  test('preserves the existing option set across primary and extended help', async () => {
+    assertExistingOptions(await help('--help'), await help('--help-all'));
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   test.each([
     ['--help', 'Options:'],
@@ -2833,9 +2914,9 @@ describe('self orchestrate CLI help tiers', () => {
     }
   });
 
-  test('fails if a formerly accepted option is absent from both help tiers', () => {
-    const primary = help('--help');
-    const extendedWithoutResume = help('--help-all').replace(/^\s+--resume.*\n/m, '');
+  test('fails if a formerly accepted option is absent from both help tiers', async () => {
+    const primary = await help('--help');
+    const extendedWithoutResume = (await help('--help-all')).replace(/^\s+--resume.*\n/m, '');
 
     expect(() => assertExistingOptions(primary, extendedWithoutResume)).toThrow();
   }, 30_000);
@@ -2863,16 +2944,18 @@ describe('dev CLI help tiers', () => {
     expect(existingOptionNames.size).toBe(51);
   });
 
-  function help(...args: string[]): string {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'dev', ...args],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  async function help(...args: string[]): Promise<string> {
+    const result = await cliOnce(['--test', 'dev', ...args]);
     expect(result.exitCode).toBe(0);
     return new TextDecoder().decode(result.stdout);
   }
+  beforeAll(() => prefetchCli([
+    ['--test', 'dev', '--help'],
+    ['--test', 'dev', '--help-all'],
+    ['--test', 'dev', '--force-preflight'],
+    ['--test', 'dev', '--file', 'tmp/nonexistent-zzz.md', '--correlation', 'request-zzz'],
+    ['--test', 'dev', '--ask', '/tmp/goal.md', '--graph', 'maybe'],
+  ]));
 
   function optionNames(text: string): Set<string> {
     return new Set(text.split('\n').flatMap((line) => {
@@ -2881,8 +2964,8 @@ describe('dev CLI help tiers', () => {
     }));
   }
 
-  test('keeps the primary option listing below sixteen lines and matches the human-chosen primary list', () => {
-    const primary = help('--help');
+  test('keeps the primary option listing below sixteen lines and matches the human-chosen primary list', async () => {
+    const primary = await help('--help');
     const optionLines = primary.split('\n').filter((line) => /^\s+-{1,2}[\w-]+/.test(line));
 
     expect(optionLines.length).toBeLessThan(16);
@@ -2899,28 +2982,18 @@ describe('dev CLI help tiers', () => {
     expect([...available].sort()).toEqual([...existingOptionNames].sort());
   }
 
-  test('preserves the existing option set across primary and extended help', () => {
-    assertExistingOptions(help('--help'), help('--help-all'));
-  }, 30_000);
+  test('preserves the existing option set across primary and extended help', async () => {
+    assertExistingOptions(await help('--help'), await help('--help-all'));
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
-  test('accepts a folded option as a real CLI argument instead of unknown option', () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'dev', '--force-preflight'],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  test('accepts a folded option as a real CLI argument instead of unknown option', async () => {
+    const result = await cliOnce(['--test', 'dev', '--force-preflight']);
     const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
     expect(output).not.toContain('unknown option');
   });
 
-  test('correlation reaches dev file validation instead of being rejected by the parser', () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'dev', '--file', 'tmp/nonexistent-zzz.md', '--correlation', 'request-zzz'],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  test('correlation reaches dev file validation instead of being rejected by the parser', async () => {
+    const result = await cliOnce(['--test', 'dev', '--file', 'tmp/nonexistent-zzz.md', '--correlation', 'request-zzz']);
     const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
 
     expect(output).not.toContain("unknown option '--correlation'");
@@ -3350,13 +3423,8 @@ describe('dev CLI help tiers', () => {
     }
   }, 5_000);
 
-  test('dev rejects the retired graph authority override', () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'dev', '--ask', '/tmp/goal.md', '--graph', 'maybe'],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  test('dev rejects the retired graph authority override', async () => {
+    const result = await cliOnce(['--test', 'dev', '--ask', '/tmp/goal.md', '--graph', 'maybe']);
     const stderr = new TextDecoder().decode(result.stderr);
 
     expect(result.exitCode).not.toBe(0);
@@ -3364,15 +3432,15 @@ describe('dev CLI help tiers', () => {
     expect(stderr).not.toMatch(/\n\s*at\s+/);
   });
 
-  test('extended dev help retains force-preflight but no graph authority override', () => {
-    const extended = help('--help-all');
+  test('extended dev help retains force-preflight but no graph authority override', async () => {
+    const extended = await help('--help-all');
     expect(extended).not.toContain('--graph <on|off>');
     expect(extended).toContain('--force-preflight');
   });
 
-  test('fails if a formerly accepted option is absent from both help tiers', () => {
-    const primary = help('--help');
-    const extendedWithoutForce = help('--help-all').replace(/^\s+--force-preflight.*\n/m, '');
+  test('fails if a formerly accepted option is absent from both help tiers', async () => {
+    const primary = await help('--help');
+    const extendedWithoutForce = (await help('--help-all')).replace(/^\s+--force-preflight.*\n/m, '');
 
     expect(() => assertExistingOptions(primary, extendedWithoutForce)).toThrow(/force-preflight/);
   }, 30_000);
@@ -3812,6 +3880,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'replay',
     // 🌿 원격 salvage/* 가지 대조 — `harness salvage`(harness-salvage-cli.ts · #24661).
     'salvage',
+    // 🌿 수확 가지 보존 그림자 — `harness salvage-retention`(DRAFT-NOT-ARCHIVE 후속 · 지울 후보 수만 보고).
+    'salvage-retention',
     'say',
     // 🛑 런 정지 — `harness stop <runId>`(stopHarnessRun).
     'stop',
@@ -3822,18 +3892,24 @@ describe('harness orchestrate canonical entrance capability', () => {
     'worktrees',
   ] as const;
 
-  function help(entrance: readonly string[], ...args: string[]): { text: string; exitCode: number } {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', ...entrance, ...args],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+  async function help(entrance: readonly string[], ...args: string[]): Promise<{ text: string; exitCode: number }> {
+    const result = await cliOnce(['--test', ...entrance, ...args]);
     return {
       exitCode: result.exitCode ?? 1,
       text: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
     };
   }
+
+  beforeAll(() => prefetchCli([
+    ['--test', 'harness', 'orchestrate', '--help'],
+    ['--test', 'harness', 'orchestrate', '--help-all'],
+    ['--test', 'self', 'orchestrate', '--help'],
+    ['--test', 'self', 'orchestrate', '--help-all'],
+    ['--test', 'harness', '--help'],
+    ['--test', 'harness', 'orchestrate', 'goal-a', '--fabric-decompose'],
+    ['--test', 'harness', 'orchestrate', 'goal-a', '--max-tasks'],
+    ['--test', 'harness', 'orchestrate', 'goal-a', '--domain', 'web'],
+  ]));
 
   test.each([
     ['--auto-merge', { autoMerge: true as const }],
@@ -3879,18 +3955,13 @@ describe('harness orchestrate canonical entrance capability', () => {
     expect(plan).not.toHaveProperty('base');
   });
 
-  test('canonical entrance still rejects --domain by name', () => {
+  test('canonical entrance still rejects --domain by name', async () => {
     const plan = buildHarnessOrchestratePlan(['goal-a'], { domain: 'web' });
     expect(plan).toMatchObject({ ok: false, exitCode: 2 });
     if (plan.ok) return;
     expect(plan.error).toContain('--domain');
     expect(plan.error).toContain('RunDevHarness');
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, elanous, '--test', 'harness', 'orchestrate', 'goal-a', '--domain', 'web'],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const result = await cliOnce(['--test', 'harness', 'orchestrate', 'goal-a', '--domain', 'web']);
     const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
     expect(result.exitCode).toBe(2);
     expect(output).toContain('--domain');
@@ -4080,12 +4151,12 @@ describe('harness orchestrate canonical entrance capability', () => {
     expect(harnessExecution).toContain('runtime.checkpoint = checkpoint');
   });
 
-  test('primary help exposes only the promoted harness orchestrate options from the self-only gap', () => {
+  test('primary help exposes only the promoted harness orchestrate options from the self-only gap', async () => {
     const optionLines = (text: string): number => text.split('\n').filter((line) => /^\s+-{1,2}[\w-]+/.test(line)).length;
-    const harnessPrimary = help(['harness', 'orchestrate'], '--help');
-    const harnessAll = help(['harness', 'orchestrate'], '--help-all');
-    const selfPrimary = help(['self', 'orchestrate'], '--help');
-    const selfAll = help(['self', 'orchestrate'], '--help-all');
+    const harnessPrimary = await help(['harness', 'orchestrate'], '--help');
+    const harnessAll = await help(['harness', 'orchestrate'], '--help-all');
+    const selfPrimary = await help(['self', 'orchestrate'], '--help');
+    const selfAll = await help(['self', 'orchestrate'], '--help-all');
     expect(harnessPrimary.exitCode).toBe(0);
     expect(harnessAll.exitCode).toBe(0);
     expect(selfPrimary.exitCode).toBe(0);
@@ -4099,7 +4170,7 @@ describe('harness orchestrate canonical entrance capability', () => {
       expect(harnessPrimary.text).not.toContain(flag);
       expect(harnessAll.text).not.toContain(flag);
     }
-    const harnessRoot = help(['harness'], '--help');
+    const harnessRoot = await help(['harness'], '--help');
     expect(harnessRoot.exitCode).toBe(0);
     const rootEntrances = harnessRoot.text
       .split('\n')
@@ -4110,7 +4181,7 @@ describe('harness orchestrate canonical entrance capability', () => {
     expect(rootEntrances).toEqual([...expectedHarnessRootEntrances].sort());
     expect(harnessPrimary.text).not.toContain('browser-act');
     expect(harnessAll.text).not.toContain('browser-act');
-  }, 20_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 
   test('fails if promoted harness options fall off the canonical execution plan', () => {
     const plan = buildHarnessOrchestratePlan(['goal-a'], { autoMerge: true, openPr: true, base: 'main' });
@@ -4120,18 +4191,18 @@ describe('harness orchestrate canonical entrance capability', () => {
     expect(plan).toMatchObject({ autoMerge: true, openPr: true, base: 'main' });
   });
 
-  test('excluded option names remain on self orchestrate but are rejected by harness orchestrate', () => {
-    const selfAll = help(['self', 'orchestrate'], '--help-all');
+  test('excluded option names remain on self orchestrate but are rejected by harness orchestrate', async () => {
+    const selfAll = await help(['self', 'orchestrate'], '--help-all');
     expect(selfAll.exitCode).toBe(0);
     for (const flag of [...promotedHarnessOptions, ...excludedHarnessOptions]) {
       expect(selfAll.text).toContain(flag);
     }
     for (const flag of excludedHarnessOptions) {
-      const result = help(['harness', 'orchestrate'], 'goal-a', flag);
+      const result = await help(['harness', 'orchestrate'], 'goal-a', flag);
       expect(result.exitCode).not.toBe(0);
       expect(result.text).toContain(`unknown option '${flag}'`);
     }
-  }, 20_000);
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });
 
 describe('self orchestrate CLI deliverable wiring', () => {

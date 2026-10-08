@@ -162,6 +162,24 @@ export function addRunGraphEdge(doc: Document, edge: RunGraphEdgeEdit): void {
   setScalar(doc, ensureMap(doc, owner), edge.outcome, edge.to);
 }
 
+/** Add one unconditional `from → to` edge (the loader's `to` form). Outcome routes use addRunGraphEdge. */
+export function addRunGraphToEdge(doc: Document, from: string, to: string): void {
+  const root = rootMap(doc);
+  if (!root) throw new Error('graph yaml root is not a map');
+  let seq = seqOf(root, 'edges');
+  if (!seq) {
+    root.set(doc.createNode('edges'), doc.createNode([]));
+    seq = seqOf(root, 'edges');
+  }
+  if (!seq) throw new Error('edges is not a sequence');
+  if (edgeMaps(doc).some((item) => scalar(item, 'from') === from && scalar(item, 'to') === to)) return;
+  const created = new YAMLMap();
+  created.set(doc.createNode('from'), doc.createNode(from));
+  created.set(doc.createNode('to'), doc.createNode(to));
+  seq.add(created);
+  (doc as TrackedDocument).structural = true;
+}
+
 /** The editor's failure picker reads the existing outcome map, not a node-level setting. */
 export function runGraphFailTarget(doc: Document, from: string): string | undefined {
   const edge = edgeMaps(doc).find((item) => scalar(item, 'from') === from);

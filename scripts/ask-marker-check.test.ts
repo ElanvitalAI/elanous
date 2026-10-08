@@ -1,4 +1,4 @@
-import { setDefaultTimeout, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,7 +6,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GOAL_TYPES } from '../src/self-implement/goal-author.js';
 import {
-  inspectNarrowedTestSignalWarnings, inspectAbsenceCountSignalWarnings, inspectUnportedIsolatedDaemonWarnings, inspectConditionObservationPairWarnings, inspectAskMarkers, inspectAskMarkersInRoot, inspectConsumerPathWarning, inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations, inspectWrappedMarkerWarnings, bunTestFileLaunchesRepositoryExecutable, formatAxis, formatAxisObservations } from './ask-marker-check.js';
+  inspectNarrowedTestSignalWarnings, inspectAbsenceCountSignalWarnings, inspectUnportedIsolatedDaemonWarnings, inspectConditionObservationPairWarnings, inspectAskMarkers, inspectAskMarkersInRoot, inspectConsumerPathWarning, inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations, inspectWrappedMarkerWarnings, bunTestFileLaunchesRepositoryExecutable, formatAxis, formatAxisObservations, main } from './ask-marker-check.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -151,11 +151,31 @@ const PRESENT_BUT_UNEXTRACTED = `대상 경로: scripts/x.ts
 판정 신호: 그냥 잘 되면 된다.
 `;
 
+/** ⭐ GATE-SPEED ③(2026-10-08): CLI 출력 계약을 «같은 프로세스»에서 `main()` 으로 잰다.
+ *  초판은 호출마다 `bun scripts/ask-marker-check.ts` 를 새로 띄웠고(92회 · 건당 ≈1s · 게이트 873s),
+ *  잰 것은 spawn 이 아니라 `main()` 의 stdout/stderr/rc 였다. ⛔ 실물 진입점 배선은 아래 «읽기 실패»·
+ *  「쓰는 법」 describe 의 실물 spawn 과 `cwd` 를 준 호출(다른 작업 디렉토리 계약)이 계속 문다. */
+function runMainInProcess(files: readonly string[]): { status: number | null; stdout: string; stderr: string } {
+  const out: string[] = [];
+  const err: string[] = [];
+  const logSpy = spyOn(console, 'log').mockImplementation((...args: unknown[]) => { out.push(`${args.map(String).join(' ')}\n`); });
+  const errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { err.push(`${args.map(String).join(' ')}\n`); });
+  try {
+    const status = main([...files]);
+    return { status, stdout: out.join(''), stderr: err.join('') };
+  } finally {
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+  }
+}
+
 function runCli(ask: string, cwd?: string): { status: number | null; stdout: string; stderr: string } {
   const dir = mkdtempSync(join(tmpdir(), 'ask-marker-check-'));
   const file = join(dir, 'ask.md');
   try {
     writeFileSync(file, ask);
+    // `cwd` 를 준 호출은 «작업 디렉토리와 무관하다»는 계약 자체를 재므로 실물 프로세스로 띄운다.
+    if (cwd === undefined) return runMainInProcess([file]);
     const r = spawnSync(process.execPath, [script, file], { cwd, encoding: 'utf8' });
     return { status: r.status, stdout: r.stdout, stderr: r.stderr };
   } finally {
@@ -185,8 +205,7 @@ function runCliFiles(asks: readonly string[]): { status: number | null; stdout: 
       writeFileSync(file, ask);
       return file;
     });
-    const r = spawnSync(process.execPath, [script, ...files], { encoding: 'utf8' });
-    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+    return runMainInProcess(files);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
