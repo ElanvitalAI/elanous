@@ -23,6 +23,7 @@ import { isAbsolute } from 'node:path';
 import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
 import { buildGridData, type GridDeps } from './grid.js';
+import { createDraftMetricsSource, type DraftMetricsSource } from './draft-metrics.js';
 import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
 import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-route.js';
 import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
@@ -31,6 +32,7 @@ import { compareTokenConstTime } from '../../acp/transport/auth.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
 import type { NexusState } from '../state/state.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
+
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import type { TabRegistry } from '../state/tab-registry.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
@@ -164,6 +166,7 @@ import {
 } from './vault-api.js';
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
+import { handleHarnessRunTraversalGet } from './harness-traversal.js';
 import { handleLoopEdgesGet } from './loop-edges.js';
 import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
@@ -367,6 +370,7 @@ import { handleTriggersSnapshot } from './triggers.js';
 import { handleWorkflowTemplatesList } from './workflow-templates.js';
 import { handleGraphVersionsGet, handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
 import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
+import { handleGraphWizardPost } from './graph-wizard-api.js';
 import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove } from './plugins-market.js';
@@ -426,6 +430,9 @@ import {
   parseShowroomLayoutPath,
 } from './showroom-layouts.js';
 
+/** Process-wide DRAFT-METRIC cache (one background collection per TTL, shared by every page load). */
+let sharedDraftMetrics: DraftMetricsSource | undefined;
+
 export const NEXUS_HTTP_PORT_RANGE = 16;     // try 31415..31430
 /** Short timeout for the pre-bind localhost occupancy probe. */
 export const NEXUS_PORT_PROBE_TIMEOUT_MS = 400;
@@ -480,11 +487,15 @@ export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
 export interface NexusHttpServerOpts {
   /** Optional fabric-plan ledger and decomposition seam; production uses the instance root and existing fabric decomposer. */
   fabricPlans?: FabricPlansRouteOpts;
+  /** GRAPH-WIZARD 시험 주입(LLM·템플릿 뿌리). 운영은 비워 둔다. */
+  graphWizard?: import('../../graph-wizard/generate.js').GraphWizardDeps;
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
   outputs?: OutputsDeps;
   /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
   grid?: GridDeps;
+  /** DRAFT-METRIC cached source seam; omitted in production for the process-wide TTL cache. */
+  draftMetrics?: DraftMetricsSource;
   decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
   opsBoard?: Pick<OpsBoardDeps, 'openStore'>;
   cardFollowup?: CardFollowupJobs;
@@ -1360,6 +1371,13 @@ export async function routeRequest(
     return handleHarnessRunEventsGet(req, opts.metaApi);
   }
 
+  // HARNESS-RUN-LIVE-GRAPH — one run's ordered node steps ⊕ journey band (PWA /live-run).
+  if (pathname === '/v1/harness/run-traversal' && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleHarnessRunTraversalGet(req);
+  }
+
   // Design direction is a write: check owner auth before the handler reads the body.
   // Keep this POST ahead of the mutation fallback, and never make it a public route.
   if (method === 'POST' && pathname === DESIGN_DIRECTION_PATH) {
@@ -1387,6 +1405,13 @@ export async function routeRequest(
   if (method === 'POST' && pathname === '/v1/graphs/validate') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleGraphsValidatePost(req, opts.metaApi);
+  }
+
+  // GRAPH-WIZARD — 말 → 그래프 YAML(저장 안 함). 다른 /v1/graphs 쓰기와 같은 인증.
+  if (method === 'POST' && pathname === '/v1/graphs/wizard') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleGraphWizardPost(req, opts.graphWizard);
   }
 
   if (pathname === '/v1/fabric/decompose' || pathname.startsWith('/v1/fabric/plans/')) {
@@ -1436,6 +1461,12 @@ export async function routeRequest(
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
     return jsonResponse(buildGridData(opts.grid));
+  }
+  // DRAFT-METRIC: answers from memory; a stale/cold cache starts one background collection (never per request).
+  if (pathname === '/v1/drafts/metrics') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
+    return jsonResponse((opts.draftMetrics ?? (sharedDraftMetrics ??= createDraftMetricsSource())).read());
   }
   if (method === 'GET' && pathname === '/v1/outputs') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);

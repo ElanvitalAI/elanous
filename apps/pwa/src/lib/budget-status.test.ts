@@ -3,7 +3,7 @@
 // end-to-end by the daemon test; this file pins the localStorage-only
 // surface so a refactor doesn't accidentally nag the user every poll.
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import {
   budgetDismissalKey,
   dismissBudget,
@@ -24,8 +24,14 @@ function fakeStorage(): Storage {
   } as Storage;
 }
 
+// Define (not assign): another file in the same bun process may have left a non-writable `localStorage` behind.
+const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
 beforeEach(() => {
-  (globalThis as { localStorage?: Storage }).localStorage = fakeStorage();
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, writable: true, value: fakeStorage() });
+});
+afterAll(() => {
+  if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
+  else Reflect.deleteProperty(globalThis, 'localStorage');
 });
 
 describe('M3-1 · budget dismissal helpers', () => {

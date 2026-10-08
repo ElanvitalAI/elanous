@@ -3743,7 +3743,7 @@ export interface UserConfig {
   guardian?: { mode?: 'shadow' | 'live' };
   /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
    *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[] };
+  taskAgent?: { liveMoves?: string[]; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string } };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -4022,21 +4022,37 @@ function parseAutoReviewConfig(raw: unknown): AutoReviewConfig | undefined {
 }
 
 /** Keeps `taskAgent.liveMoves` as raw strings — the allow-list (and the unknown-entry warning) lives in the task agent. */
+/** HARNESS-PARENT-ON-MSB1 — `taskAgent.parentHost` (기본 없음 = 끔). 문자열 칸만 받는다. */
+function parseTaskAgentParentHost(raw: unknown): NonNullable<UserConfig['taskAgent']>['parentHost'] {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('taskAgent.parentHost', '객체가 아니다 — 버림(로컬 발사)');
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const key of ['host', 'cwd', 'elanous', 'configDir', 'podPool'] as const) {
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value === 'string' && value.trim()) out[key] = value.trim();
+  }
+  return out;
+}
+
 function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
   if (raw === undefined) return undefined;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     warnUserConfigDrop('taskAgent', '섹션이 객체가 아니다 — 버림');
     return undefined;
   }
+  const parentHost = parseTaskAgentParentHost((raw as Record<string, unknown>).parentHost);
   const liveMoves = (raw as Record<string, unknown>).liveMoves;
-  if (liveMoves === undefined) return undefined;
+  if (liveMoves === undefined) return parentHost ? { parentHost } : undefined;
   // 설정이 «있으면» 환경 변수로 내려가지 않는다 — 배열이 아니면 빈 목록(fail-closed), 문자열 밖 항목은 글자로 바꿔 넘겨
   // 실행부가 «모르는 항목»으로 경고하고 버리게 한다(유효한 항목은 산다).
   if (!Array.isArray(liveMoves)) {
     warnUserConfigDrop('taskAgent.liveMoves', '배열이 아니다 — 빈 목록(실행 0)');
-    return { liveMoves: [] };
+    return { liveMoves: [], ...(parentHost ? { parentHost } : {}) };
   }
-  return { liveMoves: liveMoves.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry) ?? String(entry)) };
+  return { liveMoves: liveMoves.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry) ?? String(entry)), ...(parentHost ? { parentHost } : {}) };
 }
 
 function parseGuardianConfig(raw: unknown): UserConfig['guardian'] {

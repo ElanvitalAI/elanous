@@ -7,7 +7,7 @@ import { maturityOn, visibleOn } from '../src/maturity/feature-maturity.js';
 
 const DOCS = join(import.meta.dir, '..', 'release', 'public', 'docs');
 const MENU_ROUTE: Record<string, string> = {
-  '**Chat**': '/chat', '**Terminal**': '/term', '**Intake**': '/intake', '**Approvals**': '/approvals', '**Live**': '/live',
+  '**Chat**': '/chat', '**Terminal**': '/term', '**Editor**': '/editor', '**Intake**': '/intake', '**Approvals**': '/approvals', '**Live**': '/live',
   '**Trace**': '/trace', '**Missions**': '/tasks', '**Design**': '/design-check', '**Vault**': '/vault', '**마켓** (Market)': '/market',
   '**Schedules**': '/scheduler', '**Settings**': '/settings', '**Setup** (`/setup`)': '/setup',
 };

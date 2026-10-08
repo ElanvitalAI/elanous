@@ -20,6 +20,7 @@ import { runPodCommand, parsePodCpu, resolvePodCpu, type RunPodCommandOptions, t
 import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
+import { gateDepsInstallScript, parseGateDeps } from '../../src/task-orchestrator/surfaces/pod-gate-deps.js';
 import { gateShardsPath, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
@@ -253,7 +254,7 @@ export function shardParts(paths: readonly string[], seconds: (file: string) => 
  * leaving `install.log`/`install.rc`, `part-<i>.log`/`.rc`/`.junit.xml`, and `shard.timeout` (the part index) when the
  * deadline cut the shard. A part without `.rc` did not finish. The shell itself always exits 0 (as before).
  */
-export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPatterns: readonly string[]; softSeconds: number; cachePrefix: string; installSlots: number }): string {
+export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPatterns: readonly string[]; softSeconds: number; cachePrefix: string; installSlots: number; depsDir?: string }): string {
   const run = o.parts.map((part, index) => {
     const ignores = o.cdpPatterns.filter((pattern) => part.includes(pattern)).flatMap((pattern) => ['--path-ignore-patterns', pattern]);
     return `run_part ${index} ${['bun', 'run', 'test:deterministic', ...ignores, ...part.map(asPath)].map(quote).join(' ')}`;
@@ -276,9 +277,8 @@ export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPa
     '  echo "$prc" > "$O/part-$i.rc"',
     '}',
     'if cd .. && cd repo; then',
-    ...(o.installSlots > 0 ? ['  install_slot_acquire >> "$O/install.log" 2>&1'] : []),
-    '  { bun install && (cd apps/pwa && bun install); } >> "$O/install.log" 2>&1; irc=$?',
-    ...(o.installSlots > 0 ? ['  install_slot_release'] : []),
+    // GATE-IMAGE-DEPS: link the image's baked node_modules when the lockfiles match; only a miss installs (behind a slot).
+    ...gateDepsInstallScript({ log: '"$O/install.log"', installSlots: o.installSlots, ...(o.depsDir ? { depsDir: o.depsDir } : {}) }).split('\n').map((line) => `  ${line}`),
     '  echo "$irc" > "$O/install.rc"',
     `  if [ "$irc" -eq 0 ]; then ${run || 'true'}; fi`,
     'else echo 5 > "$O/install.rc"; fi',
@@ -800,7 +800,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
       const installSeconds = parseInstallSeconds(output ?? '');
       // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
-      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, deadlineSeconds: shardDeadline, parts: parts.length,
+      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length,
         ...(timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}) });
       if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) });
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');

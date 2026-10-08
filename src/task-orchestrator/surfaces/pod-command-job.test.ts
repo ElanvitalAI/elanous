@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import {
   commandJobSecret,
@@ -20,6 +20,7 @@ import {
 import type { Kubectl } from './self-implement-pod.js';
 import { PodPoolScheduler, syncPoolImages, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 import { podSourceScript } from './pod-source-receive.js';
+import { LogStore } from '../../mss/logging/log-store.js';
 
 const base = {
   name: 'cmd-1',
@@ -123,6 +124,52 @@ describe('pod command job manifest', () => {
     expect([podCpuMillis('0'), podCpuMillis('-1'), podCpuMillis('1Gi'), podCpuMillis('0.0001'), podCpuMillis('')]).toEqual([null, null, null, null, null]);
     expect(resolvePodCpu(undefined)).toEqual({ request: '1', limit: '4' });
     expect(resolvePodCpu({ limit: '2' })).toEqual({ request: '1', limit: '2' });
+  });
+
+  test('log export uses isolated elanous CLI JSONL with structured data and a readable outbox chunk', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-cmd-real-export-'));
+    const script = podCommandScript(manifest({ command: ['true'], returnLogs: true }));
+    try {
+      const store = new LogStore(join(dir, '.elanous', 'logs', 'logs.db'));
+      const runEvent = `pod-real-export-${Date.now()}`;
+      store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'pod.command', event: runEvent, data: { payload: 'structured' } }, surface: 'pod' }]);
+      store.close();
+      const bin = join(dir, 'elanous');
+      writeFileSync(bin, `#!/bin/bash\nexec bun ${JSON.stringify(resolve('bin/elanous.mjs'))} "$@"\n`);
+      chmodSync(bin, 0o755);
+      const start = script.indexOf('set -- ');
+      const ran = spawnSync('bash', ['-c', script.slice(start)], {
+        encoding: 'utf8', cwd: dir,
+        env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH ?? ''}` },
+      });
+      expect(ran.status).toBe(0);
+      expect(ran.stdout).not.toContain('ELANOUS_POD_LOGS_UNAVAILABLE');
+      const jsonl = readFileSync(join(dir, 'outbox/pod-logs/logs.jsonl'), 'utf8');
+      const lines = jsonl.split('\n').filter(Boolean);
+      const record = lines.map((line) => JSON.parse(line) as { event?: string; data?: unknown }).find((row) => row.event === runEvent);
+      expect(record?.data).toEqual({ payload: 'structured' });
+      const chunks = ran.stdout.split('\n').filter((line) => line.startsWith('ELANOUS_POD_ARTIFACT '));
+      expect(chunks.length).toBeGreaterThan(0);
+      expect(Buffer.from(chunks[0]!.split(' ')[1]!, 'base64url').toString()).toBe('pod-logs/logs.jsonl');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('log export emits the real outbox chunk after a failed command without replacing its exit code', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-cmd-export-'));
+    const bin = join(dir, 'elanous');
+    writeFileSync(bin, '#!/bin/bash\n[[ "$*" == "--test=$HOME/.elanous-test logs --instance prod --since 12h --limit 20000 --json --json-data" ]] || exit 19\nprintf "{\\\"ts\\\":\\\"2026-10-08T00:00:00Z\\\",\\\"category\\\":\\\"pod.command\\\",\\\"event\\\":\\\"child\\\"}\\n"\n');
+    chmodSync(bin, 0o755);
+    try {
+      const script = podCommandScript(manifest({ command: ['false'], returnLogs: true }));
+      const start = script.indexOf('set -- ');
+      const executed = script.slice(start);
+      const ran = spawnSync('bash', ['-c', executed], { encoding: 'utf8', env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH ?? ''}` } });
+      expect(ran.status).toBe(1);
+      expect(readFileSync(join(dir, 'outbox/pod-logs/logs.jsonl'), 'utf8')).toContain('"event":"child"');
+      const chunks = ran.stdout.split('\n').filter((line) => line.startsWith('ELANOUS_POD_ARTIFACT '));
+      expect(chunks).toHaveLength(1);
+      expect(Buffer.from(chunks[0]!.split(' ')[1]!, 'base64url').toString()).toBe('pod-logs/logs.jsonl');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('skills·llm 이 없으면 Secret 자격 키가 0개다', () => {
@@ -515,6 +562,22 @@ describe('명령 Job 산출 회수 — 표지가 없어도 알린 경로에 chil
     };
   }
 
+  test('a plain pod run without JSONL still imports its child output into the launching store', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-plain-'));
+    const store = new LogStore(join(root, 'logs.db'));
+    try {
+      const result = await runPodCommand({ command: ['echo', 'hi'], name: 'si-cmd-plain', imageCommit: null,
+        returnLogs: true, artifactsRoot: root, logStore: store,
+        kubectl: kubectlOf({ status: 0, stdout: 'plain child output\n', stderr: '' }),
+      });
+      expect(result.artifactsDir).toBe(join(root, 'si-cmd-plain'));
+      expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe('plain child output\n');
+      expect(store.query({ events: ['child-output'] }).map(({ data }) => JSON.parse(data ?? '{}'))).toEqual([
+        { job: 'si-cmd-plain', output: 'plain child output', origin: 'pod', podJob: 'si-cmd-plain' },
+      ]);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('표지 없는 로그 → 디렉터리와 child.log 하나, 회수 파일 0', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-cmd-nobeacon-'));
     try {
@@ -532,6 +595,45 @@ describe('명령 Job 산출 회수 — 표지가 없어도 알린 경로에 chil
         artifactsDir: result.artifactsDir, artifacts: { files: 0, names: [], error: null },
       });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('pod run Job exports its own logs before artifact emission; collection writes child/output and imports the returned row', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-cmd-return-'));
+    const store = new LogStore(join(root, 'logs.db'));
+    const ts = new Date().toISOString();
+    const row = JSON.stringify({ ts, level: 'info', surface: 'pod', category: 'pod.command', event: 'child-observed', data: { message: 'from child' } });
+    const logs = ['ran', artifactLine('note.txt', 'saved'), artifactLine('pod-logs/logs.jsonl', `${row}\n`)].join('\n');
+    try {
+      const job = manifest({ returnLogs: true });
+      const script = podCommandScript(job);
+      expect(script.indexOf('elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data')).toBeGreaterThan(script.indexOf('rc=$?'));
+      expect(script.indexOf('elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data')).toBeLessThan(script.indexOf('find "$HOME/outbox" -type f -print0'));
+      expect(script).toContain('exit $rc');
+      expect(podCommandScript(manifest())).not.toContain('elanous logs');
+      const calls: string[][] = [];
+      const result = await runPodCommand({ command: ['true'], name: 'si-cmd-return', imageCommit: null,
+        returnLogs: true, artifactsRoot: root, logStore: store,
+        kubectl: (args) => {
+          calls.push([...args]);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          if (args.includes('logs')) return { status: 0, stdout: logs, stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        },
+      });
+      expect(calls.find((args) => args.includes('logs'))).toEqual(['-n', 'elanous-test', 'logs', 'job/si-cmd-return', '-c', 'child']);
+      expect(result.exitCode).toBe(0);
+      expect(result.artifactsDir).toBe(join(root, 'si-cmd-return'));
+      expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe(logs);
+      expect(readFileSync(join(result.artifactsDir, 'note.txt'), 'utf8')).toBe('saved');
+      expect(readFileSync(join(result.artifactsDir, 'pod-logs/logs.jsonl'), 'utf8')).toBe(`${row}\n`);
+      expect(store.query({ events: ['child-observed'] }).map((entry) => JSON.parse(entry.data ?? '{}'))).toEqual([
+        { message: 'from child', origin: 'pod', podJob: 'si-cmd-return' },
+      ]);
+      expect(store.query({ events: ['child-output'] }).map((entry) => JSON.parse(entry.data ?? '{}'))).toEqual([
+        expect.objectContaining({ job: 'si-cmd-return', origin: 'pod', podJob: 'si-cmd-return', output: 'ran' }),
+      ]);
+      expect(result.artifacts).toEqual({ files: 2, names: ['note.txt', 'pod-logs/logs.jsonl'], error: null });
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
   test('표지 2 → 파일 2와 child.log, 회수 수·이름이 반환값과 job-finished 에 있다', async () => {

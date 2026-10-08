@@ -375,8 +375,8 @@ describe('goal author', () => {
     expect(authored.document).toContain('`bun bin/elanous.mjs self author --help` — unavailable — no execution capability was provided.');
   });
 
-  // Observed focused callback duration: 1.63s (one run); the 5s child timeout leaves 3.37s headroom.
-  // The explicit 10s test budget remains 5s above the child timeout for assertions and cleanup.
+  // Observed focused callback duration: 1.63s (one run); the child timeout is 60s — a gate Pod's cold `bin/elanous.mjs` boot takes several seconds (0.2.20 retro-cli timed out at bun's 5s).
+  // The explicit 120s test budget stays above the child timeout for assertions and cleanup.
   test('uses the default help probe from the authoring repository cwd outside that repository process', () => {
     const externalCwd = mkdtempSync(join(tmpdir(), 'goal-author-default-help-probe-process-'));
     temporaryDirectories.push(externalCwd);
@@ -387,11 +387,11 @@ const deps = { ground: async () => facts, enhance: async (ask) => ({ original: a
 const result = await writeAuthoredGoal('Run \`bun bin/elanous.mjs self author\`.', ${JSON.stringify(process.cwd())}, deps, { mkdir: () => {}, write: () => {} });
 console.log(result.authored.document);`;
     // Measured callback: 1.63s; 5s grants 3.37s child headroom.
-    const document = execFileSync(process.execPath, ['-e', script], { cwd: externalCwd, encoding: 'utf8', timeout: 5_000 });
+    const document = execFileSync(process.execPath, ['-e', script], { cwd: externalCwd, encoding: 'utf8', timeout: 60_000 });
 
     expect(document).toContain('`bun bin/elanous.mjs self author --help` — success — command completed successfully.');
   // Observed child probe completes within 5s; 10s leaves assertion headroom.
-  }, 10_000);
+  }, 120_000);
 
   test('records execution-failure but continues authoring when the authoring cwd is not a repository', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'goal-author-default-help-probe-non-repository-'));

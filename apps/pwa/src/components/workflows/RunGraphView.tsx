@@ -7,7 +7,8 @@ import '@xyflow/react/dist/style.css';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 import { useGraphHistory } from './use-graph-history';
 import { NexusApiError, type GraphKindEntry } from '@/nexus/client';
-import { runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
+import { RUN_NODE_WIDTH, runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
+import { TIDY_EDGE_TYPES } from './TidyEdge';
 import {
   CORE_GRAPH_KINDS,
   addRunGraphEdge,
@@ -31,10 +32,10 @@ const KIND_COLORS: Record<string, string> = {
 function RunNode({ data }: NodeProps) {
   const node = data as RunGraphNodeData;
   return (
-    <div className="min-w-[190px] rounded-lg border border-border bg-surface px-3 py-2 shadow-sm"
-      style={{ borderLeft: `4px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, height: node.height }}>
+    <div className="rounded-lg border border-border bg-surface px-3 py-2 shadow-sm"
+      style={{ width: RUN_NODE_WIDTH, borderLeft: `4px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, height: node.height }}>
       {node.inputHandles.map((id, index) => (
-        <Handle key={id} id={id} type="target" position={Position.Left} className="!pointer-events-none"
+        <Handle key={id} id={id} type="target" position={Position.Left} className="!pointer-events-none !opacity-0"
           style={{ top: `${((index + 1) / (node.inputHandles.length + 1)) * 100}%` }} />
       ))}
       <div className="flex items-center gap-1 text-[10px] text-text-tertiary">
@@ -52,7 +53,7 @@ function RunNode({ data }: NodeProps) {
         </div>
       )}
       {node.outputHandles.map((id, index) => (
-        <Handle key={id} id={id} type="source" position={Position.Right} className="!pointer-events-none"
+        <Handle key={id} id={id} type="source" position={Position.Right} className="!pointer-events-none !opacity-0"
           style={{ top: `${((index + 1) / (node.outputHandles.length + 1)) * 100}%` }} />
       ))}
     </div>
@@ -304,7 +305,7 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
         {flow && (
           <ReactFlow key={selected ?? ''} nodes={nodes}
             onNodeClick={editable ? (_event, selectedNode) => setNodeId(selectedNode.id) : undefined}
-            edges={flow.edges} nodeTypes={NODE_TYPES} fitView
+            edges={flow.edges} nodeTypes={NODE_TYPES} edgeTypes={TIDY_EDGE_TYPES} fitView
             nodesDraggable={false} nodesConnectable={false} elementsSelectable={editable}
             edgesReconnectable={false} deleteKeyCode={null} nodesFocusable={editable} edgesFocusable={false}
             defaultEdgeOptions={EDGE_OPTIONS}

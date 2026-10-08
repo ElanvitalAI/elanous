@@ -134,3 +134,19 @@
     opacity: 1;
   }
 }
+
+/* GRAPH-WIZARD (2026-10-08) — a node the «말로 만들기» chat just added glows for a moment. */
+.graph-wizard-new {
+  animation: graph-wizard-new 2.4s ease-out 1;
+  border-radius: 0.5rem;
+}
+
+@keyframes graph-wizard-new {
+  0% { box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.8); }
+  40% { box-shadow: 0 0 0 6px rgba(168, 85, 247, 0.35); }
+  100% { box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-wizard-new { animation: none; box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.6); }
+}

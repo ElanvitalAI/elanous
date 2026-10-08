@@ -1,21 +1,23 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import {
   Background, Controls, Handle, Position, ReactFlow,
   type Connection, type Edge, type Node, type NodeChange, type NodeProps, type NodeTypes, type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import '@/components/workflows/node-status.css';
-import type { GraphKindEntry, NexusClient } from '@/nexus/client';
+import type { GraphKindEntry, GraphWizardSteps, NexusClient } from '@/nexus/client';
 import type { NodeRunStatus } from '@/components/workflows/run-status-helpers';
 import { nodeStatusClass } from '@/components/workflows/node-status-class';
 import {
-  OUTCOME_SUGGESTIONS, addNode, connect, defaultOutcome, emptyGraph, isBackEdge, failTarget, fromYaml, mapServerIssues, moveNode, removeEdge, removeNode, setEntry, setFailTarget,
+  CANVAS_NODE_SIZE, OUTCOME_SUGGESTIONS, addNode, autoLayoutToFit, canvasOutcomeLabel, connect, defaultOutcome, emptyGraph, failTarget, fromYaml, mapServerIssues, moveNode, removeEdge, removeNode, setEntry, setFailTarget,
   setGraphId, setTerminal, terminalNodes, toYaml, updateEdge, updateNode, validateGraph,
   type CanvasFlow, type CanvasGraph, type CanvasIssue,
 } from './graph-canvas-model';
 import { saveCanvasGraph } from './graph-canvas-save';
+import { mergeParallelEdges, routeEdges } from '@/lib/graph-edge-route';
+import { TIDY_EDGE_TYPES, type TidyEdgeData } from '@/components/workflows/TidyEdge';
 
 /** What a toolbar extension (e.g. CGE-RUN's «실행») reads from the canvas. */
 export interface GraphCanvasContext {
@@ -44,6 +46,8 @@ interface CanvasNodeData extends Record<string, unknown> {
   flow: CanvasFlow;
   /** CGE-RUN — the node's state in the current demo run (absent when nothing ran). */
   runStatus?: NodeRunStatus;
+  /** GRAPH-WIZARD v2 — Korean display name; the id stays underneath. */
+  label?: string;
 }
 
 /** Run state stays on the card as colour AND a word: the shared CSS only flashes «done» once, so without this a finished
@@ -62,12 +66,10 @@ export function CanvasNodeCard({ data, selected }: NodeProps) {
   const run = node.runStatus ? RUN_STATUS_LOOK[node.runStatus] : undefined;
   return (
     <div data-testid={`canvas-node-${node.id}`} data-run-status={node.runStatus}
-      className={`min-w-[170px] rounded-lg border bg-background px-3 py-2 shadow-sm ${node.issueCount ? 'border-red-500' : selected ? 'border-primary' : 'border-border'}`}
-      style={{ borderLeft: `4px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, ...(run ? { boxShadow: `0 0 0 2px ${run.ring}` } : {}) }}>
+      className={`rounded-lg border bg-background px-3 py-2 shadow-sm ${node.issueCount ? 'border-red-500' : selected ? 'border-primary' : 'border-border'}`}
+      style={{ width: CANVAS_NODE_SIZE.width, borderLeft: `4px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, ...(run ? { boxShadow: `0 0 0 2px ${run.ring}` } : {}) }}>
       <Handle id="in" type="target" position={vertical ? Position.Top : Position.Left} className="!h-3 !w-3" />
-      {/* Back edges (review → build) leave and enter on the side, so a loop never crosses the forward path. */}
-      <Handle id="back-in" type="target" position={vertical ? Position.Right : Position.Bottom} className="!h-2 !w-2 !opacity-60" style={vertical ? { top: '30%' } : { left: '30%' }} />
-      <Handle id="back-out" type="source" position={vertical ? Position.Right : Position.Bottom} className="!h-2 !w-2 !opacity-60" style={vertical ? { top: '70%' } : { left: '70%' }} />
+      {/* Back edges are routed below the row by graph-edge-route (GRAPH-EDGE-TIDY) — every edge still leaves «out» and enters «in». */}
       <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
         <span>{node.kind}</span>
         {node.entry && <span className="rounded bg-emerald-500/15 px-1 text-emerald-500">시작</span>}
@@ -75,7 +77,10 @@ export function CanvasNodeCard({ data, selected }: NodeProps) {
         {node.issueCount > 0 && <span className="rounded bg-red-500/15 px-1 text-red-500">오류 {node.issueCount}</span>}
         {run && <span className={`rounded px-1 font-semibold ${run.chip}`}>{run.word}</span>}
       </div>
-      <div className="font-mono text-sm font-semibold text-foreground">{node.id}</div>
+      {node.label ? <>
+        <div className="max-w-[150px] truncate text-sm font-semibold text-foreground" title={node.label}>{node.label}</div>
+        <div className="font-mono text-[10px] text-muted-foreground">{node.id}</div>
+      </> : <div className="font-mono text-sm font-semibold text-foreground">{node.id}</div>}
       <div className="max-w-[150px] truncate text-[10px] text-muted-foreground" title={node.recipe}>{node.recipe}</div>
       <Handle id="out" type="source" position={vertical ? Position.Bottom : Position.Right} className="!h-3 !w-3" />
     </div>
@@ -83,8 +88,20 @@ export function CanvasNodeCard({ data, selected }: NodeProps) {
 }
 
 const NODE_TYPES: NodeTypes = { canvas: CanvasNodeCard };
-/** Back/failure routes are dashed and tinted so a loop reads apart from the forward path. */
-const EDGE_TONES: Record<string, string> = { fail: '#ef4444', rework: '#f59e0b' };
+/** Smallest zoom a fit may pick: 14px card ids and 12px edge labels stay ≥ ~11px on screen. */
+const FIT_MIN_ZOOM = 0.85;
+/** GRAPH-WIZARD — while the «말로 만들기» chat drives the canvas, a turn may fit the whole graph down to this zoom
+ *  (a 9–12 node draft must be seen at once); hand editing keeps FIT_MIN_ZOOM. */
+const WIZARD_FIT_MIN_ZOOM = 0.6;
+/** Zoom/fit buttons follow the theme (the library default is a white panel, unreadable on the dark canvas). */
+const CANVAS_CONTROL_TOKENS = {
+  '--xy-controls-button-background-color': 'var(--card)',
+  '--xy-controls-button-background-color-hover': 'var(--muted)',
+  '--xy-controls-button-color': 'var(--foreground)',
+  '--xy-controls-button-color-hover': 'var(--foreground)',
+  '--xy-controls-button-border-color': 'var(--border)',
+  '--xy-controls-box-shadow': '0 0 0 1px var(--border)',
+} as CSSProperties;
 
 type Selection = { type: 'node'; id: string } | { type: 'edge'; index: number } | null;
 /** Result of the explicit «검증» (or of a save) for one exact YAML text. */
@@ -99,6 +116,11 @@ export function GraphCanvasEditor({
   renderActions,
   onChange,
   onSaved,
+  replace,
+  highlight,
+  wizardMode = false,
+  nodeLabels,
+  wizardSteps,
 }: {
   palette: GraphKindEntry[];
   client: NexusClient | null;
@@ -111,6 +133,18 @@ export function GraphCanvasEditor({
   onChange?: (context: GraphCanvasContext) => void;
   /** Called after a successful create/update so lists elsewhere can refresh. */
   onSaved?: (graphId: string) => void;
+  /** GRAPH-WIZARD — a graph pushed from outside (a chat turn or its undo). Applied once per `rev`;
+   *  the save target («저장됨» vs new) stays as it was so a wizard edit of a saved graph updates it. */
+  replace?: { rev: number; graph: CanvasGraph; autoLayout?: boolean };
+  /** Node ids and edge keys (`from->to:outcome`) to flash briefly as «just added». */
+  highlight?: { nodes: string[]; edges: string[] };
+  /** GRAPH-WIZARD — the chat is driving: the palette becomes a strip, the properties panel opens only for a
+   *  selected node/edge, and turns fit down to WIZARD_FIT_MIN_ZOOM — all so the canvas gets the width. */
+  wizardMode?: boolean;
+  /** GRAPH-WIZARD v2 — Korean node names by id (cards show the name, the id small underneath). */
+  nodeLabels?: Record<string, string>;
+  /** GRAPH-WIZARD-SAVE-RECIPES — the wizard's steps, sent with «저장» (the server keeps them for «실행»). */
+  wizardSteps?: GraphWizardSteps;
 }) {
   const [graph, setGraph] = useState<CanvasGraph>(() => initialGraph ?? emptyGraph(''));
   const [selection, setSelection] = useState<Selection>(null);
@@ -128,13 +162,77 @@ export function GraphCanvasEditor({
   const canvasRef = useRef<HTMLDivElement | null>(null);
   // Phone-width canvas lays the graph top to bottom; the measured width decides, not the device.
   const [flow, setFlow] = useState<CanvasFlow>('horizontal');
+  // GRAPH-EDGE-TIDY — the canvas never shrinks text below FIT_MIN_ZOOM; a long chain wraps onto the next line to fit
+  // the measured width at that zoom (phone width: one top-to-bottom column that scrolls).
+  const [lineLength, setLineLength] = useState<number | undefined>(undefined);
+  const minZoomRef = useRef(FIT_MIN_ZOOM);
+  minZoomRef.current = wizardMode ? WIZARD_FIT_MIN_ZOOM : FIT_MIN_ZOOM;
   useEffect(() => {
     const element = canvasRef.current;
     if (!element || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(([entry]) => setFlow((entry?.contentRect.width ?? 1000) < 640 ? 'vertical' : 'horizontal'));
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry?.contentRect.width ?? 1000;
+      setFlow(width < 640 ? 'vertical' : 'horizontal');
+      // Bucketed so a few pixels of resize do not re-run the layout.
+      setLineLength(width < 640 ? undefined : Math.floor(width / minZoomRef.current / 100) * 100);
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+  // Until someone drags a card, the layout follows the flow direction and the line length.
+  const userMoved = useRef(false);
+  const layoutRef = useRef({ flow, lineLength });
+  layoutRef.current = { flow, lineLength };
+  const relayout = useCallback((next: CanvasGraph) =>
+    userMoved.current || next.nodes.length < 2 ? next : autoLayoutToFit(next, layoutRef.current.flow, layoutRef.current.lineLength), []);
+  /** Fit, but never below FIT_MIN_ZOOM — when the graph is larger than that, show it from its start and let the
+   *  person pan/scroll instead of shrinking the text. */
+  const fitCanvas = useCallback((duration = 0) => {
+    // After the relayout has rendered (a frame is not always enough for the store to take the new positions).
+    setTimeout(() => {
+      const instance = flowRef.current;
+      const element = canvasRef.current;
+      if (!instance) return;
+      void Promise.resolve(instance.fitView({ padding: 0.12, maxZoom: 1.1, minZoom: minZoomRef.current, ...(duration ? { duration } : {}) })).then(() => {
+        const nodes = instance.getNodes();
+        if (!element || nodes.length === 0) return;
+        const bounds = instance.getNodesBounds(nodes);
+        const { zoom, x, y } = instance.getViewport();
+        const box = element.getBoundingClientRect();
+        const pad = 24;
+        const overX = bounds.width * zoom + 2 * pad > box.width;
+        const overY = bounds.height * zoom + 2 * pad > box.height;
+        if (overX || overY) {
+          void instance.setViewport({ zoom, x: overX ? pad - bounds.x * zoom : x, y: overY ? pad - bounds.y * zoom : y });
+        }
+      });
+    }, 80);
+  }, []);
+  const laidOutFor = useRef<string>(`horizontal:undefined`);
+  useEffect(() => {
+    const key = `${flow}:${lineLength}`;
+    if (key === laidOutFor.current || userMoved.current) return;
+    laidOutFor.current = key;
+    setGraph((current) => relayout(current));
+    fitCanvas();
+  }, [flow, lineLength, relayout, fitCanvas]);
+  /** Measured card sizes (React Flow `dimensions` changes) — routing uses them, the fixed card size until measured. */
+  const [sizes, setSizes] = useState<Record<string, { width: number; height: number }>>({});
+
+  const appliedRev = useRef<number | null>(null);
+  useEffect(() => {
+    if (!replace || appliedRev.current === replace.rev) return;
+    appliedRev.current = replace.rev;
+    setGraph(relayout(replace.graph));
+    setSelection(null);
+    setCheck(null);
+    setEditError(null);
+    // On a phone the canvas sits in a scrolled column under the toolbar — bring it into view so the change is seen.
+    if (flow === 'vertical') canvasRef.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    fitCanvas(300);
+  }, [replace]);
+  const newNodes = useMemo(() => new Set(highlight?.nodes ?? []), [highlight]);
+  const newEdges = useMemo(() => new Set(highlight?.edges ?? []), [highlight]);
 
   const kinds = useMemo(() => palette.map((entry) => entry.kind), [palette]);
   const yaml = useMemo(() => toYaml(graph), [graph]);
@@ -149,7 +247,8 @@ export function GraphCanvasEditor({
   };
   const contextRef = useRef(context);
   contextRef.current = context;
-  useEffect(() => { onChange?.(contextRef.current); }, [onChange, yaml, context.valid, context.saved]);
+  // `graph` too: a drag changes positions but not the YAML, and the wizard needs to see the canvas as it stands.
+  useEffect(() => { onChange?.(contextRef.current); }, [onChange, graph, yaml, context.valid, context.saved]);
 
   useEffect(() => {
     if (!client) return;
@@ -171,9 +270,7 @@ export function GraphCanvasEditor({
     });
   }, []);
 
-  const fitSoon = useCallback(() => {
-    requestAnimationFrame(() => flowRef.current?.fitView({ padding: 0.25, maxZoom: 1.1, duration: 200 }));
-  }, []);
+  const fitSoon = useCallback(() => fitCanvas(200), [fitCanvas]);
 
   function addKind(kind: string, at?: { x: number; y: number }) {
     let added: string | null = null;
@@ -197,31 +294,46 @@ export function GraphCanvasEditor({
     type: 'canvas',
     position: { x: node.x, y: node.y },
     selected: selection?.type === 'node' && selection.id === node.id,
-    className: nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : undefined,
-    data: { id: node.id, kind: node.kind, recipe: node.recipe, entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
+    className: [nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : '', newNodes.has(node.id) ? 'graph-wizard-new' : ''].filter(Boolean).join(' ') || undefined,
+    data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
       ...(nodeStatus?.[node.id] ? { runStatus: nodeStatus[node.id] } : {}) } satisfies CanvasNodeData,
   }));
-  const flowEdges: Edge[] = graph.edges.map((edge, index) => {
-    const back = isBackEdge(graph, edge, flow);
+  // GRAPH-EDGE-TIDY — same-pair outcomes merge into one edge; forward edges curve, a forward edge that would cross a
+  // card detours above the row, back edges arc below it in their own lane; label pills avoid cards and each other.
+  const routed = useMemo(() => routeEdges(
+    graph.nodes.map((node) => ({ id: node.id, x: node.x, y: node.y, ...(sizes[node.id] ?? CANVAS_NODE_SIZE) })),
+    mergeParallelEdges(graph.edges),
+    { flow, rename: canvasOutcomeLabel },
+  ), [graph.nodes, graph.edges, sizes, flow]);
+  const flowEdges: Edge[] = routed.map((route) => {
+    // GRAPH-WIZARD — edges the chat just added stay highlighted (thicker, wizard purple, animated).
+    const fresh = route.indexes.some((index) => {
+      const edge = graph.edges[index];
+      return edge !== undefined && newEdges.has(`${edge.from}->${edge.to}:${edge.outcome}`);
+    });
     return {
-    id: `e${index}`,
-    source: edge.from,
-    target: edge.to,
-    sourceHandle: back ? 'back-out' : 'out',
-    targetHandle: back ? 'back-in' : 'in',
-    ...(back ? { type: 'smoothstep', pathOptions: { offset: 40 } } : {}),
-    selected: selection?.type === 'edge' && selection.index === index,
-    animated: nodeStatus?.[edge.from] === 'done' && nodeStatus?.[edge.to] === 'running',
-    style: { strokeWidth: 2, ...(EDGE_TONES[edge.outcome] ? { stroke: EDGE_TONES[edge.outcome], strokeDasharray: '6 4' } : {}) },
-    labelStyle: EDGE_TONES[edge.outcome] ? { fill: EDGE_TONES[edge.outcome], fontWeight: 600 } : undefined,
-    label: edge.outcome === 'fail' ? '실패 시' : edge.outcome || undefined,
+    id: route.id,
+    source: route.from,
+    target: route.to,
+    sourceHandle: 'out',
+    targetHandle: 'in',
+    type: 'tidy',
+    data: { route } satisfies TidyEdgeData,
+    selected: selection?.type === 'edge' && route.indexes.includes(selection.index),
+    animated: fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
+    ...(fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
     };
   });
 
   function onNodesChange(changes: NodeChange[]) {
     for (const change of changes) {
+      if (change.type === 'dimensions' && change.dimensions) {
+        const { id, dimensions } = change;
+        setSizes((current) => current[id]?.width === dimensions.width && current[id]?.height === dimensions.height ? current : { ...current, [id]: dimensions });
+      }
       if (change.type === 'position' && change.position) {
         const { id, position } = change;
+        if (change.dragging) userMoved.current = true;
         edit((current) => moveNode(current, id, position.x, position.y));
       }
     }
@@ -250,7 +362,7 @@ export function GraphCanvasEditor({
     const savingYaml = yaml;
     const savingId = graph.graphId;
     try {
-      const result = await saveCanvasGraph(client, savingId, savingYaml, saved?.id === savingId ? 'update' : 'create');
+      const result = await saveCanvasGraph(client, savingId, savingYaml, saved?.id === savingId ? 'update' : 'create', wizardSteps);
       if (result.ok) {
         setSaved({ id: savingId, yaml: savingYaml, ...(result.version !== undefined ? { version: result.version } : {}) });
         setNotice(`«${savingId}» 를 ${result.created ? '새로 ' : ''}저장했습니다${result.version !== undefined ? ` (v${result.version})` : ''}`);
@@ -269,7 +381,8 @@ export function GraphCanvasEditor({
     try {
       const loaded = await client.getRunGraphYaml(id);
       const next = fromYaml(loaded.yaml);
-      setGraph(next);
+      userMoved.current = false;
+      setGraph(relayout(next));
       setSelection(null);
       setCheck(null);
       setSaved(loaded.source === 'mine' ? { id: loaded.id, yaml: toYaml(next) } : null);
@@ -332,10 +445,10 @@ export function GraphCanvasEditor({
         <p role={editError ? 'alert' : 'status'} className={`border-b border-border px-3 py-1 text-xs ${editError ? 'text-red-500' : 'text-emerald-500'}`}>{editError ?? notice}</p>
       )}
       <datalist id="graph-canvas-outcomes">{OUTCOME_SUGGESTIONS.map((name) => <option key={name} value={name} />)}</datalist>
-      <div className="flex min-h-0 flex-1 flex-col min-[900px]:flex-row">
-        <aside aria-label="노드 팔레트" className="shrink-0 border-b border-border p-2 min-[900px]:w-44 min-[900px]:overflow-y-auto min-[900px]:border-b-0 min-[900px]:border-r">
-          <p className="mb-1 text-[11px] text-muted-foreground"><span className="min-[900px]:hidden">눌러서 추가</span><span className="hidden min-[900px]:inline">끌어 놓거나 눌러서 추가</span></p>
-          <ul className="flex gap-1 overflow-x-auto min-[900px]:flex-col min-[900px]:overflow-visible">
+      <div className={`flex min-h-0 flex-1 flex-col ${wizardMode ? '' : 'min-[900px]:flex-row'}`}>
+        <aside aria-label="노드 팔레트" className={wizardMode ? 'flex shrink-0 items-center gap-2 border-b border-border px-2 py-1.5' : 'shrink-0 border-b border-border p-2 min-[900px]:w-44 min-[900px]:overflow-y-auto min-[900px]:border-b-0 min-[900px]:border-r'}>
+          <p className={`text-[11px] text-muted-foreground ${wizardMode ? 'shrink-0' : 'mb-1'}`}>{wizardMode ? '눌러서 추가' : <><span className="min-[900px]:hidden">눌러서 추가</span><span className="hidden min-[900px]:inline">끌어 놓거나 눌러서 추가</span></>}</p>
+          <ul className={wizardMode ? 'flex min-w-0 gap-1 overflow-x-auto' : 'flex gap-1 overflow-x-auto min-[900px]:flex-col min-[900px]:overflow-visible'}>
             {palette.map((entry) => (
               <li key={`${entry.plugin ?? 'core'}:${entry.kind}`} className="shrink-0">
                 <button type="button" draggable title={entry.description || entry.kind}
@@ -351,7 +464,8 @@ export function GraphCanvasEditor({
             ))}
           </ul>
         </aside>
-        <section ref={canvasRef} aria-label="그래프 캔버스" className="relative h-[56vh] min-h-[300px] shrink-0 bg-background min-[900px]:h-auto min-[900px]:flex-1"
+        <div className={wizardMode ? 'flex min-h-0 flex-1 flex-col min-[900px]:flex-row' : 'contents'}>
+        <section ref={canvasRef} aria-label="그래프 캔버스" className={`relative h-[56vh] min-h-[300px] shrink-0 bg-background min-[900px]:h-auto min-[900px]:min-w-0 min-[900px]:flex-1`}
           onDragOver={(event) => {
             if (Array.from(event.dataTransfer.types).includes(KIND_MIME)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }
           }}
@@ -367,7 +481,7 @@ export function GraphCanvasEditor({
               빈 캔버스입니다. 팔레트에서 노드를 끌어 놓거나 눌러서 추가하세요.
             </div>
           )}
-          <ReactFlow nodes={flowNodes} edges={flowEdges} nodeTypes={NODE_TYPES}
+          <ReactFlow nodes={flowNodes} edges={flowEdges} nodeTypes={NODE_TYPES} edgeTypes={TIDY_EDGE_TYPES}
             onInit={(instance) => { flowRef.current = instance; }}
             onNodesChange={onNodesChange}
             onConnect={(connection: Connection) => {
@@ -376,12 +490,13 @@ export function GraphCanvasEditor({
             onNodeClick={(_event, node) => setSelection({ type: 'node', id: node.id })}
             onEdgeClick={(_event, edge) => setSelection({ type: 'edge', index: Number(edge.id.slice(1)) })}
             onPaneClick={() => setSelection(null)}
-            deleteKeyCode={null} fitView fitViewOptions={{ padding: 0.25, maxZoom: 1.1 }}
-            minZoom={0.3} maxZoom={1.5} className="!bg-background">
+            deleteKeyCode={null} fitView fitViewOptions={{ padding: 0.12, maxZoom: 1.1, minZoom: wizardMode ? WIZARD_FIT_MIN_ZOOM : FIT_MIN_ZOOM }}
+            minZoom={0.3} maxZoom={1.5} className="!bg-background" style={CANVAS_CONTROL_TOKENS}>
             <Background />
-            <Controls showInteractive={false} />
+            <Controls showInteractive={false} position="bottom-left" />
           </ReactFlow>
         </section>
+        {(!wizardMode || selection) && (
         <aside aria-label="속성" className="shrink-0 overflow-y-auto border-t border-border p-3 text-xs min-[900px]:w-72 min-[900px]:border-l min-[900px]:border-t-0">
           {selectedNode ? (
             <NodePanel key={selectedNode.id} graph={graph} nodeId={selectedNode.id} palette={palette}
@@ -418,6 +533,8 @@ export function GraphCanvasEditor({
             <pre aria-label="그래프 YAML" className="mt-2 max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-[11px] text-foreground">{yaml}</pre>
           </details>
         </aside>
+        )}
+        </div>
       </div>
     </div>
   );

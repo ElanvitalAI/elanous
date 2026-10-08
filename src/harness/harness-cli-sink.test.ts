@@ -257,10 +257,12 @@ describe('harness CLI sink hook', () => {
       '--observe-only',
       '--no-supervise',
       '--dry-run',
+      '--nested-elanous',
       '--target',
       '--yes',
       '--correlation',
       '--seat',
+      '--no-queue',
       '--goal-type',
       '--force-preflight',
       '--force-gate',
@@ -349,10 +351,12 @@ describe('harness CLI sink hook', () => {
       '--observe-only',
       '--no-supervise',
       '--dry-run',
+      '--nested-elanous',
       '--target',
       '--yes',
       '--correlation',
       '--seat',
+      '--no-queue',
       '--goal-type',
       '--force-preflight',
       '--force-gate',
@@ -364,6 +368,7 @@ describe('harness CLI sink hook', () => {
       '--pod-memory',
       '--after',
       '--source',
+      '--author-grade',
     ]);
   });
 
@@ -448,7 +453,8 @@ describe('harness CLI sink hook', () => {
 
     expect(options('say').slice(0, 7)).toEqual(common);
     expect(common).toEqual(['--json', '--base', '--no-auto-merge', '--merge-by-host', '--observe-only', '--no-supervise', '--dry-run']);
-    expect(options('plan')).toEqual([...common, '--role-llm']);
+    // `--nested-elanous`(#24386 깊이 0 정책)는 ask/say/plan 공통 발사 손잡이다.
+    expect(options('plan')).toEqual([...common, '--nested-elanous', '--role-llm']);
   });
 
   test('injected plan forwards common launch knobs and the repeated plan-specific role-llm values', async () => {

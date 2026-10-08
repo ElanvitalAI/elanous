@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { buildEvalPromptToolSurface, EVAL_PROMPT_TOOL_SURFACES, isEvalPromptToolSurface, resolveReproModelId, runEvalPrompt, type EvalPromptToolSurface } from '../src/eval-prompt-cli.js';
 import { getModelFamily } from '../src/models/prompts.js';
-import { resolveDefaultProvider } from '../src/llm.js';
+import { NoLlmProviderAvailableError, resolveDefaultProvider } from '../src/llm.js';
 import { filterToolsByDeny } from '../src/tool-runtime/tool-deny.js';
 import { getUserConfig } from '../src/user-config.js';
 import { resolveObserveOnlyDecision, type ObserveOnlyDecision } from '../src/self-implement/observe-only.js';
@@ -80,8 +80,16 @@ function formatMachineLoad(load: MachineLoad): string {
 
 function authoritativeSurfaceToolNames(surface: EvalPromptToolSurface): string[] {
   const cfg = getUserConfig();
-  const provider = resolveDefaultProvider();
-  const modelFamily = getModelFamily(resolveReproModelId(undefined, provider.defaultModel));
+  // ⛔ 안전 관문(노출된 변이 툴)은 «provider 해석보다 먼저» 닫혀야 한다 — 자격이 없는 기계(게이트 Pod)에서
+  //   provider 해석이 먼저 던지면 관문이 안내 대신 「No LLM provider」로 끝났다(0.2.20 컷 pod-7·pod-22).
+  //   provider 가 없으면 러너의 마지막 기본 모델로 서피스를 재서 관문을 그대로 판정한다(런은 어차피 못 돈다).
+  let providerDefaultModel: string | undefined;
+  try {
+    providerDefaultModel = resolveDefaultProvider().defaultModel;
+  } catch (error) {
+    if (!(error instanceof NoLlmProviderAvailableError)) throw error;
+  }
+  const modelFamily = getModelFamily(resolveReproModelId(undefined, providerDefaultModel));
   const { specs } = buildEvalPromptToolSurface(surface, modelFamily, cfg);
   const tools = filterToolsByDeny(specs, cfg.chat.toolDeny) ?? specs;
   return tools.map((tool) => tool.name);

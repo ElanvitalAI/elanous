@@ -59,6 +59,8 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { findGitDir } from '../../git-fs/locate.js';
 import { debug } from '../../debug/log.js';
+import { enterJourneyNode, exitJourneyNode, passJourneyNode } from '../../self-dev/graph-journey-nodes.js';
+import { routeJourneyEdge } from '../../self-dev/graph-journey-route.js';
 import { selectLiveDetail } from '../../live/detail-switch.js';
 import { authStorePath } from '../../oauth/store.js';
 import { grokAuthFilePath, isGrokSubscriptionExpiring, refreshGrokSubscriptionToken, resolveGrokCredential } from '../../grok/credential.js';
@@ -1066,9 +1068,27 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         : { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before a pool slot opened' } };
       const unfitDone = await unfitFailure();
       if (unfitDone) return unfitDone;
-      if (!await acquireAdmission()) return admissionFailure();
-      let member: PodPoolMember | null = await acquireSlot();
-      if (options.pool && !member) return { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before a pool slot opened' } };
+      // HARNESS-FULL-GRAPH — Pod 입장(입장 관문 ⊕ 멤버 슬롯)은 그래프 노드 pool-admit 이다.
+      // 2판: decompose →(substrate=pod) pool-admit 간선은 «여기»(Pod 입장 직전 · 실제 단계 경계)에서 남긴다.
+      routeJourneyEdge('decompose', 'pod', { substrate: 'pod' });
+      enterJourneyNode('pool-admit', { provenance: 'self-implement-pod', data: { spaceId: input.spaceId } });
+      // ⛔ 감싸는 함수(async 래퍼)를 쓰지 않는다 — 마이크로태스크가 늘면 Job apply 순서가 밀린다(시험이 잡았다). 같은 자리 try/catch 로.
+      const podAdmitError = (error: unknown): void => {
+        exitJourneyNode('pool-admit', { provenance: 'self-implement-pod', outcome: 'error', data: { spaceId: input.spaceId, error: error instanceof Error ? error.message : String(error) } });
+      };
+      let admitted: boolean;
+      try { admitted = await acquireAdmission(); } catch (error) { podAdmitError(error); throw error; }
+      if (!admitted) {
+        exitJourneyNode('pool-admit', { provenance: 'self-implement-pod', outcome: 'refused', data: { spaceId: input.spaceId, reason: 'admission' } });
+        return admissionFailure();
+      }
+      let member: PodPoolMember | null;
+      try { member = await acquireSlot(); } catch (error) { podAdmitError(error); throw error; }
+      if (options.pool && !member) {
+        exitJourneyNode('pool-admit', { provenance: 'self-implement-pod', outcome: 'refused', data: { spaceId: input.spaceId, reason: 'no-slot' } });
+        return { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before a pool slot opened' } };
+      }
+      exitJourneyNode('pool-admit', { provenance: 'self-implement-pod', outcome: 'admitted', data: { spaceId: input.spaceId, ...(member ? { context: member.context } : {}) } });
       const currentContext = member ? null : baseKubectl(['config', 'current-context']);
       let context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
       const kubectl: Kubectl = (args, stdin) => baseKubectl(['--context', context, ...args], stdin);
@@ -1135,10 +1155,17 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         };
         const candidates = grok ? [] : plannedCodexAccounts ?? [plannedAccount];
         const usable: Array<{ name: string; credential: ReturnType<typeof accountCredentials> }> = [];
-        for (const candidate of candidates) {
-          const credential = await podCodexCredentialWithPrerefresh(candidate, prerefreshDeps);
-          if (credential) usable.push({ name: candidate, credential });
+        enterJourneyNode('credential-refresh', { provenance: 'self-implement-pod', data: { spaceId: input.spaceId, candidates: candidates.length } });
+        try {
+          for (const candidate of candidates) {
+            const credential = await podCodexCredentialWithPrerefresh(candidate, prerefreshDeps);
+            if (credential) usable.push({ name: candidate, credential });
+          }
+        } catch (error) {
+          exitJourneyNode('credential-refresh', { provenance: 'self-implement-pod', outcome: 'error', data: { spaceId: input.spaceId, error: error instanceof Error ? error.message : String(error) } });
+          throw error;
         }
+        exitJourneyNode('credential-refresh', { provenance: 'self-implement-pod', outcome: grok || usable.length > 0 ? 'usable' : 'exhausted', data: { spaceId: input.spaceId, usable: usable.length } });
         if (!grok && usable.length === 0) throw new Error(`openai-codex 후보(${candidates.join(', ')}) access token 이 전부 3시간 안에 만료 — 선갱신도 못 했다(본부 임대 없음 또는 갱신 실패 · pod.credential-prerefresh 를 보라)`);
         const account = grok ? plannedAccount : usable[0]!.name;
         if (account !== plannedAccount) debug.log('self-implement.pod', 'account-skipped-expiring', { spaceId: input.spaceId, from: plannedAccount, to: account });
@@ -1725,6 +1752,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         // SCHED-CONTRACT: a failed child must say why outside the Pod, not «no error diagnostic».
         const podReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds, result: disposition ? { stage: disposition.stage, prUrl: disposition.prUrl ?? null, prNumber: disposition.prNumber ?? null } : null }) : undefined;
         if (podReason) debug.log('self-implement.pod', 'failure-reason', { job: name, reason: podReason });
+        if (podExitCode === 1) {
+          // HARNESS-FULL-GRAPH — 실패 쪽 두 노드: 결과 해석(result-parse) → 수확(salvage, Pod Job 이 push 한 줄로 판정).
+          passJourneyNode('result-parse', { provenance: 'self-implement-pod', outcome: podReason ? 'parsed' : 'no-reason', data: { job: name } });
+          const salvageOutcome = /^ELANOUS_POD_SALVAGE \S+ \S+$/m.test(logs) ? 'pushed' : logs.includes('ELANOUS_POD_SALVAGE_NONE') ? 'none' : 'unknown';
+          passJourneyNode('salvage', { provenance: 'self-implement-pod', outcome: salvageOutcome, data: { job: name } });
+        }
         return {
           exitCode: podExitCode,
           output: tail,

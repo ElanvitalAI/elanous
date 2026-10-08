@@ -529,6 +529,10 @@ describe('배선 — spawnCodingAgent 가 정체성을 싣는다', () => {
               return { id: 't1', title: 't', state: 'running' };
             },
           },
+          // ⛔ 실물 `claude` 바이너리 유무에 기대지 않는다 — 게이트 Pod(리눅스)엔 없다(0.2.20 컷).
+          //    이 테스트가 무는 것은 «env 배선»이지 바이너리 탐색이 아니다.
+          whichBinary: (name: string) => `/usr/local/bin/${name}`,
+          wrapCommand: (cmd: string) => cmd,
         } as never,
       );
       expect(seen?.ELANOUS_STATE_DIR).toBe('/repo/.elanous-test');

@@ -177,6 +177,7 @@ export { setWorktreeRuntimeDeps } from './git-worktree-runtimes.js';
 export {
   setSelfImplementApprover,
   setSelfImplementRuntimeDeps,
+  setSelfImplementSoftStopSpaceObserver,
 } from '../self-implement/self-implement-runtime.js';
 export {
   setTerminalSessionsGetter,

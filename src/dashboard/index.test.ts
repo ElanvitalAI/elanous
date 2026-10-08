@@ -22,6 +22,10 @@ import {
   dispatchLogZoneClick,
   flattenForkableSessionHistory,
   observeDashboardToolDispatchSignal,
+  activeEscHarnessSpace,
+  createEscAbortToolState,
+  trackEscAbortToolCall,
+  settleEscAbortToolCall,
   registerDashboardFinderAndHistoryKeys,
   type LogZoneClickWidgetHost,
 } from './index.js';
@@ -126,6 +130,20 @@ describe('dashboard ad command runner', () => {
   });
 });
 
+test('ESC selects only one identified active SelfImplement call, never a stale or ambiguous space', () => {
+  const calls = createEscAbortToolState();
+  const spaces = new Map([['call-1', 'space-1'], ['call-2', 'space-2']]);
+  expect(activeEscHarnessSpace(calls, spaces)).toBeNull();
+  trackEscAbortToolCall(calls, { id: 'call-1', name: 'SelfImplement' });
+  expect(activeEscHarnessSpace(calls, spaces)).toBe('space-1');
+  trackEscAbortToolCall(calls, { id: 'call-2', name: 'SelfImplement' });
+  expect(activeEscHarnessSpace(calls, spaces)).toBeNull();
+  settleEscAbortToolCall(calls, { id: 'call-1' });
+  expect(activeEscHarnessSpace(calls, spaces)).toBe('space-2');
+  spaces.delete('call-2');
+  expect(activeEscHarnessSpace(calls, spaces)).toBeNull();
+});
+
 describe('dashboard tool dispatch signal observation', () => {
   test('records signal provenance on a separate category before the existing runtime dispatch call', () => {
     const helper = dashboard.slice(
@@ -145,6 +163,7 @@ describe('dashboard tool dispatch signal observation', () => {
     expect(dispatchPrelude).toContain('turnIndex: ctx?.turnIndex ?? null');
     expect(dispatchPrelude).toContain("signalSource: hasParentTurnAbortSignal ? 'parent-turn' : 'fallback'");
     expect(dispatchPrelude).toContain('hasParentTurnAbortSignal');
+    expect(dashboard).toContain('toolCallId: ctx?.callId,');
     expect(dispatchPrelude).toContain('signalAlreadyAborted: (acpTurnRef.abortCtrl?.signal ?? new AbortController().signal).aborted');
   });
 
@@ -157,10 +176,11 @@ describe('dashboard tool dispatch signal observation', () => {
 
   test('forwards the current turn signal into the nested tool runtime context', () => {
     const dispatchClosure = dashboard.slice(
-      dashboard.indexOf('dispatchToolRuntime: (toolName, input) =>'),
+      dashboard.indexOf('dispatchToolRuntime: (toolName, input, toolCallId) =>'),
     ).slice(0, 1100);
     expect(dispatchClosure).toContain('runtime.dispatchToolByName(toolName, input, {');
     expect(dispatchClosure).toContain("surface: 'tui'");
+    expect(dispatchClosure).toContain('toolCallId,');
     expect(dispatchClosure).toContain('signal: acpTurnRef.abortCtrl?.signal');
     expect(dispatchClosure).toContain('agentHostTools: acpTurnToolSpecs');
     expect(dispatchClosure).toContain('agentDispatchTool: (childName, childArgs) =>');
@@ -189,6 +209,27 @@ describe('dashboard tool dispatch signal observation', () => {
 
     expect(result).toEqual({ output: 'probe-ok' });
     expect(observedSignal).toBeUndefined();
+  });
+
+  test('session runtime forwards the originating tool call id through its actual dispatcher', async () => {
+    const runtime = makeProbeRuntime(() => {});
+    const forwarded: Array<string | undefined> = [];
+    const result = await dispatchDashboardSessionRuntimeTool('DashboardSignalProbe', {}, {
+      turnRefUserText: null,
+      toolCallId: 'call-foreground',
+      muted: (line) => line,
+      pushChatLine: () => {},
+      draw: () => {},
+      getToolRuntime: (name) => name === 'DashboardSignalProbe' ? runtime : undefined,
+      dispatchToolRuntime: async (name, input, toolCallId) => {
+        forwarded.push(toolCallId);
+        return runtime.run(input, { surface: 'tui', toolCallId });
+      },
+      dispatchPluginTool: async () => ({ ok: false, error: 'plugin fallback must not run' }),
+      ptyDashboardOn: true,
+    });
+    expect(result).toEqual({ output: 'probe-ok' });
+    expect(forwarded).toEqual(['call-foreground']);
   });
 
   test('keeps esc.abort observations separate from the new dispatch signal category', () => {

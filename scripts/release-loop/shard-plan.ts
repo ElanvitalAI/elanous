@@ -1,13 +1,58 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 
 /** Plan weights for a Pod sweep: wall-scaled when the previous cut recorded shard wall times, junit seconds otherwise. */
-export function planDurations(durationSource: string | undefined): { durations: Map<string, number>; wall?: { shards: number; scaledFiles: number } } {
+export function planDurations(durationSource: string | undefined): { durations: Map<string, number>; wall?: { shards: number; scaledFiles: number }; fallback?: string } {
   if (!durationSource) return { durations: new Map() };
-  const junit = readFileDurations(durationSource);
-  const wall = readFileWallWeights(durationSource, junit);
+  const primary = planDurationsFrom(durationSource);
+  if (primary.durations.size) return primary;
+  // GATE-PLAN-TIMINGS: the baseline cut left no reports (0.2.20: baseline 0.2.19 was gated from another universe, so
+  // all 5,585 files were «unknown», planned 3.9 min, measured 13–20 min). Use the most recent sibling cut instead.
+  const fallback = latestSiblingCutDir(durationSource);
+  if (!fallback) {
+    debug.log('release-loop.gate', 'plan-duration-fallback', { source: durationSource, fallback: null });
+    return primary;
+  }
+  const result = planDurationsFrom(fallback);
+  debug.log('release-loop.gate', 'plan-duration-fallback', { source: durationSource, fallback, files: result.durations.size, wall: !!result.wall });
+  return result.durations.size ? { ...result, fallback } : primary;
+}
+
+function planDurationsFrom(dir: string): { durations: Map<string, number>; wall?: { shards: number; scaledFiles: number } } {
+  const junit = readFileDurations(dir);
+  const wall = readFileWallWeights(dir, junit);
   return wall ? { durations: wall.weights, wall: { shards: wall.shards, scaledFiles: wall.scaledFiles } } : { durations: junit };
+}
+
+/**
+ * For a `<root>/<version>/<a>/<b>` duration source (the gate passes `<ledger>/release/<baseline>/gate-logs/cut`), the
+ * sibling `<root>/<other>/<a>/<b>` directory whose newest `*.junit.xml` is the most recent — «the latest gate». The
+ * source itself is skipped. Undefined when the path is too shallow or no sibling holds a junit report.
+ */
+export function latestSiblingCutDir(durationSource: string): string | undefined {
+  const source = resolve(durationSource);
+  const b = basename(source);
+  const a = basename(dirname(source));
+  const root = dirname(dirname(dirname(source)));
+  if (!a || !b || root === dirname(dirname(source))) return undefined;
+  let versions: string[];
+  try { versions = readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name); }
+  catch { return undefined; }
+  let best: { dir: string; mtimeMs: number } | undefined;
+  for (const version of versions.sort()) {
+    const dir = join(root, version, a, b);
+    if (dir === source) continue;
+    let newest = -1;
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.junit.xml')) continue;
+        try { newest = Math.max(newest, statSync(join(dir, name)).mtimeMs); } catch { /* vanished mid-scan */ }
+      }
+    } catch { continue; }
+    if (newest >= 0 && (!best || newest > best.mtimeMs)) best = { dir, mtimeMs: newest };
+  }
+  return best?.dir;
 }
 
 /** Observation for GATE-PLAN-WALLTIME, emitted once the shards are planned so `maxPlannedMin` is the heaviest shard. */

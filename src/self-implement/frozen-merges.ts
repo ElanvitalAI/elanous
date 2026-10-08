@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { enterJourneyNode, exitJourneyNode, passJourneyNode, withJourneyNodeSync } from '../self-dev/graph-journey-nodes.js';
+import { routeJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { beginLandingMerge, type LandingFreeze } from '../release-loop/landing-freeze.js';
 
 /** `manual`: the owning repository could not be determined — a sweep never resumes it; a person does. */
@@ -184,6 +186,26 @@ export function admitLandingMerge(
   claimKey?: { prNumber: number; repoRoot: string; headCommit?: string },
   opts: { prodFreezeRoot?: string; forceReason?: string } = {},
 ): LandingAdmission {
+  // HARNESS-FULL-GRAPH — 병합 직전 한 곳의 동결 검사가 그래프 노드 freeze-check(출구: open | frozen | taken)이고,
+  // 동결이면 보류 대기열이 노드 hold 다. 판정은 바꾸지 않는다 — 관측만.
+  const pr = claimKey?.prNumber;
+  enterJourneyNode('freeze-check', { provenance: 'admit-landing-merge', ...(pr === undefined ? {} : { data: { pr } }) });
+  const admission = withJourneyNodeSync('freeze-check', { provenance: 'admit-landing-merge', ...(pr === undefined ? {} : { data: { pr } }) },
+    () => admitLandingMergeUnobserved(heldEntry, root, hooks, claimKey, opts));
+  const freezeLabel = admission.kind === 'merge' ? 'open' : admission.kind === 'held' ? 'frozen' : 'taken';
+  exitJourneyNode('freeze-check', { provenance: 'admit-landing-merge', outcome: freezeLabel, ...(pr === undefined ? {} : { data: { pr } }) });
+  // 2판: 간선 판독을 남긴다(관측). 승인 요구(open→hold) 강제는 0.2.22 — 보류 사유 값이 먼저다(RFC §3).
+  routeJourneyEdge('freeze-check', freezeLabel, { freeze: freezeLabel });
+  return admission;
+}
+
+function admitLandingMergeUnobserved(
+  heldEntry: FrozenMerge | null | (() => FrozenMerge | null),
+  root: string,
+  hooks: { afterQueue?: () => void },
+  claimKey: { prNumber: number; repoRoot: string; headCommit?: string } | undefined,
+  opts: { prodFreezeRoot?: string; forceReason?: string },
+): LandingAdmission {
   let entry: FrozenMerge | null | undefined;
   const prodFreezeRoot = opts.prodFreezeRoot ?? prodInstanceRoot();
   // A held PR is merged by exactly one runner: the claim (repository + PR) is held from admission until the lander's
@@ -223,6 +245,7 @@ export function admitLandingMerge(
     if (entry === undefined) entry = typeof heldEntry === 'function' ? heldEntry() : heldEntry; // only built when frozen
     if (!entry) return { kind: 'held', freeze: landing.frozen };
     queueFrozenMerge(entry, root);
+    passJourneyNode('hold', { provenance: 'admit-landing-merge', outcome: 'queued', data: { pr: entry.prNumber } });
     hooks.afterQueue?.();
     const afterQueue = beginLandingMerge(root, new Date(), prodFreezeRoot, opts.forceReason);
     if (afterQueue.frozen) return { kind: 'held', freeze: afterQueue.frozen };

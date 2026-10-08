@@ -151,6 +151,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
       try {
         const result = await run({
           command: commandArgs,
+          returnLogs: true,
           ...(opts.pool ? { pool: opts.pool } : {}),
           ...(skills.length ? { skills } : {}),
           ...(opts.llm === 'grok' ? { llm: 'grok' as const } : {}),

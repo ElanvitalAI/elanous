@@ -5,8 +5,11 @@
 // [[feedback_source_level_grep_test_value]] / dep-inject seam must be wired).
 
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { writePresence } from '../src/away/presence.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
 import {
   normalizeOutbound, resolveChannels, chunkForDiscord, routeOutbound,
 } from '../src/nexus/outbound/router.js';
@@ -180,6 +183,122 @@ describe('routeOutbound', () => {
     expect(got).toBe('short');
   });
 
+  test('same kind uses only away channel while away, original route again when home or presence unreadable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'outbound-away-'));
+    const path = join(root, 'presence.json');
+    setElanousConfigDir(root);
+    const calls: string[] = [];
+    const cfg = cfgWith({
+      channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+      routes: { alert: ['telegram'], report: ['telegram'] },
+      awayRoutes: { alert: ['discord'] },
+    });
+    const deps = {
+      telegramSend: async () => { calls.push('telegram'); return true; },
+      fetchImpl: (async () => { calls.push('discord'); return new Response('', { status: 200 }); }) as unknown as typeof fetch,
+      deliveryDb: mem(),
+    };
+    try {
+      writePresence(true, 'cli', { path });
+      const away = await routeOutbound(cfg, { ...msg, text: 'away' }, deps);
+      expect(calls).toEqual(['discord']);
+      expect(away.delivered).toBe(true);
+      expect(away.channels).toEqual([{ type: 'discord', ok: true }]);
+      const awayRecord = deps.deliveryDb.prepare('SELECT kind, channels FROM deliveries WHERE message_id = ?')
+        .get(away.messageId!) as { kind: string; channels: string };
+      expect(awayRecord).toEqual({ kind: 'alert', channels: JSON.stringify([{ type: 'discord', ok: true }]) });
+
+      calls.length = 0;
+      const legacy = await routeOutbound(cfgWith({
+        channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+        routes: { alert: ['telegram'] },
+      }), { ...msg, text: 'legacy' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(legacy.channels).toEqual([{ type: 'telegram', ok: true }]);
+
+      calls.length = 0;
+      const unmapped = await routeOutbound(cfg, { ...msg, kind: 'report', text: 'unmapped' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(unmapped.channels).toEqual([{ type: 'telegram', ok: true }]);
+
+      calls.length = 0;
+      const viaDefault = await routeOutbound(cfgWith({
+        channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+        routes: { alert: ['telegram'], report: ['telegram'] },
+        awayRoutes: { alert: ['telegram'], default: ['discord'] },
+      }), { ...msg, kind: 'report', text: 'via-default' }, deps);
+      expect(calls).toEqual(['discord']);
+      expect(viaDefault.channels).toEqual([{ type: 'discord', ok: true }]);
+
+      calls.length = 0;
+      writePresence(false, 'cli', { path });
+      const home = await routeOutbound(cfg, { ...msg, text: 'home' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(home.delivered).toBe(true);
+      expect(home.channels).toEqual([{ type: 'telegram', ok: true }]);
+      const homeRecord = deps.deliveryDb.prepare('SELECT kind, channels FROM deliveries WHERE message_id = ?')
+        .get(home.messageId!) as { kind: string; channels: string };
+      expect(homeRecord).toEqual({ kind: 'alert', channels: JSON.stringify([{ type: 'telegram', ok: true }]) });
+
+      calls.length = 0;
+      writeFileSync(path, '{invalid-json');
+      const unreadable = await routeOutbound(cfg, { ...msg, text: 'unreadable' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(unreadable.channels).toEqual([{ type: 'telegram', ok: true }]);
+
+      calls.length = 0;
+      rmSync(path);
+      const missing = await routeOutbound(cfg, { ...msg, text: 'missing' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(missing.channels).toEqual([{ type: 'telegram', ok: true }]);
+    } finally {
+      resetElanousConfigDir();
+      deps.deliveryDb.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('same alert kind switches exclusively to awayRoutes and back without changing its message', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'outbound-switch-'));
+    const path = join(root, 'presence.json');
+    const db = mem();
+    const calls: string[] = [];
+    const cfg = cfgWith({
+      channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+      routes: { alert: ['telegram'] },
+      awayRoutes: { alert: ['discord'] },
+    });
+    const deps = {
+      telegramSend: async () => { calls.push('telegram'); return true; },
+      fetchImpl: (async () => { calls.push('discord'); return new Response('', { status: 200 }); }) as unknown as typeof fetch,
+      deliveryDb: db,
+      dedup: false,
+    };
+    setElanousConfigDir(root);
+    try {
+      writePresence(false, 'cli', { path });
+      const home = await routeOutbound(cfg, msg, deps);
+      expect(home.channels).toEqual([{ type: 'telegram', ok: true }]);
+      expect(calls).toEqual(['telegram']);
+
+      calls.length = 0;
+      writePresence(true, 'cli', { path });
+      const away = await routeOutbound(cfg, msg, deps);
+      expect(away.channels).toEqual([{ type: 'discord', ok: true }]);
+      expect(calls).toEqual(['discord']);
+
+      calls.length = 0;
+      writePresence(false, 'cli', { path });
+      const back = await routeOutbound(cfg, msg, deps);
+      expect(back.channels).toEqual([{ type: 'telegram', ok: true }]);
+      expect(calls).toEqual(['telegram']);
+    } finally {
+      resetElanousConfigDir();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('pushcut API-key path uses injected notify with the configured name', async () => {
     const seen: Array<{ name: string; title: string }> = [];
     const r = await routeOutbound(cfgWith({
@@ -195,9 +314,16 @@ describe('routeOutbound', () => {
 
 describe('outbound handler wire (source-level)', () => {
   const src = readFileSync(join(import.meta.dir, '..', 'src/nexus/api/outbound-report.ts'), 'utf-8');
-  test('handler routes through routeOutbound and keeps top-level delivered boolean', () => {
+  test('handleOutboundReport and routeOutboundInProcess call routeOutbound, preserving delivered', () => {
     expect(src).toMatch(/import\s*\{\s*routeOutbound\s*\}\s*from\s*['"][^'"]*outbound\/router/);
-    expect(src).toMatch(/await routeOutbound\(cfg,/);
+    // 함수 본문(선언부터 첫 최상위 `}` 까지)만 잘라 본다 — 다른 함수의 호출로 통과하지 않게.
+    const body = (name: string): string => {
+      const start = src.indexOf(`export async function ${name}(`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      return src.slice(start, src.indexOf('\n}\n', start));
+    };
+    expect(body('routeOutboundInProcess')).toMatch(/await routeOutbound\(cfg,/);
+    expect(body('handleOutboundReport')).toMatch(/await routeOutbound\(cfg,/);
     expect(src).toMatch(/delivered: result\.delivered/);
   });
 });

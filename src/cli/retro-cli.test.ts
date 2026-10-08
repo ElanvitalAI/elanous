@@ -141,7 +141,10 @@ test('recorded events reach the installed CLI facts JSON', async () => {
     else process.env.ELANOUS_STATE_DIR = previous;
     rmSync(dir, { recursive: true, force: true });
   }
-});
+  // Two real CLI spawns (task-agent-action, then retro facts): a cold `bin/elanous.mjs` boot takes several seconds in a
+  // gate Pod, so bun's 5 s default timed this out (0.2.20 gate «introduced 1» · 10-08 08:1x). Same budget class as the
+  // other real-spawn tests.
+}, 120_000);
 
 test('retro facts command is registered and produces JSON', async () => {
   const command = new Command();

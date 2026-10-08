@@ -1,14 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { POD_COMMAND_DEADLINE_SECONDS, registerPodCommands } from './pod-cli.js';
 import { POD_HOST_LEASE_ANNOTATION } from '../task-orchestrator/surfaces/pod-lease.js';
 import { podPoolHostLease, parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import type { RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
+import { LogStore } from '../mss/logging/log-store.js';
 import { HostPoolLease, psProcessStart } from '../pod-lease/host-lease.js';
 
 function capture() {
@@ -395,6 +396,74 @@ exit 0
     const traceText = (await Bun.file(trace).text());
     expect(traceText.split('\n').filter((line) => line.includes('delete') && line.includes('secret'))).toHaveLength(1);
   });
+
+  test('pod run prints the directory written by its Job and returns its child logs to the launching log store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-cli-return-'));
+    const store = new LogStore(join(dir, '.elanous', 'logs', 'logs.db'));
+    const cap = capture();
+    const program = new Command();
+    program.exitOverride();
+    const prev = process.argv;
+    const ts = new Date().toISOString();
+    const podHome = join(dir, 'pod');
+    mkdirSync(podHome);
+    const podLogs = new LogStore(join(podHome, '.elanous', 'logs', 'logs.db'));
+    podLogs.insertBatch([{ surface: 'pod', rec: { ts, category: 'pod.command', event: 'returned-child', data: { from: 'pod' } } }]);
+    podLogs.close();
+    const bin = join(dir, 'elanous');
+    writeFileSync(bin, `#!/bin/bash\nexec bun ${JSON.stringify(resolve('bin/elanous.mjs'))} "$@"\n`);
+    chmodSync(bin, 0o755);
+    process.argv = ['bun', 'elanous', 'pod', 'run', '--', 'sh', '-c', 'mkdir -p "$HOME/outbox"; printf saved > "$HOME/outbox/note.txt"; printf child-output'];
+    let appliedScript = '';
+    let childOutput = '';
+    try {
+      registerPodCommands(program, { io: cap.io, run: async (options) => {
+        const { runPodCommand } = await import('../task-orchestrator/surfaces/pod-command-job.js');
+        const result = await runPodCommand({ ...options, name: 'si-cmd-cli', imageCommit: null, artifactsRoot: join(dir, 'artifacts'), logStore: store,
+          kubectl: (args, input) => {
+            if (input) {
+              const body = JSON.parse(input) as { kind: string; spec?: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+              if (body.kind === 'Job') {
+                appliedScript = body.spec!.template.spec.containers[0]!.args[0]!;
+                const ran = spawnSync('bash', ['-c', appliedScript.slice(appliedScript.indexOf('set -- '))], {
+                  cwd: podHome, encoding: 'utf8',
+                  env: { ...process.env, HOME: podHome, PATH: `${dir}:${process.env.PATH ?? ''}` },
+                });
+                expect(ran.status).toBe(0);
+                childOutput = ran.stdout;
+                expect(childOutput).toContain('ELANOUS_POD_ARTIFACT ' + Buffer.from('note.txt').toString('base64url'));
+              }
+            }
+            if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+            if (args.includes('logs')) return { status: 0, stdout: childOutput, stderr: '' };
+            return { status: 0, stdout: '0', stderr: '' };
+          },
+        });
+        expect(result.artifacts).toEqual({ files: 2, names: ['note.txt', 'pod-logs/logs.jsonl'], error: null });
+        return result;
+      } });
+      await program.parseAsync(['pod', 'run', '--', 'sh', '-c', 'mkdir -p "$HOME/outbox"; printf saved > "$HOME/outbox/note.txt"; printf child-output'], { from: 'user' });
+      const path = join(dir, 'artifacts', 'si-cmd-cli');
+      expect(appliedScript).toContain('elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data');
+      expect(cap.lines).toEqual([path]);
+      expect(cap.code()).toBe(0);
+      expect(readFileSync(join(path, 'child.log'), 'utf8')).toContain('child-output');
+      expect(readFileSync(join(path, 'child.log'), 'utf8')).toContain('ELANOUS_POD_ARTIFACT ' + Buffer.from('note.txt').toString('base64url'));
+      expect(readFileSync(join(path, 'note.txt'), 'utf8')).toBe('saved');
+      expect(readFileSync(join(path, 'pod-logs/logs.jsonl'), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).some((entry) => entry.event === 'returned-child' && entry.data?.from === 'pod')).toBe(true);
+      expect(store.query({ events: ['returned-child'] }).map(({ data }) => JSON.parse(data ?? '{}'))).toEqual([{ from: 'pod', origin: 'pod', podJob: 'si-cmd-cli' }]);
+      expect(store.query({ events: ['child-output'] }).map(({ data }) => JSON.parse(data ?? '{}'))).toEqual([
+        expect.objectContaining({ job: 'si-cmd-cli', origin: 'pod', podJob: 'si-cmd-cli', output: 'child-output' }),
+      ]);
+      const cli = spawnSync('bun', [resolve('bin/elanous.mjs'), '--test=' + join(dir, 'cli-test'), 'logs', '--instance', 'prod', '--event', 'returned-child', '--json', '--json-data'], {
+        encoding: 'utf8', env: { ...process.env, HOME: dir }, cwd: process.cwd(),
+      });
+      expect(cli.status).toBe(0);
+      expect(cli.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((entry) => entry.event === 'returned-child')).toEqual([
+        expect.objectContaining({ category: 'pod.command', event: 'returned-child', data: { from: 'pod', origin: 'pod', podJob: 'si-cmd-cli' } }),
+      ]);
+    } finally { process.argv = prev; store.close(); rmSync(dir, { recursive: true, force: true }); }
+  }, 120_000);
 
   test('--deadline 생략은 runPodCommand 에 초를 넘기지 않는다', async () => {
     const cap = capture();

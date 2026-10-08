@@ -11,8 +11,38 @@ import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkWikiLink from 'remark-wiki-link';
 import remarkCallout from 'remark-callout';
+import { MermaidDiagram } from '@/components/vault/MermaidDiagram';
 
 const WIKILINK_HREF = 'wikilink:';
+
+/** hast 노드의 최소 모양 — react-markdown 이 components 에 `node` 로 넘긴다. */
+interface HastLike {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  properties?: { className?: unknown };
+  children?: HastLike[];
+}
+
+function hastText(node: HastLike | undefined): string {
+  if (!node) return '';
+  if (node.type === 'text') return node.value ?? '';
+  return (node.children ?? []).map(hastText).join('');
+}
+
+/**
+ * ```mermaid 펜스면 그 소스를, 아니면 null 을 낸다 (2026-10-08 · «옵시디언 mermaid 가 안 그려진다»).
+ * react-markdown 은 펜스를 `pre > code.language-<lang>` 로 만든다 — `pre` 에서 가로채야
+ * 도식이 코드 상자(<pre>) «안»에 갇히지 않는다.
+ */
+export function mermaidSourceFromPre(node: HastLike | undefined): string | null {
+  const code = node?.children?.find((c) => c.type === 'element' && c.tagName === 'code');
+  if (!code) return null;
+  const cls = code.properties?.className;
+  const classes = Array.isArray(cls) ? cls.map(String) : typeof cls === 'string' ? cls.split(/\s+/) : [];
+  if (!classes.includes('language-mermaid')) return null;
+  return hastText(code).replace(/\n$/, '');
+}
 
 /** 명시적 컴포넌트 스타일 — typography 플러그인 없이 헤더 크기·테이블·리스트 렌더. */
 function makeComponents(onWikilink?: (target: string) => void): Components {
@@ -39,7 +69,11 @@ function makeComponents(onWikilink?: (target: string) => void): Components {
         ? <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">{children}</code>
         : <code className={`${className} font-mono`}>{children}</code>;
     },
-    pre: ({ children }) => <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/40 p-3 text-xs">{children}</pre>,
+    pre: ({ node, children }) => {
+      const mermaidSource = mermaidSourceFromPre(node as HastLike | undefined);
+      if (mermaidSource !== null) return <MermaidDiagram source={mermaidSource} />;
+      return <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/40 p-3 text-xs">{children}</pre>;
+    },
     img: ({ src, alt }) => <img src={typeof src === 'string' ? src : ''} alt={alt ?? ''} className="my-2 max-w-full rounded" />,
     a: ({ href, children }) => {
       const h = href ?? '';

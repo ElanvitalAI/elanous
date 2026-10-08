@@ -253,13 +253,14 @@ test('intake digest --seat user sends only two user notes and sends an empty arr
       });
       expect(sent).toEqual({ sent: true });
       expect(buildIntakeDigest(root, day, undefined, undefined, 'user').absorbed.map(e => e.noteName)).toEqual(['one', 'two']);
-      expect(messages[0]).toContain('흡수 2');
+      expect(messages[0].split('\n')[0]).toBe('흡수 2편 → 우리에게 닿는 것 0');
+      expect(messages[0]).toContain('참고 2편 — 노트: [[one]], [[two]]');
       expect(messages[0]).not.toContain('other');
       expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 2, sent: true });
       await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-06' }, {
         root, annotateLens: async () => {}, sendTelegram: async text => { messages.push(text); return true; },
       });
-      expect(messages[1]).toBe('오늘 새 소식 없음');
+      expect(messages[1]).toBe('흡수 0편 → 우리에게 닿는 것 0');
       expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 0, sent: true });
     } finally { log.mockRestore(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -283,7 +284,7 @@ test('a seat briefing does not resend yesterday\'s items when the same search re
     expect(messages[2]).not.toContain('example.com/repo');
     ingestIntakeItems(root, 'github', raw, '2026-10-06T23:00:00Z');
     await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-07' }, { ...deps, sendTelegram: async (text: string) => { messages.push(text); return false; } });
-    expect(messages[3]).toBe('오늘 새 소식 없음');
+    expect(messages[3]).toBe('흡수 0편 → 우리에게 닿는 것 0');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -13,6 +13,7 @@ import {
 } from '../src/autopilot/discovery/doc-lint.js';
 import { parseIndexLinks } from '../src/autopilot/discovery/doc-inventory.js';
 import { execFileSync } from 'node:child_process';
+import { runGitCommand } from '../src/git-fs/runner.js';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { sourceIdentifierInventory, inlineCodeIdentifiers } from '../src/autopilot/discovery/source-identifiers.js';
@@ -80,7 +81,9 @@ const readText = (relPath: string): string | null => { try { return readFileSync
 //   전부 「못 읽음」이 되어 이 규칙이 통째로 잡음이 된다. 그래서 파일명 → repo 경로를 «한 번» 만든다.
 //   ⛔ 같은 파일명이 둘 이상이면 «해석하지 않는다** — 틀린 파일을 대면 「어긋남」이 거짓으로 난다.
 const sourcePathsByBasename = new Map<string, string | null>();
-for (const relPath of execFileSync('git', ['ls-files', '*.ts', '*.tsx'], { cwd: repoRoot, encoding: 'utf-8' }).split('\n')) {
+const lsFiles = runGitCommand(repoRoot, ['ls-files', '*.ts', '*.tsx'], { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+if (lsFiles.status !== 0) throw new Error(`git ls-files failed: ${lsFiles.stderr.trim() || `rc=${lsFiles.status}`}`);
+for (const relPath of lsFiles.stdout.split('\n')) {
   if (relPath === '') continue;
   const base = basename(relPath);
   sourcePathsByBasename.set(base, sourcePathsByBasename.has(base) ? null : relPath);

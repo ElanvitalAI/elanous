@@ -1,4 +1,4 @@
-import { NexusApiError, type NexusClient } from '@/nexus/client';
+import { NexusApiError, type GraphWizardSteps, type NexusClient } from '@/nexus/client';
 import { mapServerIssues, type CanvasIssue } from './graph-canvas-model';
 
 export type CanvasSaveClient = Pick<NexusClient, 'createRunGraph' | 'putRunGraphYaml'>;
@@ -13,9 +13,11 @@ function failed(message: string): CanvasSaveResult {
 
 /** Save through the graph API only. A graph not yet saved goes to create (`POST /v1/graphs`, CGE-SAVE);
  *  one already stored under the same id goes to `PUT /v1/graphs/<id>/yaml`. The server validates both. */
-export async function saveCanvasGraph(client: CanvasSaveClient, graphId: string, yaml: string, mode: 'create' | 'update'): Promise<CanvasSaveResult> {
+export async function saveCanvasGraph(client: CanvasSaveClient, graphId: string, yaml: string, mode: 'create' | 'update', steps?: GraphWizardSteps): Promise<CanvasSaveResult> {
   try {
-    const saved = mode === 'create' ? await client.createRunGraph(graphId, yaml) : await client.putRunGraphYaml(graphId, yaml);
+    // GRAPH-WIZARD-SAVE-RECIPES — a wizard graph carries its steps so «실행» runs the real library steps.
+    const nodeSteps = steps && Object.keys(steps).length ? steps : undefined;
+    const saved = mode === 'create' ? await client.createRunGraph(graphId, yaml, nodeSteps) : await client.putRunGraphYaml(graphId, yaml, nodeSteps);
     return { ok: true, id: graphId, created: mode === 'create', ...(typeof saved.version === 'number' ? { version: saved.version } : {}) };
   } catch (error) {
     if (!(error instanceof NexusApiError)) return failed(`저장 실패: ${error instanceof Error ? error.message : String(error)}`);

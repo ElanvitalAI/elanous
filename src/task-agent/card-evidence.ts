@@ -139,6 +139,12 @@ async function defaultLoadLedger(): Promise<(runId: string) => RunLedgerEntry[] 
   // 연합 목록을 못 읽으면 이 우주만 읽되, 여기서 못 찾으면 «없음»이 아니라 실패로 올린다(card-bind-failed).
   let federationFailure: unknown;
   try { dirs = [...new Set([...dirs, ...resolveFederatedRunLedgerDirectories({})])]; } catch (error) { federationFailure = new Error(`federated run-ledger lookup failed: ${error instanceof Error ? error.message : String(error)}`); }
+  // HARNESS-PARENT-ON-MSB1: 원격 부모 런의 원장 거울(`tasks show` 가 ssh 로 당긴다) — 이 우주 ⊕ 연합 «뒤»에만 붙는다.
+  try {
+    const { remoteLedgerMirrorDirs } = await import('./parent-host.js');
+    const { prodInstanceRoot } = await import('../instance/resolve.js');
+    dirs = [...new Set([...dirs, ...remoteLedgerMirrorDirs(prodInstanceRoot())])];
+  } catch { /* 거울이 없으면 종전 그대로 */ }
   return ledgerLoader(dirs, (runId, dir) => loadRunLedger(runId, dir), federationFailure);
 }
 

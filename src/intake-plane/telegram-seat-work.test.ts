@@ -5,10 +5,16 @@ import { TelegramBot } from '../telegram.js';
 import type { UserConfig } from '../user-config.js';
 import type { PersonaProfile } from '../persona/types.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
+import type { ContextNowAnswer } from '../context-bus/context-now.js';
+import { renderTelegramNow } from '../context-bus/context-now-surfaces.js';
 
 const MSG = { chatId: -123, messageId: 456 };
 const OWNER = { chatId: 111, userId: 111, messageId: 456 };
 const config = { raw: { decisions: { telegramOwnerId: 111 } }, telegram: { allowedUsers: [111] } } as unknown as UserConfig;
+// Ordinary chat turns are preceded by a context-first summary; pin its source so these
+// tests never read the host's real release/decision ledgers (slow and host-dependent).
+const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [], events: [], guide: [] };
+const CONTEXT_SUMMARY = renderTelegramNow(CONTEXT_NOW);
 const sage: PersonaProfile = { personaId: 'sage', displayName: 'Sage', systemPrompt: '차분히 답하라.', mentionPatterns: ['@mentor'] };
 const personaProfiles: PersonaProfile[] = [sage, { personaId: 'cmo', displayName: 'CMO Persona' }, { personaId: 'mira', displayName: 'Mira' }];
 const personaSource: PersonaSource = { list: () => personaProfiles, get: (id) => personaProfiles.find((p) => p.personaId === id) };
@@ -362,6 +368,7 @@ describe('Telegram addressed seat work', () => {
     let bot: TelegramBot; let polls = 0;
     bot = new TelegramBot({ token: '123:test', allowedUsers: [111], perChatGapMs: 0,
       onMessage: async ({ text }) => { chats.push(text); },
+      readContextNow: () => CONTEXT_NOW,
       seatWorkDeps: { config: { ...config, raw: { ...config.raw, seatDispatch: { defaultSeat: 'COO' } } },
         dispatch: async (seat, text, _deps, extra) => { dispatched.push([seat, text, extra]); return { reply: '받음 — OP에 전했습니다.', channel: 'posted' }; },
         answer: async () => ({ title: 'COO', text: '진행 중입니다.' }),
@@ -414,6 +421,7 @@ describe('Telegram addressed seat work', () => {
     }) as typeof fetch;
     bot = new TelegramBot({
       token: '123:test', allowedUsers: [10], fetchImpl, perChatGapMs: 0,
+      readContextNow: () => CONTEXT_NOW,
       onMessage: async (ctx) => { chats.push(ctx.text); },
       seatWorkDeps: { submit: async (input) => {
         inputs.push(input);
@@ -427,12 +435,17 @@ describe('Telegram addressed seat work', () => {
     } }]);
     expect(chats).toEqual(['일반 대화']);
     const sent = calls.filter(({ method }) => method === 'sendMessage').map(({ body }) => body);
-    expect(sent).toHaveLength(4);
+    expect(sent).toHaveLength(5);
+    // The fifth message is the context-first summary in front of the first ordinary chat turn.
+    expect(sent.filter((body) => body.text === CONTEXT_SUMMARY)).toEqual([
+      { chat_id: -123, text: CONTEXT_SUMMARY, reply_to_message_id: 3, message_thread_id: 789 },
+    ]);
     expect(sent.find((body) => body.reply_to_message_id === 1)).toEqual({ chat_id: -123, text: '@CMO 접수번호: R-42', reply_to_message_id: 1, message_thread_id: 789 });
     const unknownReply = sent.find((body) => body.reply_to_message_id === 2);
     expect(unknownReply?.text).toContain('좌석을 확인해 다시 보내');
     expect(unknownReply).toMatchObject({ chat_id: -123, reply_to_message_id: 2, message_thread_id: 789 });
-    expect(sent.find((body) => body.reply_to_message_id === 3)).toEqual({ chat_id: -123, text: '⏳ Working…', reply_to_message_id: 3, message_thread_id: 789 });
+    expect(sent.find((body) => body.reply_to_message_id === 3 && body.text === '⏳ Working…'))
+      .toEqual({ chat_id: -123, text: '⏳ Working…', reply_to_message_id: 3, message_thread_id: 789 });
     expect(sent.find((body) => body.reply_to_message_id === 4)).toEqual({ chat_id: -123, text: 'This bot is private. Your user ID is not on the allowlist.', reply_to_message_id: 4, message_thread_id: 789 });
   });
 });

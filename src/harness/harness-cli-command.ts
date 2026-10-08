@@ -23,7 +23,7 @@ import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
-import { DRAFT_SWEEP_CONCURRENCY, mapBounded, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
+import { collectDraftMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
@@ -47,6 +47,8 @@ import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
 import type { MissionSolveOutcome } from './mission-solve-loop.js';
 import { formatAxis, formatAxisObservations, inspectAskMarkers, inspectUnpressedDecisionSignals } from '../../scripts/ask-marker-check.js';
+import { enterJourneyNode, ensureJourneyKey, exitJourneyNode, JOURNEY_KEY_ENV, passJourneyNode, withJourneyNode } from '../self-dev/graph-journey-nodes.js';
+import { intakeTakesQueue, readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 
 let harnessPlanRfcForTesting: typeof runHarnessPlanRfc | undefined;
 let harnessAskMarkerInspectorForTesting: ((ask: string) => readonly string[]) | undefined;
@@ -777,13 +779,17 @@ async function dispatchHarnessAskSay(
   immediateLaunch?: HarnessQueueDeps['launch'],
   immediateExit?: () => Promise<number>,
 ): Promise<void> {
-  await runInjectedHarnessHandler(async () => {
+  // HARNESS-FULL-GRAPH — 여정 조인 키는 이 발사 동안만 환경에 싣는다(자식은 그동안 물려받는다).
+  const journeyPreset = Boolean(process.env[JOURNEY_KEY_ENV]?.trim());
+  try { await runInjectedHarnessHandler(async () => {
     assertHarnessChildLlmModel(opts);
     if (isHarnessDryRun(opts)) {
       resolveLaunchSubstrate(opts);
       printHarnessLaunchDryRun(dryRunPreview);
       return;
     }
+    ensureJourneyKey();
+    const journey = { provenance: dryRunPreview.entrance, ...(opts.goalType ? { goalType: opts.goalType as GoalType } : {}) };
     // Resolve the launch directory once; descendants and the checkpoint retain the same identity.
     const queued = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH && process.env.ELANOUS_HARNESS_SEAT;
     const queueSeat = queued === 'OP' || queued === 'TC' || queued === 'MK' || queued === 'UX' ? queued : undefined;
@@ -801,10 +807,21 @@ async function dispatchHarnessAskSay(
     const podSeat = resolved.substrate === 'pod' && ['OP', 'TC', 'MK', 'UX'].includes(inheritedSeat ?? '')
       ? inheritedSeat as QueueSeat : undefined;
     const stampedSeat = resolved.substrate === 'pod' ? opts.seat ?? queueSeat ?? podSeat ?? assigned : assigned;
+    // HARNESS-FULL-GRAPH 2판 — 대기열을 탈지는 «그래프»가 정한다. 코드는 상태 값(queued|direct)만 내고,
+    // 다음 노드는 YAML(⊕ 조건이 맞는 launch 오버레이)의 intake 간선이 고른다. 기본 YAML 은 오늘과 같은 길이다.
+    // ⛔ 대기열은 자리가 있어야 하고 대기열 자식·--no-queue 는 다시 줄 서지 않는다 — 그 셋은 그래프가 못 넘는다.
+    const intakeLabel = shouldQueue && stampedSeat ? 'queued' : 'direct';
+    // intake 는 판정만 하는 관측 노드 — 진입·출구를 한 자리에서.
+    passJourneyNode('intake', { ...journey, outcome: intakeLabel });
+    const intakeRoute = readJourneyEdge('intake', intakeLabel, { seat: stampedSeat ?? 'none', substrate: resolved.substrate });
+    const queueEligible = opts.queue !== false && !process.env.ELANOUS_HARNESS_QUEUE_LAUNCH && Boolean(stampedSeat);
+    const takeQueue = intakeTakesQueue(intakeLabel, intakeRoute, queueEligible);
+    // 실제로 탄 간선을 전제 검사 «뒤»에 남긴다(그래프 답과 다르면 honored=false · 이유).
+    recordJourneyEdge(intakeRoute, takeQueue ? 'queue' : 'launch-gate', intakeRoute.to === 'queue' && !takeQueue ? (opts.queue === false ? '--no-queue' : process.env.ELANOUS_HARNESS_QUEUE_LAUNCH ? 'queue-child' : 'no-seat') : undefined);
     if (directSay && opts.queue === false) {
       try { debug.log('harness.queue', 'bypass', { seat: stampedSeat ?? null, reason: '--no-queue' }); }
       catch { /* Observation must not prevent an emergency launch. */ }
-    } else if (shouldQueue && stampedSeat) {
+    } else if (takeQueue && stampedSeat) {
       resolveNestedElanousOption(opts);
       const flags: string[] = [];
       const values: Array<[string, string | undefined]> = [
@@ -833,6 +850,7 @@ async function dispatchHarnessAskSay(
         [opts.forceGate, '--force-gate'],
       ] as const) if (enabled) flags.push(flag);
       let row: QueueItem;
+      enterJourneyNode('queue', journey);
       try {
         row = await addHarnessQueue({ seat: stampedSeat, launchCwd: process.cwd(), refuseDuplicate: true,
         ...(dryRunPreview.goalPath ? { ask: dryRunPreview.goalPath } : { say: dryRunPreview.input }),
@@ -842,12 +860,17 @@ async function dispatchHarnessAskSay(
         }, queueDeps);
         await queueDeps?.afterEnqueue?.(row);
       } catch (error) {
-        if (!(error instanceof HarnessQueueDuplicateError)) throw error;
+        if (!(error instanceof HarnessQueueDuplicateError)) {
+          exitJourneyNode('queue', { ...journey, outcome: 'error', data: { error: error instanceof Error ? error.message : String(error) } });
+          throw error;
+        }
         console.error(`발사 거절 — ${error.message.replace(/[\r\n]+/g, ' ')}`);
+        exitJourneyNode('queue', { ...journey, outcome: 'refused' });
         process.exitCode = 1;
         return;
       }
-      const result = await tickHarnessQueue({ ...queueDeps, ...(immediateLaunch ? { launch: immediateLaunch } : {}) }, row.id);
+      const result = await withJourneyNode('queue', journey, () => tickHarnessQueue({ ...queueDeps, ...(immediateLaunch ? { launch: immediateLaunch } : {}) }, row.id));
+      exitJourneyNode('queue', { ...journey, outcome: result.outcome === 'launched' && result.item?.id === row.id ? 'launched' : 'waiting', data: { queueItemId: row.id, queueTick: result.outcome } });
       if (result.outcome === 'launched' && result.item?.id === row.id) {
         if (immediateExit) process.exitCode = await immediateExit();
       } else if (result.outcome === 'waiting') {
@@ -880,6 +903,8 @@ async function dispatchHarnessAskSay(
       const previous = process.env.ELANOUS_HARNESS_SEAT;
       if (stampedSeat) process.env.ELANOUS_HARNESS_SEAT = stampedSeat;
       else delete process.env.ELANOUS_HARNESS_SEAT;
+      // 배치 노드 — 실행 칸(local | pod)이 그 출구 라벨이고, YAML 의 decompose 간선(on: substrate)이 그 값으로 갈린다.
+      passJourneyNode('dispatch', { ...journey, outcome: resolved.substrate });
       try { await dispatch(resolved, stampedOpts); }
       finally {
         if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
@@ -900,11 +925,16 @@ async function dispatchHarnessAskSay(
     // CLI wiring tests time out on them. Gate tests inject deps or opt in with ELANOUS_LAUNCH_GATE_LIVE=1.
     if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0 && process.env.ELANOUS_LAUNCH_GATE_LIVE !== '1') {
       try { debug.log('execution-loop.launch-gate', 'skipped-test-env', { goalId }); } catch { /* observation is fail-soft */ }
+      passJourneyNode('launch-gate', { ...journey, outcome: 'pass', data: { skipped: 'test-env' } });
       await launch();
       return;
     }
-    const budget = await (gate.readBudget ?? (() => readHarnessLaunchBudget(opts)))();
-    const decision = preLaunchGate({ goalId, budget, forceLaunch: opts.forceGate === true }, gate);
+    enterJourneyNode('launch-gate', journey);
+    const decision = await withJourneyNode('launch-gate', journey, async () => {
+      const budget = await (gate.readBudget ?? (() => readHarnessLaunchBudget(opts)))();
+      return preLaunchGate({ goalId, budget, forceLaunch: opts.forceGate === true }, gate);
+    });
+    exitJourneyNode('launch-gate', { ...journey, outcome: decision.action === 'proceed' ? 'pass' : 'refuse', data: { action: decision.action } });
     if (decision.action !== 'proceed') {
       console.error(`❌ launch gate: ${decision.action} — ${decision.reason.split(/\r?\n/, 1)[0]}`);
       process.exitCode = 3;
@@ -916,7 +946,7 @@ async function dispatchHarnessAskSay(
     ];
     if (warnings.length > 0) console.error(`⚠️ launch gate: ${warnings.join(' · ').split(/\r?\n/, 1)[0]}`);
     await launch();
-  });
+  }); } finally { if (!journeyPreset) delete process.env[JOURNEY_KEY_ENV]; }
 }
 
 function normalizeHarnessPlanOptions(opts: HarnessPlanOptions): HarnessPlanOptions {
@@ -2420,15 +2450,16 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     },
     getClaimOwner: async (repository, number) => claimCommentOwner(repository, number, execute),
     getActiveClaimOwner: async (repository, number) => {
+      // DRAFT-METRIC: the batched GraphQL comments (oldest first, proven complete) answer without a per-draft REST call.
+      const batched = (await detailFor(repository, number))?.comments;
+      if (batched) return activeClaimOwnerFromBodies(batched);
       const pages = ghJson<Array<Array<{ body: string; created_at: string }>>>(['api', '--paginate', '--slurp',
         `repos/${repository}/issues/${number}/comments?per_page=100`], execute);
       if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page)
         || page.some((comment) => typeof comment.body !== 'string' || !Number.isFinite(Date.parse(comment.created_at)))))
         throw new Error('Incomplete claim comments');
-      const last = pages.flat().sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
-        .map((comment) => comment.body)
-        .find((body) => draftClaimOwner(body) !== undefined || body.startsWith('🔧 처리 끝 —'));
-      return last ? draftClaimOwner(last) : undefined;
+      return activeClaimOwnerFromBodies(pages.flat().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+        .map((comment) => comment.body));
     },
     getReviewGate: async (draft, repository) => reviewGateForDraft(draft, repository),
   };
@@ -2462,6 +2493,12 @@ async function draftSweepRunTtl(repository: string, deps: HarnessDraftSweepDeps,
     try { debug.log('self-implement.run-ttl', 'failed', { reason }); } catch { /* fail-soft */ }
     return { error: reason };
   }
+}
+
+/** Latest claim or release among comments in chronological order (oldest first); a release means no owner. */
+export function activeClaimOwnerFromBodies(bodies: readonly string[]): string | undefined {
+  const last = [...bodies].reverse().find((body) => draftClaimOwner(body) !== undefined || body.startsWith('🔧 처리 끝 —'));
+  return last ? draftClaimOwner(last) : undefined;
 }
 
 function draftClaimOwner(body: string): string | undefined {
@@ -2515,6 +2552,25 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
             `🔧 처리 중 — owner ${owner} · ${(deps.now?.() ?? new Date()).toISOString()}${opts.note?.trim() ? ` · ${opts.note.trim()}` : ''}`]);
         }
         (deps.write ?? console.log)(`#${number} ${opts.release ? 'release' : 'claim'}: ${repository}`);
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+  drafts.command('metrics').description('draft 재고·최장 나이·needs-owner·48h 전환율 (읽기 전용 · PR 근거는 GraphQL 배치)')
+    .option('--json', 'JSON 으로 출력')
+    .option('--repo <owner/name>', '조회할 GitHub 저장소')
+    .action(async (opts: { json?: boolean; repo?: string }) => {
+      try {
+        const execute = deps.execute ?? executeGh;
+        const repository = resolveRepositoryName({ repo: opts.repo ?? deps.repository?.(), executeGh: (args) => execute(args) });
+        if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
+        const started = Date.now();
+        const metrics = await collectDraftMetrics(repository, deps.adapters ?? githubDraftSweepAdapters(deps.execute), deps.now?.() ?? new Date());
+        try { debug.log('self-dev.draft-metrics', 'collected', { repository, ms: Date.now() - started, ...metrics }); } catch { /* fail-soft */ }
+        const write = deps.write ?? console.log;
+        if (opts.json) write(JSON.stringify({ repository, ...metrics }));
+        else write(`draft 재고 ${metrics.inventory} · 최장 나이 ${metrics.oldestAgeHours === null ? '해당 없음' : `${metrics.oldestAgeHours.toFixed(1)}h`} · needs-owner ${metrics.needsOwner} · 48h 전환율 ${metrics.conversion48h === null ? '표본 없음' : `${(metrics.conversion48h * 100).toFixed(1)}% (${metrics.converted48h}/${metrics.cohort48h})`}`);
       } catch (error) {
         console.error(humanErrorLine(error));
         process.exitCode = 1;

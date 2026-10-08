@@ -48,3 +48,48 @@ test('draft metric closed inventory rejects truncated and malformed pages', asyn
   await expect(incomplete.listRecentClosed!('my/repo', new Date('2026-09-26T00:00:00Z')))
     .rejects.toThrow('Incomplete closed metric inventory');
 });
+
+test('DRAFT-METRIC: needs-owner reads the batched GraphQL comments — no per-draft gh comments call', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { collectDraftMetrics } = await import('../self-dev/draft-sweep.js');
+  const stateDir = mkdtempSync(join(tmpdir(), 'draft-metric-batch-'));
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  try {
+    const drafts = Array.from({ length: 95 }, (_, i) => ({ number: i + 1, draft: true, title: `d${i}`, body: null,
+      head: { ref: `self-impl/d-${i}`, sha: `h${i}` }, base: { ref: 'main' }, labels: [],
+      created_at: '2026-10-07T00:00:00Z', updated_at: '2026-10-07T00:00:00Z', merged_at: null }));
+    // Draft 1: claimed then released ⇒ no owner. Draft 2: claimed ⇒ owner. The rest: no claim ⇒ needs owner.
+    const comments = (number: number) => number === 1
+      ? ['🔧 처리 중 — owner OP · 2026-10-07T01:00:00Z', '🔧 처리 끝 — 2026-10-07T02:00:00Z']
+      : number === 2 ? ['noise', '🔧 처리 중 — owner UX · 2026-10-07T01:00:00Z'] : [];
+    const calls: string[] = [];
+    const adapters = githubDraftSweepAdapters((args) => {
+      calls.push(args[1] === 'graphql' ? 'graphql' : args.join(' '));
+      if (args[1] === 'graphql') {
+        const repository: Record<string, unknown> = {};
+        for (const match of args[3]!.matchAll(/p(\d+): pullRequest/g)) {
+          const number = Number(match[1]);
+          const nodes = (rows: unknown[]) => ({ totalCount: rows.length, nodes: rows, pageInfo: { hasNextPage: false } });
+          repository[`p${number}`] = { number, headRefOid: `h${number}`, files: nodes([{ path: 'src/a.ts' }]),
+            comments: nodes(comments(number).map((body) => ({ body }))), reviews: nodes([]), mergeCommit: null };
+        }
+        return JSON.stringify({ data: { repository } });
+      }
+      if (args[1]?.includes('state=open')) return JSON.stringify(args[1].endsWith('&page=1') ? drafts : []);
+      if (args[1]?.includes('state=closed')) return '[]';
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    });
+    const metrics = await collectDraftMetrics('my/repo', adapters, new Date('2026-10-08T00:00:00Z'));
+    expect(metrics).toMatchObject({ inventory: 95, needsOwner: 94, oldestAgeHours: 24 });
+    expect(calls.filter((call) => call.includes('/comments'))).toEqual([]);
+    // One open page ⊕ ceil(95/40)=3 GraphQL batches ⊕ one closed page — bounded by batches, not by drafts.
+    expect(calls.filter((call) => call === 'graphql')).toHaveLength(3);
+    expect(calls.length).toBeLessThanOrEqual(5);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

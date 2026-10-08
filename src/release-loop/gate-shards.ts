@@ -86,6 +86,9 @@ export interface GateShardsSummary {
   waitReasons: Array<{ reason: string; count: number }>;
   /** 남은 분 추정 — 계획 분이 모자라면 null(«추정 불가»). */
   etaMin: number | null;
+  /** 끝났지만 rc≠0 인 조각 수 — 쓰는 쪽의 `done` 은 «조각 끝»일 뿐 «통과»가 아니다(판정은 게이트 노드가 기존/새로 가른다).
+   *  0.2.20 컷 실측: 끝난 넷이 모두 rc 1 인데 화면이 «통과»로 읽었다. */
+  doneWithFailures: number;
   /** 도는 조각 중 계획 분을 가장 많이 넘긴 분(없으면 0). 넘겼으면 etaMin 은 «하한»일 뿐이라 화면이 그렇게 말한다
    *  — canary 10-07 실측: 계획 0.1분 · 실제 22분 → 넘김을 안 보이면 내내 «남은 약 0분». */
   overrunMin: number;
@@ -130,6 +133,7 @@ export function summarizeShards(file: GateShardsFile, now: number = Date.now()):
     total: file.shards.length,
     counts,
     waitReasons: [...reasons].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
+    doneWithFailures: file.shards.filter((s) => s.state === 'done' && s.rc !== undefined && s.rc !== 0).length,
     etaMin: estimate(file.shards, now),
     overrunMin: Math.floor(overrun),
     staleMin: stale === null ? null : Math.floor(stale),
@@ -137,7 +141,7 @@ export function summarizeShards(file: GateShardsFile, now: number = Date.now()):
 }
 
 export const SHARD_WORD: Record<ShardState, string> = {
-  pending: '대기', running: '돌기', done: '통과', retry: '재시도', timeout: '잘림', failed: '실패',
+  pending: '대기', running: '돌기', done: '끝', retry: '재시도', timeout: '잘림', failed: '실패',
 };
 
 /** 외출 알림·/release 한 줄 — «조각 24 · 돌기 5 · 대기 8(CPU 부족 8) · 잘림 2 · 통과 9 · 남은 약 40분». */
@@ -149,7 +153,8 @@ export function shardsLine(summary: GateShardsSummary): string {
     if (!n) continue;
     const why = state === 'pending' && summary.waitReasons.length
       ? `(${summary.waitReasons.slice(0, 2).map((w) => `${w.reason} ${w.count}`).join(' · ')})` : '';
-    parts.push(`${SHARD_WORD[state]} ${n}${why}`);
+    const reported = state === 'done' && summary.doneWithFailures ? `(실패 보고 ${summary.doneWithFailures})` : '';
+    parts.push(`${SHARD_WORD[state]} ${n}${why}${reported}`);
   }
   if (summary.overrunMin >= 1) parts.push(`계획보다 ${summary.overrunMin}분 넘게 도는 중 — 남은 시간 추정 불가`);
   else parts.push(summary.etaMin === null ? '남은 시간 추정 불가(계획 분 없음)' : `남은 약 ${summary.etaMin}분`);

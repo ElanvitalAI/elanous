@@ -3,9 +3,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ChecklistItem } from '../../src/release-loop/checklist.js';
+import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { addItem, listChecklist, setItem, type ChecklistItem } from '../../src/release-loop/checklist.js';
 import type { ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
-import { generateAxBrief, type AxBriefSources } from './generate-ax-brief.js';
+import { queryMergedRunLedgers } from '../../src/self-implement/run-ledger.js';
+import { generateAxBrief, generateNextVersionAxBrief, type AxBriefSources } from './generate-ax-brief.js';
 
 const item = (id: string, title: string, status: ChecklistItem['status'] = 'yellow'): ChecklistItem => ({
   id, title, status, owner: 'MK', evidence: '근거 #24146\n다음 줄', updatedAt: '2026-10-05T00:00:00Z', updatedBy: 'test',
@@ -88,6 +91,62 @@ test('missing or partially unreadable merge ledgers are not represented as a com
   expect(section(generateAxBrief('0.2.16', input), 2)).toContain('실제 병합 수 (self-implement run-ledger 전체 기록 · 중복 PR 제외 · 외부/수동 병합 제외): 못 읽음 · 사유: 원장 1건 판독 실패 · 확인된 병합 0건 (집계 불완전)');
   input.merges = () => ({ entries: sources().merges().entries, ledgerDirectoryMissing: false, unreadableLedgerCount: 0, excludedLedgerCount: 2 });
   expect(section(generateAxBrief('0.2.16', input), 2)).toContain('실제 병합 수 (self-implement run-ledger 전체 기록 · 중복 PR 제외 · 외부/수동 병합 제외): 2 · 미반영 원장: 못 읽음 0건 · 중복 병합 제외 2건');
+});
+
+test('next-version brief combines the selected version ledger facts with RELEASE-STORY notes and linked verified claims', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ax-next-'));
+  setElanousConfigDir(root);
+  try {
+    const version = '9.8.7';
+    const nextPath = join(root, 'next.md');
+    const manualRoot = join(root, 'manual');
+    mkdirSync(manualRoot);
+    writeFileSync(nextPath, '# Next\n## Internal\n- private launch\n## Feat\n- New reading mode\n');
+    addItem(version, { id: 'ORCH1', title: 'Reading improvements — details' });
+    setItem(version, 'ORCH1', { status: 'green', evidence: '근거 #24146' }, 'MK');
+    addItem(version, { id: 'NEXT_YELLOW', title: 'Unreleased capability' });
+    const ledger = new ClaimsLedger({ stateDir: root });
+    ledger.add({ id: 'NEXT_CLAIM', claim: 'Readers can open 12 views.', audience: 'personal', owner: 'MK' });
+    ledger.verify('NEXT_CLAIM', { value: '12', command: 'bun measure-views.ts', measuredAt: new Date().toISOString(),
+      validUntil: new Date(Date.now() + 86400000).toISOString(), by: 'MK' });
+    ledger.link('NEXT_CLAIM', { cell: 'ORCH1', version });
+    const ledgerDir = join(root, 'run-ledger');
+    mkdirSync(ledgerDir);
+    for (const [index, prNumber] of [24146, 24147, 24148].entries()) {
+      const runId = `run-00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`;
+      writeFileSync(join(ledgerDir, `${runId}.jsonl`), JSON.stringify({
+        runId, timestamp: '2026-10-05T00:00:00Z', event: 'merged', data: { number: prNumber, merged: true },
+      }) + '\n');
+    }
+    const input = sources();
+    input.checklist = (v) => listChecklist(v, root).items;
+    input.merges = () => queryMergedRunLedgers({ dir: ledgerDir });
+    const brief = generateNextVersionAxBrief(version, input, { nextPath, outDir: join(root, 'story'),
+      checklistRoot: root, stateDir: root, manualRoot });
+    expect(brief).toContain('| ORCH1 | 9.8.7 | green | 근거 #24146 |');
+    expect(section(brief, 2)).toContain('실제 병합 수 (self-implement run-ledger 전체 기록 · 중복 PR 제외 · 외부/수동 병합 제외): 3');
+    expect(brief).toContain('## 5. 다음 판 변화·근거 (RELEASE-STORY 초안)');
+    expect(brief).toContain('첫 공개 숫자 후보: Readers can open 12 views.');
+    expect(brief).toContain('재측정: bun measure-views.ts');
+    expect(brief).toContain('- New reading mode');
+    expect(brief).toContain('- Reading improvements');
+    expect(brief).not.toContain('private launch');
+    expect(brief).not.toContain('Unreleased capability');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('next-version brief keeps ledger facts and explicitly marks an empty RELEASE-STORY draft', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ax-next-empty-'));
+  setElanousConfigDir(root);
+  try {
+    const nextPath = join(root, 'next.md');
+    writeFileSync(nextPath, '# Next\n## Internal\n- private note\n');
+    const brief = generateNextVersionAxBrief('9.8.7', sources(), { nextPath, outDir: join(root, 'story'),
+      checklistRoot: root, stateDir: root });
+    expect(brief).toContain('사용자 대상 변경 없음 — RELEASE-STORY 초안을 건너뜀');
+    expect(brief).toContain('실제 병합 수 (self-implement run-ledger 전체 기록 · 중복 PR 제외 · 외부/수동 병합 제외): 2');
+    expect(brief).not.toContain('private note');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the CLI reads the isolated run ledger for the actual merge count', () => {

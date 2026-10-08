@@ -756,7 +756,8 @@ test('disabled delivery, bounded gh errors and injected ad news are visibly degr
     expect(composed.deliveryLine).toContain('compose degraded');
     expect(composed.deliveryLine).not.toContain('send-disabled');
     expect(ticks).toHaveLength(0);
-    const delivered = await main(['deliver'], deps);
+    const delivered = await runDaily({ stage: 'deliver' }, deps);
+    await expect(main(['deliver'], deps)).rejects.toThrow('발송 실패 · 발송 비활성');
     expect(delivered.status).toBe('degraded');
     expect(delivered.deliveryLine).toContain('deliver degraded · target=unknown · send-disabled · sent=false · chars=0 · receipt=RHYTHM-DAILY:2026-10-05');
     expect(output).toContain(delivered.deliveryLine);
@@ -864,10 +865,14 @@ test('graph stages fail the node on a send failure or a failed vault copy instea
   const root = mkdtempSync(join(tmpdir(), 'rhythm-stage-fail-'));
   const blocked = join(root, 'vault-is-a-file');
   writeFileSync(blocked, 'not a directory');
+  const ticks: Record<string, unknown>[] = [];
+  const output: string[] = [];
+  let sends = 0;
   const base: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: true, target: { chatId: 12345, botToken: 'test-token' },
     landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
     loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [],
-    send: () => null, receipt: () => 'unknown', log: () => {}, print: () => {},
+    send: () => { sends++; return null; }, receipt: () => 'unknown',
+    log: (_category, _event, data) => { ticks.push(data); }, print: line => { output.push(line); },
   };
   const prev = process.env.ELANOUS_GRAPH_DIR;
   process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
@@ -885,10 +890,19 @@ test('graph stages fail the node on a send failure or a failed vault copy instea
     expect((await main(['compose', '--json'], { ...base, vaultRoot: vault })).vaultFatal).toBe(false);
     expect(readFileSync(join(vault, '00. Inbox', 'Daily Review', '2026-10-05.md'), 'utf8')).toBe(collected.markdown);
     await expect(main(['deliver', '--json'], base)).rejects.toThrow('발송 실패');
-    const disabled = await main(['deliver', '--json'], { ...base, sendEnabled: false });
-    expect(disabled.sendError).toBeNull();
-    expect(disabled.status).toBe('degraded');
-    expect(disabled.deliveryLine).toContain('send-disabled');
+    expect(ticks.at(-1)).toMatchObject({ status: 'degraded', deliveryState: 'unknown', sent: false, deliveryLine: expect.stringContaining('deliver degraded') });
+    expect(JSON.parse(output.at(-1)!)).toMatchObject({ status: 'degraded', deliveryState: 'unknown', sent: false });
+    await expect(main(['deliver', '--json'], { ...base, sendEnabled: false })).rejects.toThrow('발송 실패 · 발송 비활성');
+    expect(ticks.at(-1)).toMatchObject({ status: 'degraded', deliveryState: 'send-disabled', sent: false,
+      deliveryLine: expect.stringContaining('deliver degraded · target=unknown · send-disabled · sent=false') });
+    expect(JSON.parse(output.at(-1)!)).toMatchObject({ status: 'degraded', deliveryState: 'send-disabled', sent: false,
+      deliveryLine: expect.stringContaining('send-disabled') });
+    await expect(main(['deliver', '--json'], { ...base, target: { chatId: NaN, botToken: 'test-token' } })).rejects.toThrow('발송 실패 · 수신자 미설정');
+    expect(ticks.at(-1)).toMatchObject({ status: 'degraded', deliveryState: 'no-recipient', sent: false,
+      deliveryLine: expect.stringContaining('deliver degraded · target=unknown · no-recipient · sent=false') });
+    expect(JSON.parse(output.at(-1)!)).toMatchObject({ status: 'degraded', deliveryState: 'no-recipient', sent: false,
+      sendError: '수신자 미설정', deliveryLine: expect.stringContaining('no-recipient') });
+    expect(sends).toBe(1);
   } finally {
     if (prev === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = prev;
     rmSync(root, { recursive: true, force: true });

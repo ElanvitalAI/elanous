@@ -7,6 +7,8 @@ import { debug } from '../../debug/log.js';
 import { defaultGraphsDir, loadGraphTemplatesFrom } from '../../self-implement/graph-templates.js';
 import { loadGraphTemplates } from '../../self-implement/graph-yaml.js';
 import { validateGraphYaml } from './graph-kinds.js';
+import { parseWizardSteps, readWizardSteps, withWizardSteps } from '../../graph-wizard/saved-steps.js';
+import type { WizardNodeStep } from '../../graph-wizard/steps.js';
 import { jsonResponse } from './json-response.js';
 
 /** Declared graph ids only. A user string is never joined onto a filesystem path. */
@@ -109,7 +111,12 @@ function detailOf(id: string, source: 'core' | 'mine', editable: boolean, dir: s
     editable,
     entry_node: template.entryNode,
     terminal_nodes: template.terminalNodes,
-    nodes: template.nodes.map(({ nodeId, kind, recipe, maxVisits }) => ({ node_id: nodeId, kind, recipe, max_visits: maxVisits })),
+    // GRAPH-GROUPS — a node's `group:` tag (when the loader carries it) rides along so the PWA can box/fold units.
+    nodes: template.nodes.map((node) => {
+      const { nodeId, kind, recipe, maxVisits } = node;
+      const group = (node as { group?: unknown }).group;
+      return { node_id: nodeId, kind, recipe, max_visits: maxVisits, ...(typeof group === 'string' && group.trim() ? { group: group.trim() } : {}) };
+    }),
     edges: spec.edges.map(({ from, to, on, map }) => ({
       from,
       ...(to === undefined ? {} : { to }),
@@ -178,7 +185,8 @@ export function handleGraphsGet(pathname: string, dir = defaultGraphsDir(), deps
     const coreHit = core.ok ? indexByDeclaredId(coreDir).get(id) : undefined;
     const hit = mineHit ?? coreHit;
     if (!hit) return jsonResponse({ error: 'not-found', id }, 404);
-    return jsonResponse({ id, source: mineHit ? 'mine' : 'core', editable: Boolean(mineHit), yaml: hit.text });
+    const steps = mineHit ? readWizardSteps(mineDir, id, hit.text) : null;
+    return jsonResponse({ id, source: mineHit ? 'mine' : 'core', editable: Boolean(mineHit), yaml: hit.text, ...(steps ? { steps } : {}) });
   }
 
   const match = /^\/v1\/graphs\/([^/]+)$/.exec(pathname);
@@ -209,17 +217,22 @@ export async function handleGraphsPut(pathname: string, req: Request, deps: Grap
   const mineOwns = indexByDeclaredId(mineDir).has(id);
   if (coreOwns && !mineOwns) return jsonResponse({ error: 'core-read-only', id }, 403);
   if (!mineOwns) return jsonResponse({ error: 'not-found', id }, 404);
-  let body: { yaml?: unknown };
-  try { body = await req.json() as { yaml?: unknown }; }
+  let body: { yaml?: unknown; steps?: unknown };
+  try { body = await req.json() as { yaml?: unknown; steps?: unknown }; }
   catch { return jsonResponse({ error: 'bad_request', reason: 'json body required' }, 400); }
   if (typeof body?.yaml !== 'string') return jsonResponse({ error: 'bad_request', reason: 'yaml string required' }, 400);
   const rejected = rejectGraphYaml(body.yaml, id);
   if (rejected) return rejected;
+  const steps = stepsOf(body.steps, body.yaml);
+  if (steps instanceof Response) return steps;
   const existing = indexByDeclaredId(mineDir).get(id)!;
   // Writes go only to <mine>/<id>.yaml; a hand-placed file under another name is not edited over HTTP.
   if (existing.file !== `${id}.yaml`) return jsonResponse({ error: 'file-name-mismatch', id, file: existing.file }, 409);
-  const { version, previous } = writeWithVersion(mineDir, id, existing, body.yaml);
-  debug.log('nexus.graphs', 'saved', { id, version, previous });
+  let written: { version: string; previous: string };
+  try { written = withWizardSteps(mineDir, id, steps, () => writeWithVersion(mineDir, id, existing, body.yaml as string)); }
+  catch (error) { return saveFailed(id, error); }
+  const { version, previous } = written;
+  debug.log('nexus.graphs', 'saved', { id, version, previous, steps: steps ? Object.keys(steps).length : 0 });
   return jsonResponse({ id, source: 'mine', editable: true, saved: true, version, previous });
 }
 
@@ -331,10 +344,27 @@ export async function handleGraphsRevert(pathname: string, req: Request, deps: G
   return jsonResponse({ id, source: 'mine', editable: true, reverted: true, version, previous, restoredFrom: target });
 }
 
+/** GRAPH-WIZARD-SAVE-RECIPES — optional `steps` on save (the wizard's node → library step map). Absent = keep
+ *  whatever sidecar the graph has; present = validated against the step library and stored as a sidecar. The
+ *  run builds commands from it server-side (src/graph-wizard/saved-steps.ts) — no client command text is kept. */
+function stepsOf(raw: unknown, yaml: string): Record<string, WizardNodeStep> | null | Response {
+  // Only an absent field means «keep what is there»; an explicit null or any other non-object is a bad request.
+  if (raw === undefined) return null;
+  const parsed = parseWizardSteps(raw, yaml);
+  if (!parsed.ok) return jsonResponse({ error: 'bad_request', reason: parsed.reason }, 400);
+  return parsed.steps;
+}
+
+function saveFailed(id: string, error: unknown): Response {
+  const reason = error instanceof Error ? error.message.slice(0, 200) : String(error);
+  debug.log('nexus.graphs', 'save-failed', { id, reason }, { level: 'warn' });
+  return jsonResponse({ error: 'save-failed', id, reason }, 500);
+}
+
 /** POST /v1/graphs {id, yaml} — a brand-new «mine» graph (blank canvas → save). Records version v1. */
 export async function handleGraphsCreate(req: Request, deps: GraphsApiDeps = {}): Promise<Response> {
-  let body: { id?: unknown; yaml?: unknown };
-  try { body = await req.json() as { id?: unknown; yaml?: unknown }; }
+  let body: { id?: unknown; yaml?: unknown; steps?: unknown };
+  try { body = await req.json() as { id?: unknown; yaml?: unknown; steps?: unknown }; }
   catch { return jsonResponse({ error: 'bad_request', reason: 'json body required' }, 400); }
   const id = typeof body?.id === 'string' ? resolveId(body.id) : null;
   if (!id) return jsonResponse({ error: 'bad_request', reason: 'id must match [a-z0-9-]' }, 400);
@@ -347,10 +377,18 @@ export async function handleGraphsCreate(req: Request, deps: GraphsApiDeps = {})
   if (indexByDeclaredId(mineDir).has(id) || existsSync(join(mineDir, `${id}.yaml`))) return jsonResponse({ error: 'exists', id }, 409);
   const rejected = rejectGraphYaml(body.yaml, id);
   if (rejected) return rejected;
-  mkdirSync(mineDir, { recursive: true });
-  writeFileSync(join(mineDir, `${id}.yaml`), body.yaml, { flag: 'wx' });
-  const version = recordVersion(mineDir, id, body.yaml);
-  debug.log('nexus.graphs', 'saved', { id, version, created: true });
+  const steps = stepsOf(body.steps, body.yaml);
+  if (steps instanceof Response) return steps;
+  let version: string;
+  try {
+    version = withWizardSteps(mineDir, id, steps, () => {
+      mkdirSync(mineDir, { recursive: true });
+      writeFileSync(join(mineDir, `${id}.yaml`), body.yaml as string, { flag: 'wx' });
+      try { return recordVersion(mineDir, id, body.yaml as string); }
+      catch (error) { rmSync(join(mineDir, `${id}.yaml`), { force: true }); throw error; }
+    });
+  } catch (error) { return saveFailed(id, error); }
+  debug.log('nexus.graphs', 'saved', { id, version, created: true, steps: steps ? Object.keys(steps).length : 0 });
   return jsonResponse({ id, source: 'mine', editable: true, saved: true, version, previous: null }, 201);
 }
 

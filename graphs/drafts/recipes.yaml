@@ -4,8 +4,8 @@ classify:
     const mode=ctx.input?.mode ?? "shadow";
     if (mode !== "shadow" && mode !== "live") throw new Error("draft cleanup mode must be shadow or live");
     const repo=process.env.ELANOUS_GRAPH_DIR+"/../..";
-    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json"], {cwd:repo,stdout:"pipe",stderr:"pipe"});
-    if (run.exitCode !== 0) throw new Error(new TextDecoder().decode(run.stderr));
+    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,stdout:"pipe",stderr:"pipe"});
+    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout); let why=""; try { why=JSON.parse(out).error ?? ""; } catch {} throw new Error(new TextDecoder().decode(run.stderr).trim() || why || "draft sweep exit " + run.exitCode); }
     const result=JSON.parse(new TextDecoder().decode(run.stdout));
     if (!result.complete || result.apply !== false) throw new Error(result.error ?? "draft sweep classification must be shadow and complete");
     console.log(JSON.stringify({outcome:mode,counts:result.counts,entries:result.entries}));'
@@ -15,8 +15,8 @@ apply:
     bun -e 'const ctx=await Bun.file(process.env.ELANOUS_GRAPH_CONTEXT).json();
     if (ctx.input?.mode !== "live" || ctx.outputs?.classify?.outcome !== "live") throw new Error("draft cleanup apply requires live mode and completed classification");
     const repo=process.env.ELANOUS_GRAPH_DIR+"/../..";
-    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--apply"], {cwd:repo,stdout:"pipe",stderr:"pipe"});
-    if (run.exitCode !== 0) throw new Error(new TextDecoder().decode(run.stderr));
+    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--apply"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,stdout:"pipe",stderr:"pipe"});
+    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout); let why=""; try { why=JSON.parse(out).error ?? ""; } catch {} throw new Error(new TextDecoder().decode(run.stderr).trim() || why || "draft sweep exit " + run.exitCode); }
     const result=JSON.parse(new TextDecoder().decode(run.stdout));
     if (!result.complete || result.apply !== true) throw new Error(result.error ?? "draft sweep application must be live and complete");
     console.log(JSON.stringify({outcome:"ok",counts:result.counts,entries:result.entries}));'

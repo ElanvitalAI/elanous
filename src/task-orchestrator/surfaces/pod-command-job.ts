@@ -13,6 +13,7 @@ import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
+import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { podHostDirsInit, podInstallSlotsVolume } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
@@ -136,6 +137,19 @@ for i in $(seq 1 60); do
 done
 echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1`;
 
+/** Export the command's log store into the existing outbox return channel without changing the command exit status. */
+const COMMAND_LOG_EXPORT = `if mkdir -p "$HOME/outbox/pod-logs" && elanous --test="$HOME/.elanous-test" logs --instance prod --since 12h --limit 20000 --json --json-data > "$HOME/outbox/pod-logs/logs.jsonl"; then
+  logs_size=$(( $(wc -c < "$HOME/outbox/pod-logs/logs.jsonl") ))
+  if [ "$logs_size" -gt 5242880 ]; then
+    tail -c 5242880 "$HOME/outbox/pod-logs/logs.jsonl" | tail -n +2 > "$HOME/outbox/pod-logs/logs.jsonl.tail" && mv -f "$HOME/outbox/pod-logs/logs.jsonl.tail" "$HOME/outbox/pod-logs/logs.jsonl"
+    printf 'ELANOUS_POD_LOGS_TRUNCATED %s %s\\n' "$logs_size" "$(( $(wc -c < "$HOME/outbox/pod-logs/logs.jsonl") ))"
+  fi
+else
+  logs_rc=$?
+  rm -f "$HOME/outbox/pod-logs/logs.jsonl"
+  printf 'ELANOUS_POD_LOGS_UNAVAILABLE export-exit-%s\\n' "$logs_rc"
+fi`;
+
 /** 기존 Job 과 같은 `~/outbox` 조각 형식(`ELANOUS_POD_ARTIFACT`). 원장 회수는 하지 않는다. */
 const ARTIFACT_EMIT = `set -o pipefail
 artifact_bytes=0
@@ -172,6 +186,8 @@ export interface PodCommandJobInput {
   repoUrl: string;
   command: readonly string[];
   skills: readonly string[];
+  /** pod run opt-in: return this command's local log store with its outbox artifacts. */
+  returnLogs?: boolean;
   llm?: 'grok';
   /** 저장소를 clone 한다 — 비공개 저장소라 GitHub 토큰이 Secret 으로 간다(명시 opt-in). 기본은 clone 없이 `~/work` 에서 이미지의 `elanous` 로 돈다. */
   clone?: boolean;
@@ -222,6 +238,8 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     `set -- ${quotedArgs}`,
     '"$@"',
     'rc=$?',
+    // A command may not end in LF; keep artifact markers on their own line for the existing parser.
+    ...(o.returnLogs ? ["printf '\\n'", COMMAND_LOG_EXPORT] : []),
     ARTIFACT_EMIT,
     'exit $rc',
   ].join('\n');
@@ -325,6 +343,8 @@ export interface PodCommandResult {
 
 export interface RunPodCommandOptions {
   command: readonly string[];
+  /** pod run opt-in; other runPodCommand callers keep their existing Job script. */
+  returnLogs?: boolean;
   pool?: string;
   skills?: readonly string[];
   llm?: 'grok';
@@ -357,6 +377,8 @@ export interface RunPodCommandOptions {
   readSkillEnv?: (skills: readonly string[]) => Record<string, string>;
   grokCredentials?: () => { grokAuth?: string; grokApiKey?: string; ghToken: string };
   artifactsRoot?: string;
+  /** Test seam for the launching instance's log store. */
+  logStore?: LogStore | null;
   sleep?: (ms: number) => Promise<void>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   env?: NodeJS.ProcessEnv;
@@ -454,7 +476,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
   const kubectl: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
   const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', '-l', own, '--ignore-not-found']); };
-  const artifactsDir = `${options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`}/${name}`;
+  const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
+  const artifactsDir = `${artifactRoot}/${name}`;
   try {
     if (!context && !options.kubectl) throw new Error('pod command: kubectl context 를 확인할 수 없다');
     let grokAuth: string | undefined;
@@ -499,7 +522,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     const manifest = podCommandJobManifest({
       name, namespace, launch, image: imageRef ?? image,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
-      repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
+      repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
       ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
@@ -519,19 +542,31 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     const logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
     const logsFailed = logsResult.status !== 0;
     const logs = logsFailed ? '' : logsResult.stdout;
-    const artifactDir = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
+    const artifactDir = artifactRoot;
     let artifacts: PodArtifactCollection;
     if (logsFailed) {
       const reason = logsResult.stderr.trim() || `kubectl logs exit ${logsResult.status}`;
       artifacts = { files: null, names: [], error: reason };
       log('pod.command', 'artifact-collect-failed', { job: name, reason });
     } else {
+      const store = options.returnLogs ? (options.logStore === undefined ? getDefaultLogStore() : options.logStore) : null;
       collectPodArtifacts(logs, {
-        dir: artifactDir,
-        job: name,
-        log: (c, e, d) => log(c, e, d),
+        dir: artifactDir, job: name, log: (c, e, d) => log(c, e, d),
+        ...(options.returnLogs ? { logStore: store } : {}),
       });
       const names = artifactNames(logs);
+      // A plain command need not write JSONL. Make its child output queryable without changing the store schema.
+      if (options.returnLogs && store) {
+        try {
+          const output = logs.split(/\r?\n/).filter((line) => !line.startsWith('ELANOUS_POD_ARTIFACT ')).join('\n').trim();
+          if (output) store.insertPodBatch(name, [{ line: -1, surface: 'pod', rec: {
+            ts: new Date().toISOString(), category: 'pod.command', event: 'child-output', level: 'info',
+            data: { job: name, output: tailBytes(output, options.childLogMaxBytes ?? podChildLogMaxBytes()), origin: 'pod', podJob: name },
+          } }]);
+        } catch (error) {
+          log('pod.command', 'child-output-import-failed', { job: name, reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
       artifacts = { files: names.length, names, error: null };
     }
     // 표지가 없어도 알리는 경로는 실제로 존재해야 한다. 자식 로그 전문은 child.log (상한 넘으면 끝부분).

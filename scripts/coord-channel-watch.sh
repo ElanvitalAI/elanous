@@ -240,15 +240,42 @@ lsof_fd1() {
   return 0
 }
 
+# 🐧 lsof 가 없는 리눅스(게이트 Pod 이미지 · 0.2.20 컷 실측)에서는 /proc/<pid>/fd/1 을 읽어
+#   lsof -Ftn 과 «같은 모양»(t<type>\nn<name>)으로 낸다 — 아래 판정 표를 그대로 쓴다.
+#   ⛔ 못 읽으면(죽은 pid·권한) 1 을 돌려 「모름」으로 끝낸다.
+proc_fd1() {
+  local pid="$1" target
+  target=$(readlink "/proc/$pid/fd/1" 2>/dev/null) || return 1
+  [ -n "$target" ] || return 1
+  case "$target" in
+    pipe:*)   printf 'tPIPE\nn%s\n' "$target" ;;
+    socket:*) printf 'tunix\nn%s\n' "$target" ;;
+    *)
+      if [ -c "$target" ]; then printf 'tCHR\nn%s\n' "$target"
+      elif [ -f "$target" ]; then printf 'tREG\nn%s\n' "$target"
+      else printf 'tunknown\nn%s\n' "$target"
+      fi ;;
+  esac
+  return 0
+}
+
 delivery_of() {
   local pid="$1" out t n
   case "$pid" in
     ''|*[!0-9]*) printf '⚠️ «못 쟀다»(감시자 pid 를 «증명하지 못했다») — 「정상」이 아니라 «모름»이다'; return 0 ;;
   esac
-  command -v lsof >/dev/null 2>&1 || { printf '⚠️ «못 쟀다»(lsof 없음) — 「정상」이 아니라 «모름»이다'; return 0; }
-  if ! out=$(lsof_fd1 "$pid"); then
-    printf '⚠️ «못 쟀다»(lsof 가 %s틱 안에 안 끝나 죽였다) — 「정상」이 아니라 «모름»이다' "$LSOF_WAIT_TICKS"
-    return 0
+  if command -v lsof >/dev/null 2>&1; then
+    if ! out=$(lsof_fd1 "$pid"); then
+      printf '⚠️ «못 쟀다»(lsof 가 %s틱 안에 안 끝나 죽였다) — 「정상」이 아니라 «모름»이다' "$LSOF_WAIT_TICKS"
+      return 0
+    fi
+  elif command -v readlink >/dev/null 2>&1 && [ -d /proc/self/fd ]; then
+    if ! out=$(proc_fd1 "$pid"); then
+      printf '⚠️ «못 쟀다»(/proc/%s/fd/1 을 못 읽었다 · lsof 없음) — 「정상」이 아니라 «모름»이다' "$pid"
+      return 0
+    fi
+  else
+    printf '⚠️ «못 쟀다»(lsof 없음) — 「정상」이 아니라 «모름»이다'; return 0
   fi
   t=$(printf '%s\n' "$out" | sed -n 's/^t//p' | head -1)
   n=$(printf '%s\n' "$out" | sed -n 's/^n//p' | head -1)

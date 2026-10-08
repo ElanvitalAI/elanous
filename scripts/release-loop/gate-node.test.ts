@@ -1063,7 +1063,9 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
       [sortedFiles[0], sortedFiles[3], sortedFiles[6], sortedFiles[9]],
       [sortedFiles[1], sortedFiles[4], sortedFiles[7]], [sortedFiles[2], sortedFiles[5], sortedFiles[8]],
     ]);
-    expect(invoked[0]!.command[2]).toContain('{ bun install && (cd apps/pwa && bun install); } >> "$O/install.log" 2>&1; irc=$?');
+    // GATE-IMAGE-DEPS (#24955): baked deps are linked first; only a miss installs, still into install.log with its rc.
+    expect(invoked[0]!.command[2]).toContain('gate_deps_link "$t" >> "$O/install.log" 2>&1');
+    expect(invoked[0]!.command[2]).toContain('(cd "$t" && bun install) >> "$O/install.log" 2>&1; irc=$?');
     expect(invoked[0]!.command[2]).toContain('> "$O/part-$i.log" 2>&1');
     const logs = join(instanceRoot, 'release/1.0.1/gate-logs/cut');
     for (let i = 0; i < 3; i++) {
@@ -1072,9 +1074,9 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     }
     expect(observed.filter((item) => item.category === 'release-loop.gate' && item.event === 'pod-shard')).toHaveLength(3);
     expect(observed.filter((item) => item.event === 'pod-shard').map((item) => item.data)).toEqual([
-      { shard: 0, files: sortedFiles.filter((_, index) => index % 3 === 0), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
-      { shard: 1, files: sortedFiles.filter((_, index) => index % 3 === 1), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
-      { shard: 2, files: sortedFiles.filter((_, index) => index % 3 === 2), durationMs: expect.any(Number), rc: 1, attempt: 1, installSeconds: null, deadlineSeconds: 1200, parts: 1 },
+      { shard: 0, files: sortedFiles.filter((_, index) => index % 3 === 0), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, gateDeps: {}, deadlineSeconds: 1200, parts: 1 },
+      { shard: 1, files: sortedFiles.filter((_, index) => index % 3 === 1), durationMs: expect.any(Number), rc: 0, attempt: 1, installSeconds: null, gateDeps: {}, deadlineSeconds: 1200, parts: 1 },
+      { shard: 2, files: sortedFiles.filter((_, index) => index % 3 === 2), durationMs: expect.any(Number), rc: 1, attempt: 1, installSeconds: null, gateDeps: {}, deadlineSeconds: 1200, parts: 1 },
     ]);
     expect(calls.filter((call) => call.startsWith('sweep '))).toHaveLength(0);
     // GATE-LIVE-OBS: the release ledger (here the explicit test ledger) holds one finished row per shard.
@@ -1113,7 +1115,7 @@ test('Pod sweep opts into the Bun cache and records the first install timing', a
     expect(uncached.rc).toBe(0);
     expect(invoked[0]!.bunCache).toBeUndefined();
     expect(invoked[0]!.command[2]).not.toContain('BUN_INSTALL_CACHE_DIR');
-    expect(invoked[0]!.command[2]).toContain('{ bun install && (cd apps/pwa && bun install); } >> "$O/install.log"');
+    expect(invoked[0]!.command[2]).toContain('(cd "$t" && bun install) >> "$O/install.log"');
     process.env.POD_BUN_CACHE_HOST_PATH = '  /srv/bun-cache  ';
     const cached = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
     expect(cached).toEqual(uncached);

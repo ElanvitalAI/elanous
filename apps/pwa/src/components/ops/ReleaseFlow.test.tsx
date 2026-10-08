@@ -103,14 +103,14 @@ describe('GATE-LIVE-OBS gate shard table', () => {
 
   test('the current gate chip shows the shard tally instead of the summary-parsed n/m', () => {
     const html = flow(gated);
-    expect(html).toContain('조각 5 · 잘림 1 · 대기 2 · 돌기 1 · 통과 1');
+    expect(html).toContain('조각 5 · 잘림 1 · 대기 2 · 돌기 1 · 끝 1');
     expect(html).not.toContain('샤드 7/24');
   });
   test('gate detail lists every shard with a state word, worst first, plus wait reasons and the estimate', () => {
     const html = detail(gated);
     const states = [...(html.match(/data-shard-state="([a-z]+)"/g) ?? [])];
     expect(states).toEqual(['timeout', 'pending', 'pending', 'running', 'done'].map((s) => `data-shard-state="${s}"`));
-    for (const word of ['잘림', '대기', '돌기', '통과']) expect(html).toContain(word);
+    for (const word of ['잘림', '대기', '돌기', '끝']) expect(html).toContain(word);
     expect(html).toContain('대기 2</span> — CPU 부족 31.2/32');
     expect(html).toContain('남은 약 1시간 15분');
     expect(html).not.toContain('갱신 없음');
@@ -130,4 +130,16 @@ test('GATE-LIVE-OBS eta text: overrun beats the plan estimate, and 0 minutes wit
   expect(etaText(0, { open: 2 })).toBe('곧 끝남(계획상)');
   expect(etaText(0)).toBe('남은 조각 없음');
   expect(etaText(75)).toBe('남은 약 1시간 15분');
+});
+
+test('GATE-LIVE-OBS: a done shard with rc 1 reads «끝 · 실패 보고», not a green pass', async () => {
+  const { GateShardsPanel, shardTally } = await import('./GateShards');
+  const gate = { version: '0.2.20', updatedAt: '2026-10-08T00:00:00Z',
+    shards: [{ id: 'pod-20', state: 'done' as const, rc: 1 }, { id: 'pod-21', state: 'done' as const, rc: 0 }],
+    summary: { total: 2, counts: { pending: 0, running: 0, done: 2, retry: 0, timeout: 0, failed: 0 }, waitReasons: [], etaMin: 0, staleMin: 0 } };
+  expect(shardTally(gate)).toBe('조각 2 · 끝 2(실패 보고 1)');
+  const html = renderToStaticMarkup(<GateShardsPanel gate={gate} />);
+  expect(html).toContain('! 끝 · 실패 보고');
+  expect(html.indexOf('pod-20')).toBeLessThan(html.indexOf('pod-21'));
+  expect(html).not.toContain('통과');
 });

@@ -1,0 +1,43 @@
+{"timestamp": "2026-10-07T22:17:46.390Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "run-origin", "data": {"instance": "prod", "elanousVersion": "0.2.20-dev.0", "substrate": "pod"}}
+{"timestamp": "2026-10-07T22:17:46.636Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-run-contract-resolved", "data": {"graphId": "self-implement", "graphVersion": "1", "actualSubstrate": "pod"}}
+{"timestamp": "2026-10-07T22:17:46.637Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "start", "data": {"feature": "대상 경로: apps/pwa/src/components/ops/ReleaseStrip.tsx — 릴리스 줄 런 표시\n(goal body trimmed for fixture)"}}
+{"timestamp": "2026-10-07T22:17:46.678Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "role", "data": {"entry": "external-verbatim"}}
+{"timestamp": "2026-10-07T22:17:52.921Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "worktree", "data": {}}
+{"timestamp": "2026-10-07T22:17:53.719Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "implement", "round": 0, "visits": 1, "maxVisits": 12}}
+{"timestamp": "2026-10-07T22:17:53.719Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "implement", "round": 0}}
+{"timestamp": "2026-10-07T22:26:06.356Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "off-diff-evidence", "data": {"round": 0, "requiredEvidence": 3, "coveredEvidence": 0}}
+{"timestamp": "2026-10-07T22:26:06.356Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "implemented", "data": {"ok": true, "round": 0}}
+{"timestamp": "2026-10-07T22:26:06.403Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "gate", "round": 0, "visits": 1, "maxVisits": 11}}
+{"timestamp": "2026-10-07T22:26:06.404Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "gate", "round": 0}}
+{"timestamp": "2026-10-07T22:27:35.193Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "gated", "data": {"passed": true, "round": 0}}
+{"timestamp": "2026-10-07T22:27:35.266Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "review", "round": 0, "visits": 1, "maxVisits": 11}}
+{"timestamp": "2026-10-07T22:27:35.266Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "review", "round": 0}}
+{"timestamp": "2026-10-07T22:27:57.703Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "reviewed", "data": {"verdict": "fail", "mustFix": 3, "shouldFix": 1, "round": 0}}
+{"timestamp": "2026-10-07T22:28:03.117Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "review-reflect", "data": {"round": 0, "acceptedCount": 3, "rejectedCount": 0}}
+{"timestamp": "2026-10-07T22:28:03.120Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "rework", "round": 1, "visits": 1, "maxVisits": 10}}
+{"timestamp": "2026-10-07T22:28:03.121Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "rework", "round": 1}}
+{"timestamp": "2026-10-07T22:28:17.572Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "rework-budget", "data": {"round": 1, "verdict": "EXTEND"}}
+{"timestamp": "2026-10-07T22:28:17.574Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "implement", "round": 1, "visits": 2, "maxVisits": 12}}
+{"timestamp": "2026-10-07T22:28:17.575Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "implement", "round": 1}}
+{"timestamp": "2026-10-07T22:37:59.426Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "off-diff-evidence", "data": {"round": 1, "requiredEvidence": 3, "coveredEvidence": 3}}
+{"timestamp": "2026-10-07T22:37:59.448Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "implemented", "data": {"ok": true, "round": 1}}
+{"timestamp": "2026-10-07T22:37:59.646Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "gate", "round": 1, "visits": 2, "maxVisits": 11}}
+{"timestamp": "2026-10-07T22:37:59.658Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "gate", "round": 1}}
+{"timestamp": "2026-10-07T22:42:37.186Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "gated", "data": {"passed": true, "round": 1}}
+{"timestamp": "2026-10-07T22:42:37.414Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "review", "round": 1, "visits": 2, "maxVisits": 11}}
+{"timestamp": "2026-10-07T22:42:37.430Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "review", "round": 1}}
+{"timestamp": "2026-10-07T22:44:07.045Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "reviewed", "data": {"verdict": "fail", "mustFix": 2, "shouldFix": 1, "round": 1}}
+{"timestamp": "2026-10-07T22:44:13.789Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "review-reflect", "data": {"round": 1, "acceptedCount": 0, "rejectedCount": 2}}
+{"timestamp": "2026-10-07T22:44:13.846Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "review-reflect", "data": {"round": 1, "converged": true}}
+{"timestamp": "2026-10-07T22:44:13.897Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "main-sync", "round": 1, "visits": 1, "maxVisits": 2}}
+{"timestamp": "2026-10-07T22:44:13.897Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "main-sync", "round": 1}}
+{"timestamp": "2026-10-07T22:44:20.000Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pre-pr-sync", "data": {"status": "merged"}}
+{"timestamp": "2026-10-07T22:44:20.050Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "regate", "round": 1, "visits": 1, "maxVisits": 2}}
+{"timestamp": "2026-10-07T22:44:20.052Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "regate", "round": 1}}
+{"timestamp": "2026-10-07T22:48:57.761Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "gate.postsync", "data": {"passed": true}}
+{"timestamp": "2026-10-07T22:48:57.820Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "merge-decision", "data": {"decision": "auto", "autoMerge": true}}
+{"timestamp": "2026-10-07T22:48:58.860Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "graph-visit-budget", "data": {"graphId": "self-implement", "node": "open-pr", "round": 1, "visits": 1, "maxVisits": 2}}
+{"timestamp": "2026-10-07T22:48:58.860Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pipeline-node-entry", "data": {"graphId": "self-implement", "node": "open-pr", "round": 1}}
+{"timestamp": "2026-10-07T22:49:06.646Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "pr-opened", "data": {"number": 24937, "autoMerge": true}}
+{"timestamp": "2026-10-07T22:49:11.097Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "merge-ready", "data": {"number": 24937}}
+{"timestamp": "2026-10-07T22:49:11.552Z", "runId": "run-c0a47484-84ec-4737-9754-e68f8a7f266e", "event": "run-status", "data": {"stage": "merge-ready", "node": "open-pr", "runStatus": "completed"}}

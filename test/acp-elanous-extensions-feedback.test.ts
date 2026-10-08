@@ -32,9 +32,11 @@ const feedbackEnvelopeVectorsPath = join(import.meta.dir, '..', 'elanous-feedbac
 const canonicalFeedbackEnvelopeVectorsPath = realpathSync(
   join(import.meta.dir, '..', 'elanous-feedback-envelope-vectors.json'),
 );
-const feedbackEnvelopeVectors = JSON.parse(
+// The canonical file is `{ kinds, vectors }` (shared with PWA/Android/iOS
+// suites) — read the `vectors` array, not the top-level object.
+const feedbackEnvelopeVectors = (JSON.parse(
   readFileSync(feedbackEnvelopeVectorsPath, 'utf8'),
-) as FeedbackEnvelopeVector[];
+) as { vectors: FeedbackEnvelopeVector[] }).vectors;
 
 function assertCanonicalFeedbackEnvelopeVectorsPath(path: string): void {
   expect(realpathSync(path)).toBe(canonicalFeedbackEnvelopeVectorsPath);

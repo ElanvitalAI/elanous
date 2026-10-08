@@ -16,6 +16,12 @@
 // D1). It holds a lazy singleton per elanous process: first call
 // spawns Chrome, subsequent calls reuse; the client lives until the
 // process exits or `closeBrowserRuntime()` is invoked.
+// BrowserRead remains read-only. An explicitly requested BrowserNavigate
+// input asks a person through the HITL confirmation channels only and fails
+// closed without approval. The shell-command approver is never consulted: an
+// unattended surface may auto-allow shell patterns, which must not type into a page.
+// Click still runs through performBrowserAction in src/harness/browser-act.ts,
+// where armed, reversibility and host-boundary checks precede CdpClient.click.
 
 import type { CdpClient } from '../browser-cdp/client.js';
 import { createCdpClient, CdpUnavailable } from '../browser-cdp/client.js';
@@ -24,6 +30,9 @@ import { defaultControlSignalBus } from '../input/control-signal.js';
 import type { LLMToolSpec } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
+import { decideTypeAction } from '../harness/browser-act-type.js';
+import { requestConfirmation } from '../hitl/confirm.js';
+import type { TypeTarget } from '../harness/bot-type-request.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 // ─── Dependency injection ───────────────────────────────────────
@@ -116,6 +125,8 @@ export async function closeBrowserRuntime(): Promise<void> {
 export interface BrowserNavigateArgs {
   /** Absolute URL. Scheme required. */
   url: string;
+  /** Input requires a selected target and explicit approval; no form submission. */
+  input?: { selector: string; text: string };
   /** When true, block until Page.loadEventFired (or timeoutMs).
    *  Default true. */
   waitForLoad?: boolean;
@@ -147,6 +158,16 @@ export function buildBrowserNavigateTool(): LLMToolSpec {
           type: 'string',
           description: 'Absolute URL including scheme (https://...). about:blank also accepted.',
         },
+        input: {
+          type: 'object',
+          description: 'Type into a selected page field only after explicit approval. Never submits a form.',
+          properties: {
+            selector: { type: 'string', description: 'CSS selector of the input field.' },
+            text: { type: 'string', description: 'Text without newlines (at most 200 characters).' },
+          },
+          required: ['selector', 'text'],
+          additionalProperties: false,
+        },
         waitForLoad: {
           type: 'boolean',
           description: 'Wait for Page.loadEventFired before returning. Default true.',
@@ -165,9 +186,33 @@ export function buildBrowserNavigateTool(): LLMToolSpec {
 const DEFAULT_NAV_TIMEOUT_MS = 10_000;
 const MAX_NAV_TIMEOUT_MS = 60_000;
 
-export async function dispatchBrowserNavigate(args: BrowserNavigateArgs): Promise<BrowserNavigateResult> {
+export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: ToolRuntimeContext): Promise<BrowserNavigateResult> {
   ensureBrowserControlSignalConsumer();
   const url = String(args.url ?? '').trim();
+  const input = args.input;
+  // Input is never an implicit side effect of navigation. Approval is scoped
+  // to this URL, selector and text, before connecting or dispatching CDP.
+  if (input !== undefined) {
+    if (typeof input.selector !== 'string' || !input.selector.trim()
+      || typeof input.text !== 'string' || !input.text.trim()
+      || /[\r\n]/.test(input.text) || input.text.length > 200) {
+      return { output: '# BrowserNavigate: invalid input', finalUrl: '', title: '', loadMs: 0 };
+    }
+    let httpUrl = false;
+    try { httpUrl = ['http:', 'https:'].includes(new URL(url).protocol); } catch { /* invalid URL */ }
+    if (!httpUrl) return { output: '# BrowserNavigate: invalid input URL', finalUrl: '', title: '', loadMs: 0 };
+    let approved = false;
+    try {
+      // Human confirmation only — `ctx.approver` is the shell-command approver (TC review of #24990).
+      approved = (await requestConfirmation({
+        prompt: `Browser input on ${url}`,
+        detail: `Selector: ${input.selector}\nText: ${input.text}`,
+        ...(ctx?.confirmChannels ? { channels: ctx.confirmChannels } : {}),
+        onTimeout: () => false,
+      })).answer === true;
+    } catch { /* approval failure is denial */ }
+    if (!approved) return { output: '# BrowserNavigate: input not approved', finalUrl: '', title: '', loadMs: 0 };
+  }
   if (!url) {
     observeBrowserAction({ action: 'navigate', url: '', target: 'url', ok: false, error: 'url is required' });
     return { output: '# BrowserNavigate: error\nurl is required', finalUrl: '', title: '', loadMs: 0 };
@@ -233,6 +278,45 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs): Promis
     timedOut = r.timedOut;
   }
 
+  if (input !== undefined) {
+    try {
+      if (!client.input) throw new Error('CDP input unavailable');
+      const currentUrl = await client.evaluate('document.location.href');
+      if (currentUrl !== new URL(url).href) throw new Error('CDP input refused: page URL changed after approval');
+      const inspected = await client.evaluate(`(() => {
+        const element = document.querySelector(${JSON.stringify(input.selector)});
+        if (!(element instanceof HTMLElement)) return null;
+        return { tag: element.tagName.toLowerCase(),
+          type: element instanceof HTMLInputElement ? element.type : null,
+          name: element.getAttribute('name'), id: element.getAttribute('id'),
+          contentEditable: element.isContentEditable, inForm: !!element.closest('form') };
+      })()`);
+      const candidate = inspected && typeof inspected === 'object' ? inspected as Record<string, unknown> : null;
+      const target: TypeTarget | null = candidate
+        && typeof candidate.tag === 'string'
+        && (candidate.type === null || typeof candidate.type === 'string')
+        && (candidate.name === null || typeof candidate.name === 'string')
+        && (candidate.id === null || typeof candidate.id === 'string')
+        && typeof candidate.contentEditable === 'boolean' && typeof candidate.inForm === 'boolean'
+        ? candidate as TypeTarget : null;
+      const verdict = decideTypeAction({ url, selector: input.selector, text: input.text,
+        // The caller's approval is for this exact URL; it cannot authorize a different host.
+        actionHosts: [new URL(url).hostname], armed: true, target });
+      if (!verdict.allowed) throw new Error(verdict.reason);
+      const focused = await client.evaluate(`(() => {
+        const element = document.querySelector(${JSON.stringify(input.selector)});
+        if (!(element instanceof HTMLElement)) return false;
+        element.focus();
+        return document.activeElement === element;
+      })()`);
+      if (focused !== true) throw new Error('CDP input target could not be focused');
+      await client.input(input.text);
+    } catch (err) {
+      return { output: `# BrowserNavigate: input error\n${err instanceof Error ? err.message : String(err)}`,
+        finalUrl: url, title: '', loadMs: Date.now() - started };
+    }
+  }
+
   const loadMs = Date.now() - started;
 
   // Best-effort metadata. Errors here don't abort the tool.
@@ -255,8 +339,8 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs): Promis
 export const browserNavigateRuntime: ToolRuntime<BrowserNavigateArgs, BrowserNavigateResult> = {
   id: 'browser_navigate',
   spec: buildBrowserNavigateTool(),
-  async run(req, _ctx: ToolRuntimeContext) {
-    return dispatchBrowserNavigate(req);
+  async run(req, ctx: ToolRuntimeContext) {
+    return dispatchBrowserNavigate(req, ctx);
   },
 };
 

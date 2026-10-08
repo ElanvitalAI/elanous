@@ -38,8 +38,12 @@
 #      (파일 이름은 RFC 어휘를 남겨 둔다 — 사람이 찾는 이름과 조인 키가 다를 수 있다.)
 graph_id: self-implement
 version: 1
-entry_node: author
-terminal_nodes: [merge]
+# ⭐ HARNESS-FULL-GRAPH (0.2.21 · 대표 10-08) — 입구부터 회수까지 «여정 전체»가 노드다.
+#   📄 내부 문서 `RFC-harness-full-journey-as-graph-2026-10-08` · 코드 = src/self-dev/graph-journey-nodes.ts
+#   ⛔ 여정 노드(intake … stopped)의 id 는 원장·라이브 그래프 화면의 조인 키다 — 바꾸지 마라.
+#   🔀 분기는 «데이터»다(`on:` 상태 키 ⊕ `map:` 값→노드) — 기본 = 풀세트, 환경(substrate·freeze·queue)이 일부를 건너뛴다.
+entry_node: intake
+terminal_nodes: [cleanup, stopped]
 
 # Runner-provided inputs are declared here so contract-flow can distinguish them from undeclared gaps.
 runner_inputs: [ask_text, goal, worktree, branch, review-intent, head-sha, base-branch]
@@ -61,8 +65,13 @@ runner_inputs: [ask_text, goal, worktree, branch, review-intent, head-sha, base-
 #   🔑 ⇒ ***여기 적은 도구 권한은 「선언」이고 「제한」이 아니다.*** 자식의 실제 권한은 코드가 정한다.
 #   ⛔ 그러니 이 칸을 좁혀 「자식이 그 도구를 못 쓴다」고 읽지 마라 — 지금은 안 그렇다.
 #   🔎 반증: rg -n "readonly contract" src/self-implement/graph-templates.ts   (⇒ 0건이면 여전히 그렇다)
+# 🧩 `group:` = 나중에 `graphs/units/*.yaml` 로 들어 올릴 «한 노드로 부르는 부분 그래프» 단위(대표 10-08).
+#   entry · dispatch · author · dispatch-pod · build · verify · land · recover · end
+#   ⛔ 지금 파서는 이 칸을 «읽지 않는다»(무시) — 단위 호출은 0.2.22(RFC §6). 묶음은 «위치»가 아니라 이 태그로 정한다
+#      (오버레이가 /nodes/<번호> 로 가리켜 노드를 재배열할 수 없다).
 nodes:
   - node_id: author
+    group: author
     kind: agent
     recipe: goal-author
     max_visits: 2
@@ -74,6 +83,7 @@ nodes:
       outputs: [goal_path, goal_id, goal_type, grounding_context]
 
   - node_id: plan
+    group: author
     kind: agent
     recipe: harness-plan-rfc
     max_visits: 2
@@ -85,6 +95,7 @@ nodes:
       outputs: [rfc_path, markdown, arcs, open_questions]
 
   - node_id: decompose
+    group: author
     kind: judge
     recipe: fabric-decompose-adapter
     max_visits: 12
@@ -96,6 +107,7 @@ nodes:
       outputs: [pieces, ordering, depends_on_edges, hot_path_edges, omitted_goal_count]
 
   - node_id: implement
+    group: build
     kind: agent
     recipe: headless-goal-loop        # seams.implement → 자식 PTY
     max_visits: 12
@@ -109,6 +121,7 @@ nodes:
       outputs: [diff, summary, changed-files]
 
   - node_id: gate
+    group: verify
     kind: gate
     recipe: gate-baseline              # 변경 파일 «범위» · 새 회귀만
     max_visits: 11
@@ -122,6 +135,7 @@ nodes:
       outputs: [passed, gate-log, reflect-gate-facts]
 
   - node_id: review
+    group: verify
     kind: judge
     recipe: pr-reviewer                # agent-substrate/pr-reviewer
     max_visits: 11
@@ -135,6 +149,7 @@ nodes:
       outputs: [verdict, must-fix, should-fix, review-summary]
 
   - node_id: rework
+    group: verify
     kind: agent
     recipe: headless-goal-loop         # 같은 루프의 다음 라운드
     max_visits: 10
@@ -148,6 +163,7 @@ nodes:
       outputs: [diff, summary]
 
   - node_id: main-sync
+    group: land
     kind: git
     recipe: seams-git-merge-main       # LLM 충돌해결 포함
     max_visits: 2
@@ -159,6 +175,7 @@ nodes:
       outputs: [synced, conflicts]
 
   - node_id: regate
+    group: land
     kind: gate
     recipe: gate-baseline              # 충돌해결 «뒤» 재-gate
     max_visits: 2
@@ -170,6 +187,7 @@ nodes:
       outputs: [passed, gate-log]
 
   - node_id: open-pr
+    group: land
     kind: git
     recipe: seams-gh-open-pr
     # 📏 실측 2026-09-08 (원장 30일 · 전 우주 · 걸음 191개 소급 계산):
@@ -185,6 +203,7 @@ nodes:
       outputs: [pr-number, pr-url]
 
   - node_id: merge
+    group: land
     kind: git
     recipe: seams-gh-merge-squash
     # 📏 실측 2026-09-08 (원장 30일 · 전 우주 · 걸음 191개 소급 계산):
@@ -199,6 +218,176 @@ nodes:
       tools: gh-pr-merge
       outputs: [merged]
 
+  # ⛔ 여정 노드는 «목록 끝»에 둔다 — 오버레이가 JSON 포인터(/nodes/<번호>)로 노드를 가리킨다(rework-patient). 앞에 끼우면 번호가 밀린다.
+  # ───────── 여정 앞단: 입구 → 대기열 → 발사 관문 → 배치 ─────────
+  - node_id: intake
+    group: entry
+    kind: observe
+    recipe: harness-entrance            # src/harness/harness-cli-command.ts (say · ask · TUI /harness)
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [ask_text]
+      tools: none
+      outputs: [entrance, journey_key]
+
+  - node_id: queue
+    group: entry
+    kind: gate
+    recipe: harness-queue               # src/harness/harness-queue.ts (directSay 플래그 · 기본 끔 → 건너뜀)
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [entrance, seat]
+      tools: queue-write
+      outputs: [queue_item, queue_outcome]
+
+  - node_id: launch-gate
+    group: entry
+    kind: gate
+    recipe: pre-launch-gate             # harness-cli-command.ts preLaunchGate (예산 · 같은 골 활성 런)
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [goal_id, budget]
+      tools: read-only
+      outputs: [launch_decision]
+
+  - node_id: dispatch
+    group: dispatch
+    kind: judge
+    recipe: harness-substrate-select    # resolveLaunchSubstrate → substrate = local | pod
+    max_visits: 2
+    terminal_stages: []
+    contract:
+      inputs: [launch_decision]
+      tools: read-only
+      outputs: [substrate]
+
+  # ───────── Pod 배치 (substrate == pod 일 때만 — local 은 건너뛴다) ─────────
+  - node_id: pool-admit
+    group: dispatch-pod
+    kind: gate
+    recipe: pod-pool-admission          # src/task-orchestrator/surfaces/self-implement-pod.ts (입장 · 멤버 슬롯 · 메모리 등급)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [substrate, memory_tier]
+      tools: pod-lease
+      outputs: [pool_member]
+
+  - node_id: image-sync
+    group: dispatch-pod
+    kind: gate
+    recipe: pod-pool-image-sync         # src/task-orchestrator/surfaces/pod-pool.ts syncPoolImages (멤버별 · pack 한 번)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pool_member]
+      tools: image-ship
+      outputs: [image_current]
+
+  - node_id: credential-refresh
+    group: dispatch-pod
+    kind: gate
+    recipe: pod-credential-prerefresh   # self-implement-pod.ts podCodexCredentialWithPrerefresh
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pool_member]
+      tools: credential-refresh
+      outputs: [usable_accounts]
+
+  # ───────── 착지: 동결 검사 → (보류) → 병합 → 회수 ─────────
+  - node_id: freeze-check
+    group: land
+    kind: gate
+    recipe: landing-freeze-admission    # src/self-implement/frozen-merges.ts admitLandingMerge (병합 직전 한 곳)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pr-number]
+      tools: read-only
+      outputs: [freeze]
+
+  - node_id: hold
+    group: land
+    kind: hitl
+    recipe: frozen-merge-queue          # frozen-merges.ts queueFrozenMerge → sweepFrozenMerges 가 해제 뒤 재개
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pr-number, head-sha]
+      tools: queue-write
+      outputs: [held]
+
+  - node_id: cleanup
+    group: land
+    kind: git
+    recipe: post-merge-cleanup          # src/self-implement/orchestrator.ts (워크트리 ⊕ 브랜치 회수)
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [worktree, branch]
+      tools: git-write
+      outputs: [cleaned]
+
+  # ───────── 실패 쪽: 결과 해석 → 수확 → heal → 다음 한 수 ─────────
+  - node_id: result-parse
+    group: recover
+    kind: observe
+    recipe: pod-failure-reason          # src/task-orchestrator/surfaces/pod-failure-reason.ts
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [pod_log]
+      tools: read-only
+      outputs: [failure_reason]
+
+  - node_id: salvage
+    group: recover
+    kind: git
+    recipe: salvage-branch              # salvage/si-task-<job>/… (Pod Job 이 push · salvage-branches.ts 가 읽는다)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [worktree]
+      tools: git-write
+      outputs: [salvage_ref]
+
+  - node_id: heal
+    group: recover
+    kind: judge
+    recipe: heal-intake                 # src/self-implement/heal-intake.ts (호스트에서만)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [failure_reason, salvage_ref]
+      tools: read-only
+      outputs: [heal_signature]
+
+  - node_id: next-move
+    group: recover
+    kind: judge
+    recipe: task-agent-judge            # src/task-agent/judge.ts (판단부 → 실행부)
+    max_visits: 4
+    terminal_stages: []
+    contract:
+      inputs: [heal_signature]
+      tools: read-only
+      outputs: [next_action]
+
+  - node_id: stopped
+    group: end
+    kind: observe
+    recipe: journey-stopped             # 거절·포기 — 종결
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: []
+      tools: none
+      outputs: []
+
 # ═══════════════════════════════════════════════════════════════════════
 # 엣지 — ⛔ 출처는 «코드 선언 ⊕ 원장 실측» 둘 다다. 어느 하나만 보면 틀린다.
 #   📏 2026-09-08 실측 (pipeline-traversal-shadow 182 걸음 · 판정 함수가 «실제로 본» 것):
@@ -207,14 +396,83 @@ nodes:
 #         gate→main-sync · gate→open-pr · review→open-pr
 #   🔑 그래서 엣지마다 `observed` 를 «값으로» 적는다 — 「선언했다」와 「돈다」를 가른다.
 edges:
+  # ───── 여정 앞단 — 분기는 «데이터»(on/map). 값은 코드가 낸다(RFC §4.3 ⑵) ─────
+  - from: intake
+    on: queue
+    map:
+      queued: queue                    # harness.queue.directSay 켬 ⊕ 자리 있음
+      direct: launch-gate              # 기본(플래그 끔) — 대기열을 건너뛴다
+
+  - from: queue
+    on: queue_outcome
+    map:
+      launched: launch-gate            # 대기열이 발사한 자식이 다시 intake 를 밟는다(queueLaunchId 로 잇는다)
+      waiting: stopped                 # 이 프로세스는 여기서 끝난다(발사는 대기열 tick 의 몫)
+      refused: stopped                 # 같은 요청이 이미 대기열에 있다
+
+  - from: launch-gate
+    on: outcome
+    map:
+      pass: dispatch
+      refuse: stopped
+
+  - from: dispatch
+    to: author
+
   - from: author
     to: plan
 
   - from: plan
     to: decompose
 
+  # ⭐ 실행 칸(substrate)이 «Pod 쪽 세 노드»를 켜고 끈다 — local 은 곧장 구현.
   - from: decompose
-    to: implement
+    on: substrate
+    map:
+      local: implement
+      pod: pool-admit
+
+  - from: pool-admit
+    on: outcome
+    map:
+      admitted: image-sync
+      refused: stopped
+
+  - from: image-sync
+    to: credential-refresh
+
+  - from: credential-refresh
+    on: outcome
+    map:
+      usable: implement
+      exhausted: stopped
+
+  # 실패 쪽 — Pod 구현이 rc≠0 이면 결과 해석으로.
+  - from: implement
+    on: pod_result
+    map:
+      failed: result-parse
+
+  - from: result-parse
+    to: salvage
+
+  # ⚠️ heal 은 실패 사건 «접수»다 — 호스트에서만(Pod 안에서는 시작 안 함 · POD-RESULT-PARSE).
+  - from: salvage
+    to: heal
+
+  - from: heal
+    to: next-move
+
+  # 출구 라벨 = task-agent 판단부의 수(TaskMove · src/task-agent/judge.ts). 관측 배선은 0.2.22(판단이 카드 단위라 런 조인 먼저).
+  - from: next-move
+    on: move
+    map:
+      narrow-relaunch: dispatch
+      salvage-relaunch: dispatch
+      alternative: dispatch
+      wait-retry: dispatch
+      decision-card: stopped
+      wait: stopped
 
   - from: implement
     to: gate
@@ -264,6 +522,20 @@ edges:
     to: open-pr
     observed: 80
 
+  # ⭐ HARNESS-FULL-GRAPH — 코드 간선 open-pr→merge 사이에 «동결 검사»가 늘 끼어 있었다(병합 직전 한 곳).
   - from: open-pr
-    to: merge
-    observed: 80
+    to: freeze-check
+    observed: 80                       # 옛 open-pr→merge 관측 — 그 사이에 동결 검사가 늘 있었다
+
+  - from: freeze-check
+    on: freeze
+    map:
+      open: merge
+      frozen: hold
+      taken: stopped                   # 다른 착지자(재개 sweep)가 그 PR 을 쥐었다
+
+  - from: hold
+    to: freeze-check                   # 해제 뒤 재검사
+
+  - from: merge
+    to: cleanup

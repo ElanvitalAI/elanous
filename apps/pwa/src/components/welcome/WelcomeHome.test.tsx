@@ -20,6 +20,9 @@ describe('WelcomeHome — core routes and not-found guidance', () => {
       expect(html).not.toContain(`data-testid="${routeGuidanceTestId(hidden)}"`);
     }
     expect(html).toContain(`data-testid="${routeGuidanceTestId('/chat')}"`);
+    // EDITOR-NAV-PUBLIC — 편집기는 stable 이라 역할을 안 고른 기기의 핵심 타일에도 있다.
+    expect(html).toContain(`data-testid="${routeGuidanceTestId('/editor')}"`);
+    expect(html.indexOf(`data-testid="${routeGuidanceTestId('/editor')}"`)).toBeLessThan(html.indexOf('<details'));
     expect(html).not.toContain('고치는 중인 화면');
   });
 

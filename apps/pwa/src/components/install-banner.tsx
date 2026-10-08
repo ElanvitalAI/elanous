@@ -17,6 +17,7 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import { Download, Share, X } from 'lucide-react';
 import { debugLog } from '@/lib/debug';
 import { useCompactMode } from '@/lib/compact-mode';
+import { useQuietSurfaceActive } from '@/lib/quiet-surface';
 import {
   detectPlatform,
   isStandalone,
@@ -42,6 +43,8 @@ function InstallBannerContent() {
   const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null);
   const pathname = usePathname();
   const { compact } = useCompactMode();
+  // GRAPH-WIZARD — the editor's «말로 만들기» needs the whole screen; the banner comes back when it closes.
+  const quietSurface = useQuietSurfaceActive();
   const searchParams = useSearchParams();
   const capture = searchParams?.get('capture');
   const demo = searchParams?.get('demo');
@@ -131,7 +134,7 @@ function InstallBannerContent() {
     }
   };
 
-  if (!visible || (pathname === '/chat' && compact)) return null;
+  if (!visible || quietSurface || (pathname === '/chat' && compact)) return null;
 
   // ⛔ 고정 층(`fixed bottom-0`)으로 띄우지 않는다 — AppShell 세로 띠(`h-screen flex-col`)의 마지막 칸으로
   //  자리를 차지해, 본문이 그만큼 줄고 채팅 입력칸이 띠 «위»에 남는다(10-02 0.2.9 릴리스 게이트 C2a·C2b 실측:

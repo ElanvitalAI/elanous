@@ -55,6 +55,11 @@ import { basename } from 'node:path';
 import { debug } from './debug/log.js';
 
 const TIMEOUT_MS = 3000;
+// An interactive shell (`-i`) ignores SIGTERM, so the default timeout signal never ends it: the
+// capture then blocks until the rc files finish. 10-08 TUI-BOOT-60: a stale pyenv rehash lock made
+// every `zsh -l -i` wait 60 s, and the «3 s» capture held the TUI boot for ~65 s. SIGKILL makes the
+// timeout real.
+const TIMEOUT_SIGNAL = 'SIGKILL' as const;
 const POSIX_SHELLS = new Set(['zsh', 'bash', 'fish', 'sh', 'dash', 'ksh']);
 
 let cached: Record<string, string> | null = null;
@@ -126,6 +131,7 @@ export function runPrintenvCapture(): Record<string, string> | null {
       env: seedEnv,
       encoding: 'utf8',
       timeout: TIMEOUT_MS,
+      killSignal: TIMEOUT_SIGNAL,
       stdio: ['ignore', 'pipe', 'pipe'],
       // Don't inherit our stdio — rc files that run `clear` or issue
       // OSC sequences would corrupt our TUI output otherwise.
@@ -133,6 +139,8 @@ export function runPrintenvCapture(): Record<string, string> | null {
   } catch {
     return null;
   }
+  // ETIMEDOUT with status 0 = the shell outlived the timeout; never trust a late capture.
+  if (res.error) return null;
   if (res.status !== 0 && res.status !== null) return null;
   if (res.signal) return null;
   return acceptCapture(typeof res.stdout === 'string' ? res.stdout : '');
@@ -149,10 +157,16 @@ export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Prom
   const start = Date.now();
   try {
     const proc = spawn([seed.shell, '-l', '-i', '-c', 'printenv'], { env: seed.seedEnv as Record<string, string>, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
-    const timer = setTimeout(() => proc.kill(), TIMEOUT_MS);
-    const [out, code] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), proc.exited]);
+    // A grandchild (e.g. a pyenv rehash) can keep the stdout pipe open after the shell is killed,
+    // so the timeout settles the race itself instead of waiting for EOF.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<null>((resolve) => {
+      timer = setTimeout(() => { proc.kill(TIMEOUT_SIGNAL); resolve(null); }, TIMEOUT_MS);
+    });
+    const finished = Promise.all([new Response(proc.stdout as ReadableStream).text(), proc.exited]);
+    const result = await Promise.race([finished, timedOut]);
     clearTimeout(timer);
-    const parsed = code === 0 ? acceptCapture(out) : null;
+    const parsed = result && result[1] === 0 ? acceptCapture(result[0]) : null;
     if (captured) return cached !== null; // a synchronous capture won the race
     if (!parsed) return false;
     cached = parsed;

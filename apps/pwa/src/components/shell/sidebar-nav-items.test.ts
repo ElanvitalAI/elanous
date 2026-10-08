@@ -38,6 +38,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/control',
   '/design-check',
   '/editor',
+  '/live-run',
   '/exec',
   '/field',
   '/inside',
@@ -201,30 +202,30 @@ describe('NAV1a menu', () => {
       expect(on.main.filter((item) => item.group === 'ops').map((item) => item.href))
         .toEqual([...expectedGroups[6][3], ...PRIVATE_SIDEBAR_NAV_ITEMS.filter((item) => item.group === 'ops').map((item) => item.href)]);
     }
-    expect(off.labs.map((item) => item.href).sort()).toEqual(['/board', '/editor', '/showroom', '/workspace'].sort());
+    expect(off.labs.map((item) => item.href).sort()).toEqual(['/board', '/showroom', '/workspace'].sort());
     expect(off.hidden.map((item) => item.href).sort()).toEqual(['/tasks', '/sessions', '/reflection', ...PRIVATE_SIDEBAR_NAV_ITEMS.filter((item) => item.group !== 'ops').map((item) => item.href)].sort());
     const general = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false }, 'general');
     expect(general.main.some((item) => item.href === '/scheduler')).toBe(false);
     expect(general.main.some((item) => item.href === '/chat')).toBe(true);
   });
 
-  test('general menu puts Inbox today first and preserves the order of its five existing entries', () => {
+  test('general menu puts Inbox today first and preserves the order of its default entries (편집기 포함)', () => {
     const main = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false }, 'general').main;
-    expect(main).toHaveLength(6);
+    expect(main).toHaveLength(7);
     expect(main[0]).toMatchObject({ group: 'today', href: '/today', label: '오늘', icon: Inbox });
-    expect(main.map((item) => item.href)).toEqual(['/today', '/chat', '/live', '/term', '/market', '/settings']);
+    expect(main.map((item) => item.href)).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
   });
 
-  test('general beta opt-in preserves six default entries and opens beta only; other roles and ops stay unchanged', () => {
+  test('general beta opt-in preserves seven default entries and opens beta only; other roles and ops stay unchanged', () => {
     const prefs = { showLabs: false, showHidden: false };
     const hrefs = (role: 'general' | 'contributor' | 'owner', showBeta?: boolean, operator = false) =>
       visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role, operator, { showBeta }).main.map((item) => item.href);
     const off = hrefs('general');
-    expect(off).toEqual(['/today', '/chat', '/live', '/term', '/market', '/settings']);
+    expect(off).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
     expect(hrefs('general', false)).toEqual(off);
     const on = hrefs('general', true);
     for (const path of ['/exec', '/field', '/trace', '/autopilot', '/vault', '/intake']) expect(on).toContain(path);
-    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/autopilot', '/outputs', '/live', '/trace', '/term', '/vault', '/field', '/market', '/settings']);
+    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/autopilot', '/outputs', '/live', '/trace', '/live-run', '/term', '/editor', '/vault', '/field', '/market', '/settings']);
     for (const path of ['/approvals', '/design-check', '/scheduler', '/ops/release', '/morning']) expect(on).not.toContain(path);
     for (const role of ['contributor', 'owner'] as const) expect(hrefs(role, true)).toEqual(hrefs(role));
     expect(hrefs('general', true, true).filter((path) => path.startsWith('/ops/'))).toEqual(['/ops/release', '/ops/checklist', '/ops/seats']);
@@ -303,7 +304,7 @@ describe('탭 다이어트 — 메뉴 노출 등급', () => {
   });
 
   test('Labs 는 별도 등급이며 Tasks·Sessions·Reflection 은 숨김이다', () => {
-    expect(hrefs('labs').sort()).toEqual(['/board', '/editor', '/showroom', '/workspace'].sort());
+    expect(hrefs('labs').sort()).toEqual(['/board', '/showroom', '/workspace'].sort());
     for (const href of ['/tasks', '/sessions', '/reflection']) {
       expect(hrefs('hidden')).toContain(href);
     }

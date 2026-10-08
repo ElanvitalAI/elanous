@@ -65,6 +65,9 @@ export function RunDrawerView({ runId, run, screen, screenError, lines, stopStat
           <Link href={`/trace?level=L2&run=${encodeURIComponent(runId)}` as never} className="rounded-md border px-2 py-1 text-xs hover:bg-muted" data-elanous-action="live-run-trace">
             Trace 로 →
           </Link>
+          <Link href={`/live-run/?run=${encodeURIComponent(runId)}` as never} className="rounded-md border px-2 py-1 text-xs hover:bg-muted" data-elanous-action="live-run-scene">
+            런 장면 →
+          </Link>
           {awaitingApproval(run) && (
             <Link href={`/approvals?pr=${encodeURIComponent(run!.pr!)}` as never} className="rounded-md border px-2 py-1 text-xs hover:bg-muted" data-elanous-action="live-run-approvals">
               승인 카드로 →

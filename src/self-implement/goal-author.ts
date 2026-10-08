@@ -1363,6 +1363,20 @@ export function tracedPathReferences(document: string): TracedPathReference[] {
   return references;
 }
 
+/**
+ * AUTO-TARGET (10-08 canary · TSC-HEAP run-446cdc71): an authored goal whose `## PROBLEM` Situation line says
+ * NOT-GROUNDED has no persistent (Read-verified) evidence — `scqaNarrative` writes NOT-GROUNDED exactly when that
+ * channel is empty, and `## TRACED PATHS` then carries no path. Such a goal is a scope card, not an implementation
+ * goal: any target path it carries was not verified by grounding. Callers that know a path was machine-suggested
+ * (not written by the human) must not launch on it. Lite goals have no Situation line and return false.
+ */
+export function isNotGroundedWithoutPersistentEvidence(document: string): boolean {
+  const problem = markdownSection(document, 'PROBLEM');
+  if (problem === null) return false;
+  const situation = problem.split(/\r?\n/).find((line) => line.startsWith('Situation: '));
+  return situation !== undefined && situation.startsWith('Situation: NOT-GROUNDED') && tracedPathReferences(document).length === 0;
+}
+
 /** Inspect supplied goal text and branch name, optionally validating traced paths through an injected reader. */
 /**
  * Lint findings plus the number of inline invariant markers recognized for judgment candidates.

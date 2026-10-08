@@ -8,6 +8,7 @@ import { LOOPS_INTERACT_HREF } from '@/components/loops/loops-view';
 import { listOpenDecisions } from '@/lib/decisions-api';
 import { getSeats, type OpsSeats } from '@/lib/ops-api';
 import type { DaemonClient } from '@/lib/daemon-client';
+import { DraftMetricsCard, readDraftMetrics, type DraftMetricsCardValue } from '@/components/ops/draft-metrics-card';
 import type { GridData } from '../../../../../src/nexus/api/grid';
 
 type Risk = { id: string; kind: string; title: string; at: string };
@@ -20,9 +21,10 @@ type Snapshot = {
   merged: number | null | undefined;
   risks: Risk[] | null | undefined;
   grid: GridData | null | undefined;
+  drafts: DraftMetricsCardValue;
 };
 
-const empty: Snapshot = { release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined };
+const empty: Snapshot = { release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined, drafts: { kind: 'loading' } };
 const validTime = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -164,7 +166,19 @@ function readWithDeadline<T>(request: Promise<T>, onTimeout: T): Promise<T> {
   });
 }
 
-function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) => void): void {
+/** The daemon collects drafts in the background; while it says «측정 중», ask again (memory read, no GitHub call). */
+const DRAFT_MEASURING_POLL_MS = 10_000;
+const DRAFT_MEASURING_POLLS = 30;
+
+function readDrafts(client: DaemonClient, update: (patch: Partial<Snapshot>) => void, alive: () => boolean, polls = DRAFT_MEASURING_POLLS): void {
+  void readWithDeadline(readDraftMetrics(client), { kind: 'unavailable', reason: null } as DraftMetricsCardValue).then((drafts) => {
+    if (!alive()) return;
+    update({ drafts });
+    if (drafts.kind === 'measuring' && polls > 0) setTimeout(() => { if (alive()) readDrafts(client, update, alive, polls - 1); }, DRAFT_MEASURING_POLL_MS);
+  });
+}
+
+function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) => void, alive: () => boolean = () => true): void {
   const now = Date.now();
   const today = todayStart(new Date(now));
   const seats = readWithDeadline(getSeats(client), { kind: 'error' as const, status: 0 });
@@ -174,6 +188,7 @@ function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) =
   const merged = readWithDeadline(readMergedRuns(client, today), null);
   const runRisks = readWithDeadline(readRunRisks(client, today), null);
   const grid = readWithDeadline(readGrid(client), null);
+  readDrafts(client, update, alive);
 
   void seats.then((value) => update({ release: value.kind === 'ready' ? releaseFromSeats(value.data) : null }));
   void loops.then((value) => update({ loops: value?.summary ?? null }));
@@ -203,7 +218,7 @@ export default function CeoPage() {
   useEffect(() => {
     let active = true;
     setSnapshot(empty);
-    readSnapshot(client, (patch) => { if (active) setSnapshot((current) => ({ ...current, ...patch })); });
+    readSnapshot(client, (patch) => { if (active) setSnapshot((current) => ({ ...current, ...patch })); }, () => active);
     return () => { active = false; };
   }, [client]);
 
@@ -256,6 +271,7 @@ export default function CeoPage() {
             ? '측정 불가' : snapshot.grid.members.reduce((sum, member) => sum + member.occupied!, 0)}/{snapshot.grid.members.reduce((sum, member) => sum + member.capacity, 0)}</p>
         </div>}
       </section>
+      <DraftMetricsCard value={snapshot.drafts} />
     </div>
   </main>;
 }

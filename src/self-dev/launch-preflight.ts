@@ -538,6 +538,9 @@ export interface LaunchPreflightInput {
   readonly askTargetPaths?: readonly string[];
   /** 대상 경로 라벨이 «있는데» 거부된 조각. 0건 막음 문면이 그 이유를 말하게 한다(판정은 안 바꾼다). */
   readonly askTargetPathRejections?: readonly AskTargetPathHintRejection[];
+  /** AUTO-TARGET: machine-suggested target paths dropped because the goal is NOT-GROUNDED (no persistent evidence).
+   *  Non-empty = the goal is a scope card and must not launch an implementation. */
+  readonly notGroundedDroppedTargetPaths?: readonly string[];
   /** ask 원문 경로. 있으면 ask-outside-path 경고만 이 목록과 최종 대상을 비교한다. */
   readonly askOutsidePathHints?: readonly string[];
   /** 이번에 쏠 골의 브랜치 이름. 없으면 형제 PR 축의 경고를 내지 않는다. */
@@ -559,19 +562,31 @@ function emitAskMarkerObservation(result: LaunchPreflightResult): void {
   emittedAskMarkerObservations.add(result);
 }
 
+/** AUTO-TARGET: blocker name for a NOT-GROUNDED goal whose only target paths were machine-suggested (a scope card). */
+export const NOT_GROUNDED_SCOPE_CARD_BLOCKER = '(NOT-GROUNDED 범위 카드)';
+
 export function evaluateLaunchPreflight(input: LaunchPreflightInput): LaunchPreflightResult {
   const paths = [...new Set(input.paths.filter((path) => path.trim().length > 0))];
   const blockers: LaunchPreflightBlocker[] = [];
   const warnings: LaunchPreflightBlocker[] = [];
 
+  // AUTO-TARGET (10-08 canary · TSC-HEAP): a NOT-GROUNDED goal whose only target paths came from the
+  //   harness candidate search is a scope card — refuse it with that reason, not the generic «no label» text.
+  const notGroundedDropped = input.notGroundedDroppedTargetPaths ?? [];
+  const notGroundedDetail = notGroundedDropped.length > 0
+    ? `골이 NOT-GROUNDED(영속 근거 0)라 하니스 후보 검색이 넣은 대상 경로 ${notGroundedDropped.length}개(${notGroundedDropped.slice(0, 3).join(' · ')}${notGroundedDropped.length > 3 ? ' …' : ''})를 대상으로 쓰지 않는다 — 범위 카드: 구현 발사 대상이 아니다 · ask 첫 줄에 사람이 「대상 경로: <파일>」을 적거나 접지 근거를 복구한 뒤 다시 저작`
+    : undefined;
+  if (notGroundedDetail !== undefined && paths.length > 0) {
+    blockers.push({ kind: 'no-target-paths', name: NOT_GROUNDED_SCOPE_CARD_BLOCKER, detail: notGroundedDetail });
+  }
   // ① 모집단이 0이면 «통과»가 아니라 «막는 사유»다(METHOD v32 를 이 코드에도 적용).
   if (paths.length === 0) {
     blockers.push({
       kind: 'no-target-paths',
-      name: '(대상 경로 0)',
+      name: notGroundedDetail !== undefined ? NOT_GROUNDED_SCOPE_CARD_BLOCKER : '(대상 경로 0)',
       // ⛔ 2026-09-23 — 라벨이 «있는데» 조각이 거부된 경우를 「라벨을 넣어라」로 뭉개면 「거부됐다」를 「없다」로 읽게 된다
       //   (실측: `대상 경로: README.md — 설명…` 한 줄 → has-whitespace 로 통째 거부 · 문면은 「넣어라」뿐이었다).
-      detail: (input.askTargetPathRejections?.length
+      detail: notGroundedDetail !== undefined ? notGroundedDetail : (input.askTargetPathRejections?.length
         ? `대상 경로 라벨은 있는데 조각 ${input.askTargetPathRejections.length}개가 거부됐다: ${input.askTargetPathRejections.slice(0, 3).map((r) => `「${r.fragment.length > 40 ? `${r.fragment.slice(0, 40)}…` : r.fragment}」(${r.reason})`).join(' · ')} — 그 줄에는 «경로만» 둔다(설명은 다음 줄)`
         : '골에서 대상 경로를 하나도 못 뽑았다 — ask 첫 줄에 「대상 경로: <파일> · <파일>」을 넣어라')
         + ' — 이 상태의 「위반 0」은 「검사했다」가 아니다 — elanous self author --inspect-target-paths "<문면>"',
@@ -1192,6 +1207,9 @@ export interface AskPreflightDeps {
   readonly askTargetPaths?: (document: string) => readonly string[];
   /** 대상 경로 라벨 «안»에서 거부된 조각(이유 포함). 0건 막음 문면이 「라벨이 없다」와 「있는데 거부됐다」를 가르게 한다. */
   readonly askTargetPathRejections?: (document: string) => readonly AskTargetPathHintRejection[];
+  /** AUTO-TARGET: true when the authored goal is NOT-GROUNDED with no persistent evidence (a scope card).
+   *  Omitted = this distinction is not made (existing behavior). Production wires `isNotGroundedWithoutPersistentEvidence`. */
+  readonly notGroundedWithoutPersistentEvidence?: (document: string) => boolean;
 }
 
 export interface AskPreflightOptions {
@@ -1212,6 +1230,10 @@ export interface AskPreflightOptions {
   readonly plannedBranch?: string;
   /** 저작 전 ask 원문. 주면 기존 ask-marker-check로 형식을 관측하되 발사를 막지 않는다. */
   readonly askText?: string;
+  /** AUTO-TARGET: target paths the harness put into the ask (candidate search), not the human.
+   *  If the authored goal is NOT-GROUNDED without persistent evidence, these paths are dropped and the
+   *  goal stops before launch (`no-target-paths` blocker naming the reason). */
+  readonly machineSuggestedTargetPaths?: readonly string[];
 }
 
 export type PlannedBranchResolution =
@@ -1539,7 +1561,24 @@ export function decideAskPreflight(
     }
   }
   // ⛔ 저작 전에는 pathsOverride 자체가 ask 대상 힌트다. 저작 뒤에는 골에서 뽑은 대상만 역할로 쓴다.
-  const askTargetPaths = opts.pathsOverride ?? (goalDocument && deps.askTargetPaths ? deps.askTargetPaths(goalDocument) : []);
+  const declaredAskTargetPaths = opts.pathsOverride ?? (goalDocument && deps.askTargetPaths ? deps.askTargetPaths(goalDocument) : []);
+  // AUTO-TARGET: a NOT-GROUNDED goal (no persistent evidence) carries no machine-suggested target path.
+  const machineSuggested = new Set((opts.machineSuggestedTargetPaths ?? []).map((path) => path.trim()).filter(Boolean));
+  let notGroundedGoal = false;
+  if (!opts.pathsOverride && goalDocument !== null && machineSuggested.size > 0 && deps.notGroundedWithoutPersistentEvidence) {
+    try { notGroundedGoal = deps.notGroundedWithoutPersistentEvidence(goalDocument); } catch { notGroundedGoal = false; }
+  }
+  const notGroundedDroppedTargetPaths = notGroundedGoal ? declaredAskTargetPaths.filter((path) => machineSuggested.has(path)) : [];
+  const askTargetPaths = notGroundedDroppedTargetPaths.length > 0
+    ? declaredAskTargetPaths.filter((path) => !machineSuggested.has(path))
+    : declaredAskTargetPaths;
+  if (notGroundedDroppedTargetPaths.length > 0) {
+    try {
+      debug.log('harness.preflight', 'not-grounded-target-paths-dropped', { goalFile: opts.goalFile, dropped: notGroundedDroppedTargetPaths });
+    } catch {
+      // Observation never changes the launch decision.
+    }
+  }
   // 저작 뒤에는 접지가 읽은 경로와 선언 대상 경로를 함께 검사한다. 저작 전 pathsOverride는 그대로 쓴다.
   const paths = opts.pathsOverride ?? [...new Set([...tracedPaths, ...askTargetPaths])];
   const askMarkerInspection = opts.askText === undefined
@@ -1677,6 +1716,7 @@ export function decideAskPreflight(
     ...(goalRulersUnknownReason ? { goalRulersUnknownReason } : {}),
     preexistingFailures,
     ...(askTargetPaths.length > 0 ? { askTargetPaths } : {}),
+    ...(notGroundedDroppedTargetPaths.length > 0 ? { notGroundedDroppedTargetPaths } : {}),
     ...(askTargetPaths.length === 0 && goalDocument && deps.askTargetPathRejections
       ? { askTargetPathRejections: deps.askTargetPathRejections(goalDocument) }
       : {}),

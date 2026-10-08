@@ -342,6 +342,50 @@ describe('post-merge goal copy cleanup', () => {
 });
 
 describe('runSelfImplement — parent soft-stop marker', () => {
+  test('reports the created child space ID that its stop reader uses without changing the ledger', async () => {
+    const observed: string[] = [];
+    const readIds: string[] = [];
+    const ledger: string[] = [];
+    const result = await runSelfImplement({
+      feature: 'stop target observation',
+      completion: 'worktree-only',
+      seams: seams({
+        createWorktree: async ({ branch, base }) => ({ path: '/wt/self-impl-goalid-0123456789abcdef-observed', branch, base }),
+        onSoftStopSpaceReady: (spaceId) => { observed.push(spaceId); },
+        readSoftStopRequestStatus: (spaceId) => { readIds.push(spaceId); return { status: 'absent' }; },
+        writeRunLedger: (entry) => { ledger.push(entry.event); },
+      }),
+    });
+    expect(result.stage).not.toBe('soft-stopped');
+    expect(observed).toEqual(['self-impl-goalid-0123456789abcdef-observed']);
+    expect(readIds).toContain(observed[0]);
+    expect(ledger).not.toContain('soft-stop-honored');
+  });
+
+  test('a stop marker addressed to the newly reported child space stops before the gate', async () => {
+    let reportedSpace: string | undefined;
+    let gateCalls = 0;
+    const readIds: string[] = [];
+    const result = await runSelfImplement({
+      feature: 'stop the reported child',
+      seams: seams({
+        createWorktree: async ({ branch, base }) => ({ path: '/wt/self-impl-goalid-0123456789abcdef-targeted', branch, base }),
+        onSoftStopSpaceReady: (spaceId) => { reportedSpace = spaceId; },
+        readSoftStopRequestStatus: (spaceId) => {
+          readIds.push(spaceId);
+          return spaceId === reportedSpace
+            ? { status: 'present', request: { version: 1, requestedAt: new Date(Date.now() + 60_000).toISOString() } }
+            : { status: 'absent' };
+        },
+        gate: async () => { gateCalls += 1; return { passed: true, log: 'ok' }; },
+      }),
+    });
+    expect(reportedSpace).toBe('self-impl-goalid-0123456789abcdef-targeted');
+    expect(readIds).toContain(reportedSpace as string);
+    expect(result.stage).toBe('soft-stopped');
+    expect(gateCalls).toBe(0);
+  });
+
   test('a post-start marker before the gate does not call the gate seam and records before-gate', async () => {
     let gateCalls = 0;
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -4849,7 +4893,10 @@ describe('runSelfImplement — traversal shadow wiring', () => {
       restore();
     }
 
-    const entryEvents = events.filter((entry) => entry.event === 'pipeline-node-entry');
+    // HARNESS-FULL-GRAPH — 여정 노드(phase=journey: freeze-check·cleanup …)는 이 8노드 실행 그래프 «밖»의 선언이라 따로 센다.
+    const journeyEntries = events.filter((entry) => entry.event === 'pipeline-node-entry' && entry.data.phase === 'journey');
+    expect(new Set(journeyEntries.map((entry) => entry.data.node))).toEqual(new Set(['freeze-check', 'cleanup']));
+    const entryEvents = events.filter((entry) => entry.event === 'pipeline-node-entry' && entry.data.phase !== 'journey');
     const observed = new Set(entryEvents.map((entry) => entry.data.node));
     const expected = new Set(Object.keys(PIPELINE_EDGES_BY_NODE));
     expect(observed).toEqual(expected);

@@ -72,6 +72,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
+import { enterJourneyNode, exitJourneyNode, journeyJoinFields, withJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { classifyGateEnvDeficit, DEFAULT_GATE_ENV_RETRY, GATE_ENV_DEFICIT_HARVESTABLE_MARK, type GateEnvDeficitKind } from './gate-env-retry.js';
 import { recordFailureEvent } from './heal-intake.js';
 import { classifyReworkCapExhaustion, type ReworkCapHealDecision } from './heal-triage.js';
@@ -975,6 +976,8 @@ export interface SelfImplementSeams {
   readSoftStopRequestStatus?: (spaceId: string) => SoftStopRequestRead;
   /** Parent harness space whose durable stop marker is read. Tests inject this; production uses `getHarnessSpace()`. */
   parentSoftStopSpaceId?: string;
+  /** Real, created worktree's soft-stop target; observation only, never guesses a space. */
+  onSoftStopSpaceReady?: (spaceId: string) => void;
   /** disposable worktree 생성 → 경로·브랜치 ⊕ **어디서 갈랐나**(관측용).
    *  ⚠️ 관측 3필드는 **선택**이다 — 시임은 주입점이고, 테스트 더블에게 git SHA 를 지어내라고
    *  요구하면 계약이 아니라 부담이 된다. 실 시임(`defaultSeams`)은 항상 채운다.
@@ -3805,6 +3808,8 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     const attemptOrdinal = readRunAttemptOrdinal(runId);
     const identified = {
       ...graphIdentity,
+      // HARNESS-FULL-GRAPH — 앞단 여정 걸음(runId 없음)과 이 런의 걸음을 잇는 조인 키.
+      ...journeyJoinFields(),
       ...data,
       attemptOrdinal,
     };
@@ -5019,6 +5024,9 @@ async function runSelfImplementInner(
   //   그래서 getHarnessSpace() 만 보면 운영에서 늘 undefined 이고 정지 확인이 «한 번도» 안 돈다(#20040 착지 직후 실측).
   //   `self send <space> --stop` 이 겨냥하는 것은 자식의 공간 = 워크트리 이름이다(아래 activeChildInboxId 와 같은 식 · dev-cli.ts recordRestart 폴백과 같다).
   const parentSoftStopSpaceId = s.parentSoftStopSpaceId || getHarnessSpace()?.id || normalizeSpaceId(basename(wt.path)) || undefined;
+  if (parentSoftStopSpaceId) {
+    try { s.onSoftStopSpaceReady?.(parentSoftStopSpaceId); } catch { /* UI registration must not break execution */ }
+  }
   const readParentSoftStop = s.readSoftStopRequestStatus ?? readSoftStopRequestStatus;
   const honorParentSoftStop = (
     beforeNode: 'gate' | 'review' | 'rework' | 'open-pr',
@@ -8088,7 +8096,14 @@ async function runSelfImplementInner(
       }
       const defaultBranch = resolveDefaultBranchTarget(s.defaultBranchRef ?? defaultBranchRef, wt.path).target ?? undefined;
       progress('merged', formatAutoMergeSuccessMessage({ prNumber: pr.number, mergedBase, defaultBranch }));
-      await runPostMergeCleanup(s.postMergeCleanup, wt.path, wt.branch, opts.goalFile, mergedBase && defaultBranch && displayBranchName(mergedBase) === displayBranchName(defaultBranch) ? defaultBranch : undefined, observe);
+      // HARNESS-FULL-GRAPH — 회수도 그래프 노드(cleanup)다. 결과 = completed | preserved | failed.
+      let cleanupOutcome = 'completed';
+      enterJourneyNode('cleanup', { provenance: 'post-merge', runId });
+      await withJourneyNode('cleanup', { provenance: 'post-merge', runId }, () => runPostMergeCleanup(s.postMergeCleanup, wt.path, wt.branch, opts.goalFile, mergedBase && defaultBranch && displayBranchName(mergedBase) === displayBranchName(defaultBranch) ? defaultBranch : undefined, (event, data) => {
+        if (event.startsWith('post-merge-cleanup-')) cleanupOutcome = event.slice('post-merge-cleanup-'.length);
+        observe(event, data);
+      }));
+      exitJourneyNode('cleanup', { provenance: 'post-merge', runId, outcome: cleanupOutcome });
       const mergedLedger = (() => {
         try { return loadRunLedger(runId); } catch { return null; }
       })();

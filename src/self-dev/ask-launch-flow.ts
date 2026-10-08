@@ -852,7 +852,7 @@ export async function runAskLaunchFlow(
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
 
   await deps.beforeAuthoring?.();
-  const authorAndPreflight = async (authorAskText: string = input.askText): Promise<{
+  const authorAndPreflight = async (authorAskText: string = input.askText, machineSuggestedTargetPaths: readonly string[] = []): Promise<{
     readonly goalFile: string;
     readonly decision: ReturnType<typeof decideAskPreflight>;
   }> => {
@@ -950,6 +950,8 @@ export async function runAskLaunchFlow(
         recentChangeWindowDays: input.recentChangeWindowDays,
         openPrsLimit: OPEN_PR_LIMIT,
         ...(askOutsidePathHints.length > 0 ? { askOutsidePathHints } : {}),
+        // AUTO-TARGET: paths injected by the candidate search (not written in the ask) — a NOT-GROUNDED goal stops on them.
+        ...(machineSuggestedTargetPaths.length > 0 ? { machineSuggestedTargetPaths } : {}),
         declaredPathsRoot: deps.cwd(),
       },
       preflightDeps,
@@ -1032,7 +1034,7 @@ export async function runAskLaunchFlow(
     }
     authored = await authorAndPreflight(selectedPaths.length > 0
       ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`
-      : input.askText);
+      : input.askText, selectedPaths);
     deps.log('ask-auto-reauthor', {
       candidatePathCount: candidates.paths.length,
       firstGoalFile: first.goalFile,

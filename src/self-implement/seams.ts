@@ -972,6 +972,8 @@ export interface DefaultSeamsOptions {
   signal?: AbortSignal;
   /** Parent-surface progress receiver supplied by the dev pipeline. */
   onProgress?: SelfImplementSeams['onProgress'];
+  /** Relay the actual worktree soft-stop target to the invoking surface. */
+  onSoftStopSpaceReady?: SelfImplementSeams['onSoftStopSpaceReady'];
   /** ⑤ HITL — PR 승인 게이트. ★fail-closed: 생략 시 PR 안 열림(자동 승인 없음). 실전 필수. */
   approvePr?: SelfImplementSeams['approvePr'];
   /** gate 스텝(기본 ['test']). */
@@ -1394,6 +1396,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
   };
   return {
     ...(o.onProgress ? { onProgress: o.onProgress } : {}),
+    ...(o.onSoftStopSpaceReady ? { onSoftStopSpaceReady: o.onSoftStopSpaceReady } : {}),
     ...(escalateGoalClarifications ? { escalateGoalClarifications } : {}),
     queryChildProviderErrors,
     persistPrBodyArtifact: (input) => createArtifactStore().put('block', input.body, {

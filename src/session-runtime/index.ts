@@ -162,6 +162,8 @@ export interface SessionPostureSnapshot {
 
 export interface SessionRuntimeDispatchDeps {
   signal?: AbortSignal;
+  /** Current LLM tool call, for correlating a foreground harness stop target with the TUI call. */
+  toolCallId?: string;
   userText?: string;
   modelFamily?: ModelFamily;
   /** Parent Agent capability context for an inline runtime fallback. */
@@ -183,7 +185,7 @@ export interface SessionRuntimeDispatchDeps {
   // scheduler-retirement R1 의 LLM tool unwire 후 모두 no-op stub 였고
   // 본 PR 에서 정식 폐기.
   getToolRuntime(name: string): ToolRuntime<Record<string, unknown>, ToolRunResult> | undefined;
-  dispatchToolRuntime(name: string, args: Record<string, unknown>): Promise<unknown>;
+  dispatchToolRuntime(name: string, args: Record<string, unknown>, toolCallId?: string): Promise<unknown>;
   dispatchPluginTool(name: string, args: Record<string, unknown>): Promise<
     { ok: true; result: unknown } | { ok: false; error: string }
   >;
@@ -2166,7 +2168,7 @@ export async function dispatchSessionRuntimeTool(
   //    registered runtimes) and drops `pathPolicy` on the floor.
   const nativeRuntime = nativeRule?.preferRuntime ? deps.getToolRuntime(name) : undefined;
   if (nativeRuntime) {
-    const result = await deps.dispatchToolRuntime(name, normalizedArgs);
+    const result = await deps.dispatchToolRuntime(name, normalizedArgs, deps.toolCallId);
     rememberCandidateListingResult(name, normalizedArgs, result, scopedAnalysis, deps.searchPlannerState);
     return result;
   }
@@ -2201,7 +2203,7 @@ export async function dispatchSessionRuntimeTool(
   if (rt) {
     const isPtyTool = name.startsWith('PtyShell') || name.startsWith('pty_shell');
     if (!isPtyTool || deps.ptyDashboardOn) {
-      const result = await deps.dispatchToolRuntime(name, normalizedArgs);
+      const result = await deps.dispatchToolRuntime(name, normalizedArgs, deps.toolCallId);
       rememberCandidateListingResult(name, normalizedArgs, result, scopedAnalysis, deps.searchPlannerState);
       return result;
     }

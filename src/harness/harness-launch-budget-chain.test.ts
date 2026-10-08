@@ -36,26 +36,30 @@ describe('harness launch budget — empty chain (L6b2 incident 10-03)', () => {
     expect(warning).toContain('outside the budget gate');
   });
 
-  test('unmeasured codex and grok launch with their own warning', () => {
+  // #24276(LLM-SHARE): 발사 관문은 grok «못 쟀다»를 통과로 보지 않는다(주간 사용률 80% 상한을 실제로 적용).
+  //   codex 의 «못 쟀다»만 경고와 함께 발사한다.
+  test('unmeasured codex launches with its own warning; unmeasured grok does not launch', () => {
     const noUsage = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default' }], grokUsedPercent: undefined } as BudgetInputs;
     const codex = harnessLaunchBudgetDecision(noUsage);
     expect(codex.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'openai-codex' }));
     expect(codex.warning).toContain('openai-codex usage unmeasured');
     expect(codex.unmeasuredProvider).toBe('openai-codex');
     const grok = harnessLaunchBudgetDecision(noUsage, { childLlmProvider: 'grok' });
-    expect(grok.decision).toEqual(expect.objectContaining({ action: 'proceed', provider: 'grok' }));
-    expect(grok.warning).toContain('grok usage unmeasured');
+    expect(grok.decision).toEqual(expect.objectContaining({ action: 'stop', reasons: ['grok: 모름'] }));
+    expect(grok.unmeasuredProvider).toBeUndefined();
   });
 
-  test('measured exhausted codex falls through to unmeasured grok, but not vice versa', () => {
+  test('measured exhausted codex falls through to measured grok under the launch cap, never to unmeasured grok', () => {
     const mixed = { ...inputs([{ provider: 'openai-codex' }, { provider: 'grok' }]), codexCandidates: [{ name: 'default', usedPercent: 95 }], grokUsedPercent: undefined } as BudgetInputs;
-    const { decision, warning } = harnessLaunchBudgetDecision(mixed);
-    expect(decision).toEqual(expect.objectContaining({ action: 'next-provider', provider: 'grok' }));
-    expect(warning).toContain('grok usage unmeasured');
-    const exhausted = harnessLaunchBudgetDecision({ ...mixed, grokUsedPercent: 48 });
+    const unmeasured = harnessLaunchBudgetDecision(mixed);
+    expect(unmeasured.decision.action).toBe('stop');
+    expect(unmeasured.warning).toBeUndefined();
+    expect(unmeasured.unmeasuredProvider).toBeUndefined();
+    const measured = harnessLaunchBudgetDecision({ ...mixed, grokUsedPercent: 48 });
+    expect(measured.decision).toEqual(expect.objectContaining({ action: 'next-provider', provider: 'grok' }));
+    expect(measured.warning).toBeUndefined();
+    const exhausted = harnessLaunchBudgetDecision({ ...mixed, grokUsedPercent: 80 });
     expect(exhausted.decision.action).toBe('stop');
-    expect(exhausted.warning).toBeUndefined();
-    expect(exhausted.unmeasuredProvider).toBeUndefined();
   });
 
   test('empty chain warns once even when default provider usage is unmeasured', () => {

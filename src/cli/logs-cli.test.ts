@@ -7,8 +7,9 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import * as nodeOs from 'node:os';
+import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
+import { withTestHome } from '../../test/helpers/with-test-home.js';
 
 import {
   aggregateListEvents, buildQuery, collectObservedEventNames, effectiveLogLimit, eventCategoryWarning, eventNameDistance, eventNameHint, eventNameVerdict, EVENT_NAME_HINT_SHOWN, EVENT_NAME_HINT_WINDOW_MS, formatLogInstance, formatLogLine, formatRemoteLogLine, grepPhraseWarning, isNameLikeEvent, limitReachedHint, limitReachedJsonMeta, limitReachedStderrSignal, matchesReworkRecurrenceDisagreement, multiSurfaceDuplicateJsonMeta, otherInstanceHint, otherInstanceMajorityWarning, rankNearbyEventNames, renderLogJsonLine, renderRemoteLogJsonLine,
@@ -873,11 +874,7 @@ async function runLogsInProcess(args: string[], env: NodeJS.ProcessEnv): Promise
   const logsCommand = program.commands.find((c) => c.name() === 'logs');
   if (!logsCommand) throw new Error('logs command is not registered');
   const savedEnv = new Map<string, string | undefined>();
-  for (const [key, value] of Object.entries(env)) {
-    if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
+  const { HOME: home, ...otherEnv } = env;
   const stdout: string[] = [];
   const stderr: string[] = [];
   const originalLog = console.log;
@@ -894,43 +891,84 @@ async function runLogsInProcess(args: string[], env: NodeJS.ProcessEnv): Promise
     return true;
   });
   let status = 0;
-  // ⚠️ Bun 의 `os.homedir()` 는 `process.env.HOME` 을 바꿔도 «안 따라온다»(실측) — 레지스트리
-  //   (`~/.elanous/logs/instances.json`)가 운영 홈을 읽게 된다. ⇒ HOME 을 준 호출은 homedir 도 같이 돌린다.
-  const homeSpy = typeof env.HOME === 'string' ? spyOn(nodeOs, 'homedir').mockReturnValue(env.HOME) : undefined;
-  console.log = ((...items: unknown[]) => { stdout.push(`${items.map(String).join(' ')}\n`); }) as typeof console.log;
-  console.error = ((...items: unknown[]) => { stderr.push(`${items.map(String).join(' ')}\n`); }) as typeof console.error;
-  console.warn = console.error;
-  process.stdout.write = sink(stdout) as typeof process.stdout.write;
-  process.stderr.write = sink(stderr) as typeof process.stderr.write;
-  process.exit = ((code?: number) => { throw Object.assign(new Error('process.exit'), { exitCode: code ?? 0 }); }) as typeof process.exit;
-  logsCommand.exitOverride();
-  try {
-    process.exitCode = 0;
-    await logsCommand.parseAsync(args, { from: 'user' });
-    status = Number(process.exitCode ?? 0);
-  } catch (error) {
-    const exitCode = (error as { exitCode?: number }).exitCode;
-    if (typeof exitCode !== 'number') throw error;
-    status = exitCode;
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-    console.warn = originalWarn;
-    process.stdout.write = originalOut;
-    process.stderr.write = originalErr;
-    process.exit = originalExit;
-    homeSpy?.mockRestore();
-    // ⚠️ Bun 은 `process.exitCode = undefined` 로는 안 되돌아간다 — 0 으로 되돌린다.
-    process.exitCode = savedExitCode ?? 0;
-    for (const [key, value] of savedEnv) {
+  const run = async () => {
+    if (Object.hasOwn(env, 'HOME') && home === undefined) {
+      savedEnv.set('HOME', process.env.HOME);
+      delete process.env.HOME;
+    }
+    for (const [key, value] of Object.entries(otherEnv)) {
+      savedEnv.set(key, process.env[key]);
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-  }
+    console.log = ((...items: unknown[]) => { stdout.push(`${items.map(String).join(' ')}\n`); }) as typeof console.log;
+    console.error = ((...items: unknown[]) => { stderr.push(`${items.map(String).join(' ')}\n`); }) as typeof console.error;
+    console.warn = console.error;
+    process.stdout.write = sink(stdout) as typeof process.stdout.write;
+    process.stderr.write = sink(stderr) as typeof process.stderr.write;
+    process.exit = ((code?: number) => { throw Object.assign(new Error('process.exit'), { exitCode: code ?? 0 }); }) as typeof process.exit;
+    logsCommand.exitOverride();
+    try {
+      process.exitCode = 0;
+      await logsCommand.parseAsync(args, { from: 'user' });
+      status = Number(process.exitCode ?? 0);
+    } catch (error) {
+      const exitCode = (error as { exitCode?: number }).exitCode;
+      if (typeof exitCode !== 'number') throw error;
+      status = exitCode;
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+      console.warn = originalWarn;
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      process.exit = originalExit;
+      // ⚠️ Bun 은 `process.exitCode = undefined` 로는 안 되돌아간다 — 0 으로 되돌린다.
+      process.exitCode = savedExitCode ?? 0;
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  };
+  if (typeof home === 'string') await withTestHome(home, run);
+  else await run();
   return { status, stdout: stdout.join(''), stderr: stderr.join('') };
 }
 
 describe('runLogsCli — 사람용 출력 wiring', () => {
+  it('in-process registry lookup reads the fixture HOME, never the operating home registry', async () => {
+    const operatingRegistry = join(homedir(), '.elanous', 'logs', 'instances.json');
+    const home = mkdtempSync(join(tmpdir(), 'elanous-logs-home-guard-'));
+    const stateDir = join(home, '.elanous');
+    const fixtureRegistry = join(stateDir, 'logs', 'instances.json');
+    new LogStore(join(stateDir, 'logs', 'logs.db')).close();
+    writeFileSync(fixtureRegistry, JSON.stringify({ instances: [] }));
+    let operatingReads = 0;
+    let fixtureReads = 0;
+    const originalRead = nodeFs.readFileSync;
+    const readSpy = spyOn(nodeFs, 'readFileSync');
+    readSpy.mockImplementation(((...args: unknown[]) => {
+      const path = args[0];
+      if (String(path) === operatingRegistry) {
+        operatingReads += 1;
+        throw new Error('operating home registry read blocked');
+      }
+      if (String(path) === fixtureRegistry) fixtureReads += 1;
+      return (originalRead as (...args: unknown[]) => unknown)(...args);
+    }) as typeof readFileSync);
+    try {
+      const result = await runLogsInProcess(['--instance', 'prod', '--limit', '1'],
+        { HOME: home, ELANOUS_STATE_DIR: stateDir, ELANOUS_CONFIG_DIR: stateDir });
+      expect(result.status).toBe(0);
+      expect(fixtureReads).toBeGreaterThan(0);
+      expect(operatingReads).toBe(0);
+    } finally {
+      readSpy.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   function runLogs(args: string[], home: string, env: NodeJS.ProcessEnv = {}) {
     return runLogsInProcess(args, { HOME: home, TZ: 'UTC', ...env });
   }

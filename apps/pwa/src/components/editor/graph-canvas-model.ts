@@ -7,6 +7,7 @@ import {
   readRunGraphYaml,
   writeRunGraphYaml,
 } from '@/lib/run-graph-yaml-edit';
+import { layeredPositions } from '@/lib/graph-edge-route';
 
 /** Pure model behind the custom graph canvas (CGE-EDIT). No DOM — every edit returns a new graph.
  *  YAML goes through the existing run-graph-yaml-edit helpers; the server loader stays the authority
@@ -314,29 +315,44 @@ export function fromYaml(text: string): CanvasGraph {
     return [];
   });
   const entry = typeof raw.entry_node === 'string' ? raw.entry_node : nodes[0]?.id ?? null;
-  // Rank = shortest hop count from the entry; unreachable nodes go one column past the last.
-  const rank = new Map<string, number>();
-  if (entry) rank.set(entry, 0);
-  const queue = entry ? [entry] : [];
-  while (queue.length) {
-    const id = queue.shift()!;
-    for (const edge of edges) if (edge.from === id && !rank.has(edge.to)) { rank.set(edge.to, rank.get(id)! + 1); queue.push(edge.to); }
-  }
-  const maxRank = Math.max(0, ...rank.values());
-  const rows = new Map<number, number>();
-  for (const node of nodes) {
-    const column = rank.get(node.id) ?? maxRank + 1;
-    const row = rows.get(column) ?? 0;
-    rows.set(column, row + 1);
-    node.x = 40 + column * 260;
-    node.y = 40 + row * 160;
-  }
+  // GRAPH-EDGE-TIDY — layered layout ranked by forward edges only (a skip branch gets its own lane).
+  placeNodes(nodes, edges, entry, 'horizontal');
   const known = new Set(nodes.map((node) => node.id));
   const terminals = (Array.isArray(raw.terminal_nodes) ? raw.terminal_nodes : []).filter((id): id is string => typeof id === 'string' && known.has(id));
   return {
     graphId: typeof raw.graph_id === 'string' ? raw.graph_id : 'my-graph', entry, terminals, nodes, edges,
     ...extrasOf(raw, ['graph_id', 'entry_node', 'terminal_nodes', 'nodes', 'edges']),
   };
+}
+
+/** Card box the canvas lays out and routes with (GraphCanvasEditor fixes the card width to this). */
+export const CANVAS_NODE_SIZE = { width: 180, height: 72 } as const;
+/** Edge label text on the canvas — `fail` reads as «실패 시». */
+export function canvasOutcomeLabel(outcome: string): string {
+  return outcome === 'fail' ? '실패 시' : outcome;
+}
+
+function placeNodes(nodes: CanvasNode[], edges: readonly CanvasEdge[], entry: string | null, flow: CanvasFlow, lineLength?: number): void {
+  const positions = layeredPositions(nodes.map((node) => ({ id: node.id, ...CANVAS_NODE_SIZE })), edges,
+    { entry, flow, rename: canvasOutcomeLabel, ...(lineLength !== undefined ? { lineLength } : {}) });
+  for (const node of nodes) {
+    const at = positions.get(node.id);
+    if (at) { node.x = at.x; node.y = at.y; }
+  }
+}
+
+/** Re-run the layered layout (the canvas calls it on load, on a width change and after each wizard turn until a
+ *  card is dragged). `lineLength` = flow px available along the reading direction at the zoom the canvas keeps; a
+ *  longer chain wraps onto the next line instead of shrinking. */
+export function autoLayoutToFit(graph: CanvasGraph, flow: CanvasFlow, lineLength: number | undefined): CanvasGraph {
+  const nodes = graph.nodes.map((node) => ({ ...node }));
+  placeNodes(nodes, graph.edges, graph.entry, flow, lineLength);
+  return { ...graph, nodes };
+}
+
+/** One-line layered layout (no wrap) — kept for callers that do not know the canvas size. */
+export function autoLayout(graph: CanvasGraph, flow: CanvasFlow = 'horizontal'): CanvasGraph {
+  return autoLayoutToFit(graph, flow, undefined);
 }
 
 function extrasOf(source: Record<string, unknown>, known: readonly string[]): { extra?: Record<string, unknown> } {

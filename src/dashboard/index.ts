@@ -769,6 +769,15 @@ export function clearEscAbortToolState(toolState: EscAbortToolState): void {
   toolState.activeToolNamesByCallId.clear();
 }
 
+export function activeEscHarnessSpace(
+  toolState: EscAbortToolState,
+  spacesByCallId: ReadonlyMap<string, string>,
+): string | null {
+  const active = [...toolState.activeToolNamesByCallId].filter(([, name]) =>
+    (SELF_IMPLEMENT_TOOL_NAMES as readonly string[]).includes(name));
+  return active.length === 1 ? spacesByCallId.get(active[0]![0]) ?? null : null;
+}
+
 /** Reset per-turn ESC tool tracking before a new stream runtime begins. */
 export function createDashboardTurnStreamRuntimeEscBoundary(toolState: EscAbortToolState): void {
   clearEscAbortToolState(toolState);
@@ -1324,6 +1333,8 @@ import {
   PULSE_HALF_PERIOD_MS,
 } from '../agent-activity-hud.js';
 import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
+import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-inbox.js';
+import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/self-implement-runtime.js';
 import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
 import { createSshPickerModal } from '../ssh/ssh-picker-modal.js';
@@ -6700,6 +6711,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
    * this function is invoked.
    */
   const escAbortToolState = createEscAbortToolState();
+  const escHarnessSpacesByCallId = new Map<string, string>();
+  setSelfImplementSoftStopSpaceObserver((callId, spaceId) => {
+    const toolName = escAbortToolState.activeToolNamesByCallId.get(callId);
+    if (toolName && (SELF_IMPLEMENT_TOOL_NAMES as readonly string[]).includes(toolName)) {
+      escHarnessSpacesByCallId.set(callId, spaceId);
+    }
+  });
   let clarificationModalId: string | null = null;
 
   const attachChatStreamingKeys = (abortCtrl: AbortController): () => void => {
@@ -6713,6 +6731,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // so the user can make an informed call.
     let abortGateModalId: string | null = null;
     const showHarnessEscHint = createHarnessEscHint((line) => pushChatLine(line));
+    let stoppedHarnessSpace: string | null = null;
+    const activeHarnessSpace = (): string | null => activeEscHarnessSpace(escAbortToolState, escHarnessSpacesByCallId);
     const escGate = createEscAbortGate({
       abortCtrl,
       getRunningCount: () => getEscAbortRunningCount(escAbortToolState),
@@ -6726,14 +6746,25 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       requestRedraw: () => draw(),
       getTheme: () => currentThemeTokens(),
       getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState),
+      shouldAbortImmediately: () => activeHarnessSpace() !== null,
       onAbortPending: ({ targets }) => {
-        if (!showHarnessEscHint(targets)) {
+        const spaceId = activeHarnessSpace();
+        if (spaceId) {
+          try {
+            enqueueSoftStop(spaceId);
+            if (readSoftStopRequestStatus(spaceId).status !== 'present') throw new Error('soft-stop marker not persisted');
+            stoppedHarnessSpace = spaceId;
+            pushChatLine('  ⏹ 멈췄다 — 해당 하니스 런에 중단 요청을 보냈습니다.');
+          } catch {
+            pushChatLine('  ⚠ 하니스 런 중단 요청을 보내지 못했습니다. /harness runs 에서 확인해 주세요.');
+          }
+        } else if (!showHarnessEscHint(targets)) {
           pushChatLine(`  ⏳ 중단 요청됨 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
         }
         chatScrollOffset = -1;
       },
       onAbortRepeat: ({ repeat, targets }) => {
-        if (!showHarnessEscHint(targets)) {
+        if (!stoppedHarnessSpace && !showHarnessEscHint(targets)) {
           pushChatLine(`  ⏳ ESC 재시도 ${repeat}회 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
         }
         chatScrollOffset = -1;
@@ -7251,7 +7282,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     return () => {
       cleanup();
       escGate.dispose();
-      settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
+      if (!stoppedHarnessSpace) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
       userScrolledDuringStream = false;
       streamingInFlight = false;
     };
@@ -15674,6 +15705,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             pushChatLine,
             draw,
             signal: acpTurnRef.abortCtrl?.signal ?? new AbortController().signal,
+            toolCallId: ctx?.callId,
             // ⛔⭐ 폴백은 `''` 가 아니라 `undefined` 다 — 「안 넘김」과 「말했는데 어휘가 없음」은 «다른 값»이다.
             //   harnessMentionState(session-runtime 소비처)는 `undefined → 'absent'` · `'' → 'not-matched'` 로
             //   가른다. `?? ''` 로 접으면 그 둘이 같은 값이 되고, 그것이 2026-08-06 에 「TUI 가 하니스에게
@@ -15695,9 +15727,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             ptyDashboardOn:
               uc.shell.allowDashboardPty === true && (acpPtyAvailable?.() ?? false),
             getToolRuntime: (toolName) => runtime.getToolRuntime(toolName),
-            dispatchToolRuntime: (toolName, input) =>
+            dispatchToolRuntime: (toolName, input, toolCallId) =>
               runtime.dispatchToolByName(toolName, input, {
                 surface: 'tui',
+                toolCallId,
                 signal: acpTurnRef.abortCtrl?.signal,
                 // ⭐ Agent-family context. Without these two the sub-agent runs
                 //  text-only (see getTools above). `agentDispatchTool` routes the
@@ -19171,6 +19204,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             createTurnStreamRuntime: (initialAssistantStart) => {
               latestTurnUsage = undefined;
               createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);
+              escHarnessSpacesByCallId.clear();
               liveTypeaheadEchoes.length = 0;
               const toolRendering = {
                 ...getUserConfig().chat.rendering.tool,
@@ -19225,6 +19259,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   const toolCall = call as DashboardTurnStreamCall;
                   turnStreamRuntime.onToolResult(toolCall);
                   settleEscAbortToolCall(escAbortToolState, toolCall);
+                  escHarnessSpacesByCallId.delete(toolCall.id);
                 },
               };
             },
@@ -19524,6 +19559,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     closeDashboardTui();
     throw err;
   } finally {
+    setSelfImplementSoftStopSpaceObserver(null);
     if (tuiSeatAskTimer) clearInterval(tuiSeatAskTimer);
   }
 }

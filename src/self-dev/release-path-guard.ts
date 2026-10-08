@@ -1,6 +1,9 @@
-// Release path = what publishing reads directly: the release scripts and graph, plus the manifest, release notes and cut schedule
-// in `src/release-loop/`. The checklist store (`checklist.ts`, `feature-store.ts`) is shared ops ledger code — the gate catches its regressions (OP 10-03).
-export const RELEASE_PATH_PREFIXES = ['scripts/release-loop/', 'graphs/release/', 'src/release-loop/manifest', 'src/release-loop/release-note', 'src/release-loop/release-schedule'] as const;
+// Release path = release scripts and graph, manifest, notes and cut schedule, plus gate execution modules
+// imported by scripts/release-loop/gate-node.ts (pod-command-job → pod-pool → pod-lease; pod-bun-cache; pod-install-slots; gate-shards).
+// The checklist store (`checklist.ts`, `feature-store.ts`) remains shared ops ledger code (OP 10-03).
+export const RELEASE_PATH_PREFIXES = ['scripts/release-loop/', 'graphs/release/', 'src/release-loop/manifest', 'src/release-loop/release-note', 'src/release-loop/release-schedule',
+  'src/task-orchestrator/surfaces/pod-command-job.ts', 'src/task-orchestrator/surfaces/pod-pool.ts', 'src/task-orchestrator/surfaces/pod-lease.ts',
+  'src/task-orchestrator/surfaces/pod-bun-cache.ts', 'src/task-orchestrator/surfaces/pod-install-slots.ts', 'src/release-loop/gate-shards.ts'] as const;
 export const RELEASE_PATH_LABEL = 'elanous:release-path';
 
 /** Flatten every GitHub PR file page, including the source of a rename. */
@@ -35,7 +38,7 @@ export function releaseGitDiffPaths(output: string): string[] {
 
 /** Evaluate the paths from the opened PR, not the requested goal or local working tree. */
 export function releasePathHold(paths: readonly string[]): string | undefined {
-  return paths.find((path) => RELEASE_PATH_PREFIXES.some((prefix) => path.startsWith(prefix)));
+  return paths.find((path) => RELEASE_PATH_PREFIXES.some((prefix) => prefix.endsWith('.ts') ? path === prefix : path.startsWith(prefix)));
 }
 
 /** Fixed opening of the hold comment — also how a PR held by several merge surfaces (or polls) is recognised, so it is posted once. */

@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { TelegramBot, type TgCallbackQuery, type TgMessageReaction } from './telegram.js';
+import type { ContextNowAnswer } from './context-bus/context-now.js';
+import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+
+// The first ordinary turn sends a context-first summary. Pin its source so the gate
+// test never reads the host's real release/decision ledgers (slow and host-dependent).
+const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [], events: [], guide: [] };
+const CONTEXT_SUMMARY = renderTelegramNow(CONTEXT_NOW);
 
 type ApiCall = { method: string; body: Record<string, unknown> };
 
@@ -68,6 +75,7 @@ function setup(allowedUsers: number[], updates: TestUpdate[], nowImpl?: () => nu
   }) as typeof fetch;
   bot = new TelegramBot({
     token: '123:test', allowedUsers, fetchImpl, perChatGapMs: 0,
+    readContextNow: () => CONTEXT_NOW,
     ...(nowImpl ? { nowImpl } : {}),
     log: (line) => logs.push(line),
     onMessage: async (ctx) => { turns.push(ctx.userId); },
@@ -129,7 +137,10 @@ describe('telegram owner gate', () => {
     await bot.start();
     expect(turns).toEqual([10]);
     expect(triggers).toEqual(['message']);
-    expect(api(calls, 'sendMessage')).toEqual([{ chat_id: 10, text: '⏳ Working…', reply_to_message_id: 1 }]);
+    expect(api(calls, 'sendMessage')).toEqual([
+      { chat_id: 10, text: CONTEXT_SUMMARY, reply_to_message_id: 1 },
+      { chat_id: 10, text: '⏳ Working…', reply_to_message_id: 1 },
+    ]);
   });
 
   test('only the owner can complete a pending text capture in a shared chat', async () => {

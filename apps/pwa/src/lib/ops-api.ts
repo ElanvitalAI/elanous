@@ -11,7 +11,7 @@ export interface GateShard {
 }
 export interface GateShards {
   version: string; updatedAt: string; shards: GateShard[];
-  summary: { total: number; counts: Record<GateShardState, number>; waitReasons: Array<{ reason: string; count: number }>; etaMin: number | null; staleMin: number | null; overrunMin?: number };
+  summary: { total: number; counts: Record<GateShardState, number>; waitReasons: Array<{ reason: string; count: number }>; etaMin: number | null; staleMin: number | null; overrunMin?: number; doneWithFailures?: number };
 }
 export interface ReleaseRun {
   runId: string;

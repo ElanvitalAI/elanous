@@ -79,6 +79,44 @@ A run's graph is shaped twice:
 
 The supervisor **chooses from a catalog and fills in arguments; code checks every insertion** (the node exists in the catalog, its inputs are satisfied, the graph still reaches an end, the visit budget holds). It never writes a graph freely. Each run records its template plus the ordered list of changes, so a resumed run — or the same run on another machine — rebuilds the same graph.
 
+## The whole run is a graph, not only its middle
+
+A harness run is more than *plan → build → verify → land*. Before the build there is intake, a launch queue, a pre-launch check and the choice of where to run; on a remote pod there is admission, image sync and credential refresh; around landing there is a merge freeze, a hold queue and cleanup; after a failure there is result parsing, salvage of partial work and healing.
+
+All of those stages are now **declared as nodes** in the implement graph, grouped by phase:
+
+| Group | Nodes | What the node decides or records |
+|---|---|---|
+| entry | intake · queue · pre-launch check | queued or direct · launched, waiting or refused · pass or refuse |
+| dispatch | dispatch | local or remote |
+| remote dispatch | pool admission · image sync · credential refresh | admitted or refused · current or synced · usable or exhausted |
+| build · verify · land | author · plan · decompose · implement · gate · review · rework · main sync · pull request · merge | (the stages above, unchanged) |
+| land | freeze check · hold · cleanup | open, frozen or taken · queued for a person · completed, preserved or failed |
+| recover | result parse · salvage · heal · next move | why a remote run failed · partial work pushed or not · a heal case opened or folded · what to try next |
+| end | stopped | where and why a run ended early |
+
+Every one of these nodes — except image sync and next move, which are declared but not yet observed — leaves an **entry and an exit record** — with its outcome label — from the place in the code where the stage actually happens, and one journey key ties the stages before a run exists to the stages after it. A node that throws records `error` on its way out; a node whose outcome ends the run also records where the run stopped.
+
+Branches are **data**: an edge reads a state value (`on:`) and maps each value to the next node (`map:`). The default graph is the full set; the environment (local or remote, freeze, queue settings) arrives as state values and simply takes a different label. Skipping a stage never deletes a node — an overlay that would make any node unreachable is refused.
+
+How far "the graph controls the run" goes today, honestly:
+
+| Step | What it means | Status |
+|---|---|---|
+| 1 | every stage declared as a node and observed at its real place in the code | 🔄 done on the main branch — ships with the next release |
+| 2 | the graph, not the code, picks the next node — starting with the entry queue branch; the other branches are recorded as "edge taken", not yet steered | 🔄 the entry branch is done on the main branch (next release) · the rest is in progress |
+| 2b | the same journey nodes in the research, document and operate graphs; phase groups callable as one sub-graph node | 📋 designed |
+| 3 | the graph runner picks each node's recipe and enforces its visit budget | 📋 designed |
+
+To see a run's whole journey:
+
+```bash
+elanous logs --all --include-test --event pipeline-node-entry --since 1d --json --json-data
+elanous logs --all --include-test --event pipeline-node-exit  --since 1d --json --json-data
+```
+
+Filter on `data.phase == "journey"` and group by `data.node` (and `data.outcome` for exits). Runs that started before the journey nodes were declared have no early-stage records — measure coverage only on newer runs.
+
 ## A catalog built from parts elanous already has
 
 The node catalog lists roles — *review*, *verify*, *triage*, *observe logs*, *ground externally*, *approval*, *release*, … — and maps each to the component that already does it. It marks where the same role has several implementations, so they can be consolidated rather than multiplied.
@@ -99,7 +137,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 
 | | Status (✅ in the latest release · ✅ in v0.2.5 · 🔄 in progress · 📋 designed) |
 |---|---|
-| Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every step |
+| Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every pipeline step · 🔄 the stages around the pipeline (intake, dispatch, landing, recovery) are now declared and observed as nodes; the graph steers the entry branch first (next release) — see [The whole run is a graph](#the-whole-run-is-a-graph-not-only-its-middle) |
 | Graph runner with approval pauses and resume (`elanous graph run` · `graph approve` · `graph run --resume`) | ✅ ships |
 | Run contract: local or remote (pod) | ✅ declared and resolved at run start |
 | Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · ✅ 0.2.3 heal roles execute through their recipes — other roles do not yet execute by role name · 🔄 the harness templates still use their own node names; mapping them to catalog role names is in progress |

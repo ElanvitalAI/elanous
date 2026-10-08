@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { judgeTypeRequest, TYPE_TEXT_MAX, type TypeTarget } from './bot-type-request.js';
 
 const HOSTS = ['news.ycombinator.com'];
@@ -80,8 +80,13 @@ describe('⌨️ judgeTypeRequest — 「이 칸에 이 글을 쳐도 되나」'
   });
 });
 
-describe('🔒 드라이버의 «계약» — 안전 주장이 코드에서 조용히 무너지지 못하게', () => {
-  const RAW = readFileSync(new URL('./bot-type.ts', import.meta.url).pathname, 'utf8');
+// 🧭 드라이버는 `scripts/botlab/bot-type.ts` 에 남았고 이 시험만 #20345 에서 `src/harness/` 로 옮겨졌다
+//    (옛 `./bot-type.ts` 는 ENOENT 로 파일 전체를 [error] 로 만들었다). 공개본은 `scripts/botlab/**` 를
+//    빼므로(release/public-export.yaml) 그때만 계약 시험을 건너뛴다.
+const BOT_TYPE_DRIVER = new URL('../../scripts/botlab/bot-type.ts', import.meta.url).pathname;
+
+describe.skipIf(!existsSync(BOT_TYPE_DRIVER))('🔒 드라이버의 «계약» — 안전 주장이 코드에서 조용히 무너지지 못하게', () => {
+  const RAW = existsSync(BOT_TYPE_DRIVER) ? readFileSync(BOT_TYPE_DRIVER, 'utf8') : '';
   /**
    * ⛔⭐ **주석을 «빼고» 본다** — 첫 판은 `/json/new` 와 `process.exit(` 를
    *    ***「그것을 쓰지 마라」고 적은 주석»***에서 찾아 «거짓 빨강»을 냈다.

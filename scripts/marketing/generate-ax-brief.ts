@@ -1,10 +1,11 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { FEATURE_MATURITY } from '../../src/maturity/feature-maturity.js';
 import type { ChecklistItem } from '../../src/release-loop/checklist.js';
 import type { ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
 import type { MergedRunLedgerQuery } from '../../src/self-implement/run-ledger.js';
 import { generateFeatureMap } from './generate-feature-map.js';
+import { draftReleaseStory } from '../release-story/draft.js';
 
 const MAP = resolve(import.meta.dir, '../../docs/marketing/MAP-value-props-to-features.md');
 const AUTONOMY = new Set(['ORCH1', 'ORCH2', 'LOOP-LIVE1', 'AUTOQ-LOOP', 'AUTHOR-PAR', 'RUN-HELPER', 'FINISH-RATE']);
@@ -108,6 +109,22 @@ export function generateAxBrief(version: string, sources: AxBriefSources): strin
     '5. **지식 팩** — 사내 문서·절차를 팩으로(로드맵 §3 · 유료 판매는 결정 뒤).',
     '',
   ].join('\n');
+}
+
+/** Derive the next release's internal brief from its ledgers and the RELEASE-STORY version-note draft.
+ * The release loop supplies its version, ledger sources and isolated story paths; the standalone CLI stays unchanged. */
+export function generateNextVersionAxBrief(
+  nextVersion: string,
+  sources: AxBriefSources,
+  storyOptions: Omit<Parameters<typeof draftReleaseStory>[0], 'version'> = {},
+): string {
+  const brief = generateAxBrief(nextVersion, sources);
+  const story = draftReleaseStory({ ...storyOptions, version: nextVersion });
+  const announcementFile = story.files.find((file) => basename(file) === 'announcement.md');
+  const announcement = story.status === 'drafted' && announcementFile
+    ? readFileSync(announcementFile, 'utf8').replace(/^# [^\r\n]*\r?\n/, '').trim()
+    : '사용자 대상 변경 없음 — RELEASE-STORY 초안을 건너뜀';
+  return `${brief}\n## 5. 다음 판 변화·근거 (RELEASE-STORY 초안)\n\n> 공개 전 CMO 확인 필요 · 원천: release/next.md, 해당 판의 green 칸, 연결된 검증 소구점 원장\n\n${announcement}\n`;
 }
 
 if (import.meta.main) {

@@ -18,6 +18,9 @@ import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/po
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
+import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
+import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
+import { setJourneyOverlaysForTesting } from '../self-dev/graph-journey-route.js';
 import {
   DEFAULT_HARNESS_PROCESS_THRESHOLDS,
   HARNESS_PROCESS_LONG_RUNNING_ELAPSED_SECONDS,
@@ -318,6 +321,43 @@ describe('harness CLI command', () => {
       expect(log.mock.calls.filter(([category]) => category === 'harness.queue')).toEqual([]);
     } finally {
       log.mockRestore(); process.exitCode = oldExit ?? 0; setUserConfigOverlay(null);
+      if (oldFlag === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY; else process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = oldFlag;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('HARNESS-FULL-GRAPH 2판: a launch overlay routing intake.direct → queue sends a real say into the queue with directSay off; --no-queue still wins', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-queue-graph-'));
+    const launches: string[][] = [];
+    const queue: HarnessQueueDeps = { root, authorShadow: () => {}, idleRequest: () => {},
+      processes: () => [], pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 8 }),
+      launch: async (_item, args) => { launches.push(args); return 901; }, log: () => {} };
+    let direct = 0;
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+      say: async () => { direct += 1; }, queue });
+    const intakeEdge = GRAPH_SPECS['self-implement']!.edges.findIndex((edge) => edge.from === 'intake');
+    const oldExit = process.exitCode;
+    const oldFlag = process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+    try {
+      delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY;
+      setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, queue: { ...config.harness?.queue, directSay: false } } }));
+      setJourneyOverlaysForTesting([{
+        overlayId: 'always-queue-tc', target: 'self-implement', stage: 'launch', appliesWhen: 'seat == TC',
+        patch: [{ op: 'replace', path: `/edges/${intakeEdge}/map/direct`, value: 'queue' }],
+      } as GraphOverlaySpec]);
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'graph routed', '--seat', 'TC', '--substrate', 'local']);
+      expect(direct).toBe(0);
+      expect(launches).toEqual([['harness', 'say', 'graph routed', '--seat', 'TC', '--substrate', 'local']]);
+      expect(listHarnessQueue(queue)).toMatchObject([{ status: 'launched', seat: 'TC', input: 'graph routed' }]);
+      // The overlay's condition does not hold for MK, and --no-queue is a precondition the graph cannot override.
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'other seat', '--seat', 'MK', '--substrate', 'local']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'emergency', '--seat', 'TC', '--substrate', 'local', '--no-queue']);
+      expect(direct).toBe(2);
+      expect(launches).toHaveLength(1);
+    } finally {
+      setJourneyOverlaysForTesting(undefined); setUserConfigOverlay(null); process.exitCode = oldExit ?? 0;
       if (oldFlag === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY; else process.env.ELANOUS_HARNESS_QUEUE_DIRECT_SAY = oldFlag;
       rmSync(root, { recursive: true, force: true });
     }

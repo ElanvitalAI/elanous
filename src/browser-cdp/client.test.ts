@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { getDefaultConfirmChannels, registerDefaultConfirmChannels } from '../hitl/confirm.js';
 
 import {
   createCdpClient,
@@ -10,6 +11,7 @@ import {
   type CdpTransport,
 } from './client.js';
 import { performBrowserAction } from '../harness/browser-act.js';
+import { browserNavigateRuntime, setBrowserRuntimeDeps } from '../tool-runtime/browser-runtime.js';
 
 function pendingTransport(): CdpTransport {
   return {
@@ -317,6 +319,243 @@ describe('CDP client watchdog', () => {
       { expression: 'measure', returnByValue: true, awaitPromise: true },
     ]);
     await client.close();
+  });
+
+  test('attached page dispatches a primary click and inserts unicode text via the same CDP transport', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    const client = await createCdpClientFromEndpoint(9222, {
+      resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+      fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+      createTransport: async () => ({
+        send: async (method, params) => { calls.push({ method, params }); return {}; },
+        close() {},
+      }),
+    });
+
+    await client.click!({ x: 120, y: 80 });
+    await client.input!('한글 🖱️');
+    expect(calls).toEqual([
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 120, y: 80, button: 'left', clickCount: 1 } },
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: 120, y: 80, button: 'left', clickCount: 1 } },
+      { method: 'Input.insertText', params: { text: '한글 🖱️' } },
+    ]);
+    await client.close();
+  });
+
+  test('input preserves the shared CDP watchdog and identifies the timed-out command', async () => {
+    const client = await createCdpClientFromEndpoint(9222, {
+      resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+      fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+      createTransport: async () => pendingTransport(),
+      timeoutMs: 20,
+    });
+    try {
+      await expect(client.input!('text')).rejects.toEqual(expect.objectContaining({
+        name: 'CdpTimeoutError', method: 'Input.insertText', timeoutMs: 20,
+      }));
+    } finally {
+      await client.close();
+    }
+  });
+
+  test('spawned client reaches the shared page transport when inserting text', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    const client = await createCdpClient({ binary: '/fake/chrome' }, {
+      spawnBinary: () => ({ pid: 123, kill: () => true }) as unknown as import('node:child_process').ChildProcess,
+      resolveUrl: async () => 'ws://fake',
+      createTransport: async () => ({
+        send: async (method, params) => {
+          calls.push({ method, params });
+          return method === 'Target.getTargets' ? { targetInfos: [{ targetId: 'tab-1', type: 'page', url: 'about:blank' }] } : {};
+        },
+        close() {},
+      }),
+    });
+    try {
+      await client.input!('approved text');
+      expect(calls).toEqual([
+        { method: 'Target.getTargets', params: undefined },
+        { method: 'Input.insertText', params: { text: 'approved text' } },
+      ]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test('spawned client refuses text input when target discovery finds no page', async () => {
+    const calls: string[] = [];
+    const client = await createCdpClient({ binary: '/fake/chrome' }, {
+      spawnBinary: () => ({ pid: 123, kill: () => true }) as unknown as import('node:child_process').ChildProcess,
+      resolveUrl: async () => 'ws://fake',
+      createTransport: async () => ({
+        send: async (method) => {
+          calls.push(method);
+          return method === 'Target.getTargets' ? { targetInfos: [] } : {};
+        },
+        close() {},
+      }),
+    });
+    try {
+      await expect(client.input!('text')).rejects.toThrow('no page target');
+      expect(calls).toEqual(['Target.getTargets']);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test('unarmed browser action sends no CDP commands, while armed action reaches the CDP click after load', async () => {
+    const calls: string[] = [];
+    const events: Array<(event: { method: string; params: Record<string, unknown> }) => void> = [];
+    const connect = () => createCdpClientFromEndpoint(9222, {
+      resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+      fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+      createTransport: async () => ({
+        send: async (method) => {
+          calls.push(method);
+          if (method === 'Page.navigate') {
+            queueMicrotask(() => events.forEach(listener => listener({
+              method: 'Page.lifecycleEvent', params: { name: 'load', frameId: 'frame', loaderId: 'loader' },
+            })));
+            return { frameId: 'frame', loaderId: 'loader' };
+          }
+          if (method === 'Runtime.evaluate') return { result: { value: { x: 120, y: 80, kind: 'navigation' } } };
+          if (method === 'Page.captureScreenshot') return { data: Buffer.from('png').toString('base64') };
+          return {};
+        },
+        on: (_method, listener) => { events.push(listener); return () => { events.splice(events.indexOf(listener), 1); }; },
+        close() {},
+      }),
+    });
+    const request = { url: 'https://example.test', target: '#next' };
+    const deps = { connect, reclaimOpenedTabs: false, loadWaitTimeoutMs: 50,
+      saveAttachment: async () => ({ ok: true, entry: { path: 'test.png' } }) as never,
+      observe: () => {},
+    };
+    expect((await performBrowserAction({ ...request, armed: false }, deps)).ok).toBe(false);
+    expect(calls).toEqual([]);
+    expect((await performBrowserAction({ ...request, armed: true }, deps)).ok).toBe(true);
+    expect(calls.filter(method => method === 'Input.dispatchMouseEvent')).toHaveLength(2);
+  });
+
+  test('BrowserNavigate requires approval before connection and sends input only after target inspection', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    const originalChannels = getDefaultConfirmChannels();
+    registerDefaultConfirmChannels([]);
+    let connects = 0;
+    let inspected = true;
+    let pageUrl = 'https://example.test/';
+    setBrowserRuntimeDeps({
+      getClient: async () => {
+        connects++;
+        return createCdpClientFromEndpoint(9222, {
+          resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+          fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+          createTransport: async () => ({
+            send: async (method, params) => {
+              calls.push({ method, params });
+              if (method === 'Page.navigate') return { frameId: 'frame', loaderId: 'loader' };
+              if (method === 'Runtime.evaluate') {
+                const expression = String(params?.expression);
+                return { result: { value: expression.includes('getAttribute')
+                  ? (inspected ? { tag: 'input', type: 'text', name: 'q', id: 'query', contentEditable: false, inForm: true } : null)
+                  : expression.includes('element.focus()') ? true : pageUrl } };
+              }
+              return {};
+            },
+            close() {},
+          }),
+        });
+      },
+      observe: () => {},
+    });
+    const req = { url: 'https://example.test/', waitForLoad: false, input: { selector: '#query', text: '승인된 입력' } };
+    const answer = (value: boolean | (() => never)) => ({ surface: 'tui' as const, confirmChannels: [{
+      name: 'test' as const, request: async () => (typeof value === 'function' ? value() : value), cancel: () => {},
+    }] });
+    try {
+      expect((await browserNavigateRuntime.run(req, { surface: 'tui' })).output).toContain('not approved');
+      expect((await browserNavigateRuntime.run(req, answer(false))).output).toContain('not approved');
+      expect((await browserNavigateRuntime.run(req, answer(() => { throw new Error('confirmation unavailable'); }))).output).toContain('not approved');
+      // The shell-command approver never authorizes browser input, even when it auto-allows.
+      expect((await browserNavigateRuntime.run(req, { surface: 'tui', approver: async () => true })).output).toContain('not approved');
+      expect((await browserNavigateRuntime.run({ ...req, input: { ...req.input, text: 'submit\n' } }, answer(true))).output).toContain('invalid input');
+      expect(connects).toBe(0);
+      expect(calls).toEqual([]);
+      const viaChannel = await browserNavigateRuntime.run(req, { surface: 'tui', confirmChannels: [{
+        name: 'test', request: async () => true, cancel: () => {},
+      }] });
+      expect(viaChannel.output).toContain('# BrowserNavigate: https://example.test/');
+      expect(calls.filter(call => call.method === 'Input.insertText')).toHaveLength(1);
+      const confirmations: unknown[] = [];
+      const result = await browserNavigateRuntime.run(req, { surface: 'tui', approver: async () => false, confirmChannels: [{
+        name: 'test', request: async (request) => { confirmations.push(request); return true; }, cancel: () => {},
+      }] });
+      expect(result.output).toContain('# BrowserNavigate: https://example.test/');
+      expect(confirmations).toHaveLength(1);
+      expect(confirmations[0]).toMatchObject({ prompt: 'Browser input on https://example.test/', detail: 'Selector: #query\nText: 승인된 입력' });
+      expect(calls.filter(call => call.method === 'Input.insertText')).toEqual([
+        { method: 'Input.insertText', params: { text: '승인된 입력' } },
+        { method: 'Input.insertText', params: { text: '승인된 입력' } },
+      ]);
+      inspected = false;
+      const before = calls.filter(call => call.method === 'Input.insertText').length;
+      expect((await browserNavigateRuntime.run(req, answer(true))).output).toContain('input error');
+      expect(calls.filter(call => call.method === 'Input.insertText')).toHaveLength(before);
+      inspected = true;
+      pageUrl = 'https://other.example.test/';
+      expect((await browserNavigateRuntime.run(req, answer(true))).output)
+        .toContain('page URL changed after approval');
+      expect(calls.filter(call => call.method === 'Input.insertText')).toHaveLength(before);
+      pageUrl = 'https://example.test/';
+      const withoutSlash = await browserNavigateRuntime.run({ ...req, url: 'https://example.test' }, answer(true));
+      expect(withoutSlash.output).toContain('# BrowserNavigate: https://example.test/');
+      expect(calls.filter(call => call.method === 'Input.insertText')).toHaveLength(before + 1);
+      const plainNavigation = await browserNavigateRuntime.run({ url: req.url, waitForLoad: false }, { surface: 'tui' });
+      expect(plainNavigation.output).toContain('# BrowserNavigate: https://example.test/');
+      expect(calls.filter(call => call.method === 'Input.insertText')).toHaveLength(before + 1);
+    } finally {
+      registerDefaultConfirmChannels(originalChannels);
+      setBrowserRuntimeDeps({ getClient: async () => null, observe: () => {} });
+    }
+  });
+
+  test('input refuses newline before dispatch, preventing an implicit form submission', async () => {
+    const calls: string[] = [];
+    const client = await createCdpClientFromEndpoint(9222, {
+      resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+      fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+      createTransport: async () => ({
+        send: async (method) => { calls.push(method); return {}; },
+        close() {},
+      }),
+    });
+    try {
+      await expect(client.input!('submit\n')).rejects.toThrow('CDP input refuses newlines');
+      expect(calls).toEqual([]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test('CDP input failure propagates to its caller rather than reporting a successful insertion', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    const client = await createCdpClientFromEndpoint(9222, {
+      resolvePage: async () => ({ wsUrl: 'ws://fake', targetId: 'tab-1' }),
+      fetchImpl: (async () => ({ ok: true })) as unknown as typeof fetch,
+      createTransport: async () => ({
+        send: async (method, params) => {
+          calls.push({ method, params });
+          throw new Error('CDP input rejected');
+        },
+        close() {},
+      }),
+    });
+    try {
+      await expect(client.input!('한글 🖱️')).rejects.toThrow('CDP input rejected');
+      expect(calls).toEqual([{ method: 'Input.insertText', params: { text: '한글 🖱️' } }]);
+    } finally {
+      await client.close();
+    }
   });
 
   test('the spawn client applies its configured watchdog during target discovery and releases transport and child on timeout', async () => {

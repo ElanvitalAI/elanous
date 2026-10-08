@@ -635,3 +635,24 @@ describe('/v1/health bind identity', () => {
     }
   });
 });
+
+test('GET /v1/drafts/metrics is bearer-gated and answers from the cached source on every load', async () => {
+  let reads = 0;
+  const snapshot = { state: 'measuring' as const, metrics: null, measuredAt: null, refreshing: true, reason: null };
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false },
+    draftMetrics: { read: () => { reads++; return snapshot; } },
+  });
+  try {
+    const denied = await fetch(`${server.url}/v1/drafts/metrics`, { headers: { 'sec-fetch-site': 'cross-site' } });
+    expect(denied.status).toBe(401);
+    expect(reads).toBe(0);
+    const headers = { 'sec-fetch-site': 'cross-site', authorization: 'Bearer auth' };
+    const ok = await fetch(`${server.url}/v1/drafts/metrics`, { headers });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual(snapshot);
+    const write = await fetch(`${server.url}/v1/drafts/metrics`, { method: 'POST', headers });
+    expect(write.status).toBe(405);
+    expect(reads).toBe(1);
+  } finally { server.stop(); }
+});

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { Children, isValidElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ReleaseRun } from '@/lib/ops-api';
-import { latestReleaseRun, ReleaseStrip } from './ReleaseStrip';
+import { finishedMinutes, latestReleaseRun, ReleaseStrip } from './ReleaseStrip';
 
 const now = Date.parse('2026-10-06T12:00:00Z');
 const run: ReleaseRun = {
@@ -33,7 +33,8 @@ test('선택된 런이 있으면 최신 자동 런보다 우선해 동일한 런
   const older = { ...run, runId: 'older', version: '0.2.8', status: 'done', startedAt: '2026-10-06T10:00:00Z', path: ['older-node'], nodes: [{ nodeId: 'older-node', ok: true, summary: '완료' }] };
   const markup = renderToStaticMarkup(<ReleaseStrip result={ready([run, older])} selectedRun={older} onSelect={() => {}} now={now} />);
   expect(markup).toContain('발행 0.2.8');
-  expect(markup).toContain('older-node (1/1)');
+  expect(markup).toContain('✓ older-node');
+  expect(markup).toContain('끝남');
   expect(markup).not.toContain('publish');
 });
 
@@ -88,4 +89,36 @@ test('알 수 없는 상태는 그대로 두고 칩만 가로 스크롤하며 �
     if (isValidElement<{ onClick: () => void }>(button)) button.props.onClick();
   }
   expect(selected).toEqual([unknown]);
+});
+
+test('RELEASE-STRIP-DONE: 끝난 런은 «끝남 · 걸린 시간 X분»(마지막 노드 끝 − 런 시작)이고 지금 노드·늘어나는 경과가 없다', () => {
+  const nodes = [
+    { nodeId: 'gate', ok: true, summary: '통과', startedAt: '2026-10-06T01:00:00Z', endedAt: '2026-10-06T01:20:00Z' },
+    { nodeId: 'npm-publish', ok: false, summary: '시간초과', startedAt: '2026-10-06T01:20:00Z', endedAt: '2026-10-06T01:47:30Z' },
+  ];
+  for (const status of ['done', 'failed', 'completed']) {
+    const finished = { ...run, status, version: '0.2.19', startedAt: '2026-10-06T01:00:00Z', path: ['gate', 'npm-publish', 'announce'], nodes };
+    const at = (t: number) => renderToStaticMarkup(<ReleaseStrip result={ready([])} selectedRun={finished} onSelect={() => {}} now={t} />);
+    const markup = at(now);
+    expect(markup).toContain('발행 0.2.19');
+    expect(markup).toContain('· 끝남 · 걸린 시간 47분');
+    expect(markup).not.toContain('경과');
+    expect(markup).not.toContain('(2/3)');
+    expect(markup).not.toContain('aria-current');
+    expect(at(now + 600 * 60_000)).toBe(markup);
+  }
+  // times missing → plain «끝남»
+  const bare = renderToStaticMarkup(<ReleaseStrip result={ready([])} selectedRun={{ ...run, status: 'done' }} onSelect={() => {}} now={now} />);
+  expect(bare).toContain('· 끝남</span>');
+  expect(bare).not.toContain('걸린 시간');
+  expect(bare).not.toContain('경과');
+  expect(finishedMinutes({ ...run, startedAt: 'garbage', nodes })).toBeNull();
+});
+
+test('RELEASE-STRIP-DONE: 도는 런은 그대로 «노드 (n/m) · 경과 X분»이고 끝남을 보이지 않는다', () => {
+  const markup = html([run]);
+  expect(markup).toContain('publish (2/3)');
+  expect(markup).toContain('경과 8분');
+  expect(markup).not.toContain('끝남 ·');
+  expect(markup).not.toContain('걸린 시간');
 });

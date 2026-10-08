@@ -135,7 +135,7 @@ it('opens the variable list with descriptions, inserts at the saved selection, a
 
 it('closes the variable list on a pointer press outside the input', () => {
   const listeners = new Map<string, EventListener>();
-  const previousDocument = globalThis.document;
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
   Object.defineProperty(globalThis, 'document', {
     configurable: true,
     value: {
@@ -153,8 +153,9 @@ it('closes the variable list on a pointer press outside the input', () => {
     expect(ui.renderer.root.findAllByProps({ role: 'listbox' })).toHaveLength(0);
     act(() => ui.renderer.unmount());
   } finally {
+    // Restore the descriptor itself: re-defining with `{ value }` would leave a non-writable `document` for the next file.
     if (previousDocument === undefined) Reflect.deleteProperty(globalThis, 'document');
-    else Object.defineProperty(globalThis, 'document', { configurable: true, value: previousDocument });
+    else Object.defineProperty(globalThis, 'document', previousDocument);
   }
 });
 

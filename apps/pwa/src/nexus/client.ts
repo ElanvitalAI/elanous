@@ -159,15 +159,20 @@ export interface NexusClient {
   getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
   getRunGraph(id: string): Promise<RunGraphDetail>;
   getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string }>;
-  putRunGraphYaml(id: string, yaml: string): Promise<{ id: string; source: 'mine'; editable: true; saved: true; version?: number; previous?: number | null }>;
+  /** `steps` (GRAPH-WIZARD-SAVE-RECIPES) — the wizard's node → library step map; the server validates it and builds the run commands itself. */
+  putRunGraphYaml(id: string, yaml: string, steps?: GraphWizardSteps): Promise<{ id: string; source: 'mine'; editable: true; saved: true; version?: number; previous?: number | null }>;
   /** Create a «mine» run graph: 409 when the id exists, 403 for a core id, 400/422 for a bad id or an invalid graph. */
-  createRunGraph(id: string, yaml: string): Promise<{ id: string; source?: 'mine'; editable?: true; version?: number; previous?: number | null }>;
+  createRunGraph(id: string, yaml: string, steps?: GraphWizardSteps): Promise<{ id: string; source?: 'mine'; editable?: true; version?: number; previous?: number | null }>;
   /** CGE-RUN — operator-only demo run of a «mine» graph (repository recipes only). */
   startRunGraphRun(id: string): Promise<{ id: string; runId: string; demo?: boolean }>;
   getRunGraphRun(id: string, runId: string): Promise<unknown>;
   cloneRunGraph(id: string, newId: string): Promise<{ id: string; source: 'mine'; editable: true; clonedFrom: string }>;
   getGraphKinds(graph: 'workflow' | 'harness'): Promise<{ kinds: GraphKindEntry[] }>;
   validateGraph(graph: 'workflow' | 'harness', yaml: string): Promise<GraphValidationResponse>;
+  /** GRAPH-WIZARD — «말로 만들기»: prompt (+ current canvas YAML and recent turns) → a validated graph draft.
+   *  A 422 draft (ok:false) is returned, not thrown, so the canvas can still show it with its issues.
+   *  Optional on the interface so hand-rolled test clients need not stub it; `createNexusClient` always has it. */
+  graphWizard?(body: GraphWizardRequest, opts?: { signal?: AbortSignal }): Promise<GraphWizardResponse>;
   // ---- workflows (Archon-port T2.3) ----
   getWorkflows(): Promise<{ workflows: WorkflowSummary[] }>;
   getWorkflow(name: string): Promise<WorkflowDetail>;
@@ -271,6 +276,10 @@ export interface NexusClient {
   getDesignCheck(): Promise<DesignCheckResponse>;
   /** Live 탭 — 런 원장. */
   getHarnessRuns(): Promise<HarnessRunsResponse>;
+  /** HARNESS-RUN-LIVE-GRAPH — 도는 런 ⊕ `sinceMs` 이후 끝난 런(고르개). */
+  getHarnessRunsSince(sinceMs: number): Promise<HarnessRunsSinceResponse>;
+  /** HARNESS-RUN-LIVE-GRAPH — 런 하나의 노드 순서·결과·시각 ⊕ 여정 띠. */
+  getHarnessRunTraversal(runId: string): Promise<HarnessRunTraversal>;
   /** Live 탭 — 로그 조회(최신순). `store` 는 다른 인스턴스 읽기 전용. */
   getLogs(query: LogsQuery): Promise<LogsResponse>;
   /** Live 탭 — 로그 저장소가 있는 인스턴스 목록. */
@@ -345,6 +354,36 @@ export interface GraphKindEntry {
   description: string;
   schema?: Record<string, unknown>;
   core: boolean;
+}
+
+/** Node id → the wizard's library step (label · step · arg · retries). */
+export type GraphWizardSteps = Record<string, { label?: string; step?: string; arg?: string; retries?: number }>;
+
+export interface GraphWizardRequest {
+  prompt: string;
+  kind?: 'harness' | 'workflow';
+  /** The canvas as it stands — the wizard edits it instead of starting over. */
+  currentYaml?: string;
+  history?: Array<{ role: 'user' | 'assistant'; text: string }>;
+}
+
+export interface GraphWizardResponse {
+  ok: boolean;
+  id?: string;
+  yaml?: string;
+  base?: string;
+  issues?: Array<string | { message: string; path?: string; nodeId?: string }>;
+  attempts?: number;
+  /** One line on what changed («노드 2개 추가 …»). */
+  summary?: string;
+  /** v2 (#24977) — Korean display names per node id («뉴스 수집»). Absent on older daemons. */
+  labels?: Record<string, string>;
+  /** v2 — why `base` was picked. */
+  baseReason?: string;
+  /** v2 — runnable steps / recipes.yaml text / dry-run walk (shown elsewhere; carried for completeness). */
+  steps?: GraphWizardSteps;
+  recipes?: string;
+  dryRun?: { status: string; path: string[] };
 }
 
 export interface GraphValidationResponse {
@@ -926,6 +965,21 @@ export interface HarnessRunsResponse {
   counts?: Record<string, number>;
   total?: number;
 }
+// HARNESS-RUN-LIVE-GRAPH — GET /v1/harness/runs?finishedSince= · GET /v1/harness/run-traversal?runId=
+export interface HarnessFinishedRunWire { runId: string; status: string; endedAt: string; stage?: string; objective?: string; prUrl?: string; merged?: boolean; mergeDecision?: string }
+export interface HarnessRunsSinceResponse extends HarnessRunsResponse {
+  entries: Array<HarnessRunEntry & { objective?: string }>;
+  finished?: HarnessFinishedRunWire[];
+}
+export interface HarnessTraversalStepWire {
+  node: string; round: number | null; outcome: string | null; at: string; durationMs: number | null;
+  visit: number; maxVisits: number | null; detail: string | null;
+}
+export interface HarnessRunTraversal {
+  runId: string; graphId: string | null; title: string | null; status: string; stage: string | null;
+  startedAt: string | null; endedAt: string | null; prNumber: number | null; substrate: string | null;
+  steps: HarnessTraversalStepWire[]; ledgerEvents: number;
+}
 export interface LogRow {
   id?: number;
   ts: string;
@@ -1127,13 +1181,14 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     method: string,
     path: string,
     body?: unknown,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<T> {
     const url = `${baseUrl}${path}`;
+    const timeoutMs = opts?.timeoutMs ?? defaultTimeoutMs;
     for (let attempt = 0; ; attempt++) {
       // Each attempt owns its timer and abort bridge; a timed-out signal cannot
       // leak into the retry, and caller cancellation always wins if it fires first.
-      const ctrl = defaultTimeoutMs > 0 || opts?.signal ? new AbortController() : null;
+      const ctrl = timeoutMs > 0 || opts?.signal ? new AbortController() : null;
       let timedOut = false;
       let cleanupExternalAbort: (() => void) | null = null;
       if (ctrl && opts?.signal) {
@@ -1146,13 +1201,13 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
           cleanupExternalAbort = () => ext.removeEventListener('abort', onAbort);
         }
       }
-      const timer = ctrl && defaultTimeoutMs > 0
+      const timer = ctrl && timeoutMs > 0
         ? setTimeout(() => {
           if (!ctrl.signal.aborted) {
             timedOut = true;
             ctrl.abort();
           }
-        }, defaultTimeoutMs)
+        }, timeoutMs)
         : null;
       try {
         const res = await fetchImpl(url, {
@@ -1186,7 +1241,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
         return parsed as T;
       } catch (err) {
         if (!timedOut || !(err instanceof Error) || err.name !== 'AbortError') throw err;
-        if (method !== 'GET' || attempt > 0) throw new NexusTimeoutError(path, defaultTimeoutMs);
+        if (method !== 'GET' || attempt > 0) throw new NexusTimeoutError(path, timeoutMs);
       } finally {
         if (timer != null) clearTimeout(timer);
         cleanupExternalAbort?.();
@@ -1282,12 +1337,23 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getRunGraphs: () => request('GET', '/v1/graphs'),
     getRunGraph: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}`),
     getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),
-    putRunGraphYaml: (id, yaml) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml }),
+    putRunGraphYaml: (id, yaml, steps) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml, ...(steps && Object.keys(steps).length ? { steps } : {}) }),
     cloneRunGraph: (id, newId) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/clone`, { newId }),
-    createRunGraph: (id, yaml) => request('POST', '/v1/graphs', { id, yaml }),
+    createRunGraph: (id, yaml, steps) => request('POST', '/v1/graphs', { id, yaml, ...(steps && Object.keys(steps).length ? { steps } : {}) }),
     startRunGraphRun: (id) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/run`),
     getRunGraphRun: (id, runId) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`),
     getGraphKinds: (graph) => request('GET', `/v1/graph/kinds?graph=${graph}`),
+    graphWizard: async (body, opts) => {
+      try {
+        // The wizard drafts and validates with an LLM (20–60 s) — the 8 s default would cut it off.
+        return await request<GraphWizardResponse>('POST', '/v1/graphs/wizard', body, { ...(opts?.signal ? { signal: opts.signal } : {}), timeoutMs: 180_000 });
+      } catch (error) {
+        if (error instanceof NexusApiError && error.status === 422 && error.body && typeof error.body === 'object' && 'ok' in error.body) {
+          return error.body as GraphWizardResponse;
+        }
+        throw error;
+      }
+    },
     validateGraph: async (graph, yaml) => {
       try {
         return await request<GraphValidationResponse>('POST', '/v1/graphs/validate', { graph, yaml });
@@ -1375,6 +1441,8 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getWorktrees: () => request('GET', '/v1/worktrees'),
     getDesignCheck: () => request('GET', '/v1/design-check'),
     getHarnessRuns: () => request('GET', '/v1/harness/runs'),
+    getHarnessRunsSince: (sinceMs) => request('GET', `/v1/harness/runs?finishedSince=${Math.max(0, Math.floor(sinceMs))}`),
+    getHarnessRunTraversal: (runId) => request('GET', `/v1/harness/run-traversal?runId=${encodeURIComponent(runId)}`),
     getLogs: (query) => {
       const q = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') q.set(k, String(v));

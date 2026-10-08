@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { runFirstRun } from './first-run.js';
+import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
@@ -182,7 +183,8 @@ describe('first run', () => {
         chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
       });
       expect(result).toEqual({ outcome: 'needs-llm', inputs: 0 });
-      expect(lines).toEqual(['eln setup llm 으로 고르세요']);
+      expect(lines).toEqual(['eln setup llm 으로 고르세요', unattendedNextStepLine()]);
+      expect(lines[1]).toBe('next: unattended: `elanous onboarding --non-interactive --config <answers.json>`');
       expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
   });
@@ -300,6 +302,7 @@ describe('first run', () => {
       expect(child.error).toBeUndefined();
       expect(child.status).toBe(0);
       expect(text).toContain('eln setup llm');
+      expect(text).toContain(unattendedNextStepLine());
       expect(text).not.toContain('Step 1');
 
       writeFileSync(join(configDir, 'config.json'), JSON.stringify({ onboarding: { completed: true } }));

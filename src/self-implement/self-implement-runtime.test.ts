@@ -21,6 +21,7 @@ import {
   buildSelfImplementSpec,
   selfImplementRuntime,
   setSelfImplementApprover,
+  setSelfImplementSoftStopSpaceObserver,
   type DocumentReferenceStatus,
 } from './self-implement-runtime.js';
 import { _setAutoOpenPrConfigReaderForTesting } from './auto-open-pr.js';
@@ -64,6 +65,7 @@ afterEach(() => {
   _setSelfImplementOrchestrateForTesting(null);
   _setSelfImplementGoalAuthorForTesting(null);
   setSelfImplementApprover(null);
+  setSelfImplementSoftStopSpaceObserver(null);
   rmSync(goalDirectory, { recursive: true, force: true });
 });
 
@@ -1373,6 +1375,34 @@ describe('관측 전용 판정의 출처는 하나다', () => {
     );
     expect(viaDaemon).toEqual({ observed: true });
     expect(daemonRunnerCalls).toBe(0);
+  });
+});
+
+describe('selfImplementRuntime — foreground ESC stop target', () => {
+  test('TUI call receives its created space; other surfaces and missing call ids do not register targets', async () => {
+    const seen: Array<[string, string]> = [];
+    const optionsSeen: DefaultSeamsOptions[] = [];
+    setSelfImplementSoftStopSpaceObserver((id, space) => seen.push([id, space]));
+    _setAutoOpenPrConfigReaderForTesting(() => false);
+    _setSelfImplementSeamsFactoryForTesting((options) => {
+      optionsSeen.push(options);
+      return {
+        async createWorktree({ branch }) { return { path: `/wt/${branch}`, branch }; },
+        async implement() { return { ok: true, summary: 'implemented' }; },
+        async gate() { return { passed: true }; },
+        async openPr() { return { url: 'https://example.test/pr/1', number: 1 }; },
+        ...(options.onSoftStopSpaceReady ? { onSoftStopSpaceReady: options.onSoftStopSpaceReady } : {}),
+      };
+    });
+    await selfImplementRuntime.run({ feature: 'foreground stop' }, { ...ctx, surface: 'tui', toolCallId: 'call-stop' });
+    expect(optionsSeen[0]?.onSoftStopSpaceReady).toBeDefined();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]![0]).toBe('call-stop');
+    expect(seen[0]![1]).toBeTruthy();
+    await selfImplementRuntime.run({ feature: 'another surface' }, { ...ctx, surface: 'chat', toolCallId: 'call-other' });
+    await selfImplementRuntime.run({ feature: 'no call id' }, { ...ctx, surface: 'tui', toolCallId: undefined });
+    expect(seen).toHaveLength(1);
+    expect(optionsSeen.slice(1).every(options => options.onSoftStopSpaceReady === undefined)).toBe(true);
   });
 });
 

@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'next/navigation';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
-import type { GraphKindEntry } from '@/nexus/client';
+import { NexusApiError, type GraphKindEntry, type NexusClient } from '@/nexus/client';
 import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
 import { RunGraphView } from '@/components/workflows/RunGraphView';
 import { CORE_GRAPH_KINDS, CORE_WORKFLOW_KINDS } from '@/lib/run-graph-yaml-edit';
@@ -13,9 +13,24 @@ import { GraphCanvasEditor } from './GraphCanvasEditor';
 import { GraphRunControl } from './GraphRunControl';
 import type { NodeRunStatus } from '@/components/workflows/run-status-helpers';
 import { fromYaml, type CanvasGraph } from './graph-canvas-model';
+import { GraphWizardChat, GraphWizardEntry } from './GraphWizardChat';
+import type { WizardClient } from './graph-wizard';
+import { useWizardCanvas } from './use-wizard-canvas';
 
-/** The run-graph tab's working canvas: a new empty graph, or a «mine» graph opened for editing. */
-type CanvasSession = { key: number; graph?: CanvasGraph; saved: boolean };
+/** The run-graph tab's working canvas: a new empty graph, or a «mine» graph opened for editing.
+ *  `wizardPrompt` — GRAPH-WIZARD: the line typed on the «말로 만들기» entry, sent as the chat's first turn. */
+type CanvasSession = { key: number; graph?: CanvasGraph; saved: boolean; wizardPrompt?: string };
+
+/** A client without the wizard (a stub) answers like an older daemon. */
+function wizardClientOf(client: NexusClient): WizardClient {
+  const ask = client.graphWizard;
+  return ask ? { graphWizard: (body, opts) => ask(body, opts) } : { graphWizard: async () => { throw new NexusApiError(404, '/v1/graphs/wizard', null); } };
+}
+
+/** `?mode=harness&wizard=<prompt>` — the workflow tab's entry hands its prompt to the canvas. */
+export function graphWizardHref(prompt: string): string {
+  return `${graphEditorHref('harness')}&wizard=${encodeURIComponent(prompt)}`;
+}
 
 function PaletteContents({ palette, fallback }: { palette: GraphKindEntry[]; fallback: boolean }) {
   return <>
@@ -51,6 +66,22 @@ export function GraphEditor() {
   const queries = useQueryClient();
   const [canvas, setCanvas] = useState<CanvasSession | null>(null);
   const [runStatus, setRunStatus] = useState<Record<string, NodeRunStatus> | undefined>(undefined);
+  const wizard = useWizardCanvas();
+  /** The canvas is in «wizard mode» once a chat turn has landed on it (or it opened with a prompt). */
+  const [wizardDriven, setWizardDriven] = useState(false);
+  const openCanvas = useCallback((session: Omit<CanvasSession, 'key'>) => {
+    wizard.reset();
+    setWizardDriven(Boolean(session.wizardPrompt));
+    setCanvas({ key: Date.now(), ...session });
+  }, [wizard.reset]);
+  // `?wizard=<prompt>` opens the canvas once per prompt — a client re-render must not wipe the work.
+  const wizardParam = params.get('wizard');
+  const handledWizardParam = useRef<string | null>(null);
+  useEffect(() => {
+    if (mode !== 'harness' || !wizardParam || !client || handledWizardParam.current === wizardParam) return;
+    handledWizardParam.current = wizardParam;
+    openCanvas({ saved: false, wizardPrompt: wizardParam });
+  }, [mode, wizardParam, client, openCanvas]);
   const onRunStatus = useCallback((status: Record<string, NodeRunStatus> | undefined) => setRunStatus(status), []);
   const kinds = useQuery({
     queryKey: ['graph-kinds', mode],
@@ -80,22 +111,40 @@ export function GraphEditor() {
       </header>
       <div className="flex min-h-0 flex-1 flex-col">
         {client && !(mode === 'harness' && canvas) && <GraphEditorPalette palette={palette} fallback={fallback} />}
+        {client && !(mode === 'harness' && canvas) && (
+          <GraphWizardEntry onStart={(prompt) => {
+            if (mode === 'harness') openCanvas({ saved: false, wizardPrompt: prompt });
+            else window.location.assign(graphWizardHref(prompt));
+          }} />
+        )}
         {mode === 'workflow' ? <WorkflowsPanel palette={palette} /> : client && canvas ? (
           <>
             <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
               <button type="button" onClick={() => { setCanvas(null); setRunStatus(undefined); }} className="rounded px-2 py-1 text-muted-foreground hover:bg-muted">← 그래프 목록</button>
               {fallback && <span role="status" className="text-amber-500">어휘 목록을 불러오지 못해 코어 팔레트를 씁니다.</span>}
             </div>
-            <GraphCanvasEditor key={canvas.key} palette={palette} client={client}
-              {...(canvas.graph ? { initialGraph: canvas.graph, initialSaved: canvas.saved } : {})}
-              {...(runStatus ? { nodeStatus: runStatus } : {})}
-              renderActions={(context) => <GraphRunControl context={context} client={client} onStatus={onRunStatus} />}
-              onSaved={() => { void queries.invalidateQueries({ queryKey: ['run-graphs'] }); }} />
+            <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col max-lg:overflow-y-auto">
+                <GraphCanvasEditor key={canvas.key} palette={palette} client={client} wizardMode={wizardDriven}
+                  {...(canvas.graph ? { initialGraph: canvas.graph, initialSaved: canvas.saved } : {})}
+                  {...(runStatus ? { nodeStatus: runStatus } : {})}
+                  {...(wizard.replace ? { replace: wizard.replace } : {})}
+                  {...(wizard.highlight ? { highlight: wizard.highlight } : {})}
+                  nodeLabels={wizard.labels}
+                  {...(wizard.steps ? { wizardSteps: wizard.steps } : {})}
+                  onChange={wizard.onChange}
+                  renderActions={(context) => <GraphRunControl context={context} client={client} onStatus={onRunStatus} />}
+                  onSaved={() => { void queries.invalidateQueries({ queryKey: ['run-graphs'] }); }} />
+              </div>
+              <GraphWizardChat key={canvas.key} client={wizardClientOf(client)} current={wizard.current} laid={wizard.laid}
+                onApply={(graph, added, autoLayout, labels, steps) => { setWizardDriven(true); wizard.apply(graph, added, autoLayout, labels, steps); }} onRestore={wizard.restore}
+                {...(canvas.wizardPrompt ? { initialPrompt: canvas.wizardPrompt } : {})} />
+            </div>
           </>
         ) : client ? (
           <RunGraphView palette={palette}
-            onNewGraph={() => setCanvas({ key: Date.now(), saved: false })}
-            onOpenInCanvas={(_id, yaml) => setCanvas({ key: Date.now(), graph: fromYaml(yaml), saved: true })} />
+            onNewGraph={() => openCanvas({ saved: false })}
+            onOpenInCanvas={(_id, yaml) => openCanvas({ graph: fromYaml(yaml), saved: true })} />
         ) :
           <p className="p-4 text-sm text-text-tertiary">Daemon 연결이 설정되지 않았습니다. Settings 에서 Base URL 을 입력하세요.</p>}
       </div>

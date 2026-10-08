@@ -62,7 +62,9 @@ describe('graph canvas model (CGE-EDIT)', () => {
     expect(parseYaml(yaml).edges).toEqual([{ from: 'A', to: 'B' }, { from: 'B', on: 'outcome', map: { pass: 'C', fail: 'A' } }]);
     const back = fromYaml(yaml);
     expect(back.edges).toEqual(graph.edges);
-    expect(back.nodes.map((node) => [node.id, node.x])).toEqual([['A', 40], ['B', 300], ['C', 560]]);
+    // Layered layout ranks by forward edges only (GRAPH-EDGE-TIDY): the B→A fail route does not reorder the line.
+    const [a, b, c] = back.nodes.map((node) => node.x);
+    expect(a! < b! && b! < c!).toBe(true);
   });
 
   test('negative: a dangling edge fails locally and in the harness loader, pinned to its source node', () => {

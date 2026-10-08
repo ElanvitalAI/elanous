@@ -27,7 +27,7 @@ describe('gate shards — 조각 상태 표', () => {
     // 도는 조각 남은 최대 10분 + 대기 8×15분 ÷ 자리 5 = 24 → 34분
     expect(s.etaMin).toBe(34);
     expect(s.staleMin).toBe(1);
-    expect(shardsLine(s)).toBe('조각 24 · 돌기 5 · 대기 8(CPU 부족 31.2/32 8) · 잘림 2 · 통과 9 · 남은 약 34분');
+    expect(shardsLine(s)).toBe('조각 24 · 돌기 5 · 대기 8(CPU 부족 31.2/32 8) · 잘림 2 · 끝 9 · 남은 약 34분');
   });
 
   test('계획 분이 없는 조각이 남아 있으면 추정하지 않는다(0 으로 꾸미지 않는다)', () => {
@@ -42,7 +42,7 @@ describe('gate shards — 조각 상태 표', () => {
     const f: GateShardsFile = { v: 1, version: '0.2.20', updatedAt: ago(30), shards: [{ id: 'pod-0', state: 'done' }] };
     const s = summarizeShards(f, NOW);
     expect(s.etaMin).toBe(0);
-    expect(shardsLine(s)).toBe('조각 1 · 통과 1 · 남은 약 0분 · ⚠️ 30분째 갱신 없음');
+    expect(shardsLine(s)).toBe('조각 1 · 끝 1 · 남은 약 0분 · ⚠️ 30분째 갱신 없음');
   });
 
   test('쓰기→읽기 왕복 · 임시 파일을 남기지 않는다 · 깨진 파일은 null', () => {
@@ -69,6 +69,17 @@ test('a running shard past its plan says so instead of «남은 약 0분» (cana
   ] };
   const s = summarizeShards(f, NOW);
   expect(s.overrunMin).toBe(19);
-  expect(shardsLine(s)).toBe('조각 2 · 돌기 1 · 통과 1 · 계획보다 19분 넘게 도는 중 — 남은 시간 추정 불가');
+  expect(shardsLine(s)).toBe('조각 2 · 돌기 1 · 끝 1 · 계획보다 19분 넘게 도는 중 — 남은 시간 추정 불가');
   expect(summarizeShards(file(), NOW).overrunMin).toBe(0);
+});
+
+test('a finished shard with rc≠0 is «끝 · 실패 보고», never «통과» (0.2.20 cut: four done shards were all rc 1)', () => {
+  const f: GateShardsFile = { v: 1, version: '0.2.20', updatedAt: ago(0), shards: [
+    { id: 'pod-20', state: 'done', rc: 1, plannedMin: 3.9, startedAt: ago(14), endedAt: ago(1) },
+    { id: 'pod-21', state: 'done', rc: 0, plannedMin: 3.9, startedAt: ago(14), endedAt: ago(1) },
+    { id: 'pod-22', state: 'running', plannedMin: 30, startedAt: ago(14) },
+  ] };
+  const s = summarizeShards(f, NOW);
+  expect(s.doneWithFailures).toBe(1);
+  expect(shardsLine(s)).toBe('조각 3 · 돌기 1 · 끝 2(실패 보고 1) · 남은 약 16분');
 });

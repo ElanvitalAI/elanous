@@ -587,8 +587,9 @@ export async function main(args: string[] = process.argv.slice(2), deps: DailyDe
   for (const arg of args) if (!['--dry-run', '--no-news', '--json'].includes(arg)) throw new Error(`알 수 없는 옵션: ${arg}`);
   const result = await runDaily({ dryRun: args.includes('--dry-run'), noNews: args.includes('--no-news'), stage }, deps);
   (deps.print ?? console.log)(args.includes('--json') ? JSON.stringify(result) : `${result.markdown}\n파일: ${result.file} · ${result.deliveryLine}`);
-  // 발송 설정 OFF 는 degraded 로 기록하고 done 으로 진행한다. 실제 발송 실패·볼트 사본 실패는 그래프를 멈춘다.
+  // 그래프 deliver 는 미발송도 출력·tick 에 기록한 뒤 실패로 종결한다.
   if ((stage === 'compose' || !stage) && result.vaultFatal) throw new Error(`볼트 사본 실패 · ${result.vaultError}`);
+  if (stage === 'deliver' && result.deliveryState === 'send-disabled') throw new Error('발송 실패 · 발송 비활성');
   if (stage === 'deliver' && result.sendError) throw new Error(`발송 실패 · ${result.sendError}`);
   return result;
 }

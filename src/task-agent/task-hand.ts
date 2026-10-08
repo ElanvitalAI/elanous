@@ -77,6 +77,8 @@ export interface TaskCard {
   launchId?: string;
   /** Pod 런이면 PR 을 연 자식 런 id(런 묶기가 PR 과 함께 적는다). */
   runChildId?: string;
+  /** HARNESS-PARENT-ON-MSB1 — 부모가 도는 원격 호스트(없으면 HQ 로컬). 원격 부모는 PR 까지만 간다(병합은 HQ). */
+  parentHost?: { host: string; configDir?: string; pid?: number; log?: string };
   /** 미션 카드만 — 모든 조각 착지 → 칸 green «제안»(체크리스트는 손대지 않는다 · OP/주인이 뒤집는다). */
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
   /** TA-JUDGE-LIVE-SAFE — live `review` 수가 리뷰를 요청한 PR 머리들(머리마다 한 번 · 띄우기 실패면 error · 이력은 지우지 않는다). */
@@ -193,7 +195,11 @@ export function shellQuote(arg: string): string {
 /** 발사기에 넘기는 연결 — env(`ELANOUS_RUN_ID`)를 자식 환경에 얹으면 하니스 런이 `runId` 로 돈다(`resolveRunIdentity` 상속). launchId 는 카드에만 남는 발사 토큰이다. */
 export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string> }
 /** 발사기가 «이 런 id 로 띄웠다»고 돌려주는 영수증 — 없으면 카드에 런 id 를 적지 않는다(추측하지 않는다). */
-export interface TaskLaunchReceipt { runId?: string }
+export interface TaskLaunchReceipt {
+  runId?: string;
+  /** HARNESS-PARENT-ON-MSB1 — 부모를 원격 호스트에서 띄웠다(ssh). 카드에 적어 `tasks show` 가 그 호스트의 원장을 당긴다. */
+  parentHost?: { host: string; configDir?: string; pid?: number; log?: string };
+}
 export type TaskLauncher = (args: string[], cwd?: string, context?: TaskLaunchContext) => void | TaskLaunchReceipt | Promise<void | TaskLaunchReceipt>;
 
 export interface HandTaskOptions {
@@ -328,8 +334,9 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const launched: TaskCard = {
     ...card, status: 'launched',
     ...(boundRunId ? { runId: boundRunId, launchId } : {}),
+    ...(receipt && receipt.parentHost && typeof receipt.parentHost.host === 'string' ? { parentHost: receipt.parentHost } : {}),
     history: [
-      { at: launchedAt, event: 'launch', detail: move.command!.join(' ') },
+      { at: launchedAt, event: 'launch', detail: `${receipt && receipt.parentHost ? `[parent@${receipt.parentHost.host} · PR 까지만] ` : ''}${move.command!.join(' ')}` },
       ...(boundRunId ? [{ at: launchedAt, event: 'run-bound', detail: boundRunId, runId: boundRunId }] : []),
     ],
   };

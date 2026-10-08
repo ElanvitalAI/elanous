@@ -55,6 +55,8 @@ export interface EscAbortGateDeps {
   getTheme?: () => ThemeTokens | null | undefined;
   /** Names shown/logged while a turn abort request is waiting for running work to unwind. */
   getWaitingTargetNames?: () => readonly string[];
+  /** Only an identified foreground harness run may bypass the sub-agent confirmation. */
+  shouldAbortImmediately?: () => boolean;
   /** Called before abortTurnOnly so the UI can paint a visible pending state immediately. */
   onAbortPending?: (event: { running: number; repeat: number; targets: readonly string[] }) => void;
   /** Called when another Escape arrives after the first abort request. */
@@ -211,7 +213,7 @@ export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
         return;
       }
       const running = deps.getRunningCount();
-      if (running <= 0) {
+      if (running <= 0 || deps.shouldAbortImmediately?.()) {
         debug.log('esc.abort', 'abort-immediately', { running, repeat: Math.max(0, escapePresses - 1) });
         abortPendingTurn(running);
         return;

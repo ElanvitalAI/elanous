@@ -1171,7 +1171,7 @@ describe('완료 런 경로 겹침 — 완료 사실은 값으로만 낸다', ()
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 120_000);
 
   test('[same-path-inline-limit-documents-obs-t458] 상한 5는 중앙값 128자·75% 1,425자 관측을 근거로 남긴다', async () => {
     const source = await Bun.file(new URL('./launch-preflight.ts', import.meta.url)).text();

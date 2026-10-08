@@ -125,6 +125,19 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
   };
 }
 
+function digestNoteRef(e: DigestEntry): string {
+  return e.noteName ? `[[${e.noteName}]]` : e.note?.trim() || e.url?.trim() || e.id;
+}
+
+/** 참고 줄에 이름을 다는 상한 — 많은 날에도 화면 한 장을 지킨다(M 은 그대로 센다). */
+const DIGEST_REFERENCE_NAMED = 10;
+
+function digestReferenceLine(entries: DigestEntry[]): string {
+  const named = entries.slice(0, DIGEST_REFERENCE_NAMED).map(digestNoteRef).join(', ');
+  const rest = entries.length - DIGEST_REFERENCE_NAMED;
+  return `참고 ${entries.length}편 — 노트: ${named}${rest > 0 ? ` 외 ${rest}편 · 원장 \`elanous intake items\`` : ''}`;
+}
+
 /** 노트 절 — 축별 묶음 · 노트 링크 · 한 줄 요약 · 골 후보. */
 export function renderDigestMarkdown(d: IntakeDigest): string {
   const L: string[] = [`## 📰 오늘의 흡수 요약 (${d.absorbed.length})`, ''];
@@ -165,14 +178,9 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
 
 /** 텔레그램 — 흡수 렌즈가 대조한 항목만 SCQA 짧은 판으로 낸다. */
 export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string } = {}): string {
-  if (d.seat && !d.absorbed.length) return '오늘 새 소식 없음';
-  if (d.seat) return [
-    `흡수 ${d.absorbed.length}`,
-    ...d.absorbed.map((item) => `- ${item.oneLiner ?? item.noteName ?? item.id}${item.url ? ` · ${item.url}` : ''}`),
-  ].join('\n');
   // «Touching» is decided by the lens verdict alone; a missing note summary only changes how S reads (ACP must-fix).
   const touching = d.absorbed.filter((e) => e.impact);
-  const L = [`흡수 ${d.absorbed.length} → 우리에게 닿는 것 ${touching.length}`];
+  const L = [`흡수 ${d.absorbed.length}편 → 우리에게 닿는 것 ${touching.length}`];
   // 관심 뉴스는 최대 셋 — 기사마다 S(요약 첫 줄) · A(엘라누스 함의 첫 줄) · 링크를 한 덩어리로(NEWS-INTAKE).
   for (const article of (d.news ?? []).slice(0, 3)) {
     L.push(`📰 ${article.title}`);
@@ -181,9 +189,7 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
     L.push(article.url);
   }
   if (d.shadowSuggestions?.length) L.push(`뉴스 칸 제안 ${d.shadowSuggestions.length}건 (그림자·판 미등록): ${d.shadowSuggestions.slice(0, 3).map((s) => `[${s.verdict}] ${s.fact}${s.url ? ` ${s.url}` : ''}`).join(' · ')}`);
-  if (!touching.length) return L.join('\n');
-  // At most three items are shown, each as its own S·C·A·link block so context and source stay paired;
-  // a later item sharing (verdict, target) says «위와 같은 행동» instead of repeating the A sentence (ACP must-fix).
+  // At most three items are shown, each as its own S·C·A·note block so context and source stay paired.
   // S must be the note's own summary: items without one still count as touching but are not shown (ACP must-fix).
   const shownItems = touching.filter((e) => e.oneLiner?.trim()).slice(0, 3);
   const actionSeen = new Set<string>();
@@ -205,10 +211,11 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
       `S 무엇: ${e.oneLiner?.trim() || '노트 한 줄 요약 없음'}`,
       `C 우리에게 왜: ${impact.why}`,
       `A 그래서 무엇을 하나: ${action}`,
-      `🔗 원문 링크: ${e.url?.trim() || '링크 없음'}`,
+      `🔗 노트: ${digestNoteRef(e)}`,
     );
   }
   if (touching.length > shownItems.length) L.push('', `닿는 것 ${touching.length - shownItems.length}건 더(요약 없는 것 포함) · 원장 \`elanous intake items\``);
-  if (d.absorbed.length > touching.length) L.push('', `그 밖 ${d.absorbed.length - touching.length}건 · 참고`);
+  const reference = d.absorbed.filter((e) => !e.impact);
+  if (reference.length) L.push('', digestReferenceLine(reference));
   return L.join('\n');
 }

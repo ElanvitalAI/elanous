@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdir
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { getUserConfig } from '../user-config.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 
@@ -184,6 +185,8 @@ export function recordFailureEvent(event: FailureEvent, root = effectiveInstance
     return false;
   });
   debug.log('heal.intake', 'recorded', { source: event.source, kind: event.kind, ref: event.ref, folded });
+  // HARNESS-FULL-GRAPH — 하니스 런 실패 사건의 접수가 그래프 노드 heal 이다(출구: started | folded).
+  if (event.source === 'harness-run') passJourneyNode('heal', { provenance: 'heal-intake', outcome: folded ? 'folded' : 'started', data: { kind: event.kind, ref: event.ref } });
   if (!folded) {
     const runId = healRunId(event);
     void Promise.resolve().then(() => startLoop(HEAL_GRAPH, { runId, input: { failureEvent: event }, deps: { root } }))

@@ -136,8 +136,10 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   // NAV2c (#23048): the general user's «오늘» group holds only /today → a direct link, no sheet
   expect(nav.findAllByType('a').find((node) => node.props['aria-label'] === '오늘')?.props.href).toBe('/today');
   expect(nav.findAllByType('a').find((node) => node.props['aria-label'] === '일')?.props.href).toBe('/live');
-  expect(nav.findAllByType('a').find((node) => node.props['aria-label'] === '만들기')?.props.href).toBe('/term');
   expect(tree!.root.findAllByProps({ role: 'dialog' })).toHaveLength(0);
+  // EDITOR-NAV-PUBLIC: 만들기 = 터미널 ⊕ 편집기 — 둘이라 시트로 연다(역할을 안 고른 기기에도 편집기가 보인다).
+  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor']);
+  act(() => tree!.root.findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());
   const more = open('더보기');
   expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
   expect(more.findAllByType('a').map((node) => node.props.href)).toContain('/settings');
@@ -145,7 +147,7 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   act(() => tree!.unmount());
   store.set(PWA_ROLE_KEY, 'owner');
   mount();
-  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/design-check']);
+  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check']);
   act(() => { store.set(NAV_SHOW_LABS_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/workspace', '/showroom']);
   act(() => { store.set(NAV_SHOW_HIDDEN_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });

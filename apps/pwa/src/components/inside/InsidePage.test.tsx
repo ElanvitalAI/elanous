@@ -15,6 +15,17 @@ import { leaksInternal } from './public-text';
 let params = new URLSearchParams();
 
 const originals = { window: globalThis.window, document: globalThis.document, HTMLElement: globalThis.HTMLElement, Node: globalThis.Node, Event: globalThis.Event };
+
+// linkedom's `window` is a proxy over globalThis: `Object.defineProperty(window, k, …)` lands on globalThis as a
+// non-writable property and outlives this file, so a later file in the same bun process fails on `globalThis.k = …`.
+const WINDOW_DEFINED_KEYS = ['location', 'history', 'localStorage'] as const;
+const globalDescriptors = WINDOW_DEFINED_KEYS.map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
+function restoreWindowDefinedGlobals(): void {
+  for (const [k, d] of globalDescriptors) {
+    if (d) Object.defineProperty(globalThis, k, d);
+    else Reflect.deleteProperty(globalThis, k);
+  }
+}
 let root: import('react-dom/client').Root;
 let host: HTMLElement;
 let address: URL;
@@ -48,6 +59,7 @@ afterEach(async () => {
   await act(async () => root.unmount());
   _setEventSourceFactoryForTest(null);
   Object.assign(globalThis, originals);
+  restoreWindowDefinedGlobals();
 });
 
 async function render(query = '', liveTrace: import('react').ReactNode = <p data-live-trace>라이브 트레이스</p>) {

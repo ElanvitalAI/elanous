@@ -16,7 +16,8 @@
 //       { "type": "discord", "webhookUrl": "https://discord.com/api/webhooks/..." },
 //       { "type": "pushcut", "webhookUrl": "https://api.pushcut.io/.../notifications/..." }
 //     ],
-//     "routes": { "alert": ["telegram", "pushcut"], "report": ["telegram", "discord"] }
+//     "routes": { "alert": ["telegram", "pushcut"], "report": ["telegram", "discord"] },
+//     "awayRoutes": { "alert": ["discord"] }
 //   }
 //
 // Backward compat: when `outbound` is absent/malformed the resolved
@@ -27,6 +28,7 @@
 // that boolean before falling back to direct Telegram).
 
 import { createHash } from 'node:crypto';
+import { readPresence } from '../../away/presence.js';
 import { debug } from '../../debug/log.js';
 import { sendTelegramReport } from '../../telegram-report.js';
 import { getPushcutClient } from '../../pushcut/client.js';
@@ -58,6 +60,8 @@ export interface OutboundFanoutConfig {
    *  `routes.default`, then to ALL configured channels. An explicitly
    *  empty route (`"heartbeat": []`) suppresses that kind. */
   routes?: Record<string, string[]>;
+  /** 외출 중 kind → channel types. 미지정 kind는 awayRoutes.default, 이것도 없으면 기존 routes를 유지한다. */
+  awayRoutes?: Record<string, string[]>;
 }
 
 export interface ChannelResult {
@@ -118,14 +122,17 @@ export function normalizeOutbound(raw: unknown): OutboundFanoutConfig | undefine
     channels.push({ type, ...(webhookUrl ? { webhookUrl } : {}), ...(notification ? { notification } : {}) });
   }
   if (channels.length === 0) return undefined;
-  let routes: Record<string, string[]> | undefined;
-  if (o.routes && typeof o.routes === 'object' && !Array.isArray(o.routes)) {
-    routes = {};
-    for (const [kind, v] of Object.entries(o.routes as Record<string, unknown>)) {
+  const parseRoutes = (value: unknown): Record<string, string[]> | undefined => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const routes: Record<string, string[]> = {};
+    for (const [kind, v] of Object.entries(value as Record<string, unknown>)) {
       if (Array.isArray(v)) routes[kind] = v.filter((t): t is string => typeof t === 'string');
     }
-  }
-  return { channels, ...(routes ? { routes } : {}) };
+    return routes;
+  };
+  const routes = parseRoutes(o.routes);
+  const awayRoutes = parseRoutes(o.awayRoutes);
+  return { channels, ...(routes ? { routes } : {}), ...(awayRoutes ? { awayRoutes } : {}) };
 }
 
 /** Resolve the channel list for one message kind. No/empty config →
@@ -219,7 +226,20 @@ export async function routeOutbound(cfg: UserConfig, msg: OutboundMsg, deps: Rou
     } catch { /* 원장 조회 실패 — 억제 없이 진행 */ }
   }
 
-  const list = resolveChannels(outbound, msg.kind);
+  // 상태 파일이 없거나 읽기에 실패하면 기존 kind 경로를 그대로 사용한다.
+  let list = resolveChannels(outbound, msg.kind);
+  if (outbound?.awayRoutes) {
+    try {
+      if (readPresence().away) {
+        const awayRoute = outbound.awayRoutes[msg.kind] ?? outbound.awayRoutes.default;
+        // kind 도 default 도 없으면 기존 경로로 · 명시적인 빈 배열은 기존 routes 와 같은 규칙(채널 0)을 따른다.
+        if (awayRoute !== undefined) {
+          list = outbound.channels.filter(ch => awayRoute.includes(ch.type));
+          try { debug.log('outbound.send', 'away-route', { kind: msg.kind, channels: list.map(ch => ch.type) }); } catch { /* 관측 실패는 발송 결과에 영향 없음 */ }
+        }
+      }
+    } catch { /* 상태 조회 실패 — 기존 경로 유지 */ }
+  }
   const channels = await Promise.all(list.map(async (ch): Promise<ChannelResult> => {
     try {
       if (ch.type === 'telegram') return await deliverTelegram(cfg, outMsg, deps);

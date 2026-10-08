@@ -6,6 +6,13 @@ import { currentNodeId, ReleaseRunsContent, ReleaseRunsView } from './ReleaseRun
 import ReleasePage from '../../app/ops/release/page';
 import type { ReleaseRun, OpsResult } from '@/lib/ops-api';
 
+// Put a global back exactly as it was (descriptor, not value) — re-defining it with `{ value }` leaves a
+// non-writable global behind, and the next file in the same bun process then fails on a plain assignment.
+function restoreGlobal(name: 'window' | 'document', descriptor: PropertyDescriptor | undefined): void {
+  if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+  else Reflect.deleteProperty(globalThis, name);
+}
+
 const run: ReleaseRun = {
   runId: 'r1', version: '0.2.9', status: 'running', startedAt: '2026-10-02T00:00:00Z',
   path: ['first', 'waiting', 'last'], nodes: [
@@ -62,8 +69,8 @@ describe('OPS1 release runs', () => {
   });
   test('client effect polls running runs every 10 seconds, pauses while hidden, stops after completion and on 403', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const originalWindow = globalThis.window;
-    const originalDocument = globalThis.document;
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
     const timers = new Map<number, () => void>();
     let timerId = 0;
     const listeners = new Map<string, () => void>();
@@ -109,14 +116,14 @@ describe('OPS1 release runs', () => {
       expect(calls).toHaveLength(7);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
-      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
-      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
+      restoreGlobal('window', originalWindow);
+      restoreGlobal('document', originalDocument);
     }
   });
   test('seat strip deep link opens the requested run even when its version is not the first run version', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const originalWindow = globalThis.window;
-    const originalDocument = globalThis.document;
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
     Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { search: '?run=r1' }, setInterval: () => 1, clearInterval: () => {} } });
     Object.defineProperty(globalThis, 'document', { configurable: true, value: { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } });
     const calls: string[] = [];
@@ -135,14 +142,14 @@ describe('OPS1 release runs', () => {
       expect(JSON.stringify(tree!.toJSON())).toContain('waiting');
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
-      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
-      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
+      restoreGlobal('window', originalWindow);
+      restoreGlobal('document', originalDocument);
     }
   });
   test('the strip and flow follow the same run across latest, list selection and version changes', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const originalWindow = globalThis.window;
-    const originalDocument = globalThis.document;
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
     Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { search: '' }, setInterval: () => 1, clearInterval: () => {} } });
     Object.defineProperty(globalThis, 'document', { configurable: true, value: { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } });
     const recent = { ...run, runId: 'recent', version: '0.3.0', startedAt: new Date(Date.now() - 60_000).toISOString(), path: ['recent-node'], nodes: [{ nodeId: 'recent-node', ok: null, summary: '최근' }] };
@@ -170,8 +177,8 @@ describe('OPS1 release runs', () => {
       expect(tree!.root.findAllByProps({ 'aria-label': '노드 흐름' })).toHaveLength(0);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
-      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
-      Object.defineProperty(globalThis, 'document', { configurable: true, value: originalDocument });
+      restoreGlobal('window', originalWindow);
+      restoreGlobal('document', originalDocument);
     }
   });
   test('403 has exactly one visible sentence and no controls or run data', () => {

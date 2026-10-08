@@ -6,6 +6,7 @@ import {
 } from './graph-yaml.js';
 import { compileGraphTemplate } from './graph-templates.js';
 import { FRONT_NODE_IDS } from '../self-dev/graph-front-nodes.js';
+import { JOURNEY_NODE_IDS } from '../self-dev/graph-journey-nodes.js';
 import { inspectPipelineGraph } from './pipeline-shape.js';
 import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shape.js';
 
@@ -243,12 +244,14 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
     const pipeline = Object.keys(TERMINAL_STAGES_BY_NODE);
     expect(pipeline.filter((n) => !yaml.has(n))).toEqual([]);            // 빠진 것 0
     const extra = [...yaml].filter((n) => !pipeline.includes(n)).sort();
-    expect(extra).toEqual([...FRONT_NODE_IDS].sort());                    // 더한 것은 «그 셋»뿐
+    // ⭐ HARNESS-FULL-GRAPH(10-08) — 앞쪽 셋 ⊕ «여정 노드»(입구·배치·착지·실패 쪽)만 더할 수 있다.
+    expect(extra).toEqual([...FRONT_NODE_IDS, ...JOURNEY_NODE_IDS].sort());
   });
 
   test('노드마다 terminal_stages 가 TERMINAL_STAGES_BY_NODE 와 «같다»', () => {
     // ⛔ 앞쪽 셋은 이 코드 상수에 «없다» — 그 셋을 여기서 세면 「없는 키」를 읽는다.
-    for (const node of implement.nodes.filter((n) => !(FRONT_NODE_IDS as readonly string[]).includes(n.nodeId))) {
+    const added: readonly string[] = [...FRONT_NODE_IDS, ...JOURNEY_NODE_IDS];
+    for (const node of implement.nodes.filter((n) => !added.includes(n.nodeId))) {
       const declared = [...(TERMINAL_STAGES_BY_NODE as Record<string, readonly string[]>)[node.nodeId]!].sort();
       expect({ node: node.nodeId, stages: [...(node.terminalStages ?? [])].sort() })
         .toEqual({ node: node.nodeId, stages: declared });
@@ -265,9 +268,26 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
       for (const fb of edge.fallback ?? []) set.add(fb.node);
       yamlTargets.set(edge.from, set);
     }
+    // ⭐ HARNESS-FULL-GRAPH(10-08) — 코드 간선 X→Y 는 YAML 에서 «직접» 또는 «여정 노드만 지나» 닿으면 덮인다
+    //   (open-pr → freeze-check → merge: 동결 검사는 그 사이에 늘 있었다). 코드에 없는 파이프라인 간선은 여전히 빨강.
+    const journey = new Set<string>(JOURNEY_NODE_IDS);
+    const reachesThroughJourney = (from: string, to: string): boolean => {
+      const seen = new Set<string>();
+      const stack = [...(yamlTargets.get(from) ?? [])];
+      while (stack.length > 0) {
+        const next = stack.pop()!;
+        if (next === to) return true;
+        if (!journey.has(next) || seen.has(next)) continue;
+        seen.add(next);
+        stack.push(...(yamlTargets.get(next) ?? []));
+      }
+      return false;
+    };
     for (const [from, targets] of Object.entries(declared)) {
-      expect({ from, targets: [...(yamlTargets.get(from) ?? new Set())].sort() })
-        .toEqual({ from, targets: [...targets].sort() });
+      expect({ from, uncovered: targets.filter((to) => !reachesThroughJourney(from, to)) }).toEqual({ from, uncovered: [] });
+      // ⛔ 역방향: YAML 이 파이프라인 노드 사이에 «코드에 없는» 간선을 더하면 빨강이다(여정 노드로 가는 간선만 더할 수 있다).
+      const pipelineTargets = [...(yamlTargets.get(from) ?? new Set())].filter((to) => !journey.has(to));
+      expect({ from, undeclaredInCode: pipelineTargets.filter((to) => !(targets as readonly string[]).includes(to)).sort() }).toEqual({ from, undeclaredInCode: [] });
     }
   });
 });

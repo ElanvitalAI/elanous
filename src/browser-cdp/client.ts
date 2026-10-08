@@ -7,11 +7,9 @@
 // `{id, method, params}` messages, receive `{id, result}` or
 // `{id, error}`.
 //
-// Scope kept narrow: navigate + screenshot + evaluate + close.
-// The MVP targets "open a page for the user to see + capture a
-// PNG" which covers the display-plus-screenshot flow the plan
-// describes. Full Puppeteer feature parity is explicitly out of
-// scope.
+// Scope kept narrow: navigation, capture, evaluation and CDP input.
+// Approval of mutating actions belongs to the caller, not this transport.
+// Full Puppeteer feature parity is explicitly out of scope.
 
 import { CHROME_NO_KEYCHAIN_FLAGS } from './chrome-flags.js';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -126,6 +124,8 @@ export interface CdpClient {
   setScriptExecutionDisabled(value: boolean): Promise<void>;
   /** Dispatch one primary-button click at viewport coordinates. */
   click?(coordinates: { x: number; y: number }): Promise<void>;
+  /** Insert text at the focused element (approval is the caller's responsibility). */
+  input?(text: string): Promise<void>;
   /** Dispose — closes Chrome + WebSocket. */
   close(): Promise<void>;
   readonly isAlive: boolean;
@@ -512,6 +512,11 @@ async function buildClientFromTransport(
       const params = { x, y, button: 'left', clickCount: 1 };
       await runOnPage('Input.dispatchMouseEvent', { type: 'mousePressed', ...params });
       await runOnPage('Input.dispatchMouseEvent', { type: 'mouseReleased', ...params });
+    },
+    async input(text) {
+      // Newlines can submit a form even without an Enter key event.
+      if (/[\r\n]/.test(text)) throw new Error('CDP input refuses newlines');
+      await runOnPage('Input.insertText', { text });
     },
     async close() {
       if (!alive) return;

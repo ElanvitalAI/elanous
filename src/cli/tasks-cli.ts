@@ -34,6 +34,10 @@ export interface TasksCliDeps {
   releaseBoard?: () => BoardNode[];
   /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
   cardRunEvidence?: CardRunEvidenceDeps;
+  /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
+  remoteLedgerMirror?: (card: TaskCard) => void;
+  /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
+  staleParents?: import('../task-agent/parent-host.js').StaleParentDeps;
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -97,6 +101,60 @@ export interface DefaultTaskLauncherDeps {
   writeStop?: import('../self-implement/run-ledger.js').RunLedgerWriter;
   /** 이미 stop 이 있나(시험 주입). 기본 = 이 우주 런 원장 ⊕ 이 프로세스 기록. */
   hasStop?: (runId: string) => boolean;
+  /** HARNESS-PARENT-ON-MSB1 — 원격 부모 대상(시험 주입). undefined = 설정·env 에서 푼다 · null = 끔. */
+  parentHost?: import('../task-agent/parent-host.js').ParentHostConfig | null;
+  /** 원격 ssh(시험 주입). */
+  ssh?: import('../task-agent/parent-host.js').SshRunner;
+  /** HQ 발사 동결(holdLaunches) 여부(시험 주입). */
+  launchHoldActive?: () => boolean;
+  /** HQ 판(시험 주입). */
+  localVersion?: string;
+  /** 원격 → 로컬 되돌림 알림(시험 주입). 기본 = stderr 한 줄. */
+  notice?: (line: string) => void;
+}
+
+/**
+ * HARNESS-PARENT-ON-MSB1 — 켜져 있고 발사 전 점검이 통과하면 원격(ssh)에서 부모를 띄운다(PR 까지만 · 병합은 HQ).
+ * 막히면 null — 호출부가 종전 로컬 발사로 간다(관측: task-agent parent-host-fallback).
+ */
+async function tryRemoteParent(args: string[], cwd: string | undefined, context: TaskLaunchContext, deps: DefaultTaskLauncherDeps): Promise<TaskLaunchReceipt | null> {
+  const parentHostModule = await import('../task-agent/parent-host.js');
+  let target = deps.parentHost;
+  if (target === undefined) {
+    const { getUserConfig } = await import('../user-config.js');
+    let configured: Parameters<typeof parentHostModule.resolveParentHost>[0];
+    try { configured = getUserConfig().taskAgent?.parentHost; } catch { configured = undefined; }
+    target = parentHostModule.resolveParentHost(configured);
+  }
+  if (!target) return null;
+  const notice = deps.notice ?? ((line: string) => { try { process.stderr.write(`${line}\n`); } catch { /* ignore */ } });
+  const fallback = (gaps: string[], facts: Record<string, string> = {}): null => {
+    try { debug.log('task-agent', 'parent-host-fallback', { host: target!.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
+    notice(`[parent-host] ${target!.host} 로 못 띄움 — 로컬 발사로 간다: ${gaps.join(' · ')}`);
+    return null;
+  };
+  if (cwd) return fallback(['project-target-is-local']);
+  let launchHoldActive = false;
+  try {
+    if (deps.launchHoldActive) launchHoldActive = deps.launchHoldActive();
+    else {
+      const { readLandingFreeze } = await import('../release-loop/landing-freeze.js');
+      const { prodInstanceRoot } = await import('../instance/resolve.js');
+      launchHoldActive = readLandingFreeze(prodInstanceRoot())?.holdLaunches === true;
+    }
+  } catch { launchHoldActive = true; /* 못 읽으면 막힌 것으로(fail-closed) */ }
+  const preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, ...(deps.ssh ? { ssh: deps.ssh } : {}) });
+  if (!preflight.ok) return fallback(preflight.gaps, preflight.facts);
+  try {
+    const launched = parentHostModule.launchRemoteParent(target, args, context.env, deps.ssh);
+    try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
+    return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
+  } catch (error) {
+    // «확실히 안 떴다»일 때만 로컬로 — 불확실(ssh 끊김 등)은 던져 카드를 launch-failed 로 남긴다(중복 발사 방지).
+    if (error instanceof parentHostModule.RemoteParentNotLaunchedError) return fallback([error.message]);
+    try { debug.log('task-agent', 'parent-host-launch-uncertain', { host: target.host, runId: context.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+    throw error;
+  }
 }
 
 /** stderr 파일의 첫 비어 있지 않은 줄(최대 4KB 만 읽는다 — 원 로그 꼬리를 싣지 않는다). */
@@ -112,6 +170,10 @@ function firstStderrLine(path: string): string {
 }
 
 export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: DefaultTaskLauncherDeps = {}): Promise<void | TaskLaunchReceipt> {
+  if (context) {
+    const remote = await tryRemoteParent(args, cwd, context, deps);
+    if (remote) return remote;
+  }
   const spawn = deps.spawn ?? ((await import('node:child_process')).spawn as unknown as DetachedSpawn);
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { prodInstanceRoot } = await import('../instance/resolve.js');
@@ -206,6 +268,21 @@ export function spawnDetachedConfirmed(spawnFn: DetachedSpawn, command: string, 
     child.once('error', onError);
     const timer = setTimeout(() => finish(child.pid ? undefined : new Error(`발사 확인 시간 초과(${timeoutMs}ms) · pid 없음`)), timeoutMs);
   });
+}
+
+/** HARNESS-PARENT-ON-MSB1 — 카드가 원격 부모면 그 런 원장(⊕ Pod 자식)을 HQ 거울로 당긴다. 실패는 관측만(«없음»으로 읽히지 않게). */
+async function mirrorRemoteCardLedger(cardId: string, deps: TasksCliDeps): Promise<void> {
+  let card: TaskCard | undefined;
+  try { card = readTaskCard(cardId, deps.taskStatePath); } catch { return; }
+  if (!card?.parentHost || !card.runId) return;
+  try {
+    if (deps.remoteLedgerMirror) { deps.remoteLedgerMirror(card); return; }
+    const { mirrorRemoteRunLedgers } = await import('../task-agent/parent-host.js');
+    const { prodInstanceRoot } = await import('../instance/resolve.js');
+    mirrorRemoteRunLedgers(card.parentHost, card.runId, prodInstanceRoot());
+  } catch (error) {
+    try { debug.log('task-agent', 'remote-ledger-mirror-failed', { card: cardId, host: card.parentHost.host, runId: card.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+  }
 }
 
 function moveLine(card: TaskCard): string {
@@ -442,6 +519,32 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       }
     });
 
+  tasks.command('parents')
+    .description('낡은 하니스 부모 보고(읽기 전용 · 죽이지 않는다) — 나이 ≥ N 시간이고 런 원장이 끝났거나(run-status) Pod 이 없는 `harness say|ask` 부모')
+    .option('--older-than <hours>', '나이 하한(시간)', '6')
+    .option('--no-pods', 'Pod 목록을 재지 않는다(원장 근거만)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { olderThan: string; pods?: boolean; json?: boolean }) => {
+      const hours = Number(opts.olderThan);
+      if (!Number.isFinite(hours) || hours < 0) { out(`--older-than 는 0 이상 수다: ${opts.olderThan}`); process.exitCode = 1; return; }
+      const { staleHarnessParents } = await import('../task-agent/parent-host.js');
+      const injected = deps.staleParents ?? {};
+      const loadLedger = injected.loadLedger ?? ((runId: string) => loadRunLedgerSync(runId));
+      let podRuns = injected.podRuns;
+      let labelOf = injected.labelOf;
+      if (!podRuns && opts.pods !== false) {
+        const queue = await import('../harness/harness-queue.js');
+        podRuns = () => queue.readHarnessQueuePodRuns();
+        labelOf = queue.queueRunLabelValue;
+      }
+      const report = staleHarnessParents(hours, { ...injected, loadLedger, ...(podRuns ? { podRuns } : {}), ...(labelOf ? { labelOf } : {}) });
+      try { debug.log('task-agent', 'stale-parents', { olderThanHours: hours, scanned: report.scanned, stale: report.rows.length, podRunsMeasured: report.podRunsMeasured }); } catch { /* fail-soft */ }
+      if (opts.json) { out(JSON.stringify({ olderThanHours: hours, ...report })); return; }
+      out(`하니스 부모 ${report.scanned} · 나이 ≥ ${hours}h 중 낡음 후보 ${report.rows.length}${report.podRunsMeasured ? '' : ' · ⚠ Pod 목록 못 잼(원장 근거만)'} — 읽기 전용(죽이지 않는다)`);
+      out('pid\t나이h\t자리\t판\t런\t사유');
+      for (const row of report.rows) out([row.pid, row.ageHours, row.seat ?? '-', row.version ?? '-', row.runId ?? '-', row.reasons.join(',')].join('\t'));
+    });
+
   tasks.command('board')
     .description('보드 — 프로젝트 › 목표 › 이정표 › 과제. 과제 카드(project·goal·milestone)와 내부 팩(릴리스 체크리스트 = elanous › 판 › 칸)을 합쳐 읽는다(쓰지 않는다)')
     .option('--project <id>', '이 프로젝트만')
@@ -569,6 +672,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           // 런 id 가 있으면 원장에서 골 id · PR 을 묶는다(찾았을 때만 적는다 · 실패는 그대로 보인다).
           const bindable = card?.pieces ? card.pieces : card ? [card.id] : [];
           for (const cardId of bindable) {
+            // HARNESS-PARENT-ON-MSB1: 원격 부모 런은 원장이 그 호스트에 있다 — HQ 거울로 먼저 당긴다(읽기 전용).
+            await mirrorRemoteCardLedger(cardId, deps);
             try { await refreshCardRunBinding(cardId, deps.taskStatePath ?? taskStatePathDefault(), deps.cardRunEvidence ?? {}); } catch (error) {
               // 근거 없음으로 보인다 — 원장 부재와 갈리게 실패는 남긴다.
               try { debug.log('task-agent', 'card-bind-failed', { card: cardId, via: 'show', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
@@ -608,6 +713,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}) }));
         else {
           for (const line of taskCardLines(card)) out(line);
+          if (card.parentHost) out(`부모 호스트: ${card.parentHost.host}${card.parentHost.pid ? ` (pid ${card.parentHost.pid})` : ''} · PR 까지만 — 병합은 HQ${card.parentHost.log ? ` · 로그 ${card.parentHost.host}:${card.parentHost.log}` : ''}`);
           if (salvage.salvageBranch) out(`수확 가지: ${salvage.salvageBranch} (draft PR 대신)`);
           else if (salvageUnread) out('수확 가지: 못 읽음(원장 읽기 실패)');
         }

@@ -97,7 +97,7 @@ function inspectLaunchingTree(cwd: string): LaunchingTreeProbe {
 
 /** 발사 전 검사가 쓰는 조회 구현 — ⛔ 이 «한 벌»을 모든 표면이 공유한다. */
 export async function buildAskPreflightDeps(options: BuildAskPreflightDepsOptions = {}): Promise<AskPreflightDeps & { inspectLaunchingTree(cwd: string): LaunchingTreeProbe }> {
-  const [{ tracedPathReferences, verbatimOriginalAsk }, { loadRunLedger, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers }] = await Promise.all([
+  const [{ tracedPathReferences, verbatimOriginalAsk, isNotGroundedWithoutPersistentEvidence }, { loadRunLedger, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers }] = await Promise.all([
     import('../self-implement/goal-author.js'),
     import('../self-implement/run-ledger.js'),
   ]);
@@ -166,6 +166,8 @@ export async function buildAskPreflightDeps(options: BuildAskPreflightDepsOption
     //   ⛔ ask 표지가 없으면 빈 배열 — 그때는 표시가 «안 붙는다»(지어내지 않는다).
     askTargetPaths: (document: string) => parseAskTargetPathHints(verbatimOriginalAsk(document) ?? ''),
     askTargetPathRejections: (document: string) => parseAskTargetPathHintsResult(verbatimOriginalAsk(document) ?? '').rejected,
+    // AUTO-TARGET: a NOT-GROUNDED goal (no persistent evidence) is a scope card — machine-suggested paths do not launch it.
+    notGroundedWithoutPersistentEvidence: isNotGroundedWithoutPersistentEvidence,
     // ⭐ 충돌 문면이 경로마다 「대상/근거」를 말하게 한다 — 판정은 «안» 바꾼다(문면만 는다).
     //   ⛔ TRACED PATHS 는 「바꿀 파일」과 「근거로 읽은 파일」을 섞는다(실측: TRACED 8 · 변경 3).
     //     ⇒ 사람이 막혔을 때 「그게 근거였네」를 «즉시» 알 수 있어야 한다.

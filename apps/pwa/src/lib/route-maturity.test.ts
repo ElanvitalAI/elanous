@@ -89,7 +89,7 @@ describe('PWA route maturity', () => {
     expect(visibleForRole('contributor', '/today')).toBe(true);
     expect(visibleForRole('owner', '/today')).toBe(true);
     expect(visibleForRole('contributor', '/editor')).toBe(true);
-    expect(visibleForRole('general', '/editor')).toBe(false);
+    expect(visibleForRole('general', '/editor')).toBe(true); // EDITOR-NAV-PUBLIC — 편집기는 stable
     expect(visibleForRole('owner', '/morning')).toBe(true);
     for (const [path, grade] of Object.entries(FEATURE_MATURITY.pwaRoute)) {
       expect(routeMaturity(path)).toBe(grade.pwa);

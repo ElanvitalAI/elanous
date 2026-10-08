@@ -196,7 +196,7 @@ describe('pruneStaleEvents — P4.3 retention/망각', () => {
     recordEvent(d, { surface: 'outbound', direction: 'outbound', kind: 'qna', text: '낡지만 회상됨', ts: daysAgo(120), importance: 2 });     // 보존(미엘린)
     recordEvent(d, { surface: 'outbound', direction: 'outbound', kind: 'qna', text: '최근 잡담', ts: daysAgo(3), importance: 2 });            // 보존(최근)
     recallEvents(d, { query: '회상됨', nowMs: NOW, sinceHours: 200 * 24 });   // 신선할 때 회상됐다 가정 → recall_count 보유
-    const pruned = pruneStaleEvents(d);
+    const pruned = pruneStaleEvents(d, { nowExpr: new Date(NOW).toISOString() });
     expect(pruned).toBe(1);
     const remain = queryEvents(d, { limit: 10 }).map(r => r.text);
     expect(remain).toContain('낡지만 중요');
@@ -208,7 +208,7 @@ describe('pruneStaleEvents — P4.3 retention/망각', () => {
   test('삭제 시 FTS 동기(orphan 없음)', () => {
     const d = db();
     recordEvent(d, { surface: 'outbound', direction: 'outbound', kind: 'qna', text: '삭제될 반도체 잡담', ts: daysAgo(200), importance: 1 });
-    pruneStaleEvents(d);
+    pruneStaleEvents(d, { nowExpr: new Date(NOW).toISOString() });
     expect(queryEvents(d, { query: '반도체' }).length).toBe(0);   // FTS 에서도 사라짐
   });
 });

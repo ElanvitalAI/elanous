@@ -4465,8 +4465,10 @@ selfCmd
     };
     try {
       const { dispatchHeavyCheck } = await import('./self-implement/gate-remote.js');
-      const { execFileSync } = await import('node:child_process');
-      const repo = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+      const { runGitCommand } = await import('./git-fs/runner.js');
+      const topLevel = runGitCommand(process.cwd(), ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+      if (topLevel.status !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${topLevel.stderr.trim() || `rc=${topLevel.status}`}`);
+      const repo = topLevel.stdout.trim();
       // Only a committed --base range is reproducible on another host: the default mode measures uncommitted files, --pr
       // reads files through gh on this host, and the remote checkout runs from the repository root — those stay local.
       const { realpathSync } = await import('node:fs');
@@ -4891,7 +4893,7 @@ const selfOrchestrateCmd = selfCmd
         // ☸️ 풀이 «원격 노드뿐»이면 이 기계의 이미지는 아무도 안 쓴다 — 로컬 판정·굽기를 건너뛰고 기준 판 = HEAD 로 노드 동기화만 한다.
         //   🩸 2026-09-26 실측: 원격 전용 풀인데 로컬 이미지가 없다고 로컬에서 굽다가 로컬 클러스터(elanous-h1)가 없어 런이 시작도 전에 죽었다.
         const remoteOnlyPool = poolMembers.length > 0 && poolMembers.every((m) => Boolean(m.sshHost));
-        const headCommit = remoteOnlyPool ? ((await import('node:child_process')).spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout?.trim() || null) : null;
+        const headCommit = remoteOnlyPool ? ((await import('./git-fs/runner.js')).runGitCommand(process.cwd(), ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim() || null) : null;
         let image = remoteOnlyPool
           ? { imageCommit: headCommit, headCommit, fresh: true, reason: 'remote-only pool — 노드 쪽에서 맞춘다' }
           : podImageFreshness();
@@ -4901,7 +4903,8 @@ const selfOrchestrateCmd = selfCmd
           } else {
             if (!opts.json) ui.info(`[pod] 이미지 다시 굽기 — ${image.reason} (~1분)`);
             const { spawnSync } = await import('node:child_process');
-            const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim() || process.cwd();
+            const { runGitCommand } = await import('./git-fs/runner.js');
+            const top = runGitCommand(process.cwd(), ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim() || process.cwd();
             // bun 1.4 applies the 1 MiB default maxBuffer: a docker build log past it kills the child (ENOBUFS · status null).
             const b = spawnSync('bash', [`${top}/docker/harness/build.sh`], { encoding: 'utf8', timeout: 900_000, maxBuffer: 64 * 1024 * 1024 });
             if (b.status !== 0) { ui.error(`--substrate pod: 이미지 굽기 실패 rc=${b.status}${b.error ? ` (${(b.error as NodeJS.ErrnoException).code ?? b.error.message})` : ''}: ${(b.stdout + b.stderr).slice(-400)}`); process.exit(2); }

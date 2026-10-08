@@ -42,7 +42,7 @@ test('그날 흡수·갈래가 끝난 것만 · 축별로 묶고 노트의 한 �
   expect(d.review).toEqual([{ fact: 'elanous 의 `y` 가 같은 것인가', note: '/v/A.md' }]);
   expect(md).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
   expect(md).not.toContain('사람이 가를 것');
-  expect(renderDigestTelegram(d)).toBe('흡수 2 → 우리에게 닿는 것 0');
+  expect(renderDigestTelegram(d)).toBe('흡수 2편 → 우리에게 닿는 것 0\n\n참고 2편 — 노트: [[A]], [[B]]');
   expect(d.absorbed.find((e) => e.id === a)?.impact).toBeUndefined();
   expect(buildIntakeDigest(r, '2026-09-25', (p) => files[p]).absorbed).toHaveLength(0);
 });
@@ -67,9 +67,9 @@ test('렌즈 판정 3 · 참고 2 — 노트 S, 우리 맥락 C, 판정별 A 와
   ].map((row) => JSON.stringify(row)).join('\n') + '\n');
   const d = buildIntakeDigest(r, '2026-10-05', (p) => notes[Number(p.match(/\d+/)?.[0])]);
   const t = renderDigestTelegram(d);
-  expect(t.split('\n')[0]).toBe('흡수 5 → 우리에게 닿는 것 3');
+  expect(t.split('\n')[0]).toBe('흡수 5편 → 우리에게 닿는 것 3');
   expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
-  expect(t.match(/^🔗 원문 링크:/gm)).toHaveLength(3);
+  expect(t.match(/^🔗 노트:/gm)).toHaveLength(3);
   expect(t.match(/^S 무엇: (.*)$/gm)?.map((line) => line.slice('S 무엇: '.length))).toEqual(notes.slice(0, 3).map((note) => noteOneLiner(note)!));
   const contexts = t.match(/^C 우리에게 왜: (.*)$/gm) ?? [];
   expect(contexts).toHaveLength(3);
@@ -82,7 +82,8 @@ test('렌즈 판정 3 · 참고 2 — 노트 S, 우리 맥락 C, 판정별 A 와
   ]);
   expect(new Set(actions).size).toBe(actions.length);
   expect(t).not.toContain('elanous 의 `video-gen` 은 python 으로 합성한다');
-  expect(t).toContain('그 밖 2건 · 참고');
+  expect(t).toContain('참고 2편 — 노트: [[3]], [[4]]');
+  expect(t).not.toContain('그 밖');
   const md = renderDigestMarkdown(d);
   expect(md).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
   expect(md).not.toContain('사람이 가를 것');
@@ -96,7 +97,7 @@ test('체크 대조 fact/current 는 렌즈 판정이 아니다 — 경로만 �
   for (const id of ids) markIntakeItem(r, id, { status: 'absorbed', output: { kind: 'note', ref: `/v/${id}.md` } }, at);
   routeIntakeItem(r, ids[0], { items: [{ fact: 'elanous 의 video-gen', current: 'src/feature.ts', verdict: '판단 필요' }] }, {}, at);
   const d = buildIntakeDigest(r, '2026-09-26', () => undefined);
-  expect(renderDigestTelegram(d)).toBe('흡수 2 → 우리에게 닿는 것 0');
+  expect(renderDigestTelegram(d)).toBe(`흡수 2편 → 우리에게 닿는 것 0\n\n참고 2편 — 노트: ${ids.map((id) => `[[${id}]]`).join(', ')}`);
   expect(renderDigestMarkdown(d)).toContain('렌즈 판정 못 함 2 — 원장 `elanous intake items`');
 });
 
@@ -106,18 +107,18 @@ test('닿는 것 4여도 텔레그램에는 최대 세 건만 낸다', () => {
     impact: { verdict: '보강' as const, why: `소구점 ${n}에 근거가 부족하다.`, target: `VIDEO-${n}` },
   }));
   const t = renderDigestTelegram({ day: '2026-10-05', grounding: 0, release: 0, manual: 0, absorbed, goals: [] });
-  expect(t.split('\n')[0]).toBe('흡수 4 → 우리에게 닿는 것 4');
+  expect(t.split('\n')[0]).toBe('흡수 4편 → 우리에게 닿는 것 4');
   expect(t.match(/^S 무엇:/gm)).toHaveLength(3);
   expect(t).not.toContain('외부 사실 3');
 });
 
-test('닿는 것 0이면 머리 한 줄만 — 침묵·옵시디언 주소도 덧붙이지 않는다', () => {
+test('닿는 것 0이면 머리 줄 ⊕ 참고 한 줄만 — 침묵·옵시디언 주소도 덧붙이지 않는다', () => {
   const t = renderDigestTelegram({
     day: '2026-09-26', grounding: 0, release: 0, manual: 0,
     absorbed: [{ id: '1', sources: ['youtube'], axis: 'x' }], goals: [{ fact: 'old aggregate without an item id' }],
     savedSilence: { days: 3, lastNewAt: '2026-09-20T00:00:00Z' },
   }, { vaultRoot: '/vault/ElanvitalAI', notePath: '/vault/ElanvitalAI/digest.md' });
-  expect(t).toBe('흡수 1 → 우리에게 닿는 것 0');
+  expect(t).toBe('흡수 1편 → 우리에게 닿는 것 0\n\n참고 1편 — 노트: 1');
 });
 
 test('저장된 메시지 새 글이 이틀 넘게 없으면 노트에 경고 · 텔레그램 닿는 것 0은 머리만 · 이틀 안이면 없다', () => {
@@ -129,7 +130,7 @@ test('저장된 메시지 새 글이 이틀 넘게 없으면 노트에 경고 ·
   const d = buildIntakeDigest(r, '2026-10-01', () => undefined, new Date('2026-10-01T00:00:00Z'));
   expect(d.savedSilence).toEqual({ days: 2, lastNewAt: '2026-09-28T22:07:49.773Z' });
   expect(renderDigestMarkdown(d)).toContain('새 글을 2일째 못 받았다(마지막 새 글 수집 2026-09-29)');
-  expect(renderDigestTelegram(d)).toBe('흡수 0 → 우리에게 닿는 것 0');
+  expect(renderDigestTelegram(d)).toBe('흡수 0편 → 우리에게 닿는 것 0');
 });
 
 test('lens file drives the digest: same verdict+target repeats collapse to one A, and a header over three says how many more (ACP must-fix)', () => {
@@ -150,13 +151,13 @@ test('lens file drives the digest: same verdict+target repeats collapse to one A
   const read = (p: string) => p.endsWith('.md') ? `## 한줄 결론\n${p} 의 결론이다.\n` : undefined;
   const d = buildIntakeDigest(r, '2026-10-05', read);
   const text = renderDigestTelegram(d);
-  expect(text.split('\n')[0]).toBe('흡수 6 → 우리에게 닿는 것 5');
+  expect(text.split('\n')[0]).toBe('흡수 6편 → 우리에게 닿는 것 5');
   const actions = text.match(/^A 그래서 무엇을 하나: .+$/gm) ?? [];
   expect(new Set(actions).size).toBe(actions.length);
   expect(actions.filter((a) => a.includes('칸 VIDEO-2 에 근거 추가')).length).toBe(2);
   expect(text.match(/^S 무엇: /gm)?.length).toBe(3);
   // Each block keeps S, C, A and its link together.
-  expect(text).toMatch(/S 무엇: [^\n]+\nC 우리에게 왜: [^\n]+\nA 그래서 무엇을 하나: [^\n]+\n🔗 원문 링크: /);
+  expect(text).toMatch(/S 무엇: [^\n]+\nC 우리에게 왜: [^\n]+\nA 그래서 무엇을 하나: [^\n]+\n🔗 노트: /);
   expect(text).toContain('닿는 것 2건 더');
 });
 

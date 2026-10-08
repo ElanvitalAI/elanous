@@ -21,6 +21,7 @@ const seat = (id: string, green = 0, yellow = 0) => ({
   checklist: { green, yellow, red: 0, done: 0 },
 });
 const seats = { date: '2026-10-05', seats: [seat('OP', 1), seat('TC', 1, 1), seat('MK'), seat('UX')] };
+const draftMetrics = { inventory: 168, oldestAgeHours: 119.2, needsOwner: 12, converted48h: 330, cohort48h: 701, conversion48h: 330 / 701 };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const gridData = {
   hq: { record: { holder: '본부-OP', generation: 4, acquiredAt: 900, renewedAt: 990, ttlSeconds: 1500 }, ageSeconds: 125, expired: false, reason: null },
@@ -65,11 +66,12 @@ test('all six cards show loading rather than unreadable before the first respons
     if (url.includes('/v1/decisions')) return json({ decisions: [] });
     if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
     if (url.includes('/v1/grid')) return json(gridData);
+    if (url.includes('/v1/drafts/metrics')) return json({ state: 'ready', metrics: draftMetrics, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null });
     throw Error(`Unexpected GET: ${url}`);
   }) as typeof fetch;
   const root = await mount();
-  const labels = ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드'];
-  expect(calls).toHaveLength(7);
+  const labels = ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드', 'draft 재고'];
+  expect(calls).toHaveLength(8);
   expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual(labels);
   for (const label of labels) {
     expect(card(root, label)).toContain('불러오는 중…');
@@ -96,9 +98,10 @@ test('failed and unanswered reads show 못 읽음 only after the request ends', 
     }) as typeof fetch;
     const root = await mount();
     expect(root.findAllByType('section').map((section) => section.props['aria-label'])).toEqual([
-      '릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드',
+      '릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5', '그리드', 'draft 재고',
     ]);
-    expect(deadlines).toHaveLength(7);
+    expect(deadlines).toHaveLength(8);
+    expect(card(root, 'draft 재고')).toBe('draft 재고못 읽음');
     for (const label of ['릴리스 판 진행', '루프 판정', '결정 대기 카드', '오늘 병합 PR', '위험·막힘 톱 5']) {
       expect(card(root, label)).toContain('못 읽음');
     }
@@ -167,7 +170,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
   expect(routeMaturity('/ceo')).toBe('ops');
   expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/ceo')).toMatchObject({ group: 'ops', label: '대표 조망판' });
   expect(root.findByProps({ 'aria-label': '대표 조망 카드' }).props.className).toContain('grid-cols-2');
-  expect(root.findAllByType('section')).toHaveLength(6);
+  expect(root.findAllByType('section')).toHaveLength(7);
   expect(card(root, '릴리스 판 진행')).toContain('green 2');
   expect(card(root, '릴리스 판 진행')).toContain('노랑 1');
   expect(card(root, '루프 판정')).toContain('늦음 1');
@@ -186,6 +189,7 @@ test('owner overview preserves four summary cards and adds two compact cards usi
     `https://nexus.example/v1/harness/runs?finishedSince=${Date.parse('2026-10-04T15:00:00Z')}`,
     `https://nexus.example/v1/harness/runs?finishedSince=${Date.parse('2026-09-27T15:00:00Z')}`,
     'https://nexus.example/v1/grid',
+    'https://nexus.example/v1/drafts/metrics',
   ]);
   expect(calls.every(({ init }) => !init?.method || init.method === 'GET')).toBe(true);
   expect(calls.every(({ init }) => (init?.headers as Record<string, string>)?.authorization === 'Bearer owner-token')).toBe(true);
@@ -390,4 +394,88 @@ test('duplicate failed loop in schedule and registry occupies only one risk slot
     '2026-10-05T08:00:00Z', '2026-10-05T06:00:00Z', '2026-10-05T05:00:00Z',
     '2026-10-05T04:00:00Z', '2026-10-05T03:00:00Z',
   ]);
+});
+
+function draftFetch(drafts: () => Response | Promise<Response>, calls: string[] = []) {
+  globalThis.fetch = (async (url: string) => {
+    calls.push(url);
+    if (url.includes('/v1/drafts/metrics')) return drafts();
+    if (url.includes('/v1/grid')) return json(gridData);
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/schedules')) return json({ schedules: [] });
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) return json({ decisions: [] });
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+}
+
+test('DRAFT-METRIC card shows inventory, oldest age, drafts without an owner mark and 48h conversion with the measurement time', async () => {
+  draftFetch(() => json({ state: 'ready', metrics: draftMetrics, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }));
+  const root = await mount();
+  const text = card(root, 'draft 재고');
+  expect(text).toContain('열린 draft168');
+  expect(text).toContain('최장 나이5.0일');
+  expect(text).toContain('주인 표식 없는 draft12');
+  expect(text).not.toContain('처리 중 표식 0건');
+  expect(text).toContain('48h 전환율47.1%330/701');
+  expect(text).toContain('09:30 측정');
+  expect(text).not.toContain('갱신 실패');
+  expect(root.findByProps({ 'aria-label': 'draft 재고' }).props.className).toContain('col-span-2');
+});
+
+test('DRAFT-METRIC card: when no draft carries an owner mark it says so instead of implying 168 orphans', async () => {
+  draftFetch(() => json({ state: 'ready', metrics: { ...draftMetrics, needsOwner: draftMetrics.inventory }, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }));
+  const root = await mount();
+  expect(card(root, 'draft 재고')).toContain('주인 표식 없는 draft168처리 중 표식 0건');
+});
+
+test('DRAFT-METRIC card: cold cache is 측정 중, failures are 못 읽음 — never zero', async () => {
+  for (const [body, expected] of [
+    [{ state: 'measuring', metrics: null, measuredAt: null, refreshing: true, reason: null }, 'draft 재고측정 중'],
+    [{ state: 'unavailable', metrics: null, measuredAt: null, refreshing: false, reason: 'gh: HTTP 502' }, 'draft 재고못 읽음'],
+    [{ state: 'ready', metrics: { ...draftMetrics, inventory: undefined }, measuredAt: '2026-10-08T00:30:00Z' }, 'draft 재고못 읽음'],
+    [{ error: 'unauthorized' }, 'draft 재고못 읽음'],
+  ] as const) {
+    draftFetch(() => json(body, 'error' in body ? 401 : 200));
+    const root = await mount();
+    expect(card(root, 'draft 재고')).toBe(expected);
+    await act(async () => { tree!.unmount(); });
+    tree = undefined;
+  }
+});
+
+test('DRAFT-METRIC card keeps the previous value after a failed refresh and says so; empty inventory is a real zero', async () => {
+  draftFetch(() => json({ state: 'ready', metrics: { ...draftMetrics, inventory: 0, oldestAgeHours: null, needsOwner: 0, cohort48h: 0, converted48h: 0, conversion48h: null },
+    measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: 'timeout' }));
+  const root = await mount();
+  const text = card(root, 'draft 재고');
+  expect(text).toContain('열린 draft0');
+  expect(text).toContain('최장 나이해당 없음');
+  expect(text).toContain('48h 전환율표본 없음');
+  expect(text).toContain('갱신 실패 — 이전 값');
+});
+
+test('DRAFT-METRIC card re-asks the daemon while it is measuring and stops after the value arrives', async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const polls: Array<() => void> = [];
+  const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    if (delay !== 10_000) return originalSetTimeout(callback, delay);
+    polls.push(callback);
+    return polls.length as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  try {
+    let ready = false;
+    const calls: string[] = [];
+    draftFetch(() => json(ready ? { state: 'ready', metrics: draftMetrics, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }
+      : { state: 'measuring', metrics: null, measuredAt: null, refreshing: true, reason: null }), calls);
+    const root = await mount();
+    expect(card(root, 'draft 재고')).toBe('draft 재고측정 중');
+    expect(polls).toHaveLength(1);
+    ready = true;
+    await act(async () => { polls[0]!(); });
+    expect(card(root, 'draft 재고')).toContain('열린 draft168');
+    expect(calls.filter((url) => url.includes('/v1/drafts/metrics'))).toHaveLength(2);
+    expect(polls).toHaveLength(1);
+  } finally { timer.mockRestore(); }
 });

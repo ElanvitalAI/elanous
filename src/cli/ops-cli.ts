@@ -213,6 +213,17 @@ opsCmd.command('status').description('현재 상태 종합(미션·태스크·�
     }
     return o.allInstances ? runOpsFleet(o.json === true, o.includeTest === true) : runOps('snapshot', o);
   });
+// OPS-OVERVIEW-CLI (RFC-ops-overview-flow-health-cli-2026-10-08) — 판정 먼저 · 이유 사슬 · 절. 못 잼 = null(0 아님).
+opsCmd.command('overview').description('흐름 한 장 — 저작→구현→착지가 흐르나(판정 먼저·이유 사슬) · 판·일꾼·기계·착지·루프 · 못 잼은 null · exit 0=흐름 정상/저하 3=그 밖 1=수집 실패')
+  .option('--json', '칸 꼴 그대로 ⊕ 머리 {verdict, reasons, nextActions, meta.elapsedMs}')
+  .option('--watch [seconds]', '주기 재조회(기본 30초)')
+  .option('--since <window>', '착지 창(<n>m|h|d · 기본 1h)', '1h')
+  .option('--owner <owner>', '일꾼 절 거르기 — seat:TC · TC · unassigned · all')
+  .option('--version <v>', '판(기본: 다음 컷)')
+  .action(async (o: { json?: boolean; watch?: string | boolean; since?: string; owner?: string; version?: string }) => {
+    const { runOpsOverview } = await import('./ops-overview-cli.js');
+    process.exitCode = await runOpsOverview(o);
+  });
 opsCmd.command('health').description('이상 판정만(blocked·errored·stale)').option('--json')
   .action((o: OpsOpts) => runOps('health', o));
 opsCmd.command('timeline').description('상태 전이 최근순 통합')

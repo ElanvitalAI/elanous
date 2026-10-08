@@ -109,6 +109,33 @@ describe('draft-cleanup graph', () => {
     }
   }, 120_000);
 
+  it('runs sweep in ELANOUS_DRAFT_SWEEP_GIT_CWD and surfaces the JSON error when it exits non-zero', async () => {
+    // Installed rails have no .git: branch liveness needs a checkout, and the sweep reports its reason on stdout.
+    const root = mkdtempSync(join(tmpdir(), 'draft-cleanup-cwd-'));
+    roots.push(root);
+    const bin = join(root, 'bin');
+    const checkout = join(root, 'checkout');
+    mkdirSync(bin);
+    mkdirSync(checkout);
+    const bun = Bun.which('bun')!;
+    const seen = join(root, 'cwd');
+    writeFileSync(join(bin, 'bun'), `#!/bin/sh\nif [ "$1" = "-e" ]; then exec "${bun}" "$@"; fi\npwd -P > "${seen}"\necho '{"complete":false,"apply":false,"error":"Branch liveness unavailable"}'\nexit 1\n`);
+    chmodSync(join(bin, 'bun'), 0o755);
+    const previousPath = process.env.PATH;
+    const previousCwd = process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD;
+    try {
+      process.env.PATH = `${bin}:${previousPath}`;
+      process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD = checkout;
+      const result = await runGraph(graph, { deps: { root: join(root, 'graph-state') } });
+      expect(result.status).toBe('failed');
+      expect(readFileSync(seen, 'utf8').trim()).toBe(spawnSync('pwd', ['-P'], { cwd: checkout, encoding: 'utf8' }).stdout.trim());
+      expect(JSON.stringify(result.nodes[0])).toContain('Branch liveness unavailable');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+      if (previousCwd === undefined) delete process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD; else process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD = previousCwd;
+    }
+  }, 60_000);
+
   it('also skips apply for explicit shadow input', async () => {
     const { result, calls } = await sweep({ mode: 'shadow' });
     expect(result.status).toBe('done');

@@ -16,10 +16,11 @@ export const FEATURE_MATURITY = {
     '/today': { pwa: 'stable' },
     '/term': { pwa: 'stable' },
     '/live': { pwa: 'stable' },
+    '/live-run': { pwa: 'beta' },        // HARNESS-RUN-LIVE-GRAPH (0.2.21) — 하니스 런 하나가 도는 장면
     '/market': { pwa: 'stable' },
     '/sessions': { pwa: 'stable' },
     '/settings': { pwa: 'beta' },
-    '/editor': { pwa: 'beta' },
+    '/editor': { pwa: 'stable' },        // EDITOR-NAV-PUBLIC (0.2.21) — 데모·0순위 피처: 역할을 안 고른 기기에도 «만들기 › 편집기»
     '/intake': { pwa: 'beta' },
     '/trace': { pwa: 'beta' },
     '/inside': { pwa: 'beta' },

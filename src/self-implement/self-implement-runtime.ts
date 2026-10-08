@@ -55,6 +55,13 @@ interface SelfImplementRuntimeDeps {
 }
 let runtimeDeps: SelfImplementRuntimeDeps = {};
 
+// TUI-only observer. The tool call id is furnished by the actual dispatcher;
+// other surfaces and calls without an id cannot register a stop target.
+let softStopSpaceObserver: ((toolCallId: string, spaceId: string) => void) | null = null;
+export function setSelfImplementSoftStopSpaceObserver(observer: typeof softStopSpaceObserver): void {
+  softStopSpaceObserver = observer;
+}
+
 /** 자식 헤드리스 elanous 의 config/state 격리 + 구현 대기 상한을 주입. */
 export function setSelfImplementRuntimeDeps(d: SelfImplementRuntimeDeps | null): void {
   runtimeDeps = d ?? {};
@@ -711,6 +718,11 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
       ...(runtimeDeps.implementMaxWaitSec ? { implementMaxWaitSec: runtimeDeps.implementMaxWaitSec } : {}),
       ...(approvePr ? { approvePr } : {}),
       onProgress: resolveHarnessProgressSink(ctx),
+      ...(ctx.surface === 'tui' && ctx.toolCallId && softStopSpaceObserver ? {
+        onSoftStopSpaceReady: (spaceId: string) => {
+          try { softStopSpaceObserver?.(ctx.toolCallId!, spaceId); } catch { /* UI observer cannot break harness */ }
+        },
+      } : {}),
     });
 
     const runnableDocumentReferences = documentReferences.filter(({ result }) => result.kind !== 'outside-repository');

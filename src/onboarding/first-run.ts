@@ -1,6 +1,7 @@
 import * as readline from 'node:readline/promises';
 import { detectProviders, type DetectedProvider } from '../llm/provider-detect.js';
 import { debug } from '../debug/log.js';
+import { unattendedNextStepLine } from './entry-hints.js';
 import { resolveProviderCredential } from '../llm/provider-credentials.js';
 import {
   getUserConfig, saveUserConfig, userConfigPath,
@@ -57,6 +58,8 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   if (!provider) {
     if ((deps.isTTY ?? process.stdin.isTTY) !== true) {
       print('eln setup llm 으로 고르세요');
+      // FIRST-CHAT-NONTTY — bare `elanous` with no TTY gets the same one-line next step as the other entrances.
+      print(unattendedNextStepLine());
       observe('needs-llm', 0);
       return { outcome: 'needs-llm', inputs: 0 };
     }

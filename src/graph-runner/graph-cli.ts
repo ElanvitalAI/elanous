@@ -94,6 +94,63 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         process.exitCode = 1;
       }
     });
+  graph.command('wizard <prompt>')
+    .description('말 한 줄로 그래프 YAML 을 짓고 같은 검증기 ⊕ graph run --dry-run 으로 확인한다(저장하지 않는다) — --from 이면 그 그래프를 고친다')
+    .option('--kind <kind>', 'harness | workflow', 'harness')
+    .option('--from <file>', '고칠 그래프 YAML (편집 경로)')
+    .option('--out <file>', 'YAML 을 이 파일에 쓰고, 하니스면 같은 폴더에 recipes.yaml 도 쓴다(있으면 덮지 않는다)')
+    .option('--json', '결과를 JSON 으로')
+    .option('--run', '생성된 그래프의 dry-run 경로를 보여 준다(--dry-run 과 함께만)')
+    .option('--dry-run', '--run 과 함께: 명령을 실행하지 않고 경로만 걷는다')
+    .action(async (prompt: string, opts: { kind: string; from?: string; out?: string; json?: boolean; run?: boolean; dryRun?: boolean }) => {
+      try {
+        if (opts.kind !== 'harness' && opts.kind !== 'workflow') throw new Error('--kind must be harness or workflow');
+        if (opts.run && !opts.dryRun) throw new Error('--run is only supported with --dry-run (run the saved graph with `elanous graph run <file>`)');
+        if (opts.run && opts.kind !== 'harness') throw new Error('--run --dry-run walks harness graphs only');
+        await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
+        const { generateGraphFromPrompt } = await import('../graph-wizard/generate.js');
+        const currentYaml = opts.from ? readFileSync(opts.from, 'utf8') : undefined;
+        const started = Date.now();
+        const result = await generateGraphFromPrompt({ prompt, kind: opts.kind, ...(currentYaml ? { currentYaml } : {}) });
+        const ms = Date.now() - started;
+        let recipesNote: string | undefined;
+        if (opts.out) {
+          const { writeFileSync } = await import('node:fs');
+          const { dirname } = await import('node:path');
+          writeFileSync(opts.out, result.yaml);
+          if (result.recipes) {
+            const recipesPath = join(dirname(resolve(opts.out)), 'recipes.yaml');
+            if (existsSync(recipesPath) && readFileSync(recipesPath, 'utf8') !== result.recipes) recipesNote = `recipes.yaml 이 이미 있어 덮지 않았다: ${recipesPath}`;
+            else { writeFileSync(recipesPath, result.recipes); recipesNote = `recipes ${recipesPath}`; }
+          }
+        }
+        if (opts.json) {
+          await writeStdoutJson(JSON.stringify({ ...result, ms, ...(recipesNote ? { recipesNote } : {}) }) + '\n');
+        } else {
+          if (!opts.out) process.stdout.write(result.yaml);
+          console.log(`# ${result.ok ? 'ok' : 'invalid'} · id ${result.id} · base ${result.base ?? '-'} · attempts ${result.attempts} · ${(ms / 1000).toFixed(1)}s${opts.out ? ` · saved ${opts.out}` : ''}`);
+          console.log(`# ${result.summary}`);
+          if (recipesNote) console.log(`# ${recipesNote}`);
+          for (const issue of result.issues) console.log(`# issue: ${issue}`);
+          if (result.dryRun && (opts.run || !result.ok)) console.log(`# dry-run ${result.dryRun.status}: ${result.dryRun.path.join(' → ')}`);
+        }
+        if (!result.ok) process.exitCode = 1;
+      } catch (error) {
+        console.error(`graph wizard: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
+  graph.command('step <step>')
+    .description('그래프 마법사 단계 하나를 실행한다(graph run 의 cmd 노드가 부른다 · 마지막 줄 JSON {outcome})')
+    .option('--arg <text>', '단계 인자')
+    .option('--retries <n>', '실패하면 이 횟수만큼 다시 시도', '0')
+    .action(async (step: string, opts: { arg?: string; retries: string }) => {
+      const { runWizardStepWithRetries } = await import('../graph-wizard/steps.js');
+      const result = runWizardStepWithRetries(step, opts.arg, Number.parseInt(opts.retries, 10) || 0);
+      if (result.error) console.error(result.error);
+      console.log(JSON.stringify({ outcome: result.outcome, tries: result.tries, ...(result.text ? { text: result.text.slice(0, 20_000) } : {}), ...(result.error ? { error: result.error } : {}) }));
+      if (result.outcome === 'fail') process.exitCode = 1;
+    });
   graph.command('tick <file>')
     .description('Advance one graph run, resuming a pending decision or starting only when requested')
     .option('--start', 'Start a new run when the graph is idle')
