@@ -2313,7 +2313,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 ## Workflows, tasks and intake
 
 - A **graph** is the flow: order, branches, retries, pauses for approval, reshaping, healing.
-- A **workflow** (`elanous wf`) is the body of a single node: a short DAG of prompts, HTTP calls, classification and templates.
+- In the unified model, a **workflow** is one form of a graph: a graph that starts from a schedule or trigger and runs task nodes. Existing `elanous wf` YAML workflows still run without a required schedule or trigger; when conversion is unsupported, they fall back to the original workflow runner.
 - **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (✅ 0.2.3). See [Tasks and intake](/using-elanous/tasks-and-intake).
 
 ## What ships today, what is in progress
@@ -2334,7 +2334,8 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Supervisor adding nodes at launch and while running | 📋 designed |
 | Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | ✅ 0.2.3 |
 | Task type → a combination of templates and workflows (run · implement · research · composite) | 📋 designed |
-| Workflows as graph nodes (`wf:`) · graphs as workflow nodes | 📋 designed |
+| Workflows as one form of graph, drawn in the same editor and canvas | ✅ ships — one canvas for task nodes and execution-stage nodes; existing workflow URLs open it; `elanous wf` remains available |
+| One execution engine for workflows and graphs | 🔄 in progress — compatibility conversion is partial; unsupported workflows fall back to the original workflow runner |
 
 ### A real walk of the heal template
 
@@ -2354,7 +2355,7 @@ elanous graph status <graph_id>
 
 ## What this page deliberately does not claim
 
-- That the in-progress rows work today. They do not yet.
+- That the in-progress rows are fully delivered today. Compatibility conversion is partial, not one unified engine.
 - How often triage picks the right level. It is logged; its accuracy is not yet measured.
 - Any fixed count of nodes, roles or templates. The catalog and templates are the source; count them when you need to.
 
@@ -5004,6 +5005,47 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.22
+
+Source: https://docs.elanous.ai/releases/0-2-22/
+
+## Behavior changes
+
+- A shared run graph that a peer edited no longer runs on the owner's machine until the owner approves that version (or saves it again); the editor run, the exec-request catalog and clone all refuse it, and the share control warns before granting edit.
+- the reviewer role can be set to a Claude subscription over ACP, falling back to the default reviewer when unavailable.
+- when a run catches up with main and only the release-note file conflicted, the run now reports it as resolved deterministically (no LLM) instead of «LLM-resolved», and the post-sync gate treats it like a clean merge.
+- the graph editor can share a graph with peers and set view or edit permission per peer.
+- the graph canvas uses one grouped node palette for workflows and harness graphs.
+- the knowledge node can use an installed knowledge pack.
+- the PWA has a plugin wizard tab.
+- Telegram opens with live runs before the /now summary.
+- /board shows the same operations board on Telegram and in the TUI.
+- control status prints a read-only seven-row board.
+- config classify reports which config keys are user, operator or internal settings, without changing them.
+- an opt-in claude-pty step can join the LLM fallback chain behind a maturity gate.
+- web push rings only for irreversible decisions or ones due within 24 hours; other decisions wait on the board.
+- ops health flags graph loops that have kept failing for over 24 hours.
+- mermaid diagrams in the PWA follow a default theme that can be changed in settings.
+- knowledge packs pass a data-leak check before they are bundled for the market.
+- supervisor answers are linked to their decision by sessionId and need an answer body.
+- a finished run's duration counts only the nodes on that run.
+- queue and immediate harness launches stamp the state directory they came from on the child.
+- the away summary takes its completed-node total from the run's graph snapshot.
+- decisions --json waits for stdout to drain, so piped output is no longer cut at 64 KB.
+- an outbound report that cannot be delivered becomes one briefing item instead of being lost.
+- the TUI no longer prints the same goal-loop completion answer twice.
+- harness policy gates also run the public export/import check.
+- the plugin validator accepts approval recipes that the graph runner already executes.
+- the loop map says the token lacks access on 401/403 instead of showing a loading or daemon message.
+- a graph's schedule trigger now starts the graph on time through the workflow scheduler.
+- graphs can use a prompt node that sends a prompt to the LLM with $ values filled in.
+- the official plugin market adds image-first-shorts, a free, non-commercial plugin that makes vertical character shorts image-first (first frames, image-to-video, matting, beat-timed sound, effects, final cut) with three human approval steps; adapted with permission from Gongnyang AI Lab (credit in the plugin's SOURCE.md).
+- Claude 5.x models are recognised as reasoning-capable, so reasoning and interleaved thinking are enabled for them on the Anthropic provider.
+
+Plus 135 internal changes.
 
 ---
 
