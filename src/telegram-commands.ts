@@ -56,6 +56,8 @@ import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
 import { CardStore } from './task-cards/card-store.js';
 import type { ContextNowDeps } from './context-bus/context-now.js';
 import type { RunningRunsResult } from './self-implement/running-runs.js';
+import { checklistBoardSlash } from './release-loop/checklist-board.js';
+import type { Checklist } from './release-loop/checklist.js';
 
 /** How many prior user/assistant turns to pass into `executeSkill` as
  *  the `## Recent conversation` block. Mirrors the dashboard default
@@ -348,6 +350,7 @@ export function defaultTelegramCommands(
   coreCommands: readonly SlashCommand[] = SLASH_COMMANDS,
   maturity: { tuiSlash: Readonly<Record<string, Maturity>>; telegramCommand: Readonly<Record<string, Maturity>>; discordCommand: Readonly<Record<string, Maturity>> } = FEATURE_MATURITY,
   runningRunsQuery?: () => RunningRunsResult,
+  checklistRead?: (version: string) => Checklist,
 ): TgSlashCommand[] {
   const handled: TgSlashCommand[] = [
     {
@@ -375,6 +378,11 @@ export function defaultTelegramCommands(
       name: 'runs',
       description: 'Running harness runs — same output as TUI /harness runs',
       handler: async (args) => telegramRunsSlash(args, runningRunsQuery),
+    },
+    {
+      name: 'board',
+      description: '판 체크리스트 — /board [판]',
+      handler: async (args) => checklistBoardSlash(args, checklistRead),
     },
     {
       name: 'release',

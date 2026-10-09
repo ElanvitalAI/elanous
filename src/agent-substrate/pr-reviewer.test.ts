@@ -111,6 +111,18 @@ describe('reviewPullRequest — llmReview seam·fail-soft·reviewed 구분', () 
   it('실제 PASS → reviewed=true', async () => {
     expect((await reviewPullRequest(input, async () => 'VERDICT: PASS')).reviewed).toBe(true);
   });
+  it('수용기준 우선 프롬프트를 받아도 reviewPullRequest와 renderReview의 실제 심사·실패 표시는 보존된다', async () => {
+    const withAcceptance = { ...input, acceptance: '실제 사용자 출력에서 번호를 확인한다' };
+    let seen = '';
+    const reviewed = await reviewPullRequest(withAcceptance, async (prompt) => { seen = prompt; return 'VERDICT: PASS'; });
+    expect(seen.indexOf('## Acceptance criteria')).toBeLessThan(seen.indexOf('(10) GOODHART PASSING PROOF:'));
+    expect(reviewed).toMatchObject({ verdict: 'pass', reviewed: true });
+    expect(renderReview(reviewed)).toContain('자율 PR 리뷰: PASS');
+
+    const failed = await reviewPullRequest(withAcceptance, async () => { throw new Error('review backend unavailable'); });
+    expect(failed).toMatchObject({ verdict: 'pass', reviewed: false, failureReason: 'review backend unavailable' });
+    expect(renderReview(failed)).toBe('⚠️ 자율 PR 리뷰: 리뷰 안 돎 — 사유 review backend unavailable (통과 판정 아님)');
+  });
   it('throw → fail-soft pass·reviewed=false', async () => {
     const r = await reviewPullRequest(input, async () => { throw new Error('down'); });
     expect(r.verdict).toBe('pass');
@@ -213,6 +225,28 @@ describe('buildReviewPrompt / renderReview', () => {
     expect(p).toContain('VERDICT: PASS | VERDICT: WARN | VERDICT: FAIL');
     expect(p).toContain('"REQUIREMENTS:"');
     expect(p).toContain('This is observational only and does not change the verdict.');
+  });
+  it('buildReviewPrompt — phase intent의 acceptance가 reviewer checklist보다 먼저 온다', () => {
+    const p = buildReviewPrompt({ prDiff: '+x', phaseIntent: '결제 결과를 사용자에게 표시', acceptance: '결제 성공 시 사용자 화면에 영수증 번호가 나타난다' });
+    expect(p.indexOf('## Phase intent\n결제 결과를 사용자에게 표시')).toBeGreaterThanOrEqual(0);
+    expect(p.indexOf('## Acceptance criteria\n결제 성공 시 사용자 화면에 영수증 번호가 나타난다')).toBeGreaterThan(p.indexOf('## Phase intent'));
+    expect(p.indexOf('## Acceptance criteria')).toBeLessThan(p.indexOf('This is a POST-PR review'));
+    expect(p.indexOf('## Acceptance criteria')).toBeLessThan(p.indexOf('(10) GOODHART PASSING PROOF:'));
+  });
+  it('buildReviewPrompt — 형식 테스트 통과만으로 실제 수용기준을 대체하지 않는다', () => {
+    const acceptance = '실제 결제 진입점에서 사용자가 영수증 번호를 볼 수 있어야 한다';
+    const formalTestDiff = 'diff --git a/test/receipt.test.ts b/test/receipt.test.ts\n+test("receipt", () => expect(true).toBe(true));';
+    const p = buildReviewPrompt({ prDiff: formalTestDiff, phaseIntent: `수용기준\n- ${acceptance}\n\n무엇을 왜\n영수증 표시` });
+    expect(p).toContain(`## Phase intent\n수용기준\n- ${acceptance}`);
+    expect(p.indexOf(acceptance)).toBeLessThan(p.indexOf('(5) tests present'));
+    expect(p).toContain('tests present\nand honest (no Goodhart)');
+    expect(p).toContain('run the real entrypoint and assert runtime output this change did not author');
+    expect(p).toContain(formalTestDiff);
+  });
+  it('buildReviewPrompt — acceptance를 주지 않으면 빈 섹션 없이 phase intent가 먼저 온다', () => {
+    const p = buildReviewPrompt({ prDiff: '+x', phaseIntent: '목표만 있는 리뷰' });
+    expect(p).not.toContain('## Acceptance criteria');
+    expect(p.indexOf('## Phase intent\n목표만 있는 리뷰')).toBeLessThan(p.indexOf('This is a POST-PR review'));
   });
   it('buildReviewPrompt — 비절단 review intent는 종전 제목을 보존한다', () => {
     const intent = `${'a'.repeat(3999)}Z`;

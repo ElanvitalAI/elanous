@@ -613,9 +613,10 @@ function buildHarnessAskSayDevCliSpec(
   input: { file: string },
   cliOpts: ReturnType<typeof harnessAskSayOptionsToDevCliOpts>,
   entranceId: EntranceId,
+  runId: string,
 ) {
   return {
-    ...buildDevCliSpec(input, { kind: 'self' }, cliOpts, Object.keys(cliOpts), entranceId),
+    ...buildDevCliSpec(input, { kind: 'self' }, cliOpts, Object.keys(cliOpts), entranceId, undefined, undefined, runId),
     ...(cliOpts.json ? { humanReadableOutput: false } : {}),
   };
 }
@@ -661,6 +662,7 @@ async function runDevAskFromAskFile(askPath: string, opts: HarnessAskSayChildLlm
         { file: flowResult.goalFile },
         cliOpts,
         CLI_HARNESS_ASK_ENTRANCE.id,
+        identity.runId,
       ),
       ...(pieceFeature === undefined ? {} : { input: { text: pieceFeature } }),
       ...(base === undefined ? {} : { base }),
@@ -765,6 +767,7 @@ async function runDevAskFromGoalFile(goalPath: string, opts: HarnessAskSayChildL
         { file: goalPath },
         cliOpts,
         CLI_HARNESS_ASK_ENTRANCE.id,
+        identity.runId,
       ),
       runId: identity.runId,
       runIdSource: identity.source,
@@ -868,6 +871,7 @@ async function runDevSayFromWords(
         { file: flowResult.goalFile },
         cliOpts,
         entrance,
+        identity.runId,
       ),
       runId: identity.runId,
       runIdSource: identity.source,
@@ -1271,9 +1275,10 @@ marketCmd.command('publish').description('Publish a local signed marketplace ind
   .option('--source-sha <sha>', 'Git source commit')
   .option('--source-base <path>', 'Git source plugin base directory')
   .option('--bundle-root <dir>', 'Root that extensions["ai.elanous"].bundle paths resolve against (usually the repository root)')
+  .option('--keep-existing', 'Carry over previous index entries whose name has no folder under --dir (unchanged entry and archive)')
   .option('--json', 'JSON result')
   .action(async (opts: { dir: string; out: string; key: string; keyId: string; marketName: string; displayName: string;
-    sourceRepo?: string; sourceSha?: string; sourceBase?: string; bundleRoot?: string; json?: boolean }) => {
+    sourceRepo?: string; sourceSha?: string; sourceBase?: string; bundleRoot?: string; keepExisting?: boolean; json?: boolean }) => {
     try {
       const sourceOptions = [opts.sourceRepo, opts.sourceSha, opts.sourceBase];
       if (sourceOptions.some(Boolean) && !sourceOptions.every(Boolean)) throw new Error('source-repo, source-sha and source-base must be provided together');
@@ -1282,12 +1287,14 @@ marketCmd.command('publish').description('Publish a local signed marketplace ind
         market: { name: opts.marketName, displayName: opts.displayName },
         key: { keyId: opts.keyId, privateKeyPem: readFileSync(opts.key, 'utf8') },
         ...(opts.bundleRoot ? { bundleRoot: opts.bundleRoot } : {}),
+        ...(opts.keepExisting ? { keepExisting: true } : {}),
         ...(opts.sourceRepo && opts.sourceSha && opts.sourceBase
           ? { source: { repoUrl: opts.sourceRepo, sha: opts.sourceSha, basePath: opts.sourceBase } } : {}),
       });
       if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
       else {
-        console.log(`Published ${result.published.length} plugins (sequence ${result.sequence}); skipped ${result.skipped.length}`);
+        console.log(`Published ${result.published.length} plugins (sequence ${result.sequence}); skipped ${result.skipped.length}` +
+          (opts.keepExisting ? `; kept ${result.kept.length}` : ''));
         for (const warning of result.warnings) console.warn(`⚠ ${warning.dir}: ${warning.graph} uses recipes it does not ship (${warning.recipes.join(', ')}) — third-party graphs should use their own recipes.yaml or custom nodes`);
       }
       for (const item of result.skipped) {
@@ -3477,8 +3484,10 @@ coordCmd.command('event').command('record')
   .requiredOption('--header <line>', '채널 글 첫 줄')
   .option('--url <url>', '채널 코멘트 URL')
   .action(async (opts: { seat: string; header: string; url?: string }) => {
-    const { parseCoordHeader, recordCoordEvent } = await import('./context-bus/coord-events.js');
-    recordCoordEvent({ ...parseCoordHeader(opts.seat, opts.header), url: opts.url || null });
+    const { parseCoordHeader, recordCoordEvent, mirrorCoordDecision } = await import('./context-bus/coord-events.js');
+    const input = { ...parseCoordHeader(opts.seat, opts.header), url: opts.url || null, at: new Date().toISOString() };
+    try { recordCoordEvent(input); }
+    finally { mirrorCoordDecision(input); }
   });
 coordCmd.command('events')
   .option('--since <ISO|2h>', '조회 시작', '2h')
@@ -7317,8 +7326,8 @@ const selfDevCmd = program
         console.error(`[dev] 외부 backend 미션의 자기 명령은 \`elanous agent-mission mission\` 입니다; 대응 명령: elanous agent-mission mission --backend ${executor.backend}`);
       }
       let spec = invokedAsDrive
-        ? devCli.buildDriveAliasDevSpec(hasText ? textParts.join(' ') : undefined, devOpts, devCli.explicitDevOptionNames(command))
-        : buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command));
+        ? devCli.buildDriveAliasDevSpec(hasText ? textParts.join(' ') : undefined, devOpts, devCli.explicitDevOptionNames(command), devRunId)
+        : buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command), 'cli-dev-ask', undefined, undefined, devRunId);
       if (!opts.json && spec.notice) console.error(spec.notice);
       // 역할별 LLM은 현재 프로세스 설정이다. self-mission 구현 자식에 전달되지 않는 조합은 위 검증이 먼저 거부한다.
       if (Array.isArray(opts.roleLlm) && opts.roleLlm.length > 0) {
@@ -7817,6 +7826,26 @@ configCmd
     debug.flush();
     console.log(o.json ? JSON.stringify(report, null, 2) : renderDrift(report, { limit: Number(o.limit) || 0 }));
     if (report.prodStatus !== 'ok') process.exit(1);
+  });
+
+configCmd
+  .command('classify')
+  .description('읽기 전용 — 운영 config 잎의 자리(기본값·기계 사실·비밀·운영 정책)와 덮어쓰기 수 (CFG-CLASSIFY)')
+  .option('--json', '잎 전체를 JSON 으로 출력 (비밀 값 제외)')
+  .action(async (o: { json?: boolean }) => {
+    const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+    const { readUniverseConfig } = await import('./cli/config-drift.js');
+    const { classifyConfig, renderClassify } = await import('./cli/config-classify.js');
+    const { buildUserConfig } = await import('./user-config.js');
+    const prod = readUniverseConfig(getElanousConfigDir(), []);
+    if (prod.status !== 'ok' || !prod.raw) {
+      console.error(`config classify — config 못 읽음(${prod.status}${prod.error ? `: ${prod.error}` : ''})`);
+      process.exitCode = 1;
+      return;
+    }
+    const report = classifyConfig(prod.raw, buildUserConfig('/nonexistent/elanous-config-drift/config.json') as unknown as Record<string, unknown>);
+    if (o.json) await (await import('./cli/stdout-flush.js')).writeStdoutFully(JSON.stringify(report, null, 2));
+    else console.log(renderClassify(report));
   });
 
 configCmd

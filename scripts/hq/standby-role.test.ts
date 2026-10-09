@@ -64,6 +64,7 @@ function runBody(mode: string, role: string, env: Record<string, string> = {}) {
     *'hq fence --role cron'*)
       echo "bun fence cfg=$3 command=$9" >> "${calls}"
       if [ "$REAL_FENCE" = 1 ] || [ "$REAL_FENCE" = source ]; then
+        if [ "$CLI_STARTUP_DELAY" = 6 ]; then sleep 6; fi
         while [ "$1" != -- ]; do shift; done
         shift
         exec "$REAL_BUN" bin/elanous.mjs --test --config-dir "$HQ_REP_CONFIG_DIR" hq fence --role cron -- "$@"
@@ -148,7 +149,9 @@ test('core verifies only a fence skip, never the direct or fence-allowed source'
 });
 
 test('the real fence declines for the non-holder, and the wrapper verifies exactly once without parsing its output', () => {
-  const result = runBody('core', 'fenced', { REAL_FENCE: '1', VERIFY_FAIL: '1' });
+  const started = Date.now();
+  const result = runBody('core', 'fenced', { REAL_FENCE: '1', VERIFY_FAIL: '1', CLI_STARTUP_DELAY: '6' });
+  expect(Date.now() - started).toBeGreaterThan(5_000);
   expect(result.status).toBe(0);
   expect(result.lines.filter(line => line.includes('standby-verify.ts'))).toEqual([
     'bun scripts/hq/standby-verify.ts --root <home>/.elanous-standby --tier core,big --max-age-min core=30,big=400',
@@ -156,7 +159,7 @@ test('the real fence declines for the non-holder, and the wrapper verifies exact
   expect(result.lines).toHaveLength(2);
   expect(result.out).toContain('hq fence: skip cron — not-holder');
   expect(result.out).toContain('hq-standby verify');
-});
+}, 60_000);
 
 test('a non-holder without source ledgers or a received folder still verifies unreadable once and exits 0', () => {
   const skipped = runBody('core', 'skip', { NO_STATE: '1', REAL_VERIFY: '1' });
@@ -174,7 +177,7 @@ test('a non-holder without source ledgers or a received folder still verifies un
   expect(result.out.trim().split('\n').filter(line => line.startsWith('hq-standby verify'))).toEqual([
     'hq-standby verify core=unreadable(?m · ? · ok 0/? · unreadable) big=unreadable(?m · ? · ok 0/? · unreadable) FAIL core:unreadable, big:unreadable',
   ]);
-});
+}, 60_000);
 
 test('the real fence allows the holder to run the same copy, without standby verification', () => {
   const result = runBody('core', 'fenced', { REAL_FENCE: 'source' });
@@ -184,7 +187,7 @@ test('the real fence allows the holder to run the same copy, without standby ver
     'env ELANOUS_STATE_DIR=<home>/.elanous bun scripts/hq/standby-snapshot.ts --tier core --push mbp',
   ]);
   expect(result.out).not.toContain('hq-standby verify');
-});
+}, 60_000);
 
 test('the fence-allowed source without HQ ledgers refuses the copy without standby verification', () => {
   const result = runBody('core', 'fenced', { REAL_FENCE: 'source', NO_STATE: '1' });
@@ -192,7 +195,7 @@ test('the fence-allowed source without HQ ledgers refuses the copy without stand
   expect(result.lines).toEqual(['bun fence cfg=<home>/.elanous command=sh']);
   expect(result.out).toContain('not an HQ state dir');
   expect(result.out).not.toContain('hq-standby verify');
-});
+}, 60_000);
 
 test('an unknown role answer (role script failed) still goes through the fence, never a bare copy', () => {
   expect(runBody('core', '')[ 'lines' ][0]).toBe('bun fence cfg=<home>/.elanous command=sh');

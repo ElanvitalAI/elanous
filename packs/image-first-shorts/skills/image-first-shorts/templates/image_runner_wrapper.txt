@@ -1,0 +1,6 @@
+Use $imagegen to generate ONE image.
+Attached reference image(s) are for STYLE and design guidance only; create a new original image following the prompt.
+Size: {SIZE}
+Quality: {QUALITY}
+Prompt: {PROMPT}
+After generation, do NOT run any shell commands. Just generate and end your turn.

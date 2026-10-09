@@ -156,8 +156,8 @@ type MergeStateReading =
   | { status: 'not-merged'; state: string }
   | { status: 'unreadable' };
 
-function readPrMergeState(run: CmdRunner, prNumber: number): MergeStateReading {
-  const state = run('gh', ['pr', 'view', String(prNumber), '--json', 'state']);
+function readPrMergeState(run: CmdRunner, prNumber: number, cwd?: string): MergeStateReading {
+  const state = run('gh', ['pr', 'view', String(prNumber), '--json', 'state'], cwd ? { cwd } : undefined);
   if (!state.ok) return { status: 'unreadable' };
   try {
     const parsed = JSON.parse(state.out) as { state?: unknown };
@@ -189,7 +189,7 @@ export interface PrManager {
   /** PR squash 머지(+브랜치 삭제). 완료 리뷰 후 clean PR 반영. */
   mergePr(prUrl: string): boolean;
   /** 머지 exit 실패 시 GH 상태를 재조회한 구조화 판정. */
-  mergePrOutcome(prUrl: string): MergePrOutcome;
+  mergePrOutcome(prUrl: string, expectedHead?: string, cwd?: string): MergePrOutcome;
 }
 
 /** "이미 커밋된 산출이 있나"를 판정할 비교 base 를 해석한다(순수 아님 — run 주입).
@@ -553,11 +553,21 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
     mergePr(prUrl) {
       return this.mergePrOutcome(prUrl).ok;
     },
-    mergePrOutcome(prUrl) {
+    mergePrOutcome(prUrl, expectedHead, cwd) {
       const n = extractPrNumber(prUrl);
       if (n === null) return { ok: false, kind: 'state-read-failed' };
+      if (expectedHead !== undefined) {
+        const pinned = run('gh', ['pr', 'view', String(n), '--json', 'headRefOid,state,isDraft'], cwd ? { cwd } : undefined);
+        try {
+          if (!pinned.ok) return { ok: false, kind: 'state-read-failed' };
+          const view = JSON.parse(pinned.out) as { headRefOid?: unknown; state?: unknown; isDraft?: unknown };
+          if (view.headRefOid !== expectedHead || view.state !== 'OPEN' || view.isDraft !== false) {
+            return { ok: false, kind: 'state-read-failed' };
+          }
+        } catch { return { ok: false, kind: 'state-read-failed' }; }
+      }
       const deleteRemoteHead = (kind: 'merge-exit-0' | 'merged-after-nonzero'): MergePrOutcome => {
-        const head = run('gh', ['pr', 'view', String(n), '--json', 'headRefName,headRepository']);
+        const head = run('gh', ['pr', 'view', String(n), '--json', 'headRefName,headRepository'], cwd ? { cwd } : undefined);
         if (!head.ok) return { ok: true, kind, remoteBranchDeletion: { detail: head.err || head.out || 'PR head branch 조회 실패' } };
         try {
           const { headRefName, headRepository } = JSON.parse(head.out) as {
@@ -568,7 +578,7 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
           if (typeof headRefName !== 'string' || !headRefName || typeof repository !== 'string' || !repository) {
             return { ok: true, kind, remoteBranchDeletion: { detail: 'PR head branch 또는 저장소를 읽지 못했습니다' } };
           }
-          const deleted = run('gh', ['api', '--method', 'DELETE', `repos/${repository}/git/refs/heads/${encodeURIComponent(headRefName)}`]);
+          const deleted = run('gh', ['api', '--method', 'DELETE', `repos/${repository}/git/refs/heads/${encodeURIComponent(headRefName)}`], cwd ? { cwd } : undefined);
           return deleted.ok
             ? { ok: true, kind }
             : { ok: true, kind, remoteBranchDeletion: { detail: deleted.err || deleted.out || `원격 브랜치 ${headRefName} 삭제 실패` } };
@@ -576,13 +586,13 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
           return { ok: true, kind, remoteBranchDeletion: { detail: 'PR head branch 응답을 읽지 못했습니다' } };
         }
       };
-      const merged = run('gh', ['pr', 'merge', String(n), '--squash']);
+      const merged = run('gh', ['pr', 'merge', String(n), '--squash', ...(expectedHead ? ['--match-head-commit', expectedHead] : [])], cwd ? { cwd } : undefined);
       if (merged.ok) return deleteRemoteHead('merge-exit-0');
       let lastNotMerged: string | undefined;
       let notMergedCount = 0;
       let sawUnreadable = false;
       for (let i = 0; i < MERGE_UNMERGED_CONFIRMATIONS; i++) {
-        const reading = readPrMergeState(run, n);
+        const reading = readPrMergeState(run, n, cwd);
         if (reading.status === 'merged') return deleteRemoteHead('merged-after-nonzero');
         if (reading.status === 'unreadable') {
           sawUnreadable = true;

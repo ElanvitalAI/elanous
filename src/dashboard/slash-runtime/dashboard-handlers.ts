@@ -395,6 +395,8 @@ import { dispatchTerminalModalObserve } from '../../skills/tools/terminal-modal.
 import { SlashCommandRegistry } from './registry.js';
 import { cronSecondDueAt, filterLoopRows, formatLoopsTable, localLoopRows, type LoopsTableRow } from './loops-table.js';
 import { loopCronVerdict } from '../../loops/verdict.js';
+import { checklistBoardSlash } from '../../release-loop/checklist-board.js';
+import type { Checklist } from '../../release-loop/checklist.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import {
   buildContextSlashCommand,
@@ -1046,6 +1048,8 @@ export interface DashboardSlashContext {
 
   /** Test seam for the local read-only loop and cron registry. */
   loopsLocalRows?: (now: Date) => LoopsTableRow[];
+  /** Test seam for the read-only release checklist. */
+  checklistRead?: (version: string) => Checklist;
 
   sessionSlash: {
     /** opts.remote — when the dashboard is attached to a remote daemon. */
@@ -1464,6 +1468,11 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     const filtered = filterLoopRows(rows, args[0]);
     for (const line of formatLoopsTable(filtered, text => ctx.error(text))) ctx.pushChatLine(`  ${line}`);
     if (!filtered.length) ctx.pushChatLine(ctx.muted('  No loops or cron jobs found.'));
+    ctx.setChatScrollOffset(-1);
+  });
+
+  registry.register('board', (args, ctx) => {
+    for (const line of checklistBoardSlash(args, ctx.checklistRead).split('\n')) ctx.pushChatLine(line);
     ctx.setChatScrollOffset(-1);
   });
 

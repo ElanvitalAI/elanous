@@ -19,6 +19,79 @@ function fixture(events: Array<{ event: string; data?: unknown }> = []) {
   return { root, store, events };
 }
 
+test('undeliverable same kind and route within an hour is one ledger item, then a fresh hour adds one', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-undeliverable-'));
+  let now = new Date('2026-10-08T03:00:00Z');
+  const store = new BriefItemsLedger({ stateDir: root, now: () => now, log: () => {} });
+  const input = {
+    text: '미전달: kind report · 데몬 not-found · 경로 bot unknown · 우주 test',
+    domain: '운영' as const, priority: 'P1' as const, source: 'outbound.undeliverable',
+    evidence: 'elanous logs --category outbound.send --event undeliverable',
+    dedupeKey: 'report · bot unknown', dedupeWithinMs: 60 * 60_000,
+  };
+  try {
+    const first = store.add(input);
+    now = new Date('2026-10-08T03:59:59Z');
+    expect(store.add({ ...input, text: '미전달: kind report · 데몬 rejected · 경로 bot unknown · 우주 prod' }).id).toBe(first.id);
+    expect(new BriefItemsLedger({ stateDir: root, now: () => now, log: () => {} }).list()).toHaveLength(1);
+    expect(store.compose('after-release')).toContain(input.text);
+    now = new Date('2026-10-08T04:00:01Z');
+    expect(store.add({ ...input, dedupeKey: 'report · path undeliverable' }).id).not.toBe(first.id);
+    expect(store.add(input).id).not.toBe(first.id);
+    expect(store.list()).toHaveLength(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('undeliverable retry before send shares one item, but retry after send appears on the next page', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-undeliverable-sent-'));
+  let now = new Date('2026-10-08T03:00:00Z');
+  const store = new BriefItemsLedger({ stateDir: root, now: () => now, log: () => {} });
+  const input = {
+    text: '미전달: kind report · 데몬 not-found · 경로 no-report-channel · 우주 test',
+    domain: '운영' as const, priority: 'P1' as const, source: 'outbound.undeliverable',
+    evidence: 'elanous logs --category outbound.send --event undeliverable',
+    dedupeKey: 'report · no-report-channel', dedupeWithinMs: 60 * 60_000,
+  };
+  try {
+    const first = store.add(input);
+    now = new Date('2026-10-08T03:01:00Z');
+    expect(store.add(input).id).toBe(first.id);
+    expect(store.list()).toHaveLength(1);
+    expect(store.composeWithIds('after-release').ids).toEqual([first.id]);
+    store.markSent([first.id], 'after-release');
+    expect(store.composeWithIds('after-release').ids).toEqual([]);
+    now = new Date('2026-10-08T03:02:00Z');
+    const second = store.add(input);
+    expect(second.id).not.toBe(first.id);
+    now = new Date('2026-10-08T03:03:00Z');
+    expect(store.add(input).id).toBe(second.id);
+    expect(store.list()).toHaveLength(2);
+    now = new Date('2026-10-08T13:01:00Z'); // 22:01 KST — the next briefing slot has opened
+    const next = store.composeWithIds('22:00');
+    expect(next.ids).toEqual([second.id]);
+    expect(next.markdown).toContain(input.text);
+    store.markSent(next.ids, '22:00');
+    expect(store.composeWithIds('22:00').ids).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ordinary claim duplicates remain suppressed after a delivered page', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-ordinary-delivered-'));
+  let now = new Date('2026-10-08T03:00:00Z');
+  const store = new BriefItemsLedger({ stateDir: root, now: () => now, log: () => {} });
+  try {
+    const first = store.add({ text: '작업 결과', domain: '운영', priority: 'P1', source: 'test' });
+    now = new Date('2026-10-08T03:01:00Z');
+    store.markSent([first.id], 'after-release');
+    const second = store.add({ text: '작업 결과', domain: '운영', priority: 'P1', source: 'test' });
+    now = new Date('2026-10-08T03:02:00Z');
+    expect(store.list()).toHaveLength(2);
+    expect(store.composeWithIds('after-release').ids).toEqual([]);
+    expect(store.compose('after-release')).not.toContain('작업 결과');
+    expect(second.sent_at).toBeNull();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('append-only items keep the claim verbatim under briefing/items.sqlite', () => {
   const events: Array<{ event: string }> = [];
   const { root, store } = fixture(events);
@@ -46,6 +119,66 @@ test('append-only items keep the claim verbatim under briefing/items.sqlite', ()
     } finally { db.close(); }
     expect(store.list()[0]?.text).toBe(text);
     expect(events.map(event => event.event)).toEqual(['added', 'added']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('reactions append per sent item without rewriting items; weekly action rates count distinct acted items by domain', () => {
+  const { root, store } = fixture();
+  try {
+    const first = store.add({ text: '움직임', domain: '판', priority: 'P0', source: 'test' });
+    const second = store.add({ text: '열람만', domain: '판', priority: 'P1', source: 'test' });
+    const third = store.add({ text: '무시', domain: '시장', priority: 'P1', source: 'test' });
+    const unsent = store.add({ text: '미발송', domain: '시장', priority: 'P2', source: 'test' });
+    expect(() => store.recordReaction(unsent.id, '버튼')).toThrow('item was not sent');
+    store.markSent([first.id, second.id, third.id], '08:30');
+    const before = store.list();
+    for (const reaction of ['열람', '버튼', '답장', '정정'] as const) store.recordReaction(first.id, reaction);
+    store.recordReaction(second.id, '열람');
+    store.recordReaction(third.id, '무시');
+    const reopened = new BriefItemsLedger({ stateDir: root, now: () => NOW, log: () => {} });
+    expect(reopened.weeklyActions()).toEqual({
+      acted: 1, total: 3, rate: 1 / 3,
+      byKind: {
+        운영: { acted: 0, total: 0, rate: 0 },
+        판: { acted: 1, total: 2, rate: 0.5 },
+        흡수: { acted: 0, total: 0, rate: 0 },
+        시장: { acted: 0, total: 1, rate: 0 },
+        행정: { acted: 0, total: 0, rate: 0 },
+        코나투스: { acted: 0, total: 0, rate: 0 },
+      },
+    });
+    expect(reopened.list()).toEqual(before);
+    const db = new Database(store.path);
+    try {
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual([
+        { item_id: first.id, reaction: '열람' }, { item_id: first.id, reaction: '버튼' },
+        { item_id: first.id, reaction: '답장' }, { item_id: first.id, reaction: '정정' },
+        { item_id: second.id, reaction: '열람' }, { item_id: third.id, reaction: '무시' },
+      ]);
+    } finally { db.close(); }
+    expect(() => store.recordReaction(0, '버튼')).toThrow('invalid item id');
+    expect(() => store.recordReaction(999, '버튼')).toThrow('item was not sent');
+    expect(() => store.recordReaction(first.id, 'unknown' as '버튼')).toThrow('invalid reaction');
+    expect(reopened.weeklyActions().total).toBe(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('weekly actions use KST Monday boundary and exclude future sends and reactions outside this week', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-week-'));
+  try {
+    let current = new Date('2026-10-04T14:59:00Z'); // Sunday 23:59 KST
+    const store = new BriefItemsLedger({ stateDir: root, now: () => current, log: () => {} });
+    const old = store.add({ text: '지난주', domain: '운영', priority: 'P1', source: 'test' });
+    store.markSent([old.id], '22:00');
+    store.recordReaction(old.id, '버튼');
+    current = new Date('2026-10-04T15:01:00Z'); // Monday 00:01 KST
+    const fresh = store.add({ text: '이번주', domain: '시장', priority: 'P1', source: 'test' });
+    store.markSent([fresh.id], '08:30');
+    store.recordReaction(fresh.id, '답장');
+    expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 1, byKind: { 운영: { total: 0 }, 시장: { acted: 1, total: 1 } } });
+    current = new Date('2026-10-04T14:59:30Z');
+    expect(() => store.recordReaction(fresh.id, '버튼')).toThrow('item was not sent');
+    expect(store.weeklyActions()).toMatchObject({ acted: 1, total: 1, byKind: { 운영: { acted: 1 }, 시장: { total: 0 } } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

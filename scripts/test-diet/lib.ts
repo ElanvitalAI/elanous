@@ -1,7 +1,87 @@
 // TD2 — a daily look at the test suite, one cost-weighted slice at a time (shadow: it measures and drafts, it
 // never deletes or moves a test). Design: 내부 문서 `TD1-v2-gate-content-review-2026-10-01`.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+/** These were reported as preexisting in the recent gate/harvest; remeasurement, not this list, decides today's count. */
+export const DEFAULT_MAIN_FAILURE_FILES = [
+  'src/task-orchestrator/surfaces/pod-pool-cli.test.ts',
+  'src/self-dev/dev-cli.test.ts',
+  'src/self-dev/dev-pipeline.test.ts',
+  'src/agent-mission/agent-backend-flag-smoke.test.ts',
+  'scripts/release-story/draft.test.ts',
+  'scripts/release-loop/freeze-off-parity.test.ts',
+] as const;
+
+export type MainFailureClass = '시험이 낡음' | '코드 결함' | '환경·부하 의존' | '외부 의존';
+export interface MainFailureResult { file: string; rc: number | null; stdout: string; stderr: string; timedOut?: boolean }
+export interface MainFailureRow { file: string; failures: number; firstError: string; classification: MainFailureClass; draft: '고침' | '격리' }
+export interface MainFailureDay { date: string; at: string; owner: 'TC'; mode: 'shadow'; commit: string; selected: string[]; rows: MainFailureRow[]; unmeasured: { file: string; reason: string }[]; failingFiles: number; previousFailingFiles: number | null; delta: number | null }
+
+export function mainFailureLedgerPath(root: string, date: string): string { return join(root, 'test-diet', 'main-failures', `${date}.json`); }
+export function kstDay(at: Date): string { return new Date(at.getTime() + 9 * 3600_000).toISOString().slice(0, 10); }
+
+export function mainFailureFiles(value: unknown): string[] {
+  const files = value === undefined ? [...DEFAULT_MAIN_FAILURE_FILES] : value;
+  if (!Array.isArray(files) || files.length === 0 || !files.every((file) => typeof file === 'string' && /^(?:src|scripts|test)\/[A-Za-z0-9_./-]+\.test\.tsx?$/.test(file) && !file.split('/').includes('..'))) {
+    throw new Error('main failure files must be nonempty repository-relative test paths');
+  }
+  return [...new Set(files as string[])];
+}
+
+/** A heuristic draft, never a finding about the root cause or permission to skip a test. */
+export function mainFailureRow(result: MainFailureResult): MainFailureRow | null {
+  const text = `${result.stdout}\n${result.stderr}`.replace(/\x1b\[[0-9;]*m/g, '');
+  const count = [...text.matchAll(/^\s*(\d+) fail\b/gm)].at(-1);
+  const failures = count ? Number(count[1]) : 0;
+  const ran = /Ran [1-9]\d* tests? across [1-9]\d* files?/m.test(text);
+  if (result.timedOut || !ran || !Number.isSafeInteger(failures) || (result.rc !== 0 && failures === 0)
+    || (result.rc === 0 && failures > 0) || /^(?:\s*[1-9]\d* errors?\b|# Unhandled error between tests)/m.test(text)) {
+    throw new Error(`test not measured: ${result.file}: ${text.split('\n').map((line) => line.trim()).find((line) => /error:|Error:|timed out|timeout|Cannot find|not found|errors?\b/i.test(line)) ?? 'no completed test result'}`);
+  }
+  if (failures === 0 && result.rc === 0) return null;
+  const firstError = text.split('\n').map((line) => line.trim()).find((line) => /^(?:\(fail\)|error:|\w*Error:|Expected:|Received:|Cannot find|Unable to)/i.test(line))
+    ?? `test exited ${result.rc} without a diagnostic`;
+  const classification: MainFailureClass = /timed out|timeout|load average|resource temporarily unavailable/i.test(firstError) ? '환경·부하 의존'
+    : /codex|--yolo|network|ECONN|API key|Unable to|Cannot find module|ENOENT/i.test(firstError) ? '외부 의존'
+      : /snapshot|next\.md|expected|Received|toEqual|toContain/i.test(firstError) ? '시험이 낡음' : '코드 결함';
+  return { file: result.file, failures, firstError: firstError.slice(0, 240), classification,
+    draft: classification === '환경·부하 의존' || classification === '외부 의존' ? '격리' : '고침' };
+}
+
+/** One KST-day snapshot, replaced on remeasurement. Incomplete runs cannot masquerade as zero failures. */
+export function writeMainFailureDay(root: string, selected: string[], results: MainFailureResult[], commit: string, at = new Date()): MainFailureDay {
+  if (results.length !== selected.length || results.some((r, i) => r.file !== selected[i])) throw new Error('incomplete main failure measurement');
+  const date = kstDay(at);
+  const dir = join(root, 'test-diet', 'main-failures');
+  mkdirSync(dir, { recursive: true });
+  const dates = earlierMainFailureDays(dir, date);
+  const previous = dates.at(-1);
+  const previousDay = previous ? JSON.parse(readFileSync(join(dir, previous), 'utf8')) as MainFailureDay : null;
+  const rows: MainFailureRow[] = [];
+  const unmeasured: MainFailureDay['unmeasured'] = [];
+  for (const result of results) {
+    try {
+      const row = mainFailureRow(result);
+      if (row) rows.push(row);
+    } catch (error) {
+      // 못 잰 파일은 «실패»가 아니다 — 행으로 접으면 측정 실패가 main 결함 1건으로 둔갑한다.
+      unmeasured.push({ file: result.file, reason: (error instanceof Error ? error.message : String(error)).slice(0, 240) });
+    }
+  }
+  const previousFailingFiles = unmeasured.length === 0 && previousDay?.unmeasured?.length === 0
+    && previousDay.selected.join('\0') === selected.join('\0') ? previousDay.failingFiles : null;
+  const line: MainFailureDay = { date, at: at.toISOString(), owner: 'TC', mode: 'shadow', commit, selected, rows, unmeasured, failingFiles: rows.length,
+    previousFailingFiles, delta: previousFailingFiles === null ? null : rows.length - previousFailingFiles };
+  const path = mainFailureLedgerPath(root, date);
+  writeFileSync(`${path}.${process.pid}.tmp`, JSON.stringify(line, null, 2) + '\n');
+  renameSync(`${path}.${process.pid}.tmp`, path);
+  return line;
+}
+
+function earlierMainFailureDays(dir: string, date: string): string[] {
+  return readdirSync(dir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name) && name < `${date}.json`).sort();
+}
 
 export const DEFAULT_COST_SECS = 10;
 export const SLOW_SECS = 60;

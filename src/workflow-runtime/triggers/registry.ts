@@ -20,6 +20,33 @@ export interface ScheduleEntry {
   trigger: ScheduleTriggerNode['scheduleTrigger'];
 }
 
+// Graph schedules use the same ScheduleEntry shape as workflow nodes; the
+// graph identity is namespaced so a workflow of the same name cannot collide.
+export function graphScheduleEntries(document: unknown): ScheduleEntry[] {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('invalid graph YAML');
+  const graph = document as Record<string, unknown>;
+  const triggers = graph.triggers;
+  if (triggers === undefined) return [];
+  if (!triggers || typeof triggers !== 'object' || Array.isArray(triggers)) throw new Error('graph triggers must be an object');
+  const schedule = (triggers as Record<string, unknown>).schedule;
+  if (schedule === undefined) return [];
+  if (typeof graph.graph_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(graph.graph_id) || graph.graph_id === '.' || graph.graph_id === '..') {
+    throw new Error('graph schedule requires a valid graph_id');
+  }
+  const schedules = Array.isArray(schedule) ? schedule : [schedule];
+  return schedules.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('graph triggers.schedule must contain schedule objects');
+    const value = raw as Record<string, unknown>;
+    if (value.type === 'cron' && typeof value.cron === 'string' && value.cron.trim()) {
+      return { workflowName: `graph:${graph.graph_id}`, nodeId: `schedule:${index}`, trigger: { type: 'cron', cron: value.cron } };
+    }
+    if (value.type === 'interval' && typeof value.interval === 'number' && Number.isFinite(value.interval) && value.interval > 0) {
+      return { workflowName: `graph:${graph.graph_id}`, nodeId: `schedule:${index}`, trigger: { type: 'interval', interval: value.interval } };
+    }
+    throw new Error(`invalid graph triggers.schedule[${index}]: expected cron or interval`);
+  });
+}
+
 export interface WebhookEntry {
   workflowName: string;
   nodeId: string;

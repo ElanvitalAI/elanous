@@ -1,5 +1,5 @@
 import { afterAll, afterEach, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { installPlugin, listInstalledPlugins } from '../../plugins/install/plugin-install.js';
@@ -7,7 +7,7 @@ import * as debugModule from '../../debug/log.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
-import { handlePluginsGet, handlePluginsIndexGet, handlePluginsInstall, handlePluginsMarketRefresh, handlePluginsRemove, readMarketIndex, safeDetail } from './plugins-market.js';
+import { handlePluginsGet, handlePluginsIndexGet, handlePluginsInstall, handlePluginsMarketRefresh, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave, readMarketIndex, safeDetail } from './plugins-market.js';
 import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
@@ -196,6 +196,37 @@ test('refresh and remove enforce owner authentication before mutation', async ()
   const del = new Request('http://localhost/v1/plugins/remaining-plugin', { method: 'DELETE', headers: { authorization: 'Bearer wrong', 'sec-fetch-site': 'cross-site' } });
   expect(handlePluginsRemove(del, 'remaining-plugin', auth, root).status).toBe(401);
   expect(await handlePluginsRemove(new Request(del.url, { method: 'DELETE', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } }), 'remaining-plugin', auth, root).json()).toEqual({ removed: 1 });
+});
+
+test('wizard route stores, lists and regenerates drafts without installing; owner-only', async () => {
+  const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+  const bus = new NexusEventBus();
+  state.bus = bus;
+  const opts = { state, registry: new TabRegistry(state), eventBus: bus, metaApi: auth, pluginStateRoot: root };
+  const route = (req: Request) => routeRequest(req, opts, { requestIP: () => ({ address: '203.0.113.1' }) } as never, null, createDevProxyRuntimeRef());
+  const path = '/v1/plugins/wizard';
+  const ledgerPath = join(root, 'plugins', 'installed.json');
+  const ledgerBefore = readFileSync(ledgerPath, 'utf8');
+  const draft = { description: 'Weather summary', skill: { description: 'Weather summary', instructions: 'Summarize forecasts.' } };
+  const post = (token: string, body: unknown) => new Request(`http://localhost${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'sec-fetch-site': 'cross-site' }, body: JSON.stringify(body) });
+  expect((await route(owner(path, 'wrong')))?.status).toBe(401);
+  expect((await route(post('wrong', { name: 'weather-research', draft })))?.status).toBe(401);
+  expect((await route(post('owner-secret', { name: '../escape', draft })))?.status).toBe(400);
+  expect((await route(post('owner-secret', { name: 'weather-research', draft })))?.status).toBe(200);
+  expect((await route(post('owner-secret', { name: 'weather-research', draft })))?.status).toBe(422);
+  const hostile = await route(post('owner-secret', { name: 'hostile-draft', draft: { ...draft,
+    connectors: [{ id: 'weather', credentials: [{ name: 'API_KEY', value: 'PRIVATE_VALUE' }] }] } }));
+  expect(hostile?.status).toBe(422);
+  expect(JSON.stringify(await hostile?.json())).not.toContain('PRIVATE_VALUE');
+  expect(existsSync(join(root, 'plugins-local', 'hostile-draft'))).toBe(false);
+  const listed = await (await route(owner(path)))?.json() as { plugins: Array<{ name: string; draft: typeof draft }> };
+  expect(listed.plugins[0]?.draft.skill?.instructions).toBe('Summarize forecasts.');
+  expect(listed.plugins.some(plugin => plugin.name === 'hostile-draft')).toBe(false);
+  expect((await route(post('owner-secret', { name: 'weather-research', draft: { ...draft, description: 'Tomorrow weather' }, regenerate: true })))?.status).toBe(200);
+  expect((await handlePluginWizardList(owner(path), auth, root).json() as { plugins: Array<{ description: string }> }).plugins[0]?.description).toBe('Tomorrow weather');
+  expect((await handlePluginWizardSave(post('wrong', { name: 'weather-research', draft }), auth, root)).status).toBe(401);
+  expect(await handlePluginsGet(owner('/v1/plugins'), auth, root).json()).toEqual(listInstalledPlugins(root));
+  expect(readFileSync(ledgerPath, 'utf8')).toBe(ledgerBefore);
 });
 
 test('HTTP dispatcher connects authenticated GET and write routes', async () => {

@@ -154,10 +154,12 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
   graph.command('tick <file>')
     .description('Advance one graph run, resuming a pending decision or starting only when requested')
     .option('--start', 'Start a new run when the graph is idle')
+    .option('--schedule', 'Subscribe graph YAML triggers.schedule to the workflow scheduler and tick on each fire')
     .option('--input <json>', 'JSON object passed to a newly started run')
     .option('--json', 'Print the tick result as JSON')
-    .action(async (file: string, opts: { start?: boolean; input?: string; json?: boolean }) => {
+    .action(async (file: string, opts: { start?: boolean; schedule?: boolean; input?: string; json?: boolean }) => {
       try {
+        if (opts.schedule && (opts.start || opts.input !== undefined || opts.json)) throw new Error('--schedule cannot be combined with --start, --input or --json');
         if (opts.input !== undefined && !opts.start) throw new Error('--input requires --start');
         let input: Record<string, unknown> | undefined;
         if (opts.input !== undefined) {
@@ -169,11 +171,41 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         }
         await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         const { graphTick } = await import('./graph-tick.js');
+        if (opts.schedule) {
+          const { createScheduleSource } = await import('../workflow-runtime/triggers/schedule-source.js');
+          const graphFile = resolve(file);
+          const source = createScheduleSource();
+          // The CLI tick callback is the graph counterpart of the workflow scheduler's onEmit.
+          const onScheduledTick = async () => {
+            try {
+              const { notifyGraphEvents } = await import('./graph-notify.js');
+              const result = await graphTick(graphFile, { startIfIdle: true, deps: { notify: async () => { await notifyGraphEvents(); } } });
+              if (result.status === 'refused') console.error(`graph tick: refused: ${result.reason}`);
+              else if (result.status === 'failed') console.error(`graph tick: ${result.runId}: failed`);
+            } catch (error) {
+              debug.log('graph.runner', 'schedule-tick-failed', { file: graphFile, error: error instanceof Error ? error.message : String(error) });
+              console.error(`graph tick: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          };
+          source.subscribeGraph(graphFile, onScheduledTick);
+          if (!source.subscriptions().length) throw new Error('graph triggers.schedule is missing');
+          await source.start();
+          if (source.handle()?.skipped.length) {
+            const reasons = source.handle()!.skipped.map(item => item.reason).join('; ');
+            await source.stop();
+            throw new Error(`graph schedule skipped: ${reasons}`);
+          }
+          console.log(`graph schedule: ${source.subscriptions().length} active`);
+          const shutdown = () => { void source.stop().then(() => { process.exitCode = 0; }); };
+          process.once('SIGINT', shutdown);
+          process.once('SIGTERM', shutdown);
+          return;
+        }
         const result = await graphTick(file, { startIfIdle: opts.start, ...(input === undefined ? {} : { input }),
           deps: { notify: async () => { const { notifyGraphEvents } = await import('./graph-notify.js'); await notifyGraphEvents(); } } });
         if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
         else console.log(`graph tick: ${result.action}${result.runId ? ` ${result.runId}: ${result.status}` : ''}`);
-        if (result.status === 'failed') process.exitCode = 1;
+        if (result.status === 'failed' || result.status === 'refused') process.exitCode = 1;
       } catch (error) {
         console.error(`graph tick: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;

@@ -107,6 +107,38 @@ test('project selection filters conversations, persists on device, and assigns a
   expect(text()).toContain('새 대화');
 });
 
+test('sidebar project picker browses remote folders and passes the chosen folder to creation', async () => {
+  const saved = new Map<string, string>();
+  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage, location: { search: '' } }) });
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
+    if (path.startsWith('/v1/projects/folders')) return path.includes('path=')
+      ? { path: '/srv/work', parent: '/srv', folders: [] }
+      : { path: '/srv', parent: '/', folders: [{ name: 'work', path: '/srv/work' }] };
+    if (path === '/v1/projects') return init?.method === 'POST'
+      ? { project: { id: 'p', name: '새 일', primaryFolder: '/srv/work', createdAt: '' } }
+      : { projects: [] };
+    return { sessions: cards };
+  }, sessionStoreEventsUrl: () => '' };
+  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
+  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
+  await act(async () => tree!.root.findAllByType('button').find(button => button.children.includes('＋ 프로젝트 만들기'))!.props.onClick());
+  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
+  await act(async () => tree!.root.findByProps({ 'aria-label': '원격 폴더 고르기' }).props.onClick());
+  expect(tree!.root.findByProps({ 'aria-label': '원격 폴더 목록' })).toBeDefined();
+  expect(calls.some(call => call.path === '/v1/projects/folders')).toBe(true);
+  await act(async () => tree!.root.findByProps({ 'aria-label': '원격 폴더 목록' }).findAllByType('button')[1]!.props.onClick());
+  await act(async () => tree!.root.findAllByType('button').find(button => button.children.includes('이 폴더 선택'))!.props.onClick());
+  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  expect(calls.filter(call => call.path.startsWith('/v1/projects/folders')).map(call => call.path))
+    .toEqual(['/v1/projects/folders', '/v1/projects/folders?path=%2Fsrv%2Fwork']);
+  expect(calls.find(call => call.init?.method === 'POST')?.init?.body).toBe('{"name":"새 일","primaryFolder":"/srv/work"}');
+  expect(saved.get(PROJECT_SELECTION_KEY)).toBe('p');
+});
+
 test('failed pending assignment restores the saved project membership in the sidebar', async () => {
   const saved = new Map<string, string>();
   saved.set(PROJECT_SELECTION_KEY, 'p');

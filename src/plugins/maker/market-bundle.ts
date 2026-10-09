@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { userConfigPath } from '../../user-config.js';
+import { scanKnowledgePackDlp } from '../../mss/logging/redaction.js';
 import { loadPluginManifestFromDir } from '../core/manifest.js';
 import { LEAK_MARKERS, loadPrivateRedactions, privateIdentifierMarkers, scanLeaks } from '../../../scripts/public-export.js';
 
@@ -56,6 +57,14 @@ export function bundleInstalledWizardPlugin(installedPath: string, outputDir: st
   if (!redactions) throw new Error('private export redaction list unavailable; market bundle refused');
   const hits = scanLeaks(source, files, [...LEAK_MARKERS, ...privateIdentifierMarkers(redactions)]);
   if (hits.length) throw new Error(`market bundle leak: ${hits.map(hit => `${hit.file}:${hit.line} ${hit.marker}`).join(', ')}`);
+  const dlpHits: string[] = [];
+  for (const file of files) {
+    const text = readFileSync(join(source, file), 'utf8');
+    const reasons = scanKnowledgePackDlp(text);
+    if (text.includes('\u0000')) reasons.push('unscannable-content');
+    if (reasons.length) dlpHits.push(`${file}: ${reasons.join(', ')}`);
+  }
+  if (dlpHits.length) throw new Error(`market bundle DLP: ${dlpHits.join('; ')}`);
   const config: unknown = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf8')) : {};
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('invalid market signing config');
   const signing = (config as { market?: { signing?: { keyId?: unknown; privateKey?: unknown } } }).market?.signing;

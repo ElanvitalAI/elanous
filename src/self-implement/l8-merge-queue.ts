@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-merge.js';
+import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 
 type Command = (bin: string, args: readonly string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
@@ -30,7 +31,10 @@ export type L8MergeQueueDeps = {
 
 export type L8ShadowVerdict = { number: number; head: string; base?: string; verdict: 'pass' | 'conflict' | 'fail'; detail?: string; tests: string[]; at: string };
 export type L8ShadowQueueState = { pending: { number: number; head: string }[]; verdicts: L8ShadowVerdict[] };
-export type L8ShadowQueueDeps = L8MergeQueueDeps & { observe?: (verdict: L8ShadowVerdict) => void | Promise<void> };
+export type L8ShadowQueueDeps = L8MergeQueueDeps & {
+  observe?: (verdict: L8ShadowVerdict) => void | Promise<void>;
+  resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>;
+};
 
 function shadowCommand(execute: Command, bin: string, args: string[], cwd: string): string {
   const result = execute(bin, args, cwd);
@@ -129,7 +133,8 @@ export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}
       if (changed.some((file) => file.startsWith('-') || file.startsWith('/') || file.split('/').includes('..') || file.includes('\\'))) throw new Error('unsafe changed-file path');
       verdict.tests = files.filter((file) => /(?:^|\/)[^/]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/.test(file));
       const merge = execute('git', ['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'merge', '--no-ff', '--no-edit', item.head], temp);
-      let autoResolvedNextMd = false;
+      let integrated = merge.status === 0;
+      let resolvedNextMd = false;
       if (merge.status !== 0) {
         const unresolved = run('git', ['diff', '--name-only', '--diff-filter=U'], temp).split('\n').filter(Boolean);
         if (!unresolved.length) throw new Error(`git merge failed: ${merge.stderr.trim() || `exit ${merge.status}`}`);
@@ -148,14 +153,81 @@ export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}
             writeFileSync(join(temp, NEXT_MD_PATH), resolved);
             run('git', ['add', '--', NEXT_MD_PATH], temp);
             run('git', ['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit', '-m', 'Integrate PR for L8 shadow evaluation'], temp);
-            autoResolvedNextMd = true;
+            resolvedNextMd = true;
+            integrated = true;
           }
         } else {
-          verdict.verdict = 'conflict';
-          verdict.detail = unresolved.join('\n');
+          const unsafe = unresolved.some((file) => file.startsWith('-') || file.startsWith('/') || file.split('/').includes('..') || file.includes('\\'));
+          if (unsafe) throw new Error('unsafe conflict path');
+          const staged = (stage: number, file: string): string | null => {
+            const result = execute('git', ['show', `:${stage}:${file}`], temp!);
+            return result.status === 0 ? result.stdout : null;
+          };
+          // Reject unsupported index shapes before consulting either resolver.
+          // A directory, submodule or unreadable path is an unsupported conflict shape, not an evaluator failure.
+          const hasTextMarkers = (file: string): boolean => {
+            try {
+              const path = join(temp!, file);
+              return existsSync(path) && statSync(path).isFile() && readFileSync(path, 'utf8').includes('<<<<<<< ');
+            } catch {
+              return false;
+            }
+          };
+          const unsupported = unresolved.some((file) => file !== NEXT_MD_PATH && !hasTextMarkers(file));
+          // A non-append-only next.md conflict must not fall through to the LLM even when other files conflict.
+          const nextStages = !unsupported && unresolved.includes(NEXT_MD_PATH)
+            ? [staged(1, NEXT_MD_PATH), staged(2, NEXT_MD_PATH), staged(3, NEXT_MD_PATH)] as const
+            : undefined;
+          const nextMd = nextStages
+            ? nextStages.some((value) => value === null) ? null
+              : resolveNextMdConflict(nextStages[0]!, nextStages[1]!, nextStages[2]!)
+            : undefined;
+          if (unsupported || nextMd === null || unresolved.some((file) => file !== NEXT_MD_PATH
+            && (staged(1, file) === null || staged(2, file) === null || staged(3, file) === null))) {
+            verdict.verdict = 'conflict';
+            verdict.detail = nextMd === null ? 'release/next.md conflict is not append-only' : unresolved.join('\n');
+          } else {
+            const git = (args: string[]) => execute('git', args, temp!);
+            const mergeGit: MergeGitSeam = {
+              isConfiguredRemote: () => false, // item.head is the fetched, pinned commit, not a remote branch.
+              fetch: () => false,
+              merge: () => ({ ok: false, conflict: true, stdout: merge.stdout, errorDetail: merge.stderr.trim() }),
+              conflictedFiles: () => run('git', ['diff', '--name-only', '--diff-filter=U'], temp!).split('\n').filter(Boolean),
+              readIndexStage: (_wt, stage, file) => {
+                const result = git(['show', `:${stage}:${file}`]);
+                if (result.status !== 0) throw new Error(`index stage ${stage} unavailable: ${file}`);
+                return result.stdout;
+              },
+              readFile: (file) => readFileSync(file, 'utf8'),
+              writeFile: (file, content) => writeFileSync(file, content),
+              add: (_wt, file) => { run('git', ['add', '--', file], temp!); },
+              commit: () => {
+                const result = git(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit', '-m', 'Integrate PR for L8 shadow evaluation']);
+                return { ok: result.status === 0, errorDetail: result.stderr.trim() };
+              },
+              abort: () => { run('git', ['merge', '--abort'], temp!); },
+            };
+            const resolved = await mergeMainWithLlmResolve(temp, item.head, async (file, conflicted) => {
+              if (file === NEXT_MD_PATH) {
+                const next = resolveNextMdConflict(mergeGit.readIndexStage(temp!, 1, file), mergeGit.readIndexStage(temp!, 2, file), mergeGit.readIndexStage(temp!, 3, file));
+                if (next === null) throw new Error('release/next.md conflict is not append-only');
+                return next;
+              }
+              return (deps.resolveConflict ?? ((path, content, target, worktree) => defaultLlmResolve(path, content, target, { worktreePath: worktree, mode: 'on' })))(file, conflicted, item.head, temp!);
+            }, mergeGit);
+            if (resolved.status === 'conflict-unresolved') {
+              verdict.verdict = 'conflict';
+              verdict.detail = resolved.failedFile === NEXT_MD_PATH ? 'release/next.md conflict is not append-only'
+                : `${resolved.failedFile ?? 'merge conflict'}: ${resolved.reason ?? 'context resolution failed'}`;
+            } else if (resolved.status === 'error') {
+              throw new Error(`git merge failed: ${resolved.errorStep}: ${resolved.errorDetail ?? 'unknown error'}`);
+            }
+            integrated = resolved.status === 'llm-resolved';
+            resolvedNextMd = integrated && resolved.resolvedFiles?.includes(NEXT_MD_PATH) === true;
+          }
         }
       }
-      if (merge.status === 0 || autoResolvedNextMd) {
+      if (integrated) {
         if (verdict.tests.length) {
           if (verdict.tests.some((file) => !existsSync(join(temp!, file)))) throw new Error('changed test path unavailable');
           run('bun', ['install', '--frozen-lockfile'], temp);
@@ -174,7 +246,7 @@ export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}
         } else {
           verdict.verdict = 'pass';
         }
-        if (autoResolvedNextMd) {
+        if (resolvedNextMd) {
           verdict.detail = verdict.detail ? `release/next.md auto-resolved; ${verdict.detail}` : 'release/next.md auto-resolved';
         }
       }

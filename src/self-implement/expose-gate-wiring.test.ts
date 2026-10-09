@@ -66,6 +66,23 @@ describe('harness exposure gate wiring', () => {
     } finally { fixture.dispose(); }
   });
 
+  test('self-implement gate awaits a Promise-resolved public-export-import failure and reports its reason', async () => {
+    const fixture = repository();
+    const reason = 'public export imports cannot resolve the release entry';
+    try {
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] SKIPPED' }),
+        runExposeGate: () => ({ passed: true, log: '' }),
+        runHarnessPolicyGates: () => Promise.resolve({
+          passed: false,
+          failures: [{ gate: 'public-export-import', lines: [reason] }],
+        }),
+      }).gate(fixture.cwd);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain(reason);
+    } finally { fixture.dispose(); }
+  });
+
   test('self-implement without public docs skips the exposure seam entirely', async () => {
     const fixture = repository();
     let calls = 0;

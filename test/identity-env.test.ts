@@ -586,6 +586,7 @@ describe('ratchet — getCapturedEnv() 직접 호출은 SSOT 밖에서 금지', 
   const ALLOWED = new Set([
     'src/shell-env-bootstrap.ts',   // 정의부
     'src/shell-env-bootstrap-warm.test.ts', // 정의부 시험 — 예열(warmCapturedEnv)이 채운 캐시를 정의부 함수로 읽는다(#22671)
+    'src/shell-env-bootstrap.test.ts', // 정의부 시험 — 주석에서 첫 캡처 경로(getCapturedEnv → runPrintenvCapture)를 설명할 뿐 호출 0(#25038)
     'src/agent/identity-env.ts',    // SSOT 합성자 — 유일한 정당 소비자
     'src/preview/terminal.ts',      // 기본값(CLAUDE_CODE_NO_FLICKER) 조회 전용 · 합성 아님
   ]);

@@ -18,7 +18,7 @@
 // ⛔ 공개본은 «원본 매니페스트»(`release/public-export.yaml`)대로만 만든다 — 매매 실행 코드는 그 매니페스트가 이미 뺀다(🅢 #20529).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Command } from 'commander';
@@ -27,7 +27,7 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { getUserConfig, userConfigPath } from '../user-config.js';
-import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
@@ -705,11 +705,28 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(`루브릭 없는 칸 ${missing}`);
     });
   withContext(checklist.command('refs <doc>').description('문서를 인용하는 칸 — 모든 판의 구현 현황(읽기 전용)'))
-    .action(async (doc: string, _opts: unknown, cmd: Command) => {
+    .option('--lint', '문서 절과 칸 인용을 양방향 대조(읽기 전용)')
+    .action(async (doc: string, opts: { lint?: boolean }, cmd: Command) => {
       if (!doc.trim() || doc.trim().startsWith('#')) throw new CliUserError(`잘못된 문서: ${doc}`, '저장소 상대 경로[#절] — 예: docs/RFC-x.md#§3');
       const { json } = context(cmd);
       const ledgerRoot = releaseLedgerRoot();
-      const rows = cellsReferencingDoc(doc, features.assignedVersions(ledgerRoot).map((version) => listChecklist(version, ledgerRoot)));
+      const checklists = features.assignedVersions(ledgerRoot).map((version) => listChecklist(version, ledgerRoot));
+      if (opts.lint) {
+        const path = doc.trim().split('#')[0]!.replace(/^\.\//, '');
+        const roots = refRoots();
+        normalizeRefs([path], roots);
+        const file = roots.map((root) => join(root, path)).find((candidate) => {
+          try { return statSync(candidate).isFile(); } catch { return false; }
+        })!;
+        const result = lintDocRefs(path, readFileSync(file, 'utf8'), checklists);
+        debug.log('release.checklist', 'refs-lint', { doc, sections: result.sections.length, uncovered: result.uncoveredSections.length, dangling: result.danglingRefs.length });
+        if (json) { await writeStdoutJson(`${JSON.stringify({ doc, ...result })}\n`); return; }
+        console.log(`칸 없는 절: ${result.uncoveredSections.join(', ') || '없음'}`);
+        console.log(`없는 절을 가리키는 칸: ${result.danglingRefs.map(({ version, id, ref }) => `${version} ${id} ${ref}`).join(' · ') || '없음'}`);
+        console.log(`절 ${result.sections.length} · 칸 없는 절 ${result.uncoveredSections.length} · 없는 절을 가리키는 칸 ${result.danglingRefs.length}`);
+        return;
+      }
+      const rows = cellsReferencingDoc(doc, checklists);
       const byStatus = { green: 0, yellow: 0, red: 0, done: 0 } as Record<ChecklistStatus, number>;
       for (const row of rows) byStatus[row.status] += 1;
       debug.log('release.checklist', 'refs-read', { doc, rows: rows.length });

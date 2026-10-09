@@ -1,13 +1,14 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, universeLaunch } from '../autopilot/track-agent.js';
 import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
 import { judgeNeighbor } from '../loops/neighbors.js';
+import { checkLoopNeighbors, emitLoopHeartbeat, SEAT_NEIGHBORS } from '../loops/neighbor-runtime.js';
 import { addHarnessQueue, harnessQueueIdForKey, harnessQueueOutcome, listHarnessQueue } from '../harness/harness-queue.js';
 import { isRescueAllowedAction } from '../steward/rescue.js';
 import { DecisionLedger, type DecisionEntry, type DecisionOption, type Recommendation } from '../decisions/decision-ledger.js';
@@ -20,6 +21,7 @@ import { openMsgStore, type MessageEnvelope } from '../msg/msg-store.js';
 import { loadLayeredPersonaDirs, resolveRepositoryPersonaDir, resolveStatePersonaDir } from '../persona/global-registry.js';
 import { orderedPersonaTodos, personaTodoPath, readPersonaTodos, type PersonaTodo } from '../persona/persona-todo.js';
 import { PersonaRegistry } from '../persona/registry.js';
+import { registeredSeats, resolveSeat } from '../seat-address/seat-address.js';
 import { recordSeatAskShadow } from '../seat-dispatch/seat-ask.js';
 import { appendSeatRequestRows, listSeatRequests, withSeatRequestLedgerLock } from '../seat-dispatch/seat-request-ledger.js';
 import { answerCrossCheck, answerSeat, askCrossCheck, askSeat, crossCheckAnswer, deliveredSeatQuestion, hasSeatAnswer, isSeatId, seatCrossChecks, seatQuestions, type CrossCheckJudgment, type SeatId } from '../seat-dispatch/seat-questions.js';
@@ -29,7 +31,7 @@ import { readSchedules, releasedVersion } from '../release-loop/feature-store.js
 import { runOpDecide, type OpDecideCandidate } from './op-decide.js';
 
 // `kind`/`createdAt` are the V3 shadow-compare keys (내부 문서 `METHOD-v3-shadow-compare-2026-10-02` · MK 10-02 18:54).
-export type SeatItem = { source: 'request' | 'checklist' | 'hook' | 'seat-question'; kind?: 'request' | 'cell' | 'hook-task' | 'seat-question'; id: string; title: string; text: string; evidence?: string; status?: string; version?: string; seat?: string; evidenceHash?: string; asOf?: string; queuedAt?: string; createdAt?: string; from?: SeatId };
+export type SeatItem = { source: 'request' | 'checklist' | 'hook' | 'seat-question' | 'idle'; kind?: 'request' | 'cell' | 'hook-task' | 'seat-question'; id: string; title: string; text: string; evidence?: string; status?: string; version?: string; seat?: string; evidenceHash?: string; asOf?: string; queuedAt?: string; createdAt?: string; from?: SeatId; idleRung?: 1 | 2 | 3 | 4 | 5 };
 export type SeatInputs = { requests: SeatItem[]; checklist: SeatItem[]; role: string };
 // V3 ledger row: `ts` · `item.id` · `item.kind` · `item.createdAt` · `action` (door, wait or skipped-*) · `reason` (matched rule or forbidden word).
 export type SeatAction = 'decision' | 'harness' | 'wait' | 'seat-question' | 'seat-answer' | 'skipped-budget' | 'skipped-empty';
@@ -44,7 +46,7 @@ export type TcCandidate =
   | { kind: 'publication-pr-approval-wait'; pr: number; title: string; readyAt: string; approvalWaitAt: string; paths: string[] }
   | { kind: 'other-seat-cell-defect'; version: string; id: string; title: string; to: SeatId };
 export type TcPullRequest = { number: number; title: string; body?: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; isDraft: boolean; createdAt: string; updatedAt?: string; mergedAt?: string | null; readyAt?: string; approvalWaitAt?: string; paths?: string[]; reviewDecision?: string };
-export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'resolved' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate | OpDecideCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number };
+export type SeatEntry = { seat: string; ts?: string; at: string; modeDowngradeReason?: string; status: 'shadow' | 'attempting' | 'outcome-unknown' | 'queued' | 'refused' | 'held' | 'launched' | 'hitl' | 'wait' | 'asked' | 'answered' | 'awaiting-answer' | 'awaiting-xcheck' | 'awaiting-resolution' | 'resolved-by-neighbor' | 'resolved' | 'rejected-no-evidence' | 'skipped-budget' | 'skipped-empty'; item?: SeatItem; candidate?: OpCandidate | TcCandidate | OpDecideCandidate; action?: SeatAction; reason?: string; runId?: string; queueId?: string; inquiry?: SeatInquiry; answer?: string; escalated?: boolean; xcheckRequestedAt?: string; xcheckQuestionId?: number; xcheckNeighbor?: SeatId; xcheckNote?: string; xcheckJudgmentEvidence?: string; xcheckWaitMinutes?: number; emptyQueueMinutes?: number };
 export type SeatLoopResult = SeatEntry | { seat: string; status: 'skipped-off'; modeDowngradeReason?: string };
 
 export function seatLoopTickLine(result: SeatLoopResult): string {
@@ -93,6 +95,8 @@ export type SeatDeps = {
   pullRequests?: () => Promise<TcPullRequest[]>;
   ledgerFiles?: (directory: string) => string[];
   lockContended?: () => void;
+  /** Override the heartbeat timer in isolated long-turn tests; production uses the seat contract's interval. */
+  heartbeatIntervalMs?: number;
   /** Supply a question only when this seat lacks evidence for the selected work item. */
   inquire?: (seat: SeatId, item: SeatItem) => Promise<SeatInquiry | null> | SeatInquiry | null;
   /** Supply the receiving seat's answer; absent evidence must not invent a reply. */
@@ -570,8 +574,8 @@ function opDecidePass(config: SeatLoopConfig, deps: SeatDeps, now: Date, path: s
       mode,
       ledger: cardLedger(stateRoot, deps, now),
       runOwner: deps.runOwner ?? ((runId) => {
-        owners ??= new Map((['OP', 'UX', 'MK', 'TC'] as const).flatMap((owner) =>
-          readSeatLedger(owner, deps, now).filter((row) => row.runId).map((row) => [row.runId!, owner] as const)));
+        owners ??= new Map(registeredSeats().filter(({ id }) => isSeatId(id)).flatMap(({ id: owner }) =>
+          readSeatLedger(owner, deps, now).filter((row) => row.runId).map((row) => [row.runId!, owner as SeatId] as const)));
         return owners.get(runId);
       }),
       routeToSeat: (to, card, reason) => {
@@ -691,9 +695,11 @@ function readTcChecklist(root: string): Array<{ version: string; id: string; tit
   if (!existsSync(path)) return [];
   const db = new Database(path, { readonly: true, strict: true });
   try {
+    const seats = registeredSeats().filter(({ id }) => isSeatId(id)).map(({ id }) => id);
+    if (!seats.length) return [];
     return db.query(`SELECT a.version, f.id, COALESCE(a.title_override, f.title) AS title, a.status, a.owner
-      FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.status IN ('yellow', 'red') AND a.owner IN ('OP', 'TC', 'MK', 'UX')
-      ORDER BY a.version, f.id`).all() as Array<{ version: string; id: string; title: string; status: string; owner: string | null }>;
+      FROM assignments a JOIN features f ON f.id = a.feature_id WHERE a.status IN ('yellow', 'red') AND a.owner IN (${seats.map(() => '?').join(', ')})
+      ORDER BY a.version, f.id`).all(...seats) as Array<{ version: string; id: string; title: string; status: string; owner: string | null }>;
   } finally { db.close(); }
 }
 
@@ -946,13 +952,48 @@ export function planAction(item: SeatItem, seat?: string): { kind: 'decision' | 
   const kind = rule?.kind ?? 'harness';
   const reason = rule?.reason;
   observe('plan', { kind, reason: reason ?? '' });
-  return { kind, text: seat && kind === 'harness' ? seatTaskText(seat, item) : `${item.id} ${item.title}`, ...(reason ? { reason } : {}) };
+  const text = seat && kind === 'harness' ? seatTaskText(seat, item) : `${item.id} ${item.title}`;
+  // Observed once per plan (not per queue comparison): how many target paths the launched ask carries.
+  if (seat && kind === 'harness' && text.startsWith('대상 경로: ')) observe('target-paths', { item: item.id, count: text.split('\n', 1)[0]!.split(' · ').length });
+  return { kind, text, ...(reason ? { reason } : {}) };
+}
+
+/** A path counts only when it resolves to a regular file whose real location stays inside `root` (symlinks out are refused). */
+export function repoFileExists(root: string = repoRoot): (path: string) => boolean {
+  return (path) => {
+    try {
+      const absolute = resolve(root, path);
+      const real = relative(realpathSync(root), realpathSync(absolute));
+      return !!real && real !== '..' && !real.startsWith(`..${sep}`) && !isAbsolute(real) && statSync(absolute).isFile();
+    } catch { return false; }
+  };
+}
+
+// Repository paths already written in a checklist item's title or evidence (dedup · first-seen order · at most six).
+export function seatTargetPaths(item: SeatItem, isFile: (path: string) => boolean = repoFileExists()): string[] {
+  const paths: string[] = [];
+  const text = `${item.title}\n${item.evidence ?? ''}`;
+  const matches = text.matchAll(/(?:^|[^A-Za-z0-9_./-])((?:src|apps|scripts|test|docs|bin|graphs|packs|plugins)\/[A-Za-z0-9_./-]+)/g);
+  for (const match of matches) {
+    const path = match[1]!.replace(/[./]+$/, '');
+    if (path.split('/').includes('..')) continue;
+    const fromRoot = relative(repoRoot, resolve(repoRoot, path));
+    if (!fromRoot || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot) || !isFile(path)) continue;
+    if (!paths.includes(path)) paths.push(path);
+    if (paths.length === 6) break;
+  }
+  return paths;
 }
 
 // The launched sentence names the seat, the source and the release so same-named items stay distinct.
-export function seatTaskText(seat: string, item: SeatItem): string {
-  const where = item.source === 'checklist' ? `${item.version ?? '?'} 체크리스트 칸 ${item.id}` : item.source === 'hook' ? `웹훅 작업 카드 ${item.id}` : `자리 요청 ${item.id}`;
-  return `[${seat} 자리 · ${where} · 역할 docs/roles/${seat}.md] ${item.title.replace(/[\r\n]+/g, ' ')}`;
+// Checklist items whose title/evidence already name repository files get a leading `대상 경로:` line
+// (the label parseAskTargetPathHints reads); without paths the text is byte-identical to the old one-liner.
+export function seatTaskText(seat: string, item: SeatItem, isFile?: (path: string) => boolean): string {
+  const where = item.source === 'checklist' ? `${item.version ?? '?'} 체크리스트 칸 ${item.id}` : item.source === 'idle' ? `쉬는 시간 사다리 ${item.id} · ${item.idleRung}단계${item.version ? ` · ${item.version}` : ''}` : item.source === 'hook' ? `웹훅 작업 카드 ${item.id}` : `자리 요청 ${item.id}`;
+  const text = `[${seat} 자리 · ${where} · 역할 docs/roles/${seat}.md] ${item.title.replace(/[\r\n]+/g, ' ')}`;
+  if (item.source !== 'checklist') return text;
+  const paths = seatTargetPaths(item, isFile);
+  return paths.length ? `대상 경로: ${paths.join(' · ')}\n${text}` : text;
 }
 
 function xcheckEvent(event: string, seat: string, neighbor: string, item: string, outcome: string): void {
@@ -986,8 +1027,10 @@ function neighborLastSeen(root: string, isolated: boolean, now: Date, wanted: Re
 }
 
 function neighborSeat(id: string): string | null {
-  const match = /^(op|tc|mk|ux)-seat$/i.exec(id);
-  return match ? match[1]!.toUpperCase() : null;
+  const match = /^([A-Za-z][A-Za-z0-9_-]*)-seat$/i.exec(id);
+  if (!match) return null;
+  const resolved = resolveSeat(match[1]!)?.id;
+  return resolved && isSeatId(resolved) ? resolved : null;
 }
 
 function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps, root: string, now: Date): void {
@@ -1034,8 +1077,89 @@ function judgeSeatNeighbors(seat: string, config: SeatLoopConfig, deps: SeatDeps
   }
 }
 
+const IDLE_WORK: Record<SeatId, string> = {
+  MK: '문서 최적화: 현재 문서의 탐색·명료성·검색 유입을 실물 근거로 개선',
+  UX: '멀티 서피스: 실제 채널별 사용자 흐름을 대조하고 결함을 개선',
+  TC: '하니스 자가 치유: 실패 원장을 대조하여 재현 가능한 결함을 수리',
+  OP: '보충 저작: 판 체크리스트의 빠진 칸을 근거와 반증 기준으로 보완',
+};
+
+function idleCell(seat: string, rung: 1 | 2 | 3 | 4 | 5, id: string, title: string, now: Date, version?: string, owner?: string, evidence?: string): SeatItem {
+  return { source: 'idle', id, title, text: title, idleRung: rung, seat: owner ?? seat,
+    ...(version ? { version } : {}), ...(evidence ? { evidence } : {}), asOf: now.toISOString() };
+}
+
+function emptyQueueMinutes(ledger: readonly SeatEntry[], now: Date): number {
+  const previousIndex = [...ledger].reverse().findIndex((row) => row.emptyQueueMinutes !== undefined);
+  const workIndex = [...ledger].reverse().findIndex((row) => row.item && row.item.source !== 'idle' && row.status !== 'skipped-empty');
+  const previousPosition = previousIndex < 0 ? -1 : ledger.length - 1 - previousIndex;
+  const workPosition = workIndex < 0 ? -1 : ledger.length - 1 - workIndex;
+  const previous = ledger[previousPosition];
+  const lastWork = ledger[workPosition];
+  const previousAt = previous ? Date.parse(previous.at) : NaN;
+  const workAt = lastWork ? Date.parse(lastWork.at) : NaN;
+  const start = Number.isFinite(previousAt) && Number.isFinite(workAt) ? Math.max(previousAt, workAt)
+    : Number.isFinite(previousAt) ? previousAt : workAt;
+  if (!Number.isFinite(start)) return 0;
+  const prior = previousPosition > workPosition ? previous!.emptyQueueMinutes! : 0;
+  return prior + Math.max(0, (now.getTime() - start) / 60_000);
+}
+
+function pickIdleWork(seat: SeatId, deps: SeatDeps, ledger: readonly SeatEntry[], now: Date, root: string, shadow: boolean): SeatItem | null {
+  const releaseRoot = deps.root ?? releaseLedgerRoot();
+  const schedules = (deps.schedules ?? (() => readSchedules(releaseRoot)))()
+    .filter((row) => /^\d+\.\d+\.\d+$/.test(row.version) && Number.isFinite(Date.parse(row.cutAt)))
+    .sort((a, b) => versionOrder(a.version, b.version));
+  const shipped = releasedVersion(releaseRoot);
+  const current = schedules.find((row) => Date.parse(row.cutAt) > now.getTime() && (!shipped || versionOrder(row.version, shipped) > 0));
+  const itemsOf = deps.checklistItems ?? ((version: string) => listChecklist(version, releaseRoot).items);
+  const handled = handledKeys(ledger, shadow, root, !shadow);
+  const available = (item: SeatItem) => eligibleItem(item, ledger, handled, shadow);
+  // The normal queue handles open owned cells first; a landed yellow cell is revisited here for physical rebuttal.
+  for (const row of schedules.filter((row) => row.version === current?.version || Date.parse(row.cutAt) <= now.getTime() || (shipped && versionOrder(row.version, shipped) <= 0))) {
+    for (const cell of itemsOf(row.version).filter((cell) => cell.owner === seat && cell.status === 'yellow' && /착지|merged|병합/i.test(cell.evidence ?? '')).sort((a, b) => a.id.localeCompare(b.id))) {
+      const item = idleCell(seat, 2, cell.id, `착지 후 노랑 실물 반증: ${cell.id} · ${cell.title}`, now, row.version, seat, cell.evidence);
+      item.evidenceHash = createHash('sha256').update(cell.evidence ?? '').digest('hex');
+      if (available(item)) return item;
+    }
+  }
+  const next = schedules.find((row) => current && versionOrder(row.version, current.version) > 0);
+  if (next) {
+    const title = `${next.version} 다음 판 칸 저작: ${seat} 자리의 자율성·효율성·동시성을 높일 칸을 근거와 실물 반증부터 작성`;
+    const item = idleCell(seat, 3, `author:${seat}`, title, now, next.version);
+    if (available(item)) return item;
+  }
+  const recurring = idleCell(seat, 4, `recurring:${seat}:${seatDay(now)}`, IDLE_WORK[seat], now);
+  if (available(recurring)) return recurring;
+  const queue = (deps.queueItems ?? ((stateRoot: string) => listHarnessQueue({ root: stateRoot })))(root);
+  const candidates: Array<{ owner: SeatId; item: SeatItem; pressure: number }> = [];
+  for (const owner of ['OP', 'MK', 'UX', 'TC'] as const) {
+    if (owner === seat) continue;
+    const ownerLedger = readSeatLedger(owner, deps, now);
+    const busy = queue.filter((row) => row.seat === owner && ['queued', 'launching', 'launched'].includes(row.status)).length;
+    for (const row of schedules.filter((row) => Date.parse(row.cutAt) > now.getTime() && (!shipped || versionOrder(row.version, shipped) > 0))) {
+      for (const cell of itemsOf(row.version).filter((cell) => cell.owner === owner && cell.status === 'yellow')) {
+        const evidence = cell.evidence ?? '';
+        const runIds = [...evidence.matchAll(RUN_REFERENCE)].map(([id]) => id.toLowerCase());
+        if (runIds.length) {
+          const observed = (deps.cutoffRuns ?? ((ids: readonly string[]) => queryRunningRuns({ runIds: ids, caller: 'seat-loop.idle' })))(runIds);
+          if (observed.completeness !== 'complete' || observed.pty.unreadable.length || observed.entries.some((entry) => entry.status !== 'ended-unclosed')) continue;
+        }
+        if (ownerLedger.some((entry) => entry.item?.source === 'checklist' && entry.item.id === cell.id && entry.item.version === row.version
+          && ['queued', 'attempting', 'outcome-unknown', 'launched'].includes(entry.status))) continue;
+        if (queue.some((entry) => entry.seat === owner && ['queued', 'launching', 'launched'].includes(entry.status)
+          && entry.input.includes(`체크리스트 칸 ${cell.id} ·`))) continue;
+        const item = idleCell(seat, 5, `borrow:${owner}:${cell.id}`, `${row.version} ${cell.id} · ${cell.title} — ${seat} 지원 (주인 ${owner} 유지)`, now, row.version, owner, evidence);
+        item.evidenceHash = createHash('sha256').update(evidence).digest('hex');
+        if (available(item)) candidates.push({ owner, item, pressure: busy + itemsOf(row.version).filter((entry) => entry.owner === owner && entry.status === 'yellow').length });
+      }
+    }
+  }
+  return candidates.sort((a, b) => b.pressure - a.pressure || a.owner.localeCompare(b.owner) || a.item.id.localeCompare(b.item.id))[0]?.item ?? null;
+}
+
 export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promise<SeatLoopResult> {
-  if (!/^(?:MK|OP|TC|UX)$/.test(seat)) throw new Error(`unknown seat: ${seat}`);
+  if (!isSeatId(seat) || !registeredSeats().some(({ id }) => id === seat)) throw new Error(`unknown seat: ${seat}`);
   const config = deps.config ?? getUserConfig().loops?.seat ?? { mode: 'shadow' };
   if (config.mode === 'off') {
     observe('skipped-off', { seat });
@@ -1060,6 +1184,25 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   } catch (error) { observe('heartbeat-write-failed', { seat, error: String(error).slice(0, 200) }); }
   const recorded = readSeatLedger(seat, deps, now);
   const ledger = config.mode === 'live-safe' ? reconciledQueueLedger(recorded, stateRoot, deps) : recorded;
+  const loopId = seat === 'MK' ? 'cmo-seat' : `${seat.toLowerCase()}-seat`;
+  const heartbeatEveryMs = (SEAT_NEIGHBORS[seat]?.find((peer) => peer.id !== 'orchestrator')?.heartbeat.everyMinutes ?? 15) * 60_000;
+  const leaseMs = heartbeatEveryMs * 2;
+  const pulse = (health: 'healthy' | 'degraded', at: Date): void => {
+    try { emitLoopHeartbeat(stateRoot, loopId, health, at, new Date(at.getTime() + leaseMs).toISOString()); }
+    catch (error) { observe('neighbor-runtime-failed', { seat, error: String(error).slice(0, 200) }); }
+  };
+  pulse('healthy', (deps.now ?? (() => new Date()))());
+  const watchNeighbors = (at: Date): void => {
+    try { checkLoopNeighbors(stateRoot, loopId, SEAT_NEIGHBORS[seat] ?? [], at); }
+    catch (error) { observe('neighbor-runtime-failed', { seat, error: String(error).slice(0, 200) }); }
+  };
+  // A long turn keeps both duties periodic: renew our lease and watch neighbors (incidents are idempotent).
+  const heartbeatTimer = setInterval(() => {
+    const at = (deps.now ?? (() => new Date()))();
+    pulse('healthy', at);
+    watchNeighbors(at);
+  }, deps.heartbeatIntervalMs ?? heartbeatEveryMs / 2);
+  heartbeatTimer.unref();
   if (seat === 'OP') opDecidePass(config, deps, now, path, stateRoot, ledger);
   let turnError: unknown;
   try {
@@ -1259,8 +1402,14 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     checklist: inputs.checklist.filter((candidate) => !ledger.some((row) => row.status === 'awaiting-resolution'
       && row.item && itemKey(row.item) === itemKey(candidate) && itemSnapshot(row.item) === itemSnapshot(candidate))) }, ledger,
     { shadow: config.mode === 'shadow', liveSafe: config.mode === 'live-safe', root: stateRoot, history: deps.checklistHistory ?? checklistHistory });
-  const item = pendingQuestion ?? ordinary;
-  const append = deps.append ?? defaultAppend;
+  const ownQueueEmpty = !pendingQuestion && !ordinary;
+  const idleMinutes = ownQueueEmpty ? emptyQueueMinutes(ledger, now) : undefined;
+  // IDLE-LADDER: off unless loops.seat.idleLadder is set; 'shadow' records the idle pick only, 'live' lets live-safe/on launch it.
+  const idleShadow = config.mode === 'shadow' || config.idleLadder !== 'live';
+  const item = pendingQuestion ?? ordinary ?? (ownQueueEmpty && !lastDecisionFailure && (config.idleLadder === 'shadow' || config.idleLadder === 'live')
+    ? pickIdleWork(seat as SeatId, deps, ledger, now, stateRoot, idleShadow) : null);
+  const appendBase = deps.append ?? defaultAppend;
+  const append: typeof appendBase = (file, row) => appendBase(file, idleMinutes === undefined ? row : { ...row, emptyQueueMinutes: idleMinutes });
   const revisedProposal = item?.source === 'checklist' && ledger.some((row) => row.status === 'awaiting-resolution'
     && row.item && itemKey(row.item) === itemKey(item) && itemSnapshot(row.item) !== itemSnapshot(item));
   if (config.mode === 'live-safe' && !pendingQuestion) {
@@ -1448,11 +1597,12 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   }
   if (!item && config.mode === 'live-safe' && tcDowngrade) return tcDowngrade;
   const entry: SeatEntry = { seat, ts: now.toISOString(), at: now.toISOString(), status: item ? 'shadow' : 'skipped-empty',
+    ...(idleMinutes === undefined ? {} : { emptyQueueMinutes: idleMinutes }),
     ...(item ? { item, action: planned!.kind, ...(planned!.reason ? { reason: planned!.reason } : {}) } : { action: 'skipped-empty' as const }) };
-  if (config.mode === 'shadow' || !item) {
+  if (config.mode === 'shadow' || !item || (item.source === 'idle' && idleShadow)) {
     if (!item && lastDecisionFailure) return lastDecisionFailure;
     append(path, entry);
-    if (config.mode === 'shadow') observe('shadow', { seat, item, status: entry.status });
+    if (config.mode === 'shadow' || item?.source === 'idle') observe('shadow', { seat, item, status: entry.status });
     return entry;
   }
   if (planned!.kind === 'wait') {
@@ -1669,8 +1819,12 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
     turnError = error;
     throw error;
   } finally {
+    clearInterval(heartbeatTimer);
     // A turn ends even when there is no picked item or a launch fails.
-    try { judgeSeatNeighbors(seat, config, deps, stateRoot, (deps.now ?? (() => new Date()))()); }
+    const endedAt = (deps.now ?? (() => new Date()))();
+    pulse(turnError === undefined ? 'healthy' : 'degraded', endedAt);
+    watchNeighbors(endedAt);
+    try { judgeSeatNeighbors(seat, config, deps, stateRoot, endedAt); }
     catch (error) {
       observe('neighbor-judgment-failed', { seat, error: String(error).slice(0, 200) });
       const neighbors = config.neighbors?.[seat as keyof NonNullable<SeatLoopConfig['neighbors']>] ?? [];

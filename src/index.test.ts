@@ -2727,8 +2727,8 @@ describe('dev and drive Commander option-source wiring', () => {
 
   function assertExplicitDevOptionSourceWiring(text: string): void {
     expect(text).toContain(".filter((name) => command.getOptionValueSource(name) === 'cli')");
-    expect(text).toContain("devCli.buildDriveAliasDevSpec(hasText ? textParts.join(' ') : undefined, devOpts, devCli.explicitDevOptionNames(command))");
-    expect(text).toContain('buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command))');
+    expect(text).toContain("devCli.buildDriveAliasDevSpec(hasText ? textParts.join(' ') : undefined, devOpts, devCli.explicitDevOptionNames(command), devRunId)");
+    expect(text).toContain("buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command), 'cli-dev-ask', undefined, undefined, devRunId)");
   }
 
   test('passes Commander explicit option sources into both dev and drive spec branches', () => {
@@ -2736,8 +2736,10 @@ describe('dev and drive Commander option-source wiring', () => {
   });
 
   test('fails if either dev or drive branch stops passing Commander explicit option sources', () => {
-    const driveSourceRemoved = source.replace('devCli.explicitDevOptionNames(command))\n        : buildDevCliSpec', '[] )\n        : buildDevCliSpec');
-    const devSourceRemoved = source.replace('buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command))', 'buildDevCliSpec(input, executor, devOpts, [])');
+    const driveSourceRemoved = source.replace('devCli.explicitDevOptionNames(command), devRunId)\n        : buildDevCliSpec', '[], devRunId)\n        : buildDevCliSpec');
+    const devSourceRemoved = source.replace("buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command), 'cli-dev-ask', undefined, undefined, devRunId)", "buildDevCliSpec(input, executor, devOpts, [], 'cli-dev-ask', undefined, undefined, devRunId)");
+    expect(driveSourceRemoved).not.toBe(source);
+    expect(devSourceRemoved).not.toBe(source);
 
     expect(() => assertExplicitDevOptionSourceWiring(driveSourceRemoved)).toThrow();
     expect(() => assertExplicitDevOptionSourceWiring(devSourceRemoved)).toThrow();

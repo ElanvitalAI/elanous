@@ -1,4 +1,8 @@
 import { describe, expect, spyOn, test } from 'bun:test';
+import { createPack } from './kgs/pack.js';
+import type { KnowledgeCard } from './kgs/types.js';
+import { KgsSqliteStore } from './kgs/sqlite-store.js';
+import { queryInstalledPack } from './query.js';
 import { Command } from 'commander';
 import { registerKnowCommand } from '../cli/know-cli.js';
 import { knowFind, type DirectiveRow as KnowDirectiveRow, type KnowFindDeps } from './know-find.js';
@@ -103,6 +107,32 @@ describe('knowFind', () => {
       { log: (line) => { output.push(line); }, error: (line) => { output.push(line); } });
     await program.parseAsync(['know', 'A안'], { from: 'user' });
     expect(output).toEqual(['[decision] SD-20261006-01 · 0.2.11 A안 · seat-posthoc']);
+  });
+
+  test('selected installed pack returns only its indexed cards, with citations; old CLI sources stay unchanged', async () => {
+    const store = new KgsSqliteStore(':memory:');
+    try {
+      const card: KnowledgeCard = { schema_version: 2, id: 'card-1', title: '반도체 식각', body: '식각 온도는 40도',
+        kind: 'card', createdAt: at, updatedAt: at, author: 'test', nature: 'fact', reliability: 'verified',
+        source: { kind: 'manual' }, tags: [] };
+      store.writePack(createPack({ id: { slug: 'fab-knowledge', version: '1.0.0' }, title: '공정', intent: '공정 지식',
+        audience: 'team', kind: 'generic', author: 'test', cards: [card] }));
+      store.writePack(createPack({ id: { slug: 'other-pack', version: '1.0.0' }, title: '다른 팩', intent: '비공개',
+        audience: 'team', kind: 'generic', author: 'test', cards: [{ ...card, id: 'card-2', body: '식각 온도는 99도' }] }));
+      const pack = (id: string, query: string) => queryInstalledPack(id, query, store);
+      expect(pack('pack:fab-knowledge@1.0.0', '식각')).toMatchObject([{ body: '식각 온도는 40도', ref: 'pack:fab-knowledge@1.0.0#card-1' }]);
+      expect(pack('pack:fab-knowledge@1.0.0', '99도')).toEqual([]);
+      expect(() => pack('pack:missing-pack@1.0.0', '식각')).toThrow('pack not installed');
+      const deps = { ...sources(), pack };
+      const found = knowFind('식각', deps, 'pack:fab-knowledge@1.0.0');
+      expect(found.rows.filter(row => row.source === 'pack')).toMatchObject([{ title: '반도체 식각', ref: 'pack:fab-knowledge@1.0.0#card-1' }]);
+      expect(knowFind('AUTHOR-POD', deps).rows).toHaveLength(5);
+      const output: string[] = [];
+      const program = new Command();
+      registerKnowCommand(program, deps, { log: line => { output.push(line); }, error: line => { output.push(line); } });
+      await program.parseAsync(['know', 'AUTHOR-POD'], { from: 'user' });
+      expect(output.some(line => line.includes('[pack]'))).toBe(false);
+    } finally { store.close(); }
   });
 
   test('seat-report failure records decision unavailable and retains representative decisions in their original order', () => {

@@ -69,8 +69,17 @@ function linkedRows(rows: readonly SupervisorLogRow[], missionIds: ReadonlySet<s
   const linked: SupervisorLogRow[] = [];
   let unlinked = false;
   for (const row of rows) {
-    const key = missionKey(row.data);
-    if (key && missionIds.has(key)) linked.push(row);
+    // The driver writes its runId into the ambient log payload and the PTY decision's
+    // sessionId; the decision emitter may replace missionId with a display alias.
+    // Without a runId, either retained identifier can identify an existing result.
+    const runId = row.data?.runId;
+    const sessionId = row.category === DECISION_CATEGORY ? row.data?.sessionId : undefined;
+    const key = typeof runId === 'string' && runId.trim() ? runId.trim() : null;
+    const sessionKey = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
+    const missionId = typeof row.data?.missionId === 'string' && row.data.missionId.trim() ? row.data.missionId.trim() : null;
+    const matches = key ? missionIds.has(key)
+      : (missionId !== null && missionIds.has(missionId)) || (sessionKey !== null && missionIds.has(sessionKey));
+    if (matches) linked.push(row);
     else unlinked = true;
   }
   return { linked, unlinked };
@@ -123,6 +132,12 @@ export function aggregateSupervisorMetrics(
     ? unmeasured('questionsAnswered', '대화형 질문에 답해 넘긴 수', UNLINKED_REASON)
     : answers.linked.length === 0
     ? unmeasured('questionsAnswered', '대화형 질문에 답해 넘긴 수', '못 잼 · pty.decision answer 기록 없음')
+    : answers.linked.some((row) => {
+      const detail = row.data?.detail;
+      return !detail || typeof detail !== 'object' || !('answer' in detail)
+        || typeof detail.answer !== 'string' || !detail.answer.trim();
+    })
+    ? unmeasured('questionsAnswered', '대화형 질문에 답해 넘긴 수', '못 잼 · 답변 본문 기록 없음')
     : {
       id: 'questionsAnswered',
       label: '대화형 질문에 답해 넘긴 수',

@@ -1,14 +1,93 @@
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { describe, expect, test } from 'bun:test';
 import { getProvider } from '../llm.js';
+import { parseReviewResult, renderReview } from '../agent-substrate/pr-reviewer.js';
+import { parseSubscriptionReviewerSpec } from '../user-config.js';
+import { defaultLlmPolicy, validateLlmPolicy } from '../policy/llm-policy.js';
 import {
   classifyReviewProviderFailure, buildReviewProviderAttempts, runReviewWithFallback,
-  type ReviewFallbackObservation,
+  type ReviewFallbackObservation, subscriptionReviewerSpawn, runSubscriptionReviewer,
 } from './review-provider-fallback.js';
 
 const A = { model: 'gpt-5.6-sol', provider: getProvider('gpt-5.6-sol')!, label: 'codex' };
 const B = { model: 'grok-4', provider: getProvider('grok-4')!, label: 'grok' };
 const C = { model: 'claude-opus', provider: getProvider('claude-opus')!, label: 'claude' };
+
+describe('Claude ACP subscription review', () => {
+  const cct = { provider: 'claude-acp' as const };
+  const cc = { provider: 'claude-acp' as const, executor: 'cc' as const };
+  const env = { PATH: '/bin', ANTHROPIC_API_KEY: 'secret', ANTHROPIC_AUTH_TOKEN: 'token',
+    CLAUDE_CODE_OAUTH_TOKEN: 'other', CLAUDE_CODE_USE_VERTEX: '1' };
+
+  test('roleLlm.reviewer is opt-in and policy cap defaults to 60%', () => {
+    expect(parseSubscriptionReviewerSpec({ provider: 'claude-acp' })).toEqual(cct);
+    expect(parseSubscriptionReviewerSpec({ provider: 'claude-acp', executor: 'cc' })).toEqual(cc);
+    expect(parseSubscriptionReviewerSpec({ provider: 'claude-acp', executor: 'unknown' })).toBeUndefined();
+    const policy = defaultLlmPolicy();
+    expect(policy.roles.reviewer).toBeUndefined();
+    expect(policy.caps.claude.harness).toBe(60);
+    expect(validateLlmPolicy({ roles: { reviewer: cc }, caps: { claude: { harness: 60 } } }).valid).toBe(true);
+    expect(validateLlmPolicy({ roles: { reviewer: { provider: 'claude-acp', executor: 'unknown' } } }).valid).toBe(false);
+  });
+
+  test('cct status confirms subscription and measures usage; an unmeasured quota falls back', async () => {
+    const calls: string[] = [];
+    const runStatus = (command: string, args: string[], cleanEnv: Record<string, string>) => {
+      calls.push(`${command} ${args.join(' ')}`);
+      expect(cleanEnv.ANTHROPIC_API_KEY).toBeUndefined();
+      return { status: 0, stdout: 'Claude subscription active; usage: 42%' };
+    };
+    const api = async () => 'VERDICT: PASS';
+    const acp = async () => 'VERDICT: WARN';
+    expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env, { runStatus })).toBe('VERDICT: WARN');
+    expect(calls).toEqual(['teamclaude status', 'teamclaude status']);
+    expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env,
+      { runStatus: () => ({ status: 0, stdout: 'Claude subscription active' }) })).toContain('usage unavailable');
+  });
+
+  test('fallback notice survives review parsing and appears in rendered review result', async () => {
+    const raw = await runSubscriptionReviewer(cct, 60, 'review', async () => 'VERDICT: PASS\nMUST-FIX:\n',
+      async () => { throw new Error('ACP must not launch'); }, env,
+      { checkSubscription: () => false, usedPercent: () => 10 });
+    const result = parseReviewResult(raw);
+    expect(result).toMatchObject({ verdict: 'pass', reviewerFallback: 'cct subscription check failed; default reviewer used' });
+    expect(renderReview(result)).toContain('[reviewer fallback: cct subscription check failed; default reviewer used]');
+  });
+
+  test('the executor command is passed to the ACP child without billing credentials', () => {
+    expect(subscriptionReviewerSpawn(cct, env)).toMatchObject({ command: 'teamclaude',
+      args: ['run', '--auto-fallback', '--', '--dangerously-skip-permissions'],
+      backendSpec: { id: 'claude', command: 'teamclaude', args: ['run', '--auto-fallback', '--', '--dangerously-skip-permissions'] } });
+    expect(subscriptionReviewerSpawn(cc, env)).toMatchObject({ command: 'claude', args: ['--dangerously-skip-permissions'],
+      backendSpec: { command: 'claude', args: ['--dangerously-skip-permissions'] } });
+    for (const spec of [cct, cc]) {
+      const child = subscriptionReviewerSpawn(spec, env).env;
+      expect(child.PATH).toBe('/bin');
+      for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_VERTEX'])
+        expect(child[key]).toBeUndefined();
+    }
+  });
+
+  test('no setting uses the unchanged default path; subscription failure and cap failure report the fallback', async () => {
+    const calls: string[] = [];
+    const api = async (_prompt: string) => { calls.push('api'); return 'PASS'; };
+    const acp = async (_prompt: string, spawn: ReturnType<typeof subscriptionReviewerSpawn>) => {
+      calls.push(spawn.command); return 'ACP PASS';
+    };
+    expect(await runSubscriptionReviewer(undefined, 60, 'review', api, acp, env)).toBe('PASS');
+    expect(calls).toEqual(['api']);
+    expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env,
+      { checkSubscription: () => false, usedPercent: () => 10 })).toBe('PASS\n[reviewer fallback: cct subscription check failed; default reviewer used]');
+    expect(await runSubscriptionReviewer(cc, 60, 'review', api, acp, env,
+      { checkSubscription: () => true, usedPercent: () => 60 })).toContain('at harness cap (60%)');
+    expect(calls).toEqual(['api', 'api', 'api']);
+    expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env,
+      { checkSubscription: () => true, usedPercent: () => 59 })).toBe('ACP PASS');
+    expect(calls.at(-1)).toBe('teamclaude');
+    expect(await runSubscriptionReviewer(cc, 60, 'review', api, async () => '', env,
+      { checkSubscription: () => true, usedPercent: () => 10 })).toContain('ACP review failed; default reviewer used');
+  });
+});
 
 describe('classifyReviewProviderFailure — 「제공자가 아픈가」만 문다', () => {
   test('⭐ 실물 문면(#10069)을 문다', () => {

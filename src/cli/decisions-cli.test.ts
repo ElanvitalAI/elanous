@@ -414,6 +414,32 @@ test('actual CLI child reads an item raised in an isolated state directory', () 
   expect(JSON.parse(readFileSync(join(stateDir, 'ask-user-question', 'answers', `${encodeURIComponent('auq:lateq:abcde')}.json`), 'utf8')).result.answers).toEqual({ late_choice: 'b) Decline' });
 }, 500000);
 
+test('actual CLI list JSON over a slow pipe matches redirected bytes beyond 64 KiB', () => {
+  const stateDir = root();
+  const file = join(stateDir, 'list.json');
+  const cwd = join(import.meta.dir, '..', '..');
+  try {
+    const ledger = new DecisionLedger({ stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) });
+    for (let i = 0; i < 24; i++) {
+      ledger.raise({ title: `Large decision ${i}`, category: 'scope', scqa: { s: `Situation ${i}.`, c: 'Choice required.' }, pendingQuestion: `Evidence ${i}: ${'x'.repeat(10_000)}`,
+        options: [{ key: 'a', label: 'Yes', consequence: 'Proceed' }, { key: 'b', label: 'No', consequence: 'Wait' }],
+        recommendation: { skipped: true, reason: 'Needs review' }, raisedBy: { agent: 'codex' } });
+    }
+    const redirected = spawnSync('sh', ['-c', 'bun bin/elanous.mjs --test="$1" decisions list --status all --json > "$2"', 'sh', stateDir, file],
+      { cwd, encoding: 'utf8', timeout: 120_000 });
+    expect(redirected.status, redirected.stderr).toBe(0);
+    const bytes = readFileSync(file);
+    expect(bytes.byteLength).toBeGreaterThan(200_000);
+    const piped = spawnSync('sh', ['-c', 'bun bin/elanous.mjs --test="$1" decisions list --status all --json | (sleep 1; cat)', 'sh', stateDir],
+      { cwd, encoding: 'buffer', timeout: 120_000, maxBuffer: 2_000_000 });
+    expect(piped.status, piped.stderr.toString('utf8')).toBe(0);
+    expect(Buffer.byteLength(piped.stdout)).toBe(bytes.byteLength);
+    expect(piped.stdout.equals(bytes)).toBe(true);
+    console.info(`decisions list bytes: file=${bytes.byteLength} pipe=${piped.stdout.byteLength}`);
+    expect(JSON.parse(piped.stdout.toString('utf8'))).toHaveLength(24);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+}, 260_000);
+
 test('CLI decide with no pending question at all reports the failed delivery and the retry command', () => {
   const stateDir = root();
   const lines: string[] = [];

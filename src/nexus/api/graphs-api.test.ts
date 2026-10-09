@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createNexusState } from '../state/state.js';
@@ -9,6 +10,10 @@ import { routeRequest } from './http-server.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { GRAPH_VERSION_CAP, handleGraphVersionsGet, RESERVED_GRAPH_IDS, handleGraphsClone, handleGraphsCreate, handleGraphsGet, handleGraphsPut, handleGraphsRevert } from './graphs-api.js';
 import { defaultGraphsDir } from '../../self-implement/graph-templates.js';
+import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
+import { installedGraphs } from '../../exec-requests/planner.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
+import { resetUserConfig } from '../../user-config.js';
 
 const headers = { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' };
 
@@ -20,6 +25,172 @@ function request(path: string, method = 'GET', authorized = true) {
     state, registry: new TabRegistry(state), eventBus: bus, metaApi: { bearerToken: 'owner-secret', noAuth: false },
   }, { requestIP: () => ({ address: '203.0.113.1' }) } as never, null, createDevProxyRuntimeRef());
 }
+
+test('W9c graph access grant changes another credential’s actual GET/PUT API responses, without changing core or YAML', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-graph-access-'));
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    const mineDir = join(root, 'graphs');
+    mkdirSync(mineDir, { recursive: true });
+    const original = readFileSync(join(defaultGraphsDir(), 'research-loop.yaml'), 'utf8')
+      .replace(/^graph_id:.*$/m, 'graph_id: w9c-peer');
+    writeFileSync(join(mineDir, 'w9c-peer.yaml'), original);
+    const peer = `eg_${randomBytes(32).toString('hex')}`;
+    const other = `eg_${randomBytes(32).toString('hex')}`;
+    const peerRequest = (token: string, method: string, path: string, body?: unknown) => {
+      const bus = new NexusEventBus();
+      const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+      state.bus = bus;
+      return routeRequest(new Request(`http://localhost${path}`, {
+        method, headers: { authorization: `Bearer ${token}`, 'sec-fetch-site': 'cross-site', ...(body ? { 'content-type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }), { state, registry: new TabRegistry(state), eventBus: bus, metaApi: { bearerToken: 'owner-secret', noAuth: false } },
+      { requestIP: () => ({ address: '203.0.113.1' }) } as never, null, createDevProxyRuntimeRef());
+    };
+    const path = '/v1/graphs/w9c-peer/yaml';
+    expect((await peerRequest(peer, 'GET', path))?.status).toBe(401);
+    expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(401);
+    const grant = (permission: string) => peerRequest('owner-secret', 'PUT', '/v1/graphs/w9c-peer/access', { recipient: peer, permission });
+    expect((await peerRequest('owner-secret', 'PUT', '/v1/graphs/research-loop/access', { recipient: peer, permission: 'edit' }))?.status).toBe(403);
+    expect((await grant('view'))?.status).toBe(200);
+    expect((await peerRequest(peer, 'GET', path))?.status).toBe(200);
+    expect((await peerRequest(peer, 'GET', '/v1/graphs/w9c-peer'))?.status).toBe(200);
+    expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(401);
+    expect((await peerRequest(other, 'GET', path))?.status).toBe(401);
+    expect((await peerRequest(peer, 'GET', '/v1/graphs/research-loop/yaml'))?.status).toBe(401);
+    expect((await peerRequest(peer, 'GET', '/v1/graphs/w9c-peer/access'))?.status).toBe(401);
+    expect((await peerRequest(peer, 'POST', '/v1/graphs'))?.status).toBe(401);
+    expect((await peerRequest(peer, 'GET', '/v1/graphs'))?.status).toBe(401);
+    expect((await peerRequest(peer, 'POST', '/v1/graphs/w9c-peer/revert'))?.status).toBe(401);
+    expect((await grant('edit'))?.status).toBe(200);
+    expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(200);
+    expect((await peerRequest(other, 'PUT', path, { yaml: original }))?.status).toBe(401);
+    expect((await peerRequest(peer, 'PUT', '/v1/graphs/w9c-peer/access', { recipient: other, permission: 'edit' }))?.status).toBe(401);
+    expect((await peerRequest(peer, 'GET', '/v1/graphs/w9c-peer/versions'))?.status).toBe(401);
+    expect((await grant('view'))?.status).toBe(200);
+    expect((await peerRequest(peer, 'GET', path))?.status).toBe(200);
+    expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(401);
+    expect(readFileSync(join(mineDir, 'w9c-peer.yaml'), 'utf8')).toBe(original);
+    expect((await peerRequest('owner-secret', 'GET', '/v1/graphs/w9c-peer/access'))?.status).toBe(200);
+    expect(readFileSync(join(mineDir, '.access', 'w9c-peer.json'), 'utf8')).not.toContain(peer);
+    writeFileSync(join(mineDir, '.access', 'w9c-peer.json'), '{broken');
+    expect((await peerRequest(peer, 'GET', path))?.status).toBe(401);
+    expect((await peerRequest('owner-secret', 'GET', '/v1/graphs/w9c-peer/access'))?.status).toBe(500);
+    expect((await grant('edit'))?.status).toBe(500);
+    expect((await peerRequest(peer, 'PUT', path, { yaml: original }))?.status).toBe(401);
+  } finally {
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const RUN_GRAPH = `graph_id: w9c-run
+version: 1
+entry_node: plan
+terminal_nodes: [done]
+nodes:
+  - { node_id: plan, kind: agent, recipe: 'cmd:plan', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: 'cmd:done', max_visits: 1 }
+edges:
+  - { from: plan, on: outcome, map: { ok: done } }
+`;
+
+test('W9c run guard: a peer edit is recorded and refused by every run entry until the owner approves or re-saves it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-graph-peer-run-'));
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    // The HTTP run route is operator-only; the owner bearer is an operator once operator mode is on.
+    // Config dir = the same root, so the state root (graphs/) does not move.
+    const configDir = root;
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ operator: { enabled: true, proxySecretFile: join(configDir, 'secret') } }));
+    setElanousConfigDir(configDir);
+    resetUserConfig();
+    const mineDir = join(root, 'graphs');
+    mkdirSync(mineDir, { recursive: true });
+    writeFileSync(join(mineDir, 'w9c-run.yaml'), RUN_GRAPH);
+    const recipesFile = join(root, 'editor-recipes.yaml');
+    writeFileSync(recipesFile, `plan:\n  command: 'true'\ndone:\n  command: 'true'\n`);
+    let runs = 0;
+    const runDeps = { mineDir, recipesFile, root: join(root, 'instance'),
+      run: (async () => { runs += 1; return { status: 'done' }; }) as never };
+    const run = () => handleGraphRunRoute('POST', '/v1/graphs/w9c-run/run', runDeps)!;
+    const peer = `eg_${randomBytes(32).toString('hex')}`;
+    const call = (token: string, method: string, path: string, body?: unknown) => {
+      const bus = new NexusEventBus();
+      const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+      state.bus = bus;
+      return routeRequest(new Request(`http://localhost${path}`, {
+        method, headers: { authorization: `Bearer ${token}`, 'sec-fetch-site': 'cross-site', ...(body ? { 'content-type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }), { state, registry: new TabRegistry(state), eventBus: bus, metaApi: { bearerToken: 'owner-secret', noAuth: false } },
+      { requestIP: () => ({ address: '203.0.113.1' }) } as never, null, createDevProxyRuntimeRef());
+    };
+    const marker = join(mineDir, '.access', 'w9c-run.peer-edit.json');
+    const catalogHas = async () => (await installedGraphs(join(root, 'no-core'), mineDir)).some((graph) => graph.id === 'w9c-run');
+
+    // Owner-only edits never flag the graph.
+    expect((await call('owner-secret', 'PUT', '/v1/graphs/w9c-run/yaml', { yaml: RUN_GRAPH }))?.status).toBe(200);
+    expect(existsSync(marker)).toBe(false);
+    expect(run().status).toBe(202);
+    expect(await catalogHas()).toBe(true);
+
+    // Peer save → recorded with a hash prefix, never the token.
+    expect((await call('owner-secret', 'PUT', '/v1/graphs/w9c-run/access', { recipient: peer, permission: 'edit' }))?.status).toBe(200);
+    const saved = await call(peer, 'PUT', '/v1/graphs/w9c-run/yaml', { yaml: RUN_GRAPH });
+    expect(saved?.status).toBe(200);
+    const savedBody = await saved!.json() as { version: string; editedBy: string };
+    expect(savedBody.editedBy).toMatch(/^peer:[a-f0-9]{8}$/);
+    const record = JSON.parse(readFileSync(marker, 'utf8')) as { editedBy: string; version: string; at: string };
+    expect(record).toMatchObject({ editedBy: savedBody.editedBy, version: savedBody.version });
+    expect(readFileSync(marker, 'utf8')).not.toContain(peer);
+
+    // Every run entry refuses: editor run (direct and over HTTP) and the exec-request catalog.
+    const refused = run();
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: 'peer-edit-unapproved', reason: '상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다', version: savedBody.version, editedBy: savedBody.editedBy });
+    expect((await call('owner-secret', 'POST', '/v1/graphs/w9c-run/run'))!.status).toBe(409);
+    expect(await catalogHas()).toBe(false);
+    // …and a clone does not launder the change into an unmarked graph.
+    expect((await call('owner-secret', 'POST', '/v1/graphs/w9c-run/clone', { newId: 'w9c-run-copy' }))?.status).toBe(409);
+    const runsBefore = runs;
+
+    // The peer cannot approve its own change.
+    expect((await call(peer, 'POST', '/v1/graphs/w9c-run/approve', { version: savedBody.version }))?.status).toBe(401);
+    expect(run().status).toBe(409);
+    // A stale version is not an approval.
+    expect((await call('owner-secret', 'POST', '/v1/graphs/w9c-run/approve', { version: '2000-01-01T00-00-00-000Z' }))?.status).toBe(409);
+    expect(run().status).toBe(409);
+    expect(runs).toBe(runsBefore);
+
+    // Owner approves the named version → runs.
+    expect((await call('owner-secret', 'POST', '/v1/graphs/w9c-run/approve', { version: savedBody.version }))?.status).toBe(200);
+    expect(run().status).toBe(202);
+    expect(await catalogHas()).toBe(true);
+
+    // A new peer save needs a new approval; an owner re-save clears it.
+    expect((await call(peer, 'PUT', '/v1/graphs/w9c-run/yaml', { yaml: RUN_GRAPH }))?.status).toBe(200);
+    expect(run().status).toBe(409);
+    expect((await call('owner-secret', 'PUT', '/v1/graphs/w9c-run/yaml', { yaml: RUN_GRAPH }))?.status).toBe(200);
+    expect(existsSync(marker)).toBe(false);
+    expect(run().status).toBe(202);
+
+    // Fail closed: a marker that cannot be read refuses the run and drops the graph from the catalog.
+    writeFileSync(marker, '{broken');
+    const unreadable = run();
+    expect(unreadable.status).toBe(409);
+    expect(await unreadable.json()).toMatchObject({ error: 'peer-edit-unreadable', reason: '상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다' });
+    expect(await catalogHas()).toBe(false);
+  } finally {
+    resetUserConfig();
+    resetElanousConfigDir();
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('GET /v1/graphs reads real YAML, retains labelled research branches and denies anonymous or write requests', async () => {
   const list = await request('/v1/graphs');

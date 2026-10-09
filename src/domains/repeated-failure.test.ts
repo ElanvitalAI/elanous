@@ -52,7 +52,7 @@ describe('repeated failure — failure shape rather than severity', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
     try {
       const health = opsHealth({ recentLogs: () => closes, missionStore: store,
-        listScheduleRows: () => [], opsDbPath: '/nonexistent/ops_events.db', mandate: null });
+        listScheduleRows: () => [], opsDbPath: '/nonexistent/ops_events.db', mandate: null, graphLoopRuns: () => [] });
       expect(health.anomalies.filter((anomaly) => anomaly.kind === 'repeated_failure')).toEqual([]);
     } finally { store.close(); }
     expect(failureReason(row(26, 'webterm.acp.close', 'close', 'socket closed: 1008: auth_failed'))).not.toBeNull();
@@ -106,7 +106,7 @@ describe('repeated failure — failure shape rather than severity', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
     try {
       const report = opsHealth({ recentLogs, missionStore: store, listScheduleRows: () => [],
-        opsDbPath: '/nonexistent/ops_events.db', mandate: null });
+        opsDbPath: '/nonexistent/ops_events.db', mandate: null, graphLoopRuns: () => [] });
       const repeated = report.anomalies.filter((a) => a.kind === 'repeated_failure');
       expect(repeated).toHaveLength(1);
       expect(repeated[0]?.entity).toContain('webterm.acp');

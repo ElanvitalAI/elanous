@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { SMALL_LEDGER_BYTES, buildGeneration, isSecretPath, planSnapshot, stripHostLocalConfig, survivalPaths } from './standby-snapshot';
+import { SMALL_LEDGER_BYTES, buildGeneration, isSecretPath, planSnapshot, snapshotItem, stripHostLocalConfig, survivalPaths } from './standby-snapshot';
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -93,4 +93,18 @@ test('stripHostLocalConfig leaves a config without hq, and unparsable text, byte
   expect(stripHostLocalConfig('{"a":1}')).toBe('{"a":1}');
   expect(stripHostLocalConfig('not json')).toBe('not json');
   expect(JSON.parse(stripHostLocalConfig('{"hq":{"hostName":"mbp"},"b":2}'))).toEqual({ b: 2 });
+});
+
+test('sqlite snapshot uses one consistent copy and replaces a stale destination (VACUUM INTO, not .backup)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hq-standby-vac-'));
+  roots.push(root);
+  const out = join(root, 'out');
+  mkdirSync(join(root, 'logs'), { recursive: true });
+  spawnSync('sqlite3', [join(root, 'logs/logs.db'), 'PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1),(2),(3);']);
+  // A destination left by an earlier generation must not make VACUUM INTO fail ("output file already exists").
+  mkdirSync(join(out, 'logs'), { recursive: true });
+  writeFileSync(join(out, 'logs/logs.db'), 'stale');
+  snapshotItem(root, out, { rel: 'logs/logs.db', kind: 'sqlite' } as Parameters<typeof snapshotItem>[2]);
+  const rows = spawnSync('sqlite3', [join(out, 'logs/logs.db'), 'SELECT count(*) FROM t; PRAGMA integrity_check;'], { encoding: 'utf8' }).stdout.trim().split('\n');
+  expect(rows).toEqual(['3', 'ok']);
 });

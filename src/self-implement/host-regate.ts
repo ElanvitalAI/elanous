@@ -8,7 +8,7 @@ import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { admitLandingMerge } from './frozen-merges.js';
 import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
-import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
+import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 
 /**
  * The PWA's static build type-checks every `src/**` file it imports, under Next's stricter
@@ -22,9 +22,10 @@ export function needsPwaBuild(files: readonly string[]): boolean {
 
 export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
 export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
+export type InterferenceVerdict = { passed: boolean; detail?: string; unmeasured?: boolean; /** neighbour tests left out so the selection fits the inspection cap */ neighborsTrimmed?: number };
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
-  interference?: (files: readonly string[], cwd: string) => Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }>;
+  interference?: (files: readonly string[], cwd: string) => Promise<InterferenceVerdict>;
   makeTemp?: () => string;
   removeTemp?: (path: string) => void;
   acquire?: (repoRoot: string) => Promise<() => void>;
@@ -46,17 +47,28 @@ const defaultCommand: NonNullable<HostRegateDeps['command']> = (bin, args, cwd, 
 };
 
 /** The informational pr-land gate always returns zero; enforce its measured report and the combined test result instead. */
-async function defaultInterference(files: readonly string[], cwd: string, opts: { neighbors?: boolean } = {}): Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }> {
-  const tests = files.filter((file) => /\.test\.tsx?$/.test(file));
-  const neighbors = new Set<string>(tests);
-  // verifyOnly(승인 탭)는 «이 PR 이 바꾼 시험»만 잰다 — 이웃 시험을 넣으면 간섭 관문의 상한(8)에 잘려 영영 «측정 불가»가 되고,
-  //   이웃의 기존 실패가 이 PR 을 막는다(2026-09-28 #21239 실측: scripts/lib 이웃 9 → 상한 8 · nl-routing-measurement 기존 1 fail).
+export async function defaultInterference(files: readonly string[], cwd: string, opts: { neighbors?: boolean; detect?: typeof detectTestInterference } = {}): Promise<InterferenceVerdict> {
+  const tests = [...new Set(files.filter((file) => /\.test\.tsx?$/.test(file)))].sort();
+  const changed = new Set(tests);
+  const neighbors = new Set<string>();
+  // verifyOnly(승인 탭)는 «이 PR 이 바꾼 시험»만 잰다 — 이웃의 기존 실패가 이 PR 을 막지 않게
+  //   (2026-09-28 #21239 실측: scripts/lib 이웃 9 · nl-routing-measurement 기존 1 fail).
   if (opts.neighbors !== false) for (const file of tests) {
     for (const sibling of readdirSync(join(cwd, dirname(file)))) {
-      if (/\.test\.tsx?$/.test(sibling)) neighbors.add(join(dirname(file), sibling));
+      const path = join(dirname(file), sibling);
+      if (/\.test\.tsx?$/.test(sibling) && !changed.has(path)) neighbors.add(path);
     }
   }
-  const selected = [...neighbors].sort();
+  // 이웃이 간섭 관문의 상한(MAX_INSPECTED_TEST_FILES)을 넘기면 그 관문이 잘라 «영영 측정 불가»가 된다
+  //   (2026-10-08 #25180·#25187 실측: src/self-implement 시험 175 · src/seat-loop 11). 바뀐 시험은 전부 두고 남는 칸만 이웃으로 채운다.
+  //   바뀐 시험만으로 상한을 넘으면 정직하게 «측정 불가»로 남는다.
+  const sortedNeighbors = [...neighbors].sort();
+  const room = Math.max(0, MAX_INSPECTED_TEST_FILES - tests.length);
+  const kept = tests.length > MAX_INSPECTED_TEST_FILES ? sortedNeighbors : sortedNeighbors.slice(0, room);
+  const neighborsTrimmed = sortedNeighbors.length - kept.length;
+  const trimmed = neighborsTrimmed > 0 ? { neighborsTrimmed } : {};
+  const trimNote = neighborsTrimmed > 0 ? ` · neighbours trimmed ${neighborsTrimmed} to fit inspection cap ${MAX_INSPECTED_TEST_FILES}` : '';
+  const selected = [...tests, ...kept].sort();
   if (!selected.length) return { passed: true };
   // 간섭 관문은 시험 파일이 둘 이상일 때만 잰다 — 하나면 간섭이라는 말이 없으니 그 파일을 한 번 돌려 실패 수로 본다.
   if (selected.length === 1) {
@@ -69,13 +81,13 @@ async function defaultInterference(files: readonly string[], cwd: string, opts: 
   let report: Awaited<ReturnType<typeof detectTestInterference>> | undefined;
   await runTestInterferenceGate({
     args: ['--changed-files', ...selected], log: () => {},
-    detect: async (paths) => (report = await detectTestInterference(paths, (batch) => runBunTest(batch, undefined, cwd))),
+    detect: async (paths) => (report = await (opts.detect ?? detectTestInterference)(paths, (batch) => runBunTest(batch, undefined, cwd))),
   });
-  if (!report || report.status === 'unmeasurable' || selected.length > report.order.length) return { passed: false, unmeasured: true, detail: 'test interference measurement unavailable or truncated' };
+  if (!report || report.status === 'unmeasurable' || selected.length > report.order.length) return { passed: false, unmeasured: true, ...trimmed, detail: `test interference measurement unavailable or truncated (selected ${selected.length}, changed tests ${tests.length}, cap ${MAX_INSPECTED_TEST_FILES})${trimNote}` };
   if (report.isolatedFailures !== 0 || report.combinedFailures !== 0 || report.status === 'interference') {
-    return { passed: false, detail: `isolated=${report.isolatedFailures}, combined=${report.combinedFailures}, interference=${report.status}` };
+    return { passed: false, ...trimmed, detail: `isolated=${report.isolatedFailures}, combined=${report.combinedFailures}, interference=${report.status}${trimNote}` };
   }
-  return { passed: true };
+  return { passed: true, ...trimmed, ...(trimNote ? { detail: trimNote.slice(3) } : {}) };
 }
 
 const SLOT_WAIT_MS = 30 * 60_000;
@@ -133,9 +145,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let endLanding: ((merged?: boolean) => void) | undefined;
   let landed = false;
   let verifiedBase: string | undefined;
+  let interferenceNote: Record<string, unknown> = {};
   const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string): HostRegateResult => {
     if (step) failures.push({ step, detail: detail ?? 'unknown' });
-    log(event, { pr: input.prNumber, files, os: process.platform, ...(step ? { failedStep: step } : {}) });
+    log(event, { pr: input.prNumber, files, os: process.platform, ...interferenceNote, ...(step ? { failedStep: step, detail: (detail ?? 'unknown').slice(0, 300) } : {}) });
     return { passed: event === 'passed', failures, os: process.platform, ...(input.verifyOnly ? { status: event, ...(verifiedBase ? { baseCommit: verifiedBase } : {}) } : {}) };
   };
   const run = (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): string => {
@@ -211,6 +224,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
     try {
       const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, { neighbors: !input.verifyOnly })))(files, worktree);
+      if (interference.neighborsTrimmed) interferenceNote = { neighborsTrimmed: interference.neighborsTrimmed, interferenceDetail: (interference.detail ?? '').slice(0, 300) };
       if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
     } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
     // Landing can also be initiated by the host after the child gate; judge the checked PR here too.

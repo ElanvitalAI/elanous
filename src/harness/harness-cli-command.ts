@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
@@ -10,6 +10,7 @@ import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
 import { normalizeRunId } from './harness-space.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { lookupGoal, type GoalLookupOptions, type GoalLookupResult } from '../self-implement/goal-lookup.js';
 import { archiveGoals, type GoalArchiveOptions } from '../self-implement/goal-archive.js';
 import { detectBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
@@ -23,13 +24,15 @@ import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
-import { collectDraftMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
+import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
+import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
 import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
+import { ghAutomationEnv } from '../autopilot/pr-manager.js';
 import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, decideLaunchBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
@@ -1589,6 +1592,28 @@ function readProcessCwd(pid: number): Pick<HarnessProcessRecord, 'cwd' | 'cwdSta
   }
 }
 
+/** One `lsof` for many pids (a per-pid lsof costs ~0.1–0.3 s); lsof exits 1 when some pid is gone yet prints the rest. */
+function batchProcessCwdReader(pids: readonly number[]): (pid: number) => Pick<HarnessProcessRecord, 'cwd' | 'cwdStatus' | 'cwdFailureReason'> {
+  const cwds = new Map<number, string>();
+  let failure: string | undefined;
+  if (pids.length) {
+    const result = spawnSync('lsof', ['-a', '-d', 'cwd', '-Fpn', '-p', pids.join(',')],
+      { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (result.error || typeof result.stdout !== 'string') failure = observationFailureReason(result.error ?? new Error('lsof output missing'));
+    else {
+      let current: number | undefined;
+      for (const line of result.stdout.split('\n')) {
+        if (line.startsWith('p')) current = Number(line.slice(1));
+        else if (line.startsWith('n') && current !== undefined && line.length > 1) cwds.set(current, line.slice(1).trim());
+      }
+    }
+  }
+  return (pid) => {
+    const cwd = cwds.get(pid);
+    return cwd ? { cwd, cwdStatus: 'observed' } : { cwdStatus: 'unknown', cwdFailureReason: failure ?? 'lsof cwd missing' };
+  };
+}
+
 const OWNERSHIP_ENV_KEYS = new Set<string>(Object.values(HARNESS_PROCESS_OWNERSHIP_ENV));
 
 function ownershipValueFromEntry(entry: string, key: string): string | undefined {
@@ -1744,10 +1769,23 @@ export function readProcessOwnership(
   }
 }
 
-export function defaultListHarnessProcesses(): HarnessProcessListObservation {
+/** Narrows the per-process reads (`lsof` cwd ≈ 0.1 s each · `ps eww`) of `defaultListHarnessProcesses`. */
+export interface HarnessProcessListOptions {
+  /** Keep only matching records; the others are dropped before any per-process read. */
+  readonly include?: (record: HarnessProcessRecord) => boolean;
+  /** Skip the ownership (`ps eww`) read — for callers that only need the cwd. */
+  readonly cwdOnly?: boolean;
+  /** Wall-clock budget for the per-process reads; records past it keep `cwdStatus: 'unknown'` (reason names the budget). */
+  readonly deadlineMs?: number;
+  readonly readCwd?: (pid: number) => Pick<HarnessProcessRecord, 'cwd' | 'cwdStatus' | 'cwdFailureReason'>;
+  readonly psOutput?: () => string;
+  readonly clock?: () => number;
+}
+
+export function defaultListHarnessProcesses(options: HarnessProcessListOptions = {}): HarnessProcessListObservation {
   let out: string;
   try {
-    out = execFileSync('ps', ['-axo', 'pid=,ppid=,pcpu=,etime=,command='], {
+    out = options.psOutput ? options.psOutput() : execFileSync('ps', ['-axo', 'pid=,ppid=,pcpu=,etime=,command='], {
       encoding: 'utf8',
       timeout: 5_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -1757,11 +1795,21 @@ export function defaultListHarnessProcesses(): HarnessProcessListObservation {
   }
   const parsed = parseHarnessProcessPsOutput(out);
   if (parsed.status === 'failed') return parsed;
-  const records = parsed.records.map((record) => ({
-    ...record,
-    ...readProcessCwd(record.pid),
-    ownership: readProcessOwnership(record.pid),
-  }));
+  const clock = options.clock ?? Date.now;
+  const selected = options.include ? parsed.records.filter(options.include) : parsed.records;
+  const readCwd = options.readCwd ?? (options.cwdOnly ? batchProcessCwdReader(selected.map((record) => record.pid)) : readProcessCwd);
+  const deadline = options.deadlineMs === undefined ? Infinity : clock() + options.deadlineMs;
+  const records = selected.map((record) => {
+    // A host with hundreds of harness processes made the serial reads take minutes (10-08 queue tick hang).
+    if (clock() >= deadline) {
+      return { ...record, cwdStatus: 'unknown' as const, cwdFailureReason: `observation deadline ${options.deadlineMs}ms exceeded` };
+    }
+    return {
+      ...record,
+      ...readCwd(record.pid),
+      ...(options.cwdOnly ? {} : { ownership: readProcessOwnership(record.pid) }),
+    };
+  });
   if (parsed.status === 'incomplete') {
     return {
       status: 'incomplete',
@@ -1877,12 +1925,30 @@ type GithubPull = {
 
 type GhExecute = (args: string[]) => string;
 
-// ⛔ `env: process.env` is required: Bun resolves the executable against the PATH it started with, not the one
-//    ensure-bin-path augments. Under cron's minimal PATH the hourly sweep died with «Executable not found: gh» (2026-09-28).
-const executeGh: GhExecute = (args) => execFileSync('gh', args, {
-  encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
-  stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
-});
+// Explicit env preserves the augmented PATH under Bun (cron may start with a minimal PATH).
+// Authentication comes from the same automation policy used by the PR manager, not the user's keyring.
+// Failure details are bounded and redact the token before reaching the sweep result or debug log.
+function ghFailure(args: string[], error: unknown, token: string | undefined): Error {
+  const failure = error as { status?: number | null; code?: number | string; stderr?: string | Buffer };
+  const exit = failure.status ?? (typeof failure.code === 'number' ? failure.code : 'unknown');
+  const stderr = String(failure.stderr ?? '');
+  const stderrTail = (token ? stderr.replaceAll(token, '[REDACTED]') : stderr).slice(-300).replace(/[\r\n]+/g, ' ').trim();
+  try { debug.log('harness.drafts', 'gh-failed', { args0: args[0], exit, stderrTail }); }
+  catch { /* Logging must not hide the gh failure. */ }
+  // gh never ran (e.g. «Executable not found: gh»): no exit or stderr to report, so keep the spawn error itself.
+  if (typeof failure.status !== 'number' && !stderrTail && error instanceof Error) return error;
+  return new Error(`gh ${args.slice(0, 2).join(' ')} exit=${exit}: ${stderrTail}`);
+}
+
+const executeGh: GhExecute = (args) => {
+  const env = ghAutomationEnv(process.env);
+  try {
+    return execFileSync('gh', args, {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'], env,
+    });
+  } catch (error) { throw ghFailure(args, error, env.GH_TOKEN); }
+};
 
 /** Merge-time adapter: reuse the sweep's GitHub inventory and worktree liveness without a second triage implementation. */
 export async function supersedeMergedGoalDrafts(
@@ -1986,9 +2052,14 @@ function deliverResyncMemo(spaceId: string, memo: ControlMemoPayload,
 }
 
 const execFileAsync = promisify(execFile);
-const executeGhAsync = async (args: string[]): Promise<string> => (await execFileAsync('gh', args, {
-  encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, env: process.env,
-})).stdout;
+const executeGhAsync = async (args: string[]): Promise<string> => {
+  const env = ghAutomationEnv(process.env);
+  try {
+    return (await execFileAsync('gh', args, {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, env,
+    })).stdout;
+  } catch (error) { throw ghFailure(args, error, env.GH_TOKEN); }
+};
 
 /** RUN-TTL adapters: open self-impl PRs, head commit time (async, bounded by the core), owning run, memo, label. */
 export async function githubRunTtlAdapters(repository: string, execute: GhExecute = executeGh,
@@ -2467,12 +2538,16 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
 
 export interface HarnessDraftSweepDeps {
   readonly adapters?: DraftSweepAdapters;
+  /** Optional overlap source injection; tests do not read GitHub or logs.db. */
+  readonly overlapAdapters?: OverlapMetricAdapters;
   readonly repository?: () => string;
   readonly write?: (line: string) => void;
   readonly execute?: GhExecute;
   readonly now?: () => Date;
   /** RUN-TTL step adapters. Omitted with injected `adapters` ⇒ the step is skipped (fakes never reach real gh). */
   readonly runTtl?: RunTtlAdapters;
+  /** Test seam for `tools.selfImplement.draftSweepCloseCap`; omitted ⇒ the user config. */
+  readonly closeCapConfig?: () => unknown;
 }
 
 /** RUN-TTL step inside the draft sweep — fail-soft: its failure never changes the sweep verdict. */
@@ -2566,10 +2641,22 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
         const repository = resolveRepositoryName({ repo: opts.repo ?? deps.repository?.(), executeGh: (args) => execute(args) });
         if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
         const started = Date.now();
-        const metrics = await collectDraftMetrics(repository, deps.adapters ?? githubDraftSweepAdapters(deps.execute), deps.now?.() ?? new Date());
+        const adapters = deps.adapters ?? githubDraftSweepAdapters(deps.execute);
+        const now = deps.now?.() ?? new Date();
+        const metrics = await collectDraftMetrics(repository, adapters, now);
+        let overlap: Awaited<ReturnType<typeof collectOverlapMetrics>> | null = null;
+        try {
+          overlap = await collectOverlapMetrics(repository, deps.overlapAdapters ?? {
+            ...adapters,
+            listPreflightRows: readAskPreflightRowsSince,
+            listSalvagedRows: readSalvagedRowsSince,
+          }, now);
+        } catch (error) {
+          try { debug.log('self-dev.draft-metrics', 'overlap-failed', { repository, reason: sweepFailureReason(error) }); } catch { /* fail-soft */ }
+        }
         try { debug.log('self-dev.draft-metrics', 'collected', { repository, ms: Date.now() - started, ...metrics }); } catch { /* fail-soft */ }
         const write = deps.write ?? console.log;
-        if (opts.json) write(JSON.stringify({ repository, ...metrics }));
+        if (opts.json) write(JSON.stringify({ repository, ...metrics, overlap }));
         else write(`draft 재고 ${metrics.inventory} · 최장 나이 ${metrics.oldestAgeHours === null ? '해당 없음' : `${metrics.oldestAgeHours.toFixed(1)}h`} · needs-owner ${metrics.needsOwner} · 48h 전환율 ${metrics.conversion48h === null ? '표본 없음' : `${(metrics.conversion48h * 100).toFixed(1)}% (${metrics.converted48h}/${metrics.cohort48h})`}`);
       } catch (error) {
         console.error(humanErrorLine(error));
@@ -2580,7 +2667,8 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
     .option('--apply', '판정한 라벨 변경과 종료를 적용')
     .option('--json', '판정 결과를 JSON 으로 출력')
     .option('--repo <owner/name>', '조회할 GitHub 저장소')
-    .action(async (opts: { apply?: boolean; json?: boolean; repo?: string }) => {
+    .option('--close-cap <n>', '이번 틱 최대 종료 수 (1~100 · config tools.selfImplement.draftSweepCloseCap 보다 우선 · 기본 10)')
+    .action(async (opts: { apply?: boolean; json?: boolean; repo?: string; closeCap?: string }) => {
       try {
         const write = deps.write ?? console.log;
         const execute = deps.execute ?? executeGh;
@@ -2593,7 +2681,16 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
         }
         // One adapter instance per sweep: its open listing and ledger scan are shared with the RUN-TTL step.
         const github = deps.adapters ? undefined : githubDraftSweepAdapters(deps.execute);
-        const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? github! });
+        const configCap = deps.closeCapConfig
+          ? deps.closeCapConfig()
+          : (() => { try { return getUserConfig().tools?.selfImplement?.draftSweepCloseCap; } catch { return undefined; } })();
+        const cap = resolveDraftSweepCloseCap({ flag: opts.closeCap, config: configCap });
+        for (const warning of cap.warnings) {
+          console.error(`⚠ ${warning}`);
+          try { debug.log('self-dev.draft-sweep', 'close-cap-rejected', { warning, closeCap: cap.closeCap, closeCapSource: cap.closeCapSource }); } catch { /* fail-soft */ }
+        }
+        const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? github!,
+          closeCap: cap.closeCap, closeCapSource: cap.closeCapSource });
         const reason = result.error ? sweepFailureReason(result.error) : undefined;
         const ttlStarted = Date.now();
         const runTtl = await draftSweepRunTtl(repository, deps, github);
@@ -2944,7 +3041,8 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
       harnessQueueReceiptPath(root, item.launchId!), queueDeps.launchCommand ?? join(import.meta.dir, '../../bin/elanous.mjs'),
       ...(resolve(root) === prodInstanceRoot() ? [] : [`--test=${root}`]), ...args], {
       cwd: item.launchCwd ?? resolve(import.meta.dir, '../..'), stdio: 'inherit',
-      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_HARNESS_SEAT: item.seat,
+      env: { ...process.env, ELANOUS_STATE_DIR: root,
+        ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root), ELANOUS_HARNESS_SEAT: item.seat,
         ELANOUS_HARNESS_QUEUE_LAUNCH: item.launchId! },
     });
     // Capture the end at spawn time: a child that already closed (or died by a signal) must not leave the parent waiting.

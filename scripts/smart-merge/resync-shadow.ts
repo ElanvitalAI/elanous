@@ -8,7 +8,6 @@ import {
   defaultGitMergeSeam, defaultLlmResolve, mergeMainWithLlmResolve,
   type MergeGitSeam,
 } from '../../src/autopilot/build/llm-conflict-merge.js';
-import { NEXT_MD_PATH } from '../../src/release-loop/next-md-merge.js';
 
 type Command = (cwd: string, program: 'git' | 'gh', args: readonly string[]) => { status: number; stdout: string; stderr: string };
 export type ShadowOutcome = 'clean' | 'resolved-deterministic' | 'resolved-llm' | 'unresolved' | 'unmeasured';
@@ -108,9 +107,12 @@ export async function runResyncShadow(options: ShadowOptions): Promise<ShadowRow
       const result = await mergeMainWithLlmResolve(temp, 'origin/main',
         options.resolve ?? ((file, conflicted) => defaultLlmResolve(file, conflicted, 'origin/main', { worktreePath: temp })), observedGit);
       if (result.status === 'merged' || result.status === 'up-to-date') outcome = 'clean';
-      else if (result.status === 'llm-resolved') {
+      else if (result.status === 'deterministic-resolved') {
         files = result.resolvedFiles ?? files;
-        outcome = files.length > 0 && files.every((file) => file === NEXT_MD_PATH) ? 'resolved-deterministic' : 'resolved-llm';
+        outcome = 'resolved-deterministic';
+      } else if (result.status === 'llm-resolved') {
+        files = result.resolvedFiles ?? files;
+        outcome = 'resolved-llm';
       } else if (result.status === 'conflict-unresolved') outcome = 'unresolved';
       // A git error is a measurement failure, not evidence of an unresolvable conflict.
     } catch {

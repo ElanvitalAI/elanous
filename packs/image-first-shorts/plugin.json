@@ -1,0 +1,38 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "image-first-shorts",
+  "version": "0.1.0",
+  "description": "Make an image-first vertical anime/character short: first-frame images, image-to-video with a swappable backend, chroma-key matting, beat-measured sound, code-rendered effects and a final composite, with three human approval gates. Source: 공냥이 AI 실험실 (https://malfoy-meme-making.vercel.app/).",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "attribution": "Adapted with permission from 공냥이 AI 실험실 («악역영애 말포이» AI 영상 제작 키트) — https://malfoy-meme-making.vercel.app/ · wiring https://malfoy-meme-making.vercel.app/wiring/index.html · download https://malfoy-meme-making.vercel.app/index.html#download — permission 2026-10-08, attribution required. See SOURCE.md.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/image-first-shorts.yaml"],
+      "capabilities": ["fs:workdir", "proc:bun", "proc:elanous", "proc:bash", "proc:python3", "proc:ffmpeg", "proc:ffprobe", "proc:higgsfield", "agent:codex", "net:api.elevenlabs.io", "net:github.com", "net:huggingface.co", "secret:elevenlabs"],
+      "connectors": [
+        {
+          "id": "elevenlabs",
+          "kind": "api-key",
+          "userConfig": [
+            {
+              "key": "ELEVENLABS_API_KEY",
+              "label": "ElevenLabs API key (music, voice lines)",
+              "secret": true,
+              "env": "ELEVENLABS_API_KEY"
+            }
+          ]
+        }
+      ],
+      "requires": {
+        "tools": ["bun", "python3", "ffmpeg", "ffprobe", "codex"],
+        "optionalTools": ["higgsfield"],
+        "optionalPython": ["numpy", "opencv-python", "pillow", "rembg", "onnxruntime", "librosa", "faster-whisper"]
+      },
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

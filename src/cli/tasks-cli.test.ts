@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
@@ -42,6 +43,112 @@ async function run(args: string[], deps: TasksCliDeps): Promise<{ lines: string[
     return { lines, code: process.exitCode };
   } finally { process.exitCode = previous ?? 0; }
 }
+
+test('tasks cover --json reads two filtered log sources and measures land without inventing other denominators', async () => {
+  const queries: Array<{ exactCategories?: string[]; events?: string[]; sinceMs?: number; untilMs?: number }> = [];
+  const since = '2026-10-01T00:00:00Z';
+  const until = '2026-10-08T00:00:00Z';
+  const result = await run(['tasks', 'cover', '--since', since, '--until', until, '--json'], {
+    coverLogs: (query) => {
+      queries.push(query);
+      const payloads = query.exactCategories?.[0] === 'task-agent'
+        ? [{ kind: 'land', result: 'done' }, { kind: 'review', result: 'done' }, { kind: 'review', result: 'done' }, { kind: 'land', result: 'failed' }]
+        : [...Array.from({ length: 4 }, () => ({ step: 'merge', ok: true })), { step: 'merge', ok: false }];
+      return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as LogStoreRow);
+    },
+  });
+  expect(result.code ?? 0).toBe(0);
+  expect(queries.map((query) => [query.exactCategories, query.events, query.sinceMs, query.untilMs])).toEqual([
+    [['task-agent'], ['action'], Date.parse(since), Date.parse(until)],
+    [['pr.land'], ['step'], Date.parse(since), Date.parse(until)],
+  ]);
+  expect(JSON.parse(result.lines[0]!).rows).toContainEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 2, ratio: 0.25, state: 'measured', liveActions: 2, shadowActions: 0, stewardTransition: 'observed' });
+  expect(JSON.parse(result.lines[0]!).rows[1]).toEqual({ verb: 'review', byTaskAgent: 2, total: null, observedActions: 2, ratio: null, state: 'no-denominator', liveActions: 2, shadowActions: 0, stewardTransition: 'unmeasured' });
+});
+
+test('tasks cover --lines uses the one-line formatter on the read-only observation path', async () => {
+  const queries: string[] = [];
+  const result = await run(['tasks', 'cover', '--lines'], { coverLogs: (query) => {
+    queries.push(query.exactCategories![0]!);
+    const data = query.exactCategories?.[0] === 'task-agent'
+      ? [{ kind: 'land', result: 'done' }, { kind: 'land', result: 'shadow' }, { kind: 'review', result: 'shadow' }]
+      : [{ step: 'merge', ok: true }, { step: 'merge', ok: true }];
+    return data.map((item) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(item) }) as LogStoreRow);
+  } });
+  expect(result.code ?? 0).toBe(0);
+  expect(queries).toEqual(['task-agent', 'pr.land']);
+  expect(result.lines).toEqual([
+    'land: TA 1/2 (50.0%) · live 1 · shadow 1 · steward-transition observed',
+    'review: TA 0/- (-) · live 0 · shadow 1 · steward-transition unmeasured',
+    'retry: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
+    'green: TA 0/- (-) · live 0 · shadow 0 · steward-transition unmeasured',
+  ]);
+});
+
+test('tasks cover reports unreadable sources and rejects an inverted window without querying', async () => {
+  const result = await run(['tasks', 'cover'], { coverLogs: (query) => {
+    if (query.exactCategories?.[0] === 'pr.land') throw new Error('unavailable');
+    return [];
+  } });
+  expect(result.lines).toContain('land\t0\t-\t-\tunreadable\t0');
+  const unknown = await run(['tasks', 'cover'], { coverLogs: (query) => {
+    if (query.exactCategories?.[0] === 'task-agent') throw new Error('unavailable');
+    return [];
+  } });
+  expect(unknown.lines).toContain('land\t-\t0\t-\tunreadable\t-');
+  expect(unknown.lines).toContain('review\t-\t-\t-\tunreadable\t-');
+  const unknownJson = await run(['tasks', 'cover', '--json'], { coverLogs: (query) => {
+    if (query.exactCategories?.[0] === 'task-agent') throw new Error('unavailable');
+    return [];
+  } });
+  expect(JSON.parse(unknownJson.lines[0]!).rows[0]).toMatchObject({ byTaskAgent: null, observedActions: null, state: 'unreadable' });
+  expect(result.lines[0]).toBe('동사\t대신\t전체\t비율\t상태\t관측 사건');
+  let calls = 0;
+  const invalid = await run(['tasks', 'cover', '--since', '2026-10-09T00:00:00Z', '--until', '2026-10-08T00:00:00Z'], {
+    coverLogs: () => { calls++; return []; },
+  });
+  expect(invalid.code).toBe(1);
+  expect(calls).toBe(0);
+});
+
+test('tasks cover --json keeps a single JSON result and declares when a source reaches its query bound', async () => {
+  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'review', result: 'done' }) } as LogStoreRow;
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => query.exactCategories?.[0] === 'task-agent' ? Array(100_000).fill(action) : [],
+  });
+  expect(result.lines).toHaveLength(1);
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.limitReached).toBe(true);
+  expect(body.warning).toContain('상한 100000 도달');
+  expect(body.rows[0]).toMatchObject({ verb: 'land', state: 'unreadable', ratio: null });
+  expect(body.rows[1]).toMatchObject({ verb: 'review', byTaskAgent: null, total: null, observedActions: null, state: 'unreadable' });
+});
+
+test('tasks cover marks land unknown when a bounded merge query has successful merges', async () => {
+  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as LogStoreRow;
+  const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => query.exactCategories?.[0] === 'task-agent' ? [action] : Array(100_000).fill(merge),
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.limitReached).toBe(true);
+  expect(body.rows[0]).toMatchObject({ verb: 'land', byTaskAgent: 1, total: null, ratio: null, state: 'unreadable' });
+});
+
+test('tasks cover --json takes a federated read and says how many stores it could not read', async () => {
+  const action = { category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as LogStoreRow;
+  const merge = { category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as LogStoreRow;
+  const result = await run(['tasks', 'cover', '--json'], {
+    coverLogs: (query) => ({
+      rows: query.exactCategories?.[0] === 'task-agent' ? [action] : [merge, merge, merge, merge],
+      limitReached: false, unreadableStores: 2, storesRead: 5,
+    }),
+  });
+  const body = JSON.parse(result.lines[0]!);
+  expect(body.rows[0]).toEqual({ verb: 'land', byTaskAgent: 1, total: 4, observedActions: 1, ratio: 0.25, state: 'measured', liveActions: 1, shadowActions: 0, stewardTransition: 'observed' });
+  expect(body.unreadableStores).toBe(2);
+  expect(body.storeWarning).toContain('2개를 못 읽었다');
+});
 
 test('task hand requires project id and target together', async () => {
   const result = await run(['task', 'hand', '보고서', '--project', 'p1'], { registerSink: async () => true });
@@ -161,7 +268,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['list', 'hand', 'board', 'advance', 'show', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'parents', 'board', 'advance', 'show', 'approve']);
 });
 
 test('an isolated universe without an acp-token still lists — no Authorization header is sent', async () => {

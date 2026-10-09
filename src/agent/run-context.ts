@@ -54,6 +54,8 @@ export interface ChildLlmSelection {
   effort?: ChildLlmEffort;
   /** 선택이 CLI 플래그에서 왔나, self-dev 설정에서 왔나. 같은 모델이라도 다른 사실이다. */
   source: 'flag' | 'config';
+  /** Grok weekly cap rerouted this run to Codex: allow prepaid credits even when subscription quota is exhausted. */
+  codexQuotaPolicy?: 'credits';
 }
 
 /** ⭐⭐ **가르는 축은 「키냐 주소냐」가 «아니라» 「그 자격이 «파일»에 사나 «env»에 사나」다**
@@ -91,6 +93,8 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
     return {
       ELANOUS_LLM_PROVIDER: provider,
       ELANOUS_LLM_MODEL: childRelayModel(provider, selection.model),
+      ...(selection.codexQuotaPolicy === 'credits' && provider === 'openai-codex'
+        ? { ELANOUS_CODEX_QUOTA_POLICY: 'credits' } : {}),
       // ⛔⭐ 새 env 이름을 «짓지 않는다» — `ELANOUS_ESCALATE_EFFORT` 가 «이미» 있고
       //    `user-config.ts` 가 그것으로 `reasoningLevel`(anthropic)과
       //    `codexReasoning.effort`(openai-codex/sol) 를 ***둘 다*** 덮는다.

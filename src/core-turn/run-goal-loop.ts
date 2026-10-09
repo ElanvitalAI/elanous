@@ -180,6 +180,7 @@ export const GOAL_CONTINUATION_PROMPT = [
   '[continue]',
   '아직 목표가 완료로 증명되지 않았다. 완료를 미리 선언하지 말고, 현재 상태 대비 실제로 검증하라:',
   '남은 요구사항을 식별하고, 다음 최고가치 스텝을 지금 도구로 실행하라.',
+  '이미 사용자에게 한 답을 다시 쓰지 마라 — 새 사실이 없으면 텍스트 없이 update_goal 만 호출하라.',
   // evidence-audit(ref codex ext/goal continuation.md:41,51) — 스푸핑·조기완료 차단.
   '완료 증거로 의도/부분진전/이전 작업 기억/그럴듯한 답을 쓰지 마라. 현재 상태(파일·명령출력·테스트결과·PR·런타임 동작)를 실제로 확인한 증거만 인정한다.',
   '예산이 곧 소진된다거나 그만두고 싶다는 이유로 완료를 선언하지 마라.',
@@ -196,6 +197,7 @@ export const GOAL_READBACK_PROMPT = [
   '[finalize]',
   `완료를 텍스트로만 말했다. 텍스트 문장은 완료 신호가 아니다 — 완료가 사실이면 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" 로 호출하고 evidence 에 현재 상태에서 실제로 확인한 증거(파일·명령출력·테스트·PR)를 적어라.`,
   '아직 미충족 항목이 있으면 완료를 주장하지 말고 다음 스텝을 지금 실행하라.',
+  '이미 사용자에게 한 답을 다시 쓰지 마라 — 새 사실이 없으면 텍스트 없이 update_goal 만 호출하라.',
 ].join('\n');
 
 /** evidence 누락 complete 재주입 — update_goal(complete) 를 호출했으나 evidence 가 비었을 때. */
@@ -689,6 +691,7 @@ export async function runGoalLoop(
       },
     };
 
+    const previousFinalText = lastResult.finalText;
     try {
       lastResult = await runTurn(turnCtx);
     } finally {
@@ -786,8 +789,26 @@ export async function runGoalLoop(
         debug.log('goal.loop', 'complete', {
           sessionId: ctx.sessionId, ...runAttribution, iterations, via: 'update_goal', evidenceCheck,
         }, { level: 'info' });
+        const normalizeAnswer = (text: string) => text.trim().replace(/\s+/g, ' ');
+        const previousAnswer = normalizeAnswer(previousFinalText);
+        const completionAnswer = normalizeAnswer(lastResult.finalText);
+        const previousAt = previousAnswer ? completionAnswer.indexOf(previousAnswer) : -1;
+        const prefix = previousAt >= 0 ? completionAnswer.slice(0, previousAt).trim() : '';
+        const suffix = previousAt >= 0 ? completionAnswer.slice(previousAt + previousAnswer.length).trim() : '';
+        // Only a readback preface is non-factual; a new sentence before the old answer
+        // (including one joined by a colon) must survive just like a new suffix.
+        const readbackPreface = /^(?:확인 결과|(?:방금\s+)?다시\s+확인(?:했습니다|했지만|해보니|해 보니|해봤지만|해 봤지만|했으나|했는데))[\s:：,.!?。！？-]*$/u;
+        const hasNewFact = (prefix.length > 0 && !readbackPreface.test(prefix)) || /\p{L}|\p{N}/u.test(suffix);
+        const duplicateAnswer = previousAnswer.length > 0 && (
+          completionAnswer.length === 0 || (previousAt >= 0 && !hasNewFact)
+        );
+        if (duplicateAnswer) {
+          debug.log('goal.loop', 'complete-duplicate-answer-suppressed', {
+            sessionId: ctx.sessionId, ...runAttribution, iterations, chars: lastResult.finalText.length,
+          });
+        }
         return finish(
-          { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+          { finalText: duplicateAnswer ? previousFinalText : lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
           { summary: completionSummary, changedFiles: completionChangedFiles },
         );
       }

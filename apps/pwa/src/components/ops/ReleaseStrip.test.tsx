@@ -21,6 +21,7 @@ test('가장 최근 startedAt 런의 판·현재 노드·순번·경과를 표�
   expect(latestReleaseRun(ready([run, old]), now)?.runId).toBe('recent');
   const markup = html([old, run]);
   expect(markup).toContain('발행 0.2.9');
+  expect(markup).not.toContain('data-run-id');
   expect(markup).toContain('publish (2/3)');
   expect(markup).toContain('경과 8분');
   expect(markup.indexOf('✓ gate')).toBeLessThan(markup.indexOf('publish</span>'));
@@ -32,6 +33,7 @@ test('가장 최근 startedAt 런의 판·현재 노드·순번·경과를 표�
 test('선택된 런이 있으면 최신 자동 런보다 우선해 동일한 런의 노드와 상태를 보인다', () => {
   const older = { ...run, runId: 'older', version: '0.2.8', status: 'done', startedAt: '2026-10-06T10:00:00Z', path: ['older-node'], nodes: [{ nodeId: 'older-node', ok: true, summary: '완료' }] };
   const markup = renderToStaticMarkup(<ReleaseStrip result={ready([run, older])} selectedRun={older} onSelect={() => {}} now={now} />);
+  expect(markup).toContain('data-run-id="older"');
   expect(markup).toContain('발행 0.2.8');
   expect(markup).toContain('✓ older-node');
   expect(markup).toContain('끝남');
@@ -95,13 +97,16 @@ test('RELEASE-STRIP-DONE: 끝난 런은 «끝남 · 걸린 시간 X분»(마지�
   const nodes = [
     { nodeId: 'gate', ok: true, summary: '통과', startedAt: '2026-10-06T01:00:00Z', endedAt: '2026-10-06T01:20:00Z' },
     { nodeId: 'npm-publish', ok: false, summary: '시간초과', startedAt: '2026-10-06T01:20:00Z', endedAt: '2026-10-06T01:47:30Z' },
+    { nodeId: 'unrelated-run', ok: true, summary: '다른 런의 노드', endedAt: '2026-10-06T11:59:00Z' },
   ];
   for (const status of ['done', 'failed', 'completed']) {
     const finished = { ...run, status, version: '0.2.19', startedAt: '2026-10-06T01:00:00Z', path: ['gate', 'npm-publish', 'announce'], nodes };
     const at = (t: number) => renderToStaticMarkup(<ReleaseStrip result={ready([])} selectedRun={finished} onSelect={() => {}} now={t} />);
     const markup = at(now);
     expect(markup).toContain('발행 0.2.19');
-    expect(markup).toContain('· 끝남 · 걸린 시간 47분');
+    expect(markup).toContain('<span class="shrink-0 whitespace-nowrap">· 끝남 · 걸린 시간 47분</span>');
+    expect(markup).toContain('✓ gate');
+    expect(markup).toContain('✗ npm-publish');
     expect(markup).not.toContain('경과');
     expect(markup).not.toContain('(2/3)');
     expect(markup).not.toContain('aria-current');

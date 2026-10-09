@@ -55,6 +55,8 @@ export interface SelfImplementDisposition {
   prNumber?: number;
   /** Head SHA checked by the Pod before host regate. */
   checkedHeadCommit?: string;
+  /** Review verdict only when the child bound a real pass to a clean, unchanged worktree head. */
+  selfReview?: { verdict: 'pass'; head: string };
   hostRegate?: { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string };
   merged?: boolean;
   detail?: string;
@@ -469,6 +471,11 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
         ...(typeof o.prUrl === 'string' ? { prUrl: o.prUrl } : {}),
         ...(typeof o.prNumber === 'number' ? { prNumber: o.prNumber } : {}),
         ...(typeof o.checkedHeadCommit === 'string' ? { checkedHeadCommit: o.checkedHeadCommit } : {}),
+        ...(o.reviewedHeadCommit && typeof o.reviewedHeadCommit === 'string' && /^[0-9a-f]{40}$/i.test(o.reviewedHeadCommit)
+          && o.review && typeof o.review === 'object' && !Array.isArray(o.review)
+          && (o.review as { reviewed?: unknown; verdict?: unknown }).reviewed === true
+          && (o.review as { verdict?: unknown }).verdict === 'pass'
+          ? { selfReview: { verdict: 'pass' as const, head: o.reviewedHeadCommit } } : {}),
         ...(typeof o.hostRegate === 'object' && o.hostRegate !== null ? { hostRegate: o.hostRegate as SelfImplementDisposition['hostRegate'] } : {}),
         ...(typeof o.merged === 'boolean' ? { merged: o.merged } : {}),
         ...(typeof o.detail === 'string' ? { detail: o.detail } : {}),

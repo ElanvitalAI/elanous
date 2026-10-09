@@ -1,6 +1,6 @@
 import { setDefaultTimeout, expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
-import { PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
+import { _usesAdaptiveThinkingForContractTest, AnthropicProvider, PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
 
 async function observeDone(run: () => Promise<unknown>) {
   const done: Record<string, unknown>[] = [];
@@ -163,11 +163,43 @@ test('streamLLMWithTools preserves compatible provider/model pairs before stream
   }
 });
 
+test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', async () => {
+  const originalKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = 'test-key';
+  const sent: { model: string; beta: string | null }[] = [];
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (_input, init) => {
+    const headers = new Headers(init?.headers);
+    sent.push({ model: JSON.parse(String(init?.body)).model, beta: headers.get('anthropic-beta') });
+    return new Response('data: {"type":"message_stop"}\n\n', { status: 200 });
+  }) as typeof fetch);
+  try {
+    for await (const _event of AnthropicProvider.streamChat!([{ role: 'user', content: 'hi' }], {
+      model: 'claude-sonnet-5-5', promptCache: false,
+    })) { /* consume the response */ }
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.model).toBe('claude-sonnet-5-5');
+    expect(sent[0]?.beta?.split(',')).toContain('interleaved-thinking-2025-05-14');
+  } finally {
+    fetchSpy.mockRestore();
+    if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = originalKey;
+  }
+});
+
 // 🩸 2026-09-25 — 도구 루프 조립부가 reasoning 꺼진 adaptive 모델(claude-sonnet-5)에 temperature 를 보내 400.
 import { anthropicTemperatureField } from './llm.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+test('adaptive thinking contract stays on 4.7+ and 5.x, not legacy 3.7/4.5', () => {
+  for (const model of ['claude-opus-5', 'claude-sonnet-5-5', 'claude-opus-4-7']) {
+    expect(_usesAdaptiveThinkingForContractTest(model)).toBe(true);
+  }
+  for (const model of ['claude-3-7-sonnet', 'claude-sonnet-4-5-20250929', 'claude-3-5-haiku']) {
+    expect(_usesAdaptiveThinkingForContractTest(model)).toBe(false);
+  }
+});
 
 test('anthropic temperature field: adaptive models never get temperature, even with thinking off', () => {
   expect(anthropicTemperatureField('claude-sonnet-5', false, undefined)).toEqual({});

@@ -62,6 +62,9 @@ import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQ
 export { branchLineageSlug, findSiblingPrs };
 
 export interface PrLandOpts {
+  /** Pin an existing PR and its reviewed head; both must be supplied together. */
+  pr?: string;
+  expectedHead?: string;
   base?: string;
   cwd?: string;
   dryRun?: boolean;
@@ -1180,10 +1183,33 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
 
   const cwd = opts.cwd ?? process.cwd();
   const run = deps.run ?? defaultCmdRunner;
+  const pinned = opts.pr !== undefined || opts.expectedHead !== undefined;
+  let pinnedBranch: string | undefined;
+  let pinnedUrl: string | undefined;
+  if (pinned) {
+    const pr = Number(opts.pr);
+    if (!/^[1-9]\d*$/.test(opts.pr ?? '') || !Number.isSafeInteger(pr) || !/^[a-f0-9]{40}$/i.test(opts.expectedHead ?? '') || opts.hold || opts.dryRun) {
+      out.error('✗ expected-head: --pr and --expected-head (full SHA) are required together without --hold/--dry-run');
+      return 1;
+    }
+    const viewed = run('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,headRefName,state,isDraft,url'], { cwd });
+    let value: { headRefOid?: string; headRefName?: string; state?: string; isDraft?: boolean; url?: string } = {};
+    try { if (viewed.ok) value = JSON.parse(viewed.out) as typeof value; } catch { /* unreadable is not approval */ }
+    const local = run('git', ['rev-parse', 'HEAD'], { cwd });
+    const dirty = run('git', ['status', '--porcelain'], { cwd });
+    if (value.state !== 'OPEN' || value.isDraft !== false || value.headRefOid?.toLowerCase() !== opts.expectedHead!.toLowerCase()
+      || !value.url?.endsWith(`/pull/${pr}`) || !value.headRefName || !local.ok || local.out.trim().toLowerCase() !== opts.expectedHead!.toLowerCase()
+      || !dirty.ok || dirty.out.trim()) {
+      out.error('✗ expected-head: PR OPEN non-draft, matching local HEAD and clean worktree required');
+      return 1;
+    }
+    pinnedBranch = value.headRefName;
+    pinnedUrl = value.url;
+  }
   const resolveBase = deps.resolveBase ?? resolveDeliverableBase;
   const branch = (deps.currentBranch ?? liveCurrentBranch)(cwd);
-  if (!branch) {
-    const detail = '현재 브랜치를 해석하지 못했습니다.';
+  if (!branch || (pinned && branch !== pinnedBranch)) {
+    const detail = pinned ? 'PR head branch와 현재 브랜치가 다릅니다.' : '현재 브랜치를 해석하지 못했습니다.';
     record('branch', false);
     out.error(`✗ branch: ${detail}`);
     return 1;
@@ -1567,6 +1593,10 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     });
   }
   const hold = !!opts.hold || overlapDecision?.outcome === 'user-hold';
+  if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge') {
+    out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+    return 1;
+  }
 
   const manager = deps.manager ?? makePrManager(run);
   const existing = manager.findPrForBranchOutcome(branch, cwd);
@@ -1638,7 +1668,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
   }
 
-  const upsert = manager.upsertPr({
+  // A pinned, already-reviewed commit must not go through upsertPr (git add/commit/force-push/PR edit).
+  const upsert = pinned
+    ? existing.status === 'ok OUTPUT' && existing.url === pinnedUrl
+      ? { ok: true as const, url: pinnedUrl!, reused: true }
+      : { ok: false as const, reason: 'gh' as const, detail: 'pinned PR is not the branch open PR' }
+    : manager.upsertPr({
     branch,
     worktreePath: cwd,
     base,
@@ -1654,7 +1689,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     ...(excludingActiveRunFiles ? { excludePaths } : {}),
   });
   if (!upsert.ok) {
-    if (upsert.reason === 'noop' && excludingActiveRunFiles) {
+    if (upsert.reason === 'noop' && excludingActiveRunFiles && !pinned) {
       record('upsert-ready-noop', true, { excludePaths, detail: upsert.detail });
       out.log(`✓ upsert-ready: 제외 후 올릴 것이 없습니다 — ${upsert.detail}`);
       return 0;
@@ -1664,6 +1699,13 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 1;
   }
   record('upsert-ready', true);
+  if (pinned) {
+    const upsertHead = run('git', ['rev-parse', 'HEAD'], { cwd });
+    if (!upsert.reused || upsert.url !== pinnedUrl || !upsertHead.ok || upsertHead.out.trim().toLowerCase() !== opts.expectedHead!.toLowerCase()) {
+      out.error('✗ expected-head: pinned PR identity or reviewed HEAD changed');
+      return 1;
+    }
+  }
   out.log(`✓ upsert-ready: ${upsert.url}${upsert.reused ? ' (기존 PR)' : ' (새 PR)'}`);
 
   if (hold) {
@@ -1688,21 +1730,34 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     debug.log('harness.merge', 'frozen', { prUrl: upsert.url, reason: frozen.reason, until: frozen.until });
     record('freeze', true, { url: upsert.url, reason: frozen.reason, until: frozen.until });
     out.log(`✓ ready: ${upsert.url} — ${landingFreezeMessage(frozen)} · 병합 연기`);
-    return 0;
+    return pinned ? 1 : 0;
   }
   if (admission.kind === 'taken') {
     record('freeze', true, { url: upsert.url, resumedElsewhere: true });
     out.log(`✓ ready: ${upsert.url} — 동결이 막 풀려 보류 병합 재개가 이 PR 을 맡았습니다`);
-    return 0;
+    return pinned ? 1 : 0;
   }
   const landing = admission;
+  if (pinned) {
+    const view = run('gh', ['pr', 'view', String(opts.pr), '--json', 'headRefOid,state,isDraft'], { cwd });
+    let current: { headRefOid?: string; state?: string; isDraft?: boolean } = {};
+    try { if (view.ok) current = JSON.parse(view.out) as typeof current; } catch { /* fail closed */ }
+    const finalHead = run('git', ['rev-parse', 'HEAD'], { cwd });
+    if (current.headRefOid?.toLowerCase() !== opts.expectedHead!.toLowerCase() || current.state !== 'OPEN' || current.isDraft !== false
+      || !finalHead.ok || finalHead.out.trim().toLowerCase() !== opts.expectedHead!.toLowerCase()) {
+      landing.end(false);
+      out.error('✗ expected-head: PR head/state changed before merge');
+      return 1;
+    }
+  }
   let merged: ReturnType<typeof manager.mergePrOutcome>;
   try {
-  merged = manager.mergePrOutcome(upsert.url);
+  merged = manager.mergePrOutcome(upsert.url, pinned ? opts.expectedHead : undefined, pinned ? cwd : undefined);
   // `GIT-S14` — 병합이 «미완료(OPEN)»로 끝났고 GitHub 가 아직 `mergeable=UNKNOWN`(병합 가능 여부 계산 중)이면
   //   짧게 기다렸다 다시 병합한다. 표본 셋(08-25 · 09-24 🅢 #20233 등)이 모두 «같은 명령 재시도에 병합»이었다.
   //   ⛔ UNKNOWN 일 때만 재시도한다 — CONFLICTING 등 다른 값은 기다려도 안 풀린다(그대로 실패를 낸다).
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  // pinned 도 재시도한다 — mergePrOutcome 이 머리를 다시 확인하고 --match-head-commit 으로 병합하므로 바뀐 머리로는 안 들어간다.
   for (let attempt = 1; !merged.ok && merged.kind === 'not-merged' && merged.state === 'OPEN' && attempt <= PR_LAND_MERGEABLE_UNKNOWN_RETRIES; attempt += 1) {
     const mergeable = run('gh', ['pr', 'view', upsert.url, '--json', 'mergeable', '--jq', '.mergeable'], { cwd });
     const value = mergeable.ok ? mergeable.out.trim() : '';
@@ -1710,7 +1765,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     record('merge-retry', true, { attempt, mergeable: value, waitMs: PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS });
     out.log(`⏳ merge: mergeable=UNKNOWN — GitHub 가 병합 가능 여부를 아직 계산 중입니다 · ${PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS / 1000}초 뒤 다시 병합 (${attempt}/${PR_LAND_MERGEABLE_UNKNOWN_RETRIES})`);
     await sleep(PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS);
-    merged = manager.mergePrOutcome(upsert.url);
+    merged = manager.mergePrOutcome(upsert.url, pinned ? opts.expectedHead : undefined, pinned ? cwd : undefined);
   }
   } finally { landing.end(merged!?.ok === true); }
   if (!merged.ok) {
@@ -1781,6 +1836,8 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
     .description('현재 브랜치 PR을 생성 또는 갱신해 ready 상태로 만들고 squash merge')
     .option('--base <branch>', 'PR base branch')
     .option('--cwd <path>', '작업 트리 경로')
+    .option('--pr <number>', '기존 PR 번호 고정 (--expected-head 와 함께)')
+    .option('--expected-head <sha>', '리뷰된 PR 머리 SHA 고정 (--pr 와 함께)')
     .option('--dry-run', '변경 없이 landing 계획만 출력')
     .option('--hold', 'PR을 생성 또는 갱신한 뒤 병합하지 않고 쌓아 둔다')
     .option('--title <title>', 'PR title')

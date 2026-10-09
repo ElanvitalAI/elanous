@@ -986,7 +986,7 @@ export interface DefaultSeamsOptions {
   runAndroidUnitTestGate?: (io: { args: readonly string[]; cwd: string }) => number;
   runIosUnitTestGate?: (io: { args: readonly string[]; cwd: string }) => number;
   /** Source-policy gate adapter for focused seam tests. */
-  runHarnessPolicyGates?: typeof runHarnessPolicyGates;
+  runHarnessPolicyGates?: (input: Parameters<typeof runHarnessPolicyGates>[0]) => Awaited<ReturnType<typeof runHarnessPolicyGates>> | ReturnType<typeof runHarnessPolicyGates>;
   runExposeGate?: typeof runExposeGate;
   /** Dependency-wide validation adapter for focused seam tests. */
   runDependencyChangeGate?: typeof runDependencyChangeGate;
@@ -1020,6 +1020,8 @@ export interface DefaultSeamsOptions {
    *  agent-substrate·staged 하니스와 동일 엔진) 배선. 미주입 시 reviewDiff 미노출(gate 통과=바로 병합결정·
    *  리뷰 스킵). dev-harness 의 llmReview 와 동일 형태(streamLLM 래퍼). */
   llmReview?: (prompt: string) => Promise<string>;
+  /** Optional independent reviewer for reviewDiff only; other judgment calls retain llmReview. */
+  subscriptionReviewLLM?: (prompt: string) => Promise<string>;
   /**
    * 이 리뷰 심이 파일을 스스로 읽을 수 있나. **선택 선언** — 안 주면 reviewDiff 가 칸을 만들지 않고
    * 오케스트레이터 관측은 `'unknown'` 이다(`false` 와 같은 값으로 접지 않는다).
@@ -2073,7 +2075,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       //   tsc-깨짐(F1 refFacts 미정의)을 결정론 차단. 변경 전체(.ts·테스트 포함)를 tsc 로 검사(변경 경로만 카운트).
       const tc = changedFileTypecheck(cwd, changedAll);
       debug.log('self-implement', 'gate.tsc', { checked: tc.checked, passed: tc.passed, errors: tc.errors, exempted: tc.exempted, noInspectionReason: tc.noInspectionReason }, { level: tc.passed ? 'info' : 'warn' });
-      const policy = (o.runHarnessPolicyGates ?? runHarnessPolicyGates)({ cwd, changedFiles: changedAll });
+      const policy = await (o.runHarnessPolicyGates ?? runHarnessPolicyGates)({ cwd, changedFiles: changedAll });
       debug.log('self-implement', 'gate.policy', {
         passed: policy.passed, failures: policy.failures.map((failure) => failure.gate), skipped: policy.skipped,
       });
@@ -2530,7 +2532,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
               ...(ctx.round !== undefined ? { round: ctx.round } : {}),
             },
           } : {}),
-        }, o.llmReview!);
+        }, o.subscriptionReviewLLM ?? o.llmReview!);
         debug.log('self-implement', 'review.done', {
           verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length,
           gateEvidenceLines: evidenceNote?.split(/\r?\n/).length ?? 0,

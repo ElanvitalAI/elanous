@@ -40,6 +40,7 @@ async function mount(initial: string | null, exists = true, compact = false, met
   let projects = [{ id: 'p', name: '일', createdAt: '' }, { id: 'q', name: '개인', createdAt: '' }];
   const client = { fetchJson: async (path: string, init?: RequestInit) => {
     calls.push({ path, init });
+    if (path === '/v1/projects/folders') return { path: '/srv/work', parent: '/srv', folders: [] };
     if (path === '/v1/projects') {
       if (init?.method === 'POST') return { project: { id: 'new', name: '새 프로젝트', createdAt: '' } };
       if (failProjects) throw Error('projects unavailable');
@@ -133,6 +134,17 @@ test('a new unsaved chat keeps its pending project, and a created project is sel
   expect(calls.find(({ path, init }) => path === '/v1/projects' && init?.method === 'POST')?.init?.body).toBe('{"name":"새 프로젝트"}');
   await act(async () => select().props.onChange({ target: { value: '' } }));
   expect(readPendingProjects()).toEqual({});
+});
+
+test('header creation browses remote folders and saves the chosen primary folder', async () => {
+  const { calls } = await mount(null, false);
+  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 만들기' }).props.onClick());
+  await act(async () => tree!.root.findByProps({ 'aria-label': '새 프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
+  await act(async () => tree!.root.findByProps({ 'aria-label': '원격 폴더 고르기' }).props.onClick());
+  await act(async () => tree!.root.findAllByType('button').find(button => button.children.includes('이 폴더 선택'))!.props.onClick());
+  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  expect(calls.some(call => call.path === '/v1/projects/folders')).toBe(true);
+  expect(calls.find(call => call.init?.method === 'POST')?.init?.body).toBe('{"name":"새 일","primaryFolder":"/srv/work"}');
 });
 
 test('an unsaved chat cannot display a project when its pending assignment cannot be stored', async () => {

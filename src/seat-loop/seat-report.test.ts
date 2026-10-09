@@ -1,4 +1,6 @@
 import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -11,6 +13,7 @@ const seatReport = (seat: string, deps: SeatReportDeps = {}) => report(seat, {
   draftMetrics: async () => ({ inventory: 0, oldestAgeHours: null, needsOwner: 0, converted48h: 0, cohort48h: 0, conversion48h: null }),
   overlapMetrics: async () => ({ ...m, launches24h: 0, launched: 3, unmeasured: 0, linked: 0, autoLanded: 0 }),
   salvagedToday: async () => 0,
+  coverLogs: () => [],
   ...deps,
 });
 
@@ -27,7 +30,7 @@ test('report: launch, decision, skip in one paragraph; without --post no sending
       { seat: 'TC', at: now.toISOString(), status: 'skipped-budget', item: { source: 'request', id: 'a', title: 'wait', text: 'wait' } },
     ].map((v) => JSON.stringify(v)).join('\n') + '\n');
     const calls: unknown[] = [];
-    const deps = { root, now: () => now, config: { mode: 'shadow' as const, reportPr: 16815 }, send: async (...args: unknown[]) => { calls.push(args); } };
+    const deps = { root, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }), config: { mode: 'shadow' as const, reportPr: 16815 }, send: async (...args: unknown[]) => { calls.push(args); } };
     const result = await seatReport('TC', deps);
     expect(result.body).toContain('발사 0.2.9 K1 build (run-12345678-1234-1234-1234-123456789abc)');
     expect(result.body).toContain('결정 상정 K2 게시');
@@ -42,6 +45,57 @@ test('report: launch, decision, skip in one paragraph; without --post no sending
     writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'outcome-unknown',
       item: { source: 'request', id: 'b', title: 'verify', text: 'verify' } }) + '\n');
     expect((await seatReport('TC', deps)).body).toContain('결과 확인 필요 outcome-unknown b verify');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('hourly OP report includes exactly one formatted land cover line, preserves the other seats, and posts the same body', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-cover-'));
+  try {
+    const seen: string[] = [];
+    const sent: string[] = [];
+    const result = await seatReport('OP', { root, now: () => now, config: { mode: 'shadow', reportPr: 16815 }, post: true,
+      coverLogs: (query) => {
+        seen.push(query.exactCategories![0]!);
+        const payloads = query.exactCategories?.[0] === 'task-agent'
+          ? [{ kind: 'land', result: 'done' }, { kind: 'land', result: 'shadow' }]
+          : [{ step: 'merge', ok: true }, { step: 'merge', ok: true }];
+        return payloads.map((data) => ({ category: query.exactCategories![0], event: query.events![0], data: JSON.stringify(data) }) as import('../mss/logging/log-store.js').LogStoreRow);
+      }, send: (body) => { sent.push(body); },
+    });
+    expect(seen).toEqual(['task-agent', 'pr.land']);
+    expect(result.body.match(/TASK-AGENT cover /g)).toHaveLength(1);
+    expect(result.body).toContain('TASK-AGENT cover land: TA 1/2 (50.0%) · live 1 · shadow 1 · steward-transition observed');
+    expect(result.body.split('\n')).toHaveLength(1);
+    expect(sent).toEqual([result.body]);
+    const other = await seatReport('TC', { root, now: () => now, coverLogs: () => { throw Error('TC must not read cover'); } });
+    expect(other.body).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 원장 기록 없음 · 도는 런 0');
+    expect(existsSync(seatLedgerPath('OP', root, now))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('OP cover does not invent a denominator when one source fails or reaches its bound', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-cover-'));
+  try {
+    const base = { root, now: () => now, config: { mode: 'shadow' as const } };
+    const unreadable = await seatReport('OP', { ...base, coverLogs: (query) => {
+      if (query.exactCategories?.[0] === 'pr.land') throw Error('unavailable');
+      return [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow];
+    } });
+    expect(unreadable.body).toContain('TASK-AGENT cover land: TA 1/- (-) · live 1 · shadow 0 · steward-transition unmeasured');
+    const bounded = await seatReport('OP', { ...base, coverLogs: (query) => ({
+      rows: query.exactCategories?.[0] === 'task-agent'
+        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow]
+        : [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow],
+      limitReached: query.exactCategories?.[0] === 'pr.land', unreadableStores: 0, storesRead: 1,
+    }) });
+    expect(bounded.body).toContain('TASK-AGENT cover land: TA 1/- (-) · live 1 · shadow 0 · steward-transition unmeasured');
+    const partial = await seatReport('OP', { ...base, coverLogs: (query) => ({
+      rows: query.exactCategories?.[0] === 'task-agent'
+        ? [{ category: 'task-agent', event: 'action', data: JSON.stringify({ kind: 'land', result: 'done' }) } as import('../mss/logging/log-store.js').LogStoreRow]
+        : [{ category: 'pr.land', event: 'step', data: JSON.stringify({ step: 'merge', ok: true }) } as import('../mss/logging/log-store.js').LogStoreRow],
+      limitReached: false, unreadableStores: 1, storesRead: 1,
+    }) });
+    expect(partial.body).toContain('TASK-AGENT cover land: TA 1/1 (100.0%) · live 1 · shadow 0 · steward-transition observed (logs.db 1개 못 읽음)');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -273,9 +327,113 @@ test('report: one line per item, last state wins — attempting then launched is
       { seat: 'TC', at: now.toISOString(), status: 'launched', item: k1, runId: 'run-12345678-1234-1234-1234-123456789abc' },
       { seat: 'TC', at: now.toISOString(), status: 'attempting', item: k2 },
     ].map((v) => JSON.stringify(v)).join('\n') + '\n');
-    const body = (await seatReport('TC', { root, now: () => now, config: { mode: 'on' } })).body;
+    const body = (await seatReport('TC', { root, now: () => now, runningRuns: () => ({ running: 0, unknown: 0 }), config: { mode: 'on' } })).body;
     expect(body).toContain('발사 0.2.9 K1 build');
     expect(body).not.toContain('결과 확인 필요 attempting 0.2.9 K1');
     expect(body).toContain('결과 확인 필요 attempting 0.2.9 K2 ship');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report counts distinct launched runIds for every seat and appends the running field after existing detail', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    for (const seat of ['MK', 'OP', 'TC', 'UX']) {
+      const path = seatLedgerPath(seat, root, now);
+      mkdirSync(dirname(path), { recursive: true });
+      const item = (id: string) => ({ source: 'checklist', id, title: id, text: id });
+      writeFileSync(path, [
+        { seat, at: now.toISOString(), status: 'launched', item: item('K1'), runId: 'r1' },
+        { seat, at: now.toISOString(), status: 'launched', item: item('K2'), runId: 'r2' },
+        { seat, at: now.toISOString(), status: 'launched', item: item('K3'), runId: 'r3' },
+        { seat, at: now.toISOString(), status: 'launched', item: item('K4'), runId: 'r1' },
+        { seat, at: now.toISOString(), status: 'hitl', item: item('K5'), runId: 'ignored' },
+        { seat, at: now.toISOString(), status: 'launched', item: item('K6') },
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+      const received: string[][] = [];
+      const body = (await seatReport(seat, { root, now: () => now, runningRuns: (ids) => {
+        received.push([...ids]);
+        return { running: 2, unknown: 1 };
+      } })).body;
+      expect(received).toEqual([['r1', 'r2', 'r3']]);
+      const prefix = `**[${seat}]** {{TS}} → 보고 2026-10-03: 발사 K1 K1 (r1) · 발사 K2 K2 (r2) · 발사 K3 K3 (r3) · 발사 K4 K4 (r1) · 결정 상정 K5 K5 · 발사 K6 K6 (runId 없음)`;
+      expect(body.startsWith(prefix)).toBe(true);
+      if (seat === 'OP') {
+        expect(body).toContain(' · 수확 가지 오늘 0 · TASK-AGENT cover land: TA 0/0 (-) · live 0 · shadow 0 · steward-transition unmeasured · 도는 런 2(불확실 1)');
+      }
+      else expect(body).toBe(`${prefix} · 도는 런 2(불확실 1)`);
+      expect(body).toEndWith(' · 도는 런 2(불확실 1)');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report default lookup follows isolated run-ledger start and termination records', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-report-real-ledger-'));
+  try {
+    const state = join(home, '.elanous');
+    const runId = `run-${randomUUID()}`;
+    const script = `
+      import { mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
+      import { dirname, join } from 'node:path';
+      import { seatReport } from ${JSON.stringify(join(import.meta.dir, 'seat-report.ts'))};
+      import { seatLedgerPath } from ${JSON.stringify(join(import.meta.dir, 'seat-loop.ts'))};
+      import { upsertPtyManifest, markPtyManifestClosed } from ${JSON.stringify(join(import.meta.dir, '../pty-shell/pty-manifest.ts'))};
+      const state = ${JSON.stringify(state)};
+      const id = ${JSON.stringify(runId)};
+      const now = new Date(${JSON.stringify(now.toISOString())});
+      const seatPath = seatLedgerPath('TC', state, now);
+      mkdirSync(dirname(seatPath), { recursive: true });
+      writeFileSync(seatPath, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+        item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: id }) + '\\n');
+      const ledgerPath = join(state, 'run-ledger', id + '.jsonl');
+      mkdirSync(dirname(ledgerPath), { recursive: true });
+      const record = (event, data) => appendFileSync(ledgerPath,
+        JSON.stringify({ timestamp: new Date().toISOString(), runId: id, event, data }) + '\\n');
+      record('start', {});
+      upsertPtyManifest({ id: 'seat-report-live', kind: 'shell', cmd: 'test fixture', startedAt: Date.now(), now: Date.now() });
+      const before = (await seatReport('TC', { root: state, now: () => now })).body;
+      record('run-status', { runStatus: 'failed' });
+      const terminatedWithPty = (await seatReport('TC', { root: state, now: () => now })).body;
+      markPtyManifestClosed('seat-report-live', 0, Date.now());
+      const after = (await seatReport('TC', { root: state, now: () => now })).body;
+      console.log(JSON.stringify({ before, terminatedWithPty, after }));
+    `;
+    const child = spawnSync('bun', ['-e', script], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 120_000,
+      env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state, ELANOUS_RUN_ID: runId },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    const { before, terminatedWithPty, after } = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { before: string; terminatedWithPty: string; after: string };
+    expect(before).toEndWith(' · 도는 런 1(불확실 0)');
+    expect(terminatedWithPty).toEndWith(' · 도는 런 0(불확실 1)');
+    expect(after).toEndWith(' · 도는 런 0(불확실 0)');
+    expect(before.slice(0, before.lastIndexOf(' · 도는 런'))).toBe(after.slice(0, after.lastIndexOf(' · 도는 런')));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}, 150_000);
+
+test('report distinguishes failed or null running lookup from no launched runs without querying the empty set', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-'));
+  try {
+    const path = seatLedgerPath('TC', root, now);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+      item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: 'r1' }) + '\n');
+    const base = { root, now: () => now };
+    const failed = (await seatReport('TC', { ...base, runningRuns: () => { throw Error('ledger unavailable'); } })).body;
+    expect(failed).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 발사 K1 build (r1) · 도는 런 못 잼');
+    expect((await seatReport('TC', { ...base, runningRuns: () => null })).body).toEndWith(' · 도는 런 못 잼');
+    expect((await seatReport('TC', { ...base, runningRuns: () => ({ running: 0, unknown: 0 }) })).body)
+      .toEndWith(' · 도는 런 0(불확실 0)');
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'hitl',
+      item: { source: 'checklist', id: 'K1', title: 'build', text: 'build' }, runId: 'r1' }) + '\n');
+    let lookups = 0;
+    const empty = (await seatReport('TC', { ...base, runningRuns: () => { lookups += 1; return null; } })).body;
+    expect(lookups).toBe(0);
+    expect(empty).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 결정 상정 K1 build · 도는 런 0');
+    expect(failed).not.toBe(empty);
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched',
+      item: { source: 'checklist', id: 'K2', title: 'unidentified', text: 'unidentified' } }) + '\n');
+    const missingId = (await seatReport('TC', { ...base, runningRuns: () => { lookups += 1; return null; } })).body;
+    expect(lookups).toBe(0);
+    expect(missingId).toBe('**[TC]** {{TS}} → 보고 2026-10-03: 발사 K2 unidentified (runId 없음) · 도는 런 0');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

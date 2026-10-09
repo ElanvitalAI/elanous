@@ -81,7 +81,7 @@ import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-follow
 import { attachTelegramProjectButtons } from './telegram-project-command.js';
 import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 import { contextNow as readContextNow, type ContextNowDeps } from './context-bus/context-now.js';
-import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { renderContextFirstNow } from './context-bus/context-now-surfaces.js';
 import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
@@ -437,7 +437,7 @@ export class TelegramBot {
     const cfg = this.slashContext?.userConfig.telegram;
     if (cfg?.contextFirst === false) return;
     try {
-      await this.sendMessage(ctx.chatId, renderContextFirst(this.readContextNow, this.contextNowDeps, renderTelegramNow), { replyTo: ctx.messageId, threadId: ctx.threadId });
+      await this.sendMessage(ctx.chatId, renderContextFirst(this.readContextNow, this.contextNowDeps, renderContextFirstNow), { replyTo: ctx.messageId, threadId: ctx.threadId });
     } catch (err) {
       this.log(`telegram context-first failed: ${err instanceof Error ? err.message : String(err)}`);
     }

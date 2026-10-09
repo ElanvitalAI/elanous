@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as githubAppToken from '../auth/github-app-token.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { githubDraftSweepAdapters } from './harness-cli-command.js';
@@ -164,6 +165,110 @@ test('batched GraphQL evidence classifies a fixture set exactly like the per-PR 
     'api repos/my/repo/pulls/10/commits?per_page=100&page=1', 'api repos/my/repo/pulls/11/commits?per_page=100&page=1']);
   // Review/gate posture is read only for the daily census (harness drafts older than 24h) — never for #17 or #18.
   expect(batched.calls.some((call) => /\/commits\/h1[78]\//.test(call))).toBe(false);
+});
+
+test('real gh sweep reports exit status and auth stderr, logs once, and passes the App token without exposing it', async () => {
+  const dir = mkdtempSync(join(stateDir, 'bin-'));
+  const gh = join(dir, 'gh');
+  const envFile = join(stateDir, 'received-token');
+  writeFileSync(gh, '#!/bin/sh\nprintf "%s" "$GH_TOKEN" > "$GH_TEST_TOKEN_FILE"\nprintf "%s\\n" "gh: To get started with GitHub CLI, please run: gh auth login" >&2\nexit 4\n');
+  chmodSync(gh, 0o755);
+  const before = { path: process.env.PATH, token: process.env.GH_TOKEN, file: process.env.GH_TEST_TOKEN_FILE,
+    relayUrl: process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL, relayToken: process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN };
+  const token = spyOn(githubAppToken, 'githubAutomationToken').mockReturnValue('token-x');
+  const logged: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { logged.push({ category, event, data }); });
+  try {
+    process.env.PATH = `${dir}:${before.path ?? ''}`;
+    delete process.env.GH_TOKEN;
+    delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL;
+    delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN;
+    process.env.GH_TEST_TOKEN_FILE = envFile;
+    const result = await runDraftSweep({ repository: 'my/repo', adapters: githubDraftSweepAdapters(undefined, git, '/tmp/main') });
+    expect(result.complete).toBe(false);
+    expect(result.error).toContain('gh api repos/my/repo/pulls?state=open&per_page=100&page=1 exit=4:');
+    expect(result.error).toContain('gh auth login');
+    expect(result.error?.endsWith('gh auth login')).toBe(true);
+    expect(result.error).not.toContain('token-x');
+    expect(result.error).not.toContain('\n');
+    expect(readFileSync(envFile, 'utf8')).toBe('token-x');
+    expect(logged.filter((entry) => entry.category === 'harness.drafts' && entry.event === 'gh-failed')).toEqual([
+      { category: 'harness.drafts', event: 'gh-failed', data: {
+        args0: 'api', exit: 4, stderrTail: 'gh: To get started with GitHub CLI, please run: gh auth login',
+      } },
+    ]);
+    expect(JSON.stringify(logged)).not.toContain('token-x');
+    expect(token).toHaveBeenCalled();
+  } finally {
+    token.mockRestore();
+    log.mockRestore();
+    if (before.path === undefined) delete process.env.PATH; else process.env.PATH = before.path;
+    if (before.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = before.token;
+    if (before.file === undefined) delete process.env.GH_TEST_TOKEN_FILE; else process.env.GH_TEST_TOKEN_FILE = before.file;
+    if (before.relayUrl === undefined) delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL; else process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL = before.relayUrl;
+    if (before.relayToken === undefined) delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN; else process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN = before.relayToken;
+  }
+});
+
+test('real gh sweep retains a caller-provided GH_TOKEN', async () => {
+  const dir = mkdtempSync(join(stateDir, 'bin-'));
+  const envFile = join(stateDir, 'received-token');
+  const gh = join(dir, 'gh');
+  writeFileSync(gh, '#!/bin/sh\nprintf "%s" "$GH_TOKEN" > "$GH_TEST_TOKEN_FILE"\nprintf "%s\\n" "auth failed" >&2\nexit 4\n');
+  chmodSync(gh, 0o755);
+  const before = { path: process.env.PATH, token: process.env.GH_TOKEN, file: process.env.GH_TEST_TOKEN_FILE };
+  const token = spyOn(githubAppToken, 'githubAutomationToken').mockReturnValue('token-x');
+  try {
+    process.env.PATH = `${dir}:${before.path ?? ''}`;
+    process.env.GH_TOKEN = 'caller-token';
+    process.env.GH_TEST_TOKEN_FILE = envFile;
+    const result = await runDraftSweep({ repository: 'my/repo', adapters: githubDraftSweepAdapters(undefined, git, '/tmp/main') });
+    expect(result.error).toContain('exit=4: auth failed');
+    expect(readFileSync(envFile, 'utf8')).toBe('caller-token');
+    expect(token).not.toHaveBeenCalled();
+  } finally {
+    token.mockRestore();
+    if (before.path === undefined) delete process.env.PATH; else process.env.PATH = before.path;
+    if (before.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = before.token;
+    if (before.file === undefined) delete process.env.GH_TEST_TOKEN_FILE; else process.env.GH_TEST_TOKEN_FILE = before.file;
+  }
+});
+
+test('real async gh request carries the App token and reports its own stderr and exit', async () => {
+  const dir = mkdtempSync(join(stateDir, 'bin-'));
+  const envFile = join(stateDir, 'received-token');
+  const gh = join(dir, 'gh');
+  writeFileSync(gh, '#!/bin/sh\nprintf "%s" "$GH_TOKEN" > "$GH_TEST_TOKEN_FILE"\nprintf "async gh auth login %s\\n" "$GH_TOKEN" >&2\nexit 4\n');
+  chmodSync(gh, 0o755);
+  const before = { path: process.env.PATH, token: process.env.GH_TOKEN, file: process.env.GH_TEST_TOKEN_FILE,
+    relayUrl: process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL, relayToken: process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN };
+  const token = spyOn(githubAppToken, 'githubAutomationToken').mockReturnValue('token-x');
+  const logged: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { logged.push({ category, event, data }); });
+  try {
+    process.env.PATH = `${dir}:${before.path ?? ''}`;
+    delete process.env.GH_TOKEN;
+    delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL;
+    delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN;
+    process.env.GH_TEST_TOKEN_FILE = envFile;
+    await expect(githubDraftSweepAdapters().getPrFiles!('my/repo', 12)).rejects.toThrow(
+      'gh api repos/my/repo/pulls/12/files?per_page=100&page=1 exit=4: async gh auth login [REDACTED]',
+    );
+    expect(readFileSync(envFile, 'utf8')).toBe('token-x');
+    expect(logged.filter(({ category, event }) => category === 'harness.drafts' && event === 'gh-failed')).toEqual([
+      { category: 'harness.drafts', event: 'gh-failed', data: { args0: 'api', exit: 4, stderrTail: 'async gh auth login [REDACTED]' } },
+    ]);
+    expect(JSON.stringify(logged)).not.toContain('token-x');
+    expect(token).toHaveBeenCalled();
+  } finally {
+    token.mockRestore();
+    log.mockRestore();
+    if (before.path === undefined) delete process.env.PATH; else process.env.PATH = before.path;
+    if (before.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = before.token;
+    if (before.file === undefined) delete process.env.GH_TEST_TOKEN_FILE; else process.env.GH_TEST_TOKEN_FILE = before.file;
+    if (before.relayUrl === undefined) delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL; else process.env.ELANOUS_POD_GITHUB_CREDENTIAL_URL = before.relayUrl;
+    if (before.relayToken === undefined) delete process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN; else process.env.ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN = before.relayToken;
+  }
 });
 
 test('mapBounded keeps result order and never exceeds its in-flight limit', async () => {

@@ -16,7 +16,7 @@ import {
   type CanvasFlow, type CanvasGraph, type CanvasIssue,
 } from './graph-canvas-model';
 import { saveCanvasGraph } from './graph-canvas-save';
-import { mergeParallelEdges, routeEdges } from '@/lib/graph-edge-route';
+import { hoverFocus, mergeParallelEdges, routeEdges } from '@/lib/graph-edge-route';
 import { TIDY_EDGE_TYPES, type TidyEdgeData } from '@/components/workflows/TidyEdge';
 
 /** What a toolbar extension (e.g. CGE-RUN's «실행») reads from the canvas. */
@@ -121,6 +121,8 @@ export function GraphCanvasEditor({
   wizardMode = false,
   nodeLabels,
   wizardSteps,
+  installedPacks,
+  onKnowledgePackChange,
 }: {
   palette: GraphKindEntry[];
   client: NexusClient | null;
@@ -145,9 +147,17 @@ export function GraphCanvasEditor({
   nodeLabels?: Record<string, string>;
   /** GRAPH-WIZARD-SAVE-RECIPES — the wizard's steps, sent with «저장» (the server keeps them for «실행»). */
   wizardSteps?: GraphWizardSteps;
+  installedPacks?: Array<{ id: string; title: string }>;
+  onKnowledgePackChange?: (packId: string) => void;
 }) {
   const [graph, setGraph] = useState<CanvasGraph>(() => initialGraph ?? emptyGraph(''));
+  const [packOverrides, setPackOverrides] = useState<Record<string, string>>({});
+  const [savedSteps, setSavedSteps] = useState<string | null>(() => initialSaved ? JSON.stringify(wizardSteps ?? {}) : null);
+  const [loadedSteps, setLoadedSteps] = useState<GraphWizardSteps | undefined>(undefined);
+  const effectiveSteps = (wizardSteps ?? loadedSteps) && Object.fromEntries(Object.entries(wizardSteps ?? loadedSteps ?? {}).map(([id, step]) =>
+    [id, packOverrides[id] !== undefined && step.step === 'knowledge-rag' ? { ...step, arg: packOverrides[id] } : step]));
   const [selection, setSelection] = useState<Selection>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
   const [check, setCheck] = useState<Check>(null);
   const [busy, setBusy] = useState<'validate' | 'save' | 'load' | null>(null);
@@ -224,6 +234,8 @@ export function GraphCanvasEditor({
     if (!replace || appliedRev.current === replace.rev) return;
     appliedRev.current = replace.rev;
     setGraph(relayout(replace.graph));
+    setPackOverrides({});
+    setLoadedSteps(undefined);
     setSelection(null);
     setCheck(null);
     setEditError(null);
@@ -243,7 +255,8 @@ export function GraphCanvasEditor({
   const context: GraphCanvasContext = {
     graphId: graph.graphId, yaml, graph,
     valid: local.ok && serverIssues.length === 0,
-    saved: saved?.id === graph.graphId && saved.yaml === yaml,
+    saved: saved?.id === graph.graphId && saved.yaml === yaml &&
+      (savedSteps === null || savedSteps === JSON.stringify(effectiveSteps ?? {})),
   };
   const contextRef = useRef(context);
   contextRef.current = context;
@@ -289,15 +302,6 @@ export function GraphCanvasEditor({
     return counts;
   }, [issues]);
   const ends = useMemo(() => new Set(terminalNodes(graph)), [graph]);
-  const flowNodes: Node[] = graph.nodes.map((node) => ({
-    id: node.id,
-    type: 'canvas',
-    position: { x: node.x, y: node.y },
-    selected: selection?.type === 'node' && selection.id === node.id,
-    className: [nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : '', newNodes.has(node.id) ? 'graph-wizard-new' : ''].filter(Boolean).join(' ') || undefined,
-    data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
-      ...(nodeStatus?.[node.id] ? { runStatus: nodeStatus[node.id] } : {}) } satisfies CanvasNodeData,
-  }));
   // GRAPH-EDGE-TIDY — same-pair outcomes merge into one edge; forward edges curve, a forward edge that would cross a
   // card detours above the row, back edges arc below it in their own lane; label pills avoid cards and each other.
   const routed = useMemo(() => routeEdges(
@@ -305,6 +309,17 @@ export function GraphCanvasEditor({
     mergeParallelEdges(graph.edges),
     { flow, rename: canvasOutcomeLabel },
   ), [graph.nodes, graph.edges, sizes, flow]);
+  const focus = hoverFocus(graph.nodes.some((node) => node.id === hovered) ? hovered : null, routed);
+  const flowNodes: Node[] = graph.nodes.map((node) => ({
+    id: node.id,
+    type: 'canvas',
+    position: { x: node.x, y: node.y },
+    selected: selection?.type === 'node' && selection.id === node.id,
+    className: [nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : '', newNodes.has(node.id) ? 'graph-wizard-new' : ''].filter(Boolean).join(' ') || undefined,
+    ...(focus && !focus.nodes.has(node.id) ? { style: { opacity: 0.25 } } : {}),
+    data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
+      ...(nodeStatus?.[node.id] ? { runStatus: nodeStatus[node.id] } : {}) } satisfies CanvasNodeData,
+  }));
   const flowEdges: Edge[] = routed.map((route) => {
     // GRAPH-WIZARD — edges the chat just added stay highlighted (thicker, wizard purple, animated).
     const fresh = route.indexes.some((index) => {
@@ -320,8 +335,10 @@ export function GraphCanvasEditor({
     type: 'tidy',
     data: { route } satisfies TidyEdgeData,
     selected: selection?.type === 'edge' && route.indexes.includes(selection.index),
-    animated: fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
-    ...(fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
+    animated: (focus?.edges.has(route.id) ?? false) || fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
+    ...(focus ? { style: focus.edges.has(route.id)
+      ? { stroke: '#f59e0b', strokeWidth: 3, strokeDasharray: '6 4' }
+      : { opacity: 0.15 } } : fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
     };
   });
 
@@ -362,9 +379,10 @@ export function GraphCanvasEditor({
     const savingYaml = yaml;
     const savingId = graph.graphId;
     try {
-      const result = await saveCanvasGraph(client, savingId, savingYaml, saved?.id === savingId ? 'update' : 'create', wizardSteps);
+      const result = await saveCanvasGraph(client, savingId, savingYaml, saved?.id === savingId ? 'update' : 'create', effectiveSteps);
       if (result.ok) {
         setSaved({ id: savingId, yaml: savingYaml, ...(result.version !== undefined ? { version: result.version } : {}) });
+        setSavedSteps(JSON.stringify(effectiveSteps ?? {}));
         setNotice(`«${savingId}» 를 ${result.created ? '새로 ' : ''}저장했습니다${result.version !== undefined ? ` (v${result.version})` : ''}`);
         onSaved?.(savingId);
       } else {
@@ -383,6 +401,9 @@ export function GraphCanvasEditor({
       const next = fromYaml(loaded.yaml);
       userMoved.current = false;
       setGraph(relayout(next));
+      setPackOverrides({});
+      setLoadedSteps(loaded.steps);
+      setSavedSteps(JSON.stringify(loaded.steps ?? {}));
       setSelection(null);
       setCheck(null);
       setSaved(loaded.source === 'mine' ? { id: loaded.id, yaml: toYaml(next) } : null);
@@ -410,7 +431,7 @@ export function GraphCanvasEditor({
             onChange={(event) => edit((current) => setGraphId(current, event.target.value))}
             className="w-36 rounded border border-border bg-background px-2 py-1 font-mono text-foreground" />
         </label>
-        <button type="button" onClick={() => { setGraph(emptyGraph('')); setSelection(null); setCheck(null); setSaved(null); setNotice(null); setEditError(null); }}
+        <button type="button" onClick={() => { setGraph(emptyGraph('')); setLoadedSteps(undefined); setPackOverrides({}); setSavedSteps(null); setSelection(null); setCheck(null); setSaved(null); setNotice(null); setEditError(null); }}
           className="rounded border border-border px-2 py-1">새 그래프</button>
         {client && (
           <select aria-label="그래프 불러오기" value="" disabled={busy !== null} onChange={(event) => { void load(event.target.value); }}
@@ -487,6 +508,8 @@ export function GraphCanvasEditor({
             onConnect={(connection: Connection) => {
               if (connection.source && connection.target) edit((current) => connect(current, connection.source, connection.target, defaultOutcome(current, connection.source)));
             }}
+            onNodeMouseEnter={(_event, node) => setHovered(node.id)}
+            onNodeMouseLeave={() => setHovered(null)}
             onNodeClick={(_event, node) => setSelection({ type: 'node', id: node.id })}
             onEdgeClick={(_event, edge) => setSelection({ type: 'edge', index: Number(edge.id.slice(1)) })}
             onPaneClick={() => setSelection(null)}
@@ -504,7 +527,8 @@ export function GraphCanvasEditor({
               linkTarget={linkTarget} linkOutcome={linkOutcome} setLinkTarget={setLinkTarget} setLinkOutcome={setLinkOutcome}
               onEdit={edit}
               onRenamed={(id) => setSelection({ type: 'node', id })}
-              onRemoved={() => setSelection(null)} />
+              onRemoved={() => setSelection(null)} installedPacks={installedPacks} effectiveSteps={effectiveSteps}
+              onKnowledgePackChange={(packId) => { setPackOverrides((current) => ({ ...current, [selectedNode.id]: packId })); onKnowledgePackChange?.(packId); }} />
           ) : selectedEdge && selection?.type === 'edge' ? (
             <div className="flex flex-col gap-2">
               <h2 className="text-sm font-semibold">간선 <span className="font-mono">{selectedEdge.from} → {selectedEdge.to}</span></h2>
@@ -542,6 +566,7 @@ export function GraphCanvasEditor({
 
 function NodePanel({
   graph, nodeId, palette, issues, linkTarget, linkOutcome, setLinkTarget, setLinkOutcome, onEdit, onRenamed, onRemoved,
+  installedPacks, effectiveSteps, onKnowledgePackChange,
 }: {
   graph: CanvasGraph;
   nodeId: string;
@@ -554,6 +579,9 @@ function NodePanel({
   onEdit: (change: (current: CanvasGraph) => CanvasGraph) => void;
   onRenamed: (id: string) => void;
   onRemoved: () => void;
+  installedPacks?: Array<{ id: string; title: string }>;
+  effectiveSteps?: GraphWizardSteps;
+  onKnowledgePackChange?: (packId: string) => void;
 }) {
   const node = graph.nodes.find((entry) => entry.id === nodeId)!;
   const [draftId, setDraftId] = useState(node.id);
@@ -596,6 +624,14 @@ function NodePanel({
         </select>
       </label>
       {kindEntry?.description && <p className="text-[11px] text-muted-foreground">{kindEntry.description}</p>}
+      {installedPacks && effectiveSteps?.[nodeId]?.step === 'knowledge-rag' && <label className="flex flex-col gap-1 text-muted-foreground">지식(RAG) 팩
+        <select aria-label="지식(RAG) 팩" value={effectiveSteps[nodeId]?.arg ?? ''}
+          onChange={(event) => onKnowledgePackChange?.(event.target.value)}
+          className="rounded border border-border bg-background px-1 py-1 text-foreground">
+          <option value="" disabled>팩 선택</option>
+          {installedPacks.map((pack) => <option key={pack.id} value={pack.id}>{pack.title} ({pack.id})</option>)}
+        </select>
+      </label>}
       <label className="flex flex-col gap-1 text-muted-foreground">recipe
         <input aria-label="recipe" value={node.recipe} spellCheck={false}
           onChange={(event) => onEdit((current) => updateNode(current, nodeId, { recipe: event.target.value }))}

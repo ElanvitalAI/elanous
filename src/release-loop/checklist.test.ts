@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, devVersion, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, devVersion, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -58,6 +58,70 @@ describe('release checklist ledger', () => {
     const rows = cellsReferencingDoc('package.json', [listChecklist('0.2.18')]);
     expect(rows.map(({ id, section }) => [id, section])).toEqual([['M', '§1 · §2'], ['W', null]]);
     expect(cellsReferencingDoc('package.json#§2', [listChecklist('0.2.18')]).map(({ id, section }) => [id, section])).toEqual([['M', '§2']]);
+  });
+
+  test('lintDocRefs finds uncovered A2/A3 and dangling Z9 across versions without writing', () => {
+    root();
+    addItem('0.2.18', { id: 'A', title: 'covered', refs: ['package.json#A1'] });
+    addItem('0.2.19', { id: 'Z', title: 'dangling', refs: ['./package.json#Z9', 'package.json'] });
+    addItem('0.2.19', { id: 'W', title: 'whole only', refs: ['package.json'] });
+    addItem('0.2.19', { id: 'OTHER', title: 'another document', refs: ['src/release-loop/checklist.ts#A2'] });
+    const checklists = [listChecklist('0.2.18'), listChecklist('0.2.19')];
+    const before = JSON.stringify(checklists);
+    const doc = '# RFC\n## A1. first\n### A2. second\n#### A3. third\n# not a section\n##### A4. too deep\nbody ## Z9. not a heading\n';
+    expect(lintDocRefs('./package.json', doc, checklists)).toEqual({
+      sections: ['A1', 'A2', 'A3'],
+      uncoveredSections: ['A2', 'A3'],
+      danglingRefs: [{ version: '0.2.19', id: 'Z', ref: './package.json#Z9' }],
+    });
+    expect(lintDocRefs('package.json', '### A2b. middle\n', [])).toEqual({ sections: ['A2b'], uncoveredSections: ['A2b'], danglingRefs: [] });
+    expect(lintDocRefs('package.json', '## B1: colon title\n', []).sections).toEqual(['B1']);
+    expect(JSON.stringify(checklists)).toBe(before);
+    expect([listChecklist('0.2.18'), listChecklist('0.2.19')]).toEqual(checklists);
+  });
+
+  test('lintDocRefs ignores headings inside fenced code and treats refs to fenced examples as dangling', () => {
+    root();
+    addItem('0.2.18', { id: 'EXAMPLE', title: 'example only', refs: ['package.json#Z9'] });
+    addItem('0.2.19', { id: 'REAL', title: 'real section', refs: ['package.json#A1'] });
+    const doc = [
+      '## A1. actual',
+      '```markdown',
+      '### Z9. example, not a section',
+      '```',
+      '~~~md',
+      '#### T8. another example',
+      '~~~',
+      '## A2. actual but uncited',
+    ].join('\n');
+    expect(lintDocRefs('package.json', doc, [listChecklist('0.2.18'), listChecklist('0.2.19')])).toEqual({
+      sections: ['A1', 'A2'],
+      uncoveredSections: ['A2'],
+      danglingRefs: [{ version: '0.2.18', id: 'EXAMPLE', ref: 'package.json#Z9' }],
+    });
+  });
+
+  test('lintDocRefs recognizes Markdown headings indented one to three spaces without dangling their refs', () => {
+    root();
+    addItem('0.2.18', { id: 'INDENT', title: 'indented heading', refs: ['package.json#A1'] });
+    const doc = '  ## A1. first\n ### A2. second\n   #### A3. third\n    ## Z9. code, not a heading\n';
+    expect(lintDocRefs('package.json', doc, [listChecklist('0.2.18')])).toEqual({
+      sections: ['A1', 'A2', 'A3'],
+      uncoveredSections: ['A2', 'A3'],
+      danglingRefs: [],
+    });
+  });
+
+  test('lintDocRefs keeps dotted numeric section identifiers distinct and matches exact refs', () => {
+    root();
+    addItem('0.2.18', { id: 'NUM', title: 'numeric section', refs: ['package.json#2.1'] });
+    addItem('0.2.19', { id: 'BAD', title: 'missing numeric section', refs: ['package.json#2.3'] });
+    const checklists = [listChecklist('0.2.18'), listChecklist('0.2.19')];
+    expect(lintDocRefs('package.json', '## 2.1. First\n## 2.2 Second\n', checklists)).toEqual({
+      sections: ['2.1', '2.2'],
+      uncoveredSections: ['2.2'],
+      danglingRefs: [{ version: '0.2.19', id: 'BAD', ref: 'package.json#2.3' }],
+    });
   });
 
   test('checklistHistory unifies cross-version moves, timestamps and reasons without mixing ids', () => {

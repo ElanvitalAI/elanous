@@ -91,6 +91,8 @@ export interface PublishResult {
   ok: boolean;
   sequence: number;
   published: Array<{ name: string; version: string; sha256: string; bundled: string[] }>;
+  /** With keepExisting: previous index entries whose name has no folder under pluginsDir, carried over unchanged. */
+  kept: Array<{ name: string; version: string; sha256: string }>;
   skipped: Array<{ dir: string; reason: string; hits?: InternalRefHit[] }>;
   /** Published anyway, but a reviewer should look (e.g. a third-party graph relying on core recipes). */
   warnings: Array<{ dir: string; graph: string; reason: 'third-party-core-recipe'; recipes: string[] }>;
@@ -103,6 +105,8 @@ export function publishMarket(input: {
   market: { name: string; displayName: string };
   key: { keyId: string; privateKeyPem: string };
   source?: { repoUrl: string; sha: string; basePath: string };
+  /** Carry over previous entries whose name is not a plugin folder under pluginsDir (entry, archive and unpacked files untouched). */
+  keepExisting?: boolean;
   now?: Date;
 }): PublishResult {
   let sequence = 1;
@@ -307,6 +311,18 @@ export function publishMarket(input: {
       published.push({ name: manifest.name, version: manifest.version, sha256, bundled });
       debug.log('market.publish', 'bundled', { name: manifest.name, version: manifest.version, skills: bundled });
     }
+    const kept: PublishResult['kept'] = [];
+    if (input.keepExisting && previous) {
+      // Folders under pluginsDir own their names (even when skipped); every other previous entry stays as it was.
+      const present = new Set(readdirSync(input.pluginsDir).filter(dir => lstatSync(join(input.pluginsDir, dir)).isDirectory()));
+      for (const item of previous.plugins) {
+        if (present.has(item.name)) continue;
+        plugins.push(item);
+        kept.push({ name: item.name, version: item.version, sha256: item.artifact.sha256 });
+        debug.log('market.publish', 'kept', { name: item.name, version: item.version });
+      }
+      plugins.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    }
     const index: MarketplaceIndex = { name: input.market.name, interface: { displayName: input.market.displayName },
       sequence, generatedAt: (input.now ?? new Date()).toISOString(), plugins };
     const bytes = Buffer.from(JSON.stringify(index, null, 2) + '\n');
@@ -345,7 +361,7 @@ export function publishMarket(input: {
       signatureText: readFileSync(join(input.outDir, 'index.sig'), 'utf8'), trustedKeys });
     if (!verified.ok) throw new Error(`index verification failed: ${verified.reason}: ${verified.detail}`);
     for (const item of published) debug.log('market.publish', 'published', { name: item.name, version: item.version, sequence });
-    return { ok: !skipped.some(item => item.reason === 'internal-reference'), sequence, published, skipped, warnings };
+    return { ok: !skipped.some(item => item.reason === 'internal-reference'), sequence, published, kept, skipped, warnings };
   } catch (error) {
     const rawReason = error instanceof Error ? error.message : 'unknown-error';
     const reason = input.key.privateKeyPem && rawReason.includes(input.key.privateKeyPem) ? 'invalid signing key' : rawReason;

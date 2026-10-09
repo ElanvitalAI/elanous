@@ -1,0 +1,13 @@
+{
+ "_source": "출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트(https://malfoy-meme-making.vercel.app/) · 원작자 허락(2026-10-08) · 출처 명기 조건 — 영상 프롬프트 조립 순서와 BACKGROUND/LOCK/TAIL 문형은 키트에서 가져옴. 캐릭터 고유 장식(KEEP)은 범용 예시로 새로 씀",
+ "_how": "합성용(blue) 컷 = BACKGROUND + LOCK 필수 · 인월드 컷 = CAMERA + 장면 묘사. TAIL 은 «모든» 컷에 붙는다(컷 분할·대사·음악을 막는다)",
+ "BACKGROUND": {"blue": "The background stays a perfectly flat solid blue the entire time, no props, no floor, no shadows on the backdrop."},
+ "LOCK": "Locked-off camera, full body stays in frame.",
+ "STYLE": {
+  "showcase": "3D anime cel-shaded game character showcase style, energetic, snappy, stylish anime game motion with fluid follow-through.",
+  "hyper": "3D anime cel-shaded game character style. Very fast, sharp, snappy motion with strong anticipation and a crisp final hold, like an anime edit."
+ },
+ "TAIL": "One continuous shot, no scene cuts. No dialogue, no music.",
+ "KEEP": {"_rule": "모델이 잘 바꾸는 작은 장식(문장·배지)을 이름으로 고정한다", "example": "Keep the small brass compass badge on her jacket unchanged."},
+ "CAMERA": {"push_in": "Slow push-in.", "ecu_push": "Extreme close-up, slow push-in."}
+}

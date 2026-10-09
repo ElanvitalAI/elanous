@@ -69,14 +69,15 @@ test('live-safe enqueues an allowed goal through AUTOQ, with durable receipt and
   } finally { spy.mockRestore(); f.close(); }
 });
 
-test('AUTOQ cancellation and failed child are retryable, while successful child remains handled', async () => {
-  for (const outcome of ['cancelled', 'failed', 'succeeded'] as const) {
+test('a failed child is retryable, while a successful child and a person-removed item remain handled (SEAT-REQUEUE-HANDLED)', async () => {
+  for (const outcome of ['removed', 'failed', 'succeeded'] as const) {
     const f = fixture('구현');
+    const spy = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       const deps: SeatDeps = { ...f.deps, config: { mode: 'live-safe', seats: ['TC'] },
         run: async (args) => { if (args[1] !== 'budget') throw Error('direct launch'); return '{"outcome":"proceed"}'; } };
       const first = await runSeatLoopOnce('TC', deps) as SeatEntry;
-      if (outcome === 'cancelled') expect(await removeHarnessQueue(first.queueId!, { root: f.root })).toBe(true);
+      if (outcome === 'removed') expect(await removeHarnessQueue(first.queueId!, { root: f.root })).toBe(true);
       else {
         await tickHarnessQueue({ root: f.root, cap: () => 2, pool: () => ({ running: 0, pending: 0, reserved: 0, limit: 2 }),
           processes: () => [], launch: async () => 501 });
@@ -87,17 +88,26 @@ test('AUTOQ cancellation and failed child are retryable, while successful child 
           .toBe(outcome === 'failed' ? 1 : 0);
       }
       const second = await runSeatLoopOnce('TC', deps) as SeatEntry;
+      const retryEvents = () => spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'queue-retryable').length;
       if (outcome === 'succeeded') {
         expect(second.status).toBe('skipped-empty');
         expect(listHarnessQueue({ root: f.root })).toHaveLength(1);
         expect(await removeHarnessQueue(first.queueId!, { root: f.root, processes: () => [], receipt: () => 'finished' })).toBe(true);
         expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+      } else if (outcome === 'removed') {
+        // The person took it out of the queue: it does not re-enter on this or the next tick, and is not reported as retryable.
+        expect(harnessQueueOutcome(first.queueId!, { root: f.root })).toBe('removed');
+        expect(second.status).toBe('skipped-empty');
+        expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+        expect(listHarnessQueue({ root: f.root })).toEqual([]);
+        expect(retryEvents()).toBe(0);
       } else {
         expect(second.status).toBe('queued');
         expect(second.queueId).not.toBe(first.queueId);
         expect(listHarnessQueue({ root: f.root }).at(-1)!.id === second.queueId).toBe(true);
+        expect(retryEvents()).toBeGreaterThan(0);
       }
-    } finally { f.close(); }
+    } finally { spy.mockRestore(); f.close(); }
   }
 });
 
@@ -193,7 +203,7 @@ test('real AUTOQ: the same key with a different task body is refused explicitly,
   } finally { spy.mockRestore(); f.close(); }
 });
 
-test('a crash after enqueue but before the queued row is recovered by key, so a cancelled item is retried', async () => {
+test('a crash after enqueue but before the queued row is recovered by key, and a person-removed item stays handled', async () => {
   const f = fixture('구현');
   const spy = spyOn(debug, 'log').mockImplementation(() => {});
   try {
@@ -211,13 +221,14 @@ test('a crash after enqueue but before the queued row is recovered by key, so a 
     expect(f.ledger().map((row) => row.status)).toEqual(['attempting']);
     const [orphan] = listHarnessQueue({ root: f.root });
     expect(orphan).toBeDefined();
-    // The queue item fails (cancelled) before the seat loop runs again.
+    // A person removes the queue item before the seat loop runs again (SEAT-REQUEUE-HANDLED: not a failure).
     expect(await removeHarnessQueue(orphan!.id, { root: f.root })).toBe(true);
-    expect(harnessQueueOutcome(orphan!.id, { root: f.root })).toBe('retryable');
-    const retry = await runSeatLoopOnce('TC', base) as SeatEntry;
-    expect(retry).toMatchObject({ status: 'queued', item: { id: 'K1' } });
-    expect(retry.queueId).not.toBe(orphan!.id);
+    expect(harnessQueueOutcome(orphan!.id, { root: f.root })).toBe('removed');
+    const next = await runSeatLoopOnce('TC', base) as SeatEntry;
+    expect(next.status).toBe('skipped-empty');
+    expect(listHarnessQueue({ root: f.root })).toEqual([]);
     expect(spy.mock.calls.some(([category, event]) => category === 'seat.loop' && event === 'queue-recovered')).toBe(true);
+    expect(spy.mock.calls.some(([category, event]) => category === 'seat.loop' && event === 'queue-retryable')).toBe(false);
   } finally { spy.mockRestore(); f.close(); }
 });
 

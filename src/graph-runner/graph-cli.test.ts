@@ -1,7 +1,8 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { writePeerEdit } from '../nexus/api/graph-peer-edit.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -43,6 +44,81 @@ test('graph tick defaults to idle and --start passes JSON input, prints results,
   expect(following.code).toBe(0);
   expect(following.stdout).toContain('graph tick: idle');
   expect(readFileSync(executed, 'utf8')).toBe('x');
+}, 30000);
+
+test('graph YAML triggers.schedule fires through the workflow scheduler into graph tick and persists a run', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-schedule-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const graph = join(dir, 'graph.yaml');
+  const executed = join(dir, 'executed');
+  writeFileSync(join(dir, 'recipes.yaml'), `a:\n  command: "printf x >> '${executed}'"\n`);
+  writeFileSync(graph, `graph_id: cli-scheduled\nversion: 1\nentry_node: a\nterminal_nodes: [done]\ntriggers:\n  schedule: { type: interval, interval: 1000 }\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
+  const child = Bun.spawn(['bun', join(root, 'bin/elanous.mjs'), `--test=${stateRoot}`, 'graph', 'tick', 'graph.yaml', '--schedule'], {
+    cwd: dir, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
+  });
+  try {
+    for (let i = 0; i < 100 && !existsSync(executed); i++) {
+      if (child.exitCode !== null) break;
+      await Bun.sleep(100);
+    }
+    expect(child.exitCode).toBeNull();
+    expect(readFileSync(executed, 'utf8')).toContain('x');
+    const runDir = join(stateRoot, 'graph-runs', 'cli-scheduled');
+    const deadline = Date.now() + 10_000;
+    let saved: { graphId: string; runId: string; status: string } | undefined;
+    while (Date.now() < deadline) {
+      for (const name of existsSync(runDir) ? readdirSync(runDir).filter(name => name.endsWith('.json')) : []) {
+        try {
+          const state = JSON.parse(readFileSync(join(runDir, name), 'utf8')) as typeof saved;
+          if (state?.status === 'done') saved = state;
+        } catch { /* A run may still be writing its state; retry until the deadline. */ }
+      }
+      if (saved || child.exitCode !== null) break;
+      await Bun.sleep(100);
+    }
+    expect(saved?.status).toBe('done');
+    expect(saved?.graphId).toBe('cli-scheduled');
+    expect(typeof saved?.runId).toBe('string');
+    const runs = spawnGraphAt(stateRoot, dir, 'runs', 'list', '--graph', 'cli-scheduled', '--json');
+    expect(runs.code).toBe(0);
+    expect(JSON.parse(runs.stdout)).toContainEqual(expect.objectContaining({ runId: saved!.runId, status: 'done' }));
+  } finally {
+    child.kill('SIGTERM');
+    await child.exited;
+  }
+}, 30000);
+
+test('a scheduled mine graph refuses a later peer edit without killing its schedule', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-mine-schedule-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const mineDir = join(stateRoot, 'graphs');
+  mkdirSync(mineDir, { recursive: true });
+  const graph = join(mineDir, 'g1.yaml');
+  const executed = join(dir, 'executed');
+  writeFileSync(join(mineDir, 'recipes.yaml'), `a:\n  command: "printf x >> '${executed}'"\n`);
+  writeFileSync(graph, `graph_id: g1\nversion: 1\nentry_node: a\nterminal_nodes: [done]\ntriggers:\n  schedule: { type: interval, interval: 1000 }\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
+  const child = Bun.spawn(['bun', join(root, 'bin/elanous.mjs'), `--test=${stateRoot}`, 'graph', 'tick', graph, '--schedule'], {
+    cwd: dir, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
+  });
+  try {
+    for (let i = 0; i < 150 && !existsSync(executed); i++) {
+      if (child.exitCode !== null) break;
+      await Bun.sleep(100);
+    }
+    expect(readFileSync(executed, 'utf8')).toBe('x');
+    writePeerEdit(mineDir, 'g1', { editedBy: 'peer:12345678', version: 'peer-v1', at: new Date().toISOString() });
+    const before = readFileSync(executed, 'utf8');
+    await Bun.sleep(2_500);
+    expect(child.exitCode).toBeNull();
+    expect(readFileSync(executed, 'utf8')).toBe(before);
+    expect(readdirSync(join(stateRoot, 'graph-runs', 'g1')).filter(name => name.endsWith('.json'))).toHaveLength(1);
+  } finally {
+    child.kill('SIGTERM');
+    await child.exited;
+  }
+  expect(await new Response(child.stderr).text()).toContain('graph tick: refused: peer-edit-unapproved');
 }, 30000);
 
 test('graph tick waits for approval and resumes the same run without replaying completed nodes', () => {

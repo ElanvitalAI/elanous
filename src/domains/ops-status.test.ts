@@ -19,13 +19,90 @@ import { buildCronLine, openSchedulesDb, repoRoot, scheduleHealth, type Schedule
 import type { TradeMandate } from './trade-mandate.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 
+describe('opsHealth — graph loop failures', () => {
+  const now = new Date('2026-10-08T12:00:00Z');
+  const runs = [
+    { at: '2026-10-08T11:00:00Z', status: 'failed' as const, failedNodes: ['last-node'] },
+    { at: '2026-10-08T06:00:00Z', status: 'failed' as const, failedNodes: ['earlier'] },
+    { at: '2026-10-07T18:00:00Z', status: 'failed' as const, failedNodes: [] },
+    { at: '2026-10-07T06:00:00Z', status: 'failed' as const, failedNodes: ['first-node'] },
+  ];
+  function check(graphLoopRuns: NonNullable<Parameters<typeof opsHealth>[0]>['graphLoopRuns'], rows: ScheduleRow[] = []) {
+    const store = new TaskStore({ path: ':memory:', noWal: true });
+    try {
+      return opsHealth({ now, missionStore: store, opsDbPath: '/nonexistent/ops_events.db', mandate: null,
+        listScheduleRows: () => rows, recentLogs: () => [], graphLoopRuns });
+    } finally { store.close(); }
+  }
+
+  test('30h of consecutive failures adds one repeated_failure with first failure since and latest failed nodes', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const report = check(() => [{ id: 'nightly-condense', enabled: true, runs: [runs[2]!, runs[0]!, runs[3]!, runs[1]!] }]);
+      expect(report.anomalies).toEqual([{
+        kind: 'repeated_failure', entity: 'loop:nightly-condense',
+        detail: '그래프 루프 nightly-condense 연속 실패 4회 · 2026-10-07T06:00:00Z 부터 · 마지막 실패 노드 last-node',
+        since: '2026-10-07T06:00:00Z',
+      }]);
+      expect(report.healthy).toBe(false);
+      expect(log).toHaveBeenCalledWith('ops.health', 'graph-loop-failure', { loops: 1, flagged: 1 });
+    } finally { log.mockRestore(); }
+  });
+
+  test('short, disabled, interrupted, and exactly-24h failure streaks do not alert', () => {
+    const recent = runs.slice(0, 2);
+    const interrupted = [runs[0]!, { at: '2026-10-08T08:00:00Z', status: 'done' as const, failedNodes: [] }, ...runs.slice(1)];
+    const boundary = [runs[0]!, { at: '2026-10-07T12:00:00Z', status: 'failed' as const, failedNodes: [] }];
+    const report = check(() => [
+      { id: 'short', enabled: true, runs: recent },
+      { id: 'disabled', enabled: false, runs },
+      { id: 'interrupted', enabled: true, runs: interrupted },
+      { id: 'boundary', enabled: true, runs: boundary },
+    ]);
+    expect(report.anomalies.filter(a => a.entity.startsWith('loop:'))).toEqual([]);
+    expect(report.healthy).toBe(true);
+    const withScheduleError = check(() => [{ id: 'disabled', enabled: false, runs }],
+      [schedRow({ id: 'failed', name: 'failed', last_status: 'error', last_run: '2026-10-08T11:00:00Z' })]);
+    expect(withScheduleError.anomalies).toContainEqual({ kind: 'schedule_error', entity: 'failed', detail: '마지막 실행 error', since: '2026-10-08T11:00:00Z' });
+    expect(withScheduleError.anomalies.filter(a => a.entity.startsWith('loop:'))).toEqual([]);
+    expect(withScheduleError.healthy).toBe(false);
+  });
+
+  test('a single failed run older than 24h is not a repeated failure, but two are', () => {
+    const first = { at: '2026-10-07T06:00:00Z', status: 'failed' as const, failedNodes: ['first-node'] };
+    const one = check(() => [{ id: 'one-failure', enabled: true, runs: [first] }]);
+    expect(one.anomalies.filter(a => a.entity === 'loop:one-failure')).toEqual([]);
+    expect(one.healthy).toBe(true);
+
+    const two = check(() => [{ id: 'two-failures', enabled: true, runs: [runs[0]!, first] }]);
+    expect(two.anomalies).toEqual([{
+      kind: 'repeated_failure', entity: 'loop:two-failures',
+      detail: '그래프 루프 two-failures 연속 실패 2회 · 2026-10-07T06:00:00Z 부터 · 마지막 실패 노드 last-node',
+      since: first.at,
+    }]);
+    expect(two.healthy).toBe(false);
+  });
+
+  test('unreadable graph registry logs a skip without hiding schedule or log anomalies', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const report = check(() => { throw new Error('graph registry unavailable'); },
+        [schedRow({ id: 'failed', name: 'failed', last_status: 'error', last_run: '2026-10-08T11:00:00Z' })]);
+      expect(report.anomalies).toContainEqual({ kind: 'schedule_error', entity: 'failed', detail: '마지막 실행 error', since: '2026-10-08T11:00:00Z' });
+      expect(report.healthy).toBe(false);
+      expect(log).toHaveBeenCalledWith('ops.health', 'graph-loop-failure-skipped', { reason: 'graph registry unavailable' });
+      expect(log).toHaveBeenCalledWith('ops.health', 'repeated-failure', { groups: 0, topCount: 0 });
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('opsHealth — repeated failure is isolated from existing health checks', () => {
   test('unreadable logs skip only this check and leave existing anomaly wording untouched', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     const store = new TaskStore({ path: ':memory:', noWal: true });
     const opts = { missionStore: store, opsDbPath: '/nonexistent/ops_events.db', mandate: null,
       listScheduleRows: () => [schedRow({ id: 'failed', name: 'failed', last_status: 'error', last_run: '2026-09-28T06:00:00Z' })],
-      now: new Date('2026-09-28T06:02:00Z') };
+      graphLoopRuns: () => [], now: new Date('2026-09-28T06:02:00Z') };
     try {
       const baseline = opsHealth({ ...opts, recentLogs: () => [] });
       const failed = opsHealth({ ...opts, recentLogs: () => { throw new Error('log DB unavailable'); } });

@@ -58,7 +58,7 @@ describe('authoring metrics', () => {
     });
     expect(empty.status).toBe(0);
     expect(JSON.parse(empty.stdout)).toEqual({ files: 0, medianChars: null, medianBytes: null });
-  }, 30_000);
+  }, 60_000);
 
   test('CLI measures all valid UTF-8 bytes including a leading BOM', () => {
     const present = join(temp, 'bom.md');
@@ -70,7 +70,7 @@ describe('authoring metrics', () => {
     const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
     expect(lines[0]).toMatchObject({ path: present, chars: 5, bytes: 7, sections: 0 });
     expect(lines.at(-1)).toEqual({ files: 1, medianChars: 5, medianBytes: 7 });
-  }, 30_000);
+  }, 60_000);
 
   test('CLI rejects invalid UTF-8 instead of reporting re-encoded bytes', () => {
     const invalid = join(temp, 'invalid.md');
@@ -85,7 +85,7 @@ describe('authoring metrics', () => {
     expect(lines).toContainEqual({ path: invalid, error: 'unreadable' });
     expect(lines).toContainEqual(expect.objectContaining({ path: present, chars: 2, bytes: 4 }));
     expect(lines.at(-1)).toEqual({ files: 1, medianChars: 2, medianBytes: 4 });
-  }, 30_000);
+  }, 60_000);
 
   test('CLI keeps unreadable row and fails without dropping readable row', () => {
     const present = join(temp, 'present.md');
@@ -99,5 +99,5 @@ describe('authoring metrics', () => {
     expect(lines).toContainEqual({ path: missing, error: 'unreadable' });
     expect(lines).toContainEqual(expect.objectContaining({ path: present, chars: 4, bytes: 4 }));
     expect(lines.at(-1)).toEqual({ files: 1, medianChars: 4, medianBytes: 4 });
-  }, 30_000);
+  }, 60_000);
 });

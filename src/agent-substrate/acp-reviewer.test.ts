@@ -6,6 +6,7 @@ import { AcpAgentManager } from '../acp/agent-manager.js';
 import { CODEX_APP_SERVER_CAPS } from '../acp/codex-app-server-agent.js';
 import type { ReviewImage } from './pr-reviewer.js';
 import type { ElanousCapabilities } from '../acp/capabilities.js';
+import { subscriptionReviewerSpawn } from '../self-dev/review-provider-fallback.js';
 
 // ⛔⭐⭐ 기본 백엔드 회귀 가드 (2026-08-01 · JDG-S9).
 //   이 계약은 **아무 테스트도 안 걸고 있었다** — 기본값을 바꿔도 게이트가 초록이었다.
@@ -88,6 +89,32 @@ function reviewAgent(opts: AcpAgentOpts, capabilities?: ElanousCapabilities): Ac
 }
 
 describe('ACP reviewer backend factory', () => {
+  it('uses a review-owned ACP child with the configured executor and scrubbed environment', async () => {
+    const spawn = subscriptionReviewerSpawn({ provider: 'claude-acp' }, {
+      PATH: '/bin', ANTHROPIC_API_KEY: 'key', ANTHROPIC_AUTH_TOKEN: 'token', NODE_ENV: 'test',
+    });
+    let child: { spec: { command: string; args: string[] }; env: NodeJS.ProcessEnv } | undefined;
+    const start = spyOn(AcpAgent.prototype, 'start').mockImplementation(async function (this: AcpAgent) {
+      child = this as unknown as typeof child;
+    });
+    const newSession = spyOn(AcpAgent.prototype, 'newSession').mockResolvedValue('session-1');
+    const prompt = spyOn(AcpAgent.prototype, 'prompt').mockResolvedValue({ stopReason: 'end_turn' });
+    const stop = spyOn(AcpAgent.prototype, 'stop').mockResolvedValue();
+    const manager = spyOn(AcpAgentManager.prototype, 'getAgent');
+    try {
+      await makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env })('review');
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(manager).not.toHaveBeenCalled();
+      expect(child?.spec.command).toBe('teamclaude');
+      expect(child?.spec.args).toEqual(['run', '--auto-fallback', '--', '--dangerously-skip-permissions']);
+      expect(child?.env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(child?.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    } finally {
+      start.mockRestore(); newSession.mockRestore(); prompt.mockRestore(); stop.mockRestore(); manager.mockRestore();
+    }
+  });
   it('canonicalizes a friendly backend alias, records its transport, and uses a review-owned manager', async () => {
     const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
     const agent = reviewAgent({ backendId: 'codex-app-server' });

@@ -93,3 +93,20 @@ export function redactLogRecord(rec: LogRecord, opts: RedactOpts = {}): LogRecor
   const mask = opts.mask ?? defaultMask;
   return { ...rec, data: redactValue(rec.data, keyBlock, mask, new WeakSet()) };
 }
+
+/** Pre-bundle knowledge-pack DLP. Reasons are fixed labels, never source text or secret values.
+ * This is separate from the opt-in log masking path above. */
+const KNOWLEDGE_PACK_DLP_RULES: ReadonlyArray<{ reason: string; pattern: RegExp }> = [
+  { reason: 'secret-value', pattern: /-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY(?: BLOCK)?-----|\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}\b|\b(?:sk-[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|(?:AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}|AIza[A-Za-z0-9_-]{35})\b|\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|private[_-]?key|token)['"]?\s*[=:]\s*['"]?[A-Za-z0-9_./+~-]{16,}/iu },
+  // A key that names a password/secret makes ANY assigned value secret: short or punctuated values count too.
+  // Schema flags (`"secret": true`) are not values.
+  { reason: 'secret-value', pattern: /\b(?:password|passwd|pwd|passphrase|client[_-]?secret|secret)['"]?\s*[=:]\s*(?!(?:true|false|null)\b)(?:"[^"\n]+"|'[^'\n]+'|[^\s'",;{}\[\]]{4,})/iu },
+  { reason: 'personal-information', pattern: /\b01[016789]-?\d{3,4}-?\d{4}\b|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b\d{6}-[1-8]\d{6}\b/iu },
+  { reason: 'internal-identifier', pattern: /(?:사번|사내\s*식별자|내부\s*식별자|employee[_ -]?id|internal[_ -]?id)\s*(?:[:=]|\s)\s*[A-Za-z0-9][A-Za-z0-9_-]{3,}/iu },
+  { reason: 'sales-confidential', pattern: /영업\s*기밀|(?:sales\s+confidential|confidential\s+sales|영업\s*비밀)/iu },
+];
+
+export function scanKnowledgePackDlp(text: string): string[] {
+  const reasons = KNOWLEDGE_PACK_DLP_RULES.filter(({ pattern }) => pattern.test(text)).map(({ reason }) => reason);
+  return [...new Set(reasons)];
+}

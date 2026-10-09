@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, readdirSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { validatePluginDir } from './plugin-maker.js';
 import { runGraph } from '../../graph-runner/runner.js';
-import { generateWizardFiles, type WizardResearchDraft } from './wizard-generate.js';
+import { generateWizardFiles, listWizardDrafts, saveWizardDraft, type WizardResearchDraft } from './wizard-generate.js';
 
 const roots: string[] = [];
 function temp(): string {
@@ -93,6 +93,69 @@ test('refuses to replace existing scaffold connectors without changing files', (
   expect(readdirSync(dir).sort()).toEqual(['graphs', 'plugin.json']);
 });
 
+test('explicit regeneration updates only wizard-owned text and preserves the graph', async () => {
+  const dir = temp();
+  generateWizardFiles(dir, 'weather-research', draft);
+  const graph = readFileSync(join(dir, 'graphs/weather-research.yaml'), 'utf8');
+  const recipe = readFileSync(join(dir, 'graphs/recipes.yaml'), 'utf8');
+  const files = generateWizardFiles(dir, 'weather-research', {
+    description: 'Summarize tomorrow’s forecast.',
+    connectors: [{ id: 'forecast', credentials: [{ name: 'FORECAST_TOKEN' }] }],
+    skill: { description: 'Forecast summary', instructions: 'Summarize tomorrow.', requires: [] },
+  }, { regenerate: true });
+  expect(files).toEqual(['plugin.json', 'README.md', 'skills/weather-research/SKILL.md']);
+  expect(JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8')).description).toBe('Summarize tomorrow’s forecast.');
+  expect(readFileSync(join(dir, 'skills/weather-research/SKILL.md'), 'utf8')).toContain('Summarize tomorrow.');
+  expect(readFileSync(join(dir, 'graphs/weather-research.yaml'), 'utf8')).toBe(graph);
+  expect(readFileSync(join(dir, 'graphs/recipes.yaml'), 'utf8')).toBe(recipe);
+  expect(await validatePluginDir(dir)).toEqual([]);
+  expect(() => generateWizardFiles(dir, 'weather-research', draft)).toThrow('already exists');
+  expect(() => generateWizardFiles(dir, 'weather-research', { ...draft,
+    connectors: [{ id: 'forecast', credentials: [{ name: 'TOKEN', value: 'secret' }] }],
+  } as unknown as WizardResearchDraft, { regenerate: true })).toThrow('names only');
+  expect(readFileSync(join(dir, 'graphs/weather-research.yaml'), 'utf8')).toBe(graph);
+});
+
+test('regeneration refuses non-wizard scaffold without changing it', () => {
+  const dir = temp();
+  mkdirSync(dir, { recursive: true });
+  const manifest = JSON.stringify({ name: 'weather-research', extensions: { 'ai.elanous': { connectors: [] } } });
+  writeFileSync(join(dir, 'plugin.json'), manifest);
+  expect(() => generateWizardFiles(dir, 'weather-research', draft, { regenerate: true })).toThrow('existing research draft');
+  expect(readFileSync(join(dir, 'plugin.json'), 'utf8')).toBe(manifest);
+});
+
+test('regeneration leaves user-owned README intact after generation', () => {
+  const dir = temp();
+  generateWizardFiles(dir, 'weather-research', draft);
+  const path = join(dir, 'README.md');
+  writeFileSync(path, 'Custom documentation\n');
+  expect(generateWizardFiles(dir, 'weather-research', { ...draft, description: 'Revised' }, { regenerate: true }))
+    .toEqual(['plugin.json', 'skills/weather-research/SKILL.md']);
+  expect(readFileSync(path, 'utf8')).toBe('Custom documentation\n');
+});
+
+test('wizard draft inventory survives reload and regeneration without touching the install ledger', () => {
+  const parent = temp();
+  expect(listWizardDrafts(parent)).toEqual([]);
+  saveWizardDraft(parent, 'weather-research', draft);
+  expect(listWizardDrafts(parent)).toEqual([{ name: 'weather-research', description: draft.description, draft }]);
+  expect(() => saveWizardDraft(parent, 'weather-research', draft)).toThrow('already exists');
+  saveWizardDraft(parent, 'weather-research', { ...draft, description: 'Tomorrow weather.' }, true);
+  expect(listWizardDrafts(parent)[0]?.description).toBe('Tomorrow weather.');
+  expect(readdirSync(parent)).toEqual(['weather-research']);
+  expect(() => saveWizardDraft(parent, '../escape', draft)).toThrow('invalid wizard plugin name');
+});
+
+test('browser wizard rejects a symlinked draft directory without touching the target', () => {
+  const parent = temp();
+  const outside = temp();
+  writeFileSync(join(outside, 'sentinel'), 'unchanged');
+  symlinkSync(outside, join(parent, 'weather-research'));
+  expect(() => saveWizardDraft(parent, 'weather-research', draft, true)).toThrow('local directory');
+  expect(readFileSync(join(outside, 'sentinel'), 'utf8')).toBe('unchanged');
+});
+
 test('adds research files to an existing maker scaffold without replacing its graph', () => {
   const dir = temp();
   mkdirSync(join(dir, 'graphs'));
@@ -106,4 +169,8 @@ test('adds research files to an existing maker scaffold without replacing its gr
     .toEqual([{ id: 'weather', fields: [{ name: 'WEATHER_API_KEY', secret: true }] }]);
   expect(manifest.extensions['ai.elanous'].researchDraft).toBe(true);
   expect(() => generateWizardFiles(dir, 'weather-research', draft)).toThrow('already exists');
+  expect(generateWizardFiles(dir, 'weather-research', { ...draft, description: 'Revised scaffold draft' }, { regenerate: true }))
+    .toEqual(['plugin.json', 'skills/weather-research/SKILL.md']);
+  expect(readFileSync(join(dir, 'graphs/weather-research.yaml'), 'utf8')).toBe('original graph\n');
+  expect(JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8')).description).toBe('Revised scaffold draft');
 });

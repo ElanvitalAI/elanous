@@ -7,7 +7,7 @@ import type { PushPayload, SendPushResult } from '../web-push/sender.js';
 import type { PushSubscriptionRecord } from '../web-push/subscriptions.js';
 import { DecisionCardService, renderCard } from './decision-cards.js';
 import { DecisionLedger, type RaiseInput } from './decision-ledger.js';
-import { webPushDecisionTransport } from './web-push-decision-cards.js';
+import { WEB_PUSH_URGENT_WINDOW_MS, webPushDecisionTransport, webPushUrgency } from './web-push-decision-cards.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -36,6 +36,80 @@ function fixture() {
 }
 
 describe('AN1a web push decision cards', () => {
+  test('webPushUrgency distinguishes no deadline, unreadable deadline, near deadline and irreversible category', () => {
+    const f = fixture();
+    const entry = f.ledger.raise(input());
+    expect(webPushUrgency(entry, start)).toBe('not-urgent');
+    expect(webPushUrgency({ ...entry, dueAt: 'not-a-date' }, start)).toBe('due-unreadable');
+    expect(webPushUrgency({ ...entry, dueAt: '' }, start)).toBe('due-unreadable');
+    expect(webPushUrgency({ ...entry, dueAt: new Date(start.getTime() + 3600_000).toISOString() }, start)).toBe('due-soon');
+    expect(webPushUrgency({ ...entry, category: 'secret' }, start)).toBe('irreversible');
+    expect(webPushUrgency({ ...entry, dueAt: start.toISOString() }, start)).toBe('due-soon');
+    expect(WEB_PUSH_URGENT_WINDOW_MS).toBe(24 * 3600_000);
+    expect(webPushUrgency({ ...entry, dueAt: new Date(start.getTime() + WEB_PUSH_URGENT_WINDOW_MS).toISOString() }, start)).toBe('due-soon');
+    expect(webPushUrgency({ ...entry, dueAt: new Date(start.getTime() + WEB_PUSH_URGENT_WINDOW_MS + 1).toISOString() }, start)).toBe('not-urgent');
+  });
+
+  test('urgency-filtered push sends only irreversible and due-soon decisions', async () => {
+    const f = fixture();
+    let current = start;
+    const service = new DecisionCardService({ transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => current,
+      sendFilter: (entry, now) => webPushUrgency(entry, now) !== 'not-urgent' });
+    await service.tick();
+    current = new Date(start.getTime() + 1000);
+    const ordinary = f.ledger.raise(input({ title: '게시판 결정' }));
+    const money = f.ledger.raise(input({ title: '지출 결정', category: 'money' }));
+    const near = f.ledger.raise(input({ title: '임박한 결정', dueAt: new Date(current.getTime() + 3 * 3600_000).toISOString() }));
+    expect((await service.tick()).sent).toBe(2);
+    expect(f.payloads.map(payload => payload.tag).sort()).toEqual([`decision-${money.id}`, `decision-${near.id}`].sort());
+    expect(f.payloads.some(payload => payload.tag === `decision-${ordinary.id}`)).toBe(false);
+    const state = JSON.parse(readFileSync(join(f.dir, 'decisions', 'cards-webpush.json'), 'utf8')) as { cards: Record<string, unknown> };
+    expect(state.cards[ordinary.id]).toBeUndefined();
+  });
+
+  test('deferred deadline is rechecked each tick and observed only once across restarts', async () => {
+    const f = fixture();
+    let current = start;
+    const options = { transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => current,
+      sendFilter: (entry: ReturnType<DecisionLedger['raise']>, now: Date) => webPushUrgency(entry, now) !== 'not-urgent', deferredReason: webPushUrgency };
+    const service = new DecisionCardService(options);
+    const logs: unknown[][] = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+    try {
+      await service.tick();
+      current = new Date(start.getTime() + 1000);
+      const e = f.ledger.raise(input({ dueAt: new Date(current.getTime() + 30 * 3600_000).toISOString() }));
+      expect((await service.tick()).sent).toBe(0);
+      expect(f.payloads).toHaveLength(0);
+      const state = JSON.parse(readFileSync(join(f.dir, 'decisions', 'cards-webpush.json'), 'utf8')) as { cards: Record<string, unknown> };
+      expect(state.cards[e.id]).toBeUndefined();
+      await service.tick();
+      await new DecisionCardService(options).tick();
+      current = new Date(current.getTime() + 7 * 3600_000);
+      expect((await new DecisionCardService(options).tick()).sent).toBe(1);
+      expect(f.payloads.map(payload => payload.tag)).toEqual([`decision-${e.id}`]);
+      expect(logs.filter(args => args[0] === 'decisions.webpush' && args[1] === 'push-deferred' && (args[2] as { id?: string }).id === e.id)).toEqual([
+        ['decisions.webpush', 'push-deferred', { id: e.id, urgency: 'not-urgent' }],
+      ]);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('unreadable due date fails open without crashing the push payload', async () => {
+    const f = fixture();
+    let current = start;
+    const service = new DecisionCardService({ transport: f.transport, ownerIds: [], ledger: f.ledger, now: () => current,
+      sendFilter: (entry, now) => webPushUrgency(entry, now) !== 'not-urgent' });
+    await service.tick();
+    current = new Date(start.getTime() + 1000);
+    const e = f.ledger.raise(input());
+    const list = f.ledger.list.bind(f.ledger);
+    const listSpy = spyOn(f.ledger, 'list').mockImplementation((filters) => list(filters).map(entry => entry.id === e.id ? { ...entry, dueAt: 'not-a-date' } : entry));
+    try {
+      expect((await service.tick()).sent).toBe(1);
+      expect(f.payloads).toMatchObject([{ tag: `decision-${e.id}`, body: '추천안: A · 기한: 읽을 수 없음' }]);
+    } finally { listSpy.mockRestore(); }
+  });
+
   test('no subscriptions: no send, then a newly subscribed device receives a later decision', async () => {
     const f = fixture();
     f.setSubscribers(0);

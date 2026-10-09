@@ -15,10 +15,13 @@ export function latestReleaseRun(result: OpsResult<ReleaseRun[]> | null, now: nu
   return latest;
 }
 
-/** Last node end − run start, in whole minutes; null when either time is missing or unreadable. */
+/** Last ended node on the run path − run start, in whole minutes; null when either time is missing or unreadable. */
 export function finishedMinutes(run: ReleaseRun): number | null {
   const start = Date.parse(run.startedAt);
-  const ends = run.nodes.map((node) => (node.endedAt ? Date.parse(node.endedAt) : Number.NaN)).filter(Number.isFinite);
+  const ends = run.path.map((id) => {
+    const endedAt = run.nodes.find((node) => node.nodeId === id)?.endedAt;
+    return endedAt ? Date.parse(endedAt) : Number.NaN;
+  }).filter(Number.isFinite);
   if (!Number.isFinite(start) || ends.length === 0) return null;
   return Math.max(0, Math.floor((Math.max(...ends) - start) / 60_000));
 }
@@ -39,11 +42,11 @@ export function ReleaseStrip({ result, onSelect, selectedRun, now = Date.now() }
   const doneWithFailedNode = run.status.toLowerCase() === 'done' && current?.ok === false;
   const blocked = !doneWithFailedNode && (current?.ok === false || BLOCKED.test(run.status));
   const summary = blocked ? current?.summary.split(/\r?\n/, 1)[0]?.trim() : null;
-  const elapsed = Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
   // RELEASE-STRIP-DONE — a finished run has no «current node» and its clock must not keep growing.
   const finished = FINISHED.has(run.status.toLowerCase());
   const tookMin = finished ? finishedMinutes(run) : null;
-  return <section aria-label="발행 진행" className="min-w-0 rounded-2xl border bg-card p-3 text-foreground">
+  const elapsed = finished ? null : Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
+  return <section aria-label="발행 진행" {...(selectedRun !== undefined ? { 'data-run-id': run.runId } : {})} className="min-w-0 rounded-2xl border bg-card p-3 text-foreground">
     <button type="button" onClick={() => onSelect(run)} className="flex w-full min-w-0 items-center gap-2 text-left text-sm hover:text-primary">
       <span className="shrink-0 whitespace-nowrap font-semibold">발행 {run.version ?? '판 미상'}</span>
       {finished

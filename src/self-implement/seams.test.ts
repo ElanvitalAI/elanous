@@ -2250,6 +2250,32 @@ describe('defaultSeams.gate — source policy feedback', () => {
     }
   });
 
+  test('a Promise-resolved public-export-import failure blocks the harness gate with its diagnostic', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-public-export-import-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      mkdirSync(join(cwd, 'src'));
+      writeFileSync(join(cwd, 'src/x.ts'), 'export const x = 1;\n');
+      const result = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: async ({ changedFiles }) => {
+          expect(changedFiles).toEqual(['src/x.ts']);
+          await Promise.resolve();
+          return { passed: false, failures: [{ gate: 'public-export-import', lines: ['src/x.ts:1 → src/private.ts'] }] };
+        },
+      }).gate(cwd);
+      expect(result.passed).toBe(false);
+      expect(result.log).toContain('src/x.ts:1 → src/private.ts');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('a passing policy leaves the previous gate.log byte-for-byte intact', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'seam-policy-clean-'));
     try {

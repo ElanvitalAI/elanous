@@ -19,7 +19,9 @@ import { setInProcessOutbound } from '../../domains/outbound-alert.js';
 import { getUserConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join, dirname, relative } from 'node:path';
+import { homedir } from 'node:os';
+import { readdirSync, realpathSync, statSync } from 'node:fs';
 import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
 import { buildGridData, type GridDeps } from './grid.js';
@@ -368,12 +370,12 @@ import {
 } from './workflows.js';
 import { handleTriggersSnapshot } from './triggers.js';
 import { handleWorkflowTemplatesList } from './workflow-templates.js';
-import { handleGraphVersionsGet, handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
+import { graphAccessForRequest, handleGraphAccess, handleGraphAccessPut, handleGraphVersionsGet, handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
 import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
-import { handleGraphWizardPost } from './graph-wizard-api.js';
+import { handleGraphWizardPost, handleGraphWizardPacksGet } from './graph-wizard-api.js';
 import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove } from './plugins-market.js';
+import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave } from './plugins-market.js';
 import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
 import {
   handleWorkflowsList,
@@ -489,6 +491,8 @@ export interface NexusHttpServerOpts {
   fabricPlans?: FabricPlansRouteOpts;
   /** GRAPH-WIZARD 시험 주입(LLM·템플릿 뿌리). 운영은 비워 둔다. */
   graphWizard?: import('../../graph-wizard/generate.js').GraphWizardDeps;
+  /** Roots the remote folder picker may browse (default: the daemon user's home). Tests inject a temp root. */
+  projectFolderRoots?: string[];
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
   outputs?: OutputsDeps;
@@ -846,6 +850,55 @@ export function handleProjectsGet(): Response {
   return jsonResponse({ projects: listProjects() });
 }
 
+function isWithinRoot(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Remote folder picker: lists sub-folders under an allow-listed root only.
+ * Every path is resolved with realpath first, so `..` segments and symlinks cannot escape the roots;
+ * dot-folders are hidden and symlinked entries that point outside the roots are not listed.
+ */
+export function handleProjectFoldersGet(req: Request, roots: string[] = [homedir()]): Response {
+  const allowed: string[] = [];
+  for (const root of roots) {
+    try { allowed.push(realpathSync(root)); } catch { /* a missing root grants nothing */ }
+  }
+  if (allowed.length === 0) return jsonResponse({ error: 'folder_unavailable' }, 404);
+  const requested = new URL(req.url).searchParams.get('path') ?? allowed[0]!;
+  if (!isAbsolute(requested) || requested.includes('\0')) return jsonResponse({ error: 'invalid_folder' }, 400);
+  let path: string;
+  try { path = realpathSync(requested); }
+  catch {
+    debug.log('nexus.projects', 'folders-unavailable', { reason: 'missing' });
+    return jsonResponse({ error: 'folder_unavailable' }, 404);
+  }
+  if (!allowed.some(root => isWithinRoot(path, root))) {
+    debug.log('nexus.projects', 'folders-refused', { reason: 'outside-roots' });
+    return jsonResponse({ error: 'outside_allowed_roots' }, 403);
+  }
+  try {
+    if (!statSync(path).isDirectory()) return jsonResponse({ error: 'not_directory' }, 400);
+    const folders = readdirSync(path, { withFileTypes: true })
+      .filter(entry => {
+        if (entry.name.startsWith('.')) return false;
+        if (entry.isDirectory()) return true;
+        if (!entry.isSymbolicLink()) return false;
+        try {
+          const target = realpathSync(join(path, entry.name));
+          return statSync(target).isDirectory() && allowed.some(root => isWithinRoot(target, root));
+        } catch { return false; }
+      })
+      .map(entry => ({ name: entry.name, path: join(path, entry.name) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const atRoot = allowed.includes(path);
+    return jsonResponse({ path, parent: atRoot ? null : dirname(path), folders });
+  } catch {
+    return jsonResponse({ error: 'folder_unavailable' }, 404);
+  }
+}
+
 export async function handleProjectsPost(req: Request): Promise<Response> {
   let body: unknown;
   try { body = await req.json(); }
@@ -996,7 +1049,9 @@ export async function routeRequest(
     const offered = req.headers.get('authorization');
     const fallbackAuthorized = fallbackToken !== undefined && offered?.startsWith('Bearer ') === true
       && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
-    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized)) {
+    const graphPeerAuthorized = (method === 'GET' || method === 'PUT')
+      && graphAccessForRequest(pathname, method, offered?.startsWith('Bearer ') ? offered.slice(7).trim() : null);
+    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) && !graphPeerAuthorized) {
       const name = method === 'POST' && (pathname === '/v1/tasks' || pathname === '/v1/reports/ingest') && opts.metaApi
         ? matchIngestAuthorization(req)?.name
         : undefined;
@@ -1407,7 +1462,12 @@ export async function routeRequest(
     return handleGraphsValidatePost(req, opts.metaApi);
   }
 
-  // GRAPH-WIZARD — 말 → 그래프 YAML(저장 안 함). 다른 /v1/graphs 쓰기와 같은 인증.
+  // GRAPH-WIZARD — 설치된 팩 목록과 말 → 그래프 YAML(저장 안 함). 같은 소유자 인증.
+  if (method === 'GET' && pathname === '/v1/graphs/wizard/packs') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleGraphWizardPacksGet(opts.graphWizard);
+  }
   if (method === 'POST' && pathname === '/v1/graphs/wizard') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
     if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -1419,6 +1479,10 @@ export async function routeRequest(
     return handleFabricPlans(req, opts.fabricPlans);
   }
 
+  if (pathname === '/v1/projects/folders' && method === 'GET') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleProjectFoldersGet(req, opts.projectFolderRoots);
+  }
   if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
@@ -1515,6 +1579,10 @@ export async function routeRequest(
         ...opts.decisions,
       });
     }
+    if (method === 'POST' && pathname === '/v1/plugins/wizard') {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handlePluginWizardSave(req, opts.metaApi, opts.pluginStateRoot);
+    }
     if (method === 'POST' && pathname === '/v1/plugins/install') {
       if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
       return handlePluginsInstall(req, opts.metaApi, opts.pluginStateRoot);
@@ -1534,10 +1602,19 @@ export async function routeRequest(
       if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
       return handlePluginsRemove(req, pluginRemove[1]!, opts.metaApi, opts.pluginStateRoot);
     }
+    if (method === 'PUT' && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
+      if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleGraphAccessPut(pathname, req);
+    }
     if ((method === 'PUT' || method === 'POST') && (pathname.startsWith('/v1/graphs/') || pathname === '/v1/graphs')) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const mutated = await handleGraphsMutation(pathname, req);
+      const peerMayEdit = method === 'PUT' && graphAccessForRequest(pathname, method,
+        req.headers.get('authorization')?.startsWith('Bearer ') ? req.headers.get('authorization')!.slice(7).trim() : null);
+      const ownerAuthorized = checkAuth(req, opts.metaApi);
+      if (!ownerAuthorized && !peerMayEdit) return jsonResponse({ error: 'unauthorized' }, 401);
+      // A peer save is recorded on the graph so every run path refuses it until the owner approves (W9c run guard).
+      const mutated = await handleGraphsMutation(pathname, req, {}, ownerAuthorized ? null
+        : { peerToken: req.headers.get('authorization')!.slice(7).trim() });
       if (mutated) return mutated;
     }
     const cardClose = /^\/v1\/task-cards\/([^/]+)\/close$/.exec(pathname);
@@ -2829,6 +2906,10 @@ export async function routeRequest(
   // surface (`/v1/workflows` · `~/.elanous/workflows-runs/`) covers the same
   // user need.
 
+  if (method === 'GET' && pathname === '/v1/plugins/wizard') {
+    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handlePluginWizardList(req, opts.metaApi, opts.pluginStateRoot);
+  }
   const pluginCredentialsGet = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(pathname);
   if (method === 'GET' && pluginCredentialsGet) {
     if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -2843,6 +2924,10 @@ export async function routeRequest(
     try { syncInstalledPluginNodes(opts.pluginStateRoot ?? elanousStateRoot()); }
     catch (error) { debug.log('graph.kinds', 'installed-sync-failed', { reason: String(error) }); }
     return handleGraphKindsGet(req, opts.metaApi);
+  }
+  if (method === 'GET' && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
+    if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleGraphAccess(pathname, req);
   }
   // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.
   if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname))) {

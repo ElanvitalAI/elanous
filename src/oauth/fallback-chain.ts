@@ -19,9 +19,10 @@
 //   지갑을 여는» 일이 없다. (2026-08-13 실측 · RESEARCH-grok-oauth-… §7b)
 
 import type { RotationCandidate } from './codex-account-rotation.js';
+import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
 
 /** 체인에 놓을 수 있는 칸. ⛔ 모르는 이름은 «조용히 건너뛰지 않고» 거부한다(오타 방어). */
-export const FALLBACK_STEPS = ['codex-rotate', 'grok'] as const;
+export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty'] as const;
 export type FallbackStep = (typeof FALLBACK_STEPS)[number];
 
 /** 기본 체인 — ⛔⭐ **2026-08-20 에 `grok` 이 «기본»으로 들어왔다**(대표 지시).
@@ -75,8 +76,8 @@ export type RotationOutcome =
 export type FallbackDecision =
   /** codex 계정을 갈아탄다(종전 동작). */
   | { readonly action: 'codex-rotate'; readonly to: RotationCandidate }
-  /** 백엔드를 통째로 바꾼다. 지금은 grok 뿐. */
-  | { readonly action: 'switch-backend'; readonly backend: 'grok' }
+  /** 백엔드를 통째로 바꾼다. */
+  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' }
   /** 아무것도 안 한다 — 이유를 «값으로» 남긴다. */
   | { readonly action: 'stay'; readonly why: StayReason };
 
@@ -96,7 +97,9 @@ export type StayReason =
   /** 다음 칸이 grok 인데 grok 자격이 «없다». */
   | 'grok-unavailable'
   /** grok 자격은 있는데 «잔량이 소진»됐다 — 자격 부재와 «다른 값»이다. */
-  | 'grok-exhausted';
+  | 'grok-exhausted'
+  /** claude PTY 의 최근 표본이 성숙 관문을 통과하지 못했거나 읽히지 않는다. */
+  | 'claude-pty-immature';
 
 type FallbackRunPosition =
   | { readonly currentCredentialRateLimited?: false; readonly currentStep?: FallbackStep }
@@ -120,6 +123,8 @@ export type FallbackInput = {
    *   (⇒ 그리고 그 사실은 관측에 값으로 남는다 — 「모르고 갔다」를 셀 수 있다.)
    */
   readonly grokQuota?: 'usable' | 'exhausted' | 'unknown';
+  /** 최근 claude PTY 표본의 순수 성숙 판정. 생략·못 읽음은 전환 불가. */
+  readonly claudePtyMaturity?: ClaudePtyMaturity;
   /**
    * `reset-credit-available` 에서 체인을 타지 않고 머문다.
    * 기본(생략·false)은 `no-candidate` 와 같이 `codex-rotate` 다음 칸을 찾는다.
@@ -148,12 +153,12 @@ export type FallbackInput = {
 export function decideFallback(input: FallbackInput): FallbackDecision {
   const {
     rotation, chain, currentStep, currentCredentialRateLimited = false,
-    grokAvailable, grokQuota = 'unknown', stayOnResetCreditAvailable = false,
+    grokAvailable, grokQuota = 'unknown', claudePtyMaturity, stayOnResetCreditAvailable = false,
   } = input;
 
   if (currentCredentialRateLimited) {
     if (currentStep === undefined) return { action: 'stay', why: 'chain-exhausted' };
-    return stepAfter(chain, currentStep, grokAvailable, grokQuota, 'chain-exhausted');
+    return stepAfter(chain, currentStep, grokAvailable, grokQuota, claudePtyMaturity, 'chain-exhausted');
   }
   if (rotation.reason === 'explicit') return { action: 'stay', why: 'explicit' };
   if (rotation.reason === 'not-reached' || (rotation.reason === 'credit-pace' && !('to' in rotation))) {
@@ -167,13 +172,13 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
     // 회전이 답을 냈는데 체인이 codex-rotate 를 «빼» 놨다면 그 뜻을 존중하고
     // 다음 칸으로 간다(회전을 원치 않는 구성).
     if (chain.includes('codex-rotate')) return { action: 'codex-rotate', to: rotation.to };
-    return stepAfterCodex(chain, grokAvailable, grokQuota, 'chain-exhausted');
+    return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, 'chain-exhausted');
   }
 
   // no-candidate | disabled | reset-credit-available(기본) — codex 축이 끝났다. 다음 칸을 본다.
   // ⛔ 다음 칸이 «없을 때»의 이름만 고른다. 진행(stepAfterCodex)은 그대로다.
   const fallbackWhy = stayReasonWhenCodexAxisEnds(rotation.reason === 'credit-pace' ? 'no-candidate' : rotation.reason);
-  return stepAfterCodex(chain, grokAvailable, grokQuota, fallbackWhy);
+  return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, fallbackWhy);
 }
 
 /** codex 축이 끝났는데 체인 다음 칸도 없을 때 머무는 이유.
@@ -191,9 +196,10 @@ function stepAfterCodex(
   chain: readonly FallbackStep[],
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
+  claudePtyMaturity: ClaudePtyMaturity | undefined,
   whyIfNone: StayReason,
 ): FallbackDecision {
-  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, whyIfNone);
+  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, whyIfNone);
 }
 
 function stepAfter(
@@ -201,20 +207,27 @@ function stepAfter(
   currentStep: FallbackStep | undefined,
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
+  claudePtyMaturity: ClaudePtyMaturity | undefined,
   whyIfNone: StayReason,
 ): FallbackDecision {
   const idx = currentStep === undefined ? -1 : chain.indexOf(currentStep);
   const rest = idx === -1 ? chain : chain.slice(idx + 1);
+  let unavailableWhy: StayReason | undefined;
   for (const step of rest) {
     if (step === 'grok') {
-      // ⛔ 자격 «먼저» — 자격이 없으면 잔량을 물을 것도 없다(그리고 두 사유는 다른 값이다).
-      if (!grokAvailable) return { action: 'stay', why: 'grok-unavailable' };
-      // ⛔ 「모른다」는 통과시킨다 — 못 읽었다고 갈 곳을 없애지 않는다(위 계약 주석).
-      if (grokQuota === 'exhausted') return { action: 'stay', why: 'grok-exhausted' };
+      // 자격 부재와 소진은 다른 값이다. 다음 칸이 있으면 그 칸을 살핀다.
+      if (!grokAvailable) { unavailableWhy = 'grok-unavailable'; continue; }
+      // 「모른다」는 통과시킨다 — 못 읽었다고 갈 곳을 없애지 않는다.
+      if (grokQuota === 'exhausted') { unavailableWhy = 'grok-exhausted'; continue; }
       return { action: 'switch-backend', backend: 'grok' };
     }
+    if (step === 'claude-pty') {
+      // 미성숙·못 읽음은 «건너뛴다» — 뒤에 다른 칸이 있으면 그 칸을 본다(없으면 이 사유로 머문다).
+      if (claudePtyMaturity?.mature !== true) { unavailableWhy = 'claude-pty-immature'; continue; }
+      return { action: 'switch-backend', backend: 'claude' };
+    }
   }
-  return { action: 'stay', why: whyIfNone };
+  return { action: 'stay', why: unavailableWhy ?? whyIfNone };
 }
 
 /** 사람이 읽는 한 줄 — 관측·CLI 표면용. ⛔ 토큰·계정 홈은 넣지 않는다. */

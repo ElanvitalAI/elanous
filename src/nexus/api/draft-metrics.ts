@@ -1,6 +1,8 @@
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import type { DraftMetrics } from '../../self-dev/draft-sweep.js';
+import type { DraftMetrics, OverlapMetrics } from '../../self-dev/draft-sweep.js';
+
+export type CeoDraftMetrics = DraftMetrics & { readonly overlap: OverlapMetrics | null };
 
 /**
  * DRAFT-METRIC — CEO view source. Opening the page must never trigger a GitHub read:
@@ -14,7 +16,7 @@ export type DraftMetricsState = 'measuring' | 'ready' | 'unavailable';
 export interface DraftMetricsSnapshot {
   /** measuring = no value yet and a collection is running · unavailable = no value and the last collection failed. */
   readonly state: DraftMetricsState;
-  readonly metrics: DraftMetrics | null;
+  readonly metrics: CeoDraftMetrics | null;
   /** When the served value was collected (ISO). null without a value. */
   readonly measuredAt: string | null;
   /** A background collection is in flight. */
@@ -24,7 +26,7 @@ export interface DraftMetricsSnapshot {
 }
 
 export interface DraftMetricsSourceOptions {
-  readonly collect?: () => Promise<DraftMetrics>;
+  readonly collect?: () => Promise<CeoDraftMetrics>;
   readonly ttlMs?: number;
   readonly failureRetryMs?: number;
   readonly now?: () => number;
@@ -43,17 +45,29 @@ function isMetrics(value: unknown): value is DraftMetrics {
     && nullableNumber('oldestAgeHours') && nullableNumber('conversion48h');
 }
 
-/** Parses the CLI's single JSON line; anything else is a failed collection, never a zero. */
-export function parseDraftMetricsOutput(stdout: string): DraftMetrics {
+function isOverlapMetrics(value: unknown): value is OverlapMetrics {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const count = (key: string) => row[key] === null || (Number.isInteger(row[key]) && (row[key] as number) >= 0);
+  const nullableNumber = (key: string) => row[key] === null || (typeof row[key] === 'number' && Number.isFinite(row[key]) && (row[key] as number) >= 0);
+  return ['launches24h', 'launched', 'unmeasured', 'linked', 'autoLanded', 'salvaged', 'salvageUnmeasured'].every(count)
+    && typeof row.sourceIncomplete === 'boolean' && nullableNumber('secondSiblingMedianHours')
+    && (row.autoRate === null || (typeof row.autoRate === 'number' && Number.isFinite(row.autoRate) && row.autoRate >= 0 && row.autoRate <= 1));
+}
+
+/** Parses the CLI's single JSON line; malformed draft values fail, malformed overlap is unmeasured. */
+export function parseDraftMetricsOutput(stdout: string): CeoDraftMetrics {
   const line = stdout.trim().split('\n').reverse().find((text) => text.trim().startsWith('{'));
   if (!line) throw new Error('draft metrics: no JSON output');
   const parsed: unknown = JSON.parse(line);
   if (!isMetrics(parsed)) throw new Error('draft metrics: malformed output');
   const { inventory, oldestAgeHours, needsOwner, converted48h, cohort48h, conversion48h } = parsed;
-  return { inventory, oldestAgeHours, needsOwner, converted48h, cohort48h, conversion48h };
+  const candidate = (parsed as DraftMetrics & { overlap?: unknown }).overlap;
+  return { inventory, oldestAgeHours, needsOwner, converted48h, cohort48h, conversion48h,
+    overlap: isOverlapMetrics(candidate) ? candidate : null };
 }
 
-async function collectViaCli(): Promise<DraftMetrics> {
+async function collectViaCli(): Promise<CeoDraftMetrics> {
   const root = join(import.meta.dir, '../../..');
   const proc = Bun.spawn(['bun', join(root, 'bin/elanous.mjs'), 'harness', 'drafts', 'metrics', '--json'], {
     cwd: root, stdout: 'pipe', stderr: 'pipe',
@@ -75,7 +89,7 @@ export function createDraftMetricsSource(options: DraftMetricsSourceOptions = {}
   const ttl = options.ttlMs ?? DRAFT_METRICS_TTL_MS;
   const retry = options.failureRetryMs ?? DRAFT_METRICS_FAILURE_RETRY_MS;
   const now = options.now ?? Date.now;
-  let value: { metrics: DraftMetrics; at: number } | null = null;
+  let value: { metrics: CeoDraftMetrics; at: number } | null = null;
   let failure: { reason: string; at: number } | null = null;
   let inFlight: Promise<void> | null = null;
 

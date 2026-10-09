@@ -7,6 +7,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { useTheme, THEMES } from '@/components/providers/ThemeProvider';
+import {
+  MERMAID_THEME_PREFERENCES,
+  readMermaidThemePreference,
+  writeMermaidThemePreference,
+  type MermaidThemePreference,
+} from '@/components/vault/mermaid-theme';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
@@ -56,6 +62,34 @@ import { BuildInfoCard } from './BuildInfoCard';
 import { MenuVisibilityCard } from './MenuVisibilityCard';
 
 const PROVIDER_OPTIONS = ['', 'claude', 'gemini', 'grok', 'codex'];
+
+export function MermaidThemeSelector() {
+  const [mermaidTheme, setMermaidTheme] = useState<MermaidThemePreference>(readMermaidThemePreference);
+  const chooseMermaidTheme = (value: MermaidThemePreference) => {
+    setMermaidTheme(value);
+    writeMermaidThemePreference(value);
+  };
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium">Mermaid theme</h2>
+      <p className="text-xs text-muted-foreground">자동은 밝은 default 도식입니다. 노트의 init 테마 지시가 이 설정보다 우선합니다.</p>
+      <div className="flex flex-wrap gap-2" role="group" aria-label="Mermaid theme">
+        {MERMAID_THEME_PREFERENCES.map((choice) => (
+          <Button
+            key={choice}
+            type="button"
+            variant={mermaidTheme === choice ? 'default' : 'outline'}
+            size="sm"
+            aria-pressed={mermaidTheme === choice}
+            onClick={() => chooseMermaidTheme(choice)}
+          >
+            {choice === 'auto' ? '자동' : choice}
+          </Button>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 interface HealthState {
   status: 'idle' | 'loading' | 'ok' | 'error';
@@ -1149,6 +1183,8 @@ export function SettingsPanel() {
           ))}
         </div>
       </section>
+
+      <MermaidThemeSelector />
 
       {/* Phase 3 (2026-05-19) — Persona description editor.
           id="personas" anchor 가 본 카드 자체에 있음 (PersonaCard 내부 section).

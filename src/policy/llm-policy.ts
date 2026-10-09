@@ -4,7 +4,7 @@ import { isScalar, parseDocument } from 'yaml';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { DEFAULT_FALLBACK_CHAIN, isFallbackStep, type FallbackStep } from '../oauth/fallback-chain.js';
 import { isCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
-import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseRoleLlmEntry, type RoleLlmConfig } from '../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig } from '../user-config.js';
 
 export interface LlmPolicy {
   version: 1;
@@ -22,7 +22,7 @@ export interface LlmPolicy {
     grants: Array<{ account: string; amount: number; expires: string; source: string }>;
     pace?: { targetPerDay: number; until: string; why?: string };
   };
-  caps: { codex: { harness: number; pod: number; tox: number; intake: number; headroom: number }; grok: { weekly: number; tox: number; intake: number } };
+  caps: { codex: { harness: number; pod: number; tox: number; intake: number; headroom: number }; grok: { weekly: number; tox: number; intake: number }; claude: { harness: number } };
   resetCredits: { redeem: 'human' };
   alerts: { lowRemainingPercent: number; resetCreditExpiryDays: number; creditsStep: number };
 }
@@ -71,6 +71,7 @@ export function defaultLlmPolicy(): LlmPolicy {
     caps: {
       codex: { harness: DEFAULT_BUDGET_GATE_MAX_USED_PERCENT['openai-codex']!, pod: 95, tox: 60, intake: 80, headroom: 15 },
       grok: { weekly: DEFAULT_BUDGET_GATE_MAX_USED_PERCENT.grok!, tox: 50, intake: 48 },
+      claude: { harness: 60 },
     },
     resetCredits: { redeem: 'human' },
     alerts: { lowRemainingPercent: 10, resetCreditExpiryDays: 7, creditsStep: 5000 },
@@ -103,8 +104,10 @@ export function validateLlmPolicy(input: unknown): LlmPolicyValidation {
   const grants = (v: unknown) => Array.isArray(v) && v.every(g => object(g)
     && Object.keys(g).every(k => ['account', 'amount', 'expires', 'source'].includes(k))
     && nonempty(g.account) && positive(g.amount) && date(g.expires) && nonempty(g.source));
-  const roles = (v: unknown) => object(v) && Object.entries(v).every(([role, spec]) => MODEL_ROLES.some(r => r === role)
-    && object(spec) && Object.keys(spec).every(k => ['provider', 'tier', 'model'].includes(k)) && parseRoleLlmEntry(spec).ok);
+  const roles = (v: unknown) => object(v) && Object.entries(v).every(([role, spec]) => role === 'reviewer'
+    ? !!parseSubscriptionReviewerSpec(spec)
+    : MODEL_ROLES.some(r => r === role) && object(spec)
+      && Object.keys(spec).every(k => ['provider', 'tier', 'model'].includes(k)) && parseRoleLlmEntry(spec).ok);
   check(input, 'policy', {
     version: (v: unknown) => v === 1,
     default: { provider: (v: unknown) => nonempty(v) && RUNTIME_LLM_PROVIDER_NAMES.some(p => p === v), model: nonempty },
@@ -122,7 +125,7 @@ export function validateLlmPolicy(input: unknown): LlmPolicyValidation {
         && Object.keys(v).every(k => ['targetPerDay', 'until', 'why'].includes(k)),
     },
     caps: { codex: { harness: percent, pod: percent, tox: percent, intake: percent, headroom: percent },
-      grok: { weekly: percent, tox: percent, intake: percent } },
+      grok: { weekly: percent, tox: percent, intake: percent }, claude: { harness: percent } },
     resetCredits: { redeem: (v: unknown) => v === 'human' },
     alerts: { lowRemainingPercent: percent, resetCreditExpiryDays: positive, creditsStep: positive },
   });
@@ -191,7 +194,9 @@ export function loadLlmPolicy(opts: LoadLlmPolicyOptions = {}): LoadedLlmPolicy 
     add('llm.provider', llm.provider, base, 'provider', v => nonempty(v) && RUNTIME_LLM_PROVIDER_NAMES.some(p => p === v));
     add('llm.model', llm.model, base, 'model', nonempty);
     if (Object.keys(base).length) overlay.default = base;
-    add('roleLlm', legacy.roleLlm, overlay, 'roles', v => object(v) && Object.entries(v).every(([r, spec]) => MODEL_ROLES.some(k => k === r) && parseRoleLlmEntry(spec).ok));
+    add('roleLlm', legacy.roleLlm, overlay, 'roles', v => object(v) && Object.entries(v).every(([r, spec]) => r === 'reviewer'
+      ? !!parseSubscriptionReviewerSpec(spec)
+      : MODEL_ROLES.some(k => k === r) && parseRoleLlmEntry(spec).ok));
     add('llm.fallbackChain', llm.fallbackChain, overlay, 'fallback', v => Array.isArray(v) && v.length > 0 && v.every(isFallbackStep) && new Set(v).size === v.length);
     const codex: Obj = {};
     add('llm.codexAccountOrder', llm.codexAccountOrder, codex, 'order', v => Array.isArray(v) && v.every(nonempty));

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { checklistHistory, listChecklist, devVersion } from '../release-loop/checklist.js';
+import { checklistHistory, listChecklist, devVersion, refRoots } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import { tmpdir } from 'node:os';
@@ -68,6 +68,42 @@ describe('release checklist CLI', () => {
       jsonOutput.mockRestore();
       resetElanousConfigDir();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('refs --lint reads the git-root document and reports both directions in text/JSON without changing the ledger', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-refs-lint-cli-'));
+    const repo = realpathSync(mkdtempSync(join(tmpdir(), 'release-refs-lint-repo-')));
+    mkdirSync(join(repo, 'docs', 'sub'), { recursive: true });
+    writeFileSync(join(repo, 'docs', 'RFC-x.md'), '# RFC\n## A1. first\n### A2. second\n#### A3. third\n');
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    setElanousConfigDir(dir);
+    const previous = process.cwd();
+    const lines: string[] = [];
+    const logs: unknown[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { if (category === 'release.checklist' && event === 'refs-lint') logs.push(data); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      process.chdir(join(repo, 'docs', 'sub'));
+      expect(refRoots()).toContain(repo);
+      await run('--version', '9.9.8', 'add', 'A', 'first', '--ref', 'docs/RFC-x.md#A1');
+      await run('--version', '9.9.9', 'add', 'Z', 'missing', '--ref', 'docs/RFC-x.md#Z9');
+      await run('--version', '9.9.9', 'add', 'W', 'whole', '--ref', 'docs/RFC-x.md');
+      const before = [listChecklist('9.9.8'), listChecklist('9.9.9')];
+      lines.length = 0;
+      await run('refs', 'docs/RFC-x.md', '--lint', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toEqual({ doc: 'docs/RFC-x.md', sections: ['A1', 'A2', 'A3'], uncoveredSections: ['A2', 'A3'], danglingRefs: [{ version: '9.9.9', id: 'Z', ref: 'docs/RFC-x.md#Z9' }] });
+      expect(logs).toContainEqual({ doc: 'docs/RFC-x.md', sections: 3, uncovered: 2, dangling: 1 });
+      lines.length = 0;
+      await run('refs', 'docs/RFC-x.md', '--lint');
+      expect(lines).toEqual(['칸 없는 절: A2, A3', '없는 절을 가리키는 칸: 9.9.9 Z docs/RFC-x.md#Z9', '절 3 · 칸 없는 절 2 · 없는 절을 가리키는 칸 1']);
+      expect([listChecklist('9.9.8'), listChecklist('9.9.9')]).toEqual(before);
+      await expect(run('refs', 'docs/no-such-doc.md', '--lint')).rejects.toThrow('없는 문서');
+    } finally {
+      process.chdir(previous); observation.mockRestore(); output.mockRestore(); jsonOutput.mockRestore(); resetElanousConfigDir();
+      rmSync(dir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true });
     }
   });
 

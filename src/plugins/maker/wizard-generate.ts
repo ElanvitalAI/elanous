@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 /** Research is descriptive. Credential values are never an input to the generator. */
@@ -16,7 +16,7 @@ const SLUG = /^[a-z0-9][a-z0-9-]{1,31}$/;
 const FIELD = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 
 /** Materialize a research draft; its graph steps fail until the requested processing is implemented. */
-export function generateWizardFiles(dir: string, slug: string, draft: WizardResearchDraft): string[] {
+export function generateWizardFiles(dir: string, slug: string, draft: WizardResearchDraft, options: { regenerate?: boolean } = {}): string[] {
   if (!SLUG.test(slug)) throw new Error(`invalid wizard plugin name: ${slug}`);
   if (!draft || typeof draft.description !== 'string' || !draft.description.trim()) throw new Error('wizard description is required');
   if (draft.connectors !== undefined && !Array.isArray(draft.connectors)) throw new Error('invalid wizard connectors');
@@ -48,21 +48,30 @@ export function generateWizardFiles(dir: string, slug: string, draft: WizardRese
   }
   const manifestPath = join(dir, 'plugin.json');
   const existing = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-    name: string; extensions: { 'ai.elanous': { connectors?: unknown[]; graphs?: string[]; researchDraft?: boolean } };
+    name: string; description?: string; extensions: { 'ai.elanous': { connectors?: unknown[]; graphs?: string[]; researchDraft?: boolean } };
   } : undefined;
   if (existing && (existing.name !== slug || !existing.extensions?.['ai.elanous'])) {
     throw new Error('wizard scaffold name or extension mismatch');
   }
-  if (existsSync(join(dir, `skills/${slug}/SKILL.md`))) {
+  const skillPath = join(dir, `skills/${slug}/SKILL.md`);
+  const readmePath = join(dir, 'README.md');
+  const wizardReadme = options.regenerate && existsSync(readmePath) &&
+    readFileSync(readmePath, 'utf8').includes('Research draft only. Connector declarations contain credential names, not values.');
+  if (options.regenerate) {
+    if (!existing || existing.extensions['ai.elanous'].researchDraft !== true || !existsSync(skillPath)) {
+      throw new Error('wizard regeneration requires an existing research draft');
+    }
+  } else if (existsSync(skillPath)) {
     throw new Error(`wizard file already exists: skills/${slug}/SKILL.md`);
   }
   const scaffoldConnectors = existing?.extensions['ai.elanous'].connectors;
-  if (scaffoldConnectors !== undefined && (!Array.isArray(scaffoldConnectors) || scaffoldConnectors.length > 0)) {
+  if (!options.regenerate && scaffoldConnectors !== undefined && (!Array.isArray(scaffoldConnectors) || scaffoldConnectors.length > 0)) {
     throw new Error('wizard cannot replace existing scaffold connectors');
   }
   const manifest = existing ?? { name: slug, version: '0.1.0', description: draft.description,
     extensions: { 'ai.elanous': { graphs: [`./graphs/${slug}.yaml`],
       capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'], connectors: [] as unknown[], researchDraft: true } } };
+  if (options.regenerate) manifest.description = draft.description;
   manifest.extensions['ai.elanous'].connectors = connectors;
   manifest.extensions['ai.elanous'].researchDraft = true;
 
@@ -90,14 +99,69 @@ process.exitCode = 1;
     ['README.md', `# ${slug}\n\n${draft.description}\n\nResearch draft only. Connector declarations contain credential names, not values. The graph cannot perform the requested processing yet: implement and validate its steps, then remove extensions["ai.elanous"].researchDraft from plugin.json before installing or running it. No messages are sent.\n`],
     [`skills/${slug}/SKILL.md`, `---\n${stringifyYaml({ name: slug, description: draft.skill?.description ?? draft.description, requires: [...new Set(requires)] })}---\n\n${draft.skill?.instructions ?? draft.description}\n`],
   ];
-  const generated = existing ? files.filter(([path]) => path === 'plugin.json' || path.startsWith('skills/')) : files;
+  const generated = existing ? files.filter(([path]) => path === 'plugin.json' || path.startsWith('skills/') ||
+    (options.regenerate && wizardReadme && path === 'README.md')) : files;
   for (const [path] of generated) {
-    if (path !== 'plugin.json' && existsSync(join(dir, path))) throw new Error(`wizard file already exists: ${path}`);
+    if (path !== 'plugin.json' && !(options.regenerate && (path === 'README.md' || path.startsWith('skills/'))) && existsSync(join(dir, path))) {
+      throw new Error(`wizard file already exists: ${path}`);
+    }
   }
   for (const [path, content] of generated) {
     const target = join(dir, path);
     mkdirSync(join(target, '..'), { recursive: true });
-    writeFileSync(target, content, { flag: path === 'plugin.json' && existing ? 'w' : 'wx' });
+    writeFileSync(target, content, { flag: existing && (path === 'plugin.json' || options.regenerate) ? 'w' : 'wx' });
   }
   return generated.map(([path]) => path);
+}
+
+/** Browser wizard drafts are stored outside the install ledger. Only wizard-owned directories are listed. */
+export function listWizardDrafts(parent: string): Array<{ name: string; description: string; draft: WizardResearchDraft }> {
+  if (!existsSync(parent)) return [];
+  return readdirSync(parent, { withFileTypes: true }).filter(entry => entry.isDirectory() && SLUG.test(entry.name)).flatMap(entry => {
+    const dir = join(parent, entry.name);
+    try {
+      const manifestPath = join(dir, 'plugin.json');
+      const skillDir = join(dir, 'skills', entry.name);
+      const skillPath = join(skillDir, 'SKILL.md');
+      if (lstatSync(manifestPath).isSymbolicLink() || lstatSync(skillDir).isSymbolicLink() || lstatSync(skillPath).isSymbolicLink()) return [];
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+        name?: string; description?: string; extensions?: { 'ai.elanous'?: { researchDraft?: boolean; connectors?: Array<{ id: string; fields: Array<{ name: string }> }> } } };
+      if (manifest.name !== entry.name || manifest.extensions?.['ai.elanous']?.researchDraft !== true) return [];
+      const skill = readFileSync(skillPath, 'utf8');
+      const parts = /^---\n([\s\S]*?)---\n\n([\s\S]*)$/.exec(skill);
+      if (!parts || typeof manifest.description !== 'string') return [];
+      const meta = parseYaml(parts[1]!) as { description?: string; requires?: string[] };
+      return [{ name: entry.name, description: manifest.description, draft: {
+        description: manifest.description,
+        connectors: manifest.extensions['ai.elanous'].connectors?.map(connector => ({ id: connector.id, credentials: connector.fields.map(field => ({ name: field.name })) })) ?? [],
+        skill: { description: meta.description ?? manifest.description, instructions: parts[2]!.trimEnd(), requires: meta.requires ?? [] },
+      } }];
+    } catch { return []; }
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function saveWizardDraft(parent: string, slug: string, draft: WizardResearchDraft, regenerate = false): string[] {
+  if (!SLUG.test(slug)) throw new Error(`invalid wizard plugin name: ${slug}`);
+  const requested = resolve(parent);
+  if (existsSync(requested) && lstatSync(requested).isSymbolicLink()) throw new Error('wizard parent cannot be a symlink');
+  // Ancestors may be symlinks (macOS /var -> /private/var); compare the draft directory against the real parent.
+  const base = existsSync(requested) ? realpathSync(requested) : requested;
+  const dir = resolve(base, slug);
+  if (!dir.startsWith(`${base}${sep}`)) throw new Error('invalid wizard directory');
+  if (existsSync(dir) && (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory() || realpathSync(dir) !== dir)) {
+    throw new Error('wizard directory must be a local directory');
+  }
+  if (regenerate && existsSync(join(dir, 'skills')) && lstatSync(join(dir, 'skills')).isSymbolicLink()) {
+    throw new Error('wizard skills cannot be a symlink');
+  }
+  if (!regenerate && existsSync(dir)) throw new Error('wizard directory already exists');
+  if (regenerate && existsSync(join(dir, 'skills', slug)) && lstatSync(join(dir, 'skills', slug)).isSymbolicLink()) {
+    throw new Error('wizard skills cannot be a symlink');
+  }
+  if (regenerate && ['plugin.json', 'README.md', `skills/${slug}/SKILL.md`].some(file => {
+    const path = join(dir, file);
+    return existsSync(path) && lstatSync(path).isSymbolicLink();
+  })) throw new Error('wizard regeneration cannot follow symlinks');
+  if (!existsSync(base) && !regenerate) mkdirSync(base, { recursive: true });
+  return generateWizardFiles(dir, slug, draft, { regenerate });
 }

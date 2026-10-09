@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { ReleaseRunView } from '../nexus/api/ops-api.js';
-import { ALIVE_EVERY_MS, diffRun, markOf, releaseNowText, releaseWatchTick, type WatchState } from './release-watch.js';
+import { ALIVE_EVERY_MS, diffRun, markOf, releaseGraphFile, releaseNowText, releaseWatchTick, type WatchState } from './release-watch.js';
+
+/** 시험은 이 기계의 실제 런 원장을 읽지 않는다 — 그래프 스냅샷 없음으로 고정. */
+const NO_GRAPH = (): string | undefined => undefined;
 
 const T0 = Date.parse('2026-10-07T09:00:00.000Z');
 const PATH = ['version-release', 'cutoff', 'gate', 'publish', 'done'];
@@ -27,6 +33,7 @@ function harness(initial: WatchState = { runs: {} }, opts: { away?: boolean; sen
     send: (text: string) => { sent.push(text); return opts.sendOk ?? true; },
     sendUrgent: (text: string) => { urgent.push(text); return opts.sendOk ?? true; },
     now: () => now,
+    graphFile: NO_GRAPH,
   };
   return {
     deps, sent, urgent,
@@ -39,7 +46,72 @@ describe('AWAY-MODE-1 — 발행 전이 따라가기', () => {
   test('처음 본 도는 런은 «따라가기 시작» 한 줄 — 지난 노드를 쏟지 않는다', () => {
     const d = diffRun(undefined, run({ ended: 2, runningAt: new Date(T0 + 5 * 60_000).toISOString() }), T0 + 25 * 60_000);
     expect(d.lines).toHaveLength(1);
-    expect(d.lines[0]).toContain('0.2.19 발행 따라가기 시작 · 끝난 노드 2/3 · 지금 gate(20분째)');
+    expect(d.lines[0]).toContain('0.2.19 발행 따라가기 시작 · 끝난 노드 2 · 지금 gate(20분째)');
+  });
+
+  test('22노드 그래프에서 완료 3개는 원장 path 길이가 아닌 3/22 — 시작·생존·지금', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-watch-graph-'));
+    const graph = join(dir, 'release-loop.yaml');
+    try {
+      writeFileSync(graph, `graph_id: release-loop\nterminal_nodes: [done, failed]\nnodes:\n${[
+        ...PATH.slice(0, 4), ...Array.from({ length: 18 }, (_, i) => `node-${i}`), 'done', 'failed',
+      ].map((id) => `  - node_id: ${id}`).join('\n')}\n`);
+      const r = run({ ended: 3, version: '0.2.21' });
+      expect(r.path).toHaveLength(4);
+      const h = harness();
+      h.set([r]);
+      const deps = { ...h.deps, graphFile: (candidate: ReleaseRunView) => candidate.runId === r.runId ? graph : undefined };
+      expect(releaseWatchTick(deps)).toMatchObject({ outcome: 'sent', lines: 1 });
+      expect(h.sent[0]).toContain('끝난 노드 3/22');
+      expect(h.sent[0]).not.toContain('끝난 노드 3/4');
+      expect(releaseWatchTick(deps).outcome).toBe('quiet');
+      h.set([r], T0 + ALIVE_EVERY_MS - 1);
+      expect(releaseWatchTick(deps).outcome).toBe('quiet');
+      h.set([r], T0 + ALIVE_EVERY_MS);
+      expect(releaseWatchTick(deps)).toMatchObject({ outcome: 'sent', lines: 1 });
+      expect(h.sent[1]).toContain('끝난 노드 3/22');
+      expect(releaseNowText([r], T0, () => graph)).toContain('끝난 노드 3/22');
+      const unknown = harness();
+      unknown.set([r]);
+      expect(releaseWatchTick(unknown.deps).outcome).toBe('sent');
+      expect(unknown.sent[0]).toContain('끝난 노드 3 ·');
+      expect(unknown.sent[0]).not.toContain('끝난 노드 3/');
+      const other = run({ runId: 'other', ended: 3 });
+      other.nodes[0] = { nodeId: 'not-in-graph', ok: true, summary: '' };
+      expect(diffRun(undefined, other, T0, graph).lines[0]).toContain('끝난 노드 3 ·');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('기본 경로 = 런 원장 옆 스냅샷 <런>.json.graph/graph.yaml — 종결 자리표는 분모에서 뺀다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-watch-root-'));
+    try {
+      const r = run({ ended: 3, version: '0.2.21' });
+      const file = releaseGraphFile(r, root)!;
+      expect(file).toBe(join(root, 'graph-runs', 'release-loop', 'r1.json.graph', 'graph.yaml'));
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, `graph_id: release-loop\nterminal_nodes: [done, failed]\nnodes:\n${[
+        ...PATH.slice(0, 4), ...Array.from({ length: 18 }, (_, i) => `node-${i}`), 'done', 'failed',
+      ].map((id) => `  - { node_id: ${id}, kind: gate }`).join('\n')}\n`);
+      expect(releaseNowText([r], T0, (x) => releaseGraphFile(x, root))).toContain('끝난 노드 3/22');
+      const h = harness();
+      h.set([r]);
+      expect(releaseWatchTick({ ...h.deps, graphFile: (x) => releaseGraphFile(x, root) }).outcome).toBe('sent');
+      expect(h.sent[0]).toContain('끝난 노드 3/22');
+      expect(releaseGraphFile(run({ runId: '../escape', ended: 1 }), root)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('그래프를 못 읽으면 시작·생존·지금의 분모를 생략한다', () => {
+    const missing = join(tmpdir(), 'release-watch-no-such-graph', 'release-loop.yaml');
+    const r = run({ ended: 3 });
+    expect(diffRun(undefined, r, T0, missing).lines[0]).toContain('끝난 노드 3 ·');
+    const prev = markOf(r, new Date(T0).toISOString());
+    expect(diffRun(prev, r, T0 + ALIVE_EVERY_MS, missing).lines[0]).toEndWith('끝난 노드 3');
+    expect(releaseNowText([r], T0, () => missing)).toContain('끝난 노드 3\n');
   });
 
   test('이미 끝난 판은 조용히 기준만 잡는다', () => {
@@ -74,7 +146,7 @@ describe('AWAY-MODE-1 — 발행 전이 따라가기', () => {
     const r = run({ ended: 2, runningAt: new Date(T0).toISOString() });
     const prev = markOf(r, new Date(T0).toISOString());
     expect(diffRun(prev, r, T0 + ALIVE_EVERY_MS - 1).lines).toEqual([]);
-    expect(diffRun(prev, r, T0 + ALIVE_EVERY_MS).lines[0]).toBe('💓 0.2.19 발행 진행 중 · 지금 gate(60분째) · 끝난 노드 2/3');
+    expect(diffRun(prev, r, T0 + ALIVE_EVERY_MS).lines[0]).toBe('💓 0.2.19 발행 진행 중 · 지금 gate(60분째) · 끝난 노드 2');
   });
 
   test('틱: 같은 전이는 두 번 안 보낸다', () => {
@@ -117,9 +189,9 @@ describe('AWAY-MODE-1 — 발행 전이 따라가기', () => {
   });
 
   test('/release 요약: 못 읽음과 없음을 가른다', () => {
-    expect(releaseNowText('unavailable')).toContain('「없다」가 아니다');
-    expect(releaseNowText([])).toContain('발행 런 기록 없음');
-    expect(releaseNowText([run({ ended: 2, runningAt: new Date(T0).toISOString() })], T0 + 10 * 60_000)).toContain('지금: gate (10분째)');
+    expect(releaseNowText('unavailable', Date.now(), NO_GRAPH)).toContain('「없다」가 아니다');
+    expect(releaseNowText([], Date.now(), NO_GRAPH)).toContain('발행 런 기록 없음');
+    expect(releaseNowText([run({ ended: 2, runningAt: new Date(T0).toISOString() })], T0 + 10 * 60_000, NO_GRAPH)).toContain('지금: gate (10분째)');
   });
 });
 
@@ -166,7 +238,7 @@ describe('GATE-LIVE-OBS — 외출 알림의 조각 줄', () => {
   });
 
   test('/release 지금 요약에 조각 줄이 붙는다', () => {
-    const text = releaseNowText([run({ ended: 2, gateShards: shards(1) })], T0);
+    const text = releaseNowText([run({ ended: 2, gateShards: shards(1) })], T0, NO_GRAPH);
     expect(text).toContain('지금: gate');
     expect(text).toContain('조각 6 · 돌기 3 · 대기 2(CPU 부족 2) · 잘림 1 · 남은 약 27분');
   });

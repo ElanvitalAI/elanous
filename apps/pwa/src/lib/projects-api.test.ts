@@ -18,3 +18,30 @@ test('projects API lists, creates and assigns or clears membership using the aut
   expect(calls[2]?.init).toMatchObject({ method: 'PATCH', body: '{"projectId":"p"}' });
   expect(calls[3]?.init).toMatchObject({ method: 'PATCH', body: '{"projectId":null}' });
 });
+
+test('projects API browses remote folders with an encoded path (and defaults to the server home)', async () => {
+  const calls: string[] = [];
+  const client = { fetchJson: async (path: string) => {
+    calls.push(path);
+    return { path: '/srv/a & b', parent: '/srv', folders: [{ name: 'child', path: '/srv/a & b/child' }] };
+  } };
+  const api = new ProjectsApi(client as never);
+  expect((await api.folders('/srv/a & b')).folders).toEqual([{ name: 'child', path: '/srv/a & b/child' }]);
+  await api.folders();
+  expect(calls).toEqual(['/v1/projects/folders?path=%2Fsrv%2Fa%20%26%20b', '/v1/projects/folders']);
+});
+
+test('projects API creates a project using a folder selected on the remote host', async () => {
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
+    return { project: { id: 'p', name: '새 일', primaryFolder: '/srv/work/a' } };
+  } };
+  const api = new ProjectsApi(client as never);
+  expect((await api.create('새 일', '/srv/work/a')).project).toMatchObject({ id: 'p', name: '새 일', primaryFolder: '/srv/work/a' });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ path: '/v1/projects', init: {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: '{"name":"새 일","primaryFolder":"/srv/work/a"}',
+  } });
+});

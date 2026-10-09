@@ -140,10 +140,15 @@ export function checkPublicSkills(root: string, boundary: SkillBoundaryReport = 
   const errors = [...boundary.errors];
   const skills: PublicSkillRow[] = [];
   const skillsDir = join(root, 'skills');
-  const addon = new Set(boundary.skills.filter((row) => row.verdict === 'addon').map((row) => row.skill));
+  // Scope discrepancy: the stated 15 public deployments have no named fifteenth
+  // skill in this tree's boundary inventory (14 core, 5 addons). No verified
+  // deployment-name list is available here to justify adding a row. Never use
+  // an addon to fill the gap; keep the existing report shape and exit semantics.
+  // Unclassified folders retain their check rows and boundary errors.
+  const verdicts = new Map(boundary.skills.map((row) => [row.skill, row.verdict]));
   const names = existsSync(skillsDir) ? readdirSync(skillsDir).filter((name) => {
     const dir = join(skillsDir, name);
-    return lstatSync(dir).isDirectory() && !addon.has(name);
+    return lstatSync(dir).isDirectory() && verdicts.get(name) !== 'addon';
   }).sort() : [];
   if (!existsSync(skillsDir)) errors.push('skills/ 디렉터리가 없다');
   for (const row of boundary.skills) {

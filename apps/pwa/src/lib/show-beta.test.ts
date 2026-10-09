@@ -69,7 +69,7 @@ test('the general-only switch updates desktop and mobile beta menus and badges i
   const sheet = () => root.findByProps({ role: 'dialog' });
   const open = (label: string) => act(() => root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('button').find((node) => node.props['aria-label'] === label)!.props.onClick({ currentTarget: null }));
   const close = () => act(() => sheet().findAllByProps({ 'aria-label': '메뉴 닫기' })[0]!.props.onClick());
-  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/market', '/settings']);
+  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(1);
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(false);
   expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').find((link) => link.props['aria-label'] === '오늘')?.props.href).toBe('/today');
@@ -94,7 +94,7 @@ test('the general-only switch updates desktop and mobile beta menus and badges i
   expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/field', '/market', '/settings']);
   close();
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: false } }));
-  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/market', '/settings']);
+  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
   expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').find((link) => link.props['aria-label'] === '오늘')?.props.href).toBe('/today');
   act(() => { store.set(PWA_ROLE_KEY, 'contributor'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);

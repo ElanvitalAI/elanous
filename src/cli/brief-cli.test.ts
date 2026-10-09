@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BriefItemsLedger } from '../briefing/brief-items.js';
+import { Database } from 'bun:sqlite';
+import { BriefItemsLedger, BRIEF_REACTIONS } from '../briefing/brief-items.js';
 import { registerBriefCommands } from './brief-cli.js';
 
 type Handler = (opts: Record<string, string | boolean | undefined>) => void;
@@ -44,7 +45,7 @@ function fixture(options: { now?: () => Date; send?: (markdown: string) => numbe
   });
   const brief = program.children.find(child => child.name === 'brief');
   const run = (verb: string, opts: Record<string, string | boolean | undefined>) => {
-    const command = brief?.children.find(child => child.name === verb);
+    const command = verb === '' ? brief : brief?.children.find(child => child.name === verb);
     if (!command?.handler) throw new Error(`missing brief ${verb}`);
     command.handler(opts);
   };
@@ -54,10 +55,69 @@ function fixture(options: { now?: () => Date; send?: (markdown: string) => numbe
   };
 }
 
+test('bare brief prints exactly one weekly acted/sent line, leaving subcommands and item state unchanged', () => {
+  const f = fixture();
+  try {
+    const empty = f.output.length;
+    f.run('', {});
+    expect(f.output.slice(empty)).toEqual(['이번 주 브리핑 중 대표가 움직인 것 0/0']);
+    const acted = f.ledger.add({ text: '결정', domain: '판', priority: 'P0', source: 'test' });
+    const ignored = f.ledger.add({ text: '읽음', domain: '시장', priority: 'P1', source: 'test' });
+    f.ledger.add({ text: '미발송', domain: '운영', priority: 'P1', source: 'test' });
+    f.ledger.markSent([acted.id, ignored.id], '08:30');
+    f.ledger.recordReaction(acted.id, '버튼');
+    f.ledger.recordReaction(acted.id, '정정');
+    f.ledger.recordReaction(ignored.id, '열람');
+    const before = f.ledger.list();
+    const lines = f.output.length;
+    f.run('', {});
+    expect(f.output.slice(lines)).toEqual(['이번 주 브리핑 중 대표가 움직인 것 1/2']);
+    expect(f.ledger.list()).toEqual(before);
+    f.run('list', { json: true });
+    expect(JSON.parse(f.output.at(-1)!)).toEqual(before);
+    expect(f.errors).toEqual([]);
+  } finally { f.cleanup(); }
+});
+
+test('brief react records all five reactions on sent items through the CLI and keeps weekly action counts distinct', () => {
+  const f = fixture();
+  try {
+    expect(f.brief?.children.find(child => child.name === 'react')?.opts).toMatchObject({
+      'item-id': { required: true }, reaction: { required: true },
+    });
+    const item = f.ledger.add({ text: '원장 응답', domain: '판', priority: 'P0', source: 'test' });
+    const unsent = f.ledger.add({ text: '미발송', domain: '시장', priority: 'P1', source: 'test' });
+    const before = f.ledger.list();
+    f.run('react', { itemId: String(unsent.id), reaction: '버튼' });
+    expect(f.errors.at(-1)).toBe('brief react: item was not sent');
+    expect(process.exitCode).toBe(2);
+    process.exitCode = 0;
+    f.ledger.markSent([item.id], '08:30');
+    for (const reaction of BRIEF_REACTIONS) f.run('react', { itemId: String(item.id), reaction });
+    expect(f.output.slice(-BRIEF_REACTIONS.length)).toEqual(BRIEF_REACTIONS.map(reaction => `reacted ${item.id} ${reaction}`));
+    const db = new Database(f.ledger.path);
+    try {
+      expect(db.query('SELECT item_id, reaction FROM reactions ORDER BY id').all()).toEqual(
+        BRIEF_REACTIONS.map(reaction => ({ item_id: item.id, reaction })),
+      );
+    } finally { db.close(); }
+    f.run('', {});
+    expect(f.output.at(-1)).toBe('이번 주 브리핑 중 대표가 움직인 것 1/1');
+    expect(f.ledger.list()).toEqual(before.map(row => row.id === item.id ? { ...row, sent_at: '2026-10-05T00:00:00.000Z' } : row));
+    f.run('react', { itemId: '1x', reaction: '버튼' });
+    expect(f.errors.at(-1)).toBe('brief react: invalid item id');
+    f.run('react', { itemId: String(item.id), reaction: 'unknown' });
+    expect(f.errors.at(-1)).toBe('brief react: invalid reaction');
+    f.run('react', { itemId: '999', reaction: '버튼' });
+    expect(f.errors.at(-1)).toBe('brief react: item was not sent');
+    expect(f.ledger.weeklyActions()).toMatchObject({ acted: 1, total: 1 });
+  } finally { f.cleanup(); }
+});
+
 test('brief add|list|compose: five items, P0 first, one duplicate, three domain heads, later slot item omitted', () => {
   const f = fixture();
   try {
-    expect(f.brief?.children.map(child => child.name)).toEqual(['add', 'list', 'compose', 'send']);
+    expect(f.brief?.children.map(child => child.name)).toEqual(['add', 'react', 'list', 'compose', 'send']);
     expect(f.brief?.children[0]?.opts).toMatchObject({ text: { required: true }, domain: { required: true }, priority: { required: true }, source: { required: true }, deadline: { required: false } });
     const at = '2026-10-04T23:00:00Z';
     f.run('add', { text: '흡수 대기', domain: '흡수', priority: 'P1', source: '흡수', createdAt: at, json: true });

@@ -371,6 +371,8 @@ export function readClientInfo(
 export interface AcpAgentOpts {
   /** Backend id from ACP_BACKENDS. */
   backendId: string;
+  /** Review-owned ACP executable override; never changes the shared backend registry. */
+  backendSpec?: AcpBackendSpec;
   /** Working directory the agent runs in (cwd argument to spawn).
    *  Affects file-tool resolution. Default: getSessionCwd() so a
    *  Ctrl+W / /wd in the dashboard retargets new ACP agents. */
@@ -443,7 +445,7 @@ export class AcpAgent {
   private authMethods: string[] = [];
 
   constructor(opts: AcpAgentOpts) {
-    this.spec = getAcpBackend(opts.backendId);
+    this.spec = opts.backendSpec ?? getAcpBackend(opts.backendId);
     // WD7 — default to the session working directory; ACP agents
     // inherit the "active project" concept.
     this.cwd = opts.cwd ?? getSessionCwd();
@@ -456,7 +458,7 @@ export class AcpAgent {
     // proactively. Mirrors zed's env-strip pattern for provider
     // tokens (acp.rs:232-243), generalized here for any env that
     // breaks nested agents.
-    const cleanEnv: NodeJS.ProcessEnv = { ...process.env, ...opts.env };
+    const cleanEnv: NodeJS.ProcessEnv = opts.backendSpec && opts.env ? { ...opts.env, NODE_ENV: process.env.NODE_ENV } : { ...process.env, ...opts.env };
     for (const key of Object.keys(cleanEnv)) {
       if (NESTED_AGENT_ENV_BLOCKLIST.has(key) || /^CLAUDE_CODE_/.test(key)) {
         delete cleanEnv[key];

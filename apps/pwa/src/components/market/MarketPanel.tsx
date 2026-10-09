@@ -2,12 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
-import type { InstalledPluginWire, MarketIndexResponse } from '@/nexus/client';
-import { marketCards, type MarketCard } from './market-view';
+import type { InstalledPluginWire, MarketIndexResponse, WizardPluginWire } from '@/nexus/client';
+import { marketCards, wizardDraftFromForm, wizardFormFromPlugin, wizardFormFromRequest, type MarketCard, type WizardForm, type WizardMessage } from './market-view';
 import { installProgressFromLine, type InstallProgress } from './market-install';
 import { CredentialsForm } from './CredentialsForm';
 
-type Tab = 'browse' | 'detail' | 'installed';
+type Tab = 'browse' | 'detail' | 'installed' | 'wizard';
+const emptyWizardForm: WizardForm = { name: '', description: '', instructions: '', connectorId: '', credentialNames: '' };
 
 export function MarketPanel() {
   const client = useOptionalNexusClient();
@@ -23,6 +24,46 @@ export function MarketPanel() {
   const [installConsent, setInstallConsent] = useState(false);
   const [progress, setProgress] = useState<InstallProgress[]>([]);
   const [removing, setRemoving] = useState<string | null>(null);
+  const [wizardForm, setWizardForm] = useState<WizardForm>(emptyWizardForm);
+  const [wizardRequest, setWizardRequest] = useState('');
+  const [wizardMessages, setWizardMessages] = useState<WizardMessage[]>([]);
+  const [generated, setGenerated] = useState<WizardPluginWire[]>([]);
+  const [wizardError, setWizardError] = useState<string | null>(null);
+  const [wizardBusy, setWizardBusy] = useState(false);
+  const [regenerating, setRegenerating] = useState<string | null>(null);
+
+  function submitWizardRequest() {
+    try {
+      const next = wizardFormFromRequest(wizardRequest, wizardForm);
+      setWizardForm(next);
+      setWizardMessages(current => [...current, { role: 'user', text: wizardRequest.trim() },
+        { role: 'assistant', text: wizardForm.description
+          ? '추가 요청을 스킬 지시문에 반영했습니다. 폼을 확인한 뒤 다시 만드세요.'
+          : '초안을 폼에 옮겼습니다. 이름과 연결 정보·지시문을 다듬은 뒤 생성하세요.' }]);
+      setWizardRequest(''); setWizardError(null);
+    } catch (error) { setWizardError(error instanceof Error ? error.message : '초안을 만들지 못했습니다.'); }
+  }
+
+  async function saveWizard() {
+    if (!client || wizardBusy) return;
+    setWizardBusy(true); setWizardError(null);
+    try {
+      const body = wizardDraftFromForm(wizardForm);
+      if (regenerating && regenerating !== body.name) throw new Error('다시 만들 때는 기존 플러그인 이름을 유지하세요. 새 이름으로 만들려면 새 초안을 선택하세요.');
+      await client.saveWizardPlugin({ ...body, ...(regenerating === body.name ? { regenerate: true } : {}) });
+      setGenerated((await client.getWizardPlugins()).plugins);
+      setWizardMessages(current => [...current, { role: 'assistant', text: `${body.name} 연구 초안을 저장했습니다. 실행·설치 전 그래프 단계를 구현하고 검증해야 합니다.` }]);
+      setRegenerating(body.name);
+    } catch (error) { setWizardError(error instanceof Error ? error.message : '플러그인을 저장하지 못했습니다.'); }
+    finally { setWizardBusy(false); }
+  }
+
+  async function openWizard() {
+    setTab('wizard');
+    if (!client) return;
+    try { setGenerated((await client.getWizardPlugins()).plugins); setWizardError(null); }
+    catch { setWizardError('만든 플러그인 목록을 불러오지 못했습니다.'); }
+  }
 
   async function refresh() {
     if (!client) return;
@@ -96,6 +137,7 @@ export function MarketPanel() {
     setInstalledError(false);
     setInstalledLoaded(false);
     setProgress([]); setInstallConsent(false); setRemoving(null); setActionError(null);
+    setGenerated([]); setWizardForm(emptyWizardForm); setWizardMessages([]); setRegenerating(null); setWizardError(null);
     void client.getPluginsIndex().then(nextIndex => {
       if (active) setIndex(nextIndex);
     }).catch(() => {
@@ -117,15 +159,15 @@ export function MarketPanel() {
         <p className="text-sm text-muted-foreground">확인된 플러그인을 살펴보고 설치할 수 있습니다.</p>
       </header>
       <nav aria-label="마켓 탭" className="flex flex-wrap gap-2">
-        {([['browse', '찾아보기'], ['detail', '상세'], ['installed', '설치됨']] as const).map(([id, label]) =>
+        {([['browse', '찾아보기'], ['detail', '상세'], ['installed', '설치됨'], ['wizard', '플러그인 만들기']] as const).map(([id, label]) =>
           <button key={id} type="button" aria-current={tab === id ? 'page' : undefined}
             className={`rounded-lg border px-4 py-2 text-sm ${tab === id ? 'border-blue-500 font-semibold' : 'border-border'}`}
-            onClick={() => setTab(id)}>{label}</button>)}
+            onClick={() => { if (id === 'wizard') void openWizard(); else setTab(id); }}>{label}</button>)}
       </nav>
       {!client && <p role="status">서버 연결이 설정되지 않았습니다. 설정에서 서버 주소를 입력하세요.</p>}
       {actionError && <p role="alert">{actionError}</p>}
-      {tab !== 'installed' && indexError && <p role="alert">마켓을 불러오지 못했습니다.</p>}
-      {tab !== 'installed' && client && !indexError && !index && <p role="status">마켓을 불러오는 중…</p>}
+      {tab !== 'installed' && tab !== 'wizard' && indexError && <p role="alert">마켓을 불러오지 못했습니다.</p>}
+      {tab !== 'installed' && tab !== 'wizard' && client && !indexError && !index && <p role="status">마켓을 불러오는 중…</p>}
       {tab === 'installed' && installedError && <p role="alert">설치 목록을 불러오지 못했습니다.</p>}
       {tab === 'installed' && client && !installedLoaded && <p role="status">설치 목록을 불러오는 중…</p>}
       {tab === 'browse' && index && (index.markets.length === 0
@@ -160,6 +202,43 @@ export function MarketPanel() {
         {client && progress.some(item => item.credentialsRequired) &&
           <CredentialsForm key={`${selected.plugin.name}-${progress.some(item => item.step === '완료' || item.step === '등록')}`} client={client} name={selected.plugin.name} />}
       </section> : <p>찾아보기에서 플러그인을 선택하세요.</p>)}
+      {tab === 'wizard' && <section aria-label="플러그인 마법사" className="space-y-5">
+        <h2 className="text-xl font-semibold">플러그인 마법사</h2>
+        <p className="text-sm text-muted-foreground">대화로 요청을 정리하고 폼을 다듬어 연구 초안을 만듭니다. 생성된 그래프는 아직 실행·설치할 수 없습니다.</p>
+        <ol aria-label="마법사 대화" className="space-y-2">{wizardMessages.map((message, i) =>
+          <li key={i} className="rounded-lg border border-border p-3"><strong>{message.role === 'user' ? '나' : '마법사'}: </strong>{message.text}</li>)}</ol>
+        <div className="flex flex-wrap gap-2">
+          <label className="flex-1 min-w-48">만들고 싶은 플러그인
+            <textarea className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardRequest} onChange={event => setWizardRequest(event.target.value)} />
+          </label>
+          <button type="button" className="self-end rounded border px-3 py-2" onClick={submitWizardRequest}>대화에 추가</button>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label>이름 (영문 소문자·숫자·하이픈)<input className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardForm.name}
+            onChange={event => setWizardForm(current => ({ ...current, name: event.target.value }))} /></label>
+          <label>설명<input className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardForm.description}
+            onChange={event => setWizardForm(current => ({ ...current, description: event.target.value }))} /></label>
+          <label className="sm:col-span-2">스킬 지시문<textarea className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardForm.instructions}
+            onChange={event => setWizardForm(current => ({ ...current, instructions: event.target.value }))} /></label>
+          <label>연결 이름 (선택)<input className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardForm.connectorId}
+            onChange={event => setWizardForm(current => ({ ...current, connectorId: event.target.value }))} /></label>
+          <label>자격 정보 항목 이름 (쉼표 구분, 값은 입력하지 마세요)<input className="mt-1 w-full rounded border border-border bg-background p-2" value={wizardForm.credentialNames}
+            onChange={event => setWizardForm(current => ({ ...current, credentialNames: event.target.value }))} /></label>
+        </div>
+        {wizardError && <p role="alert">{wizardError}</p>}
+        <div className="flex gap-2">
+          <button type="button" disabled={!client || wizardBusy} className="rounded border px-3 py-2" onClick={() => void saveWizard()}>
+            {wizardBusy ? '저장 중…' : regenerating === wizardForm.name ? '다시 만들기' : '초안 만들기'}</button>
+          <button type="button" disabled={wizardBusy} className="rounded border px-3 py-2" onClick={() => { setWizardForm(emptyWizardForm); setWizardMessages([]); setRegenerating(null); setWizardError(null); }}>새 초안</button>
+        </div>
+        <section aria-label="만든 플러그인" className="space-y-2"><h3 className="font-semibold">만든 플러그인</h3>
+          {generated.length === 0 ? <p>만든 초안이 없습니다.</p> : <ul className="space-y-2">{generated.map(plugin =>
+            <li key={plugin.name} className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-3">
+              <span>{plugin.name} · {plugin.description}</span>
+              <button type="button" className="rounded border px-3 py-1" onClick={() => { setWizardForm(wizardFormFromPlugin(plugin)); setRegenerating(plugin.name); setWizardMessages([]); setWizardError(null); }}>다듬고 다시 만들기</button>
+            </li>)}</ul>}
+        </section>
+      </section>}
       {tab === 'installed' && installedLoaded && !installedError && (installed.length === 0 ? <p>설치된 플러그인이 없습니다.</p> :
         <ul className="space-y-2">{installed.map(plugin => <li className="rounded-lg border border-border p-3" key={`${plugin.market}/${plugin.name}/${plugin.version}`}>
           {plugin.name} · v{plugin.version} · 설치 시각: {plugin.installedAt && Number.isFinite(Date.parse(plugin.installedAt))

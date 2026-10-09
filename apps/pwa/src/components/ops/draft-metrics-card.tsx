@@ -3,7 +3,21 @@ import type { DaemonClient } from '@/lib/daemon-client';
 /** DRAFT-METRIC — daemon `/v1/drafts/metrics` answers from a TTL cache; the page never triggers GitHub reads. */
 export const DRAFT_METRICS_PATH = '/v1/drafts/metrics';
 
+export interface OverlapMetricsView {
+  launches24h: number | null;
+  launched: number | null;
+  unmeasured: number | null;
+  sourceIncomplete: boolean;
+  linked: number | null;
+  autoLanded: number | null;
+  autoRate: number | null;
+  secondSiblingMedianHours: number | null;
+  salvaged: number | null;
+  salvageUnmeasured: number | null;
+}
+
 export interface DraftMetricsView {
+  overlap: OverlapMetricsView | null;
   inventory: number;
   oldestAgeHours: number | null;
   needsOwner: number;
@@ -23,6 +37,16 @@ const isObject = (value: unknown): value is Record<string, unknown> => !!value &
 const count = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
 const nullableNumber = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value));
 
+function parseOverlap(value: unknown): OverlapMetricsView | null {
+  if (!isObject(value)) return null;
+  const nullableCount = (key: string) => value[key] === null || count(value[key]);
+  const nonnegative = (key: string) => value[key] === null || (nullableNumber(value[key]) && (value[key] as number) >= 0);
+  if (!['launches24h', 'launched', 'unmeasured', 'linked', 'autoLanded', 'salvaged', 'salvageUnmeasured'].every(nullableCount)
+    || typeof value.sourceIncomplete !== 'boolean' || !nonnegative('secondSiblingMedianHours')
+    || !(value.autoRate === null || (nullableNumber(value.autoRate) && value.autoRate >= 0 && value.autoRate <= 1))) return null;
+  return value as unknown as OverlapMetricsView;
+}
+
 /** Anything malformed is «못 읽음», never a zero. */
 export function parseDraftMetricsBody(body: unknown): DraftMetricsCardValue {
   if (!isObject(body)) return { kind: 'unavailable', reason: null };
@@ -36,7 +60,8 @@ export function parseDraftMetricsBody(body: unknown): DraftMetricsCardValue {
   return {
     kind: 'ready', measuredAt: body.measuredAt, refreshError: reason,
     metrics: { inventory: metrics.inventory, oldestAgeHours: metrics.oldestAgeHours, needsOwner: metrics.needsOwner,
-      converted48h: metrics.converted48h, cohort48h: metrics.cohort48h, conversion48h: metrics.conversion48h },
+      converted48h: metrics.converted48h, cohort48h: metrics.cohort48h, conversion48h: metrics.conversion48h,
+      overlap: parseOverlap(metrics.overlap) },
   };
 }
 
@@ -75,6 +100,13 @@ export function DraftMetricsCard({ value }: { value: DraftMetricsCardValue }) {
                 ? '표본 없음' : `${(value.metrics.conversion48h * 100).toFixed(1)}%`}</dd>
                 {value.metrics.conversion48h !== null && <dd className="text-muted-foreground tabular-nums">{value.metrics.converted48h}/{value.metrics.cohort48h}</dd>}</div>
             </dl>
+            {value.metrics.overlap && <p className="mt-2 text-xs text-muted-foreground tabular-nums">
+              겹침 발사 24h {value.metrics.overlap.launches24h === null ? '못 잼' : value.metrics.overlap.launches24h}
+              {' · 자동 착지 '}{value.metrics.overlap.autoRate === null ? '못 잼' : `${(value.metrics.overlap.autoRate * 100).toFixed(1)}%`}
+              {' ('}{value.metrics.overlap.autoLanded === null ? '못 잼' : value.metrics.overlap.autoLanded}/{value.metrics.overlap.linked === null ? '못 잼' : value.metrics.overlap.linked}{')'}
+              {' · 둘째 형제 착지 중앙값 '}{value.metrics.overlap.secondSiblingMedianHours === null ? '못 잼' : `${value.metrics.overlap.secondSiblingMedianHours.toFixed(1)}h`}
+              {(value.metrics.overlap.sourceIncomplete || value.metrics.overlap.unmeasured === null || value.metrics.overlap.unmeasured > 0) && ' · 부분 측정'}
+            </p>}
             <p className="mt-1 text-xs text-muted-foreground"><time dateTime={value.measuredAt}>{kstTime(value.measuredAt)}</time> 측정
               {value.refreshError && <span className="ml-1 text-amber-700" title={value.refreshError}>· 갱신 실패 — 이전 값</span>}</p>
           </>}

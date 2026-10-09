@@ -2840,6 +2840,43 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
   // 🩸 2026-09-23 실측: 리뷰 티어를 best(sol·high)로 올린 «뒤에도» wire 에는 effort:"medium" 이 나갔다
   //   — 호출부에 'medium' 이 박혀 있었다. 사다리를 재는 시험(role-tier-contract)은 초록이었다.
   //   ⇒ 이 시험은 사다리가 아니라 ***review seam 이 streamLLM 에 «실제로 넘기는» 옵션***을 문다. 대표 결정: 리뷰는 high.
+  it('reviewer=claude-acp selects the fake ACP judge only for reviewDiff; fallback is visible in the result', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-claude-review-'));
+    const calls: string[] = [];
+    let subscribed = true;
+    try {
+      writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
+      setUserConfigOverlay((config) => ({ ...config,
+        llm: { ...config.llm, provider: 'openai-codex' },
+        roleLlm: { reviewer: { provider: 'claude-acp', executor: 'cc' } },
+      }));
+      const seams = await buildDefaultSelfImplementSeams(planDevPipeline(T()), {
+        toolReviewerRate: 0,
+        subscriptionReviewerDeps: { checkSubscription: () => subscribed, usedPercent: () => 12 },
+        makeSubscriptionReviewLLM: (spawn) => async () => {
+          expect(spawn.command).toBe('claude');
+          expect(spawn.backendSpec.args).toEqual(['--dangerously-skip-permissions']);
+          expect(spawn.env.ANTHROPIC_API_KEY).toBeUndefined();
+          calls.push('acp'); return 'VERDICT: PASS';
+        },
+        streamLLM: async () => { calls.push('default'); return 'VERDICT: PASS'; },
+        reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
+      });
+      const review = await seams.reviewDiff!(repo, { goal: 'independent review' });
+      expect(review.reviewed).toBe(true);
+      expect(calls).toEqual(['acp']);
+      subscribed = false;
+      const fallback = await seams.reviewDiff!(repo, { goal: 'independent review' });
+      expect(calls).toEqual(['acp', 'default']);
+      expect(fallback.summary).toContain('[reviewer fallback: cc subscription check failed; default reviewer used]');
+      await seams.judgmentCallLLM!({ prompt: 'judge' } as never);
+      expect(calls).toEqual(['acp', 'default', 'default']);
+    } finally {
+      setUserConfigOverlay(null);
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   it('⭐ 리뷰 seam 이 streamLLM 에 넘기는 effort 는 «역할 티어의 값»이다 — 하드코딩이 아니다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-review-effort-'));
     const seen: { model?: string; effort?: string }[] = [];
@@ -2955,7 +2992,7 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         ...config,
         roleLlm: {},
         roleModels: { review: 'unregistered-review-model' },
-        llm: { ...config.llm, reviewFallbackModels: ['grok-4.6'] },
+        llm: { ...config.llm, provider: 'openai-codex', reviewFallbackModels: ['grok-4.6'] },
       }));
       const seams = await buildDefaultSelfImplementSeams(planDevPipeline(T()), {
         toolReviewerRate: 0,

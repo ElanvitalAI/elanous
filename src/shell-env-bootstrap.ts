@@ -65,6 +65,12 @@ const POSIX_SHELLS = new Set(['zsh', 'bash', 'fish', 'sh', 'dash', 'ksh']);
 let cached: Record<string, string> | null = null;
 let captured = false;
 
+// Both the daemon warm path (nexus/index.ts) and PTY's first synchronous capture
+// pass through here. Keep the existing capture events intact; these are additive timings.
+function logBootPhase(phase: string, start: number, outcome: string): void {
+  debug.log('boot.phase', phase, { ms: performance.now() - start, outcome });
+}
+
 /** Parse `KEY=VALUE\n` output from `printenv`. Tolerates values that
  *  themselves contain `=`; does not attempt to unescape newlines
  *  (bash/zsh `printenv` emits them literally, which is fine for
@@ -121,10 +127,13 @@ function acceptCapture(stdout: string): Record<string, string> | null {
 }
 
 export function runPrintenvCapture(): Record<string, string> | null {
+  const seedStart = performance.now();
   const seed = captureSeed();
+  logBootPhase('login-env.seed', seedStart, seed ? 'ready' : 'unavailable');
   if (!seed) return null;
   const { shell, seedEnv } = seed;
 
+  const shellStart = performance.now();
   let res: ReturnType<typeof spawnSync>;
   try {
     res = spawnSync(shell, ['-l', '-i', '-c', 'printenv'], {
@@ -137,13 +146,14 @@ export function runPrintenvCapture(): Record<string, string> | null {
       // OSC sequences would corrupt our TUI output otherwise.
     });
   } catch {
+    logBootPhase('login-env.shell', shellStart, 'error');
     return null;
   }
   // ETIMEDOUT with status 0 = the shell outlived the timeout; never trust a late capture.
-  if (res.error) return null;
-  if (res.status !== 0 && res.status !== null) return null;
-  if (res.signal) return null;
-  return acceptCapture(typeof res.stdout === 'string' ? res.stdout : '');
+  const parsed = !res.error && (res.status === 0 || res.status === null) && !res.signal
+    ? acceptCapture(typeof res.stdout === 'string' ? res.stdout : '') : null;
+  logBootPhase('login-env.shell', shellStart, parsed ? 'ok' : 'failed');
+  return parsed;
 }
 
 /** Fill the login-env cache off the event loop (daemon boot). The first web-terminal spawn otherwise ran the
@@ -152,9 +162,12 @@ export function runPrintenvCapture(): Record<string, string> | null {
 export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Promise<boolean> {
   if (captured) return cached !== null;
   if (process.env.ELANOUS_SKIP_LOGIN_ENV === '1' || process.env.TERM_PROGRAM === 'monad-agent-nested') return false;
+  const seedStart = performance.now();
   const seed = captureSeed();
+  logBootPhase('login-env.seed', seedStart, seed ? 'ready' : 'unavailable');
   if (!seed) return false;
   const start = Date.now();
+  const shellStart = performance.now();
   try {
     const proc = spawn([seed.shell, '-l', '-i', '-c', 'printenv'], { env: seed.seedEnv as Record<string, string>, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
     // A grandchild (e.g. a pyenv rehash) can keep the stdout pipe open after the shell is killed,
@@ -167,6 +180,7 @@ export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Prom
     const result = await Promise.race([finished, timedOut]);
     clearTimeout(timer);
     const parsed = result && result[1] === 0 ? acceptCapture(result[0]) : null;
+    logBootPhase('login-env.shell', shellStart, parsed ? 'ok' : result ? 'failed' : 'timeout');
     if (captured) return cached !== null; // a synchronous capture won the race
     if (!parsed) return false;
     cached = parsed;
@@ -174,6 +188,7 @@ export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Prom
     debug.log('shell.envbootstrap.capture', 'warmed', { ok: true, ms: Date.now() - start, keyCount: Object.keys(parsed).length });
     return true;
   } catch {
+    logBootPhase('login-env.shell', shellStart, 'error');
     return false;
   }
 }

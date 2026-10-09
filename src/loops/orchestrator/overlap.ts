@@ -19,6 +19,9 @@ export interface CollectWorkDeps {
   config?: Pick<OrchestratorLoopConfig, 'seatTrees'>;
 }
 
+/** Budget for collectWork's per-process cwd reads. */
+export const COLLECT_WORK_PROCESS_DEADLINE_MS = 10_000;
+
 const repoRoot = resolve(import.meta.dir, '../../..');
 const defaultRunGh = (args: string[]): string => execFileSync('bun', ['bin/elanous.mjs', '--test', 'gh', ...args], {
   cwd: repoRoot, encoding: 'utf8', timeout: 60_000, maxBuffer: 20 * 1024 * 1024,
@@ -63,7 +66,10 @@ function goalFiles(text: string): string[] {
 export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
   const prs = JSON.parse((deps.runGh ?? defaultRunGh)(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,body,headRefName,files,isDraft,labels'])) as OpenPr[];
   if (!Array.isArray(prs)) throw new Error('PR observation is not a list');
-  const observation = (deps.listProcesses ?? defaultListHarnessProcesses)();
+  // Only goal-carrying launches become work, so only they need a cwd; bounded so a host with hundreds of harness processes
+  // cannot hold the queue lock for minutes (10-08). Records past the budget stay cwd-unknown → their goal reads unreadable.
+  const observation = deps.listProcesses ? deps.listProcesses()
+    : defaultListHarnessProcesses({ include: record => goalPath(record.command) !== null, cwdOnly: true, deadlineMs: COLLECT_WORK_PROCESS_DEADLINE_MS });
   if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
   const cfg = deps.config ?? getUserConfig().loops?.orchestrator ?? ORCHESTRATOR_DEFAULTS;
   const excluded = { stalled: 0, superseded: 0, draft: 0 };

@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { writePeerEdit, type PeerEditRecord } from '../nexus/api/graph-peer-edit.js';
 import { graphTick } from './graph-tick.js';
 import { decideGraphApproval, latestGraphRun, runGraph } from './runner.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
@@ -35,6 +36,234 @@ edges:
 }
 
 const ok = async () => ({ stdout: '', stderr: '', exitCode: 0 });
+
+const peerEdit: PeerEditRecord = { editedBy: 'peer:12345678', version: 'peer-v1', at: '2026-10-08T12:00:00Z' };
+
+function mineFixture(): { graph: string; mineDir: string; root: string } {
+  const { graph, root } = fixture();
+  const mineDir = join(root, 'mine');
+  mkdirSync(mineDir);
+  const mineGraph = join(mineDir, 'g1.yaml');
+  copyFileSync(graph, mineGraph);
+  writeFileSync(mineGraph, readFileSync(mineGraph, 'utf8').replace('graph_id: tick-test', 'graph_id: g1'));
+  copyFileSync(join(root, 'recipes.yaml'), join(mineDir, 'recipes.yaml'));
+  return { graph: mineGraph, mineDir, root };
+}
+
+test('unapproved peer edit refuses a mine graph before creating a run ledger', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    runBash: async (body: string) => { calls.push(body); return ok(); } } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(calls).toEqual([]);
+  expect(latestGraphRun('g1', root)).toBeNull();
+  expect(existsSync(join(root, 'graph-runs', 'g1'))).toBe(false);
+});
+
+test('changing graph_id in a peer-edited mine file cannot evade the file identity gate', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('graph_id: g1', 'graph_id: g2'));
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    runBash: async (body: string) => { calls.push(body); return ok(); } } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(calls).toEqual([]);
+  expect(existsSync(join(root, 'graph-runs'))).toBe(false);
+  expect(latestGraphRun('g2', root)).toBeNull();
+});
+
+test('a mine alias checks the real target filename even when its YAML declares the alias id', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('graph_id: g1', 'graph_id: g2'));
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  const alias = join(mineDir, 'g2.yaml');
+  symlinkSync(graph, alias);
+  expect(await graphTick(alias, { mineDir, startIfIdle: true, deps: { root, runBash: ok } }))
+    .toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(existsSync(join(root, 'graph-runs'))).toBe(false);
+});
+
+test('a mine filename distinct from graph_id also checks the declared id marker', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g2', peerEdit);
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('graph_id: g1', 'graph_id: g2'));
+  expect(await graphTick(graph, { mineDir, startIfIdle: true, deps: { root, runBash: ok } }))
+    .toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(existsSync(join(root, 'graph-runs'))).toBe(false);
+});
+
+test('an unrelated mine filename without an edit marker retains declared-id execution', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('graph_id: g1', 'graph_id: g2'));
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root, runBash: ok } });
+  expect(result).toMatchObject({ action: 'started', status: 'awaiting-approval' });
+  expect(latestGraphRun('g2', root)?.runId).toBe(result.runId);
+});
+
+test('matching owner approval permits a mine graph to start', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', { ...peerEdit, approved: { version: peerEdit.version, at: '2026-10-08T13:00:00Z' } });
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    runBash: async (body: string) => { calls.push(body); return ok(); } } });
+  expect(result).toMatchObject({ action: 'started', status: 'awaiting-approval' });
+  expect(latestGraphRun('g1', root)?.runId).toBe(result.runId);
+  expect(calls).toEqual(['printf a']);
+});
+
+test('peer edit blocks a pending mine run from advancing even after graph approval', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  const calls: string[] = [];
+  const deps = { root, runBash: async (body: string) => { calls.push(body); return ok(); } };
+  const started = await graphTick(graph, { mineDir, startIfIdle: true, deps });
+  decideGraphApproval('g1', started.runId!, 'approved', 'owner', root);
+  const before = readFileSync(join(root, 'graph-runs', 'g1', `${started.runId}.json`), 'utf8');
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  expect(await graphTick(graph, { mineDir, deps })).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(readFileSync(join(root, 'graph-runs', 'g1', `${started.runId}.json`), 'utf8')).toBe(before);
+  expect(calls).toEqual(['printf a']);
+});
+
+test('a peer edit during asynchronous execution stops the active tick and blocks the next tick', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  const calls: string[] = [];
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const executing = new Promise<void>((resolve) => { entered = resolve; });
+  const deps = { root, runBash: async (body: string) => {
+    calls.push(body);
+    if (body === 'printf a') { entered(); await held; }
+    return ok();
+  } };
+  const active = graphTick(graph, { mineDir, startIfIdle: true, deps });
+  await executing;
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  release();
+  expect(await active).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  const before = latestGraphRun('g1', root);
+  expect(before?.nodes.map(node => node.nodeId)).toEqual(['a']);
+  expect(await graphTick(graph, { mineDir, deps })).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(latestGraphRun('g1', root)).toEqual(before);
+  writePeerEdit(mineDir, 'g1', { ...peerEdit, approved: { version: peerEdit.version, at: '2026-10-08T13:00:00Z' } });
+  expect(await graphTick(graph, { mineDir, deps })).toMatchObject({ action: 'resumed', status: 'awaiting-approval' });
+  expect(calls).toEqual(['printf a']);
+});
+
+test('an unapproved edit arriving during a node stops the same tick before its next node', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writeFileSync(graph, `graph_id: g1
+version: 1
+entry_node: a
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1 }
+  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: a, to: b }
+  - { from: b, to: done }
+`);
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    runBash: async (body: string) => {
+      calls.push(body);
+      if (body === 'printf a') { await Promise.resolve(); writePeerEdit(mineDir, 'g1', peerEdit); }
+      return ok();
+    } } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(calls).toEqual(['printf a']);
+  expect(latestGraphRun('g1', root)?.nodes.map(node => node.nodeId)).toEqual(['a']);
+});
+
+test('a peer edit arriving during notify refuses before the run starts', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    notify: () => { writePeerEdit(mineDir, 'g1', peerEdit); },
+    runBash: async (body: string) => { calls.push(body); return ok(); } } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(latestGraphRun('g1', root)).toBeNull();
+  expect(calls).toEqual([]);
+});
+
+test('YAML id replaced during notify is checked before running its bytes', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  const calls: string[] = [];
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    notify: () => {
+      writeFileSync(graph, readFileSync(graph, 'utf8').replace('graph_id: g1', 'graph_id: g2'));
+      writePeerEdit(mineDir, 'g2', peerEdit);
+    },
+    runBash: async (body: string) => { calls.push(body); return ok(); } } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(calls).toEqual([]);
+  expect(existsSync(join(root, 'graph-runs', 'g2'))).toBe(false);
+  expect(latestGraphRun('g1', root)).toBeNull();
+});
+
+test('a newly unapproved id during runner setup refuses before any node executes', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  const original = readFileSync(graph, 'utf8');
+  let changed = false;
+  const result = await graphTick(graph, { mineDir, startIfIdle: true, deps: { root,
+    processStartMs: () => {
+      if (!changed) {
+        changed = true;
+        writeFileSync(graph, original.replace('graph_id: g1', 'graph_id: g2'));
+        writePeerEdit(mineDir, 'g2', peerEdit);
+      }
+      return Date.now();
+    }, runBash: ok } });
+  expect(result).toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(latestGraphRun('g1', root)?.nodes).toEqual([]);
+  expect(latestGraphRun('g2', root)).toBeNull();
+});
+
+test('unreadable peer edit marker refuses a mine graph without a run ledger', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  mkdirSync(join(mineDir, '.access'));
+  writeFileSync(join(mineDir, '.access', 'g1.peer-edit.json'), '{broken');
+  expect(await graphTick(graph, { mineDir, startIfIdle: true, deps: { root, runBash: ok } }))
+    .toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unreadable' });
+  expect(existsSync(join(root, 'graph-runs', 'g1'))).toBe(false);
+});
+
+test('outside graph with the same id does not consult the mine peer edit marker', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  const outside = join(root, 'outside.yaml');
+  copyFileSync(graph, outside);
+  const result = await graphTick(outside, { mineDir, startIfIdle: true, deps: { root, runBash: ok } });
+  expect(result).toMatchObject({ action: 'started', status: 'awaiting-approval' });
+  expect(latestGraphRun('g1', root)?.runId).toBe(result.runId);
+});
+
+test('external symlink into mine observes the mine edit marker', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  const outside = join(root, 'outside-link.yaml');
+  symlinkSync(graph, outside);
+  expect(await graphTick(outside, { mineDir, startIfIdle: true, deps: { root, runBash: ok } }))
+    .toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(latestGraphRun('g1', root)).toBeNull();
+});
+
+test('symlink from mine to an outside graph still observes its mine edit marker', async () => {
+  const { graph, mineDir, root } = mineFixture();
+  writePeerEdit(mineDir, 'g1', peerEdit);
+  const outside = join(root, 'outside.yaml');
+  copyFileSync(graph, outside);
+  rmSync(graph);
+  symlinkSync(outside, graph);
+  expect(await graphTick(graph, { mineDir, startIfIdle: true, deps: { root, runBash: ok } }))
+    .toEqual({ action: 'refused', status: 'refused', reason: 'peer-edit-unapproved' });
+  expect(latestGraphRun('g1', root)).toBeNull();
+});
 
 test('idle ticks notify once and leave the run directory empty without an explicit start', async () => {
   const { graph, root } = fixture();

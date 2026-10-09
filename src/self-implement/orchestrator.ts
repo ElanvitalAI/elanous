@@ -434,7 +434,7 @@ function resolveDefaultBranchTarget(
  * 🔑 실패일 때만 두 칸을 더한다 — 성공 경로 payload 를 바꾸면 기존 소비자가 흔들린다.
  *   `moduleLoadFailure` 는 ***「산출이 상했다」와 「그 순간 트리가 불일치했다」***를 가르는 값이다.
  */
-type PostSyncStatus = 'merged' | 'llm-resolved';
+type PostSyncStatus = 'merged' | 'llm-resolved' | 'deterministic-resolved';
 
 type PostSyncGatePolicy = {
   exempted: boolean;
@@ -495,7 +495,7 @@ function postSyncGatePolicy(
     && !introduced && childResponsibility === 'none'
     && syncStatus === 'llm-resolved';
   const exempted = !passed
-    && (timeoutOnly || (!introduced && childResponsibility === 'none' && syncStatus === 'merged'));
+    && (timeoutOnly || (!introduced && childResponsibility === 'none' && (syncStatus === 'merged' || syncStatus === 'deterministic-resolved')));
   return {
     exempted,
     exemptionWithheld,
@@ -2256,6 +2256,8 @@ export interface SelfImplementResult {
   branch?: string;
   gate?: SelfImplementGateResult;
   review?: SelfImplementReview;
+  /** Worktree commit observed while this review ran; not inferred from the later PR head. */
+  reviewedHeadCommit?: string;
   completionDisposition?: SelfImplementCompletionDisposition;
   /** Explicit supervisor rework verdict retained independently of workflow execution verdicts. */
   supervisorVerdict?: ReworkBudgetVerdict;
@@ -2362,7 +2364,18 @@ function truncatePrTitle(text: string): string {
   return points.length <= 72 ? text : `${points.slice(0, 69).join('')}...`;
 }
 
-export function prTitle(feature: string): string {
+export function goalChecklistIds(feature: string, goalFile?: string): string[] {
+  const document = goalFile ? goalDocumentForReleaseNote(goalFile) : feature;
+  const declaration = document.split(/\r?\n/).find((line) => line.startsWith('- 칸 id: '));
+  const declared = declaration?.slice('- 칸 id: '.length).trim();
+  if (declared && declared !== 'not declared') {
+    return [...new Set(declared.split(' · ').map((id) => id.trim()).filter(Boolean))];
+  }
+  const firstLine = feature.split(/\r?\n/, 1)[0] ?? '';
+  return [...new Set(Array.from(firstLine.matchAll(/\b[A-Z][A-Z0-9]+-[A-Z0-9]+\b/g), (match) => match[0]))];
+}
+
+function prTitleWithoutChecklistId(feature: string): string {
   const proseTitle = parseAskProseTitle(feature);
   if (proseTitle) return truncatePrTitle(proseTitle);
 
@@ -2403,6 +2416,13 @@ export function prTitle(feature: string): string {
   if (title) return `${titlePrefix}${title}`;
   const firstFileName = fileNames[0]!;
   return truncatePrTitle(firstFileName);
+}
+
+export function prTitle(feature: string, goalFile?: string): string {
+  const title = prTitleWithoutChecklistId(feature);
+  const id = goalChecklistIds(feature, goalFile)[0];
+  if (!id) return title;
+  return truncatePrTitle(title.startsWith(`${id}: `) ? title : `${id}: ${title}`);
 }
 
 const BLOCKED_DRAFT_PR_HUMAN_JUDGMENT_ANCHOR = '## 사람 판단 필요';
@@ -2665,6 +2685,7 @@ function prBody(feature: string, implSummary: string, gateLog?: string, review?:
     ? ['', '## 감독 수용 기준 완화', `- 대상: ${planRevision.relaxation.target}`, `- 이전: ${planRevision.relaxation.expected}`, `- 완화: ${planRevision.relaxation.replacement}`, `- 이유: ${planRevision.reason}`, `- 적용: ${planRevision.application?.status ?? 'failed'}${planRevision.application?.detail ? ` (${planRevision.application.detail})` : ''}`, ...(planRevision.disposition ? [`- 충돌 처분: ${planRevision.disposition}`] : [])]
     : [];
   return [
+    `칸: ${goalChecklistIds(feature, goalFile).join(' · ') || '없음'}`,
     '## 요청',
     ...(goalFile ? [`- 골 파일: ${formatGoalFileForPrBody(goalFile)}`] : []),
     feature.trim(),
@@ -2882,6 +2903,7 @@ export function formatBlockedDraftClassificationSection(
 
 function blockedDraftPrBody(feature: string, implSummary: string, state: BlockedDraftPrState, goalFile?: string): string {
   return [
+    `칸: ${goalChecklistIds(feature, goalFile).join(' · ') || '없음'}`,
     BLOCKED_DRAFT_PR_HUMAN_JUDGMENT_ANCHOR,
     state.salvageStatusExpected
       ? BLOCKED_DRAFT_PR_SALVAGE_STATUS_INSTRUCTION
@@ -3638,7 +3660,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     }
     try {
       const pushed = opts.seams.preserveBlockedBranch
-        ? await opts.seams.preserveBlockedBranch({ cwd: worktreePath, branch, title: prTitle(opts.feature), commit: preSyncCommit })
+        ? await opts.seams.preserveBlockedBranch({ cwd: worktreePath, branch, title: prTitle(opts.feature, opts.goalFile), commit: preSyncCommit })
         : runGitCommand(worktreePath, ['push', '-u', 'origin', `${preSyncCommit}:refs/heads/${branch}`]).status === 0;
       if (!pushed) throw new Error('branch push failed');
       // The worktree is left untouched: a late merge may still be writing it. The harvest source is the pinned commit.
@@ -4963,7 +4985,7 @@ async function runSelfImplementInner(
     role: describeRole({ role: 'executor', executorKind: 'self' }),
     entry: siEntry, capabilities: [...siCaps.active], enhanceActive,
   });
-  progress('start', `🔨 self-implement 시작 — ${prTitle(opts.feature)}`);
+  progress('start', `🔨 self-implement 시작 — ${prTitle(opts.feature, opts.goalFile)}`);
 
   let sessionId: string | undefined;
   if (opts.parentSessionId && s.forkSession) {
@@ -5202,6 +5224,7 @@ async function runSelfImplementInner(
   /** GATE-ENV-RETRY: 재시도 뒤에도 남은 환경 결손의 종류. 정의되면 이 라운드의 gate 실패는 «수확 대기»로 끝난다. */
   let gateEnvDeficitKind: GateEnvDeficitKind | undefined;
   let review: SelfImplementReview | undefined;
+  let reviewedHeadCommit: string | undefined;
   /** Review-budget leftovers and the body that carried them, so a later merge drafts from the same text. */
   let preparedReviewBudgetPrBody: string | undefined;
   const reviewMustFixCountHistory: number[] = [];
@@ -5791,11 +5814,11 @@ async function runSelfImplementInner(
             throw new Error(`worktree not found: ${wt.path}`);
           }
           if (s.preserveBlockedBranch) {
-            pushed = await s.preserveBlockedBranch({ cwd: wt.path, branch: wt.branch, title: prTitle(opts.feature) });
+            pushed = await s.preserveBlockedBranch({ cwd: wt.path, branch: wt.branch, title: prTitle(opts.feature, opts.goalFile) });
             if (!pushed) throw new Error('브랜치 push가 성공하지 않았음');
           } else {
             preservationErrorStep = 'commit';
-            const commit = commitWorktree(wt.path, prTitle(opts.feature));
+            const commit = commitWorktree(wt.path, prTitle(opts.feature, opts.goalFile));
             if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(commit.out);
             committed = commit.ok;
             if (runGitCommand(wt.path, ['remote', 'get-url', 'origin']).status === 0) {
@@ -5875,10 +5898,10 @@ async function runSelfImplementInner(
       let salvageError: string | undefined;
       try {
         if (s.preserveBlockedBranch) {
-          if (!await s.preserveBlockedBranch({ cwd: wt.path, branch: salvageBranch, title: prTitle(opts.feature) })) throw new Error('수확 가지 push가 성공하지 않았음');
+          if (!await s.preserveBlockedBranch({ cwd: wt.path, branch: salvageBranch, title: prTitle(opts.feature, opts.goalFile) })) throw new Error('수확 가지 push가 성공하지 않았음');
         } else {
           if (!existsSync(wt.path)) throw new Error(`worktree not found: ${wt.path}`);
-          const commit = commitWorktree(wt.path, prTitle(opts.feature));
+          const commit = commitWorktree(wt.path, prTitle(opts.feature, opts.goalFile));
           if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(`로컬 커밋 실패: ${commit.out}`);
           const push = runGitCommand(wt.path, ['push', 'origin', `HEAD:refs/heads/${salvageBranch}`]);
           if (push.status !== 0) throw new Error(push.stderr || push.stdout || 'git push failed');
@@ -5915,10 +5938,10 @@ async function runSelfImplementInner(
       let pushed = false;
       try {
         if (s.preserveBlockedBranch) {
-          pushed = await s.preserveBlockedBranch({ cwd: wt.path, branch: wt.branch, title: prTitle(opts.feature) });
+          pushed = await s.preserveBlockedBranch({ cwd: wt.path, branch: wt.branch, title: prTitle(opts.feature, opts.goalFile) });
         } else {
           if (commitFirst) {
-            const commit = commitWorktree(wt.path, prTitle(opts.feature));
+            const commit = commitWorktree(wt.path, prTitle(opts.feature, opts.goalFile));
             if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(`로컬 브랜치 커밋 실패: ${commit.out}`);
           }
           const push = runGitCommand(wt.path, ['push', '-u', 'origin', `HEAD:refs/heads/${wt.branch}`]);
@@ -5942,7 +5965,7 @@ async function runSelfImplementInner(
     if (stage === 'review-blocked' && podReviewBlockedDraft) {
       let commitError: string | undefined;
       try {
-        const commit = commitWorktree(wt.path, prTitle(opts.feature));
+        const commit = commitWorktree(wt.path, prTitle(opts.feature, opts.goalFile));
         if (!commit.ok && !/nothing to commit/.test(commit.out)) commitError = commit.out.trim() || 'git commit failed';
       } catch (error) {
         commitError = safeErrorDescription(error);
@@ -5954,7 +5977,7 @@ async function runSelfImplementInner(
     let pr: { url: string; number: number };
     try {
       pr = await withStepTimeout(s.openPr({
-        title: prTitle(opts.feature),
+        title: prTitle(opts.feature, opts.goalFile),
         body: assembled.body,
         head: wt.branch,
         ...(opts.base ? { base: opts.base } : {}),
@@ -6110,7 +6133,7 @@ async function runSelfImplementInner(
     );
     preparedReviewBudgetPrBody = preparedPrBody.body;
     const pr = await withStepTimeout(s.openPr({
-      title: prTitle(opts.feature),
+      title: prTitle(opts.feature, opts.goalFile),
       body: preparedPrBody.body,
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
@@ -6826,7 +6849,7 @@ async function runSelfImplementInner(
             && targets.some((target) => changedFileIsInsideDeclaredTarget(path, target)));
         if (eligible.length) {
           inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
-          const message = `self-implement: ${prTitle(opts.feature)}`;
+          const message = `self-implement: ${prTitle(opts.feature, opts.goalFile)}`;
           let outcome: { ok: boolean; out: string };
           try {
             outcome = (s.commitFinishedChildWork ?? ((cwd, paths, title) => {
@@ -7347,6 +7370,7 @@ async function runSelfImplementInner(
     lastReviewContext = reviewContext;
     reviewIntent = buildReviewIntent(reviewContext);
 
+    reviewedHeadCommit = undefined;
     if (s.reviewDiff) {
       try {
         const stoppedBeforeReview = honorParentSoftStop('review');
@@ -7356,7 +7380,18 @@ async function runSelfImplementInner(
         }
         onNodeEntry(node('review'), round);
         progress('reviewing', '내부 리뷰 (리뷰어 비평)…');
+        const readReviewHead = s.headCommit ?? ((cwd: string) => {
+          const commit = runGitCommand(cwd, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
+          return commit.status === 0 ? commit.stdout.trim() : undefined;
+        });
+        const headBeforeReview = readReviewHead(wt.path);
+        const statusBeforeReview = runGitCommand(wt.path, ['status', '--porcelain'], { encoding: 'utf8', timeout: 10_000 });
         review = await withStepTimeout(s.reviewDiff(wt.path, reviewContext), T.review, 'review');
+        const statusAfterReview = runGitCommand(wt.path, ['status', '--porcelain'], { encoding: 'utf8', timeout: 10_000 });
+        reviewedHeadCommit = review.reviewed && headBeforeReview && /^[0-9a-f]{40}$/i.test(headBeforeReview)
+          && statusBeforeReview.status === 0 && statusBeforeReview.stdout.trim() === ''
+          && statusAfterReview.status === 0 && statusAfterReview.stdout.trim() === ''
+          && headBeforeReview === readReviewHead(wt.path) ? headBeforeReview : undefined;
       } catch (error) {
         finalizeSupervisorDeliveries(error instanceof StepTimeoutError ? 'next-round-review-timeout' : 'next-round-review-failed');
         throw error;
@@ -7595,6 +7630,7 @@ async function runSelfImplementInner(
     ? { completionDisposition }
     : {};
   const reviewReal = !!review?.reviewed;
+  const reviewedHeadResult = reviewReal && reviewedHeadCommit ? { reviewedHeadCommit } : {};
   const reviewDiffComplete = review?.diffTruncated === false;
   const requiredEvidenceMissing = evidenceCoverage !== undefined && evidenceCoverage.uncoveredCount > 0;
   const { latestSignalIncomplete } = signalIncompleteState(roundClassifications);
@@ -7680,7 +7716,7 @@ async function runSelfImplementInner(
       try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* no documented targets */ }
     }
     inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
-    s.commitWork(wt.path, prTitle(opts.feature));
+    s.commitWork(wt.path, prTitle(opts.feature, opts.goalFile));
     // ⛔⭐ resume 경로와 «같은» 해석기를 쓴다 — 두 자리가 갈리면 같은 원인이 다른 얼굴로 나온다.
     const resolvedTarget = resolveDefaultBranchTarget(s.defaultBranchRef ?? defaultBranchRef, wt.path);
     const mergeTarget = resolvedTarget.target;
@@ -7725,9 +7761,9 @@ async function runSelfImplementInner(
         && await preserveMergeHarvest(sync.reason, sync.inputChars);
       return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(harvestable ? { harvestable: true } : {}), detail: harvestable ? sync.reason === 'conflict-input-too-large' ? `충돌 큼 — 사람 수확 (${wt.branch}, 입력 ${sync.inputChars}자)` : `충돌 해결 중단 — 사람 수확 (${wt.branch})` : `pre-PR main sync ${sync.status}` };
     }
-    if (sync.status === 'llm-resolved' || sync.status === 'merged') {
+    if (sync.status === 'llm-resolved' || sync.status === 'merged' || sync.status === 'deterministic-resolved') {
       preservationBase = opts.base ?? mergeTarget;
-      progress('gating', sync.status === 'llm-resolved'
+      progress('gating', sync.status === 'llm-resolved' || sync.status === 'deterministic-resolved'
         ? `${mergeTarget} 충돌해결됨 — ${formatLlmMergeOutcome(sync)} — 통합 결과 full 재-gate…`
         : `${mergeTarget} 정합됨 — 통합 결과 full 재-gate…`);
       onNodeEntry('regate', round);
@@ -7880,7 +7916,7 @@ async function runSelfImplementInner(
   let pr: { url: string; number: number };
   try {
     pr = await withStepTimeout(s.openPr({
-      title: prTitle(opts.feature),
+      title: prTitle(opts.feature, opts.goalFile),
       body: preparedPrBody.body,
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
@@ -7901,6 +7937,11 @@ async function runSelfImplementInner(
     }, { level: 'error' });
     progress('aborted', formatPrOpenFailedProgress(location, prErrorFirstLine));
     throw new Error(`${location}\n${prError}`);
+  }
+  // PR creation may commit generated body/release notes or sync the base after review. Never bind an old review to that new head.
+  if (reviewedHeadCommit) {
+    const current = runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
+    if (current.status !== 0 || current.stdout.trim() !== reviewedHeadCommit) delete reviewedHeadResult.reviewedHeadCommit;
   }
   observe('pr-opened', {
     url: pr.url,
@@ -7951,7 +7992,7 @@ async function runSelfImplementInner(
     }
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): ${releaseHoldPath}`);
-    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, prUrl: pr.url, prNumber: pr.number, detail: `OP approval required: ${releaseHoldPath}` };
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number, detail: `OP approval required: ${releaseHoldPath}` };
   }
   if (!releasePathInspectionError && labels?.includes(AUTO_REVIEW_LABEL)) {
     try {
@@ -7969,7 +8010,7 @@ async function runSelfImplementInner(
       : 'release-path-inspection-failed';
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): PR 경로 조회 실패`);
-    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, prUrl: pr.url, prNumber: pr.number };
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number };
   }
 
   if (canAuto && (s.mergePr || opts.mergeByHost)) {
@@ -8019,12 +8060,12 @@ async function runSelfImplementInner(
       //    판정(mergeReason)이 아니라 «집행 직전 가드»가 막았으므로 그 사실을 값으로 말한다.
       //    ⛔ 안 그러면 마지막 줄이 침묵하고, 그건 이 착지가 없애려던 상태다(리뷰 must-fix 2R).
       const guardSkipReason = mergeSkipReason ?? (guardFailure ? 'merge-guard-unevaluated' : 'docs-deletion-threshold');
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: guardSkipReason, prUrl: pr.url, prNumber: pr.number, detail };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: guardSkipReason, prUrl: pr.url, prNumber: pr.number, detail };
     }
     if (opts.mergeByHost) {
       observe('merge-ready', { number: pr.number, checkedHeadCommit });
       progress('pr-opened', `호스트 재게이트 대기 (#${pr.number})`);
-      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
+      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
     }
     // Landing freeze: the in-flight marker is written before the freeze is read, so a `freeze on` racing this merge waits.
     // The resume sweep merges from the repository that owns the run worktree (the worktree itself may be cleaned up).
@@ -8036,13 +8077,13 @@ async function runSelfImplementInner(
     };
     const landing = admitLandingMerge(heldEntry, undefined, {}, { prNumber: pr.number, repoRoot: owningRepoRoot(wt.path) ?? wt.path, ...(checkedHeadCommit ? { headCommit: checkedHeadCommit } : {}) });
     if (landing.kind === 'held' && !(checkedHeadCommit && /^[0-9a-f]{40}$/i.test(checkedHeadCommit))) {
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: 'merge-guard-unevaluated', prUrl: pr.url, prNumber: pr.number, detail: 'freeze: checked head SHA unavailable; PR left ready for review' };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: 'merge-guard-unevaluated', prUrl: pr.url, prNumber: pr.number, detail: 'freeze: checked head SHA unavailable; PR left ready for review' };
     }
     if (landing.kind !== 'merge') {
       const detail = landing.kind === 'held' ? landingFreezeMessage(landing.freeze) : 'freeze lifted; a resume sweep is merging this PR';
       debug.log('harness.merge', 'frozen', { pr: pr.number, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
       progress('pr-opened', `#${pr.number} ready · ${detail}`);
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: landing.kind === 'held' ? 'frozen' : 'resumed-elsewhere', prUrl: pr.url, prNumber: pr.number, detail };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: landing.kind === 'held' ? 'frozen' : 'resumed-elsewhere', prUrl: pr.url, prNumber: pr.number, detail };
     }
     // The marker and claim live until the merge call itself settles — a step timeout does not stop a merge already
     // sent — and anything that throws before the merge call is made releases them.
@@ -8132,10 +8173,10 @@ async function runSelfImplementInner(
     //    그대로 두면 마지막 산출 줄이 «침묵»한다 — 이 착지가 없애려던 바로 그 상태다(리뷰 must-fix).
     //    ⇒ 판정이 아니라 «집행»에서 막힌 것이므로 그 사실을 별도 값으로 말한다.
     const mergeAttemptSkipReason = mergeSkipReason ?? 'merge-attempt-failed';
-    return { ok: true, stage: 'pr-opened', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: mergeAttemptSkipReason, merged: false, prUrl: pr.url, prNumber: pr.number, ...(m.detail ? { detail: m.detail } : {}) };
+    return { ok: true, stage: 'pr-opened', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: mergeAttemptSkipReason, merged: false, prUrl: pr.url, prNumber: pr.number, ...(m.detail ? { detail: m.detail } : {}) };
   }
   progress('pr-opened', `✅ PR 개설 (#${pr.number})`);
-  return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}), prUrl: pr.url, prNumber: pr.number };
+  return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}), prUrl: pr.url, prNumber: pr.number };
 }
 
 /** 결정적 요청 거부 — 같은 요청을 다시 보내면 «같은» 답이 온다(BACKLOG B6).

@@ -14,7 +14,9 @@ test('core catalog shares the parser vocabulary, is idempotent and graph-scoped'
   expect(WORKFLOW_CORE_KINDS).toHaveLength(24);
   expect(WORKFLOW_CORE_KINDS).toContain('knowledge');
   expect(WORKFLOW_CORE_KINDS).toContain('subworkflow');
-  expect(HARNESS_CORE_KINDS).toHaveLength(7);
+  expect(HARNESS_CORE_KINDS).toHaveLength(8);
+  expect(hasNodeKind('harness', 'prompt')).toBe(true);
+  expect(parseGraphTemplateYaml(yaml('prompt')).template?.nodes[0]?.kind).toBe('prompt');
   expect(listNodeKinds('workflow').filter((entry) => entry.core).every((entry) => entry.description.length > 0)).toBe(true);
   expect(hasNodeKind('workflow', 'hitl')).toBe(false);
   expect(hasNodeKind('harness', 'approval')).toBe(false);
@@ -29,6 +31,21 @@ test('registered plugin kind parses only after registration; collisions and inva
   expect(registerNodeKind({ ...plugin, kind: 'other:x' })).toEqual({ ok: false, reason: 'bad-name' });
   expect(registerNodeKind({ ...plugin, kind: 'job-coach:x:y' })).toEqual({ ok: false, reason: 'bad-name' });
   expect(listNodeKinds('harness').filter((kind) => kind.kind === plugin.kind)).toHaveLength(1);
+});
+
+test('workflow core prompt remains registered while unsupported plugin prompt specs are rejected', () => {
+  const entry = (kind: string, run: unknown) => ({
+    graph: 'workflow' as const, kind: `demo:${kind}`, plugin: 'demo', description: 'prompt', core: false,
+    run: run as { bash: string },
+  });
+  expect(hasNodeKind('workflow', 'prompt')).toBe(true);
+  for (const [kind, run] of [
+    ['prompt-valid', { prompt: 'Summarize $ARGUMENTS' }],
+    ['prompt-empty', { prompt: '  ' }],
+    ['prompt-number', { prompt: 42 }],
+    ['prompt-mixed', { prompt: 'Hi', bash: 'echo hi' }],
+  ] as const) expect(registerNodeKind(entry(kind, run))).toEqual({ ok: false, reason: 'bad-name' });
+  expect(hasNodeKind('workflow', 'demo:prompt-valid')).toBe(false);
 });
 
 test('MCP run accepts gateway names and rejects empty, invalid, or mixed executor specs', () => {

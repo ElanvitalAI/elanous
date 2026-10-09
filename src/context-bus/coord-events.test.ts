@@ -1,8 +1,73 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
-import { listCoordEvents, parseCoordHeader, recordCoordEvent } from './coord-events.js';
+import { listCoordEvents, mirrorCoordDecision, parseCoordHeader, recordCoordEvent } from './coord-events.js';
 
 const at = '2026-10-02T02:00:00.000Z';
+
+test('decision header mirrors one posthoc seat report on retry; report and unregistered seat do not mirror', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'coord-seat-decision-'));
+  try {
+    const ledger = new DecisionLedger({ stateDir, now: () => new Date(at), resolveVersion: () => ({ released: null, dev: null, codename: null }) });
+    const url = 'https://github.com/o/r/issues/1#issuecomment-42';
+    const input = { ...parseCoordHeader('OP', '**[OP]** 2026-10-02 11:00 KST → TC · 결정 · DEC-RECORD · 기한 12:40'), url, at };
+    mirrorCoordDecision(input, { ledger });
+    mirrorCoordDecision(input, { ledger });
+    mirrorCoordDecision({ ...parseCoordHeader('OP', '**[OP]** 2026-10-02 11:00 KST → TC · 보고 · DEC-RECORD'), url, at }, { ledger });
+    mirrorCoordDecision({ ...input, seat: 'E' }, { ledger });
+    const [row] = ledger.seatReport();
+    expect(row?.seat).toBe('OP');
+    expect(row?.title).toBe('DEC-RECORD');
+    expect(row?.decision).toBe('→ TC · 결정 · DEC-RECORD · 기한 12:40');
+    expect(row?.delegation).toBe('조율 채널 — 자리 위임 범위');
+    expect(row?.reporting).toBe('posthoc');
+    expect(row?.decidedAt).toBe(at);
+    expect(row?.refs).toEqual([url]);
+    expect(ledger.seatReport()).toHaveLength(1);
+    mirrorCoordDecision({ ...input, slot: null, url: null }, { ledger });
+    expect(ledger.seatReport()).toHaveLength(2);
+    expect(ledger.seatReport().some(row => row.title === row.decision && !row.refs)).toBe(true);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('decision mirror redacts the slot before writing the seat title', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'coord-secret-title-'));
+  try {
+    const ledger = new DecisionLedger({ stateDir, now: () => new Date(at), resolveVersion: () => ({ released: null, dev: null, codename: null }) });
+    const secret = 'token=very-sensitive-value';
+    const input = { ...parseCoordHeader('OP', `**[OP]** 2026-10-02 11:00 KST → TC · 결정 · ${secret} · 기한 12:40`),
+      url: 'https://github.com/o/r/issues/1#issuecomment-72', at };
+    let passedTitle: string | undefined;
+    mirrorCoordDecision(input, { ledger: { recordSeatDecision: (decision) => {
+      passedTitle = decision.title;
+      return ledger.recordSeatDecision(decision);
+    } } });
+    const [row] = ledger.seatReport();
+    expect(passedTitle).toBe('token=***');
+    expect(row?.title).toBe('[REDACTED]');
+    expect(JSON.stringify(row)).not.toContain(secret);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('decision mirror failure is swallowed without changing the context event', () => {
+  const db = openSurfaceEventsDb(':memory:');
+  try {
+    const input = { ...parseCoordHeader('OP', '**[OP]** 2026-10-02 11:00 KST → TC · 결정 · D1'), url: 'https://example.org/decision', at };
+    recordCoordEvent(input, { db });
+    const before = listCoordEvents({ since: at }, { db });
+    let attempts = 0;
+    expect(() => mirrorCoordDecision(input, { ledger: { recordSeatDecision: () => {
+      attempts++;
+      throw new Error('write failed');
+    } } })).not.toThrow();
+    expect(attempts).toBe(1);
+    expect(listCoordEvents({ since: at }, { db })).toEqual(before);
+    expect(before).toHaveLength(1);
+  } finally { db.close(); }
+});
 
 test('one outbound event contains structured refs and first-line-only redacted text; URL and minute retries dedup', () => {
   const db = openSurfaceEventsDb(':memory:');

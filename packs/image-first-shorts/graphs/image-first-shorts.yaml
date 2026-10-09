@@ -1,0 +1,121 @@
+# image-first-shorts — 이미지 우선 애니/캐릭터 쇼츠 제작 그래프
+# 출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트(https://malfoy-meme-making.vercel.app/) · 원작자 허락(2026-10-08) · 출처 명기 조건
+#   (키트 pipeline.yaml 의 S0~S6 단계·사용자 반려=되돌림·동시성·예산 개념을 elanous 그래프 문법으로 옮김. IP 소재는 없음)
+#
+# 실행:  elanous graph run graphs/image-first-shorts.yaml --input "$(cat examples/input.json)" --json
+# 승인:  elanous graph approve image-first-shorts <run_id> [--reject] --by <이름>  → 같은 run 을 --resume
+# 대기:  검사 노드가 «산출이 아직 없다»(outcome=pending)면 wait_<stage> 승인 노드에서 멈춘다.
+#        스킬대로 생성한 뒤 `graph approve … <run_id>` → `graph run … --resume <run_id>` 하면 그 검사로 되돌아간다.
+#        (⚠️ --from 재개는 쓰지 않는다 — 실행기는 반려 이력이 있거나 같은 노드를 두 번 지난 런의 --from 을 거절한다)
+#
+# 동시성(실행기가 강제하지 않는다 — 스킬·도구가 지킨다):
+#   images: codex 병렬 4(imagegen_runner PARALLEL) · video: Flow 동시 제출 5 이하 · matte/render: heavy.sh 세마포어 2
+# 예산: input.budget.video_credits(영상 크레딧) · input.budget.eleven_chars(ElevenLabs 문자) — storyboard·video 노드가 막는다
+# 반려 되돌림: approve_storyboard→storyboard · approve_images→images · approve_final→compose (max_visits 가 반려 횟수 상한)
+#   승인 노드는 명명 결과를 안 낸다 — 실행기가 승인=ok · 반려=fail 로 간선을 고른다. wait_* 반려 = 제작 중단(failed)
+graph_id: image-first-shorts
+version: 1
+entry_node: brief
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: brief
+    kind: agent
+    recipe: cmd:brief
+    max_visits: 2
+    contract: { inputs: [input.title, input.workspace, input.ip_blocklist, input.budget, input.video_backend], tools: 'bun · 파일 쓰기(workspace)', outputs: [workspace, video_backend, budget] }
+  - node_id: storyboard
+    kind: agent
+    recipe: cmd:storyboard
+    max_visits: 8
+    contract: { inputs: [storyboard.json, templates/], tools: 'bun · 템플릿 조립 · IP 0건 검사 · 크레딧 추정', outputs: [jobs/images.jsonl, jobs/video.jsonl, credits_estimate] }
+  - node_id: wait_storyboard
+    kind: hitl
+    recipe: approval:wait-storyboard
+    max_visits: 6
+    contract: { inputs: [storyboard.json], tools: '사람/에이전트 — 스토리보드 작성 완료 신호', outputs: [approved|rejected] }
+  - node_id: approve_storyboard
+    kind: hitl
+    recipe: approval:storyboard-approval
+    max_visits: 4
+    contract: { inputs: [storyboard.json, jobs/], tools: '사람 승인', outputs: [approved|rejected] }
+  - node_id: images
+    kind: agent
+    recipe: cmd:images
+    max_visits: 8
+    contract: { inputs: [jobs/images.jsonl], tools: 'codex $imagegen(스킬이 실행) · 이 노드는 존재·내용대조 확인만', outputs: [assets/images/*.png, manifest.jsonl] }
+  - node_id: wait_images
+    kind: hitl
+    recipe: approval:wait-images
+    max_visits: 8
+    contract: { inputs: [jobs/images.jsonl], tools: '사람/에이전트 — 이미지 생성·내용대조 완료 신호', outputs: [approved|rejected] }
+  - node_id: approve_images
+    kind: hitl
+    recipe: approval:images-approval
+    max_visits: 4
+    contract: { inputs: [assets/images/, contact sheet], tools: '사람 대조', outputs: [approved|rejected] }
+  - node_id: video
+    kind: agent
+    recipe: cmd:video
+    max_visits: 8
+    contract: { inputs: [jobs/video.jsonl, assets/images/], tools: '백엔드 교체 가능 — flow-aside(기본, Aside MCP 로 Flow 웹) | higgsfield(higgsfield-generate)', outputs: [assets/video/*.mp4, ledger/video_credits.jsonl] }
+  - node_id: wait_video
+    kind: hitl
+    recipe: approval:wait-video
+    max_visits: 8
+    contract: { inputs: [jobs/video.jsonl], tools: '사람/에이전트 — 영상 생성 완료 신호', outputs: [approved|rejected] }
+  - node_id: matte
+    kind: agent
+    recipe: cmd:matte
+    max_visits: 12
+    contract: { inputs: [assets/video/, jobs/inworld.txt], tools: 'tools/matte_queue.sh(색차 키 + isnet-anime, heavy.sh 2)', outputs: [assets/matte/*.webm, '*_qc.jpg'] }
+  - node_id: audio
+    kind: agent
+    recipe: cmd:audio
+    max_visits: 12
+    contract: { inputs: [storyboard.json], tools: 'epidemic-sound | ElevenLabs music · ElevenLabs TTS · analyze_music.py · asr_pick.py', outputs: [audio/beats.json, audio/vo/picks.json] }
+  - node_id: fx
+    kind: agent
+    recipe: cmd:fx
+    max_visits: 12
+    contract: { inputs: [audio/beats.json], tools: 'HyperFrames(코드 배경·타이포·플래시)', outputs: ['fx/*.mp4|mov|webm'] }
+  - node_id: compose
+    kind: agent
+    recipe: cmd:compose
+    max_visits: 12
+    contract: { inputs: [fx/, assets/matte/, audio/], tools: 'ffmpeg 합성·mux(heavy.sh 아래)', outputs: [out/final.mp4] }
+  - node_id: wait_post
+    kind: hitl
+    recipe: approval:wait-post
+    max_visits: 12
+    contract: { inputs: [assets/matte/, audio/, fx/, out/], tools: '사람/에이전트 — 후반(매팅·소리·효과·합성) 작업 완료 신호', outputs: [approved|rejected] }
+  - node_id: approve_final
+    kind: hitl
+    recipe: approval:final-approval
+    max_visits: 4
+    contract: { inputs: [out/final.mp4], tools: '사람 최종 판정', outputs: [approved|rejected] }
+  - node_id: done
+    kind: gate
+    recipe: cmd:done
+    max_visits: 1
+    contract: { inputs: [outputs], tools: bun, outputs: [final] }
+  - node_id: failed
+    kind: gate
+    recipe: cmd:failed
+    max_visits: 1
+    contract: { inputs: [outputs], tools: bun, outputs: [error, next] }
+edges:
+  - { from: brief, on: outcome, map: { ok: storyboard, fail: failed } }
+  - { from: storyboard, on: outcome, map: { ok: approve_storyboard, pending: wait_storyboard, fail: failed } }
+  - { from: wait_storyboard, on: outcome, map: { ok: storyboard, fail: failed } }
+  - { from: approve_storyboard, on: outcome, map: { ok: images, fail: storyboard } }
+  - { from: images, on: outcome, map: { ok: approve_images, pending: wait_images, fail: failed } }
+  - { from: wait_images, on: outcome, map: { ok: images, fail: failed } }
+  - { from: approve_images, on: outcome, map: { ok: video, fail: images } }
+  - { from: video, on: outcome, map: { ok: matte, pending: wait_video, fail: failed } }
+  - { from: wait_video, on: outcome, map: { ok: video, fail: failed } }
+  - { from: matte, on: outcome, map: { ok: audio, pending: wait_post, fail: failed } }
+  - { from: audio, on: outcome, map: { ok: fx, pending: wait_post, fail: failed } }
+  - { from: fx, on: outcome, map: { ok: compose, pending: wait_post, fail: failed } }
+  - { from: compose, on: outcome, map: { ok: approve_final, pending: wait_post, fail: failed } }
+  - { from: wait_post, on: outcome, map: { ok: matte, fail: failed } }
+  - { from: approve_final, on: outcome, map: { ok: done, fail: compose } }

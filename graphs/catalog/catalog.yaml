@@ -21,7 +21,7 @@ catalog_id: elanous-node-catalog
 version: 1
 
 kinds:
-  existing: [agent, gate, git, judge, observe, hitl, subgraph]
+  existing: [agent, gate, git, judge, observe, hitl, prompt, subgraph]
   proposed: {}
 
 roles:

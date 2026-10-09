@@ -1,0 +1,8 @@
+{
+ "_source": "출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트(https://malfoy-meme-making.vercel.app/) · 원작자 허락(2026-10-08) · 출처 명기 조건",
+ "_recipe": "POST https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_192 , 헤더 xi-api-key: $ELEVENLABS_API_KEY. text 는 tts_template.txt 로 조립. 한 줄에 seed 2개(11/22)로 테이크 2개 → tools/asr_pick.py 로 고름",
+ "text": "{TEXT}",
+ "model_id": "eleven_v4",
+ "voice_settings": {"stability": "{STABILITY}", "similarity_boost": 0.8},
+ "seed": "{SEED}"
+}

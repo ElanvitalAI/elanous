@@ -11,6 +11,8 @@ const before = {
     // SYNC1 ② (#22883) added `ops now-refresh` after the extraction.
     { name: 'now-refresh', flags: ['--once', '--dry-run', '--json'] },
     { name: 'status', flags: ['--json', '--all-instances', '--include-test', '-r', '--remote <name>'] },
+    // OVW-CLI (0.2.21) added `ops overview` after `status`.
+    { name: 'overview', flags: ['--json', '--watch [seconds]', '--since <window>', '--owner <owner>', '--version <v>'] },
     { name: 'health', flags: ['--json'] },
     { name: 'timeline', flags: ['--entity-type <t>', '--event <e>', '--since-hours <n>', '--limit <n>', '--json'] },
     { name: 'mission', flags: ['--json'] },

@@ -63,6 +63,21 @@ export const EDGE_FAMILY_COLOR: Record<EdgeFamily, string> = {
   neutral: 'var(--muted-foreground, #64748b)',
 };
 
+export function hoverFocus(
+  nodeId: string | null,
+  edges: readonly { id: string; from: string; to: string }[],
+): { nodes: Set<string>; edges: Set<string> } | null {
+  if (nodeId === null) return null;
+  const nodes = new Set([nodeId]);
+  const focusedEdges = new Set<string>();
+  for (const edge of edges) {
+    if (edge.from !== nodeId && edge.to !== nodeId) continue;
+    nodes.add(edge.from === nodeId ? edge.to : edge.from);
+    focusedEdges.add(edge.id);
+  }
+  return { nodes, edges: focusedEdges };
+}
+
 export function mergeParallelEdges(edges: readonly RouteEdgeInput[]): MergedEdge[] {
   const byPair = new Map<string, MergedEdge>();
   edges.forEach((edge, index) => {

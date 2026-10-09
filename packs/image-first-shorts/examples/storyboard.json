@@ -1,0 +1,31 @@
+{
+  "_about": "예시 스토리보드(원작 캐릭터 · IP 없음). 에이전트가 이 꼴로 workspace/storyboard.json 을 쓴다. fixed = 편 전체 고정 블록, shots[].image/video = 가변 블록",
+  "title": "copper-swordswoman-showcase",
+  "bpm": 128,
+  "fixed": {
+    "image": {
+      "STYLE": "Premium 3D anime game character render, cel-shaded toon shading, crisp rim light, AAA anime action RPG showcase quality.",
+      "CHARACTER": "Same character as the attached reference: confident young swordswoman about 18, warm tan skin, short copper-red hair, bright amber eyes, cheeky grin.",
+      "OUTFIT": "Outfit: cropped navy travel jacket with brass buttons, white shirt, dark utility shorts, knee-high brown boots, fingerless gloves.",
+      "BACKGROUND": "Background: perfectly flat solid pure blue (#1E3CFF) studio backdrop, evenly lit, no gradient, no floor line, no shadows on the backdrop, the whole character clearly separated from the background with clean edges, for chroma keying.",
+      "TAIL": "No text, no letters, no logo, no watermark."
+    },
+    "video": {
+      "STYLE": "3D anime cel-shaded game character showcase style, energetic, snappy, stylish anime game motion with fluid follow-through.",
+      "KEEP": "Keep the small brass compass badge on her jacket unchanged."
+    }
+  },
+  "shots": [
+    { "id": "S1_closeup", "kind": "blue", "seconds": 4,
+      "image": { "POSE": "Close-up bust shot, looking slightly away, half-lidded eyes." },
+      "video": { "CAMERA": "Slow push-in.", "ACTION": "She turns her gaze straight into the camera and breaks into a confident grin, a few hair strands drifting in a light breeze." } },
+    { "id": "S2_fullbody", "kind": "blue", "seconds": 8,
+      "image": { "POSE": "Full body, standing three-quarter view, one hand on the sword hilt, chin slightly raised." },
+      "video": { "ACTION": "She spins once to face the camera, jacket hem swirling, draws the sword halfway and snaps it back into the sheath, ending with a hand on her hip." } },
+    { "id": "S3_plaza", "kind": "inworld", "seconds": 6,
+      "image": { "POSE": "Wide shot, she stands at the edge of a sunlit stone plaza with fluttering market banners.", "BACKGROUND": "Background: sunlit stone plaza with fluttering colorful market banners, soft morning light." },
+      "video": { "CAMERA": "Slow crane down.", "ACTION": "Banners ripple in the wind as she walks toward the camera and stops with a playful salute." } }
+  ],
+  "lines": [ { "line_id": "L1", "text": "[confident] Ready when you are.", "lang": "en", "must": ["ready"] } ],
+  "lyrics": []
+}

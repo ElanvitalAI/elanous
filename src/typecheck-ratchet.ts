@@ -8,9 +8,10 @@ export const TYPECHECK_GATE_CONFIG = 'tsconfig.gate.json';
  *   🩸 2026-09-23: 🅢·🅕·🅣 세 창이 같은 날 `heap out of memory` 로 착지가 막혔다. 📏 통과한 판의 최대 RSS **5.0GB**
  *   (128GB 기계 · 부하와 무관하게 재현 — 🅕 「로드 ~7 로 내려간 뒤에도 났다」). 우회 12288 로 🅢 착지 19건 PASS.
  *   ⇒ 부하 탓이 아니라 «자란 프로젝트»다. 값을 사람이 기억해 붙이는 우회를 도구가 스스로 갖는다.
+ *   🩸 2026-10-08: 12288 로도 호스트 재게이트·`pr land` 가 OOM 으로 «못 잼»(#25177 · #25248 · TC 수확 4건 — 전부 20480 에서 PASS) → 20480.
  * ⚠️ 호출자가 이미 `--max-old-space-size` 를 줬으면 «그것을» 존중한다(덮지 않는다).
  */
-export const TSC_HEAP_MB = 12288;
+export const TSC_HEAP_MB = 20480;
 export function tscEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const cur = base.NODE_OPTIONS ?? '';
   if (/--max-old-space-size[= ]/.test(cur)) return base;

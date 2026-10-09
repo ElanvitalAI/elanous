@@ -16,7 +16,7 @@ function tmpDb(tag: string): string {
 describe('ops P3 — opsHealthContext 자각', () => {
   test('이상 없으면 빈 문자열(노이즈 없음)', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
-    const ctx = opsHealthContext({ opsDbPath: tmpDb('healthy'), missionStore: store, schedulesDbPath: tmpDb('sched1'), mandate: null });
+    const ctx = opsHealthContext({ opsDbPath: tmpDb('healthy'), missionStore: store, schedulesDbPath: tmpDb('sched1'), mandate: null, graphLoopRuns: () => [] });
     expect(ctx).toBe('');
     store.close();
     rmSync(tmpDb('healthy'), { force: true }); rmSync(tmpDb('sched1'), { force: true });
@@ -28,7 +28,7 @@ describe('ops P3 — opsHealthContext 자각', () => {
     recordOpsEvent(db, { entityType: 'loop', entityId: 'rule:capstone', event: 'cycle_end', toState: 'failed', refs: { error: 'x' } });
     db.close();
     const store = new TaskStore({ path: ':memory:', noWal: true });
-    const ctx = opsHealthContext({ opsDbPath, missionStore: store, schedulesDbPath: tmpDb('sched2'), mandate: null });
+    const ctx = opsHealthContext({ opsDbPath, missionStore: store, schedulesDbPath: tmpDb('sched2'), mandate: null, graphLoopRuns: () => [] });
     expect(ctx).toContain('운영 상태 경보');
     expect(ctx).toContain('rule:capstone');
     expect(ctx).toContain('대표 결정');

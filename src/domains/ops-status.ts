@@ -26,6 +26,7 @@ import { loadMandate, type TradeMandate } from './trade-mandate.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
 import { detectRepeatedFailures, explainFailure } from './repeated-failure.js';
+import { listLoops, loopRecentRuns, type LoopRun } from '../loops/registry.js';
 
 /** 예약 레지스트리 조회 관측 — 실패가 0으로 접히지 않게 남기는 창구. */
 export const OPS_STATUS_LOG_CATEGORY = 'ops.status';
@@ -33,6 +34,29 @@ export const OPS_SCHEDULES_LOOKUP_FAILED_EVENT = 'schedules.lookup-failed';
 
 /** 예약 레지스트리 행 조회 seam — 미지정 시 실 레지스트리 reader. */
 export type ListScheduleRows = () => ScheduleRow[];
+
+/** Graph-loop health input — run history is newest first. */
+export type GraphLoopRuns = () => Array<{
+  id: string;
+  enabled: boolean;
+  runs: Array<Pick<LoopRun, 'at' | 'status' | 'failedNodes'>>;
+}>;
+
+/** Bounded window per loop: a streak whose oldest read run is already >24h old is flagged; a longer
+ * all-failed history than this window can only under-report (never over-report) the streak length. */
+export const GRAPH_LOOP_HEALTH_RUN_WINDOW = 50;
+
+function defaultGraphLoopRuns(): ReturnType<GraphLoopRuns> {
+  const out: ReturnType<GraphLoopRuns> = [];
+  for (const loop of listLoops().filter(entry => entry.enabled)) {
+    // One unreadable run history must not hide the other loops.
+    try { out.push({ id: loop.id, enabled: loop.enabled, runs: loopRecentRuns(loop.id, {}, GRAPH_LOOP_HEALTH_RUN_WINDOW) }); }
+    catch (err) {
+      debug.log('ops.health', 'graph-loop-failure-skipped', { loop: loop.id, reason: redactSecretText(err instanceof Error ? err.message : String(err)) });
+    }
+  }
+  return out;
+}
 
 /** 조회 seam(테스트) — 미지정 시 실 스토어. */
 export interface OpsStatusOpts {
@@ -47,6 +71,8 @@ export interface OpsStatusOpts {
   planDraftFor?: (missionId: string) => string;
   /** Health-only log reader seam; the default reads the current instance's last ten minutes read-only. */
   recentLogs?: () => LogStoreRow[];
+  /** Health-only graph-loop registry reader; injection avoids the real state directory. */
+  graphLoopRuns?: GraphLoopRuns;
 }
 
 export interface CountByStatus { [status: string]: number }
@@ -339,6 +365,33 @@ export function opsHealth(opts: OpsStatusOpts = {}): OpsHealthReport {
     for (const e of snap.schedules.errored) {
       anomalies.push({ kind: 'schedule_error', entity: e.name, detail: `마지막 실행 error`, ...(e.lastRun ? { since: e.lastRun } : {}) });
     }
+  }
+
+  // Graph-run history is independent of ops_events loops and of log-store failures.
+  try {
+    const loops = (opts.graphLoopRuns ?? defaultGraphLoopRuns)();
+    const nowMs = (opts.now ?? new Date()).getTime();
+    let flagged = 0;
+    for (const loop of loops) {
+      if (!loop.enabled) continue;
+      const runs = [...loop.runs].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+      const failures = [] as typeof runs;
+      for (const run of runs) {
+        if (run.status !== 'failed') break;
+        failures.push(run);
+      }
+      const first = failures.at(-1);
+      if (failures.length < 2 || !first || !Number.isFinite(Date.parse(first.at)) || nowMs - Date.parse(first.at) <= 24 * 3600_000) continue;
+      anomalies.push({
+        kind: 'repeated_failure', entity: `loop:${loop.id}`,
+        detail: `그래프 루프 ${loop.id} 연속 실패 ${failures.length}회 · ${first.at} 부터 · 마지막 실패 노드 ${failures[0]!.failedNodes.join(', ')}`,
+        since: first.at,
+      });
+      flagged++;
+    }
+    debug.log('ops.health', 'graph-loop-failure', { loops: loops.length, flagged });
+  } catch (err) {
+    debug.log('ops.health', 'graph-loop-failure-skipped', { reason: redactSecretText(err instanceof Error ? err.message : String(err)) });
   }
 
   // Independent log check: an unreadable log store must not hide task/loop/schedule anomalies.

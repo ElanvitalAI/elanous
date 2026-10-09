@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { queryInstalledPack } from '../knowledge/query.js';
 
 export interface WizardStepSpec {
   id: string;
@@ -28,6 +29,7 @@ export const WIZARD_STEPS: readonly WizardStepSpec[] = [
   { id: 'notify-me', use: '실패·포기 같은 사건을 나(대표)에게 알린다. arg = 알림 문구', outcomes: ['ok', 'fail'], timeoutMs: 60_000 },
   { id: 'gh-pr-review', use: 'GitHub PR 을 엘라누스 리뷰어로 리뷰한다. arg = PR 번호(없으면 실행 입력 input.pr). 결과 ok(must-fix 없음) · must-fix', outcomes: ['ok', 'must-fix', 'fail'], timeoutMs: 900_000 },
   { id: 'gh-pr-merge', use: 'GitHub PR 을 squash 머지한다. arg = PR 번호(없으면 input.pr)', outcomes: ['ok', 'fail'], timeoutMs: 300_000 },
+  { id: 'knowledge-rag', use: '설치된 지식 팩만 검색해 인용 가능한 근거를 낸다. arg = pack:<slug>@<version>; 실행 입력 input.query 또는 앞 단계 결과로 검색하며 둘 다 없으면 팩의 색인에서 가져온다', outcomes: ['ok', 'fail'], timeoutMs: 120_000 },
   { id: 'custom', use: '위 단계로 안 되는 외부 연동(노션·슬랙 업로드 등). 실행하면 «아직 구현되지 않음»으로 실패한다. arg = 무엇을 해야 하는지', outcomes: ['ok', 'fail'], timeoutMs: 60_000 },
 ];
 
@@ -140,6 +142,17 @@ export function runWizardStep(step: string, arg: string | undefined, ctx: GraphC
   const started = Date.now();
   let result: StepResult;
   switch (step) {
+    case 'knowledge-rag': {
+      const query = ctx.input && typeof ctx.input === 'object' && typeof (ctx.input as { query?: unknown }).query === 'string'
+        ? (ctx.input as { query: string }).query : prev.trim();
+      if (!arg) { result = { outcome: 'fail', error: 'knowledge-rag: pack id(arg) required' }; break; }
+      try {
+        const hits = queryInstalledPack(arg, query);
+        result = hits.length ? { outcome: 'ok', text: hits.slice(0, 5).map(hit => `[${hit.ref}] ${hit.title}: ${hit.body}`).join('\n') }
+          : { outcome: 'fail', error: `knowledge-rag: no matches in ${arg}` };
+      } catch (error) { result = { outcome: 'fail', error: error instanceof Error ? error.message : String(error) }; }
+      break;
+    }
     case 'web-search': {
       const query = arg?.trim() || (ctx.input && typeof ctx.input === 'object' && typeof (ctx.input as { query?: unknown }).query === 'string' ? (ctx.input as { query: string }).query : '');
       if (!query) { result = { outcome: 'fail', error: 'web-search: 검색어(arg)가 없다' }; break; }

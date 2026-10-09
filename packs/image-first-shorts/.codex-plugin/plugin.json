@@ -1,0 +1,12 @@
+{
+  "name": "image-first-shorts",
+  "version": "0.1.0",
+  "description": "Image-first vertical anime/character shorts: first-frame images, image-to-video, matting, sound, code effects and compositing with three human approvals.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "image-first-shorts",
+    "shortDescription": "Image-first anime/character shorts with human approval gates",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

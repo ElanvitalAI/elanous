@@ -261,8 +261,18 @@ test('exported /inside is reused only when its HTML is newer than PWA sources an
 // hard-coded pod path).
 const CHROMIUM = [process.env.CHROME_BIN, '/usr/local/bin/chromium', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
   .find((path): path is string => !!path && existsSync(path));
+// `next build` type-checks repo-root sources the PWA imports, and that closure reaches `src/preview/terminal.ts`
+// (`import type { IPty } from 'node-pty'`). `node-pty` is an optionalDependency: where its native install is dropped
+// (0.2.20 Linux gate Pod: "Cannot find package 'node-pty'"), the build cannot compile, so a browser check that would
+// first have to build cannot measure the layout at all. Skip it there - loudly, like the missing-Chromium case. A
+// fresh export needs no build and still runs.
+function nodePtyResolvable(): boolean {
+  try { Bun.resolveSync('node-pty', join(import.meta.dir, '../../../../../src/preview')); return true; } catch { return false; }
+}
+const INSIDE_BUILD_BLOCKED = !exportedInsideIsFresh(join(import.meta.dir, '../../..')) && !nodePtyResolvable();
+if (INSIDE_BUILD_BLOCKED) console.warn('[skip] fresh exported /inside browser checks — export is stale and next build cannot resolve node-pty (optional native dependency not installed)');
 if (!CHROMIUM) console.warn('[skip] fresh exported /inside browser check — no Chromium/Chrome found (CHROME_BIN · /usr/local/bin/chromium · Google Chrome.app)');
-test.skipIf(!CHROMIUM)('fresh exported /inside renders scene ①② at 375px, 1440px and 1920px in Chromium without overflow', async () => {
+test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside renders scene ①② at 375px, 1440px and 1920px in Chromium without overflow', async () => {
   const pwaDir = join(import.meta.dir, '../../..');
   if (!exportedInsideIsFresh(pwaDir)) {
     const build = spawnSync('bun', ['run', 'build'], { cwd: pwaDir, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 10_000_000 });
@@ -400,7 +410,7 @@ test.skipIf(!CHROMIUM)('fresh exported /inside renders scene ①② at 375px, 14
 }, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
 
 if (!CHROMIUM) console.warn('[skip] fold approximation /inside browser check — no Chromium/Chrome found');
-test.skipIf(!CHROMIUM)('fresh exported /inside scenes 1–6 at approximate folded outer 344px, unfolded inner 884px, and 1920px stay inside the viewport in Chromium', async () => {
+test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside scenes 1–6 at approximate folded outer 344px, unfolded inner 884px, and 1920px stay inside the viewport in Chromium', async () => {
   const pwaDir = join(import.meta.dir, '../../..');
   if (!exportedInsideIsFresh(pwaDir)) {
     const build = spawnSync('bun', ['run', 'build'], { cwd: pwaDir, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 10_000_000 });

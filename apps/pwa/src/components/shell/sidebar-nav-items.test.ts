@@ -161,7 +161,7 @@ describe('NAV1a menu', () => {
     expect(Object.fromEntries(SIDEBAR_NAV_ITEMS.map((item) => [item.href, item.label]))).toMatchObject({
       '/today': '오늘', '/approvals': '승인 대기', '/intake': '넣기', '/chat': '채팅', '/exec': 'COO 에게 맡기기',
       '/autopilot': '미션', '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
-      '/term': '터미널', '/editor': '편집기', '/design-check': '디자인', '/workspace': '여러 탭',
+      '/term': '터미널', '/editor': '그래프', '/design-check': '디자인', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
       '/ceo': '대표 조망판', '/loops': '루프 현황', '/loops?view=interact': '루프 상호작용', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
       '/observatory': '관측', '/worktrees': '작업 트리', '/control': '제어',

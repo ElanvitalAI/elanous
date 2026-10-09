@@ -10,6 +10,26 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { parseFrontmatter, type ObsidianVault } from '../auto-research/obsidian-bridge.js';
 import type { KnowledgeKind, KnowledgeNote, KnowledgeQueryInput, KnowledgeQueryResult } from './types.js';
+import { PACK_KINDS, parsePackIdString, packIdString } from './kgs/pack.js';
+import { kgsStoreSingleton, type KgsSqliteStore } from './kgs/sqlite-store.js';
+
+/** Search only cards belonging to a pack present in the local KGS index. No vault fallback. */
+export function listInstalledPacks(store: Pick<KgsSqliteStore, 'listPacksByKind'> = kgsStoreSingleton()): Array<{ id: string; title: string }> {
+  return PACK_KINDS.flatMap(kind => store.listPacksByKind(kind).map(pack => ({ id: packIdString(pack.metadata.id), title: pack.metadata.title })));
+}
+
+export function queryInstalledPack(packId: string, question: string, store: Pick<KgsSqliteStore, 'readPack'> = kgsStoreSingleton()): Array<{ id: string; title: string; body: string; ref: string; updatedAt: string }> {
+  const id = parsePackIdString(packId);
+  if (!id) throw new Error(`invalid pack id: ${packId}`);
+  const pack = store.readPack(id.slug, id.version);
+  if (!pack) throw new Error(`pack not installed: ${packId}`);
+  const words = question.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  return pack.cards.map(card => ({ card, score: words.filter(word => `${card.title} ${card.body}`.toLocaleLowerCase().includes(word)).length }))
+    .filter(hit => hit.score > 0 || words.length === 0)
+    .sort((a, b) => b.score - a.score || a.card.id.localeCompare(b.card.id))
+    .map(({ card }) => ({ id: card.id, title: card.title, body: card.body,
+      ref: `${packIdString(pack.metadata.id)}#${card.id}`, updatedAt: card.updatedAt }));
+}
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;

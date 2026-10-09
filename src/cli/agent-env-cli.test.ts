@@ -21,7 +21,7 @@ function fixture(): string {
     permissions: { defaultMode: 'acceptEdits', allow: [secret] },
     statusLine: { type: 'command', command: `echo ${secret}` },
     hooks: { PreToolUse: [{ matcher: secret, hooks: [{ command: secret }, { command: 'bun' }] }], Stop: [{ hooks: [] }] },
-    enabledPlugins: { 'writer@local': true, 'reader@local': false },
+    enabledPlugins: { 'writer@local': true, 'reader@local': false, [`${secret}@local`]: true },
     mcpServers: { source: { command: 'npx', args: [secret], env: { TOKEN: secret }, headers: { Authorization: secret } },
       remote: { command: `echo ${secret}`, headers: { XToken: secret } } },
     apiKey: secret,

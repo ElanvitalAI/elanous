@@ -9,7 +9,7 @@ classify:
     const result=JSON.parse(new TextDecoder().decode(run.stdout));
     if (!result.complete || result.apply !== false) throw new Error(result.error ?? "draft sweep classification must be shadow and complete");
     console.log(JSON.stringify({outcome:mode,counts:result.counts,entries:result.entries}));'
-  timeout_ms: 120000
+  timeout_ms: 600000
 apply:
   command: >-
     bun -e 'const ctx=await Bun.file(process.env.ELANOUS_GRAPH_CONTEXT).json();
@@ -20,4 +20,4 @@ apply:
     const result=JSON.parse(new TextDecoder().decode(run.stdout));
     if (!result.complete || result.apply !== true) throw new Error(result.error ?? "draft sweep application must be live and complete");
     console.log(JSON.stringify({outcome:"ok",counts:result.counts,entries:result.entries}));'
-  timeout_ms: 120000
+  timeout_ms: 900000

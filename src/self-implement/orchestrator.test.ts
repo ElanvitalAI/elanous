@@ -22,7 +22,7 @@ import { instanceNameForStateDir } from '../instance-identity.js';
 import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-user-question/tool.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
-import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
+import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, goalChecklistIds, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { resetAutohealProcessMemory } from './stop-autoheal.js';
 import { defaultGitMergeSeam, defaultLlmResolve, mergeMainIntoWorktreeWithResolveOptions, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
@@ -36,6 +36,8 @@ import { PIPELINE_EDGES_BY_NODE, PIPELINE_GRAPH_ID, TERMINAL_STAGES_BY_NODE, pip
 
 const isolatedStateDir = mkdtempSync(join(tmpdir(), 'elanous-orchestrator-goal-run-store-'));
 const priorStateDir = process.env.ELANOUS_STATE_DIR;
+const priorPodName = process.env.ELANOUS_POD_NAME;
+const priorSubstrate = process.env.ELANOUS_SUBSTRATE;
 const invokingRepo = process.cwd();
 const invokingGitEnv = { ...process.env };
 delete invokingGitEnv.GIT_DIR;
@@ -51,9 +53,15 @@ let initialInvokingRevision: string;
 beforeAll(() => {
   initialInvokingRevision = invokingRevision();
   process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+  delete process.env.ELANOUS_POD_NAME;
+  delete process.env.ELANOUS_SUBSTRATE;
 });
 
 afterAll(() => {
+  if (priorPodName === undefined) delete process.env.ELANOUS_POD_NAME;
+  else process.env.ELANOUS_POD_NAME = priorPodName;
+  if (priorSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+  else process.env.ELANOUS_SUBSTRATE = priorSubstrate;
   if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = priorStateDir;
   rmSync(isolatedStateDir, { recursive: true, force: true });
@@ -14756,6 +14764,84 @@ describe('runSelfImplement — quota refresh', () => {
 // ⛔⭐⭐ 이 블록은 #7736 이 «지운 4,732줄과 함께» 들어왔던 것이다.
 //   그 PR 은 구현은 옳았으나 «기존 테스트를 지워» revert 됐다(#7738).
 //   ⇒ 구현과 이 테스트만 되살리고 ***삭제는 되살리지 않는다***. 테스트 수는 «늘어야» 한다.
+describe('PR checklist cell stamp', () => {
+  const ask = '대상 경로: src/self-implement/orchestrator.ts · src/self-implement/orchestrator.test.ts\n제목: 이 제목은 칠십두 글자 상한에 맞추려고 충분히 길어야 하며 앞에 칸 접두를 반드시 넣는다';
+  const goalDirectory = mkdtempSync(join(tmpdir(), 'elanous-pr-cell-stamp-'));
+  const goalFile = join(goalDirectory, 'GOAL-cell.txt');
+  afterAll(() => { rmSync(goalDirectory, { recursive: true, force: true }); });
+
+  test('prefers GOAL declaration, stamps first ID on title and every ID on both body kinds', async () => {
+    writeFileSync(goalFile, '- 칸 id: KPACK4 · NEXT-2\n');
+    expect(goalChecklistIds(ask, goalFile)).toEqual(['KPACK4', 'NEXT-2']);
+    expect(goalChecklistIds(`ASK-3 ${ask}`, goalFile)).toEqual(['KPACK4', 'NEXT-2']);
+    const title = prTitle(ask, goalFile);
+    expect(title.startsWith('KPACK4: ')).toBe(true);
+    expect(Array.from(title).length).toBeLessThanOrEqual(72);
+    const longTitle = prTitle(`제목: ${'긴제목'.repeat(35)}`, goalFile);
+    expect(longTitle.startsWith('KPACK4: ')).toBe(true);
+    expect(Array.from(longTitle).length).toBe(72);
+    let openedTitle = '';
+    let body = '';
+    await runSelfImplement({ feature: ask, goalFile, seams: seams({ openPr: async ({ title: opened, body: openedBody }) => {
+      openedTitle = opened;
+      body = openedBody;
+      return { url: 'https://pr/cell', number: 7 };
+    } }) });
+    expect(openedTitle).toBe(title);
+    expect(body.split('\n')[0]).toBe('칸: KPACK4 · NEXT-2');
+    const blocked = assembleBlockedDraftPrBody(ask, 'summary', {
+      reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
+    }, goalFile);
+    expect(blocked.body.split('\n')[0]).toBe('칸: KPACK4 · NEXT-2');
+  });
+
+  test('a single GOAL cell puts exactly 칸: KPACK4 first on a blocked draft', () => {
+    writeFileSync(goalFile, '- 칸 id: KPACK4\n');
+    const blocked = assembleBlockedDraftPrBody(ask, 'summary', {
+      reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
+    }, goalFile);
+    expect(blocked.body.split('\n')[0]).toBe('칸: KPACK4');
+  });
+
+  test('does not duplicate an existing ID prefix and uses only first-line ask tokens as fallback', () => {
+    const feature = 'KPACK-4: 이미 시작하는 제목\n본문의 OTHER-2 는 대상이 아니다';
+    expect(goalChecklistIds(feature)).toEqual(['KPACK-4']);
+    expect(prTitle(feature)).toBe(feature.split('\n')[0]);
+  });
+
+  test('GOAL without a cell declaration falls back to the first-line ask token', () => {
+    const feature = 'KPACK-4: 이미 표지한 제목\nOTHER-2 는 첫 줄이 아니다';
+    writeFileSync(goalFile, '# Goal\n## SCOPE BOUNDARY\n- 대상 경로: src/self-implement/orchestrator.ts\n');
+    expect(goalChecklistIds(feature, goalFile)).toEqual(['KPACK-4']);
+    expect(prTitle(feature, goalFile)).toBe('KPACK-4: 이미 표지한 제목');
+    expect(assembleBlockedDraftPrBody(feature, 'summary', {
+      reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
+    }, goalFile).body.split('\n')[0]).toBe('칸: KPACK-4');
+  });
+
+  test('not declared GOAL falls back to the ask first line without scanning later lines', () => {
+    writeFileSync(goalFile, '- 칸 id: not declared\n');
+    const feature = 'ASK-3: 첫 줄 제목\nOTHER-2 는 후순위다';
+    expect(goalChecklistIds(feature, goalFile)).toEqual(['ASK-3']);
+    expect(prTitle(feature, goalFile)).toBe('ASK-3: 첫 줄 제목');
+  });
+
+  test('not declared leaves title unchanged and puts 없음 first on normal and blocked bodies', async () => {
+    writeFileSync(goalFile, '- 칸 id: not declared\n');
+    expect(goalChecklistIds(ask, goalFile)).toEqual([]);
+    expect(prTitle(ask, goalFile)).toBe('이 제목은 칠십두 글자 상한에 맞추려고 충분히 길어야 하며 앞에 칸 접두를 반드시 넣는다');
+    let body = '';
+    await runSelfImplement({ feature: ask, goalFile, seams: seams({ openPr: async ({ body: openedBody }) => {
+      body = openedBody;
+      return { url: 'https://pr/no-cell', number: 7 };
+    } }) });
+    expect(body.split('\n')[0]).toBe('칸: 없음');
+    expect(assembleBlockedDraftPrBody(ask, 'summary', {
+      reason: 'blocked', rounds: 0, salvageStatusExpected: false, undeliveredSupervisorInputs: [],
+    }, goalFile).body.split('\n')[0]).toBe('칸: 없음');
+  });
+});
+
 describe('runSelfImplement — PR title path extraction', () => {
   test('uses only first-line paths for the PR title and the main-sync commit message', async () => {
     let prTitle = '';

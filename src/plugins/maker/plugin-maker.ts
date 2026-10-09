@@ -146,7 +146,10 @@ export async function validatePluginDir(dir: string): Promise<string[]> {
   catch (error) { errors.push(`recipes.yaml 파싱 실패: ${String(error)}`); }
   if (!isRecord(recipes)) errors.push('recipes.yaml 은 맵이어야 한다');
   else for (const [id, recipe] of Object.entries(recipes)) {
-    if (!isRecord(recipe) || typeof recipe.command !== 'string' || !recipe.command.trim() ||
+    if (!isRecord(recipe) ||
+      (!(typeof recipe.command === 'string' && recipe.command.trim()) && !(typeof recipe.approval === 'string' && recipe.approval.trim())) ||
+      (recipe.command !== undefined && (typeof recipe.command !== 'string' || !recipe.command.trim())) ||
+      (recipe.approval !== undefined && (typeof recipe.approval !== 'string' || !recipe.approval.trim())) ||
       (recipe.timeout_ms !== undefined && (!Number.isSafeInteger(recipe.timeout_ms) || Number(recipe.timeout_ms) <= 0))) errors.push(`잘못된 recipe: ${id}`);
   }
   for (const graph of Array.isArray(graphs) ? graphs : []) {
@@ -162,11 +165,14 @@ export async function validatePluginDir(dir: string): Promise<string[]> {
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(template.graphId)) errors.push(`잘못된 graph_id: ${template.graphId}`);
       if (template.terminalNodes.length !== 2 || !template.terminalNodes.includes('done') || !template.terminalNodes.includes('failed')) errors.push('terminal_nodes 는 done, failed 이어야 한다');
       const executionNodes = template.nodes.filter(node => !template.terminalNodes.includes(node.nodeId));
-      if (executionNodes.length < 2 || executionNodes.length > 6) errors.push(`실행 노드는 2~6개여야 한다: ${executionNodes.length}개`);
+      if (executionNodes.length < 2) errors.push(`실행 노드는 2개 이상이어야 한다: ${executionNodes.length}개`);
       for (const node of template.nodes) {
         if (node.recipe.startsWith('cmd:')) {
           const id = node.recipe.slice(4);
-          if (!isRecord(recipes) || !isRecord(recipes[id]) || typeof recipes[id].command !== 'string' || !recipes[id].command) errors.push(`recipe ${id} 없음`);
+          if (!isRecord(recipes) || !isRecord(recipes[id]) || recipes[id].approval !== undefined || typeof recipes[id].command !== 'string' || !recipes[id].command.trim()) errors.push(`recipe ${id} 없음`);
+        } else if (node.recipe.startsWith('approval:')) {
+          const id = node.recipe.slice(9);
+          if (!isRecord(recipes) || !isRecord(recipes[id]) || typeof recipes[id].approval !== 'string' || !recipes[id].approval.trim()) errors.push(`approval recipe ${id} 없음`);
         } else if (node.recipe !== 'none') errors.push(`지원하지 않는 recipe: ${node.recipe}`);
       }
     } catch (error) { errors.push(`${graph} 파싱 실패: ${String(error)}`); }

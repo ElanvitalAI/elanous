@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkCompletionEvidence } from './completion-evidence.js';
@@ -16,6 +16,40 @@ function schedule(db: Database, id: string, status: string | null) {
 }
 
 describe('completion evidence (read-only, temporary root)', () => {
+  test('deliverable: output path must point to a nonempty file within the task directory', () => {
+    const dir = temp();
+    const output = join(dir, 'output.txt');
+    const input = { dir, ref: 'output.txt', receipt: true };
+    expect(checkCompletionEvidence('deliverable', input).missing).toContain('산출물 파일');
+    writeFileSync(output, '');
+    expect(checkCompletionEvidence('deliverable', input).missing).toContain('산출물 파일');
+    writeFileSync(output, 'delivered');
+    expect(checkCompletionEvidence('deliverable', input)).toEqual({ ok: true, ref: 'output.txt', missing: [] });
+    expect(checkCompletionEvidence('deliverable', { dir, ref: '../output.txt', receipt: true }).missing).toContain('못 쟀다: 경로');
+    const outside = temp();
+    writeFileSync(join(outside, 'outside.txt'), 'outside');
+    symlinkSync(join(outside, 'outside.txt'), join(dir, 'link.txt'));
+    expect(checkCompletionEvidence('deliverable', { dir, ref: 'link.txt', receipt: true }).missing).toContain('못 쟀다: 경로');
+  });
+
+  test('deliverable: a valid http(s) link can identify the output without a local file', () => {
+    const dir = temp();
+    expect(checkCompletionEvidence('deliverable', { dir, ref: 'https://example.org/output', receipt: true }))
+      .toEqual({ ok: true, ref: 'https://example.org/output', missing: [] });
+    expect(checkCompletionEvidence('deliverable', { dir, ref: 'https://', receipt: true }).ok).toBe(false);
+    expect(checkCompletionEvidence('deliverable', { dir, ref: 'ftp://example.org/output', receipt: true }).missing).toContain('산출물 경로 또는 링크');
+  });
+
+  test('deliverable: receipt confirmation is required even with a valid output', () => {
+    const dir = temp();
+    writeFileSync(join(dir, 'output.txt'), 'delivered');
+    const input = { dir, ref: 'output.txt' };
+    expect(checkCompletionEvidence('deliverable', input)).toEqual({ ok: false, ref: 'output.txt', missing: ['수신 확인'] });
+    expect(checkCompletionEvidence('deliverable', { ...input, receipt: false }).missing).toContain('수신 확인');
+    expect(checkCompletionEvidence('deliverable', { ...input, receipt: true }))
+      .toEqual({ ok: true, ref: 'output.txt', missing: [] });
+  });
+
   test('research-report: md, two distinct http(s) sources, counter-evidence heading', () => {
     const dir = temp();
     const path = join(dir, 'report.md');

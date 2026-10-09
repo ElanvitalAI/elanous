@@ -42,7 +42,7 @@ describe('ops-status — opsSnapshot', () => {
     const opsDbPath = tmpOpsDb();
     seedOps(opsDbPath);
     const store = new TaskStore({ path: ':memory:', noWal: true });
-    const snap = opsSnapshot({ opsDbPath, missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: stubMandate });
+    const snap = opsSnapshot({ opsDbPath, missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: stubMandate, graphLoopRuns: () => [] });
     expect(snap.loops.armed).toBe(true);
     expect(snap.loops.executionMode).toBe('orchestrator');
     expect(snap.loops.paperSources).toContain('agent:free-swing');
@@ -57,7 +57,7 @@ describe('ops-status — opsSnapshot', () => {
     createMission(store, { goal: '테스트 미션', source: 'manual' });
     const blocked = { ...createTask({ title: 'blocked one', surface }, { id: 'task:b', now: 1 }), status: 'blocked' as const, notes: ['[LEARNING] dep missing'] };
     store.saveTask(blocked);
-    const snap = opsSnapshot({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null });
+    const snap = opsSnapshot({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null, graphLoopRuns: () => [] });
     expect(snap.missions.total).toBe(1);
     expect(snap.missions.byStatus['proposed']).toBe(1);
     expect(snap.tasks.byStatus['blocked']).toBe(1);
@@ -75,7 +75,7 @@ describe('ops-status — opsSnapshot', () => {
     const sched2 = { ...createTask({ title: 'run-y-cycle', surface }, { id: 'task:s2', now: 1 }), scheduleText: '0 8 * * *' };
     const pending = createTask({ title: '진짜 대기 태스크', surface }, { id: 'task:p1', now: 1 });
     store.saveTask(sched1); store.saveTask(sched2); store.saveTask(pending);
-    const snap = opsSnapshot({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null });
+    const snap = opsSnapshot({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null, graphLoopRuns: () => [] });
     expect(snap.tasks.scheduleBacked).toBe(2);
     expect(snap.tasks.dispatchPending).toBe(1);
     expect(snap.tasks.dispatchable[0]!.title).toBe('진짜 대기 태스크');
@@ -90,7 +90,7 @@ describe('ops-status — opsHealth', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
     const blocked = { ...createTask({ title: 'b', surface }, { id: 'task:b', now: 1 }), status: 'blocked' as const };
     store.saveTask(blocked);
-    const health = opsHealth({ opsDbPath, missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: stubMandate });
+    const health = opsHealth({ opsDbPath, missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: stubMandate, graphLoopRuns: () => [] });
     expect(health.healthy).toBe(false);
     expect(health.anomalies.some((a) => a.kind === 'errored_loop' && a.entity === 'rule:capstone')).toBe(true);
     expect(health.anomalies.some((a) => a.kind === 'blocked_task')).toBe(true);
@@ -99,7 +99,7 @@ describe('ops-status — opsHealth', () => {
 
   test('이상 없으면 healthy=true', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
-    const health = opsHealth({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null });
+    const health = opsHealth({ opsDbPath: tmpOpsDb(), missionStore: store, schedulesDbPath: tmpOpsDb(), mandate: null, graphLoopRuns: () => [] });
     expect(health.healthy).toBe(true);
     expect(health.anomalies.length).toBe(0);
     store.close();

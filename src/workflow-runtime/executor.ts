@@ -41,6 +41,9 @@ import {
 import { evaluateWhen } from './variables.js';
 import { readWorkflowPin } from './pin-data.js';
 import { WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
+import { workflowToGraph, walkWorkflowGraph } from '../graph-unify/wf-to-graph.js';
+import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
 import { checkModelRequires } from '../registry/resolver.js';
 import { validateJudgmentContract, validateJudgmentVerdict } from './judgment-contract.js';
 import { signalBus } from '../signal-bus/index.js';
@@ -107,8 +110,25 @@ export async function* runWorkflow(
   yield { type: 'workflow_start', workflow: opts.workflow.name, runId, mode };
 
   let order: string[];
+  let graphRecipes: Readonly<Record<string, DagNode>> | undefined;
   try {
-    order = topoSort(opts.workflow.nodes);
+    // WF2G supplies the graph cursor. The compatibility adapter owns workflow
+    // events, substitution, pins and persistence; graph-runner's file/command
+    // recipes do not execute workflow nodes yet.
+    const graphEnabled = getUserConfig().raw.workflowGraphEnabled !== false;
+    const conversion = graphEnabled ? workflowToGraph(opts.workflow) : null;
+    if (conversion?.ok) {
+      try {
+        order = walkWorkflowGraph(conversion.graph);
+        graphRecipes = conversion.graph.recipes;
+      } catch (error) {
+        debug.log('graph.unify', 'wf-fallback', { file: opts.workflow.name, reason: String(error) });
+        order = topoSort(opts.workflow.nodes);
+      }
+    } else {
+      if (conversion) debug.log('graph.unify', 'wf-fallback', { file: opts.workflow.name, reason: conversion.reason });
+      order = topoSort(opts.workflow.nodes);
+    }
   } catch (err) {
     yield {
       type: 'workflow_failed',
@@ -119,7 +139,9 @@ export async function* runWorkflow(
     return {};
   }
 
-  const nodeById = new Map(opts.workflow.nodes.map(n => [n.id, n] as const));
+  const nodeById = graphRecipes
+    ? new Map(Object.entries(graphRecipes))
+    : new Map(opts.workflow.nodes.map(n => [n.id, n] as const));
   const startIndex = opts.fromNode ? order.indexOf(opts.fromNode) : 0;
   const outputs: Record<string, NodeOutput> = {};
   if (startIndex < 0 || (opts.onlyNode && !nodeById.has(opts.onlyNode))) {

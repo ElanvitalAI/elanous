@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 
 import type { AcpConnection, AcpFrame, AcpFrameHandler } from './daemon-client';
 import { DaemonClient } from './daemon-client';
+import { _resetDebugForwarderForTest } from './debug';
 import { parseElanousFeedbackEnvelope } from './elanous-feedback-envelope';
 import { FEEDBACK_KINDS } from './feedback-envelope';
 import * as feedbackBlockAccumulator from './feedback-block-accumulator';
@@ -53,7 +54,8 @@ function assertCanonicalFeedbackEnvelopeVectorsPath(path: string): void {
   expect(realpathSync(path)).toBe(canonicalFeedbackEnvelopeVectorsPath);
 }
 
-const realFetch = globalThis.fetch;
+let realFetch: typeof fetch;
+let dateNowSpy: ReturnType<typeof spyOn> | undefined;
 let calls: FetchCall[] = [];
 
 function mockResponse(opts: { status: number; body: unknown }): typeof fetch {
@@ -83,7 +85,7 @@ function makeCtx(sessionId = 'session-1', provider = 'anthropic'): ChatRuntimeCo
   };
 }
 
-const realStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+let realStorage: PropertyDescriptor | undefined;
 let wishStorage = new Map<string, string>();
 const mockStorage: Storage = {
   get length() { return wishStorage.size; },
@@ -95,11 +97,21 @@ const mockStorage: Storage = {
 };
 
 beforeEach(() => {
+  // A DebugForwarder cached by an earlier file in the same bun process (one that
+  // installed a temporary `window`) keeps queueing this file's debugLog records and
+  // flushes them through whatever `globalThis.fetch` is current - i.e. our mock -
+  // which shows up as an extra entry in `calls`. Drop the cached forwarder so it is
+  // re-derived here (no `window` => no forwarding).
+  _resetDebugForwarderForTest();
+  realFetch = globalThis.fetch;
+  realStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   calls = [];
   wishStorage.clear();
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: mockStorage });
 });
 afterEach(() => {
+  dateNowSpy?.mockRestore();
+  dateNowSpy = undefined;
   globalThis.fetch = realFetch;
   if (realStorage) Object.defineProperty(globalThis, 'localStorage', realStorage);
   else Reflect.deleteProperty(globalThis, 'localStorage');
@@ -260,7 +272,7 @@ describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
   });
 
   it('B-3: flips matching tool_use block to done on tool-result event (same id)', async () => {
-    const now = spyOn(Date, 'now')
+    dateNowSpy = spyOn(Date, 'now')
       .mockReturnValueOnce(100)
       .mockReturnValueOnce(200);
     globalThis.fetch = mockSseResponseChunks([
@@ -278,7 +290,6 @@ describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
     expect((tool as { summary?: string }).summary).toBe('3 lines');
     expect((tool as { startedAt?: number }).startedAt).toBe(100);
     expect((tool as { endedAt?: number }).endedAt).toBe(200);
-    now.mockRestore();
   });
 
   it('B-3: flips status to error when tool-result.ok is false', async () => {
@@ -1104,7 +1115,7 @@ describe('PWA :wish', () => {
   });
 
   it('uses distinct refs for concurrent wishes even in the same millisecond', async () => {
-    const clock = spyOn(Date, 'now').mockReturnValue(12345);
+    dateNowSpy = spyOn(Date, 'now').mockReturnValue(12345);
     const ctx = { ...makeCtx('same-session'), daemon: { baseUrl: 'http://localhost:31415', token: 'tok' } };
     globalThis.fetch = mockResponse({ status: 201, body: { title: '저장됨' } });
     try {
@@ -1117,7 +1128,7 @@ describe('PWA :wish', () => {
       expect(bodies.map(({ text }) => text)).toEqual(['첫 소원', '둘째 소원']);
       expect(new Set(bodies.map(({ ref }) => ref)).size).toBe(2);
       expect(bodies.every(({ ref }) => ref.startsWith('same-session:'))).toBe(true);
-    } finally { clock.mockRestore(); }
+    } finally { dateNowSpy?.mockRestore(); dateNowSpy = undefined; }
   });
 
   it('keeps separate work IDs for identical failed wishes and retries only the selected work after reload', async () => {

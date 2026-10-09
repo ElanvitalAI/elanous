@@ -1,9 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
+import { SearchParamsContext } from 'next/dist/shared/lib/hooks-client-context.shared-runtime';
 import { act, create } from 'react-test-renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ComponentProps } from 'react';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { LoopAgentsScene, LoopAgentsViewContent, loopEdgesPath, mapNodeDetails } from './LoopAgentsScene';
+import { LoopActivityMap } from './LoopActivityMap';
+import { NexusApiError } from '@/nexus/client';
 import { loopAgentsView } from './loop-agents-view';
 
 const originalFetch = globalThis.fetch;
@@ -114,6 +117,126 @@ test('polls every 10 seconds, pauses while hidden, preserves the other feed on f
     expect(cleared).toBe(true);
     expect(visible).toBeUndefined();
   }
+});
+
+for (const status of [401, 403, 500] as const) {
+  test(`map edges status ${status} displays ${status === 500 ? 'the existing error' : 'token access denied'}`, async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.document = { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Document;
+    globalThis.window = { setInterval: () => 1, clearInterval: () => {}, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Window & typeof globalThis;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ entries: [] }))) as unknown as typeof fetch;
+    const edgePath = '/v1/loops/edges';
+    const requests: string[] = [];
+    const value = {
+      client: {
+        fetchResponse: async () => new Response(JSON.stringify({ date: '2026-10-08', seats: [] })),
+        fetchJson: async (path: string) => {
+          requests.push(path);
+          if (path.startsWith(edgePath)) throw new NexusApiError(status, path, null);
+          if (path.startsWith('/v1/schedules')) return { schedules: [], owners: [] };
+          return { loops: { loops: [] } };
+        },
+        logsStreamUrl: () => null,
+      },
+      config: { baseUrl: '', token: '', provider: '' },
+    } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+    let root: ReturnType<typeof create>;
+    await act(async () => { root = create(<SearchParamsContext.Provider value={new URLSearchParams()}><DaemonContext.Provider value={value}><LoopAgentsScene initialMode="map" /></DaemonContext.Provider></SearchParamsContext.Provider>); });
+    try {
+      expect(requests.some(path => path.startsWith(edgePath))).toBe(true);
+      const map = root!.root.findByType(LoopActivityMap);
+      expect(map.props.state).toBe(status === 500 ? 'error' : 'unauthorized');
+      const alerts = map.findAllByProps({ role: 'alert' });
+      expect(alerts).toHaveLength(1);
+      const text = JSON.stringify(root!.toJSON());
+      if (status === 500) {
+        expect(text).toContain('지도 원천을 읽지 못했습니다');
+        expect(text).toContain('데몬 연결을 확인하세요');
+        expect(text).not.toContain('지도 원천에 접근 권한이 없습니다');
+      } else {
+        expect(alerts[0]!.props.children).toBe('지도 원천에 접근 권한이 없습니다 — 토큰으로 다시 붙으세요');
+        expect(text).not.toContain('지도를 읽는 중');
+        expect(text).not.toContain('데몬 연결을 확인하세요');
+      }
+    } finally { act(() => { root!.unmount(); }); }
+  });
+}
+
+for (const status of [401, 403] as const) {
+  test(`map clears previously displayed rows and edges after status ${status}`, async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.document = { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Document;
+    let refresh: (() => void) | undefined;
+    globalThis.setInterval = ((fn: () => void, ms: number) => { if (ms === 5_000) refresh = fn; return 1; }) as typeof setInterval;
+    globalThis.clearInterval = (() => {}) as typeof clearInterval;
+    globalThis.window = { setInterval: () => 1, clearInterval: () => {}, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Window & typeof globalThis;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ entries: [] }))) as unknown as typeof fetch;
+    let denied = false;
+    const value = {
+      client: {
+        fetchResponse: async () => new Response(JSON.stringify({ date: '2026-10-08', seats: [] })),
+        fetchJson: async (path: string) => {
+          if (path.startsWith('/v1/loops/edges')) {
+            if (denied) throw new NexusApiError(status, path, null);
+            return { edges: [{ at: new Date(Date.now() - 1_000).toISOString(), kind: 'request', from: 'OP', to: 'TC', ref: 'visible-edge' }] };
+          }
+          if (path.startsWith('/v1/schedules')) return { schedules: [], owners: [{ id: 'visible-loop', title: '기존 지도 데이터', owner: 'OP', enabled: true, lastRun: null, jobs: [] }] };
+          return { loops: { loops: [] } };
+        },
+        logsStreamUrl: () => null,
+      },
+      config: { baseUrl: '', token: '', provider: '' },
+    } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+    let root: ReturnType<typeof create>;
+    await act(async () => { root = create(<SearchParamsContext.Provider value={new URLSearchParams()}><DaemonContext.Provider value={value}><LoopAgentsScene initialMode="map" /></DaemonContext.Provider></SearchParamsContext.Provider>); });
+    try {
+      const map = () => root!.root.findByType(LoopActivityMap);
+      expect(map().props.state).toBe('ready');
+      expect(map().props.rows.map((row: { name: string }) => row.name)).toContain('기존 지도 데이터');
+      expect(map().props.edges).toHaveLength(1);
+      expect(refresh).toBeDefined();
+      denied = true;
+      await act(async () => { refresh!(); });
+      expect(map().props.state).toBe('unauthorized');
+      expect(map().props.rows).toEqual([]);
+      expect(map().props.edges).toEqual([]);
+      expect(map().props.seenAt).toEqual({});
+      const text = JSON.stringify(root!.toJSON());
+      expect(text).toContain('지도 원천에 접근 권한이 없습니다 — 토큰으로 다시 붙으세요');
+      expect(text).not.toContain('기존 지도 데이터');
+      expect(text).not.toContain('visible-edge');
+      expect(text).not.toContain('지도를 읽는 중');
+      expect(text).not.toContain('데몬 연결을 확인하세요');
+    } finally { act(() => { root!.unmount(); }); }
+  });
+}
+
+test('non-NexusApiError map failure keeps the existing error', async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  globalThis.document = { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Document;
+  globalThis.window = { setInterval: () => 1, clearInterval: () => {}, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Window & typeof globalThis;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ entries: [] }))) as unknown as typeof fetch;
+  const value = {
+    client: {
+      fetchResponse: async () => new Response(JSON.stringify({ date: '2026-10-08', seats: [] })),
+      fetchJson: async (path: string) => {
+        if (path.startsWith('/v1/loops/edges')) throw new Error('network unavailable');
+        if (path.startsWith('/v1/schedules')) return { schedules: [], owners: [] };
+        return { loops: { loops: [] } };
+      },
+      logsStreamUrl: () => null,
+    },
+    config: { baseUrl: '', token: '', provider: '' },
+  } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+  let root: ReturnType<typeof create>;
+  await act(async () => { root = create(<SearchParamsContext.Provider value={new URLSearchParams()}><DaemonContext.Provider value={value}><LoopAgentsScene initialMode="map" /></DaemonContext.Provider></SearchParamsContext.Provider>); });
+  try {
+    const map = root!.root.findByType(LoopActivityMap);
+    expect(map.props.state).toBe('error');
+    const text = JSON.stringify(root!.toJSON());
+    expect(text).toContain('지도 원천을 읽지 못했습니다');
+    expect(text).not.toContain('지도 원천에 접근 권한이 없습니다');
+  } finally { act(() => { root!.unmount(); }); }
 });
 
 test('demo address asks one journey with ?ref=&mode=live instead of the 60-minute window; bad ids fall back', () => {

@@ -46,6 +46,46 @@ describe('CGE-RUN run control', () => {
     expect(text(tree.toJSON() as Node)).toContain("끝 노드 'review' 는 실행할 수 없다");
     act(() => tree.unmount());
   });
+
+  test('W9c: a peer-edited graph shows the server refusal and the owner can approve that exact version, then run', async () => {
+    const { NexusApiError } = await import('@/nexus/client');
+    const approvals: Array<[string, string]> = [];
+    let refuse = true;
+    const client: GraphRunClient = {
+      startRunGraphRun: async () => {
+        if (refuse) throw new NexusApiError(409, '/v1/graphs/demo-review-mine/run', { error: 'peer-edit-unapproved', reason: '상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다', version: 'v-peer', editedBy: 'peer:0123abcd' });
+        return { id: 'demo-review-mine', runId: 'ed-1-abcdef' };
+      },
+      getRunGraphRun: async () => null,
+      approveRunGraph: async (id, version) => { approvals.push([id, version]); refuse = false; return { id, approved: true, version }; },
+    };
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<GraphRunControl context={ctx()} client={client} onStatus={() => {}} />); });
+    await act(async () => { tree.root.findAllByType('button')[0]!.props.onClick(); await Bun.sleep(5); });
+    expect(tree.root.findByProps({ role: 'alert' }).children.join('')).toContain('상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다');
+    const approve = tree.root.findAllByType('button').find((button) => text(button as never).includes('승인'))!;
+    await act(async () => { approve.props.onClick(); await Bun.sleep(5); });
+    expect(approvals).toEqual([['demo-review-mine', 'v-peer']]);
+    expect(tree.root.findAllByProps({ role: 'alert' })).toHaveLength(0);
+    await act(async () => { tree.root.findAllByType('button')[0]!.props.onClick(); await Bun.sleep(5); });
+    expect(tree.root.findAllByProps({ role: 'alert' })).toHaveLength(0);
+    act(() => tree.unmount());
+  });
+
+  test('W9c: an unreadable peer-edit marker is refused with no approve button', async () => {
+    const { NexusApiError } = await import('@/nexus/client');
+    const client: GraphRunClient = {
+      startRunGraphRun: async () => { throw new NexusApiError(409, '/v1/graphs/x/run', { error: 'peer-edit-unreadable', reason: '상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다' }); },
+      getRunGraphRun: async () => null,
+      approveRunGraph: async () => { throw new Error('must not be called'); },
+    };
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<GraphRunControl context={ctx()} client={client} onStatus={() => {}} />); });
+    await act(async () => { tree.root.findByType('button').props.onClick(); await Bun.sleep(5); });
+    expect(text(tree.toJSON() as Node)).toContain('승인해야 실행할 수 있다');
+    expect(tree.root.findAllByType('button')).toHaveLength(1);
+    act(() => tree.unmount());
+  });
 });
 
 test('a failed read does not freeze the control — it keeps polling and gives up loudly after repeated misses', async () => {

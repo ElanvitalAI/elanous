@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDiscordSelfOnMessage } from './discord-self-message.js';
 import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
-import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { renderContextFirstNow } from './context-bus/context-now-surfaces.js';
 import type { DcIncoming, DiscordBot } from './discord.js';
 import { getUserConfig, type UserConfig } from './user-config.js';
 import type { runTurn } from './session/chat.js';
@@ -14,8 +14,10 @@ const nowDeps: ContextNowDeps = {
   now: () => new Date(at), version: () => '0.2.16',
   checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
   decisions: () => [], seatEntries: () => [], events: () => [],
+  // Pin the live operational readers so the summary never depends on this machine's running runs.
+  runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null,
 };
-const summary = renderTelegramNow(contextNow({}, nowDeps));
+const summary = renderContextFirstNow(contextNow({}, nowDeps));
 const incoming = (text: string, channelId = 'dm'): DcIncoming => ({
   channelId, userId: 'owner', text, messageId: '1', isDm: true, attachments: [], raw: {},
 });

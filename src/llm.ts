@@ -1746,7 +1746,7 @@ export const REASONING_CYCLE: readonly import('./user-config.js').ReasoningLevel
 
 /** Does the (provider, model) pair support a "think before answering"
  *  reasoning surface? Capability-based: gpt-5 family on Codex /
- *  Responses API + Anthropic claude-4 / claude-3.7 (extended thinking)
+ *  Responses API + Anthropic Claude 3.7+ (extended thinking)
  *  + OpenAI o-series. Other providers / older models return false so
  *  the HUD pill auto-hides and the wire body skips the reasoning
  *  field — no user toggle required. */
@@ -1768,9 +1768,7 @@ export function modelSupportsReasoning(
     return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4');
   }
   if (provider === 'anthropic') {
-    // Extended thinking is GA on claude-3.7 onward — anything 4-family
-    // (opus-4, sonnet-4, haiku-4) plus the 3.7 line.
-    return m.includes('-4-') || m.includes('-3-7') || m.includes('3.7') || m.includes('claude-4');
+    return claudeSupportsThinking(model);
   }
   if (provider === 'gemini') {
     // Gemini 2.5+ family supports thinking budget (thinkingConfig).
@@ -1926,15 +1924,31 @@ function mapReasoningLevelToAnthropicEffort(
  *  🩹 그래서 규칙을 이름 목록이 아니라 «수»로 둔다 — 목록은 새 모델마다 늙지만 세대 비교는 안 늙는다.
  *  ⚠️ 알 수 없는 형태는 legacy 로 둔다(무회귀). 판정 못 하면 종전 동작이 정답이다. */
 function usesAdaptiveThinking(model: string | undefined): boolean {
+  const version = claudeVersion(model, true);
+  if (!version) return false;
+  if (version.generation >= 5) return true;
+  return version.generation === 4 && version.minor >= 7;
+}
+
+/** Shared numeric version parser for adaptive API shape and extended-thinking support. */
+function claudeVersion(model: string | undefined, requireTerminal = false): { generation: number; minor: number } | undefined {
   // 끝에 붙는 릴리스 날짜(`-20251101`)는 버전이 아니다 — 떼고 본다.
   const m = (model ?? '').toLowerCase().replace(/-\d{8}$/, '');
-  const v = /-(\d+)(?:[-.](\d+))?$/.exec(m);
-  if (!v) return false;
-  const generation = Number(v[1]);
-  const minor = v[2] === undefined ? 0 : Number(v[2]);
-  if (generation >= 5) return true;
-  return generation === 4 && minor >= 7;
+  for (const v of m.matchAll(/-(\d+)(?:[-.](\d+))?(?=-|$)/g)) {
+    if (requireTerminal && v.index + v[0].length !== m.length) continue;
+    return { generation: Number(v[1]), minor: v[2] === undefined ? 0 : Number(v[2]) };
+  }
+  return undefined;
 }
+
+function claudeSupportsThinking(model: string | undefined): boolean {
+  // includes, not startsWith: prefixed ids (`us.anthropic.claude-…`, `anthropic/claude-…`) passed the old substring check.
+  if (!model?.toLowerCase().includes('claude-')) return false;
+  const version = claudeVersion(model);
+  return version !== undefined && (version.generation > 3 || version.generation === 3 && version.minor >= 7);
+}
+
+export const _claudeSupportsThinkingForContractTest = claudeSupportsThinking;
 
 /** ⛔ 테스트 전용 노출이 아니다 — 모델 계열 계약은 «이름을 가진 판정»이라 회귀를 테스트로 물어야 한다.
  *  이 파일 안 두 조립부(:3102·:9591)가 그 값을 쓰고, 그 계약이 틀리면 provider 가 통째로 막힌다. */
@@ -3134,13 +3148,9 @@ async function* streamAnthropicEvents(
   //   forcing a single thinking block before all tools). Improves
   //   multi-tool turn quality — the model can decide what to call
   //   next based on the prior tool's output thinking. Only supported
-  //   on extended-thinking-capable models (claude-3-7 / 4 family).
-  const model: string = (body?.model ?? '') as string;
-  const m = model.toLowerCase();
-  const supportsThinking =
-    m.includes('-4-') || m.includes('-3-7') || m.includes('3.7') || m.includes('claude-4');
+  //   on extended-thinking-capable models (Claude 3.7+).
   const betas: string[] = ['fine-grained-tool-streaming-2025-05-14'];
-  if (supportsThinking) betas.push('interleaved-thinking-2025-05-14');
+  if (claudeSupportsThinking(body?.model)) betas.push('interleaved-thinking-2025-05-14');
 
   const response = await fetchApiWithRetry(
     ANTHROPIC_API_URL,

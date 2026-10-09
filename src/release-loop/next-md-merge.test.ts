@@ -74,7 +74,7 @@ test('★ concurrent landing: the second sync to main keeps both next.md lines w
   const repo = repoWithTwoLandings();
   let llmCalls = 0;
   const outcome = await mergeMainWithLlmResolve(repo, 'main', async () => { llmCalls += 1; throw new Error('LLM must not be called for next.md'); }, defaultGitMergeSeam());
-  expect(outcome.status).toBe('llm-resolved');
+  expect(outcome.status).toBe('deterministic-resolved');
   expect(outcome.resolvedFiles).toEqual(['release/next.md']);
   expect(llmCalls).toBe(0);
   const merged = readFileSync(join(repo, 'release', 'next.md'), 'utf8');
@@ -88,8 +88,55 @@ test('★ concurrent landing: the second sync to main keeps both next.md lines w
 test('another file also conflicts → that file goes to the usual resolver; an unresolved one still stops (abort)', async () => {
   const repo = repoWithTwoLandings(true);
   const seen: string[] = [];
-  const outcome = await mergeMainWithLlmResolve(repo, 'main', async (file, conflicted) => { seen.push(file); return conflicted; }, defaultGitMergeSeam());
+  const inputs: string[] = [];
+  const outcome = await mergeMainWithLlmResolve(repo, 'main', async (file, conflicted) => { seen.push(file); inputs.push(conflicted); return conflicted; }, defaultGitMergeSeam());
   expect(seen).toEqual(['other.ts']);
+  expect(inputs.join('\n')).not.toContain('release/next.md');
   expect(outcome.status).toBe('conflict-unresolved');
   expect(readFileSync(join(repo, 'release', 'next.md'), 'utf8')).toBe(withFeat(lineB));
+});
+
+test('release/next.md where the run (ours) is not append-only still goes to the LLM', async () => {
+  const repo = repoWithTwoLandings();
+  // The run (ours, checked out = landing-b) deleted a base line — the deterministic resolver must refuse.
+  const next = join(repo, 'release', 'next.md');
+  writeFileSync(next, readFileSync(next, 'utf8').replace('- fix — old fix. Target: next.\n', ''));
+  git(repo, 'commit', '-qam', 'run deletes a base line');
+  let llmCalls = 0;
+  const outcome = await mergeMainWithLlmResolve(repo, 'main', async (file) => {
+    llmCalls += 1;
+    expect(file).toBe('release/next.md');
+    return withFeat(lineB);
+  }, defaultGitMergeSeam());
+  expect(llmCalls).toBe(1);
+  expect(outcome.status).toBe('llm-resolved');
+});
+
+test('main (theirs) dropped released lines on dev-bump → still deterministic, no LLM', async () => {
+  const repo = repoWithTwoLandings();
+  git(repo, 'checkout', '-q', 'main');
+  const next = join(repo, 'release', 'next.md');
+  writeFileSync(next, readFileSync(next, 'utf8').replace('- fix — old fix. Target: next.\n', ''));
+  git(repo, 'commit', '-qam', 'dev-bump drops a released line');
+  git(repo, 'checkout', '-q', 'landing-b');
+  let llmCalls = 0;
+  const outcome = await mergeMainWithLlmResolve(repo, 'main', async () => { llmCalls += 1; throw new Error('LLM must not be called'); }, defaultGitMergeSeam());
+  expect(llmCalls).toBe(0);
+  expect(outcome.status).toBe('deterministic-resolved');
+  const merged = readFileSync(next, 'utf8');
+  expect(merged).toContain(lineA);
+  expect(merged).toContain(lineB);
+  expect(merged).not.toContain('old fix');
+});
+
+test('next.md resolved deterministically plus another file resolved by the LLM → llm-resolved', async () => {
+  const repo = repoWithTwoLandings(true);
+  const seen: string[] = [];
+  const outcome = await mergeMainWithLlmResolve(repo, 'main', async (file) => { seen.push(file); return 'export const x = 3;\n'; }, defaultGitMergeSeam());
+  expect(seen).toEqual(['other.ts']);
+  expect(outcome.status).toBe('llm-resolved');
+  expect(outcome.resolvedFiles?.sort()).toEqual(['other.ts', 'release/next.md']);
+  const merged = readFileSync(join(repo, 'release', 'next.md'), 'utf8');
+  expect(merged).toContain(lineA);
+  expect(merged).toContain(lineB);
 });

@@ -62,7 +62,7 @@ function mockFetch(replies: Reply[]) {
 }
 
 /** A stand-in canvas: keeps the graph the chat pushed, like GraphEditor → GraphCanvasEditor does. */
-function harness(replies: Reply[], initialPrompt?: string) {
+function harness(replies: Reply[], initialPrompt?: string, packId?: string) {
   const { calls, client } = mockFetch(replies);
   const state: { graph: CanvasGraph | null; added: WizardDiff | null; restores: number } = { graph: null, added: null, restores: 0 };
   const current = (): CanvasSnapshot | null => state.graph ? { graph: state.graph, yaml: toYaml(state.graph) } : null;
@@ -71,7 +71,7 @@ function harness(replies: Reply[], initialPrompt?: string) {
     root = create(<GraphWizardChat client={client} current={current}
       onApply={(graph, added) => { state.graph = graph; state.added = added; }}
       onRestore={(graph) => { state.graph = graph; state.restores += 1; }}
-      {...(initialPrompt ? { initialPrompt } : {})} />);
+      {...(initialPrompt ? { initialPrompt } : {})} {...(packId ? { packId } : {})} />);
   });
   return { calls, state, root };
 }
@@ -87,6 +87,13 @@ async function say(root: ReactTestInstance, prompt: string) {
 describe('GRAPH-WIZARD chat', () => {
   beforeEach(() => { (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true; });
   afterEach(() => { delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT; });
+
+  test('selected knowledge pack is sent with the wizard request, not added to ordinary requests', async () => {
+    const { calls, root } = harness([{ status: 200, body: { ok: true, yaml: CREATE_YAML, issues: [] } }], undefined, 'pack:fab-knowledge@1.0.0');
+    await say(root.root, '식각 지침');
+    expect(calls[0]!.body).toEqual({ prompt: '식각 지침', kind: 'harness', packId: 'pack:fab-knowledge@1.0.0' });
+    act(() => root.unmount());
+  });
 
   test('create → edit grows the same canvas (current YAML + history sent), then undo puts the previous canvas back', async () => {
     const { calls, state, root } = harness([

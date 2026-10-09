@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { loadRunLedger as loadRunLedgerSync } from '../self-implement/run-ledger.js';
 import { join, resolve } from 'node:path';
@@ -12,6 +12,9 @@ import type { Task } from '../task-orchestrator/types.js';
 import { cardPrNumber, COMPLETION_KINDS, handTask, nextMoveFor, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { readCardSalvageBranch, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
+import { formatTaskAgentCover, measureTaskAgentCover, type CoverRow, type TaskAgentCoverInput } from '../task-agent/cover.js';
+import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
+import { resolveLogTargets } from './logs-cli.js';
 
 type TaskRow = Pick<Task, 'id' | 'title' | 'priority' | 'status' | 'createdAt' | 'approval' | 'generatedBy'>;
 
@@ -38,6 +41,9 @@ export interface TasksCliDeps {
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
   staleParents?: import('../task-agent/parent-host.js').StaleParentDeps;
+  /** `tasks cover` logs 조회 seam. 기본은 등록된 모든 우주(운영 ⊕ test)의 logs.db 를 read-only 로 연다 —
+   *  pr land 는 작업 트리마다 파생 test 우주에 기록되므로 현재 우주만 읽으면 분모가 늘 0 이다. */
+  coverLogs?: (query: LogQuery) => LogStoreRow[] | CoverLogRead;
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -390,6 +396,74 @@ function handleError(error: unknown, out: (line: string) => void): void {
   }
 }
 
+const COVER_QUERY_LIMIT = STORE_SAFETY_MAX;
+
+/** Federated read: rows from every store, whether any single store hit the bound, and how many stores could not be read. */
+export interface CoverLogRead { rows: LogStoreRow[]; limitReached: boolean; unreadableStores: number; storesRead: number }
+
+function queryCoverLogs(query: LogQuery): CoverLogRead {
+  const { targets, error } = resolveLogTargets({ all: true, includeTest: true });
+  if (error) throw new Error(error);
+  const read: CoverLogRead = { rows: [], limitReached: false, unreadableStores: 0, storesRead: 0 };
+  for (const target of targets) {
+    if (!existsSync(target.dbPath)) continue;
+    let store: LogStore | undefined;
+    try {
+      store = LogStore.openReadOnly(target.dbPath);
+      const rows = store.query(query);
+      if (query.limit !== undefined && rows.length >= query.limit) read.limitReached = true;
+      read.rows.push(...rows);
+      read.storesRead++;
+    } catch { read.unreadableStores++; }
+    finally { try { store?.close(); } catch { /* already closed */ } }
+  }
+  if (read.storesRead === 0) throw new Error('읽을 수 있는 logs.db 없음');
+  return read;
+}
+
+function coverEvents<T>(rows: readonly LogStoreRow[], category: string, event: string, parse: (data: Record<string, unknown>) => T | null): T[] {
+  const events: T[] = [];
+  for (const row of rows) {
+    if (row.category !== category || row.event !== event || !row.data) continue;
+    try {
+      const data: unknown = JSON.parse(row.data);
+      if (data === null || typeof data !== 'object' || Array.isArray(data)) continue;
+      const parsed = parse(data as Record<string, unknown>);
+      if (parsed !== null) events.push(parsed);
+    } catch { /* malformed log data is not evidence of an action */ }
+  }
+  return events;
+}
+
+export function readTaskAgentCover(
+  window: { sinceMs?: number; untilMs?: number } = {},
+  query: NonNullable<TasksCliDeps['coverLogs']> = queryCoverLogs,
+): { rows: CoverRow[]; limitReached: boolean; unreadableStores: number } {
+  let unreadableStores = 0;
+  const read = (category: 'task-agent' | 'pr.land', event: 'action' | 'step'): { rows: LogStoreRow[]; limitReached: boolean } | null => {
+    try {
+      const result = query({ ...window, limit: COVER_QUERY_LIMIT, exactCategories: [category], events: [event] });
+      if (Array.isArray(result)) return { rows: result, limitReached: result.length >= COVER_QUERY_LIMIT };
+      unreadableStores = Math.max(unreadableStores, result.unreadableStores);
+      return { rows: result.rows, limitReached: result.limitReached };
+    } catch { return null; }
+  };
+  const actionRead = read('task-agent', 'action');
+  const landRead = read('pr.land', 'step');
+  const actions = actionRead?.rows ?? null;
+  const lands = landRead?.rows ?? null;
+  const truncated = { taskAgentActions: actionRead?.limitReached === true, allLands: landRead?.limitReached === true };
+  const input: TaskAgentCoverInput = {
+    taskAgentActions: actions === null ? null : coverEvents(actions, 'task-agent', 'action', (data) =>
+      typeof data.kind === 'string' && typeof data.result === 'string'
+        ? { kind: data.kind as NonNullable<TaskAgentCoverInput['taskAgentActions']>[number]['kind'], result: data.result } : null),
+    allLands: lands === null ? null : coverEvents(lands, 'pr.land', 'step', (data) =>
+      typeof data.step === 'string' && typeof data.ok === 'boolean' ? { step: data.step, ok: data.ok } : null),
+    truncated,
+  };
+  return { rows: measureTaskAgentCover(input), limitReached: truncated.taskAgentActions || truncated.allLands, unreadableStores };
+}
+
 export function registerTasksCommands(program: Command, deps: TasksCliDeps = {}): void {
   let activeToken: string | undefined;
   const output = deps.output ?? console.log;
@@ -401,6 +475,39 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     return auth;
   };
   const tasks = program.command('tasks').alias('task').description('TOX 태스크 조회 및 승인 · TASK-AGENT 과제 넘기기(hand)');
+
+  tasks.command('cover')
+    .description('TASK-AGENT 가 대신한 착지 비율과 리뷰·재발사·green 의 아직 없는 분모를 조회(읽기 전용)')
+    .option('--since <iso>', '시작 시각 (ISO)')
+    .option('--until <iso>', '끝 시각 (ISO)')
+    .option('--json', 'JSON 출력')
+    .option('--lines', '동사별 한 줄 요약 출력 (읽기 전용)')
+    .action((opts: { since?: string; until?: string; json?: boolean; lines?: boolean }) => {
+      const parseIso = (value: string | undefined, flag: string): number | undefined => {
+        if (value === undefined) return undefined;
+        const time = Date.parse(value);
+        if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) || !Number.isFinite(time)) throw new Error(`${flag} 는 ISO 시각이어야 한다`);
+        return time;
+      };
+      try {
+        const sinceMs = parseIso(opts.since, '--since');
+        const untilMs = parseIso(opts.until, '--until');
+        if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) throw new Error('--since 가 --until 보다 늦다');
+        const { rows, limitReached, unreadableStores } = readTaskAgentCover({ sinceMs, untilMs }, deps.coverLogs);
+        const limitWarning = limitReached ? `조회 상한 ${COVER_QUERY_LIMIT} 도달 — 더 오래된 사건이 있을 수 있다(절단된 수를 전체로 읽지 말 것)` : null;
+        const storeWarning = unreadableStores > 0 ? `logs.db ${unreadableStores}개를 못 읽었다 — 그 우주의 사건은 수에 없다(«없다»로 읽지 말 것)` : null;
+        if (opts.json) out(JSON.stringify({ rows, limitReached, unreadableStores, ...(limitWarning ? { warning: limitWarning } : {}), ...(storeWarning ? { storeWarning } : {}) }));
+        else {
+          if (opts.lines) for (const row of rows) out(formatTaskAgentCover(row));
+          else {
+            out('동사\t대신\t전체\t비율\t상태\t관측 사건');
+            for (const row of rows) out(`${row.verb}\t${row.byTaskAgent ?? '-'}\t${row.total ?? '-'}\t${row.ratio ?? '-'}\t${row.state}\t${row.observedActions ?? '-'}`);
+          }
+          if (limitWarning) out(`⚠ ${limitWarning}`);
+          if (storeWarning) out(`⚠ ${storeWarning}`);
+        }
+      } catch (error) { out(error instanceof Error ? error.message : '커버 조회 실패'); process.exitCode = 1; }
+    });
 
   tasks.command('list')
     .description('우선순위와 생성 시각 순으로 태스크 보기')

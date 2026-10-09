@@ -57,6 +57,8 @@ export interface StewardDeps {
   cardStore?: StewardCardDeps['store'];
   warn?: (message: string) => void;
   ask?: StewardAsk;
+  /** Maximum time for each working-backwards wish draft in schedule (milliseconds). */
+  draftItemMs?: number;
   launchSettings?: Pick<StewardSettings, 'mode' | 'launch' | 'maxParallel' | 'podPool'>;
   launchCommand?: LaunchDeps['command'];
   spawnLaunch?: LaunchDeps['spawn'];
@@ -413,20 +415,35 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       const wishes = rows.filter(row => present.has(row.issue) && row.capability === 'new-capability' && row.rung !== 'hitl');
       const store = wishes.length ? deps.cardStore ?? new CardStore(root) : undefined;
       const invalid = new Set<string>();
+      const carried = new Set<string>();
       if (store) try {
         recordTriageOnCards(wishes, issues, { root, store, now: deps.now });
         for (const wish of wishes) {
-          try { await recordWorkingBackwardsOnCards([wish], issues, store, deps.ask ?? askSteward); }
-          catch (error) {
-            if (!(error instanceof InvalidWorkingBackwardsDraft)) throw error;
-            invalid.add(wish.issue);
-            debug.log('steward.stage', 'draft-invalid', { issue: wish.issue });
-          }
+          const timedOut = Symbol('draft-timeout');
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(timedOut), deps.draftItemMs ?? 120_000);
+          });
+          // The draft may finish without ever racing this promise (no ask needed) — never leave its rejection unhandled.
+          timeout.catch(() => undefined);
+          try {
+            // Bound the ask itself so a late answer cannot write to a store closed after this tick.
+            const ask: StewardAsk = (prompt, role) => Promise.race([(deps.ask ?? askSteward)(prompt, role), timeout]);
+            await recordWorkingBackwardsOnCards([wish], issues, store, ask);
+          } catch (error) {
+            if (error instanceof InvalidWorkingBackwardsDraft) {
+              invalid.add(wish.issue);
+              debug.log('steward.stage', 'draft-invalid', { issue: wish.issue });
+            } else {
+              carried.add(wish.issue);
+              debug.log('steward.schedule', 'draft-carried', { issue: wish.issue, reason: error === timedOut ? 'timeout' : 'error' });
+            }
+          } finally { if (timer) clearTimeout(timer); }
         }
       } finally { if (!deps.cardStore) store.close(); }
-      if (invalid.size) rows = rows.map(row => invalid.has(row.issue)
+      if (invalid.size || carried.size) rows = rows.map(row => invalid.has(row.issue)
         ? { ...row, rung: 'hitl' as const, disposition: 'hitl' as const, hitlReason: 'other' as const, why: 'working-backwards draft invalid' }
-        : row);
+        : carried.has(row.issue) ? { ...row, deferred: true as const, disposition: 'wait' as const } : row);
     }
     for (const row of rows) try { debug.log('steward.schedule', 'decision', {
       kind: row.disposition, target: row.issue, wouldAct: row.disposition === 'now' && liveLike(settings.mode),

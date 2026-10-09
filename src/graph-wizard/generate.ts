@@ -18,6 +18,8 @@ import { validateGraphYaml } from '../nexus/api/graph-kinds.js';
 import { defaultGraphsDir } from '../self-implement/graph-templates.js';
 import { WORKFLOW_SYNTH_SYSTEM_PROMPT } from '../workflow-synth/system-prompt.js';
 import { WIZARD_ARCHETYPES } from './archetypes.js';
+import { listInstalledPacks, queryInstalledPack } from '../knowledge/query.js';
+import { parsePackIdString } from '../knowledge/kgs/pack.js';
 import { WIZARD_MAX_RETRIES, WIZARD_STEPS, WIZARD_STEP_IDS, recipesYamlFor, type WizardNodeStep } from './steps.js';
 
 export interface GraphWizardTurn { role: 'user' | 'assistant'; text: string }
@@ -28,6 +30,8 @@ export interface GraphWizardRequest {
   /** 있으면 prompt 는 «이 그래프를 고치라»는 지시다 — 결과는 고친 «전체» YAML. */
   currentYaml?: string;
   history?: GraphWizardTurn[];
+  /** Installed pack selected for a knowledge (RAG) node. */
+  packId?: string;
 }
 
 export interface GraphWizardResult {
@@ -58,9 +62,17 @@ export interface GraphWizardDeps {
   /** 이미 쓰인 graph_id(핵심 ⊕ 내 그래프). 기본 = graphs/** ⊕ <state>/graphs. */
   existingIds?: () => ReadonlySet<string>;
   maxAttempts?: number;
+  /** Installed pack inventory and retrieval seams for isolated generation. */
+  packs?: typeof listInstalledPacks;
+  searchPack?: typeof queryInstalledPack;
 }
 
 export const GRAPH_WIZARD_MAX_ATTEMPTS = 3;
+
+/** Inventory used by the editor's pack picker and the wizard's validation. */
+export function wizardInstalledPacks(deps: GraphWizardDeps = {}): Array<{ id: string; title: string }> {
+  return (deps.packs ?? listInstalledPacks)();
+}
 
 /** 요청 자체가 틀렸다(400) — LLM 실패(502)와 가른다. */
 export class GraphWizardInputError extends Error { override name = 'GraphWizardInputError'; }
@@ -422,8 +434,9 @@ async function defaultCallLLM(prompt: string): Promise<string> {
 function buildPrompt(input: {
   req: GraphWizardRequest; kind: GraphKind; id: string; base?: TemplateEntry; templates: readonly TemplateEntry[];
   previous?: { yaml: string; issues: string[] };
+  evidence?: string;
 }): string {
-  const { req, kind, id, base, templates, previous } = input;
+  const { req, kind, id, base, templates, previous, evidence } = input;
   const kinds = listNodeKinds(kind).map((k) => k.kind).join(', ');
   const editing = typeof req.currentYaml === 'string' && req.currentYaml.trim() !== '';
   const lines: string[] = [
@@ -451,6 +464,8 @@ function buildPrompt(input: {
   } else {
     lines.push('', `사용자의 말: ${req.prompt}`);
   }
+  if (evidence) lines.push('', '선택한 설치 팩의 검색 근거:', evidence,
+    `지식(RAG) 노드를 cmd 단계로 넣고 # 지식 검색 | knowledge-rag | ${req.packId} 주석을 붙인다. 다음 산출 단계는 이 노드의 근거를 사용한다. 실행 입력 input.query 가 있으면 질문으로 검색하고 없으면 설치 팩 전체 색인에서 가져온다. 근거에 없는 사실을 만들지 마라.`);
   if (previous) {
     lines.push('', '직전 시도가 검증에 실패했다. 아래 문제를 «전부» 고쳐 전체 YAML 을 다시 써라:', ...previous.issues.map((i) => `- ${i}`),
       '직전 YAML:', '```yaml', previous.yaml.trim(), '```');
@@ -467,6 +482,15 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
   const kind: GraphKind = req.kind === 'workflow' ? 'workflow' : 'harness';
   const prompt = typeof req.prompt === 'string' ? req.prompt.trim() : '';
   if (!prompt) throw new GraphWizardInputError('prompt is required');
+  if (req.packId !== undefined && kind !== 'harness') throw new GraphWizardInputError('pack selection requires a harness graph');
+  let evidence: string | undefined;
+  if (req.packId !== undefined) {
+    if (!parsePackIdString(req.packId) || !wizardInstalledPacks(deps).some(pack => pack.id === req.packId))
+      throw new GraphWizardInputError(`pack not installed: ${req.packId}`);
+    const cards = (deps.searchPack ?? queryInstalledPack)(req.packId, prompt);
+    if (!cards.length) throw new GraphWizardInputError(`no knowledge found in ${req.packId} for: ${prompt}`);
+    evidence = cards.slice(0, 5).map(card => `[${card.ref}] ${card.title}: ${card.body.slice(0, 1200)}`).join('\n');
+  }
   const editing = typeof req.currentYaml === 'string' && req.currentYaml.trim() !== '';
   const graphsDir = deps.graphsDir ?? defaultGraphsDir();
   const templates = kind === 'harness' ? listWizardTemplates(graphsDir) : [];
@@ -497,7 +521,7 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
   for (attempts = 1; attempts <= maxAttempts; attempts += 1) {
     let text: string;
     try {
-      text = await callLLM(buildPrompt({ req: { ...req, prompt }, kind, id, base: keywordBase, templates,
+      text = await callLLM(buildPrompt({ req: { ...req, prompt }, kind, id, base: keywordBase, templates, evidence,
         ...(attempts > 1 ? { previous: { yaml, issues } } : {}) }));
     } catch (error) {
       debug.log('graph.wizard', 'error', { id, kind, attempt: attempts, base, message: error instanceof Error ? error.message : String(error) });
@@ -514,6 +538,14 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
     try { issues = validateWizardYaml(kind, yaml); }
     catch (error) { issues = [`검증 실패: ${error instanceof Error ? error.message : String(error)}`]; }
     steps = kind === 'harness' ? parseNodeAnnotations(yaml) : {};
+    if (req.packId && issues.length === 0) {
+      const raw = parseYaml(yaml) as { nodes?: Array<{ node_id: string; recipe: string }>; edges?: Array<{ from: string; map?: Record<string, string> }> };
+      const rag = (raw.nodes ?? []).find(node => node.recipe.startsWith('cmd:') && steps[node.node_id]?.step === 'knowledge-rag' && steps[node.node_id]?.arg === req.packId);
+      if (!rag || !(raw.edges ?? []).some(edge => edge.from === rag.node_id &&
+        typeof edge.map?.ok === 'string' && !['done', 'failed'].includes(edge.map.ok) &&
+        (raw.nodes ?? []).some(node => node.node_id === edge.map!.ok && node.recipe.startsWith('cmd:'))))
+        issues.push(`선택한 팩 ${req.packId} 의 knowledge-rag 노드를 산출 단계에 연결하라`);
+    }
     recipes = undefined;
     dryRun = undefined;
     if (kind === 'harness' && issues.length === 0) {

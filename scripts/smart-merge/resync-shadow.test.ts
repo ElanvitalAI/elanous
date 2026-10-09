@@ -17,6 +17,7 @@ test('three conflicting harness drafts: clean, deterministic next.md, unresolved
   let current = 0;
   let tick = 0;
   let llmCalls = 0;
+  const llmFiles: string[] = [];
   const run = (_cwd: string, program: 'git' | 'gh', args: readonly string[]) => {
     calls.push(`${program} ${args.join(' ')}`);
     if (program === 'gh') return { status: 0, stdout: JSON.stringify([
@@ -40,10 +41,11 @@ test('three conflicting harness drafts: clean, deterministic next.md, unresolved
   };
   try {
     const rows = await runResyncShadow({ repo: stateRoot, stateRoot, run, git, log: (line) => summaries.push(line),
-      now: () => ++tick, resolve: async (_file, conflicted) => { llmCalls++; return conflicted; } });
+      now: () => ++tick, resolve: async (file, conflicted) => { llmCalls++; llmFiles.push(file); return conflicted; } });
     expect(rows.map((row) => row.outcome)).toEqual(['clean', 'resolved-deterministic', 'unresolved']);
     expect(rows.map((row) => row.files)).toEqual([[], ['release/next.md'], ['src/code.ts']]);
     expect(rows.map((row) => row.durationMs)).toEqual([1, 1, 1]);
+    expect(llmFiles).toEqual(['src/code.ts']);
     expect(llmCalls).toBe(1);
     expect(summaries).toEqual(['충돌 draft 3 중 살릴 수 있음 2 = 67%']);
     const persisted = readFileSync(join(stateRoot, 'smart-merge/resync-shadow.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as ShadowRow);

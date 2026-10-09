@@ -17,6 +17,7 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { explainReportRoute, isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
+import type { AddBriefItem } from '../briefing/brief-items.js';
 import { registerLogStoreSink, setLogInstanceName } from '../mss/logging/log-store.js';
 import type { LogSink } from '../mss/logging/sink.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
@@ -633,6 +634,13 @@ export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => v
   return false;
 }
 
+type UndeliverableRecorder = (item: AddBriefItem) => void;
+let undeliverableRecorder: UndeliverableRecorder | null = null;
+/** Replace the ledger writer in tests; null restores the production ledger. */
+export function setUndeliverableRecorder(recorder: UndeliverableRecorder | null): void {
+  undeliverableRecorder = recorder;
+}
+
 /** OB8b — both paths failed: say so loudly, with the universe this process resolved, instead of a silent false.
  *  The usual cause (10-01 · MK): an ad-hoc `bun -e` or a script from a source tree resolves a cwd-derived test
  *  universe, so it finds neither the production daemon nor the production bot token. */
@@ -647,7 +655,22 @@ function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-fo
   let route: ReturnType<typeof explainReportRoute> | null = null;
   try { if (cfg) route = explainReportRoute(cfg, kind); } catch { /* the report still goes out */ }
   ensureOutboundLogSink();
-  try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root, route: route?.reason ?? 'unknown' }); } catch { /* fail-soft */ }
+  const reason = route?.reason ?? 'unknown';
+  try { debug.log('outbound.send', 'undeliverable', { kind: safeObservationLabel(kind), daemonPath, universe, root, route: reason }); } catch { /* fail-soft */ }
+  try {
+    const record = undeliverableRecorder ?? ((item: AddBriefItem) => {
+      const { BriefItemsLedger } = require('../briefing/brief-items.js') as typeof import('../briefing/brief-items.js');
+      new BriefItemsLedger().add(item);
+    });
+    record({
+      domain: '운영', priority: 'P1', source: 'outbound.undeliverable',
+      text: `미전달: kind ${kind} · 데몬 ${daemonPath} · 경로 ${reason} · 우주 ${universe}`,
+      evidence: 'elanous logs --category outbound.send --event undeliverable',
+      dedupeKey: `${kind} · ${reason}`, dedupeWithinMs: 60 * 60_000,
+    });
+  } catch (error) {
+    try { debug.log('outbound.send', 'undeliverable-record-failed', { kind: safeObservationLabel(kind), route: reason, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+  }
   const hint = universe === 'prod'
     ? '운영 데몬이 떠 있는지 확인: elanous nexus show'
     : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous 와 --config-dir ~/.elanous 를 준다';

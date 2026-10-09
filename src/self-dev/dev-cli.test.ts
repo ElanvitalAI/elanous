@@ -2,9 +2,9 @@ import { resetFrontVisitCountsForTesting } from './graph-front-nodes.js';
 import { setDefaultTimeout, describe, it, expect, spyOn, beforeAll, afterAll } from 'bun:test';
 import * as devCli from './dev-cli.js';
 
-// 발사 시험은 실시간 `elanous usage`(grok 잔량)를 부르지 않는다 — 캐시가 «모름»이던 종전 동작으로 고정.
-beforeAll(() => devCli.setLaunchGrokQuotaReaderForTesting(() => 'unknown'));
-afterAll(() => devCli.setLaunchGrokQuotaReaderForTesting(undefined));
+// 발사 시험은 실시간 `elanous usage`(grok 잔량·주간 사용률)를 부르지 않는다.
+beforeAll(() => { devCli.setLaunchGrokQuotaReaderForTesting(() => 'unknown'); devCli.setLaunchGrokWeeklyReaderForTesting(() => undefined); });
+afterAll(() => { devCli.setLaunchGrokQuotaReaderForTesting(undefined); devCli.setLaunchGrokWeeklyReaderForTesting(undefined); });
 import { debug } from '../debug/log.js';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

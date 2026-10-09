@@ -42,7 +42,7 @@ const createNodeMock = () => ({
   clientWidth: 1000, clientHeight: 600, offsetWidth: 1000, offsetHeight: 600, style: {}, ownerDocument: globalThis.document,
 });
 
-function setup(replies: Array<{ status: number; body: unknown }>, wizardMode = false) {
+function setup(replies: Array<{ status: number; body: unknown }>, wizardMode = false, installedPacks?: Array<{ id: string; title: string }>) {
   const calls: Array<Record<string, unknown>> = [];
   const saves: Array<Record<string, unknown>> = [];
   const fetchImpl = (async (url: string, init?: RequestInit) => {
@@ -72,6 +72,7 @@ function setup(replies: Array<{ status: number; body: unknown }>, wizardMode = f
         {...(wizard.replace ? { replace: wizard.replace } : {})}
         {...(wizard.highlight ? { highlight: wizard.highlight } : {})}
         nodeLabels={wizard.labels}
+        installedPacks={installedPacks}
         {...(wizard.steps ? { wizardSteps: wizard.steps } : {})}
         onChange={(context) => { wizard.onChange(context); seen.context = context; }} />
       <GraphWizardChat client={wizardClient} current={wizard.current} laid={wizard.laid} onApply={wizard.apply} onRestore={wizard.restore} />
@@ -174,6 +175,26 @@ describe('GRAPH-WIZARD chat ↔ real canvas', () => {
     await act(async () => { save.props.onClick(); await Bun.sleep(20); });
     expect(saves).toHaveLength(1);
     expect(saves[0]).toEqual({ id: 'ai-news', yaml: seen.context!.yaml, steps });
+    act(() => root.unmount());
+  });
+
+  test('the knowledge node form changes the pack saved with its runnable step', async () => {
+    const oldPack = 'pack:fab-knowledge@1.0.0';
+    const nextPack = 'pack:fab-knowledge@2.0.0';
+    const steps = { fetch: { label: '팩 검색', step: 'knowledge-rag', arg: oldPack } };
+    const { root, saves } = setup([{ status: 200, body: { ok: true, yaml: T1, issues: [], steps } }], false,
+      [{ id: oldPack, title: '공정 1' }, { id: nextPack, title: '공정 2' }]);
+    await say(root.root, '팩 근거로 지침 작성');
+    const canvas = root.root.findByType(GraphCanvasEditor);
+    await act(async () => { canvas.findAll((item) => typeof item.props.onNodeClick === 'function')[0]!.props.onNodeClick({}, { id: 'fetch' }); });
+    const select = root.root.findByProps({ 'aria-label': '지식(RAG) 팩' });
+    expect(select.props.value).toBe(oldPack);
+    await act(async () => { select.props.onChange({ target: { value: nextPack } }); });
+    expect(root.root.findByProps({ 'aria-label': '지식(RAG) 팩' }).props.value).toBe(nextPack);
+    expect(root.root.findAllByType('button').find((button) => text(button) === '저장')!.props.disabled).toBe(false);
+    const save = root.root.findAllByType('button').find((button) => text(button) === '저장')!;
+    await act(async () => { save.props.onClick(); await Bun.sleep(20); });
+    expect(saves[0]?.steps).toEqual({ fetch: { ...steps.fetch, arg: nextPack } });
     act(() => root.unmount());
   });
 

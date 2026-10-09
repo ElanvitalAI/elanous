@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { getUserConfig } from '../user-config.js';
-import { addHarnessQueue, harnessQueueCountingLimits, queueLaunchTime, HarnessQueueDuplicateError, queueCellId, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, queuePodRunsFromJobs, queueRunLabelValue, readHarnessQueuePodRuns, readHarnessQueueProcesses, queueCellRubricPriority, QUEUE_CEO_PRIORITY_BONUS, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
+import { addHarnessQueue, harnessQueueCountingLimits, queueLaunchTime, HarnessQueueDuplicateError, queueCellId, harnessQueueIdForKey, harnessQueueOutcome, harnessQueuePath, harnessQueueReceiptPath, listHarnessQueue, queueLaunchArgs, queueSeatForCwd, queuePodRunsFromJobs, queueRunLabelValue, readHarnessQueuePodRuns, readHarnessQueueProcesses, queueCellRubricPriority, QUEUE_CEO_PRIORITY_BONUS, reconcileHarnessQueue, removeHarnessQueue, requestIdleSeats, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem } from './harness-queue.js';
 import { checkpointDependenciesForRun, loadSelfDevRun, processBirthId, saveSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
 import { bindOrchestrateRunLedger } from '../self-dev/self-orchestrate-runtime.js';
 import { debug } from '../debug/log.js';
@@ -205,6 +205,72 @@ test('QUEUE-BURST CLI tick prints the first launch as before and one line per fu
   try { await program.parseAsync(['node', 'elanous', 'harness', 'queue', 'tick']); }
   finally { console.log = original; }
   expect(lines).toEqual([`launched ${first.id}: spawned`, `launched ${second.id}: spawned`]);
+});
+
+test('launch advice observes pool wait and non-pool wait without changing queue decisions', async () => {
+  const dir = root(), launches: string[][] = [], events: Record<string, unknown>[] = [];
+  const deps = fixture(dir, launches, { running: 8, pending: 0, reserved: 0, limit: 8 });
+  const item = await addHarnessQueue({ seat: 'MK', say: 'advice shadow' }, deps);
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+    if (category === 'resource.advice' && event === 'launch-advice') events.push(data as Record<string, unknown>);
+  }) as typeof debug.log;
+  try {
+    const poolWait = await tickHarnessQueue(deps);
+    expect(poolWait).toMatchObject({ outcome: 'waiting', item: { id: item.id }, reason: 'pool: 8+0+0+0/8' });
+    expect(events).toEqual([{ caller: 'harness-queue-tick', verdict: 'wait', why: 'pool 8/8 occupied',
+      actual: 'waiting', kind: 'agree', itemId: item.id }]);
+    const seatWait = await tickHarnessQueue({ ...deps, cap: () => 0 });
+    expect(seatWait).toMatchObject({ outcome: 'waiting', item: { id: item.id } });
+    expect(events[1]).toMatchObject({ verdict: 'unknown', actual: 'waiting', kind: 'advice-unknown', itemId: item.id });
+    const unreadable = await tickHarnessQueue({ ...deps, pool: () => { throw Error('pool down'); } });
+    expect(unreadable).toMatchObject({ outcome: 'waiting', item: { id: item.id } });
+    expect(events[2]).toMatchObject({ verdict: 'unknown', actual: 'waiting', kind: 'advice-unknown', itemId: item.id });
+    const other = await addHarnessQueue({ seat: 'TC', say: 'another seat' }, deps);
+    const turnWait = await tickHarnessQueue({ ...deps, pool: () => ({ running: 2, pending: 0, reserved: 0, limit: 8 }) }, other.id);
+    expect(turnWait).toMatchObject({ outcome: 'waiting', item: { id: other.id }, reason: '다른 자리 차례 — MK' });
+    expect(events[3]).toMatchObject({ verdict: 'launch-now', actual: 'waiting', kind: 'advice-launch-actual-wait', itemId: other.id });
+    expect(launches).toEqual([]);
+  } finally { (debug as { log: typeof debug.log }).log = original; }
+});
+
+test('an empty queue tick leaves no launch-advice line', async () => {
+  const dir = root(), launches: string[][] = [], events: unknown[] = [];
+  const deps = fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 8 });
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+    if (category === 'resource.advice' && event === 'launch-advice') events.push(data);
+  }) as typeof debug.log;
+  try {
+    expect(await tickHarnessQueue(deps)).toMatchObject({ outcome: 'skipped', reason: 'empty' });
+    expect(events).toEqual([]);
+  } finally { (debug as { log: typeof debug.log }).log = original; }
+});
+
+test('throwing advice and throwing advice log preserve launched, waiting and skipped tick results', async () => {
+  const run = async (broken: boolean) => {
+    const dir = root(), launches: string[][] = [];
+    const deps = fixture(dir, launches, { running: 0, pending: 0, reserved: 0, limit: 1 });
+    const first = await addHarnessQueue({ seat: 'TC', say: 'launch' }, deps);
+    const second = await addHarnessQueue({ seat: 'MK', say: 'wait' }, deps);
+    const original = debug.log;
+    if (broken) (debug as { log: typeof debug.log }).log = ((category) => {
+      if (category === 'resource.advice') throw Error('advice log down');
+    }) as typeof debug.log;
+    try {
+      const injected = broken ? { ...deps, advice: (() => { throw Error('advice down'); }) as NonNullable<HarnessQueueDeps['advice']> } : deps;
+      const launched = await tickHarnessQueue(injected, first.id);
+      const waiting = await tickHarnessQueue(injected, second.id);
+      const skipped = await tickHarnessQueue(injected, first.id);
+      return { launched, waiting, skipped, launches };
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  };
+  const baseline = await run(false), broken = await run(true);
+  const shape = (result: Awaited<ReturnType<typeof run>>) => ({ outcomes: [result.launched, result.waiting, result.skipped]
+    .map(tick => ({ outcome: tick.outcome, reason: tick.reason, item: tick.item && {
+      input: tick.item.input, status: tick.item.status, waitingReason: tick.item.waitingReason }, launched: tick.launched?.length })), launches: result.launches });
+  expect(shape(broken)).toEqual(shape(baseline));
+  expect(shape(broken).outcomes.map(row => row.outcome)).toEqual(['launched', 'waiting', 'skipped']);
 });
 
 test('queue admits only the FIFO head when seat cap and running+pending+reservations allow it', async () => {
@@ -684,8 +750,10 @@ test('macOS ps/lsof attributes only the matching working tree, keeps unknown run
   const run = ((command: string, args: string[]) => {
     calls.push(`${command} ${args.join(' ')}`);
     if (command === 'ps') return { status: 0, stdout: ps };
-    const path = cwd[args[2]!];
-    return path ? { status: 0, stdout: `p${args[2]}\nfcwd\nn${path}\n` } : { status: 1, stdout: '' };
+    // One batched lsof: like the real one it exits 1 when some pid prints no cwd, yet prints the others.
+    const pids = args[args.indexOf('-p') + 1]!.split(',');
+    const found = pids.filter((pid) => cwd[pid]);
+    return { status: found.length === pids.length ? 0 : 1, stdout: found.map((pid) => `p${pid}\nfcwd\nn${cwd[pid]}\n`).join('') };
   }) as typeof import('node:child_process').spawnSync;
   const trees = { MK: ['/work/mk'], TC: ['/work/tc'], UX: ['/work/ux'] };
   const configPath = join(dir, 'seat-trees.json');
@@ -697,7 +765,8 @@ test('macOS ps/lsof attributes only the matching working tree, keeps unknown run
     run: ((_command: string, _args: string[]) => ({ status: 0, stdout: '123 bun /repo/bin/elanous.mjs harness say goal' })) as typeof import('node:child_process').spawnSync }))
     .toThrow('invalid harness process inventory row');
   expect(calls[0]).toBe('ps -eo pid=,ppid=,args=');
-  expect(calls).toEqual(['ps -eo pid=,ppid=,args=', ...['100', '101', '200', '300', '400', '500', '600'].map((pid) => `lsof -a -p ${pid} -d cwd -Fn`)]);
+  // 10-08 tick hang: a per-pid lsof (~0.1–0.3 s each) on a host with dozens of runs made the tick take 10 s+ — one lsof only.
+  expect(calls).toEqual(['ps -eo pid=,ppid=,args=', 'lsof -a -d cwd -Fpn -p 100,101,200,300,400,500,600']);
   expect(processes).toEqual([{ pid: 100, seat: 'TC' }, { pid: 200, seat: 'TC' }, { pid: 300 }, { pid: 400 }, { pid: 500, seat: 'MK' }, { pid: 600, seat: 'UX' }]);
   const deps = { ...fixture(dir, launches), cap: () => 2, processes: () => processes,
     log: (event: string, data: Record<string, unknown>) => { if (event === 'waiting') events.push(data); } };
@@ -932,6 +1001,31 @@ test('reconcile distinguishes successful and failed finished launching receipts 
     expect(harnessQueueOutcome(first.id, deps)).toBe(exitCode === 0 ? 'succeeded' : 'retryable');
     const again = await addHarnessQueue({ seat: 'TC', say: 'once', idempotencyKey: `seat:reconcile:${exitCode}` }, deps);
     expect(again.id === first.id).toBe(false);
+  }
+});
+
+// SEAT-REQUEUE-HANDLED: a person's `queue remove` is its own outcome, never folded into a failure's
+// «retryable» — the seat loop must not re-enter what a person took out of the queue.
+test('queue remove records «removed» for a waiting or failed item, but keeps a succeeded launch succeeded', async () => {
+  const dir = root(), deps = fixture(dir, []);
+  const waiting = await addHarnessQueue({ seat: 'TC', say: 'waiting', idempotencyKey: 'seat:remove:waiting' }, deps);
+  expect(harnessQueueOutcome(waiting.id, deps)).toBe('pending');
+  expect(await removeHarnessQueue(waiting.id, deps)).toBe(true);
+  expect(readFileSync(join(dir, 'harness', `${waiting.id}.outcome`), 'utf8')).toBe('removed');
+  expect(harnessQueueOutcome(waiting.id, deps)).toBe('removed');
+  expect(harnessQueueIdForKey('seat:remove:waiting', deps)).toBe(waiting.id);
+
+  for (const exitCode of [1, 0]) {
+    const item = await addHarnessQueue({ seat: 'TC', say: `ran ${exitCode}`, idempotencyKey: `seat:remove:exit-${exitCode}` }, deps);
+    await expect(tickHarnessQueue({ ...deps, launch: async () => { throw Error('uncertain spawn'); } })).rejects.toThrow('uncertain spawn');
+    const launchId = listHarnessQueue(deps).find((row) => row.id === item.id)!.launchId!;
+    const childFile = join(dir, `remove-exit-${exitCode}.ts`);
+    writeFileSync(childFile, `process.exitCode = ${exitCode};`);
+    expect(await runHarnessQueueChild(harnessQueueReceiptPath(dir, launchId), childFile, [])).toBe(exitCode);
+    // Contrast: without the person's removal this failed row reads «retryable» (see the reconcile test above).
+    expect(harnessQueueOutcome(item.id, deps)).toBe(exitCode === 0 ? 'succeeded' : 'retryable');
+    expect(await removeHarnessQueue(item.id, { ...deps, processes: () => [], receipt: () => 'finished' })).toBe(true);
+    expect(harnessQueueOutcome(item.id, deps)).toBe(exitCode === 0 ? 'succeeded' : 'removed');
   }
 });
 
@@ -1373,11 +1467,18 @@ test('FINISH-RATE: a test process without injected metrics skips the real measur
   mkdirSync(join(dir, 'harness'), { recursive: true });
   writeFileSync(join(dir, 'harness', 'finish-metrics.json'), JSON.stringify({ at: '2026-10-05T08:58:00Z', metrics: backlogged }));
   await addHarnessQueue({ seat: 'MK', say: 'skip' }, deps);
-  const count = () => debug.events(1000).filter(entry => entry.category === 'loop.orchestrator' && entry.event === 'finish-skipped-test').length;
-  const before = count();
-  expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+  // Count via a pass-through spy: a fixed-size ring window shifts when other lines (e.g. launch advice) are logged.
+  let skipped = 0;
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category, event, ...rest) => {
+    if (category === 'loop.orchestrator' && event === 'finish-skipped-test') skipped++;
+    return original.call(debug, category, event, ...rest);
+  }) as typeof debug.log;
+  try {
+    expect((await tickHarnessQueue(deps)).outcome).toBe('launched');
+  } finally { (debug as { log: typeof debug.log }).log = original; }
   expect(launches).toHaveLength(1);
-  expect(count()).toBe(before + 1);
+  expect(skipped).toBe(1);
 });
 
 test('FINISH-RATE: the CLI harness queue tick path reaches the finish gate', async () => {

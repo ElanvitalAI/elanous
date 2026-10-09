@@ -25,6 +25,10 @@ export interface AcpReviewerOpts {
   cwd: string;
   /** ACP 백엔드 id (기본 claude = Claude Code via claude-code-acp). */
   backend?: string;
+  /** Per-review ACP spawn specification (subscription executor). */
+  backendSpec?: import('../acp/backend-registry.js').AcpBackendSpec;
+  /** Subscription child environment after billing credentials are removed. */
+  env?: Record<string, string>;
   /** 모델 tier 별칭 (opus|sonnet|haiku 등). 지정 시 session/set_model 로 고정(백엔드 CLI 기본 위임 아님). */
   model?: string;
   /** 리뷰 1턴 최대 대기(ms). 초과 시 cancel→throw(부분 리뷰로 오판 pass 방지). 기본 300000. */
@@ -96,7 +100,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     //   ⇒ 이 한 줄만 자기 catch 로 감싼다(전체 try 를 앞당기면 `start` 관측이 그 안으로 들어간다).
     let transport: string | null;
     try {
-      transport = injected ? null : getAcpBackend(backend).transport ?? 'acp';
+      transport = injected ? null : opts.backendSpec?.transport ?? getAcpBackend(backend).transport ?? 'acp';
     } catch (e) {
       debug.log('acp-review', 'error', {
         requestedBackend, backend, stage: 'resolve-backend', message: (e as Error).message,
@@ -116,6 +120,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     let capabilitiesObserved = false;
     const agentOpts: Omit<AcpAgentOpts, 'backendId'> = {
       cwd: opts.cwd,
+      ...(opts.backendSpec ? { backendSpec: opts.backendSpec, env: opts.env } : {}),
       log: (message) => debug.log('acp-review', 'agent-log', { backend, message }),
       onCapabilities: (capabilities) => {
         capabilitiesObserved = true;
@@ -142,7 +147,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     };
     // A review owns its manager and subprocess: the global manager caches
     // chat agents, whose callbacks and lifecycle must not be mutated here.
-    const reviewManager = injected ? undefined : new AcpAgentManager();
+    const reviewManager = injected || opts.backendSpec ? undefined : new AcpAgentManager();
     let agent: AcpAgent | undefined;
     let text = '';
     let timedOut = false;
@@ -150,8 +155,10 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     try {
       agent = opts.createAgent
         ? opts.createAgent({ backendId: requestedBackend, ...agentOpts })
-        : await reviewManager!.getAgent(requestedBackend, agentOpts);
-      if (injected) await agent.start();
+        : opts.backendSpec
+          ? new AcpAgent({ backendId: requestedBackend, ...agentOpts })
+          : await reviewManager!.getAgent(requestedBackend, agentOpts);
+      if (injected || opts.backendSpec) await agent.start();
       if (!capabilitiesObserved) {
         try {
           debug.log('acp-review', 'capabilities', {
@@ -211,7 +218,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
       // cleanup seam, while the per-review manager releases its agents and
       // process hooks. An injected agent is external to the manager.
       try {
-        if (injected) await agent?.stop();
+        if (injected || opts.backendSpec) await agent?.stop();
         else await reviewManager!.dispose();
       } catch (e) {
         debug.log('acp-review', 'stop-fail', { backend, message: (e as Error).message }, { level: 'error' });

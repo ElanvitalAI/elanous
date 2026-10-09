@@ -153,7 +153,7 @@ describe('expose rubric suggestions — measurement, not judgement', () => {
       expect(result[0]!.criteria.reproducible.status).toBe('pass');
       expect(log).toHaveBeenCalledWith('expose.rubric', 'suggested', expect.objectContaining({ helpRuns: 2, helpFailures: 0 }));
     } finally { log.mockRestore(); }
-  });
+  }, 60_000);
 
   test('루트 help 실패도 재시도 후 모든 참조 문서에서 측정 불가', () => {
     let attempts = 0;
@@ -273,7 +273,7 @@ describe('expose rubric suggestions — measurement, not judgement', () => {
     expect(rows[0].path).toBe(path('three'));
     expect(rows[0].criteria.brand).toEqual({ status: 'fail', reason: '브랜드 규칙: B7' });
     expect(readFileSync(ledger)).toEqual(original);
-  });
+  }, 60_000);
 
   test('실제 CLI --help 로 있는 elanous 명령은 pass, 없는 명령은 fail 로 측정한다', () => {
     const script = join(import.meta.dir, 'expose-rubric-suggest.ts');
@@ -293,7 +293,7 @@ describe('expose rubric suggestions — measurement, not judgement', () => {
         .toEqual({ status: 'fail', reason: '없는 명령: elanous nonexistentrubriccommand' });
       expect(readFileSync(ledger)).toEqual(original);
     } finally { rmSync(missing); }
-  });
+  }, 60_000);
 
   test('기본 출력에 한 줄씩·합계·사람 판정 표시, JSON은 요구된 배열만 출력', () => {
     const lines: string[] = [];

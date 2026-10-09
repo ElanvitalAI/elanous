@@ -63,7 +63,7 @@ describe('logs model-input baseline', () => {
         { scope: 'loop-tick', nodeKind: 'review', measured: 1, unmeasured: 0, median: 140, p90: 140 },
       ],
     });
-    expect(renderModelInput(report)).toContain('loop-tick\tplan\t0\t—\t—\t1');
+    expect(renderModelInput(report)).toContain('loop-tick\tplan\t0\t못 잼\t못 잼\t1');
     const store = LogStore.openReadOnly(path);
     try { expect(store.query({ exactCategories: ['harness.model-input'], events: ['recorded'], sinceMs: now - 3 * 86_400_000, limit: 100 })).toHaveLength(16); }
     finally { store.close(); }
@@ -98,7 +98,7 @@ describe('logs model-input baseline', () => {
     const path = makeStore([{ ts: now - 1000, data: record('harness-node', 'review', null) }]);
     const output: string[] = [], errors: string[] = [];
     expect(runLogsModelInput({}, deps([path], output, errors))).toBe(0);
-    expect(output[0]).toContain('harness-node\treview\t0\t—\t—\t1');
+    expect(output[0]).toContain('harness-node\treview\t0\t못 잼\t못 잼\t1');
     output.length = 0;
     expect(runLogsModelInput({ since: new Date(now - 100).toISOString() }, deps([path], output, errors))).toBe(0);
     expect(output[0]).toContain('(관측 표본 없음)');
@@ -113,7 +113,7 @@ describe('logs model-input baseline', () => {
     expect(errors).toHaveLength(2);
   });
 
-  test('registered logs model-input --json reports observations emitted to an isolated log store', () => {
+  test('registered logs model-input reports observations emitted to an isolated log store in JSON and text', () => {
     const root = mkdtempSync(join(tmpdir(), 'model-input-cli-'));
     dirs.push(root);
     const state = join(root, '.elanous-test');
@@ -134,17 +134,26 @@ describe('logs model-input baseline', () => {
       store.close();
     }
     const cli = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
-    const result = spawnSync('bun', [cli, 'logs', 'model-input', '--test', '--json', '--since', '1d'], {
-      cwd: root, env: { ...process.env, NODE_ENV: 'test', ELANOUS_STATE_DIR: state }, encoding: 'utf8', timeout: 120_000,
+    const cliEnv = { ...process.env, NODE_ENV: 'test', ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state };
+    const runCli = (...args: string[]) => spawnSync('bun', [cli, `--test=${root}`, 'logs', 'model-input', '--test', '--since', '1d', ...args], {
+      cwd: root, env: cliEnv, encoding: 'utf8', timeout: 120_000,
     });
-    expect(result.status).toBe(0);
-    const report = JSON.parse(result.stdout);
+    const json = runCli('--json');
+    expect({ status: json.status, stderr: json.stderr }).toEqual({ status: 0, stderr: '' });
+    const report = JSON.parse(json.stdout);
     expect(report.records).toBe(5);
     expect(report.baselines).toEqual([
       { scope: 'harness-node', nodeKind: 'review', measured: 3, unmeasured: 1, median: 30, p90: 50 },
       { scope: 'loop-tick', nodeKind: 'research', measured: 0, unmeasured: 1, median: null, p90: null },
     ]);
-  });
+    const text = runCli();
+    expect(text.status).toBe(0);
+    expect(text.stdout).toContain('harness-node\treview\t3\t30\t50\t1');
+    expect(text.stdout).toContain('loop-tick\tresearch\t0\t못 잼\t못 잼\t1');
+    const reader = LogStore.openReadOnly(join(state, 'logs', 'logs.db'));
+    try { expect(reader.query({ exactCategories: ['harness.model-input'], events: ['recorded'], limit: 100 })).toHaveLength(5); }
+    finally { reader.close(); }
+  }, 20_000);
 
   test('CLI registers model-input subcommand and scope/time/JSON flags', () => {
     const program = new Command();

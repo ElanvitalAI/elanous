@@ -6,7 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { VaultMarkdown, mermaidSourceFromPre } from './VaultMarkdown';
-import { isDarkColorScheme } from './MermaidDiagram';
+import { isDarkColorScheme, mermaidCardClassName } from './MermaidDiagram';
 
 const MERMAID_NOTE = ['# 노트', '', '```mermaid', 'graph TD', '  A[시작] --> B[끝]', '```', ''].join('\n');
 
@@ -18,6 +18,13 @@ describe('VaultMarkdown mermaid 배선', () => {
     expect(html).toContain('A[시작] --&gt; B[끝]');
     // 바깥 코드 상자(<pre class="my-3 ...">)에 갇히지 않는다
     expect(html).not.toContain('<pre class="my-3');
+  });
+
+  test('노트 안 init 지시는 MermaidDiagram 소스로 그대로 전달된다', () => {
+    const directive = "%%{init: {theme: 'forest'}}%%";
+    const html = renderToStaticMarkup(<VaultMarkdown markdown={`\`\`\`mermaid\n${directive}\ngraph TD\nA-->B\n\`\`\``} />);
+    expect(html).toContain(directive.replaceAll("'", '&#x27;'));
+    expect(html).toContain('data-elanous-mermaid="loading"');
   });
 
   test('다른 언어 펜스·인라인 코드는 그대로다', () => {
@@ -42,6 +49,13 @@ describe('VaultMarkdown mermaid 배선', () => {
     expect(mermaidSourceFromPre(node)).toBe('sequenceDiagram\n  A->>B: hi');
     expect(mermaidSourceFromPre({ ...node, children: [{ ...node.children[0], properties: { className: ['language-js'] } }] })).toBeNull();
     expect(mermaidSourceFromPre(undefined)).toBeNull();
+  });
+
+  test('다크 화면에서 밝은 Mermaid 테마는 도식 카드만 밝게 만든다', () => {
+    expect(mermaidCardClassName(true, 'default')).toContain('bg-white');
+    expect(mermaidCardClassName(true, 'forest')).toContain('bg-white');
+    expect(mermaidCardClassName(true, 'dark')).not.toContain('bg-white');
+    expect(mermaidCardClassName(false, 'default')).not.toContain('bg-white');
   });
 
   test('isDarkColorScheme — 테마의 color-scheme 첫 값으로 가른다', () => {

@@ -8,6 +8,7 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug } from '../../debug/log.js';
+import { emitLoopHeartbeat } from '../neighbor-runtime.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../self-dev/run-store.js';
 import { planAction, runSeatLoopOnce, type SeatDeps, type SeatItem } from '../../seat-loop/seat-loop.js';
 import { addHarnessQueue, harnessQueueOutcome, setQueuedPoolHint } from '../../harness/harness-queue.js';
@@ -48,7 +49,8 @@ export type PlacementInput = { id: string; title: string; owner: string; priorit
 export type PlaceAdapter = (cell: PlacementInput, deps?: { dryRun?: boolean; now?: Date }) => Promise<{ version?: string } | null> | { version?: string } | null;
 export type RebalanceAdapter = (version: string) => Promise<{ decisions: unknown[]; blocked: Array<{ id: string; reason: string }> }> | { decisions: unknown[]; blocked: Array<{ id: string; reason: string }> };
 export interface TickDeps {
-  root?: string; now?: Date; mode?: Mode; runId?: string; window?: Window;
+  root?: string; now?: Date | (() => Date); mode?: Mode; runId?: string; window?: Window;
+  heartbeatIntervalMs?: number;
   cards?: () => TaskCard[]; split?: SplitAdapter; placeCell?: PlaceAdapter;
   degradation?: () => { llm: boolean; board: boolean };
   gridHosts?: readonly GridHost[];
@@ -100,6 +102,19 @@ function handedKeys(path: string): Set<string> {
 export function kstWindow(now: Date): Window {
   const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Seoul', hour: '2-digit', hourCycle: 'h23' }).format(now));
   return hour < 12 ? '08' : hour < 18 ? '12' : '18';
+}
+/** KST schedule of graphs/orchestrator/orchestrator.yaml (`0 8,12,18 * * *`). */
+const ORCHESTRATOR_HOURS_KST = [8, 12, 18] as const;
+/** Grace past the next scheduled window before neighbors may call the orchestrator absent. */
+export const ORCHESTRATOR_LEASE_GRACE_MS = 60 * 60_000;
+/** The next scheduled window strictly after `now` — the orchestrator is idle, not absent, until then. */
+export function nextOrchestratorWindowAt(now: Date): Date {
+  const kst = new Date(now.getTime() + 9 * 3_600_000);
+  for (let day = 0; day < 2; day++) for (const hour of ORCHESTRATOR_HOURS_KST) {
+    const at = Date.UTC(kst.getUTCFullYear(), kst.getUTCMonth(), kst.getUTCDate() + day, hour) - 9 * 3_600_000;
+    if (at > now.getTime()) return new Date(at);
+  }
+  throw new Error('unreachable: no orchestrator window within two days');
 }
 function kstDay(now: Date): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
@@ -371,7 +386,8 @@ async function optionalAdapter<T>(path: string, name: string): Promise<T | undef
 
 /** A graph command invokes one node; only the per-run file carries data across processes. */
 export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Promise<TickState> {
-  const now = deps.now ?? new Date();
+  const currentTime = () => typeof deps.now === 'function' ? deps.now() : deps.now ?? new Date();
+  const now = currentTime();
   const window = deps.window ?? kstWindow(now);
   const root = deps.root ?? effectiveInstanceRoot();
   const runId = deps.runId ?? graphRunId() ?? `${kstDay(now)}-${window}`;
@@ -379,6 +395,16 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   const orchestratorConfig = getUserConfig().loops?.orchestrator;
   const configured = deps.mode ?? orchestratorConfig?.mode;
   const mode: Mode = configured === 'off' || configured === 'live' ? configured : 'shadow';
+  const pulse = (health: 'healthy' | 'degraded', at: Date): void => {
+    try { emitLoopHeartbeat(root, 'orchestrator', health, at,
+      new Date(nextOrchestratorWindowAt(at).getTime() + ORCHESTRATOR_LEASE_GRACE_MS).toISOString()); }
+    catch (error) { debug.log('loop.orchestrator', 'heartbeat-failed', { error: String(error).slice(0, 200) }, { level: 'warn' }); }
+  };
+  if (mode !== 'off') pulse('healthy', now);
+  const heartbeatTimer = mode === 'off' ? undefined : setInterval(() => pulse('healthy', currentTime()), deps.heartbeatIntervalMs ?? 60 * 60_000);
+  heartbeatTimer?.unref();
+  let nodeError: unknown;
+  try {
   const state: TickState = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as TickState : initial(runId, window, mode, kstDay(now));
   state.steps ??= [];
   if (state.window !== window || state.mode !== mode) throw new Error('orchestrator run window/mode changed');
@@ -739,6 +765,13 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(state));
   return state;
+  } catch (error) {
+    nodeError = error;
+    throw error;
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (mode !== 'off') pulse(nodeError === undefined ? 'healthy' : 'degraded', currentTime());
+  }
 }
 
 /** COORD-HA — the production supply of `TickDeps.degradation` (config `loops.orchestrator.degradationSignal`). Shadow (the

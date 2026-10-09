@@ -64,7 +64,7 @@ import { getUserConfig } from './user-config.js';
 import { detectCard, runCardFollowup, NotACardError } from './card-followup/core.js';
 import { localOcrText } from './telegram-card-followup.js';
 import type { runGraph } from './graph-runner/runner.js';
-import { readSlashContextNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { readSlashContextNow, renderContextFirstNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
 import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
 import { telegramLoopsStatus, type LoopsSources } from './telegram-loops-command.js';
@@ -160,7 +160,7 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
   const maybeSendContextFirst = async (channelId: string): Promise<void> => {
     if (!contextFirstGate.take(channelId) || cfg.discord?.contextFirst === false) return;
     try {
-      await deps.getBot()?.sendMessage(channelId, renderContextFirst(contextNow, deps.nowDeps, renderTelegramNow));
+      await deps.getBot()?.sendMessage(channelId, renderContextFirst(contextNow, deps.nowDeps, renderContextFirstNow));
     } catch (err) {
       log(`discord context-first failed: ${err instanceof Error ? err.message : String(err)}`);
     }

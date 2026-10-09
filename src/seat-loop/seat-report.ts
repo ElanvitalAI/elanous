@@ -7,6 +7,10 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig, type SeatLoopConfig } from '../user-config.js';
 import { collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type DraftMetrics, type OverlapMetrics } from '../self-dev/draft-sweep.js';
+import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { readTaskAgentCover } from '../cli/tasks-cli.js';
+import { formatTaskAgentCover } from '../task-agent/cover.js';
+import type { TasksCliDeps } from '../cli/tasks-cli.js';
 import { seatDay, seatLedgerPath, type OpCandidate, type SeatEntry } from './seat-loop.js';
 
 export type SeatReportDeps = {
@@ -19,8 +23,10 @@ export type SeatReportDeps = {
   send?: (body: string, seat: string, pr: number) => Promise<void> | void;
   draftMetrics?: (now: Date) => Promise<DraftMetrics>;
   overlapMetrics?: (now: Date) => Promise<OverlapMetrics>;
+  coverLogs?: TasksCliDeps['coverLogs'];
   /** DRAFT-NOT-ARCHIVE salvage branches since the KST day start; null = unreadable. */
   salvagedToday?: (dayStart: Date, now: Date) => Promise<number | null>;
+  runningRuns?: (runIds: readonly string[]) => { running: number; unknown: number } | null;
 };
 export type SeatReportResult = { seat: string; date: string; body: string; posted: boolean };
 const repoRoot = resolve(import.meta.dir, '../..');
@@ -144,8 +150,30 @@ export async function seatReport(seat: string, deps: SeatReportDeps = {}): Promi
       }))(new Date(`${date}T00:00:00+09:00`), now);
     } catch { salvagedToday = null; }
     draftDetail += ` · 수확 가지 오늘 ${salvagedToday === null ? '못 잼' : salvagedToday}`;
+    try {
+      const cover = readTaskAgentCover({}, deps.coverLogs);
+      draftDetail += ` · TASK-AGENT cover ${formatTaskAgentCover(cover.rows[0]!)}${cover.unreadableStores ? ` (logs.db ${cover.unreadableStores}개 못 읽음)` : ''}`;
+    } catch {
+      draftDetail += ` · TASK-AGENT cover ${formatTaskAgentCover({ verb: 'land', byTaskAgent: null, total: null, observedActions: null, ratio: null, state: 'unreadable', liveActions: null, shadowActions: null, stewardTransition: 'unmeasured' })}`;
+    }
   }
-  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}${draftDetail}`;
+  const runIds = [...new Set(entries.filter((entry) => entry.status === 'launched' && entry.runId).map((entry) => entry.runId!))];
+  let runningDetail = ' · 도는 런 0';
+  if (runIds.length) {
+    try {
+      const counts = (deps.runningRuns ?? ((ids: readonly string[]) => {
+        const observed = queryRunningRuns({ runIds: ids, caller: 'seat-report' });
+        if (observed.completeness !== 'complete') return null;
+        return {
+          running: observed.entries.filter((entry) => ids.includes(entry.runId) && entry.status === 'running').length,
+          unknown: observed.entries.filter((entry) => ids.includes(entry.runId) && (entry.status === 'probable-running' || entry.status === 'unknown')).length,
+        };
+      }))(runIds);
+      runningDetail = counts === null ? ' · 도는 런 못 잼'
+        : ` · 도는 런 ${counts.running}(불확실 ${counts.unknown})`;
+    } catch { runningDetail = ' · 도는 런 못 잼'; }
+  }
+  const body = `**[${seat}]** {{TS}} → 보고 ${date}: ${detail.join(' · ') || (classified.length ? 'OP 그림자 판단' : '원장 기록 없음')}${opDetail}${draftDetail}${runningDetail}`;
   const pr = (deps.config ?? getUserConfig().loops?.seat)?.reportPr;
   const posted = deps.post === true && pr !== undefined;
   if (posted) await (deps.send ?? ((text, id, number) => defaultSend(text, id, number, deps.repo ?? repoRoot)))(body, seat, pr);

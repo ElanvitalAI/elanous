@@ -9,6 +9,7 @@ export type SeatEntry = {
 export type SeatAddress = { seats: string[]; body: string };
 
 const registry: readonly SeatEntry[] = trackData.tracks.filter((entry) => 'title' in entry);
+export function registeredSeats(): readonly SeatEntry[] { return registry; }
 const addressLine = /^@([A-Za-z][A-Za-z0-9_-]*(?:,[A-Za-z][A-Za-z0-9_-]*)*)(?:[ \t]+|\r?\n|(?![\s\S]))/gm;
 
 /** Parse an address only when its @ begins a line; leave the instruction text intact. */

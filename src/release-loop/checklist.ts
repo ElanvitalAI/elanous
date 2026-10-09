@@ -175,6 +175,44 @@ export function cellsReferencingDoc(doc: string, checklists: readonly Checklist[
   return rows;
 }
 
+/** 문서 절과 판 칸의 `#절` 인용을 양방향으로 대조한다. 원장은 전달받은 스냅샷만 읽는다. */
+export function lintDocRefs(docPath: string, docText: string, checklists: readonly Checklist[]): {
+  sections: string[];
+  uncoveredSections: string[];
+  danglingRefs: Array<{ version: string; id: string; ref: string }>;
+} {
+  const path = splitRef(docPath.trim()).path;
+  const sections: string[] = [];
+  let fence: { marker: string; length: number } | null = null;
+  for (const line of docText.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (marker?.[0] === fence.marker && marker.length >= fence.length && /^\s*$/.test(line.slice(line.indexOf(marker) + marker.length))) fence = null;
+      continue;
+    }
+    if (marker) { fence = { marker: marker[0]!, length: marker.length }; continue; }
+    const heading = /^ {0,3}#{2,4}[ \t]+(\S+)/.exec(line);
+    if (heading) {
+      const section = heading[1]!.replace(/[.:]$/, '');
+      if (!sections.includes(section)) sections.push(section);
+    }
+  }
+  const known = new Set(sections);
+  const cited = new Set<string>();
+  const danglingRefs: Array<{ version: string; id: string; ref: string }> = [];
+  for (const data of checklists) {
+    for (const item of data.items) {
+      for (const ref of item.refs ?? []) {
+        const got = splitRef(ref);
+        if (got.path !== path || !got.section) continue;
+        if (known.has(got.section)) cited.add(got.section);
+        else danglingRefs.push({ version: data.version, id: item.id, ref });
+      }
+    }
+  }
+  return { sections, uncoveredSections: sections.filter((section) => !cited.has(section)), danglingRefs };
+}
+
 /** `| 판 | 칸 | 상태 | 절 | 제목 |` 마크다운 표 — 행이 없으면 머리줄 둘만. */
 export function renderRefsStatus(rows: readonly DocRefRow[]): string {
   const cell = (value: string) => value.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');

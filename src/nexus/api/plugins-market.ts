@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { listWizardDrafts, saveWizardDraft, type WizardResearchDraft } from '../../plugins/maker/wizard-generate.js';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
@@ -118,6 +119,29 @@ function configuredTrustedKeys(path = userConfigPath()): Array<{ keyId: string; 
 export function handlePluginsIndexGet(req: Request, opts: MetaApiOpts, root?: string, configPath?: string): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   return jsonResponse(readMarketIndex(root, configuredTrustedKeys(configPath)));
+}
+
+export function handlePluginWizardList(req: Request, opts: MetaApiOpts, root = elanousStateRoot()): Response {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  return jsonResponse({ plugins: listWizardDrafts(join(root, 'plugins-local')) });
+}
+
+export async function handlePluginWizardSave(req: Request, opts: MetaApiOpts, root = elanousStateRoot()): Promise<Response> {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  let body: unknown;
+  try { body = await req.json(); } catch { return jsonResponse({ error: 'bad_request' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonResponse({ error: 'bad_request' }, 400);
+  const input = body as { name?: unknown; draft?: unknown; regenerate?: unknown };
+  if (typeof input.name !== 'string' || !/^[a-z0-9][a-z0-9-]{1,31}$/.test(input.name) ||
+    !input.draft || typeof input.draft !== 'object' || Array.isArray(input.draft) ||
+    (input.regenerate !== undefined && typeof input.regenerate !== 'boolean')) return jsonResponse({ error: 'bad_request' }, 400);
+  try {
+    saveWizardDraft(join(root, 'plugins-local'), input.name, input.draft as WizardResearchDraft, input.regenerate === true);
+    return jsonResponse({ name: input.name, saved: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'invalid draft';
+    return jsonResponse({ error: 'invalid_wizard_draft', reason: /already exists|research draft/.test(reason) ? reason : 'invalid draft' }, 422);
+  }
 }
 
 export function handlePluginsGet(req: Request, opts: MetaApiOpts, root?: string): Response {

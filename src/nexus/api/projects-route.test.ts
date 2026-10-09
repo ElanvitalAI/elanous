@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
@@ -19,8 +19,8 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-async function request(method: string, body?: unknown, bearer = token): Promise<Response> {
-  const req = new Request('http://nexus.test/v1/projects', {
+async function request(method: string, body?: unknown, bearer = token, path = '/v1/projects'): Promise<Response> {
+  const req = new Request(`http://nexus.test${path}`, {
     method,
     headers: {
       'content-type': 'application/json',
@@ -28,11 +28,46 @@ async function request(method: string, body?: unknown, bearer = token): Promise<
     },
     ...(body !== undefined ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {}),
   });
-  const response = await routeRequest(req, { metaApi: { bearerToken: token, noAuth: false } } as NexusHttpServerOpts,
+  const response = await routeRequest(req, { metaApi: { bearerToken: token, noAuth: false }, projectFolderRoots: [join(root, 'allowed')] } as NexusHttpServerOpts,
     {} as never, null, createDevProxyRuntimeRef());
   if (!response) throw new Error('no response from projects route');
   return response;
 }
+
+test('GET /v1/projects/folders browses only inside the allowed root and only for the authenticated owner', async () => {
+  const allowed = join(realpathSync(root), 'allowed');
+  const parent = join(allowed, 'folder space');
+  const outside = join(realpathSync(root), 'outside');
+  mkdirSync(join(parent, 'child'), { recursive: true });
+  mkdirSync(join(parent, '.hidden'), { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(parent, 'not-a-folder'), 'file');
+  symlinkSync(join(parent, 'child'), join(parent, 'link'));
+  symlinkSync(outside, join(parent, 'escape'));
+  const path = `/v1/projects/folders?path=${encodeURIComponent(parent)}`;
+  expect(isPublicRoute('GET', '/v1/projects/folders', { setupMode: false })).toBe(false);
+  for (const bearer of ['', 'wrong-owner']) {
+    const res = await request('GET', undefined, bearer, path);
+    expect(res.status).toBe(401);
+  }
+  const res = await request('GET', undefined, token, path);
+  expect(res.status).toBe(200);
+  // dot-folders, files and a symlink that leaves the root are not listed
+  expect(await res.json()).toEqual({ path: parent, parent: allowed, folders: [
+    { name: 'child', path: join(parent, 'child') },
+    { name: 'link', path: join(parent, 'link') },
+  ] });
+  // with no path the picker opens at the root, which has no parent to climb to
+  const top = await request('GET', undefined, token, '/v1/projects/folders');
+  expect(await top.json()).toEqual({ path: allowed, parent: null, folders: [{ name: 'folder space', path: parent }] });
+  for (const escape of [outside, join(allowed, '..'), join(parent, '..', '..', 'outside'), join(parent, 'escape'), '/']) {
+    const refused = await request('GET', undefined, token, `/v1/projects/folders?path=${encodeURIComponent(escape)}`);
+    expect(refused.status).toBe(403);
+  }
+  expect((await request('GET', undefined, token, '/v1/projects/folders?path=relative')).status).toBe(400);
+  expect((await request('GET', undefined, token, `/v1/projects/folders?path=${encodeURIComponent(join(parent, 'not-a-folder'))}`)).status).toBe(400);
+  expect((await request('GET', undefined, token, `/v1/projects/folders?path=${encodeURIComponent(join(allowed, 'missing'))}`)).status).toBe(404);
+});
 
 test('GET and POST /v1/projects require owner authentication and stay off the public routes', async () => {
   for (const method of ['GET', 'POST']) {

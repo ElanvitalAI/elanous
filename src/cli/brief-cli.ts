@@ -1,5 +1,5 @@
 import type { Command } from 'commander';
-import { BRIEF_DOMAINS, BRIEF_PRIORITIES, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, type BriefDomain, type BriefPriority, type BriefSlot } from '../briefing/brief-items.js';
+import { BRIEF_DOMAINS, BRIEF_PRIORITIES, BRIEF_REACTIONS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, type BriefDomain, type BriefPriority, type BriefReaction, type BriefSlot } from '../briefing/brief-items.js';
 import { kindRouteTarget } from '../domains/telegram-kind-route.js';
 import { sendTelegramReturningId } from '../autopilot/mission-notify.js';
 import { getUserConfig } from '../user-config.js';
@@ -24,7 +24,13 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
     error(`brief ${verb}: ${cause instanceof Error ? cause.message : String(cause)}`);
     process.exitCode = cause instanceof BriefItemsInputError ? 2 : 1;
   };
-  const brief = program.command('brief').description('대표 브리핑 항목 원장과 슬롯 발송');
+  const brief = program.command('brief').description('대표 브리핑 항목 원장과 슬롯 발송')
+    .action(() => {
+      try {
+        const { acted, total } = ledger().weeklyActions();
+        output(`이번 주 브리핑 중 대표가 움직인 것 ${acted}/${total}`);
+      } catch (cause) { fail('', cause); }
+    });
 
   brief.command('add')
     .description('주장 한 줄을 원장에 추가한다 (원문 그대로)')
@@ -49,6 +55,18 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
         });
         output(opts.json ? JSON.stringify(item) : `added ${item.id} [${item.priority}] ${item.domain}`);
       } catch (cause) { fail('add', cause); }
+    });
+
+  brief.command('react')
+    .description('발송된 브리핑 항목에 대한 대표 반응을 기록한다')
+    .requiredOption('--item-id <id>', '발송 항목 id')
+    .requiredOption('--reaction <reaction>', `반응 (${BRIEF_REACTIONS.join('|')})`)
+    .action((opts: { itemId: string; reaction: string }) => {
+      try {
+        const id = Number(opts.itemId);
+        ledger().recordReaction(id, opts.reaction as BriefReaction);
+        output(`reacted ${id} ${opts.reaction}`);
+      } catch (cause) { fail('react', cause); }
     });
 
   brief.command('list')

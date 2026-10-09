@@ -466,6 +466,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'widget', aliases: ['widgets'], description: 'Manage widgets', subcommands: ['list', 'reload', 'instances'] },
   { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'help'] },
   { name: 'loops', aliases: [], description: '루프와 크론 상태 표 — /loops [owner]' },
+  { name: 'board', aliases: [], description: '판 체크리스트 — /board [판]' },
   { name: 'memory', aliases: ['mem'], description: 'Memory ops — list / show / search / add / delete (see `elanous memory --help`)', subcommands: ['list', 'show', 'search', 'add', 'delete', 'index'] },
   { name: 'export', aliases: [], description: 'Export this conversation transcript to a markdown file — /export [path] (default ~/temp/elanous-transcript-<stamp>.md)' },
   { name: 'delta', aliases: ['diffs'], description: 'Source delta browser — open the latest turn-scoped file diff popup', subcommands: ['open', 'help'] },

@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { deliver, inQuietHours, sendOutbound } from '../domains/outbound-alert.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -53,6 +54,39 @@ function endedNodes(run: ReleaseRunView): ReleaseRunNodeView[] {
   return run.nodes.filter((node) => node.ok !== null && !TERMINAL.has(node.nodeId));
 }
 
+/** 분모는 원장 path(지나온 자리)가 아니라 이 런에 확인된 그래프 선언의 전체 노드 수다. */
+function graphTotal(file: string, run: ReleaseRunView): number | undefined {
+  try {
+    const raw: unknown = parseYaml(readFileSync(file, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const graph = raw as Record<string, unknown>;
+    if (graph.graph_id !== 'release-loop' || !Array.isArray(graph.nodes) || !Array.isArray(graph.terminal_nodes)) return undefined;
+    const terminal = graph.terminal_nodes;
+    if (!terminal.length || !terminal.every((id): id is string => typeof id === 'string')) return undefined;
+    const ids = graph.nodes.map((node: unknown) => node && typeof node === 'object' && !Array.isArray(node)
+      ? (node as Record<string, unknown>).node_id : undefined);
+    if (!ids.length || !ids.every((id): id is string => typeof id === 'string') || new Set(ids).size !== ids.length
+      || !terminal.every((id) => ids.includes(id)) || !run.nodes.every((node) => ids.includes(node.nodeId))) return undefined;
+    // 분자(endedNodes)가 종결 자리표를 빼므로 분모도 뺀다 — 끝난 판이 «23/25» 로 영영 덜 끝나 보이지 않게.
+    return ids.filter((id) => !terminal.includes(id)).length;
+  } catch { return undefined; }
+}
+
+/**
+ * 이 런이 실제로 쓴 그래프 정의 — 그래프 실행기가 런마다 떠 두는 스냅샷 `<런>.json.graph/graph.yaml`.
+ * 없거나 runId 가 경로로 못 쓰는 모양이면 undefined(분모 생략) — 현재 선언 파일로 추측하지 않는다.
+ */
+export function releaseGraphFile(run: ReleaseRunView, root: string = effectiveInstanceRoot()): string | undefined {
+  if (!/^[A-Za-z0-9-]+$/.test(run.runId)) return undefined;
+  return join(root, 'graph-runs', 'release-loop', `${run.runId}.json.graph`, 'graph.yaml');
+}
+
+function completedCount(run: ReleaseRunView, graphFile?: string): string {
+  const ended = endedNodes(run).length;
+  const total = graphFile ? graphTotal(graphFile, run) : undefined;
+  return `끝난 노드 ${ended}${total !== undefined ? `/${total}` : ''}`;
+}
+
 function runningNode(run: ReleaseRunView): ReleaseRunNodeView | undefined {
   return run.status === 'running' ? run.nodes.find((node) => node.ok === null) : undefined;
 }
@@ -88,7 +122,7 @@ function blockedLine(run: ReleaseRunView): string {
 }
 
 /** 직전 표지와 지금 런을 견주어 보낼 줄을 만든다. 순수 함수 — 시험이 이것을 문다. */
-export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: number): { lines: string[]; urgent: boolean; changed: boolean } {
+export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: number, graphFile?: string): { lines: string[]; urgent: boolean; changed: boolean } {
   const ended = endedNodes(run);
   const running = runningNode(run);
   const lines: string[] = [];
@@ -97,11 +131,10 @@ export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: num
     // 이미 끝난 판은 조용히 기준만 잡는다 — 외출을 켤 때 지난 판이 쏟아지지 않게.
     if (run.status === 'done') return { lines, urgent, changed: true };
     // 처음 보는 런 — 지난 노드를 다시 쏟지 않고 «지금 어디인가» 한 줄로 시작한다.
-    const total = run.path.filter((step) => !TERMINAL.has(step)).length || run.nodes.length;
     const where = run.status === 'running'
       ? `지금 ${running?.nodeId ?? '다음 노드 준비'}${running?.startedAt ? `(${minutesSince(running.startedAt, now)}분째)` : ''}`
       : `상태 ${run.status}`;
-    lines.push(`📦 ${label(run)} 발행 따라가기 시작 · 끝난 노드 ${ended.length}${total ? `/${total}` : ''} · ${where}`);
+    lines.push(`📦 ${label(run)} 발행 따라가기 시작 · ${completedCount(run, graphFile)} · ${where}`);
     if (BLOCKED.has(run.status)) { lines.push(blockedLine(run)); urgent = true; }
     return { lines, urgent, changed: true };
   }
@@ -129,7 +162,7 @@ export function diffRun(prev: RunMark | undefined, run: ReleaseRunView, now: num
   }
   if (!lines.length && run.status === 'running' && now - Date.parse(prev.sentAt) >= ALIVE_EVERY_MS) {
     const mins = minutesSince(running?.startedAt, now);
-    lines.push(`💓 ${label(run)} 발행 진행 중 · 지금 ${running?.nodeId ?? '다음 노드 준비'}${mins !== null ? `(${mins}분째)` : ''} · 끝난 노드 ${ended.length}/${run.path.filter((step) => !TERMINAL.has(step)).length || ended.length}`
+    lines.push(`💓 ${label(run)} 발행 진행 중 · 지금 ${running?.nodeId ?? '다음 노드 준비'}${mins !== null ? `(${mins}분째)` : ''} · ${completedCount(run, graphFile)}`
       + (run.gateShards ? `\n   ${shardsLine(run.gateShards.summary)}` : ''));
   }
   const changed = lines.length > 0 || prev.ended !== ended.length || prev.status !== run.status || prev.running !== running?.nodeId
@@ -182,6 +215,8 @@ export interface TickDeps {
   /** 막힘·실패 — 야간 무음을 뚫는다. */
   sendUrgent?: (text: string) => boolean;
   now?: () => number;
+  /** 이 런이 쓴 그래프 정의 파일 — 기본은 런 원장 옆 스냅샷(`releaseGraphFile`). */
+  graphFile?: (run: ReleaseRunView) => string | undefined;
 }
 
 export type TickOutcome =
@@ -228,7 +263,8 @@ export function releaseWatchTick(deps: TickDeps = {}): TickOutcome {
   let changed = false;
   for (const run of [...runs].reverse()) {
     const prev = state.runs[run.runId];
-    const diff = diffRun(prev, run, now);
+    const graphFile = (deps.graphFile ?? releaseGraphFile)(run);
+    const diff = diffRun(prev, run, now, graphFile);
     lines.push(...diff.lines);
     urgent ||= diff.urgent;
     changed ||= diff.changed;
@@ -248,14 +284,17 @@ export function releaseWatchTick(deps: TickDeps = {}): TickOutcome {
 }
 
 /** /release · away status 가 쓰는 «지금» 요약 — 가장 최근 런 하나. */
-export function releaseNowText(runs: ReleaseRunView[] | 'unavailable', now: number = Date.now()): string {
+export function releaseNowText(
+  runs: ReleaseRunView[] | 'unavailable',
+  now: number = Date.now(),
+  graphFileOf: (run: ReleaseRunView) => string | undefined = releaseGraphFile,
+): string {
   if (runs === 'unavailable') return '발행 런 원장을 못 읽었다(권한·디스크) — 「없다」가 아니다';
   const run = runs[0];
   if (!run) return `발행 런 기록 없음\n↗ ${RELEASE_SCREEN_URL}`;
   const ended = endedNodes(run);
   const running = runningNode(run);
-  const total = run.path.filter((step) => !TERMINAL.has(step)).length || run.nodes.length;
-  const head = `📦 ${label(run)} · ${run.status} · 끝난 노드 ${ended.length}${total ? `/${total}` : ''}`;
+  const head = `📦 ${label(run)} · ${run.status} · ${completedCount(run, graphFileOf(run))}`;
   const lines = [head];
   if (running) {
     const mins = minutesSince(running.startedAt, now);

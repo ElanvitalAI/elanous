@@ -9,6 +9,13 @@ import { readRequirementFunnel, type RequirementFunnelResult } from '../intake-p
 export const BRIEF_DOMAINS = ['운영', '판', '흡수', '시장', '행정', '코나투스'] as const;
 export const BRIEF_PRIORITIES = ['P0', 'P1', 'P2'] as const;
 export const BRIEF_SLOTS = ['08:30', 'after-release', '22:00'] as const;
+export const BRIEF_REACTIONS = ['열람', '버튼', '답장', '정정', '무시'] as const;
+
+export type BriefReaction = (typeof BRIEF_REACTIONS)[number];
+export interface BriefActionCount { acted: number; total: number; rate: number }
+export interface BriefWeeklyActions extends BriefActionCount {
+  byKind: Record<BriefDomain, BriefActionCount>;
+}
 
 export type BriefDomain = (typeof BRIEF_DOMAINS)[number];
 export type BriefPriority = (typeof BRIEF_PRIORITIES)[number];
@@ -36,6 +43,9 @@ export interface AddBriefItem {
   evidence?: string | null;
   source: string;
   createdAt?: string;
+  /** Optional normalized claim identity and time window for repeat observations. */
+  dedupeKey?: string;
+  dedupeWithinMs?: number;
 }
 
 export interface BriefItemsOptions {
@@ -98,8 +108,10 @@ export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlo
 export function composeBriefPage(items: readonly BriefItem[], slot: BriefSlot, now: Date): { markdown: string; ids: number[] } {
   const today = dateKey(now, { timeZone: KST });
   // A duplicate left out of a delivered page stays unsent in the ledger, but must not reappear on a later page.
+  // A new undeliverable observation after a sent page is a new occurrence, not an old duplicate.
   const deliveredClaims = new Set(items.filter(item => item.sent_at !== null).map(item => normalizeClaim(item.text)));
-  const eligible = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now) && !deliveredClaims.has(normalizeClaim(item.text)));
+  const eligible = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now)
+    && (item.source === 'outbound.undeliverable' || !deliveredClaims.has(normalizeClaim(item.text))));
   // Duplicate claims keep the copy that needs a decision today (P0 or due today), then the higher priority, then the earliest (ACP must-fix).
   const rank = (item: BriefItem) => [needsDecision(item, today) ? 0 : 1, BRIEF_PRIORITIES.indexOf(item.priority), item.id];
   const better = (a: BriefItem, b: BriefItem) => { const x = rank(a), y = rank(b); return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!; };
@@ -210,7 +222,19 @@ export class BriefItemsLedger {
         item_id INTEGER NOT NULL REFERENCES items(id),
         slot TEXT NOT NULL,
         sent_at TEXT NOT NULL
-      );`);
+      );
+      CREATE TABLE IF NOT EXISTS reactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id INTEGER NOT NULL REFERENCES items(id),
+        reaction TEXT NOT NULL CHECK(reaction IN ('열람', '버튼', '답장', '정정', '무시')),
+        reacted_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS reactions_item_time ON reactions(item_id, reacted_at);
+      CREATE INDEX IF NOT EXISTS sends_time ON sends(sent_at);`);
+      if (!(db.query("SELECT name FROM pragma_table_info('items')").all() as { name: string }[]).some(column => column.name === 'dedupe_key')) {
+        db.exec('ALTER TABLE items ADD COLUMN dedupe_key TEXT');
+      }
+      db.exec('CREATE INDEX IF NOT EXISTS items_dedupe ON items(source, dedupe_key, created_at)');
       return work(db);
     } finally {
       db.close();
@@ -236,16 +260,85 @@ export class BriefItemsLedger {
     const evidence = optional(input.evidence, 'evidence');
     const createdAt = input.createdAt ?? this.now().toISOString();
     if (!Number.isFinite(Date.parse(createdAt))) throw new BriefItemsInputError('invalid createdAt');
-    const item = this.using(db => {
-      const result = db.query(
-        'INSERT INTO items (text, domain, priority, deadline, evidence, source, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)',
-      ).run(text, input.domain, input.priority, deadline, evidence, source, createdAt);
-      return db.query(
-        'SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items WHERE id = ?',
-      ).get(result.lastInsertRowid) as BriefItem;
+    const dedupeKey = input.dedupeKey === undefined ? null : normalizeClaim(required(input.dedupeKey, 'dedupeKey'));
+    const windowMs = input.dedupeWithinMs;
+    if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs <= 0 || dedupeKey === null)) {
+      throw new BriefItemsInputError('invalid dedupe window');
+    }
+    const selected = this.using(db => {
+      const select = 'SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items WHERE id = ?';
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (dedupeKey !== null && windowMs !== undefined) {
+          const existing = db.query(`SELECT id FROM items WHERE source = ? AND dedupe_key = ?
+            AND NOT EXISTS (SELECT 1 FROM sends WHERE sends.item_id = items.id)
+            AND julianday(created_at) >= julianday(?) - ? / 86400000.0
+            AND julianday(created_at) <= julianday(?) ORDER BY id DESC LIMIT 1`)
+            .get(source, dedupeKey, createdAt, windowMs, createdAt) as { id: number } | null;
+          if (existing) {
+            const item = db.query(select).get(existing.id) as BriefItem;
+            db.exec('COMMIT');
+            return { item, added: false };
+          }
+        }
+        const result = db.query(
+          'INSERT INTO items (text, domain, priority, deadline, evidence, source, created_at, sent_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+        ).run(text, input.domain, input.priority, deadline, evidence, source, createdAt, dedupeKey);
+        const item = db.query(select).get(result.lastInsertRowid) as BriefItem;
+        db.exec('COMMIT');
+        return { item, added: true };
+      } catch (cause) {
+        db.exec('ROLLBACK');
+        throw cause;
+      }
     });
-    this.log('briefing.items', 'added', { id: item.id, domain: item.domain, priority: item.priority, source: item.source });
-    return item;
+    if (selected.added) this.log('briefing.items', 'added', { id: selected.item.id, domain: selected.item.domain, priority: selected.item.priority, source: selected.item.source });
+    return selected.item;
+  }
+
+  /** Append a reaction without changing the original item or its send history. */
+  recordReaction(itemId: number, reaction: BriefReaction): void {
+    if (!Number.isSafeInteger(itemId) || itemId < 1) throw new BriefItemsInputError('invalid item id');
+    if (!(BRIEF_REACTIONS as readonly string[]).includes(reaction)) throw new BriefItemsInputError('invalid reaction');
+    this.using(db => {
+      const at = this.now().toISOString();
+      if (!db.query('SELECT 1 FROM sends WHERE item_id = ? AND sent_at <= ? LIMIT 1').get(itemId, at)) {
+        throw new BriefItemsInputError('item was not sent');
+      }
+      db.query('INSERT INTO reactions (item_id, reaction, reacted_at) VALUES (?, ?, ?)')
+        .run(itemId, reaction, at);
+    });
+    this.log('briefing.items', 'reaction-recorded', { itemId, reaction });
+  }
+
+  /** KST Monday through now: distinct sent items acted on (button/reply/correction), grouped by domain. */
+  weeklyActions(): BriefWeeklyActions {
+    const now = this.now();
+    const today = dateKey(now, { timeZone: KST });
+    const day = new Date(`${today}T00:00:00Z`);
+    day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
+    const since = new Date(`${day.toISOString().slice(0, 10)}T00:00:00+09:00`).toISOString();
+    const until = now.toISOString();
+    return this.using(db => {
+      const rows = db.query(`SELECT items.domain AS kind,
+        COUNT(*) AS total,
+        SUM(CASE WHEN EXISTS (
+          SELECT 1 FROM reactions r WHERE r.item_id = items.id
+            AND r.reaction IN ('버튼', '답장', '정정') AND r.reacted_at >= ? AND r.reacted_at <= ?
+        ) THEN 1 ELSE 0 END) AS acted
+        FROM items WHERE EXISTS (
+          SELECT 1 FROM sends s WHERE s.item_id = items.id AND s.sent_at >= ? AND s.sent_at <= ?
+        ) GROUP BY items.domain`).all(since, until, since, until) as Array<{ kind: BriefDomain; total: number; acted: number }>;
+      const byKind = Object.fromEntries(BRIEF_DOMAINS.map(kind => [kind, { acted: 0, total: 0, rate: 0 }])) as Record<BriefDomain, BriefActionCount>;
+      let acted = 0;
+      let total = 0;
+      for (const row of rows) {
+        byKind[row.kind] = { acted: row.acted, total: row.total, rate: row.acted / row.total };
+        acted += row.acted;
+        total += row.total;
+      }
+      return { acted, total, rate: total === 0 ? 0 : acted / total, byKind };
+    });
   }
 
   /** Insertion order. Optional domain filter. Item text is the stored original. */

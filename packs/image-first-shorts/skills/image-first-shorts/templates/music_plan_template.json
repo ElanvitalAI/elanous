@@ -1,0 +1,13 @@
+{
+ "_source": "출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트(https://malfoy-meme-making.vercel.app/) · 원작자 허락(2026-10-08) · 출처 명기 조건 — 키트 템플릿 구조 그대로(청크 = 박 격자 배수)",
+ "_recipe": "fill.py music 이 _ 로 시작하는 키를 지우고 chunks 배열을 vars.chunks 개수만큼 복제해 채움. 결과 = ElevenLabs POST /v1/music 본문",
+ "_chunk_rules": {
+  "TEXT": "[섹션명] {악기·전개 지시} (연주 청크) 또는 [섹션명]\\n가사 2~4줄 (보컬 청크). 가사에 IP 단어 금지",
+  "DURATION_MS": "박 격자 배수. 1마디(4/4) ms = 240000 / BPM (128 BPM = 1875, 160 BPM = 1500)",
+  "POSITIVE_STYLES": "곡 전체 장르 묶음(장르·BPM·4/4·대표 악기 6~10개)을 청크마다 반복 + 섹션 분위기 태그",
+  "NEGATIVE_STYLES": "공통 lo-fi·slow tempo + 무보컬 청크는 vocals·singing·lyrics"
+ },
+ "composition_plan": {"chunks": [{"text": "{TEXT}", "duration_ms": "{DURATION_MS}", "positive_styles": "{POSITIVE_STYLES}", "negative_styles": "{NEGATIVE_STYLES}"}]},
+ "model_id": "music_v2_5",
+ "respect_sections_durations": true
+}

@@ -19,6 +19,89 @@
 //     쿼터 축은 과부하에 «반응하지 않는다».
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import type { LLMProvider } from '../llm.js';
+import { spawnSync } from 'node:child_process';
+import { claudeBackend, resolveBackendSpawn } from '../agent-mission/driver.js';
+import { checkClaudeSubscription } from '../agent-mission/claude-subscription.js';
+import { getAcpBackend, type AcpBackendSpec } from '../acp/backend-registry.js';
+import type { SubscriptionReviewerSpec } from '../user-config.js';
+
+export interface SubscriptionReviewerDeps {
+  /** Returns measured Claude subscription usage; unknown usage fails closed. */
+  usedPercent?: () => number | undefined;
+  checkSubscription?: (env: Record<string, string>) => boolean;
+  runStatus?: (command: string, args: string[], env: Record<string, string>) => { status: number | null; stdout?: string | Buffer | null };
+}
+
+/** The runner and the subscription probe share the PTY backend's billing-env scrub. */
+export function subscriptionReviewerSpawn(spec: SubscriptionReviewerSpec, env: NodeJS.ProcessEnv = process.env): {
+  command: string; args: string[]; env: Record<string, string>; backendSpec: AcpBackendSpec;
+} {
+  const executor = spec.executor ?? 'cct';
+  const { env: cleanEnv } = resolveBackendSpawn(claudeBackend, env);
+  const command = executor === 'cct' ? 'teamclaude' : 'claude';
+  const args = executor === 'cct'
+    ? ['run', '--auto-fallback', '--', '--dangerously-skip-permissions']
+    : ['--dangerously-skip-permissions'];
+  return { command, args, env: cleanEnv,
+    backendSpec: { ...getAcpBackend('claude'), command, args } };
+}
+
+/** Guard the ACP review before spawning. An unmeasured quota never authorizes subscription use. */
+export function subscriptionReviewerAvailability(
+  spec: SubscriptionReviewerSpec,
+  cap: number,
+  env: NodeJS.ProcessEnv = process.env,
+  deps: SubscriptionReviewerDeps = {},
+): { spawn?: ReturnType<typeof subscriptionReviewerSpawn>; reason?: string } {
+  const spawn = subscriptionReviewerSpawn(spec, env);
+  const executor = spec.executor ?? 'cct';
+  const runStatus = deps.runStatus ?? ((command: string, args: string[], cleanEnv: Record<string, string>) =>
+    spawnSync(command, args, { env: { ...cleanEnv, NODE_ENV: process.env.NODE_ENV }, encoding: 'utf8', timeout: 5_000 }));
+  const usedPercent = deps.usedPercent ?? (() => {
+    const result = runStatus('teamclaude', ['status'], spawn.env);
+    if (result.status !== 0) return undefined;
+    // Only a named usage percentage is accepted; a random percentage in status is not quota evidence.
+    const match = String(result.stdout).match(/(?:usage|used)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%/i);
+    return match ? Number(match[1]) : undefined;
+  });
+  try {
+    const subscribed = deps.checkSubscription ?? ((cleanEnv: Record<string, string>) => {
+      if (executor === 'cc') return checkClaudeSubscription({ env: cleanEnv }).ok;
+      const status = runStatus('teamclaude', ['status'], cleanEnv);
+      return status.status === 0 && /(?:subscription|claude\.ai|claude\s+(?:max|pro))/i.test(String(status.stdout))
+        && !/(?:logged\s*out|not\s+logged\s+in|api[_ -]?key|not\s+authenticated)/i.test(String(status.stdout));
+    });
+    if (!subscribed(spawn.env)) return { reason: `${executor} subscription check failed` };
+    const used = usedPercent();
+    if (!Number.isFinite(cap) || cap < 0 || cap > 100 || used === undefined
+      || !Number.isFinite(used) || used < 0 || used >= cap) return { reason: `Claude subscription usage unavailable or at harness cap (${cap}%)` };
+    return { spawn };
+  } catch {
+    return { reason: `${executor} subscription check failed` };
+  }
+}
+
+/** Keep a single notice attached to the actual default review result. */
+export async function runSubscriptionReviewer(
+  spec: SubscriptionReviewerSpec | undefined,
+  cap: number,
+  prompt: string,
+  defaultReview: (prompt: string) => Promise<string>,
+  acpReview: (prompt: string, spawn: ReturnType<typeof subscriptionReviewerSpawn>) => Promise<string>,
+  env: NodeJS.ProcessEnv = process.env,
+  deps: SubscriptionReviewerDeps = {},
+): Promise<string> {
+  if (!spec) return defaultReview(prompt);
+  const availability = subscriptionReviewerAvailability(spec, cap, env, deps);
+  if (availability.spawn) {
+    try {
+      const text = await acpReview(prompt, availability.spawn);
+      if (text.trim()) return text;
+    } catch { /* ACP failure is not a completed review. */ }
+  }
+  const reason = availability.reason ?? 'ACP review failed';
+  return `${await defaultReview(prompt)}\n[reviewer fallback: ${reason}; default reviewer used]`;
+}
 
 export type ReviewFailureReason =
   | 'overloaded'

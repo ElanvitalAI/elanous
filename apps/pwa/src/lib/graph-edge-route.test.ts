@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { autoLayout, autoLayoutToFit, CANVAS_NODE_SIZE, canvasOutcomeLabel, fromYaml, type CanvasGraph } from '../components/editor/graph-canvas-model';
-import { dfsBackEdges, edgeFamily, labelCollisions, mergeParallelEdges, routeEdges, type RouteNode } from './graph-edge-route';
+import { dfsBackEdges, edgeFamily, hoverFocus, labelCollisions, mergeParallelEdges, routeEdges, type RouteNode } from './graph-edge-route';
 
 const repoGraph = (name: string) => readFileSync(join(import.meta.dir, '../../../../graphs', name), 'utf8');
 
@@ -22,6 +22,29 @@ function hitsBody(points: Array<{ x: number; y: number }>, box: RouteNode): bool
   }
   return false;
 }
+
+describe('graph editor hover focus', () => {
+  const edges = [
+    { id: 'ab', from: 'a', to: 'b' },
+    { id: 'bc', from: 'b', to: 'c' },
+    { id: 'de', from: 'd', to: 'e' },
+  ] as const;
+
+  test('focuses only the hovered node and its directly connected nodes and edges', () => {
+    const focus = hoverFocus('b', edges);
+    expect(focus?.nodes).toEqual(new Set(['a', 'b', 'c']));
+    expect(focus?.edges).toEqual(new Set(['ab', 'bc']));
+    expect(focus?.nodes.has('d')).toBe(false);
+    expect(focus?.nodes.has('e')).toBe(false);
+    expect(focus?.edges.has('de')).toBe(false);
+  });
+
+  test('returns null without hover and keeps an isolated node with no edges', () => {
+    expect(hoverFocus(null, edges)).toBeNull();
+    expect(hoverFocus('isolated', edges)).toEqual({ nodes: new Set(['isolated']), edges: new Set() });
+    expect(hoverFocus('isolated', [])).toEqual({ nodes: new Set(['isolated']), edges: new Set() });
+  });
+});
 
 describe('GRAPH-EDGE-TIDY · merge', () => {
   test('same (from,to) outcomes become one edge with a combined label', () => {

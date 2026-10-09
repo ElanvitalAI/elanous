@@ -67,12 +67,14 @@ export async function runLightMember(opts: LightMemberOptions): Promise<LightMem
   const root = opts.root ?? effectiveInstanceRoot();
   const configured = readMachineProfile(root);
   if (configured) assertJoinedMachineId(configured.id, root);
-  const machineAttrs = () => {
+  // measureLoad is async (harness parents · disk I/O); a pending Promise would serialize as `{}` and blank `load`.
+  const pageoutBaseline: { value: number } = { value: Number.NaN };
+  const machineAttrs = async () => {
     const profile = readMachineProfile(root);
     if (profile && profile.id !== machine) {
       throw new Error(`machine id ${profile.id} differs from joined machine ${machine}`);
     }
-    return { load: measureLoad(now), ...(profile ? { duties: profile.duties, seats: profile.seats } : {}) };
+    return { load: await measureLoad(now, pageoutBaseline), ...(profile ? { duties: profile.duties, seats: profile.seats } : {}) };
   };
   const interval = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   if (!Number.isFinite(interval) || interval <= 0 || interval > MAX_RETRY_MS) throw new Error('invalid member heartbeat interval');
@@ -119,7 +121,7 @@ export async function runLightMember(opts: LightMemberOptions): Promise<LightMem
   while (!signal.aborted) {
     const resources: LightMemberResult['resources'] = [];
     try {
-      const attrs = machineAttrs();
+      const attrs = await machineAttrs();
       await post(machineId, registered.has(machineId) ? { attrs } : {
         id: machineId, kind: 'machine', machine, name: machine, owner: '',
         attrs, observedAt: now(), ttlMs: TTL_MS,

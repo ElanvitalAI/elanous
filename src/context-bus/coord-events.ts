@@ -2,7 +2,9 @@ import { Database } from 'bun:sqlite';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
+import { DecisionLedger, type Seat } from '../decisions/decision-ledger.js';
 import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
+import { registeredSeats } from '../seat-address/seat-address.js';
 
 export interface CoordEventInput {
   seat: string;
@@ -30,6 +32,13 @@ function seatIds(): Set<string> {
     { tracks: Array<{ id: string }> }).tracks.map((track) => track.id));
 }
 const kinds = new Set(['요청', '결정', '사고', '보고', '정정']);
+
+function cleanCoordHeadline(value: string): string {
+  const first = value.split(/\r?\n/, 1)[0] ?? '';
+  const withoutPrefix = first.replace(/^\*\*\[[A-Z]+\]\*\*\s*/, '')
+    .replace(/^(?:📌안내\s*)?\d{4}-\d\d-\d\d\s+\d\d:\d\d\s+KST\s*/, '');
+  return redactSecretText(withoutPrefix).trim().slice(0, 120);
+}
 
 /** Mirror the sender's ordered envelope fields; only the first line enters this parser. */
 export function parseCoordHeader(seat: string, header: string): Omit<CoordEventInput, 'url' | 'at'> {
@@ -69,10 +78,7 @@ export function recordCoordEvent(input: CoordEventInput, deps: { db?: Database }
   try {
     db = deps.db ?? openSurfaceEventsDb();
     const at = input.at ?? new Date().toISOString();
-    const first = input.headline.split(/\r?\n/, 1)[0] ?? '';
-    const withoutPrefix = first.replace(/^\*\*\[[A-Z]+\]\*\*\s*/, '')
-      .replace(/^(?:📌안내\s*)?\d{4}-\d\d-\d\d\s+\d\d:\d\d\s+KST\s*/, '');
-    const headline = redactSecretText(withoutPrefix).trim().slice(0, 120);
+    const headline = cleanCoordHeadline(input.headline);
     const safe = (value: string) => redactSecretText(value.split(/\r?\n/, 1)[0] ?? '');
     const refs = { seat: safe(input.seat), recipients: input.recipients.map(safe), all: input.all,
       kind: input.kind === null ? null : safe(input.kind), slot: input.slot === null ? null : safe(input.slot),
@@ -96,6 +102,28 @@ export function recordCoordEvent(input: CoordEventInput, deps: { db?: Database }
     catch { /* preserve the original write error */ }
     throw error;
   } finally { if (!deps.db) db?.close(); }
+}
+
+/** A failed decision mirror must never turn a successful channel/context record into a failure. */
+export function mirrorCoordDecision(input: CoordEventInput, deps: { ledger?: Pick<DecisionLedger, 'recordSeatDecision'> } = {}): void {
+  if (input.kind !== '결정') return;
+  try {
+    if (!registeredSeats().some(({ id }) => id === input.seat)) return;
+    const entry = (deps.ledger ?? new DecisionLedger()).recordSeatDecision({
+      seat: input.seat as Seat,
+      title: input.slot ? redactSecretText(input.slot.split(/\r?\n/, 1)[0] ?? '').trim() : cleanCoordHeadline(input.headline),
+      decision: cleanCoordHeadline(input.headline),
+      delegation: '조율 채널 — 자리 위임 범위',
+      ...(input.url ? { refs: [input.url] } : {}),
+      decidedAt: input.at ?? new Date().toISOString(),
+    });
+    try { debug.log('context.coord', 'decision-mirrored', { seat: entry.seat, id: entry.id }); }
+    catch { /* observation cannot turn a successful write into a failed send */ }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'seat decision source already recorded') return;
+    try { debug.log('context.coord', 'decision-mirror-failed', { seat: redactSecretText(input.seat) }); }
+    catch { /* observation cannot turn a successful send into a failure */ }
+  }
 }
 
 /** Read-only chronological list; a missing store is an empty ledger, not a newly created one. */

@@ -24,9 +24,15 @@ const bearerToken = 'nexus-config-api-test-token';
 
 let tmpRoot: string;
 let prevHome: string | undefined;
+let prevNexus: string | undefined;
 let prevTg: string | undefined;
 let prevDc: string | undefined;
 let prevTools: string | undefined;
+// Each test boots a real in-process NEXUS (runNexus). On a loaded release-gate Pod that
+// boot took 5-12 s (event-loop stalls logged), so bun's default 5 s hook/test budget timed
+// out before any assertion ran (0.2.20 gate). Give the boot an explicit budget instead.
+const NEXUS_BOOT_TIMEOUT_MS = 60_000;
+
 let handle: RunNexusHandle | undefined;
 let baseUrl: string;
 let hotApplyCalls: { id: string; v: unknown }[];
@@ -34,6 +40,7 @@ let hotApplyCalls: { id: string; v: unknown }[];
 beforeEach(async () => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'elanous-nexus-n3-cfgapi-'));
   prevHome = process.env.HOME;
+  prevNexus = process.env.ELANOUS_NEXUS_DIR;
   prevTg = process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
   prevDc = process.env.ELANOUS_DISCORD_BOT_TOKEN;
   prevTools = process.env.ELANOUS_TOOLS;
@@ -67,7 +74,12 @@ beforeEach(async () => {
     skipIntentPrediction: true,
   });
   baseUrl = handle!.httpServer!.url;
-});
+}, NEXUS_BOOT_TIMEOUT_MS);
+
+function restoreNexusDir(previous: string | undefined): void {
+  if (previous === undefined) delete process.env.ELANOUS_NEXUS_DIR;
+  else process.env.ELANOUS_NEXUS_DIR = previous;
+}
 
 afterEach(() => {
   handle?.release();
@@ -81,7 +93,7 @@ afterEach(() => {
   else process.env.ELANOUS_DISCORD_BOT_TOKEN = prevDc;
   if (prevTools === undefined) delete process.env.ELANOUS_TOOLS;
   else process.env.ELANOUS_TOOLS = prevTools;
-  delete process.env.ELANOUS_NEXUS_DIR;
+  restoreNexusDir(prevNexus);
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
   clearSwitchRegistry();
 });
@@ -118,7 +130,7 @@ describe('Tailscale Serve ghost preflight', () => {
     });
     expect(calls).toEqual([requestedPort]);
     expect(handle!.httpServer?.port).toBe(requestedPort);
-  });
+  }, NEXUS_BOOT_TIMEOUT_MS);
 });
 
 describe('GET /v1/config', () => {
@@ -345,7 +357,7 @@ describe('runNexus boot · env auto-migrate (D-13)', () => {
     expect(handle!.state.events.some((e) =>
       e.kind === 'config.changed' && (e.detail as { reason?: string })?.reason === 'env-migrate'
     )).toBe(true);
-  });
+  }, NEXUS_BOOT_TIMEOUT_MS);
 
   test('ELANOUS_TELEGRAM_BOT_TOKEN env → secret + ref (with telegram tab registered)', async () => {
     handle?.release();
@@ -362,7 +374,7 @@ describe('runNexus boot · env auto-migrate (D-13)', () => {
     baseUrl = handle!.httpServer!.url;
     const ref = readSwitchValue(readUserConfig(), 'tabs.telegram:1.tokenRef');
     expect(isSecretRef(ref)).toBe(true);
-  });
+  }, NEXUS_BOOT_TIMEOUT_MS);
 
   test('skipEnvMigration=true preserves raw env behavior', async () => {
     handle?.release();
@@ -378,5 +390,5 @@ describe('runNexus boot · env auto-migrate (D-13)', () => {
     baseUrl = handle!.httpServer!.url;
     // Switch NOT migrated
     expect(readSwitchValue(readUserConfig(), 'global.tools')).toBeUndefined();
-  });
+  }, NEXUS_BOOT_TIMEOUT_MS);
 });

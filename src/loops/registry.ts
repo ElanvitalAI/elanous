@@ -685,6 +685,11 @@ export function unregisteredCronLoops(entries: AllLoopEntry[], opts: LoopRegistr
   return warnings;
 }
 
+/** Newest-first run history of one loop without re-listing the registry (health reads a longer window than `loop status`). */
+export function loopRecentRuns(id: string, opts: LoopRegistryOptions = {}, count = 5): LoopRun[] {
+  return recentRuns(id, opts.stateRoot ?? effectiveInstanceRoot(), count);
+}
+
 export function loopStatus(id: string, opts: LoopRegistryOptions = {}): LoopEntry & { recentRuns: LoopRun[] } {
   const loop = listLoops(opts).find(entry => entry.id === id);
   if (!loop) throw new Error(`loop not found: ${id}`);

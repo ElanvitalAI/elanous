@@ -149,8 +149,8 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
         <ChatProjectSwitcher projects={projects} selection={activeSelection} onChange={(value) => {
           setSelection(value);
           writeStore(PROJECT_SELECTION_KEY, value);
-        }} onCreate={async (name) => {
-          const { project } = await new ProjectsApi(daemon.client).create(name);
+        }} api={new ProjectsApi(daemon.client)} onCreate={async (name, primaryFolder) => {
+          const { project } = await new ProjectsApi(daemon.client).create(name, primaryFolder);
           setProjects((previous) => [...previous, project]);
           setSelection(project.id);
           writeStore(PROJECT_SELECTION_KEY, project.id);

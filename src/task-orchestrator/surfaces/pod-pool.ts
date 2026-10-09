@@ -16,13 +16,14 @@
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
-import { HostPoolLease, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
+import { HostPoolLease, hostLeaseBaseDir, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
+import { acquireLockSync } from '../../storage/file-lock.js';
 import { harnessCpuSlotsBesideGate, measurePoolLease, recommendConcurrency, type PodLeaseMember, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
 
 export interface PodPoolMember {
@@ -473,13 +474,64 @@ type LocalImageInspect = (image: string) => { status: number | null; stdout: str
 /** `docker save | ssh docker load` 한 번. 시험이 실제 전송 대신 호출 횟수만 센다. */
 type ImageShip = (member: PodPoolMember, image: string) => { status: number | null; stderr: string };
 
+const IMAGE_SHIP_TIMEOUT_MS = 1_800_000;
+const REMOTE_RUN_TIMEOUT_MS = 900_000;
+
+/**
+ * Runs a shell pipeline in its «own process group» and kills the whole group, not just bash (flood 10-08:
+ * 186 orphaned `docker save | gzip | ssh` pipes after runs timed out or died).
+ *   - `perl setpgrp` gives the pipeline a group of its own, so `kill 0` cannot reach the caller.
+ *   - The pipeline runs in the background and bash `wait`s, because bash defers a trap until a «foreground»
+ *     command finishes — a TERM from the spawnSync timeout would otherwise wait out `docker save`.
+ *   - A watchdog in the group polls the parent pid: if the caller dies (kill -9 included), the group goes too.
+ *   - On a normal finish the group is swept as well (watchdog and its `sleep`).
+ * ⚠️ The background pipeline's stdin is /dev/null (non-interactive bash) — fine for `docker save`.
+ */
+export function runProcessGroupPipeline(pipeline: string, opts: { timeoutMs: number; parentPid?: number; watchIntervalSec?: number }): { status: number | null; stderr: string; timedOut: boolean } {
+  const script = [
+    `trap 'trap "" TERM HUP INT; kill -TERM 0 2>/dev/null; exit 143' TERM HUP INT`,
+    `( while kill -0 "$ELANOUS_PIPE_PARENT" 2>/dev/null; do sleep "$ELANOUS_PIPE_WATCH"; done; kill -TERM 0 2>/dev/null ) &`,
+    `( set -o pipefail; eval "$ELANOUS_PIPE_CMD" ) &`,
+    'wait $!',
+    'rc=$?',
+    `trap "" TERM HUP INT`,
+    'kill -TERM 0 2>/dev/null',
+    'exit $rc',
+  ].join('\n');
+  const r = spawnSync('perl', ['-e', 'setpgrp(0,0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"', 'bash', '-c', script], {
+    encoding: 'utf8',
+    timeout: opts.timeoutMs,
+    killSignal: 'SIGTERM',
+    env: { ...process.env, ELANOUS_PIPE_CMD: pipeline, ELANOUS_PIPE_PARENT: String(opts.parentPid ?? process.pid), ELANOUS_PIPE_WATCH: String(opts.watchIntervalSec ?? 2) },
+  });
+  const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+  return { status: r.status, stderr: (r.stderr ?? '') + (timedOut ? ` · timed out after ${opts.timeoutMs}ms (process group killed)` : r.error ? ` · ${String(r.error)}` : ''), timedOut };
+}
+
 function defaultImageShip(member: PodPoolMember, image: string): { status: number | null; stderr: string } {
-  const ship = spawnSync('bash', ['-c', `set -o pipefail; docker save ${image} | gzip -1 | ssh -o BatchMode=yes -o ConnectTimeout=10 ${member.sshHost} 'export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; gunzip | docker load'`], { encoding: 'utf8', timeout: 1_800_000 });
-  return { status: ship.status, stderr: ship.stderr ?? '' };
+  const ship = runProcessGroupPipeline(`docker save ${image} | gzip -1 | ssh -o BatchMode=yes -o ConnectTimeout=10 ${member.sshHost} 'export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; gunzip | docker load'`, { timeoutMs: IMAGE_SHIP_TIMEOUT_MS });
+  return { status: ship.status, stderr: ship.stderr };
+}
+
+/** This machine's image ID (`sha256:…` — `docker save | docker load` keeps it). Null when unreadable. */
+function defaultLocalImageId(image: string): { status: number | null; stdout: string } {
+  const r = spawnSync('docker', ['image', 'inspect', image, '--format', '{{.Id}}'], { encoding: 'utf8', timeout: 30_000 });
+  return { status: r.status, stdout: r.stdout ?? '' };
+}
+
+function imageIdFrom(r: { status: number | null; stdout: string }): string | null {
+  const v = r.status === 0 ? r.stdout.trim() : '';
+  return /^sha256:[0-9a-f]{64}$/.test(v) ? v : null;
+}
+
+/** The remote node's image ID. Null when unreadable — never read as «same». */
+export function remoteImageId(member: PodPoolMember, image: string, run: RemoteRun = defaultRemoteRun): string | null {
+  if (!member.sshHost) return null;
+  return imageIdFrom(run(member.sshHost, `docker image inspect ${image} --format '{{.Id}}'`));
 }
 
 export function defaultRemoteRun(host: string, script: string): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, `export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; ${script}`], { encoding: 'utf8', timeout: 900_000 });
+  const r = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, `export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; ${script}`], { encoding: 'utf8', timeout: REMOTE_RUN_TIMEOUT_MS });
   return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
 }
 
@@ -491,29 +543,100 @@ export function remoteImageCommit(member: PodPoolMember, image: string, run: Rem
   return v && v !== '<no value>' ? v : null;
 }
 
+/** Cross-process lock options for one image ship per host (tests shrink them). */
+export interface ImageShipLockOptions {
+  /** Directory for the per-host lock files. Default = the machine-wide pod lease dir (shared by every universe on this machine). */
+  dir?: string;
+  retryMs?: number;
+  /** A lock older than this is a crash leftover. Default = ship timeout ⊕ import timeout ⊕ 2 min. */
+  staleMs?: number;
+  maxTries?: number;
+}
+
+export function imageShipLockPath(host: string, dir: string = join(hostLeaseBaseDir(), 'image-ship')): string {
+  return join(dir, `${host.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120) || 'host'}.lock`);
+}
+
 /**
  * 원격 노드에 이 기계의 이미지를 보낸다(판이 다를 때만) — `docker save | ssh docker load` ⊕ `k3d image import`.
  * ⛔ Pod 의 elanous 는 이미지 판이다(피드백: Pod 는 main 이 아니라 이미지를 돈다) — 노드마다 판이 다르면 같은 골이 노드마다 다른 코드로 돈다.
+ * 🩸 10-08 flood: many runs saw the same stale label at once and all shipped together — ssh refused them
+ *   (`Session open refused by peer` · `kex_exchange_identification`). Now:
+ *   ① «same image» = commit label OR (label missing) the same image ID on both sides — never ship it twice.
+ *   ② one ship per host, under a cross-process lock; whoever gets the lock re-checks and skips if another process shipped.
+ *   ③ the ship pipeline runs in its own process group (`runProcessGroupPipeline`).
  */
-export function syncPoolImage(member: PodPoolMember, image: string, localCommit: string | null, run: RemoteRun | { run?: RemoteRun; inspect?: LocalImageInspect; transfer?: ImageShip } = defaultRemoteRun): { ok: boolean; action: 'local' | 'fresh' | 'built' | 'shipped' | 'failed'; detail: string } {
-  const opts = typeof run === 'function' ? { run } : { run: run.run ?? defaultRemoteRun, inspect: run.inspect, transfer: run.transfer };
+export function syncPoolImage(member: PodPoolMember, image: string, localCommit: string | null, run: RemoteRun | { run?: RemoteRun; inspect?: LocalImageInspect; inspectId?: LocalImageInspect; transfer?: ImageShip; lock?: ImageShipLockOptions } = defaultRemoteRun): { ok: boolean; action: 'local' | 'fresh' | 'built' | 'shipped' | 'failed'; detail: string } {
+  const opts = typeof run === 'function' ? { run } : { run: run.run ?? defaultRemoteRun, inspect: run.inspect, inspectId: run.inspectId, transfer: run.transfer, lock: run.lock };
   const remote = opts.run ?? defaultRemoteRun;
   const inspect = opts.inspect ?? defaultLocalImageInspect;
+  // An injected label inspect without an ID inspect = a hermetic caller: the ID check is off (no real docker call).
+  const inspectId = opts.inspectId ?? (opts.inspect ? null : defaultLocalImageId);
   const transfer = opts.transfer ?? defaultImageShip;
   if (!member.sshHost) return { ok: true, action: 'local', detail: 'this machine' };
+  const host = member.sshHost;
   const before = remoteImageCommit(member, image, remote);
   if (localCommit && before === localCommit) return { ok: true, action: 'fresh', detail: before.slice(0, 12) };
   // 통째 전송은 이 기계 이미지의 커밋 라벨이 목표와 같을 때만. 다르면 낡은 판을 보내지 않는다.
   const here = localImageCommit(image, inspect);
   if (localCommit && here !== localCommit) return { ok: false, action: 'failed', detail: '로컬 이미지 판이 다르다 · 보내지 않음' };
-  const ship = transfer(member, image);
-  if (ship.status !== 0) return { ok: false, action: 'failed', detail: `docker load rc=${ship.status}: ${(ship.stderr ?? '').slice(-300)}` };
-  const imp = remote(member.sshHost, `k3d image import ${image} -c ${member.k3dCluster}`);
-  if (imp.status !== 0) return { ok: false, action: 'failed', detail: `k3d import rc=${imp.status}: ${imp.stderr.slice(-300)}` };
-  const after = remoteImageCommit(member, image, remote);
-  return after && (!localCommit || after === localCommit)
-    ? { ok: true, action: 'shipped', detail: `${before?.slice(0, 12) ?? '없음'} → ${after.slice(0, 12)}` }
-    : { ok: false, action: 'failed', detail: `보낸 뒤 판이 ${after ?? '없음'} — 기대 ${localCommit ?? '?'}` };
+  const localId = inspectId ? imageIdFrom(inspectId(image)) : null;
+  /** Fresh = the commit label matches, or the very same image (ID) is already there. Null = not fresh. */
+  const freshDetail = (label: string | null): string | null => {
+    if (localCommit && label === localCommit) return label.slice(0, 12);
+    if (localId && remoteImageId(member, image, remote) === localId) return `same image id ${localId.slice(7, 19)}`;
+    return null;
+  };
+  const sameId = freshDetail(before);
+  if (sameId) {
+    debug.log('pod.pool', 'image-ship-skipped-same-id', { host, image, localCommit, remoteCommit: before, detail: sameId });
+    return { ok: true, action: 'fresh', detail: sameId };
+  }
+
+  const lockOpts = opts.lock ?? {};
+  const retryMs = lockOpts.retryMs ?? 2_000;
+  const staleMs = lockOpts.staleMs ?? IMAGE_SHIP_TIMEOUT_MS + REMOTE_RUN_TIMEOUT_MS + 120_000;
+  const lockDir = lockOpts.dir ?? join(hostLeaseBaseDir(), 'image-ship');
+  const lockPath = imageShipLockPath(host, lockDir);
+  const t0 = Date.now();
+  let waited = false;
+  let release: () => void;
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    release = acquireLockSync(lockPath, {
+      staleMs,
+      retryBusyMs: retryMs,
+      maxTries: lockOpts.maxTries ?? Math.ceil(staleMs / retryMs) + 10,
+      breakDeadHolder: true,
+      onWait: (holder) => { waited = true; debug.log('pod.pool', 'image-ship-lock-wait', { host, image, lockPath, holder }); },
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    debug.log('pod.pool', 'image-ship-lock-failed', { host, image, lockPath, reason }, { level: 'warn' });
+    return { ok: false, action: 'failed', detail: `image ship lock: ${reason}` };
+  }
+  try {
+    debug.log('pod.pool', 'image-ship-lock-acquired', { host, image, lockPath, waited, waitedMs: Date.now() - t0 });
+    // ⭐ Re-check after the lock: the holder we waited for may have shipped this very image.
+    const labelNow = waited ? remoteImageCommit(member, image, remote) : before;
+    const fresh = waited ? freshDetail(labelNow) : null;
+    if (fresh) {
+      debug.log('pod.pool', 'image-ship-skipped-fresh-after-wait', { host, image, localCommit, remoteCommit: labelNow, detail: fresh, waitedMs: Date.now() - t0 });
+      return { ok: true, action: 'fresh', detail: `${fresh} (shipped by another process while waiting)` };
+    }
+    const ship = transfer(member, image);
+    if (ship.status !== 0) return { ok: false, action: 'failed', detail: `docker load rc=${ship.status}: ${(ship.stderr ?? '').slice(-300)}` };
+    // The import phase gets its own stale window (the lock file's age restarts here).
+    try { const now = new Date(); utimesSync(lockPath, now, now); } catch { /* lock gone · finish anyway */ }
+    const imp = remote(host, `k3d image import ${image} -c ${member.k3dCluster}`);
+    if (imp.status !== 0) return { ok: false, action: 'failed', detail: `k3d import rc=${imp.status}: ${imp.stderr.slice(-300)}` };
+    const after = remoteImageCommit(member, image, remote);
+    return after && (!localCommit || after === localCommit)
+      ? { ok: true, action: 'shipped', detail: `${labelNow?.slice(0, 12) ?? '없음'} → ${after.slice(0, 12)}` }
+      : { ok: false, action: 'failed', detail: `보낸 뒤 판이 ${after ?? '없음'} — 기대 ${localCommit ?? '?'}` };
+  } finally {
+    release();
+  }
 }
 
 export type PoolKubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };

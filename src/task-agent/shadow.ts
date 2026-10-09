@@ -16,12 +16,16 @@ import { readTaskAgentState, readTaskCard, taskAgentStatePath, type CompletionKi
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type DeliveryKind, type NextAction } from './actions.js';
 import { judgeNextMove, type TaskJudgeInput, type TaskJudgement } from './judge.js';
-import { configuredTaskAgentLiveMoves, executeLiveGreenProposal, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
+import { configuredTaskAgentLiveMoves, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
 
 export interface TaskAgentShadowInput {
   runId: string | null;
   stopReason: SupervisorStopReason;
   results: readonly SupervisorJobResult[];
+  /** One judgement cycle can attempt at most one land, even across PRs. */
+  cycleId?: string;
+  /** Reviewed SHA is mandatory for land; a bare pass cannot authorize merging. */
+  selfReview?: { verdict: 'pass' | 'fail'; head: string };
 }
 
 export interface TaskAgentShadowMove {
@@ -47,7 +51,7 @@ export interface TaskAgentShadowDeps {
   readCard?: (taskId: string) => TaskCard | undefined;
   /** Explicit live invocation only; supervisor's default hook always uses shadow. */
   mode?: 'shadow' | 'live';
-  /** TA-JUDGE-LIVE-SAFE — 실제로 할 안전한 수(`review`·`propose-green`). 비면 설정 `taskAgent.liveMoves` 를 읽는다. */
+  /** TA-JUDGE-LIVE-SAFE — 실제로 할 수(`review`·`propose-green`·`propose-land`). 없으면 설정 `taskAgent.liveMoves` 를 읽는다. */
   liveMoves?: ReadonlySet<TaskAgentLiveMove>;
   /** live 수의 부작용(리뷰 띄우기·PR 머리 조회·상태 파일) — 시험은 주입한다. */
   live?: LiveMoveDeps;
@@ -161,6 +165,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   }
   const kind = card?.completion;
   const judgeInput = shadowJudgeInput(input.stopReason, input.results, kind);
+  if (input.selfReview) judgeInput.review = input.selfReview.verdict;
   const delivery = successful?.worktreePath && card?.project?.target && isDeliveryKind(kind)
     ? { kind, worktreePath: successful.worktreePath, projectTarget: card.project.target, files: selectDeliveryCandidates(successful.worktreePath, kind) }
     : undefined;
@@ -209,8 +214,8 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     move.reason = wouldDo ?? judgement.reason;
     move.wouldDo = null;
   }
-  const liveKind: TaskAgentLiveMove | null = move.move === 'review' || move.move === 'propose-green' ? move.move : null;
-  // 판단마다 해석한다 — 안전하지 않은 수를 판단할 때도 모르는 항목 경고가 남게(실행은 아래 두 수뿐).
+  const liveKind: TaskAgentLiveMove | null = move.move === 'review' || move.move === 'propose-green' || move.move === 'propose-land' ? move.move : null;
+  // 판단마다 해석한다 — 허용되지 않은 수를 판단할 때도 모르는 항목 경고가 남게.
   const liveMoves = deps.liveMoves ?? await configuredTaskAgentLiveMoves();
   const live = liveKind !== null && liveMoves.has(liveKind);
   // 카드 id 는 모든 판단 관측에 싣는다(그림자 일치율을 카드로 잇는다) — 읽기 전용 조회.
@@ -231,6 +236,16 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
           runId: input.runId, stopReason: input.stopReason,
           ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}),
           // TA-LIVE-REVIEW-POD — 작업 트리가 없는 런(Pod)은 «런이 낸 머리»로 리뷰 저장소를 확인한다.
+          ...(prResult && !prResult.worktreePath ? { produced: {
+            ...(prResult.checkedHeadCommit !== undefined ? { headCommit: prResult.checkedHeadCommit } : {}),
+            ...(prResult.branch ? { branch: prResult.branch } : {}),
+            ...(prResult.prUrl ? { prUrl: prResult.prUrl } : {}),
+          } } : {}),
+        }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
+    } else if (liveKind === 'propose-land') {
+      liveMove = await executeLiveLand(boundCard, prResult?.prNumber,
+        { runId: input.runId, cycleId: input.cycleId, review: input.selfReview,
+          ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}),
           ...(prResult && !prResult.worktreePath ? { produced: {
             ...(prResult.checkedHeadCommit !== undefined ? { headCommit: prResult.checkedHeadCommit } : {}),
             ...(prResult.branch ? { branch: prResult.branch } : {}),

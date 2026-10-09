@@ -27,7 +27,8 @@ type Phase =
   | { kind: 'idle' }
   | { kind: 'starting' }
   | { kind: 'running'; runId: string; run: GraphRun | null; misses: number; since: number; tick: number }
-  | { kind: 'refused'; lines: string[] };
+  | { kind: 'refused'; lines: string[] }
+  | { kind: 'peer-edit'; message: string; version?: string; editedBy?: string; approving?: boolean; error?: string };
 
 /** CGE-RUN — 캔버스 도구줄의 «데모 실행». 런을 시작하고 1초마다 원장을 읽어 노드 색을 넘긴다. */
 export function GraphRunControl({ context, client, onStatus }: {
@@ -82,7 +83,21 @@ export function GraphRunControl({ context, client, onStatus }: {
     if (result.kind === 'started') setPhase({ kind: 'running', runId: result.runId, run: null, misses: 0, since: Date.now(), tick: 0 });
     else if (result.kind === 'not-runnable') setPhase({ kind: 'refused', lines: result.issues });
     else if (result.kind === 'forbidden') setPhase({ kind: 'refused', lines: ['운영자만 실행할 수 있습니다'] });
+    else if (result.kind === 'peer-edit') setPhase({ kind: 'peer-edit', message: result.message,
+      ...(result.version ? { version: result.version } : {}), ...(result.editedBy ? { editedBy: result.editedBy } : {}) });
     else setPhase({ kind: 'refused', lines: [`실행을 시작하지 못했습니다${result.message ? ` — ${result.message}` : ''}${result.status ? ` (${result.status})` : ''}`] });
+  };
+
+  const approve = async () => {
+    if (phase.kind !== 'peer-edit' || !phase.version || !client.approveRunGraph) return;
+    const current = phase;
+    setPhase({ ...current, approving: true });
+    try {
+      await client.approveRunGraph(context.graphId, current.version!);
+      setPhase({ kind: 'idle' });
+    } catch (error) {
+      setPhase({ ...current, approving: false, error: `승인 실패${error instanceof Error ? ` — ${error.message}` : ''}` });
+    }
   };
 
   const busy = phase.kind === 'starting' || (phase.kind === 'running' && !finished);
@@ -100,5 +115,13 @@ export function GraphRunControl({ context, client, onStatus }: {
       {run ? graphRunLine(run) : '데모 실행 · 시작하는 중'}
     </span>}
     {phase.kind === 'refused' && <span role="alert" className="text-xs font-semibold text-red-700 dark:text-red-400">{phase.lines.join(' · ')}</span>}
+    {phase.kind === 'peer-edit' && <span role="alert" className="text-xs font-semibold text-red-700 dark:text-red-400">
+      {phase.message}{phase.editedBy ? ` (${phase.editedBy})` : ''}{phase.error ? ` · ${phase.error}` : ''}
+    </span>}
+    {phase.kind === 'peer-edit' && phase.version && client.approveRunGraph && <button type="button" onClick={() => { void approve(); }}
+      disabled={phase.approving === true} title="캔버스에서 상대의 변경을 확인한 뒤 승인하세요 — 승인하면 이 판을 실행할 수 있습니다"
+      className="rounded border border-red-600/60 px-2.5 py-1 text-xs font-semibold text-red-800 disabled:opacity-50 dark:text-red-300">
+      변경 확인 · 승인
+    </button>}
   </span>;
 }

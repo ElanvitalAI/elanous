@@ -43,7 +43,8 @@ import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-
 import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
-import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig } from './review-provider-fallback.js';
+import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
+import { loadLlmPolicy } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
 import { provisionRepository, type RepoProvisionResult } from '../self-implement/repo-provision.js';
@@ -1077,6 +1078,8 @@ export async function buildDefaultSelfImplementSeams(
     toolReviewerRoll?: () => number;
     /** Tool-reviewer factory (same prompt→text shape as llmReview). Tests stub this; default is ACP. */
     makeToolReviewLLM?: () => UnmannedToolReviewLLM | Promise<UnmannedToolReviewLLM>;
+    subscriptionReviewerDeps?: SubscriptionReviewerDeps;
+    makeSubscriptionReviewLLM?: (spawn: ReturnType<typeof import('./review-provider-fallback.js').subscriptionReviewerSpawn>) => (prompt: string) => Promise<string>;
   } = {},
 ): Promise<SelfImplementSeams> {
   const { defaultSeams } = await import('../self-implement/seams.js');
@@ -1143,6 +1146,21 @@ export async function buildDefaultSelfImplementSeams(
       reviewerCanSelfRead = false;
     }
   }
+  let subscriptionReviewLLM: ((prompt: string) => Promise<string>) | undefined;
+  if (reviewerIsDefaultApiCall) {
+    const userConfig = getUserConfig();
+    const policy = loadLlmPolicy();
+    const spec = policy.policy.roles.reviewer ?? userConfig.roleLlm?.reviewer;
+    if (spec) {
+      const cap = policy.policy.caps.claude.harness;
+      subscriptionReviewLLM = (prompt) => runSubscriptionReviewer(spec, cap, prompt, defaultApiReview, async (text, spawn) => {
+        if (deps.makeSubscriptionReviewLLM) return deps.makeSubscriptionReviewLLM(spawn)(text);
+        const { makeAcpReviewLLM } = await import('../agent-substrate/acp-reviewer.js');
+        return makeAcpReviewLLM({ cwd: targetOptions?.repoRoot ?? childScope.elanousBinRoot, backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env })(text);
+      }, process.env, deps.subscriptionReviewerDeps);
+      reviewerCanSelfRead = undefined;
+    }
+  }
   const opensPr = plan.completion !== 'worktree-only';
   const target = plan.target === undefined ? undefined : revalidateHarnessTarget(plan.target);
   if (target?.status === 'outside-home') {
@@ -1159,6 +1177,7 @@ export async function buildDefaultSelfImplementSeams(
     ...(plan.self?.maxWaitSec !== undefined ? { implementMaxWaitSec: plan.self.maxWaitSec } : {}),
     ...(plan.self?.activityGraceSec !== undefined ? { implementActivityGraceSec: plan.self.activityGraceSec } : {}),
     llmReview,
+    ...(subscriptionReviewLLM ? { subscriptionReviewLLM } : {}),
     ...(reviewerCanSelfRead !== undefined ? { reviewerCanSelfRead } : {}),
     ...(deps.reviewScopeDiff ? { reviewScopeDiff: deps.reviewScopeDiff } : {}),
     onProgress: ({ stage, message }) => {

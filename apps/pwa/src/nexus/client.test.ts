@@ -48,6 +48,21 @@ describe('createNexusClient · base + fetchImpl wiring', () => {
   });
 });
 
+test('wizard client sends authenticated draft and reads saved list separately from installed plugins', async () => {
+  const draft = { description: 'Weather summary', skill: { description: 'Weather summary', instructions: 'Summarize.' } };
+  const { fetchImpl, calls } = makeMockFetch({
+    '/v1/plugins/wizard': init => ({ status: 200, body: init?.method === 'GET' ? { plugins: [{ name: 'weather-research', description: draft.description, draft }] } : { name: 'weather-research', saved: true } }),
+  });
+  const client = createNexusClient({ baseUrl: BASE, token: 'nexus-auth', fetchImpl });
+  expect(await client.saveWizardPlugin({ name: 'weather-research', draft, regenerate: true })).toEqual({ name: 'weather-research', saved: true });
+  expect((await client.getWizardPlugins()).plugins[0]?.draft).toEqual(draft);
+  expect(calls.map(call => [call.url, call.init?.method])).toEqual([
+    [`${BASE}/v1/plugins/wizard`, 'POST'], [`${BASE}/v1/plugins/wizard`, 'GET'],
+  ]);
+  expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ name: 'weather-research', draft, regenerate: true });
+  expect(JSON.stringify(calls[0]?.init?.headers)).toContain('nexus-auth');
+});
+
 test('channel-bot setup client uses GET status and authenticated POST without echoing token', async () => {
   const { fetchImpl, calls } = makeMockFetch({
     '/v1/setup/channel-bots': () => ({ status: 200, body: { platforms: [

@@ -12,7 +12,7 @@ import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorSeat } from '../
 import { checkAuthorInput } from './author-input-check.js';
 import { AuthorLedger } from './author-ledger.js';
 import { collectWork, findOverlaps, type WorkItem } from './overlap.js';
-import { seatOfTree, trafficTick, TRAFFIC_SEATS } from './traffic.js';
+import { isTrafficLaunch, seatOfTree, trafficTick, TRAFFIC_SEATS } from './traffic.js';
 
 export type AuthorCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status' | 'evidence'> & { version: string };
 export type AuthorQueueRow = Pick<QueueItem, 'seat' | 'status'> & Partial<Pick<QueueItem, 'input' | 'kind'>>;
@@ -101,7 +101,11 @@ export interface CollectAuthorDepthDeps {
   versions?: () => readonly [string, string];
   ledger?: Pick<AuthorLedger, 'request'>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  listProcesses?: typeof defaultListHarnessProcesses;
 }
+
+/** Budget for the shadow's process read (it runs inside the queue lock, whose waiters give up after 30 s). */
+export const AUTHOR_DEPTH_PROCESS_DEADLINE_MS = 10_000;
 
 function defaultVersions(now: Date, root = releaseLedgerRoot()): readonly [string, string] {
   if (!existsSync(join(root, 'release', 'features.sqlite'))) throw new Error('release schedule ledger unavailable');
@@ -122,15 +126,6 @@ export function collectAuthorDepth(deps: CollectAuthorDepthDeps = {}): AuthorDep
   };
   const cfg = deps.caps && deps.running ? null : observe('config', () => getUserConfig().loops?.orchestrator ?? ORCHESTRATOR_DEFAULTS);
   const caps = deps.caps ? observe('caps', deps.caps) : cfg === null ? null : observe('caps', () => cfg.seatCaps);
-  const running = deps.running ? observe('running', deps.running) : cfg === null ? null : observe('running', () => {
-    const observation = defaultListHarnessProcesses();
-    if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
-    const processes = observation.records.map(process => ({ ...process,
-      seat: seatOfTree(process.cwdStatus === 'unknown' ? undefined : process.cwd, cfg) }));
-    const measured = trafficTick({ processes, now, caps: cfg.seatCaps, openCells: [] });
-    if (measured.unassigned) throw new Error(`${measured.unassigned} unassigned harness launch process(es)`);
-    return Object.fromEntries(measured.seats.map(row => [row.seat, row.running]));
-  });
   const queued = observe('queue', deps.queued ?? (() => listHarnessQueue({ root: deps.root })));
   const releaseRoot = deps.root ?? releaseLedgerRoot();
   const versions = observe('versions', deps.versions ?? (() => defaultVersions(now, releaseRoot)));
@@ -139,7 +134,30 @@ export function collectAuthorDepth(deps: CollectAuthorDepthDeps = {}): AuthorDep
       throw new Error('checklist ledger unavailable');
     return deps.cells?.(version) ?? listChecklist(version, deps.root).items.map(item => ({ ...item, version }));
   }));
-  const overlaps = observe('overlap', deps.overlaps ?? (() => {
+  // Without release cells there is no candidate to compare, and the host reads below are the expensive ones (every launch's
+  // cwd · open PRs over the network) — a fresh --test universe has no release ledger, so it skips them (10-08 tick hang).
+  const noCells = cells === null && !deps.cells;
+  if (noCells && !deps.running && cfg !== null) unreadable.push({ source: 'running', reason: 'skipped: no release cells to compare' });
+  const running = deps.running ? observe('running', deps.running) : cfg === null || noCells ? null : observe('running', () => {
+    // Only launch processes are counted, so only they need a cwd; the whole read is bounded because the queue tick runs
+    // this shadow inside its lock (10-08: ~490 host processes × lsof kept a --test tick for minutes).
+    const started = Date.now();
+    const observation = (deps.listProcesses ?? defaultListHarnessProcesses)({ include: record => isTrafficLaunch(record.command),
+      cwdOnly: true, deadlineMs: AUTHOR_DEPTH_PROCESS_DEADLINE_MS });
+    if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
+    const late = observation.records.filter(process => process.cwdFailureReason?.startsWith('observation deadline')).length;
+    (deps.log ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data)))(
+      'loop.orchestrator', 'author-depth-processes', { launches: observation.records.length, late, ms: Date.now() - started,
+        deadlineMs: AUTHOR_DEPTH_PROCESS_DEADLINE_MS });
+    if (late) throw new Error(`process observation deadline ${AUTHOR_DEPTH_PROCESS_DEADLINE_MS}ms: ${late} launch cwd(s) unread`);
+    const processes = observation.records.map(process => ({ ...process,
+      seat: seatOfTree(process.cwdStatus === 'unknown' ? undefined : process.cwd, cfg) }));
+    const measured = trafficTick({ processes, now, caps: cfg.seatCaps, openCells: [] });
+    if (measured.unassigned) throw new Error(`${measured.unassigned} unassigned harness launch process(es)`);
+    return Object.fromEntries(measured.seats.map(row => [row.seat, row.running]));
+  });
+  if (noCells && !deps.overlaps) unreadable.push({ source: 'overlap', reason: 'skipped: no release cells to compare' });
+  const overlaps = noCells && !deps.overlaps ? null : observe('overlap', deps.overlaps ?? (() => {
     const observed = collectWork();
     if (observed.unreadableTrees || observed.unreadableGoals || observed.work.some(item => item.unreadable))
       throw new Error(`incomplete work observation: trees=${observed.unreadableTrees} goals=${observed.unreadableGoals}`);

@@ -424,6 +424,44 @@ test('DRAFT-METRIC card shows inventory, oldest age, drafts without an owner mar
   expect(root.findByProps({ 'aria-label': 'draft 재고' }).props.className).toContain('col-span-2');
 });
 
+test('DRAFT-METRIC card shows overlap on one line and never turns null fields into zero', async () => {
+  const overlap = { launches24h: 3, launched: 4, unmeasured: 0, sourceIncomplete: false,
+    linked: 2, autoLanded: 2, autoRate: 1, secondSiblingMedianHours: 4.5, salvaged: 0, salvageUnmeasured: 0 };
+  let rate: number | null = 1;
+  draftFetch(() => json({ state: 'ready', metrics: { ...draftMetrics, overlap: { ...overlap, autoRate: rate } },
+    measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }));
+  let root = await mount();
+  expect(card(root, 'draft 재고')).toContain('겹침 발사 24h 3 · 자동 착지 100.0% (2/2) · 둘째 형제 착지 중앙값 4.5h');
+  expect(card(root, 'draft 재고')).toContain('열린 draft168');
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+  rate = null;
+  root = await mount();
+  expect(card(root, 'draft 재고')).toContain('겹침 발사 24h 3 · 자동 착지 못 잼 (2/2)');
+  expect(card(root, 'draft 재고')).not.toContain('자동 착지 0%');
+});
+
+test('DRAFT-METRIC overlap warns when the source is incomplete or launches were unmeasured', async () => {
+  const overlap = { launches24h: 3, launched: 5, unmeasured: 0, sourceIncomplete: false,
+    linked: 2, autoLanded: 2, autoRate: 1, secondSiblingMedianHours: 4.5, salvaged: 0, salvageUnmeasured: 0 };
+  let partial: Omit<typeof overlap, 'unmeasured'> & { unmeasured: number | null } = { ...overlap, sourceIncomplete: true };
+  draftFetch(() => json({ state: 'ready', metrics: { ...draftMetrics, overlap: partial },
+    measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }));
+  for (const incomplete of [{ ...overlap, sourceIncomplete: true }, { ...overlap, unmeasured: 1 },
+    { ...overlap, unmeasured: null }]) {
+    partial = incomplete;
+    const root = await mount();
+    expect(card(root, 'draft 재고')).toContain('겹침 발사 24h 3 · 자동 착지 100.0% (2/2) · 둘째 형제 착지 중앙값 4.5h · 부분 측정');
+    expect(card(root, 'draft 재고')).toContain('열린 draft168');
+    await act(async () => { tree!.unmount(); });
+    tree = undefined;
+  }
+  partial = overlap;
+  const root = await mount();
+  expect(card(root, 'draft 재고')).toContain('겹침 발사 24h 3 · 자동 착지 100.0% (2/2) · 둘째 형제 착지 중앙값 4.5h');
+  expect(card(root, 'draft 재고')).not.toContain('부분 측정');
+});
+
 test('DRAFT-METRIC card: when no draft carries an owner mark it says so instead of implying 168 orphans', async () => {
   draftFetch(() => json({ state: 'ready', metrics: { ...draftMetrics, needsOwner: draftMetrics.inventory }, measuredAt: '2026-10-08T00:30:00Z', refreshing: false, reason: null }));
   const root = await mount();

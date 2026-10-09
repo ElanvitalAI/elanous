@@ -5,6 +5,8 @@ import { readPendingQuestionAnswer, readPendingQuestions, writePendingQuestionAn
 import { debug, redactSecretText } from '../debug/log.js';
 import { createVersionResolver, type VersionOptions, type Versions } from '../directives/version-at.js';
 import { getUserConfig } from '../user-config.js';
+import { registeredSeats, resolveSeat } from '../seat-address/seat-address.js';
+import { isSeatId } from '../seat-dispatch/seat-questions.js';
 
 export type DecisionCategory = 'secret' | 'publish' | 'money' | 'security' | 'scope' | 'irreversible' | 'other';
 /** Old track letters (S·T·F·O) stay readable; seat names (OP·MK·TC·UX) are the current identities. */
@@ -53,7 +55,8 @@ export class DecisionAnswerDeliveryError extends Error {
   }
 }
 const CATEGORIES: readonly string[] = ['secret', 'publish', 'money', 'security', 'scope', 'irreversible', 'other'];
-const TRACKS: readonly string[] = ['S', 'T', 'F', 'O', 'OP', 'MK', 'TC', 'UX'];
+const isDecisionTrack = (value: string): boolean => registeredSeats().some(({ id, alias }) => value === id || value === alias);
+const isRegisteredSeat = (value: string): boolean => isSeatId(value) && resolveSeat(value)?.id === value;
 
 function required(value: string, name: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
@@ -88,7 +91,7 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
   const title = safe(single(input.title, 'title'));
   if (!CATEGORIES.includes(input.category)) throw new Error('invalid category');
   if (!input.raisedBy?.agent) throw new Error('raisedBy.agent is required');
-  if (input.raisedBy.track && !TRACKS.includes(input.raisedBy.track)) throw new Error('invalid track');
+  if (input.raisedBy.track && !isDecisionTrack(input.raisedBy.track)) throw new Error('invalid track');
   const s = scqaField(input.scqa.s, 's');
   const c = scqaField(input.scqa.c, 'c');
   const q = input.scqa.q?.trim() ? scqaField(input.scqa.q, 'q') : undefined;
@@ -117,7 +120,7 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
   if (input.crossCheck !== undefined && !Array.isArray(input.crossCheck)) throw new Error('cross-check must be a list');
   const crossCheck = input.crossCheck?.map(check => {
     const seat = single(check.seat, 'cross-check seat');
-    if (!['OP', 'MK', 'TC', 'UX'].includes(seat)) throw new Error('invalid cross-check seat');
+    if (!isRegisteredSeat(seat)) throw new Error('invalid cross-check seat');
     return { seat, at: utc(check.at), note: safe(single(check.note, 'cross-check note')) };
   });
   const crossCheckSkipped = input.crossCheckSkipped === undefined ? undefined : safe(single(input.crossCheckSkipped, 'cross-check skipped reason'));
@@ -242,7 +245,7 @@ export class DecisionLedger {
   /** Delegated decisions are already made: they share the append-only ledger, never the owner's open-card state machine. */
   recordSeatDecision(input: SeatDecisionInput): SeatDecisionRecord {
     const seat = input.seat;
-    if (!['OP', 'MK', 'TC', 'UX'].includes(seat)) throw new Error('invalid seat');
+    if (!isRegisteredSeat(seat)) throw new Error('invalid seat');
     const title = safe(single(input.title, 'title'));
     const decision = safe(single(input.decision, 'decision'));
     const delegation = safe(single(input.delegation, 'delegation'));
@@ -263,7 +266,7 @@ export class DecisionLedger {
   }
   seatReport(filters: { since?: string; seat?: Seat } = {}): SeatDecisionRecord[] {
     const since = filters.since === undefined ? undefined : utc(filters.since);
-    if (filters.seat && !['OP', 'MK', 'TC', 'UX'].includes(filters.seat)) throw new Error('invalid seat');
+    if (filters.seat && !isRegisteredSeat(filters.seat)) throw new Error('invalid seat');
     return this.events().filter((event): event is Extract<Event, { type: 'seat-recorded' }> => event.type === 'seat-recorded')
       .map(event => event.entry)
       .filter(entry => (!since || (entry.recordedAt ?? entry.decidedAt ?? '') >= since) && (!filters.seat || entry.seat === filters.seat))
@@ -307,7 +310,7 @@ export class DecisionLedger {
     if (!by || (by.kind !== 'human' && by.kind !== 'auto')) throw new Error('decidedBy is required');
     if (by.kind === 'auto') {
       single(by.delegation, 'delegation'); single(by.agent, 'agent');
-      if (by.track && !TRACKS.includes(by.track)) throw new Error('invalid track');
+      if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
       by = { ...by, agent: safe(single(by.agent, 'agent')), delegation: safe(single(by.delegation, 'delegation')) };
     }
     return this.locked(() => {
@@ -424,7 +427,7 @@ export class DecisionLedger {
     if (choice ? !clean.options.some(o => o.key === choice) : clean.options.length !== 0) throw new Error(`option not found: ${choice}`);
     if (by.kind === 'auto') {
       single(by.agent, 'agent'); single(by.delegation, 'delegation');
-      if (by.track && !TRACKS.includes(by.track)) throw new Error('invalid track');
+      if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
       by = { ...by, agent: safe(single(by.agent, 'agent')), delegation: safe(single(by.delegation, 'delegation')) };
     }
     const cleanNote = safe(single(note, 'note'));
@@ -449,7 +452,7 @@ export class DecisionLedger {
   completeRecorded(id: string, choice: string | undefined, by: DecisionActor, note: string, sourceOptions: DecisionOption[]): DecisionEntry {
     if (by.kind === 'auto') {
       single(by.agent, 'agent'); single(by.delegation, 'delegation');
-      if (by.track && !TRACKS.includes(by.track)) throw new Error('invalid track');
+      if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
       by = { ...by, agent: safe(single(by.agent, 'agent')), delegation: safe(single(by.delegation, 'delegation')) };
     }
     const cleanNote = safe(single(note, 'note'));

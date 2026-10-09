@@ -1548,7 +1548,8 @@ describe('runSelfImplement — traversal shadow observation', () => {
   it('wires entry observations for every declared node across reachable seam scenarios', async () => {
     const entries = new Set<PipelineNodeId>();
     const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
-      if (event === 'pipeline-node-entry') entries.add(data?.node as PipelineNodeId);
+      // HARNESS-FULL-GRAPH (#24984): journey nodes (freeze-check · cleanup …) emit the same event with phase 'journey' — this test counts pipeline nodes only.
+      if (event === 'pipeline-node-entry' && data?.phase !== 'journey') entries.add(data?.node as PipelineNodeId);
     }) as never);
     try {
       let gates = 0;

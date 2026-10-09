@@ -1,5 +1,5 @@
-export interface ExternalTaskEvent {
-  provider: 'linear' | 'asana';
+export interface ExternalTaskEvent<Provider extends string = 'linear' | 'asana'> {
+  provider: Provider;
   eventId: string;
   kind: 'created' | 'updated';
   ref: string;
@@ -11,9 +11,9 @@ export interface ExternalTaskEvent {
   occurredAt: string;
 }
 
-export interface TaskConnector {
-  provider: ExternalTaskEvent['provider'];
+export interface TaskConnector<Provider extends string = ExternalTaskEvent['provider']> {
+  provider: Provider;
   verify(req: { rawBody: string | Uint8Array; signature: string; secret: string; now?: number }): { ok: true } | { ok: false; reason: string };
-  parse(body: unknown, deliveryId: string): ExternalTaskEvent | null;
-  idempotencyKey(event: ExternalTaskEvent): string;
+  parse(body: unknown, deliveryId: string): ExternalTaskEvent<Provider> | null;
+  idempotencyKey(event: ExternalTaskEvent<Provider>): string;
 }

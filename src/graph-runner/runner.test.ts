@@ -318,6 +318,95 @@ second:
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).input).toEqual({ request: 'hello' });
 });
 
+test('prompt recipe executes through injected LLM with saved input and preceding structured output', async () => {
+  const { graph, root } = fixture('printf first-output');
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace("kind: agent, recipe: 'cmd:second'", "kind: prompt, recipe: 'prompt:second'"));
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: 'printf first-output'\nsecond:\n  prompt: 'Request $ARGUMENTS; prior $first.output.value; all $first.output'\n`);
+  const seen: string[] = [];
+  const state = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"value":"saved"}\n', stderr: '', exitCode: 0 }),
+    callLLM: async prompt => { seen.push(prompt); return 'LLM answer'; },
+  } });
+  expect(seen).toEqual(['Request {"request":"hello"}; prior saved; all {"value":"saved"}']);
+  expect(state.status).toBe('done');
+  expect(state.executed).toBe(2);
+  expect(state.nodes[1]).toMatchObject({ nodeId: 'second', executed: true, ok: true, output: 'LLM answer' });
+  expect(JSON.parse(readFileSync(state.statePath, 'utf8')).nodes[1].output).toBe('LLM answer');
+});
+
+test('successive prompt nodes resolve persisted input and the previous LLM output', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8').replaceAll('kind: agent, recipe: \'cmd:', 'kind: prompt, recipe: \'prompt:'));
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  prompt: 'Read $ARGUMENTS'\nsecond:\n  prompt: 'Answer $first.output.value for $ARGUMENTS'\n`);
+  const prompts: string[] = [];
+  const state = await runGraph(graph, { input: 'original', deps: { root,
+    runBash: async () => { throw new Error('prompt must not run bash'); },
+    callLLM: async body => {
+      prompts.push(body);
+      return prompts.length === 1 ? '{"value":"from-model"}' : 'finished';
+    },
+  } });
+  expect(prompts).toEqual(['Read original', 'Answer from-model for original']);
+  expect(state.status).toBe('done');
+  expect(state.executed).toBe(2);
+  expect(state.nodes.slice(0, 2).map(node => node.output)).toEqual(['{"value":"from-model"}', 'finished']);
+  expect(JSON.parse(readFileSync(state.statePath, 'utf8')).input).toBe('original');
+});
+
+test('prompt output names an outcome and an injected LLM failure takes the fail edge', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8')
+    .replace("kind: agent, recipe: 'cmd:second'", "kind: prompt, recipe: 'prompt:second'")
+    .replace('map: { ok: done, fail: failed }', 'map: { rejected: failed, ok: done, fail: failed }'));
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: 'exit 0'\nsecond:\n  prompt: 'Decide $ARGUMENTS'\n`);
+  const deps = { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }), callLLM: async () => '{"outcome":"rejected"}' };
+  const named = await runGraph(graph, { input: 'publish?', deps });
+  expect(named.path).toEqual(['first', 'second', 'failed']);
+  expect(named.nodes[1]).toMatchObject({ ok: true, output: '{"outcome":"rejected"}' });
+  const failed = await runGraph(graph, { deps: { ...deps, callLLM: async () => { throw new Error('model unavailable'); } } });
+  expect(failed.path).toEqual(['first', 'second', 'failed']);
+  expect(failed.nodes[1]).toMatchObject({ ok: false, error: 'model unavailable' });
+});
+
+test('prompt after approval resolves saved input and prior outputs on resume', async () => {
+  const { graph, root } = approvalFixture();
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace("kind: agent, recipe: 'cmd:b'", "kind: prompt, recipe: 'prompt:b'"));
+  writeFileSync(join(root, 'recipes.yaml'), `a:\n  command: 'exit 0'\ngate:\n  approval: 'Publish now?'\nb:\n  prompt: 'Input $ARGUMENTS; first $a.output; decision $gate.output.outcome'\n`);
+  const prompts: string[] = [];
+  const deps = { root, runBash: async () => ({ stdout: 'previous', stderr: '', exitCode: 0 }),
+    callLLM: async (prompt: string) => { prompts.push(prompt); return 'resumed'; } };
+  const paused = await runGraph(graph, { input: 'original', deps });
+  expect(paused.status).toBe('awaiting-approval');
+  decideGraphApproval(paused.graphId, paused.runId, 'approved', 'owner', root);
+  const resumed = await runGraph(graph, { resumeRunId: paused.runId, input: 'replacement', deps });
+  expect(prompts).toEqual(['Input original; first previous; decision approved']);
+  expect(resumed.status).toBe('done');
+  expect(resumed.nodes.find(node => node.nodeId === 'b')?.output).toBe('resumed');
+});
+
+test('prompt dry run skips LLM and missing references fail without calling LLM', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace("kind: agent, recipe: 'cmd:second'", "kind: prompt, recipe: 'prompt:second'"));
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: 'exit 0'\nsecond:\n  prompt: 'Missing $first.output.absent'\n`);
+  const deps = { root, runBash: async () => ({ stdout: '{"value":"saved"}', stderr: '', exitCode: 0 }),
+    callLLM: async () => { throw new Error('LLM must not run'); } };
+  const dry = await runGraph(graph, { dryRun: true, deps });
+  expect(dry.status).toBe('done');
+  expect(dry.executed).toBe(0);
+  const run = await runGraph(graph, { deps });
+  expect(run.status).toBe('failed');
+  expect(run.nodes[1]).toMatchObject({ ok: false, executed: true, error: 'missing prompt reference: $first.output.absent' });
+});
+
+test('prompt without an injected LLM fails the node instead of calling a real provider', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace("kind: agent, recipe: 'cmd:second'", "kind: prompt, recipe: 'prompt:second'"));
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: 'exit 0'\nsecond:\n  prompt: 'Hello $ARGUMENTS'\n`);
+  const run = await runGraph(graph, { input: 'x', deps: { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) } });
+  expect(run.status).toBe('failed');
+  expect(run.nodes[1]).toMatchObject({ ok: false, executed: true, error: 'prompt node requires an injected LLM (deps.callLLM)' });
+});
+
 test('real bash reads ELANOUS_GRAPH_CONTEXT and previous command output', async () => {
   const { graph, root } = fixture('printf first-output');
   writeFileSync(join(root, 'recipes.yaml'), `first:

@@ -3,6 +3,7 @@ import { LessonLedger, type LessonRow } from '../lessons/lesson-ledger.js';
 import { DecisionLedger, type DecisionEntry, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { devVersion, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { debug } from '../debug/log.js';
+import { queryInstalledPack } from './query.js';
 
 /** Directive row fields this search reads — kept local because `src/directives/directive-index` is excluded from the public export. */
 export interface DirectiveRow { ts: string; text: string; source_file: string; line_no: number }
@@ -14,7 +15,7 @@ function openDirectiveIndex(): { search(q: string): DirectiveRow[]; close(): voi
   return new mod.DirectiveIndex();
 }
 
-export type KnowSource = 'directive' | 'decision' | 'checklist' | 'lesson';
+export type KnowSource = 'directive' | 'decision' | 'checklist' | 'lesson' | 'pack';
 export interface KnowHit {
   source: KnowSource;
   id: string;
@@ -36,6 +37,7 @@ export interface KnowFindDeps {
   lessons: (query: string) => LessonRow[];
   versions: () => string[];
   now: () => Date;
+  pack?: typeof queryInstalledPack;
 }
 
 function versions(): string[] {
@@ -55,6 +57,7 @@ const defaults: KnowFindDeps = {
   lessons: (query) => new LessonLedger().find(query),
   versions,
   now: () => new Date(),
+  pack: queryInstalledPack,
 };
 
 function matches(text: string, words: string[]): boolean {
@@ -62,7 +65,7 @@ function matches(text: string, words: string[]): boolean {
   return words.every((word) => normalized.includes(word));
 }
 
-export function knowFind(query: string, deps: Partial<KnowFindDeps> = {}): KnowResult {
+export function knowFind(query: string, deps: Partial<KnowFindDeps> = {}, packId?: string): KnowResult {
   const read = { ...defaults, ...deps };
   const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) throw new Error('know: 질문이 필요합니다');
@@ -105,6 +108,10 @@ export function knowFind(query: string, deps: Partial<KnowFindDeps> = {}): KnowR
   attempt('lesson', () => {
     for (const row of read.lessons(query)) rows.push({ source: 'lesson', id: row.id, title: row.incident,
       status: row.status, at: row.updated_at, current: row.occurrence_count > 1, ref: `lesson show ${row.id}` });
+  });
+  if (packId) attempt('pack', () => {
+    for (const card of (read.pack ?? queryInstalledPack)(packId, query)) rows.push({ source: 'pack', id: card.id, title: card.title,
+      status: 'installed', at: card.updatedAt, current: true, ref: card.ref });
   });
   rows.sort((a, b) => Number(b.current) - Number(a.current) || (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0)
     || a.source.localeCompare(b.source) || a.id.localeCompare(b.id));

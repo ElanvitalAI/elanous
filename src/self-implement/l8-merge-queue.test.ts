@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireL8MergeQueue, evaluateL8Integration, runL8MergeQueue, type L8MergeQueueDeps } from './l8-merge-queue.js';
+import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps } from './l8-merge-queue.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -78,6 +78,114 @@ function deps(remote: string, opts: { failTest?: boolean; failInstall?: boolean;
   };
   return { injected, calls, pushes };
 }
+
+function shadowDeps(remote: string, resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>, onIntegrated?: (cwd: string) => void) {
+  const { injected, calls, pushes } = deps(remote);
+  const observed: unknown[] = [];
+  const queueDeps = { ...injected, resolveConflict, observe: (verdict: unknown) => { observed.push(verdict); },
+    command: (bin: string, args: readonly string[], cwd: string) => {
+      if (bin === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic') {
+        calls.push([...args]);
+        onIntegrated?.(cwd);
+        return { status: 0, stdout: '1 pass\n0 fail\nRan 1 test across 1 file', stderr: '' };
+      }
+      return injected.command!(bin, args, cwd);
+    },
+  };
+  return { queueDeps, calls, pushes, observed };
+}
+
+test('shadow queue uses context resolution for ordinary conflicts and preserves next.md additions', async () => {
+  const { cwd, remote, head } = fixture(true);
+  const main = git(remote, 'rev-parse', 'main');
+  const seen: string[] = [];
+  const { queueDeps, calls, pushes, observed } = shadowDeps(remote, async (file, conflicted, target, worktree) => {
+    seen.push(file);
+    expect(target).toBe(head);
+    expect(worktree).not.toBe(cwd);
+    expect(conflicted).toContain('<<<<<<<');
+    return 'export const x = 3; // feature and main\n';
+  }, (path) => {
+    expect(readFileSync(join(path, 'other.ts'), 'utf8')).toBe('export const x = 3; // feature and main\n');
+    const note = readFileSync(join(path, 'release/next.md'), 'utf8');
+    expect(note).toContain('- main');
+    expect(note).toContain('- feature');
+    expect(git(path, 'diff', '--name-only', '--diff-filter=U')).toBe('');
+  });
+  await enqueueL8ShadowQueue(cwd, 7, queueDeps);
+  const verdict = await runL8ShadowQueue(cwd, queueDeps);
+  expect(verdict?.verdict).toBe('pass');
+  expect(verdict?.detail).toBe('release/next.md auto-resolved');
+  expect(seen).toEqual(['other.ts']);
+  expect(calls).toEqual([['install', '--frozen-lockfile'], ['run', 'test:deterministic', 'src.test.ts']]);
+  expect(pushes).toEqual([]);
+  expect(observed).toHaveLength(1);
+  expect(await statusL8ShadowQueue(cwd, queueDeps)).toMatchObject({ pending: [], verdicts: [{ verdict: 'pass' }] });
+  expect(git(remote, 'rev-parse', 'main')).toBe(main);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(head);
+});
+
+test('shadow queue rejects unresolved context without tests, push or changes to remote refs', async () => {
+  const { cwd, remote, head } = fixture(true);
+  const main = git(remote, 'rev-parse', 'main');
+  const { queueDeps, calls, pushes } = shadowDeps(remote, async (_file, conflicted) => conflicted);
+  await enqueueL8ShadowQueue(cwd, 7, queueDeps);
+  const verdict = await runL8ShadowQueue(cwd, queueDeps);
+  expect(verdict?.verdict).toBe('conflict');
+  expect(verdict?.detail).toContain('conflict-markers-remain');
+  expect(calls).toEqual([]);
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'main')).toBe(main);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(head);
+});
+
+test('shadow queue treats a resolver exception as a conflict and never runs tests', async () => {
+  const { cwd, remote, head } = fixture(true);
+  const main = git(remote, 'rev-parse', 'main');
+  const { queueDeps, calls, pushes } = shadowDeps(remote, async () => { throw new Error('resolver unavailable'); });
+  await enqueueL8ShadowQueue(cwd, 7, queueDeps);
+  const verdict = await runL8ShadowQueue(cwd, queueDeps);
+  expect(verdict?.verdict).toBe('conflict');
+  expect(verdict?.detail).toContain('conflict-resolver-interrupted');
+  expect(calls).toEqual([]);
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'main')).toBe(main);
+  expect(git(remote, 'rev-parse', 'feature')).toBe(head);
+});
+
+test('shadow queue reports a file/directory conflict as conflict without consulting the resolver', async () => {
+  const { cwd, remote } = fixture();
+  git(remote, 'checkout', '-q', 'feature');
+  writeFileSync(join(remote, 'other.ts'), 'export const x = 5;\n');
+  git(remote, 'add', '.'); git(remote, 'commit', '-qm', 'feature edits other');
+  git(remote, 'update-ref', 'refs/pull/7/head', git(remote, 'rev-parse', 'HEAD'));
+  git(remote, 'checkout', '-q', 'main');
+  git(remote, 'rm', '-q', 'other.ts');
+  mkdirSync(join(remote, 'other.ts'));
+  writeFileSync(join(remote, 'other.ts', 'inner.ts'), 'export const y = 1;\n');
+  git(remote, 'add', '.'); git(remote, 'commit', '-qm', 'main turns other into a directory');
+  const main = git(remote, 'rev-parse', 'main');
+  const seen: string[] = [];
+  const { queueDeps, calls, pushes } = shadowDeps(remote, async (file) => { seen.push(file); return ''; });
+  await enqueueL8ShadowQueue(cwd, 7, queueDeps);
+  const verdict = await runL8ShadowQueue(cwd, queueDeps);
+  expect(verdict?.verdict).toBe('conflict');
+  expect(verdict?.detail).toContain('other.ts');
+  expect(seen).toEqual([]);
+  expect(calls).toEqual([]);
+  expect(pushes).toEqual([]);
+  expect(git(remote, 'rev-parse', 'main')).toBe(main);
+});
+
+test('shadow queue still resolves next.md alone without invoking the ordinary-file resolver', async () => {
+  const { cwd, remote } = fixture();
+  const { queueDeps, calls } = shadowDeps(remote, async () => { throw new Error('not an ordinary conflict'); });
+  await enqueueL8ShadowQueue(cwd, 7, queueDeps);
+  const verdict = await runL8ShadowQueue(cwd, queueDeps);
+  expect(verdict?.verdict).toBe('pass');
+  expect(verdict?.detail).toBe('release/next.md auto-resolved');
+  expect(calls).toEqual([['install', '--frozen-lockfile'], ['run', 'test:deterministic', 'src.test.ts']]);
+});
 
 test('a second queue entrant waits for the first PR to release the shared git slot', async () => {
   const { cwd } = fixture();

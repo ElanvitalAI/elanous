@@ -18,6 +18,14 @@ export interface MemoryItem {
   conflict?: { owner: 'OP'; sources: [string, string] };
 }
 
+/** Guardian retention boundary: lifecycle hygiene, independent of librarian promotion. */
+export function guardianRetireAged(items: readonly MemoryItem[], now: Date): MemoryItem[] {
+  const cutoff = now.getTime() - 30 * DAY_MS;
+  return items.map(item => ({ ...item,
+    status: Date.parse(item.updatedAt) < cutoff ? 'retired' as const : item.status,
+  }));
+}
+
 export type MemorySource =
   | { kind: 'event'; at: string; seat: string; text: string; source: string }
   | { kind: 'decision'; at: string; seat: string; text: string; source: string };
@@ -28,6 +36,8 @@ export interface MemorySummary {
   summary: string;
   /** Only supply this when the two strings identify the same fact and mutually exclusive values. */
   claim?: { key: string; value: string };
+  /** Sleep-review task agent's promotion decision; not stored in a MemoryItem. */
+  promote?: boolean;
 }
 
 type CondenseEvent = CoordEvent & { surface?: string };
@@ -38,7 +48,7 @@ export interface MemoryDeps {
   decisions?: () => DecisionEntry[];
 }
 
-export type CondenseSkipReason = 'no-seat' | 'no-project' | 'no-topic' | 'no-summary' | 'bad-link' | 'bad-claim' | 'no-claim' | 'summarize-failed';
+export type CondenseSkipReason = 'not-promoted' | 'no-seat' | 'no-project' | 'no-topic' | 'no-summary' | 'bad-link' | 'bad-claim' | 'no-claim' | 'summarize-failed';
 export type CondenseSkipped = Partial<Record<CondenseSkipReason, number>>;
 export interface FunnelCount { total: number; bySeat: Record<string, number> }
 export interface CondenseFunnel {
@@ -77,22 +87,25 @@ export function readCondenseEvents(since: string): CondenseEvent[] {
 /** Condense one UTC day; callers persist the returned snapshot, not raw transcripts. Read-only ledger access. */
 export async function condenseContextDay(
   day: string, previous: readonly MemoryItem[], deps: MemoryDeps, now: Date = new Date(),
+  policy: { promotion?: 'sleep-review'; retention?: 'guardian' } = {},
 ): Promise<MemoryItem[]> {
   if (!/^\d{4}-\d\d-\d\d$/.test(day) || new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) !== day) {
     throw new Error('day must be a valid UTC YYYY-MM-DD');
   }
-  return condenseContextWindow(`${day}T00:00:00.000Z`, new Date(Date.parse(`${day}T00:00:00.000Z`) + DAY_MS).toISOString(), previous, deps, now);
+  return condenseContextWindow(`${day}T00:00:00.000Z`, new Date(Date.parse(`${day}T00:00:00.000Z`) + DAY_MS).toISOString(), previous, deps, now, policy);
 }
 
 /** Read-only condensation over an exact rolling UTC window; the caller owns any persistence. */
 export async function condenseContextWindow(
   since: string, until: string, previous: readonly MemoryItem[], deps: MemoryDeps, now: Date = new Date(),
+  policy: { promotion?: 'sleep-review'; retention?: 'guardian' } = {},
 ): Promise<MemoryItem[]> {
-  return (await condenseContextWindowWithReport(since, until, previous, deps, now)).cards;
+  return (await condenseContextWindowWithReport(since, until, previous, deps, now, policy)).cards;
 }
 
 export async function condenseContextWindowWithReport(
   since: string, until: string, previous: readonly MemoryItem[], deps: MemoryDeps, now: Date = new Date(),
+  policy: { promotion?: 'sleep-review'; retention?: 'guardian' } = {},
 ): Promise<CondenseWindowReport> {
   const start = Date.parse(since);
   const end = Date.parse(until);
@@ -228,6 +241,7 @@ export async function condenseContextWindowWithReport(
     try { summary = await deps.summarize(source); }
     catch { skip('summarize-failed', source); continue; }
     bump(funnel.summarized, source.seat);
+    if (policy.promotion === 'sleep-review' && summary.promote !== true) { skip('not-promoted', source); continue; }
     const project = safeLine(summary?.project);
     const topic = safeLine(summary?.topic);
     const text = safeLine(summary?.summary);
@@ -253,17 +267,20 @@ export async function condenseContextWindowWithReport(
     updatedKeys.add(key);
   }
   const cutoff = now.getTime() - 30 * DAY_MS;
-  // Compare only the winning, non-retired assertions; a superseded claim cannot keep a decision candidate alive.
+  // The nightly librarian makes promotion judgments; guardian retention runs at the record boundary.
+  // The ordinary condense command keeps its existing retention behavior.
   const finalItems: MemoryItem[] = [...items.values()].map(({ conflict: _conflict, ...item }) => ({ ...item,
-    status: Date.parse(item.updatedAt) < cutoff ? 'retired' as const : 'active' as const,
+    status: policy.retention === 'guardian' ? item.status
+      : Date.parse(item.updatedAt) < cutoff ? 'retired' as const : 'active' as const,
   }));
   finalItems.sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.source.localeCompare(b.source)
     || a.seat.localeCompare(b.seat));
   for (let index = 0; index < finalItems.length; index++) {
     const item = finalItems[index]!;
-    if (item.status !== 'active' || !item.claim) continue;
+    if (item.status !== 'active' || !item.claim || (policy.retention === 'guardian' && Date.parse(item.updatedAt) < cutoff)) continue;
     const { key, value } = item.claim;
     const conflicting = finalItems.slice(0, index).find(other => other.status === 'active'
+      && (policy.retention !== 'guardian' || Date.parse(other.updatedAt) >= cutoff)
       && other.project === item.project
       && other.claim?.key === key && other.claim.value !== value);
     if (conflicting) {

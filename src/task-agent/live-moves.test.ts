@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveReview, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
+import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 
@@ -388,6 +388,257 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
 
   test('기본 리뷰 요청 argv — 진입점 · 같은 우주 config-dir · self review <PR> --json --intent', () => {
     expect(liveReviewArgs('/repo/bin/elanous.mjs', '/universe', 9, 'intent')).toEqual(['/repo/bin/elanous.mjs', '--config-dir', '/universe', 'self', 'review', '9', '--json', '--intent', 'intent']);
+  });
+});
+
+describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => {
+  const reviewed = { verdict: 'pass' as const, head: HEAD_A };
+  function landFixture() {
+    const f = fixture();
+    const calls: Array<{ pr: number; head: string; cwd: string }> = [];
+    let view = { head: HEAD_A, state: 'OPEN', isDraft: false };
+    const live = {
+      statePath: f.statePath,
+      log: f.deps().log,
+      landPrHead: async () => view,
+      land: async (pr: number, head: string, cwd: string) => { calls.push({ pr, head, cwd }); return { status: 0, stdout: 'merged' }; },
+    };
+    const card = () => readTaskCard('ta-live-1', f.statePath)!;
+    const ctx = { cwd: '/tmp/land-wt', review: reviewed };
+    return { f, calls, live, card, ctx, setView: (next: typeof view) => { view = next; } };
+  }
+
+  test('OPEN non-draft + pass for current SHA → exactly one pinned pr land, history and observation', async () => {
+    const t = landFixture();
+    const first = await executeLiveLand(t.card(), 51, t.ctx, t.live);
+    expect(first).toMatchObject({ kind: 'land', executed: true, ok: true });
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
+    expect(t.f.logs.find(entry => entry.event === 'live-move')?.data).toMatchObject({ kind: 'land', executed: true, ok: true, live: true });
+    expect(t.card().landAttempts).toEqual([expect.objectContaining({ pr: 51, head: HEAD_A, ok: true, detail: 'merged' })]);
+    const second = await executeLiveLand(t.card(), 51, t.ctx, t.live);
+    expect(second).toMatchObject({ executed: false, detail: expect.stringContaining('already attempted') });
+    expect(t.calls).toHaveLength(1);
+  });
+
+  test('stale review head, missing pass, draft and closed PR all refuse to land', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, review: { verdict: 'pass', head: HEAD_B } }, t.live)).detail).toContain('review head mismatch');
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, review: undefined }, t.live)).detail).toContain('pass missing');
+    t.setView({ head: HEAD_A, state: 'OPEN', isDraft: true });
+    expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).detail).toContain('draft');
+    t.setView({ head: HEAD_A, state: 'CLOSED', isDraft: false });
+    expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).detail).toContain('CLOSED');
+    expect(t.calls).toHaveLength(0);
+    expect(t.card().landAttempts).toBeUndefined();
+  });
+
+  test('run PR URL must match the freshly observed PR identity', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, produced: { prUrl: 'https://github.com/owner/repo/pull/51' } }, t.live)).detail).toContain('URL mismatches');
+    expect(t.calls).toHaveLength(0);
+  });
+
+  test('missing card, PR or verified repository never invokes landing', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(undefined, 51, t.ctx, t.live)).detail).toContain('no task card');
+    expect((await executeLiveLand(t.card(), undefined, t.ctx, t.live)).detail).toContain('no PR');
+    expect((await executeLiveLand(t.card(), 51, { review: reviewed }, { ...t.live, repoCandidates: () => [] })).detail).toContain('worktree unknown');
+    expect(t.calls).toHaveLength(0);
+  });
+
+  test('one judgement cycle cannot land a second PR even when its review and head pass', async () => {
+    const t = landFixture();
+    const ctx = { ...t.ctx, cycleId: 'unique-land-cycle-51' };
+    expect((await executeLiveLand(t.card(), 51, ctx, t.live)).executed).toBe(true);
+    expect((await executeLiveLand(t.card(), 52, ctx, t.live)).detail).toContain('already landed');
+    expect(t.calls).toHaveLength(1);
+    expect(t.card().landAttempts).toHaveLength(1);
+  });
+
+  test('run id prevents a second landing when no separate judgement cycle is supplied', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, runId: 'land-cycle-from-run' }, t.live)).executed).toBe(true);
+    expect((await executeLiveLand(t.card(), 52, { ...t.ctx, runId: 'land-cycle-from-run' }, t.live)).executed).toBe(false);
+    expect(t.calls).toHaveLength(1);
+  });
+
+  test('explicit judgement cycle blocks a second PR', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'one-cycle-2026-10-08' }, t.live)).executed).toBe(true);
+    expect((await executeLiveLand(t.card(), 52, { ...t.ctx, cycleId: 'one-cycle-2026-10-08' }, t.live)).executed).toBe(false);
+    expect(t.calls).toHaveLength(1);
+  });
+
+  test('failed invocation records last 300 chars and is not retried for this PR/head', async () => {
+    const t = landFixture();
+    t.live.land = async () => ({ status: 1, stdout: '', stderr: 'e'.repeat(350) });
+    const out = await executeLiveLand(t.card(), 51, t.ctx, t.live);
+    expect(out).toMatchObject({ ok: false, executed: true, detail: 'e'.repeat(300) });
+    expect(t.card().landAttempts?.[0]).toMatchObject({ ok: false, detail: 'e'.repeat(300) });
+    expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).executed).toBe(false);
+  });
+
+  test('judgement stays shadow without propose-land config; with it binds the right PR/card and reviewed SHA', async () => {
+    const t = landFixture();
+    const results = [job({ prNumber: 51, worktreePath: '/tmp/land-wt', harvestable: true })];
+    const shadow = await recordTaskAgentShadowMove({ runId: 'land-shadow', stopReason: 'needs-human', results, selfReview: reviewed },
+      { ...t.f.deps(), liveMoves: new Set(), live: t.live });
+    expect(shadow).toMatchObject({ move: 'propose-land', executorResult: 'shadow' });
+    expect(shadow.liveMove).toBeUndefined();
+    expect(t.calls).toHaveLength(0);
+    const landed = await recordTaskAgentShadowMove({ runId: 'land-live', stopReason: 'needs-human', results, selfReview: reviewed },
+      { ...t.f.deps(), liveMoves: new Set<TaskAgentLiveMove>(['propose-land']), live: t.live });
+    expect(landed.liveMove).toMatchObject({ kind: 'land', card: 'ta-live-1', executed: true });
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
+  });
+
+  test('child review verdict and checked head reach supervisor stop and live land without direct review injection', async () => {
+    const { singleRunAsJobResult } = await import('../self-implement/self-implement-cli.js');
+    const { superviseRun } = await import('../self-dev/run-supervisor.js');
+    const { parseSelfImplementJson } = await import('../task-orchestrator/surfaces/self-implement.js');
+    const t = landFixture();
+    const base = { runId: 'ta-live-1', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: { kind: 'completed' },
+      prNumber: 51, worktreePath: '/tmp/land-wt', checkedHeadCommit: HEAD_A, reviewedHeadCommit: HEAD_A,
+      review: { verdict: 'pass', reviewed: true, mustFix: [], shouldFix: [], summary: 'review passed' } };
+    const result = singleRunAsJobResult('feature ask', base as unknown as Parameters<typeof singleRunAsJobResult>[1]);
+    expect(result.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    await superviseRun({ initial: [{ ...result, harvestable: true, branch: 'feature' }],
+      rerun: async () => { throw new Error('unexpected relaunch'); },
+      sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+      taskAgentShadow: input => recordTaskAgentShadowMove(input,
+        { ...t.f.deps(['propose-land']), live: t.live }) });
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
+    expect(t.f.logs.find(entry => entry.event === 'live-move')?.data).toMatchObject({ kind: 'land', executed: true });
+    expect(t.card().landAttempts).toHaveLength(1);
+    const unreviewed = singleRunAsJobResult('feature ask', { ...base, review: { ...base.review, reviewed: false } } as unknown as Parameters<typeof singleRunAsJobResult>[1]);
+    expect(unreviewed.selfReview).toBeUndefined();
+    const noHead = singleRunAsJobResult('feature ask', { ...base, reviewedHeadCommit: undefined } as unknown as Parameters<typeof singleRunAsJobResult>[1]);
+    expect(noHead.selfReview).toBeUndefined();
+    expect(parseSelfImplementJson(JSON.stringify(base))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    expect(parseSelfImplementJson(JSON.stringify({ ...base, reviewedHeadCommit: undefined }))?.selfReview).toBeUndefined();
+    const parsed = parseSelfImplementJson(JSON.stringify(base))!;
+    const { orchestrateSelfDev } = await import('../self-dev/orchestrate.js');
+    const jobs = await orchestrateSelfDev({ goals: [{ id: 'ta-live-1', feature: 'feature ask', openPr: true }],
+      spawn: input => ({ address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { ...parsed, branch: 'feature', harvestable: true } }) }) });
+    expect(jobs[0]?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    const stale = singleRunAsJobResult('feature ask', { ...base, reviewedHeadCommit: HEAD_B } as unknown as Parameters<typeof singleRunAsJobResult>[1]);
+    const staleMove = await recordTaskAgentShadowMove({ runId: 'stale-wired', stopReason: 'needs-human', results: [{ ...stale, taskId: 'ta-live-1' }], selfReview: stale.selfReview },
+      { ...t.f.deps(['propose-land']), live: t.live });
+    expect(staleMove.liveMove?.detail).toContain('review head mismatch');
+    expect(t.calls).toHaveLength(1);
+  });
+
+  test('config recognizes propose-land, while absent config keeps no live moves', () => {
+    const enabled = resolveTaskAgentLiveMoves(['propose-land'], {});
+    expect([...enabled.moves]).toEqual(['propose-land']);
+    expect(enabled.ignored).toEqual([]);
+    expect(resolveTaskAgentLiveMoves(undefined, {}).moves.has('propose-land')).toBe(false);
+  });
+
+  test('a second reviewed SHA on the same PR is a new one-time attempt', async () => {
+    const t = landFixture();
+    expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).executed).toBe(true);
+    t.setView({ head: HEAD_B, state: 'OPEN', isDraft: false });
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, review: { verdict: 'pass', head: HEAD_B } }, t.live)).executed).toBe(true);
+    expect(t.calls.map(call => call.head)).toEqual([HEAD_A, HEAD_B]);
+  });
+
+  test('merge operation rechecks pinned head at the side-effect boundary', async () => {
+    const { makePrManager } = await import('../autopilot/pr-manager.js');
+    const calls: string[][] = [];
+    let head = HEAD_A;
+    const manager = makePrManager((command, args) => {
+      calls.push([command, ...args]);
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') return { ok: true, out: JSON.stringify({ headRefOid: head, state: 'OPEN', isDraft: false }) };
+      return { ok: true, out: '' };
+    });
+    head = HEAD_B;
+    expect(manager.mergePrOutcome('https://github.com/owner/repo/pull/51', HEAD_A, '/tmp/land-wt')).toMatchObject({ ok: false, kind: 'state-read-failed' });
+    expect(calls.some(args => args[0] === 'gh' && args[1] === 'pr' && args[2] === 'merge')).toBe(false);
+  });
+
+  test('post-merge branch lookup and failed-merge state probes use the pinned repository cwd', async () => {
+    const { makePrManager } = await import('../autopilot/pr-manager.js');
+    const calls: Array<{ args: readonly string[]; cwd?: string }> = [];
+    const manager = makePrManager((command, args, opts) => {
+      if (command !== 'gh') return { ok: false, out: '' };
+      calls.push({ args, cwd: opts?.cwd });
+      if (args.includes('headRefOid,state,isDraft')) return { ok: true, out: JSON.stringify({ headRefOid: HEAD_A, state: 'OPEN', isDraft: false }) };
+      if (args.includes('headRefName,headRepository')) return { ok: true, out: JSON.stringify({ headRefName: 'feature', headRepository: { nameWithOwner: 'owner/repo' } }) };
+      if (args.includes('state')) return { ok: true, out: JSON.stringify({ state: 'MERGED' }) };
+      if (args.includes('merge')) return { ok: false, out: 'timeout' };
+      return { ok: true, out: '' };
+    });
+    expect(manager.mergePrOutcome('https://github.com/owner/repo/pull/51', HEAD_A, '/tmp/land-wt').ok).toBe(true);
+    expect(calls.filter(call => call.args[0] === 'pr' && call.args[1] === 'view').map(call => call.cwd)).toEqual(['/tmp/land-wt', '/tmp/land-wt', '/tmp/land-wt']);
+    expect(calls.find(call => call.args[0] === 'api')?.cwd).toBe('/tmp/land-wt');
+  });
+
+  test('merge command uses GitHub match-head-commit when pinned', async () => {
+    const { makePrManager } = await import('../autopilot/pr-manager.js');
+    const commands: string[][] = [];
+    const manager = makePrManager((command, args) => {
+      commands.push([command, ...args]);
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') return { ok: true, out: JSON.stringify({ headRefOid: HEAD_A, state: 'OPEN', isDraft: false }) };
+      return { ok: true, out: '' };
+    });
+    expect(manager.mergePrOutcome('https://github.com/owner/repo/pull/51', HEAD_A, '/tmp/land-wt').ok).toBe(true);
+    expect(commands).toContainEqual(['gh', 'pr', 'merge', '51', '--squash', '--match-head-commit', HEAD_A]);
+  });
+
+  test('failed pinned merge is not retried against a changed head', async () => {
+    const { makePrManager } = await import('../autopilot/pr-manager.js');
+    let mergeCalls = 0;
+    const manager = makePrManager((command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,state,isDraft'))
+        return { ok: true, out: JSON.stringify({ headRefOid: HEAD_A, state: 'OPEN', isDraft: false }) };
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') return { ok: true, out: JSON.stringify({ state: 'OPEN' }) };
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'merge') { mergeCalls++; return { ok: false, out: 'head changed' }; }
+      return { ok: false, out: '' };
+    });
+    expect(manager.mergePrOutcome('https://github.com/owner/repo/pull/51', HEAD_A).ok).toBe(false);
+    expect(mergeCalls).toBe(1);
+  });
+
+  test('missing self-review input remains shadow even when propose-land is configured', async () => {
+    const t = landFixture();
+    const result = await recordTaskAgentShadowMove({ runId: 'missing-review', stopReason: 'needs-human', results: [job({ prNumber: 51, worktreePath: '/tmp/land-wt' })] },
+      { ...t.f.deps(), liveMoves: new Set<TaskAgentLiveMove>(['propose-land']), live: t.live });
+    expect(result.move).toBe('review');
+    expect(result.liveMove).toBeUndefined();
+    expect(t.calls).toHaveLength(0);
+  });
+
+  test('pr land rejects invalid or unpaired head pins before any command', async () => {
+    const { runPrLand } = await import('../cli/pr-cli.js');
+    const seen: string[] = [];
+    const deps = { run: () => { throw new Error('should not run git/gh'); }, out: { log: () => {}, error: (message: string) => { seen.push(message); } } };
+    expect(await runPrLand({ pr: '51' }, deps)).toBe(1);
+    expect(await runPrLand({ expectedHead: HEAD_A }, deps)).toBe(1);
+    expect(await runPrLand({ pr: '51', expectedHead: HEAD_A, hold: true }, deps)).toBe(1);
+    expect(seen).toHaveLength(3);
+    expect(seen.every(message => message.includes('expected-head'))).toBe(true);
+  });
+
+  test('pinned CLI rejects a changed remote head before any landing side effect', async () => {
+    const { runPrLand } = await import('../cli/pr-cli.js');
+    const commands: Array<[string, readonly string[]]> = [];
+    const run = (command: string, args: readonly string[]) => {
+      commands.push([command, args]);
+      if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: HEAD_B, headRefName: 'feature', state: 'OPEN', isDraft: false, url: 'https://github.com/owner/repo/pull/51' }) };
+      return { ok: true, out: HEAD_A };
+    };
+    const errors: string[] = [];
+    expect(await runPrLand({ pr: '51', expectedHead: HEAD_A, cwd: '/tmp/never' },
+      { run, out: { log: () => {}, error: message => { errors.push(message); } } })).toBe(1);
+    expect(errors[0]).toContain('expected-head');
+    expect(commands.some(([command, args]) => command === 'gh' && args.includes('merge'))).toBe(false);
+  });
+
+  test('CLI argv pins PR and SHA without bypassing landing gates', () => {
+    expect(liveLandArgs('/repo/bin/elanous.mjs', '/universe', 51, HEAD_A, '/repo')).toEqual([
+      '/repo/bin/elanous.mjs', '--config-dir', '/universe', 'pr', 'land', '--cwd', '/repo', '--pr', '51', '--expected-head', HEAD_A,
+    ]);
   });
 });
 

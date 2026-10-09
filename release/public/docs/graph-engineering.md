@@ -130,7 +130,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 ## Workflows, tasks and intake
 
 - A **graph** is the flow: order, branches, retries, pauses for approval, reshaping, healing.
-- A **workflow** (`elanous wf`) is the body of a single node: a short DAG of prompts, HTTP calls, classification and templates.
+- In the unified model, a **workflow** is one form of a graph: a graph that starts from a schedule or trigger and runs task nodes. Existing `elanous wf` YAML workflows still run without a required schedule or trigger; when conversion is unsupported, they fall back to the original workflow runner.
 - **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (✅ 0.2.3). See [Tasks and intake](tasks-and-intake.md).
 
 ## What ships today, what is in progress
@@ -151,7 +151,8 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Supervisor adding nodes at launch and while running | 📋 designed |
 | Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | ✅ 0.2.3 |
 | Task type → a combination of templates and workflows (run · implement · research · composite) | 📋 designed |
-| Workflows as graph nodes (`wf:`) · graphs as workflow nodes | 📋 designed |
+| Workflows as one form of graph, drawn in the same editor and canvas | ✅ ships — one canvas for task nodes and execution-stage nodes; existing workflow URLs open it; `elanous wf` remains available |
+| One execution engine for workflows and graphs | 🔄 in progress — compatibility conversion is partial; unsupported workflows fall back to the original workflow runner |
 
 ### A real walk of the heal template
 
@@ -171,6 +172,6 @@ elanous graph status <graph_id>
 
 ## What this page deliberately does not claim
 
-- That the in-progress rows work today. They do not yet.
+- That the in-progress rows are fully delivered today. Compatibility conversion is partial, not one unified engine.
 - How often triage picks the right level. It is logged; its accuracy is not yet measured.
 - Any fixed count of nodes, roles or templates. The catalog and templates are the source; count them when you need to.

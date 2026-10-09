@@ -25,6 +25,11 @@ import { ensureAuthToken } from '../src/auth/acp-token.js';
 import { makeTestSpawnBackend } from '../src/nexus/supervisor/spawn.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
+// Each test boots a real in-process NEXUS (runNexus). On a loaded release-gate Pod that
+// boot took 5-12 s (event-loop stalls logged), so bun's default 5 s hook/test budget timed
+// out before any assertion ran (0.2.20 gate). Give the boot an explicit budget instead.
+const NEXUS_BOOT_TIMEOUT_MS = 60_000;
+
 let tmpRoot: string;
 let prevNexus: string | undefined;
 beforeEach(() => {
@@ -249,7 +254,7 @@ describe('HTTP /v1/registry/bindings', () => {
       cleanGhostTailscaleServeFn: async () => {},
     });
     baseUrl = handle!.httpServer!.url;
-  });
+  }, NEXUS_BOOT_TIMEOUT_MS);
   afterEach(() => { handle?.release(); handle = undefined; });
 
   async function call(path: string, init: RequestInit = {}): Promise<{ status: number; body: any }> {

@@ -14,9 +14,11 @@ nodes:
   - { node_id: pick, kind: judge, recipe: 'cmd:pick', max_visits: 1 }
   - { node_id: measure, kind: gate, recipe: 'cmd:measure', max_visits: 1 }
   - { node_id: record, kind: judge, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: main-failures, kind: judge, recipe: 'cmd:main-failures', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
   - { from: pick, on: outcome, map: { ok: measure, fail: failed, error: failed } }
   - { from: measure, on: outcome, map: { ok: record, fail: failed, error: failed } }
-  - { from: record, on: outcome, map: { ok: done, fail: failed, error: failed } }
+  - { from: record, on: outcome, map: { ok: main-failures, fail: failed, error: failed } }
+  - { from: main-failures, on: outcome, map: { ok: done, fail: failed, error: failed } }

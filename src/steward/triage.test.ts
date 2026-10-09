@@ -1267,6 +1267,102 @@ test('track table prompt lists every key and is empty without a table', () => {
   expect(trackTablePrompt(undefined)).toBe('');
 });
 
+const draftScheduleIssues: TriageIssue[] = [
+  { identifier: 'ELA-1', ref: 'wish', title: '새 기능 소원', body: '새 능력 초안' },
+  { identifier: 'ELA-2', ref: 'existing', title: '기존 기능 실행', body: '설치된 기능으로 수행' },
+];
+
+test('a never-resolving wish draft is carried after its item deadline while an existing capability launches', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-draft-timeout-'));
+  const dir = join(root, 'steward');
+  const carried: Array<{ issue: string; reason: string }> = [];
+  const unregister = debug.registerSink({ name: 'steward-draft-timeout', emit: record => {
+    if (record.category === 'steward.schedule' && record.event === 'draft-carried') {
+      const { issue, reason } = record.data as { issue: string; reason: string };
+      carried.push({ issue, reason });
+    }
+  } });
+  const spawned: string[] = [];
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify(draftScheduleIssues));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([
+      { issue: 'ELA-1', rung: 4, dependsOn: [], priority: 0, why: 'wish', capability: 'new-capability' },
+      { issue: 'ELA-2', rung: 4, dependsOn: [], priority: 1, why: 'existing', capability: 'existing-capability' },
+    ]));
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'live' }, draftItemMs: 50,
+      ask: async () => new Promise<never>(() => {}),
+      launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      launchGate: () => ({ action: 'proceed', sameGoalActiveRuns: [], budget: { action: 'proceed', reasons: [] }, reason: 'no confirmed duplicate' }),
+      spawnLaunch: args => { spawned.push(args.at(-1)!); return { pid: 99999999 }; },
+    });
+    const rows = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8')) as Array<{ issue: string; disposition: string; deferred?: true }>;
+    expect(rows.find(row => row.issue === 'ELA-1')).toMatchObject({ deferred: true, disposition: 'wait' });
+    expect(rows.find(row => row.issue === 'ELA-2')?.disposition).toBe('now');
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toContain('기존 기능 실행');
+    expect(readLaunchLedger(root).launches['ELA-1']).toBeUndefined();
+    expect(readLaunchLedger(root).launches['ELA-2']?.status).toBe('launched');
+    expect(carried).toEqual([{ issue: 'ELA-1', reason: 'timeout' }]);
+  } finally { unregister(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a wish draft throwing an ordinary error is carried without rejecting the schedule or blocking an existing row', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-draft-error-'));
+  const dir = join(root, 'steward');
+  const carried: Array<{ issue: string; reason: string }> = [];
+  const unregister = debug.registerSink({ name: 'steward-draft-error', emit: record => {
+    if (record.category === 'steward.schedule' && record.event === 'draft-carried') {
+      const { issue, reason } = record.data as { issue: string; reason: string };
+      carried.push({ issue, reason });
+    }
+  } });
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify(draftScheduleIssues));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([
+      { issue: 'ELA-1', rung: 4, dependsOn: [], priority: 0, why: 'wish', capability: 'new-capability' },
+      { issue: 'ELA-2', rung: 4, dependsOn: [], priority: 1, why: 'existing', capability: 'existing-capability' },
+    ]));
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' },
+      ask: async () => { throw new Error('draft service failed'); },
+      spawnLaunch: () => { throw new Error('shadow spawned'); },
+    });
+    const rows = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8')) as Array<{ issue: string; disposition: string; deferred?: true }>;
+    expect(rows.find(row => row.issue === 'ELA-1')).toMatchObject({ deferred: true, disposition: 'wait' });
+    expect(rows.find(row => row.issue === 'ELA-2')?.disposition).toBe('now');
+    expect(readLaunchLedger(root).launches['ELA-1']).toBeUndefined();
+    expect(readLaunchLedger(root).launches['ELA-2']?.status).toBe('shadow');
+    expect(carried).toEqual([{ issue: 'ELA-1', reason: 'error' }]);
+  } finally { unregister(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('invalid wish drafts still go to HITL and memoize the same text instead of being carried', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-draft-invalid-preserved-'));
+  const dir = join(root, 'steward');
+  let asks = 0;
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([
+      { issue: 'ELA-1', rung: 4, dependsOn: [], priority: 0, why: 'wish', capability: 'new-capability' },
+    ]));
+    const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' as const },
+      ask: async () => { asks++; return 'not json'; } };
+    await runStewardStage('schedule', deps);
+    await runStewardStage('schedule', deps);
+    expect(asks).toBe(1);
+    const rows = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8')) as Array<{ rung: string; disposition: string; why: string; deferred?: true }>;
+    expect(rows[0]).toMatchObject({ rung: 'hitl', disposition: 'hitl', why: 'working-backwards draft invalid' });
+    expect(rows[0]?.deferred).toBeUndefined();
+    expect(readLaunchLedger(root).hitl['ELA-1']).toBeDefined();
+    expect(readLaunchLedger(root).launches['ELA-1']).toBeUndefined();
+    const store = new CardStore(root);
+    try { expect(store.listCards()[0]?.sections.some(section => section.key.startsWith('hitl:draft-invalid-'))).toBe(true); }
+    finally { store.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('schedule stage reproduced from a copied steward state names the first stack line', async () => {
   const prod = join(homedir(), '.elanous', 'steward');
   const root = mkdtempSync(join(tmpdir(), 'steward-schedule-repro-'));

@@ -1,0 +1,876 @@
+{
+  "project": "외부 행정·큰 일 (COO)",
+  "source": "Linear GraphQL read-only fetchLinearProjectIssues via LINEAR_API_KEY (never write key to evidence)",
+  "status": "current-linear-cohort-official-unverified",
+  "sourceRead": {
+    "status": "success",
+    "observedAt": "2026-10-08T20:43:48.028Z",
+    "projectIssues": 33,
+    "truncated": false,
+    "result": "33 open issues; oldest 29 by Linear createdAt are ELA-22..ELA-50, followed by four ELA-51/52/53/55; current dueDate and priority checked separately; no historical snapshot"
+  },
+  "expected": {
+    "issues": 29,
+    "existingDueDates": 4,
+    "prioritizedIssues": 7,
+    "source": "request counts only; not proof of historical membership"
+  },
+  "cohort": {
+    "rule": "oldest 29 of 33 currently open project issues by Linear createdAt (observed snapshot only); historical request membership unconfirmed",
+    "excludedCurrentIssues": [
+      {
+        "identifier": "ELA-55",
+        "url": "https://linear.app/elanous-lab/issue/ELA-55/valley-대표-미팅-엘라누스-pro-기업-적용-투자-모듈-협업-valley-2027-and-project-epsilon",
+        "dueDate": null,
+        "priority": 2,
+        "createdAt": "2026-10-05T20:02:53.302Z"
+      },
+      {
+        "identifier": "ELA-53",
+        "url": "https://linear.app/elanous-lab/issue/ELA-53/특허-출원-검토-자율-목표-체계선제성기억-설계-중-출원-거리-찾기",
+        "dueDate": "2026-10-12",
+        "priority": 2,
+        "createdAt": "2026-10-04T21:13:15.688Z"
+      },
+      {
+        "identifier": "ELA-52",
+        "url": "https://linear.app/elanous-lab/issue/ELA-52/해외-상표-한국-출원일-우선권6개월-안에-미국중국인도eu일본-출원-x-국제-공개-전-출원일-확보",
+        "dueDate": null,
+        "priority": 1,
+        "createdAt": "2026-10-04T20:40:37.253Z"
+      },
+      {
+        "identifier": "ELA-51",
+        "url": "https://linear.app/elanous-lab/issue/ELA-51/soc-2iso-27001-준비-시점-판단-컴플라이언스-자동화vanta-등-검토",
+        "dueDate": "2027-01-15",
+        "priority": 4,
+        "createdAt": "2026-10-04T20:34:23.883Z"
+      }
+    ],
+    "selectionEvidence": "Linear createdAt: ELA-50 2026-10-02T03:05:50.924Z (youngest selected); ELA-51 2026-10-04T20:34:23.883Z (oldest excluded); request timestamp/list absent"
+  },
+  "verifiedIssues": [
+    {
+      "identifier": "ELA-22",
+      "title": "통신판매업 신고 — 유료 서비스(클라우드 보관함 과금) 전",
+      "url": "https://linear.app/elanous-lab/issue/ELA-22/통신판매업-신고-유료-서비스클라우드-보관함-과금-전",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:06.549Z",
+      "existingDueDate": "2026-10-23",
+      "priority": 2,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:24.786Z"
+    },
+    {
+      "identifier": "ELA-23",
+      "title": "상표 출원 — 특허법인 남촌 (ELANOUS 09·42 · ELANVITAL 35·41·42)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-23/상표-출원-특허법인-남촌-elanous-0942-elanvital-354142",
+      "state": {
+        "name": "In Progress",
+        "type": "started"
+      },
+      "updatedAt": "2026-10-05T22:34:06.881Z",
+      "existingDueDate": null,
+      "priority": 1,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:25.167Z"
+    },
+    {
+      "identifier": "ELA-24",
+      "title": "매니지드 클라우드 실행판 준비 (12월 이후 추진)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-24/매니지드-클라우드-실행판-준비-12월-이후-추진",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:23.175Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:26.912Z"
+    },
+    {
+      "identifier": "ELA-25",
+      "title": "클라우드 보관함 — 구글 로그인 · 개인 플러그인·설정·기억 (11월)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-25/클라우드-보관함-구글-로그인-개인-플러그인설정기억-11월",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:08.649Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:27.750Z"
+    },
+    {
+      "identifier": "ELA-26",
+      "title": "메타 비즈니스 포트폴리오·광고 계정 개설",
+      "url": "https://linear.app/elanous-lab/issue/ELA-26/메타-비즈니스-포트폴리오광고-계정-개설",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:23.463Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:28.253Z"
+    },
+    {
+      "identifier": "ELA-27",
+      "title": "알바트로스 다음 행사 후원·연사 제안",
+      "url": "https://linear.app/elanous-lab/issue/ELA-27/알바트로스-다음-행사-후원연사-제안",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:23.735Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:28.784Z"
+    },
+    {
+      "identifier": "ELA-28",
+      "title": "로컬 LLM 지원 ⊕ 초경량판 (11월)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-28/로컬-llm-지원-초경량판-11월",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:16.347Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:29.193Z"
+    },
+    {
+      "identifier": "ELA-29",
+      "title": "10-28 대규모 업데이트 무대 — 아이폰 듀오에서 COO 가 세 자리를 거느린다",
+      "url": "https://linear.app/elanous-lab/issue/ELA-29/10-28-대규모-업데이트-무대-아이폰-듀오에서-coo-가-세-자리를-거느린다",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:09.177Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:29.665Z"
+    },
+    {
+      "identifier": "ELA-30",
+      "title": "맥 스튜디오 M5 Ultra 512GB 편입 (10월 말)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-30/맥-스튜디오-m5-ultra-512gb-편입-10월-말",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:16.864Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:30.140Z"
+    },
+    {
+      "identifier": "ELA-31",
+      "title": "codex 크레딧 ≈19.9만 소진 (12-31 만료) · third 해지는 소진 뒤",
+      "url": "https://linear.app/elanous-lab/issue/ELA-31/codex-크레딧-199만-소진-12-31-만료-third-해지는-소진-뒤",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:17.152Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:34:31.502Z"
+    },
+    {
+      "identifier": "ELA-32",
+      "title": "방구석 리뷰룸 채널 출연 — 11월 추진",
+      "url": "https://linear.app/elanous-lab/issue/ELA-32/방구석-리뷰룸-채널-출연-11월-추진",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:18.022Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:36:03.026Z"
+    },
+    {
+      "identifier": "ELA-33",
+      "title": "비개발자 클라우드 체험 좌석(웜 스타트 · 11월) — 맥 스튜디오 ⊕ VM 16GB",
+      "url": "https://linear.app/elanous-lab/issue/ELA-33/비개발자-클라우드-체험-좌석웜-스타트-11월-맥-스튜디오-vm-16gb",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:18.521Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:56:38.193Z"
+    },
+    {
+      "identifier": "ELA-34",
+      "title": "클라우드 비용 비교(AWS·GCP·Cloudflare·Azure) ⊕ 스타트업 크레딧·제휴",
+      "url": "https://linear.app/elanous-lab/issue/ELA-34/클라우드-비용-비교awsgcpcloudflareazure-스타트업-크레딧제휴",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:18.779Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:56:39.312Z"
+    },
+    {
+      "identifier": "ELA-35",
+      "title": "에이전트 사업 정부 과제·지원사업",
+      "url": "https://linear.app/elanous-lab/issue/ELA-35/에이전트-사업-정부-과제지원사업",
+      "state": {
+        "name": "In Progress",
+        "type": "started"
+      },
+      "updatedAt": "2026-10-05T22:34:09.705Z",
+      "existingDueDate": null,
+      "priority": 2,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:56:39.972Z"
+    },
+    {
+      "identifier": "ELA-36",
+      "title": "엔젤 투자 계획 ⊕ 지분 구조 정리(가족 지분)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-36/엔젤-투자-계획-지분-구조-정리가족-지분",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:19.044Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T09:56:41.457Z"
+    },
+    {
+      "identifier": "ELA-37",
+      "title": "데이터사업자 신고 → 데이터바우처 공급기업 모집(11~12월 · 가장 이른 마감)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-37/데이터사업자-신고-데이터바우처-공급기업-모집1112월-가장-이른-마감",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:10.217Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:15:42.793Z"
+    },
+    {
+      "identifier": "ELA-38",
+      "title": "초기창업패키지 2027-01 — 사실상 마지막 «초기» 기회(최대 1억)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-38/초기창업패키지-2027-01-사실상-마지막-초기-기회최대-1억",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:19.319Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:15:43.907Z"
+    },
+    {
+      "identifier": "ELA-39",
+      "title": "킹핀 ① 화장품 원료사(매출 800억) AX 전환 — 엘라누스 첫 기업 사례",
+      "url": "https://linear.app/elanous-lab/issue/ELA-39/킹핀-화장품-원료사매출-800억-ax-전환-엘라누스-첫-기업-사례",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:10.746Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:19:16.910Z"
+    },
+    {
+      "identifier": "ELA-40",
+      "title": "킹핀 ② OpenAI 한국 — «codex 를 가장 잘 쓰는 에이전트» 제휴·토큰 지원",
+      "url": "https://linear.app/elanous-lab/issue/ELA-40/킹핀-openai-한국-codex-를-가장-잘-쓰는-에이전트-제휴토큰-지원",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:19.650Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:19:17.465Z"
+    },
+    {
+      "identifier": "ELA-41",
+      "title": "킹핀 ③ 클라우드 3사(Azure·GCP·AWS) 비용 지원·제휴",
+      "url": "https://linear.app/elanous-lab/issue/ELA-41/킹핀-클라우드-3사azuregcpaws-비용-지원제휴",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:19.981Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:19:17.981Z"
+    },
+    {
+      "identifier": "ELA-42",
+      "title": "킹핀 ④ 업스테이지 대표 미팅·협업",
+      "url": "https://linear.app/elanous-lab/issue/ELA-42/킹핀-업스테이지-대표-미팅협업",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:20.249Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:19:18.487Z"
+    },
+    {
+      "identifier": "ELA-43",
+      "title": "킹핀 ⑤ 삼성전자 빅데이터·AX센터 파일럿 제안",
+      "url": "https://linear.app/elanous-lab/issue/ELA-43/킹핀-삼성전자-빅데이터ax센터-파일럿-제안",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:20.511Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:19:18.958Z"
+    },
+    {
+      "identifier": "ELA-44",
+      "title": "경기도교육청 — 로컬 LLM ⊕ 설치형 에이전트 제휴 타진(지인 경유)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-44/경기도교육청-로컬-llm-설치형-에이전트-제휴-타진지인-경유",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:20.893Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:24:13.370Z"
+    },
+    {
+      "identifier": "ELA-45",
+      "title": "의사·한의사 AI 모임 — 전문직 사례 수집",
+      "url": "https://linear.app/elanous-lab/issue/ELA-45/의사한의사-ai-모임-전문직-사례-수집",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:21.236Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:24:14.030Z"
+    },
+    {
+      "identifier": "ELA-46",
+      "title": "화장품 원료사 AX 착수(2026-11 합의)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-46/화장품-원료사-ax-착수2026-11-합의",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:11.316Z",
+      "existingDueDate": null,
+      "priority": 0,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-09-30T10:24:14.973Z"
+    },
+    {
+      "identifier": "ELA-47",
+      "title": "10-27 기업 대표 세미나 — «AI 네이티브 한 사람이 에이전트로 회사를 운영한다» 실연(갤폴드8 ⊕ 아이폰 듀오)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-47/10-27-기업-대표-세미나-ai-네이티브-한-사람이-에이전트로-회사를-운영한다-실연갤폴드8-아이폰-듀오",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:07.452Z",
+      "existingDueDate": "2026-10-27",
+      "priority": 2,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-10-02T02:53:13.189Z"
+    },
+    {
+      "identifier": "ELA-48",
+      "title": "사무실 이전 — 12~13평 일반 사무실 · 12월 입주 · 인테리어 · 2027-01 말부터 새 사무실 (직원 2~3명 포석)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-48/사무실-이전-1213평-일반-사무실-12월-입주-인테리어-2027-01-말부터-새-사무실-직원-23명-포석",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:21.555Z",
+      "existingDueDate": "2026-11-14",
+      "priority": 2,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-10-02T03:01:31.578Z"
+    },
+    {
+      "identifier": "ELA-49",
+      "title": "새 사무실 지도·내비 등록 — 카카오맵/카카오내비 · 네이버 지도(스마트플레이스) · 현대차 내비(블루링크/ccNC) · 구글 지도(비즈니스 프로필)",
+      "url": "https://linear.app/elanous-lab/issue/ELA-49/새-사무실-지도내비-등록-카카오맵카카오내비-네이버-지도스마트플레이스-현대차-내비블루링크ccnc-구글-지도비즈니스-프로필",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:24.596Z",
+      "existingDueDate": "2027-02-15",
+      "priority": 3,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-10-02T03:03:12.490Z"
+    },
+    {
+      "identifier": "ELA-50",
+      "title": "직원 2~3명 채용 ⊕ 인건비 지원 — 청년일자리도약장려금(1인 연 720만원) 우선",
+      "url": "https://linear.app/elanous-lab/issue/ELA-50/직원-23명-채용-인건비-지원-청년일자리도약장려금1인-연-720만원-우선",
+      "state": {
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "updatedAt": "2026-10-05T22:34:21.840Z",
+      "existingDueDate": null,
+      "priority": 2,
+      "officialDeadline": null,
+      "preparationPeriod": null,
+      "representativeActionDate": null,
+      "createdAt": "2026-10-02T03:05:50.924Z"
+    }
+  ],
+  "research": {
+    "method": "2026-10-08 per-issue Firecrawl search via omni-crawl searchFirecrawl(query,{limit:3}); results are leads, not proof of absence or a deadline. Existing four previous searches retained.",
+    "leads": [
+      {
+        "identifier": "ELA-37",
+        "sourceUrl": "https://kisia.or.kr/bucket/uploads/2025/11/17/1.%202026%EB%85%84%20%EB%8D%B0%EC%9D%B4%ED%84%B0%EB%B0%94%EC%9A%B0%EC%B2%98%20%EC%A7%80%EC%9B%90%EC%82%AC%EC%97%85%20%EA%B3%B5%EA%B8%89%EA%B8%B0%EC%97%85%20%EB%AA%A8%EC%A7%91%20%EA%B3%B5%EA%B3%A0%EC%84%9C.pdf",
+        "finding": "2026 supplier call closed 2025-12-11; not evidence of a 2027 supplier deadline."
+      },
+      {
+        "identifier": "ELA-38",
+        "sourceUrl": "https://www.mss.go.kr/site/smba/ex/bbs/View.do?cbIdx=310&bcIdx=1065015",
+        "finding": "Official 2026 early-startup application closed 2026-02-13; 2027 application deadline unconfirmed."
+      },
+      {
+        "identifier": "ELA-50",
+        "sourceUrl": "https://www.moel.go.kr/news/notice/noticeView.do?bbs_seq=20260100030",
+        "finding": "2026 official youth-employment notice located; hiring and application date for this company unconfirmed."
+      },
+      {
+        "identifier": "ELA-22",
+        "sourceUrl": "https://www.gov.kr/mw/AA020InfoCappView.do?CappBizCD=11300000006",
+        "finding": "Official mail-order registration service says processing period varies; specific launch/representative action date unconfirmed."
+      }
+    ],
+    "issueChecks": [
+      {
+        "identifier": "ELA-22",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:gov.kr 통신판매업 신고 신청 처리기간",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.gov.kr/mw/AA020InfoCappView.do?CappBizCD=11300000006",
+          "title": "통신판매업신고 | 민원안내 및 신청 - 정부24",
+          "excerpt": "# 확인하세요!\n## 통신판매업신고\n### 서비스 개요\n- 신청방법\n\n- 신청자격\n\n- 처리기간\n\n[처리기간 계산 방법](https://www.gov.kr/mw/AA020InfoCappView.do?CappBizCD=11300000006#noaction)\n\n- 신청서\n\n### 신청 방법 및 절차\n참고\n\n각 기관을 선택하면 해당기관 정보조회가 가능하며, 조회된 접수/처리기관에 대한 실제 민원 접수/처리 가능여부는 해당기관에 확인해 주시기 바랍니다."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-23",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:kipo.go.kr 상표 출원 신청 지정상품 접수",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.kipo.go.kr/ko/kpoContentView.do?menuCd=SCD0200243",
+          "title": "상표우선심사제도 소개 - 지식재산처",
+          "excerpt": "신청인 상표를 출원한 출원인이나 이해관계인은 우선심사를 신청할 수 있습니다. 출원인이 출원한 상표를 지정상품의 전부에 사용하고 있거나 사용준비 중인 사실을 구체 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-24",
+        "engine": "omni-crawl/firecrawl",
+        "query": "매니지드 클라우드 서비스 구축 일정",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-25",
+        "engine": "omni-crawl/firecrawl",
+        "query": "Google OAuth 로그인 클라우드 보관함 서비스 출시",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-26",
+        "engine": "omni-crawl/firecrawl",
+        "query": "Meta 비즈니스 포트폴리오 광고 계정 개설",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://ko-kr.facebook.com/business/help/1710077379203657",
+          "title": "Meta Business Suite에서 비즈니스 포트폴리오 만들기 - Facebook",
+          "excerpt": "business.facebook.com으로 이동하여 Facebook 프로필 또는 매니지드 Meta 계정으로 로그인합니다. · 왼쪽 상단의 홈 아래에서 드롭다운 메뉴를 클릭합니다. · 비즈니스 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-27",
+        "engine": "omni-crawl/firecrawl",
+        "query": "알바트로스 행사 후원 연사 다음 행사 공고",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://event-us.kr/albatross/event",
+          "title": "알바트로스 : ALBATROSS - 이벤터스",
+          "excerpt": "알바트로스 : ALBATROSS … 현재 진행중인 행사가 없습니다. 종료 행사 26] LECTURE & NETWORKING 종료. Digital Marketing & Branding Forum 2025 : DMBF 2025 종료 강남 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-28",
+        "engine": "omni-crawl/firecrawl",
+        "query": "로컬 LLM 초경량판 출시 일정",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-29",
+        "engine": "omni-crawl/firecrawl",
+        "query": "엘라누스 10월 28일 업데이트 행사",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-30",
+        "engine": "omni-crawl/firecrawl",
+        "query": "Apple Mac Studio M5 Ultra 512GB 출시일",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.apple.com/newsroom/2026/08/apple-introduces-new-mac-studio-with-m5-max-and-m5-ultra/",
+          "title": "Apple introduces new Mac Studio with M5 Max and M5 Ultra",
+          "excerpt": "# Apple introduces new Mac Studio with M5 Max and M5 Ultra — the ultimate desktop for on‑device AI and the most extreme pro workflows\nApple’s most powerful Mac raises the bar for local AI with up to 4.3x faster performance, more advanced graphics, up to 512GB "
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-31",
+        "engine": "omni-crawl/firecrawl",
+        "query": "OpenAI codex credits expiration 2026 December 31 third",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-32",
+        "engine": "omni-crawl/firecrawl",
+        "query": "방구석 리뷰룸 채널 11월 출연 일정",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-33",
+        "engine": "omni-crawl/firecrawl",
+        "query": "엘라누스 비개발자 클라우드 체험 VM 16GB",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-34",
+        "engine": "omni-crawl/firecrawl",
+        "query": "AWS GCP Cloudflare Azure 스타트업 크레딧 신청 기한",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-35",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:bizinfo.go.kr 2027 AI 에이전트 정부 지원 사업 모집 공고",
+        "returnedHits": 2,
+        "inspectedLead": {
+          "url": "https://bizinfo.go.kr/cmm/fms/fileDown.do?atchFileId=FILE_000000000758808&fileSn=0",
+          "title": "[PDF] 동대구벤처밸리 AI테크포트 구축 사업 공고 제2026-001호",
+          "excerpt": "2026년 AI 서비스 개발·확산 지원사업 모집공고. 과학기술정보통신부 ... - 신청과제의 목표 및 내용이 타 정부지원사업에서 旣지원받았거나 현재 지원."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-36",
+        "engine": "omni-crawl/firecrawl",
+        "query": "엔젤투자 가족 지분 구조 정리 법정 기한",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.kban.or.kr/jsp/ext/iia/info.jsp",
+          "title": "개인투자조합 - ::::: 엔젤투자지원센터 :::::",
+          "excerpt": "필요서류 ; 2. 개인투자조합 등록 신청서 · 3. 규약 · 4. 결성총회 의사록(조합원 전원의 기명날인 또는 서명 포함) *규약 승인의 건 내용포함 필수 *조합원이 미성년자일 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-37",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:kdata.or.kr 2027 데이터바우처 공급기업 모집 공고 마감",
+        "returnedHits": 1,
+        "inspectedLead": {
+          "url": "https://www.kdata.or.kr/",
+          "title": "한국데이터산업진흥원 - 메인",
+          "excerpt": "K-data소식. 전체. 공지. [입찰공고] 2027년 한국데이터산업진흥원 사업관리 웹페이지 유지관리 용역 ... 2025 데이터바우처 지원사업 공급기업 모집 과학기술정보통신부와 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-38",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:mss.go.kr 2027 초기창업패키지 모집 공고 마감",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.mss.go.kr/site/smba/ex/bbs/View.do?cbIdx=310&bcIdx=1065015",
+          "title": "중소벤처기업부 - 2026년 초기창업패키지(일반형) 창업기업 모집공고",
+          "excerpt": "2026년도 초기창업패키지(일반형) 창업기업 모집공고 유망 창업 아이템 및 기술을 보유한 초기창업기업의 사업 안정화와 성장을 지원하는 『2026년도 초기 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-39",
+        "engine": "omni-crawl/firecrawl",
+        "query": "화장품 원료사 AX 엘라누스 기업 사례",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-40",
+        "engine": "omni-crawl/firecrawl",
+        "query": "OpenAI Korea agent codex partnership application deadline",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://openai.com/index/chatgpt-for-your-most-ambitious-work/",
+          "title": "ChatGPT is now a partner for your most ambitious work - OpenAI",
+          "excerpt": "Starting today, the Codex app is merging with the new ChatGPT desktop app. Codex remains the same powerful coding agent for developers and ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-41",
+        "engine": "omni-crawl/firecrawl",
+        "query": "Azure Google Cloud AWS startup credits partnership deadline",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://cloud.google.com/startup",
+          "title": "Startups | Google Cloud",
+          "excerpt": "Build and grow with $200,000 in cloud credits (or up to $350,000 for AI-first startups) through the Google for Startups Cloud Program. Apply now."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-42",
+        "engine": "omni-crawl/firecrawl",
+        "query": "업스테이지 대표 미팅 엘라누스 협업",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-43",
+        "engine": "omni-crawl/firecrawl",
+        "query": "삼성전자 빅데이터 AX 센터 엘라누스 파일럿 제안",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://news.samsung.com/kr/%EC%82%BC%EC%84%B1%EC%A0%84%EC%9E%90-%EC%99%B8%EB%B6%80-%EC%83%9D%EC%84%B1%ED%98%95-ai-%EB%8F%84%EC%9E%85%EC%9C%BC%EB%A1%9C-ax-%EB%B3%B8%EA%B2%A9%ED%99%94",
+          "title": "삼성전자, 외부 생성형 AI 도입으로 AX 본격화 - Samsung Newsroom",
+          "excerpt": "삼성전자가 글로벌 빅테크의 대표 생성형 AI를 업무에 전면 도입하기로 하고 일하는 방식을 AI 중심으로 바꾸는 'AI 전환(AI Transformation, 이하 AX)'에 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-44",
+        "engine": "omni-crawl/firecrawl",
+        "query": "경기도교육청 로컬 LLM 설치형 에이전트 제휴 공고",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.goe.go.kr/goe/na/ntt/selectNttInfo.do?nttSn=2343374&mi=10963",
+          "title": "[입찰공고] 경기형 미래학교 스페이스프로그램 개발 연구용역",
+          "excerpt": "[입찰공고] 경기형 미래학교 스페이스프로그램 개발 연구용역 ; 부서명 재무관리과 ; 공고년월일 2026/03/19 ; 공고번호 2026-119 ; 작성자 류현수 ; 등록일 2026.03.19 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-45",
+        "engine": "omni-crawl/firecrawl",
+        "query": "의사 한의사 AI 모임 전문직 사례 수집 일정",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.akomnews.com/bbs/board.php?bo_table=news&wr_id=67740",
+          "title": "AI 시대, 한의학은 어디로 가는가 > 뉴스 - 한의신문",
+          "excerpt": "이 박사는 기존의 한의 임상데이터를 활용한 빅데이터 구축을 어렵게 하는 오류요인을 짚으며 이를 해결할 방안을 제시하는 한편, 앞으로 AI 한의사 개발 ..."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-46",
+        "engine": "omni-crawl/firecrawl",
+        "query": "화장품 원료사 AX 착수 2026년 11월 엘라누스",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-47",
+        "engine": "omni-crawl/firecrawl",
+        "query": "AI 네이티브 기업 대표 세미나 2026 10 27",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-48",
+        "engine": "omni-crawl/firecrawl",
+        "query": "사무실 이전 12월 입주 엘라누스",
+        "returnedHits": 3,
+        "inspectedLead": null,
+        "finding": "Returned leads were unrelated/general; no applicable issue-specific official deadline, preparation window or representative-action date established by this search.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-49",
+        "engine": "omni-crawl/firecrawl",
+        "query": "카카오맵 네이버 스마트플레이스 구글 비즈니스 프로필 장소 등록 기한",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://business.google.com/kr/business-profile/",
+          "title": "비즈니스 프로필로 구글에서 존재감을 드러내세요 - Google Business Profile",
+          "excerpt": "# 비즈니스 프로필로 구글에서 존재감을 드러내세요\n[프로필 만들기](https://business.google.com/create/new?gmbsrc=kr-ko-z-z-z-gmb-s-z-u%7Ebgcmhp-hom_hr-u&hl=ko&skipLandingPage=true&skipPagesList=1&cbl=hr&cbp=hom&cbt=now)\n\n![](https://www.gstatic.com/marketing-cms/assets/images/ads/9b/05/69"
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      },
+      {
+        "identifier": "ELA-50",
+        "engine": "omni-crawl/firecrawl",
+        "query": "site:moel.go.kr 2026 청년일자리도약장려금 사업 신청 기한",
+        "returnedHits": 3,
+        "inspectedLead": {
+          "url": "https://www.moel.go.kr/news/notice/noticeView.do?bbs_seq=20251201775",
+          "title": "2026년도 고용창출장려금 및 고용안정장려금 사업 공고 | 고용노동부 > 뉴스",
+          "excerpt": "제목: 2026년도 고용창출장려금 및 고용안정장려금 사업 공고 ; 구분: 공고 ; 담당부서: 기업일자리지원과 ; 전화번호: 044-202-7218 ; 담당자: 이울림."
+        },
+        "finding": "Related lead returned; search excerpt does not establish an applicable company-specific official deadline, preparation window or representative-action date.",
+        "officialDeadline": null
+      }
+    ]
+  },
+  "unverified": [
+    "Historical request membership: no timestamped original 29-issue list; current oldest-29 selection is corroborated by Linear createdAt but is not a historical snapshot.",
+    "Current Linear dueDate/priority are per-issue planning fields; values at original request time not recoverable from this read.",
+    "Per-issue omni-crawl checks (research.issueChecks) and four prior leads do not establish applicable official deadlines; search results are not evidence of absence.",
+    "Preparation periods and specific representative-action dates for all 29 remain unverified; no inferred lead times or dates."
+  ]
+}

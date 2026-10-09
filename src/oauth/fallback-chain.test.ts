@@ -16,6 +16,7 @@ import {
   type RotationOutcome,
 } from './fallback-chain.js';
 import type { RotationCandidate } from './codex-account-rotation.js';
+import { judgeClaudePtyMaturity } from './claude-pty-maturity.js';
 
 const CAND: RotationCandidate = { name: 'work', storeKey: 'k', home: '/h/work', reached: undefined };
 const CHAIN_BOTH: readonly FallbackStep[] = ['codex-rotate', 'grok'];
@@ -54,10 +55,16 @@ describe('normalizeFallbackChain — 「설정이 있다」와 「유효하다�
     const { chain } = normalizeFallbackChain(undefined);
     expect(decideFallback({ rotation: { reason: 'no-candidate' }, chain, grokAvailable: true }))
       .toEqual({ action: 'switch-backend', backend: 'grok' });
+    expect(decideFallback({ rotation: { reason: 'no-candidate' }, chain, grokAvailable: false,
+      claudePtyMaturity: { mature: true } }))
+      .toEqual({ action: 'stay', why: 'grok-unavailable' });
   });
 
   it('isFallbackStep 은 아는 이름만 통과', () => {
     expect(isFallbackStep('grok')).toBe(true);
+    expect(isFallbackStep('claude-pty')).toBe(true);
+    expect(normalizeFallbackChain(['codex-rotate', 'grok', 'claude-pty']).chain)
+      .toEqual(['codex-rotate', 'grok', 'claude-pty']);
     expect(isFallbackStep('codex-rotate')).toBe(true);
     expect(isFallbackStep('gpt')).toBe(false);
     expect(isFallbackStep(null)).toBe(false);
@@ -176,6 +183,63 @@ describe('decideFallback — grok 자격이 «없을» 때', () => {
     const noStep = decideFallback({ rotation: { reason: 'no-candidate' }, chain: ['codex-rotate'], grokAvailable: false });
     const noCred = decideFallback({ rotation: { reason: 'no-candidate' }, chain: CHAIN_BOTH, grokAvailable: false });
     expect(noStep).not.toEqual(noCred);
+  });
+});
+
+describe('claude-pty 성숙 관문과 명시 체인', () => {
+  const chain = ['codex-rotate', 'grok', 'claude-pty'] as const;
+  const sample = { runCount: 10, completedCount: 8, unknownScreenCount: 0, interventionCount: 1 };
+  const input = { rotation: { reason: 'no-candidate' } as const, chain, grokAvailable: false };
+
+  it('10런·8완주·unknown 0·개입 1이면 grok 자격 부재 뒤 claude 로 전환한다', () => {
+    expect(judgeClaudePtyMaturity(sample)).toEqual({ mature: true });
+    expect(decideFallback({ ...input, claudePtyMaturity: judgeClaudePtyMaturity(sample) }))
+      .toEqual({ action: 'switch-backend', backend: 'claude' });
+    expect(describeFallback({ action: 'switch-backend', backend: 'claude' })).toContain('claude');
+  });
+
+  it('10런·6완주는 미성숙으로 멈춘다', () => {
+    const maturity = judgeClaudePtyMaturity({ ...sample, completedCount: 6 });
+    expect(maturity).toEqual({ mature: false, why: 'completion-below-70' });
+    const decision = decideFallback({ ...input, claudePtyMaturity: maturity });
+    expect(decision).toEqual({ action: 'stay', why: 'claude-pty-immature' });
+    expect(describeFallback(decision)).toContain('claude-pty-immature');
+  });
+
+  it('표본 없음·못 읽음이면 전환하지 않으며 미달과 다른 판정값을 준다', () => {
+    expect(judgeClaudePtyMaturity(null)).toEqual({ mature: false, why: 'sample-unreadable' });
+    expect(judgeClaudePtyMaturity({ ...sample, completedCount: Number.NaN }))
+      .toEqual({ mature: false, why: 'sample-unreadable' });
+    expect(judgeClaudePtyMaturity({ ...sample, completedCount: 11 }))
+      .toEqual({ mature: false, why: 'sample-unreadable' });
+    expect(decideFallback(input)).toEqual({ action: 'stay', why: 'claude-pty-immature' });
+    expect(decideFallback({ ...input, claudePtyMaturity: judgeClaudePtyMaturity(null) }))
+      .toEqual({ action: 'stay', why: 'claude-pty-immature' });
+  });
+
+  it('표본·완주·화면 unknown·개입 관문은 등호에서 통과하고 바깥에서 각각 거부한다', () => {
+    expect(judgeClaudePtyMaturity({ ...sample, runCount: 9 })).toEqual({ mature: false, why: 'too-few-samples' });
+    expect(judgeClaudePtyMaturity({ ...sample, completedCount: 7, unknownScreenCount: 1, interventionCount: 2 }))
+      .toEqual({ mature: true });
+    expect(judgeClaudePtyMaturity({ ...sample, unknownScreenCount: 2 }))
+      .toEqual({ mature: false, why: 'unknown-screen-above-10' });
+    expect(judgeClaudePtyMaturity({ ...sample, interventionCount: 3 }))
+      .toEqual({ mature: false, why: 'intervention-above-0.2' });
+  });
+
+  it('claude-pty 가 앞 칸이어도 미성숙이면 뒤의 grok 으로 간다', () => {
+    expect(decideFallback({ rotation: { reason: 'no-candidate' }, chain: ['codex-rotate', 'claude-pty', 'grok'], grokAvailable: true }))
+      .toEqual({ action: 'switch-backend', backend: 'grok' });
+  });
+
+  it('grok 자격이 있으면 기존 grok 우선이고 한도 실패의 다음 칸은 claude', () => {
+    const maturity = judgeClaudePtyMaturity(sample);
+    expect(decideFallback({ ...input, grokAvailable: true, claudePtyMaturity: maturity }))
+      .toEqual({ action: 'switch-backend', backend: 'grok' });
+    expect(decideFallback({ ...input, grokQuota: 'exhausted', grokAvailable: true, claudePtyMaturity: maturity }))
+      .toEqual({ action: 'switch-backend', backend: 'claude' });
+    expect(decideFallback({ ...input, currentStep: 'grok', currentCredentialRateLimited: true, claudePtyMaturity: maturity }))
+      .toEqual({ action: 'switch-backend', backend: 'claude' });
   });
 });
 

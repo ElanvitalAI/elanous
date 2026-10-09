@@ -18,6 +18,17 @@ test('llm.codexCreditsAllowed 는 config set → get 왕복에서 살아남는�
   expect(got.stdout.trim().split('\n').at(-1)).toBe('true');
 }, 60_000);
 
+test('llm.grokWeeklyCapPct defaults to 80 and config set → get preserves a custom cap', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'grok-weekly-cap-cfg-'));
+  dirs.push(dir);
+  const cli = (...args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', '--test', '--config-dir', dir, 'config', ...args], { cwd: join(import.meta.dir, '..'), encoding: 'utf8' });
+  expect(cli('get', 'llm.grokWeeklyCapPct').stdout.trim().split('\n').at(-1)).toBe('80');
+  expect(cli('set', 'llm.grokWeeklyCapPct', '65').status).toBe(0);
+  const got = cli('get', 'llm.grokWeeklyCapPct');
+  expect(got.status).toBe(0);
+  expect(got.stdout.trim().split('\n').at(-1)).toBe('65');
+}, 60_000);
+
 test('llm.codexQuotaPolicy 는 config set → get 왕복에서 살아남는다', () => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-policy-cfg-'));
   dirs.push(dir);

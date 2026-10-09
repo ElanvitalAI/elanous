@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makePlugin, validatePluginDir } from './plugin-maker.js';
+import { runGraph } from '../../graph-runner/runner.js';
 import { debug } from '../../debug/log.js';
 import { fromWizardLogFrame } from '../../../apps/pwa/src/lib/inside-events.js';
 import { listInstalledPlugins } from '../install/plugin-install.js';
@@ -369,33 +370,57 @@ test('unchanged single-node scaffold fails after one repair and never installs',
   const root = temp();
   let calls = 0;
   const result = await makePlugin({ request: 'unchanged', name: 'unchanged', parentDir: join(root, 'plugins-local'),
-    deps: { codex: async (_dir, prompt) => { calls++; if (calls === 2) expect(prompt).toContain('실행 노드는 2~6개여야 한다: 1개'); } } });
+    deps: { codex: async (_dir, prompt) => { calls++; if (calls === 2) expect(prompt).toContain('실행 노드는 2개 이상이어야 한다: 1개'); } } });
   expect(calls).toBe(2);
   expect(result.status).toBe('failed');
-  expect(result.errors).toContain('실행 노드는 2~6개여야 한다: 1개');
+  expect(result.errors).toContain('실행 노드는 2개 이상이어야 한다: 1개');
   expect(existsSync(result.dir)).toBe(true);
   expect(listInstalledPlugins(root)).toEqual([]);
 });
 
-test('seven execution nodes are rejected after repair without installation', async () => {
-  const root = temp();
-  let calls = 0;
-  const result = await makePlugin({ request: 'too many', name: 'too-many', parentDir: join(root, 'plugins-local'), deps: {
-    codex: async dir => {
-      calls++;
-      if (calls !== 1) return;
-      const graph = join(dir, 'graphs', 'too-many.yaml');
-      const text = readFileSync(graph, 'utf8');
-      writeFileSync(graph, text.replace('  - { node_id: done,', Array.from({ length: 6 }, (_, i) => `  - { node_id: extra${i}, kind: agent, recipe: 'cmd:main', max_visits: 1 }`).join('\n') + '\n  - { node_id: done,'));
-    },
-  } });
-  expect(calls).toBe(2);
-  expect(result.status).toBe('failed');
-  expect(result.errors).toContain('실행 노드는 2~6개여야 한다: 7개');
-  expect(listInstalledPlugins(root)).toEqual([]);
+function approvalGraphFixture(): { dir: string; graph: string; recipes: string } {
+  const dir = join(temp(), 'image-first-shorts');
+  mkdirSync(join(dir, 'graphs'), { recursive: true });
+  mkdirSync(join(dir, 'examples'));
+  writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'image-first-shorts', version: '0.1.0',
+    extensions: { 'ai.elanous': { graphs: ['./graphs/image-first-shorts.yaml'], capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'] } } }));
+  const graph = join(dir, 'graphs', 'image-first-shorts.yaml');
+  const nodes = Array.from({ length: 15 }, (_, i) => ({ node_id: `step${i}`, kind: 'agent', recipe: i < 7 ? `approval:review${i}` : 'cmd:main', max_visits: 1 }));
+  const edges = nodes.map((node, i) => ({ from: node.node_id, on: 'outcome', map: { ok: i === 14 ? 'done' : `step${i + 1}`, fail: 'failed' } }));
+  writeFileSync(graph, `graph_id: image-first-shorts\nversion: 1\nentry_node: step0\nterminal_nodes: [done, failed]\nnodes:\n${[...nodes, { node_id: 'done', kind: 'gate', recipe: 'none', max_visits: 1 }, { node_id: 'failed', kind: 'gate', recipe: 'none', max_visits: 1 }].map(node => `  - ${JSON.stringify(node)}`).join('\n')}\nedges:\n${edges.map(edge => `  - ${JSON.stringify(edge)}`).join('\n')}\n`);
+  const recipes = join(dir, 'graphs', 'recipes.yaml');
+  writeFileSync(recipes, `main:\n  command: echo ok\n  timeout_ms: 120000\n${Array.from({ length: 7 }, (_, i) => `review${i}:\n  approval: 'Review step ${i}'\n`).join('')}`);
+  writeFileSync(join(dir, 'graphs', 'run-step.ts'), "console.log(JSON.stringify({ outcome: 'ok' }));\n");
+  writeFileSync(join(dir, 'examples', 'input.json'), '{}\n');
+  return { dir, graph, recipes };
+}
+
+test('15 execution nodes including 7 approval-only recipes validate; missing and unsupported recipes are rejected', async () => {
+  const { dir, graph, recipes } = approvalGraphFixture();
+  expect(await validatePluginDir(dir)).toEqual([]);
+  const original = readFileSync(graph, 'utf8');
+  writeFileSync(graph, original.replace('approval:review0', 'approval:missing'));
+  expect(await validatePluginDir(dir)).toContain('approval recipe missing 없음');
+  writeFileSync(graph, original.replace('approval:review0', 'skill:review0'));
+  expect(await validatePluginDir(dir)).toContain('지원하지 않는 recipe: skill:review0');
+  writeFileSync(graph, original);
+  const originalRecipes = readFileSync(recipes, 'utf8');
+  writeFileSync(recipes, originalRecipes.replace('Review step 0', '   '));
+  expect(await validatePluginDir(dir)).toContain('approval recipe review0 없음');
+  expect(await validatePluginDir(dir)).toContain('잘못된 recipe: review0');
+  writeFileSync(recipes, originalRecipes.replace("  approval: 'Review step 0'", "  approval: 'Review step 0'\n  command: echo ok"));
+  expect(await validatePluginDir(dir)).toEqual([]);
+  writeFileSync(graph, original.replace('approval:review0', 'cmd:review0'));
+  expect(await validatePluginDir(dir)).toContain('recipe review0 없음');
+  const runRoot = join(temp(), 'graph-run');
+  await expect(runGraph(graph, { input: {}, deps: { root: runRoot } }))
+    .rejects.toThrow('unknown command recipe for step0: cmd:review0');
+  writeFileSync(graph, original);
+  writeFileSync(recipes, originalRecipes.replace('  timeout_ms: 120000', '  timeout_ms: 0'));
+  expect(await validatePluginDir(dir)).toContain('잘못된 recipe: main');
 });
 
-test('six execution nodes are accepted at the upper boundary', async () => {
+test('six execution nodes are accepted', async () => {
   const root = temp();
   const result = await makePlugin({ request: 'upper bound', name: 'upper-bound', parentDir: join(root, 'plugins-local'), deps: {
     codex: async dir => {

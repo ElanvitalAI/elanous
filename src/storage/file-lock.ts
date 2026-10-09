@@ -27,9 +27,13 @@ const STALE_MS = 30_000;
 const RETRY_BUSY_MS = 25;
 const MAX_TRIES = 240; // ~6s upper bound
 
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
 function busyWaitMs(ms: number): void {
+  // ⭐ A real sleep, not a CPU spin — a waiter may wait minutes (pod image ship lock, 10-08 flood).
+  try { Atomics.wait(SLEEP_CELL, 0, 0, ms); return; }
+  catch { /* Atomics.wait unavailable on this thread · fall back to the spin */ }
   const target = Date.now() + ms;
-  // Trivial busy-loop. Nothing else to do synchronously.
   while (Date.now() < target) { /* spin */ }
 }
 
@@ -37,6 +41,22 @@ export interface LockOpts {
   staleMs?: number;
   retryBusyMs?: number;
   maxTries?: number;
+  /**
+   * Sync lock only: also break the lock when the pid on its first line is a dead process
+   * (a holder killed with -9 must not wedge waiters for `staleMs`).
+   */
+  breakDeadHolder?: boolean;
+  /** Sync lock only: called once, the first time the lock is found held by someone else. */
+  onWait?: (holder: string) => void;
+}
+
+function holderIsDead(lockPath: string): boolean {
+  let pid: number;
+  try { pid = Number.parseInt(readFileSync(lockPath, 'utf8').split(/[\n:]/)[0] ?? '', 10); }
+  catch { return false; }
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try { process.kill(pid, 0); return false; }
+  catch (err) { return (err as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
 
 export type ReleaseLock = () => void;
@@ -45,6 +65,7 @@ export function acquireLockSync(lockPath: string, opts: LockOpts = {}): ReleaseL
   const staleMs = opts.staleMs ?? STALE_MS;
   const retryBusyMs = opts.retryBusyMs ?? RETRY_BUSY_MS;
   const maxTries = opts.maxTries ?? MAX_TRIES;
+  let waited = false;
 
   for (let attempt = 0; attempt < maxTries; attempt += 1) {
     try {
@@ -63,14 +84,22 @@ export function acquireLockSync(lockPath: string, opts: LockOpts = {}): ReleaseL
       if (code !== 'EEXIST') throw err;
       // Lock exists · check for staleness.
       try {
-        const age = Date.now() - statSync(lockPath).mtimeMs;
-        if (age > staleMs) {
-          try { unlinkSync(lockPath); } catch { /* race · retry */ }
+        const seen = statSync(lockPath);
+        const age = Date.now() - seen.mtimeMs;
+        if (age > staleMs || (opts.breakDeadHolder && holderIsDead(lockPath))) {
+          // Narrow the race: only unlink the file we judged (a fresh holder may have replaced it meanwhile).
+          try { if (statSync(lockPath).ino === seen.ino) unlinkSync(lockPath); } catch { /* race · retry */ }
           continue;
         }
       } catch {
         // Race: lock disappeared between EEXIST and stat → retry.
         continue;
+      }
+      if (!waited && opts.onWait) {
+        waited = true;
+        let holder = '';
+        try { holder = readFileSync(lockPath, 'utf8').trim(); } catch { /* gone */ }
+        try { opts.onWait(holder); } catch { /* observer only */ }
       }
       busyWaitMs(retryBusyMs);
     }

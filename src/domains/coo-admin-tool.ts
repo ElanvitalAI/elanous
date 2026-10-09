@@ -4,10 +4,23 @@ import { getUserConfig } from '../user-config.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { fetchLinearProjectIssues, type LinearProjectIssue } from '../connectors/linear.js';
 import { formatElanousCard } from './elanous-card.js';
+import recordedDateEvidence from './coo-admin-dates.evidence.json';
+
+type CooDateEvidence = {
+  project: string;
+  verifiedIssues: Array<{
+    identifier: string;
+    title: string;
+    url: string;
+    officialDeadline: string | null;
+    preparationPeriod: string | { start: string } | null;
+    representativeActionDate: string | null;
+  }>;
+};
 
 export const COO_ADMIN_SPEC: LLMToolSpec = {
   name: 'coo_admin',
-  description: '읽기 전용 Linear COO 행정 조회 — «행정 뭐 남았어 · COO 할 일 · 마감 다가오는 행정» 질문에 사용. 외부 행정 프로젝트의 열린 일을 마감 순으로 읽는다.',
+  description: '읽기 전용 Linear COO 행정 조회 — «행정 뭐 남았어 · COO 할 일 · 마감 다가오는 행정» 질문에 사용. 외부 행정 프로젝트의 열린 일을 우선순위와 확인된 날짜 근거로 브리핑한다.',
   parameters: { type: 'object', properties: {}, required: [] },
 };
 
@@ -16,6 +29,7 @@ export interface CooAdminDeps {
   fetch?: typeof fetch;
   project?: string;
   now?: Date;
+  dateEvidence?: CooDateEvidence;
 }
 
 /** Reads the configured Linear project without changing any Linear issue. */
@@ -32,27 +46,47 @@ export async function dispatchCooAdmin(_args: Record<string, unknown>, deps: Coo
     const issues = await fetchLinearProjectIssues({ apiKey, project, fetch: deps.fetch ?? fetch });
     const today = deps.now ?? new Date();
     const todayUtc = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
-    const daysUntil = (date: string) => Math.round((Date.parse(`${date.slice(0, 10)}T00:00:00Z`) - todayUtc) / 86_400_000);
+    const daysUntil = (date: string) => Math.round((Date.parse(`${date}T00:00:00Z`) - todayUtc) / 86_400_000);
+    const dateEvidence = deps.dateEvidence ?? (recordedDateEvidence as CooDateEvidence);
+    const verifiedDate = (date: string | null | undefined): string | null => {
+      if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+      const time = Date.parse(`${date}T00:00:00Z`);
+      return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === date ? date : null;
+    };
+    const evidenceFor = (item: LinearProjectIssue) => dateEvidence.project === project
+      ? dateEvidence.verifiedIssues.find(row => row.identifier === item.identifier && row.url === item.url && row.title === item.title)
+      : undefined;
+    const deadlineFor = (item: LinearProjectIssue) => verifiedDate(evidenceFor(item)?.officialDeadline);
+    const rank = (item: LinearProjectIssue) => item.priority === 0 ? 5 : item.priority;
     issues.sort((a, b) => {
-      const deadlineOrder = a.dueDate == null ? (b.dueDate == null ? 0 : 1)
-        : b.dueDate == null ? -1 : daysUntil(a.dueDate) - daysUntil(b.dueDate);
-      return deadlineOrder || (a.priority === 0 ? 5 : a.priority) - (b.priority === 0 ? 5 : b.priority);
+      const aDue = deadlineFor(a);
+      const bDue = deadlineFor(b);
+      return rank(a) - rank(b) || (aDue === null ? (bDue === null ? 0 : 1)
+        : bDue === null ? -1 : daysUntil(aDue) - daysUntil(bDue));
     });
     count = issues.length;
     const lines = issues.map((item: LinearProjectIssue) => {
-      const days = item.dueDate ? daysUntil(item.dueDate) : null;
+      const evidence = evidenceFor(item);
+      const due = deadlineFor(item);
+      const days = due ? daysUntil(due) : null;
       if (days !== null && days < 0) overdue++;
-      const deadline = days === null ? '마감 없음' : days < 0 ? `지남 ${-days}일` : `D-${days}`;
-      return `${deadline} · ${item.title} · ${item.state.name} · ${item.assignee?.name ?? '미배정'}\n${item.url}`;
+      const deadline = due ? `확인된 마감일 ${due} (${days !== null && days < 0 ? `지남 ${-days}일` : `D-${days}`})` : '기한 미확인 · 확인 예정일 미정';
+      const preparation = verifiedDate(typeof evidence?.preparationPeriod === 'string'
+        ? evidence.preparationPeriod : evidence?.preparationPeriod?.start);
+      const representative = verifiedDate(evidence?.representativeActionDate);
+      const dates = [preparation && `준비 시작일 ${preparation}`, representative && `대표 손이 필요한 날 ${representative}`].filter(Boolean);
+      return `${deadline} · 우선순위 ${item.priority || '미지정'} · ${item.title} · ${item.state.name} · ${item.assignee?.name ?? '미배정'}${dates.length ? ` · ${dates.join(' · ')}` : ''}\n${item.url}`;
     });
     debug.log('coo.admin', 'read', { count, overdue, reason: 'ok' });
-    const scope = issues.truncated ? '최대 250건 중 조회한 항목만 마감 순으로 표시 (이후 항목은 포함되지 않음)\n' : '';
+    const scope = issues.truncated ? '최대 250건 중 조회한 항목만 우선순위·확인된 마감 순으로 표시 (이후 항목은 포함되지 않음)\n' : '';
     const prose = lines.length ? `${scope}${lines.join('\n')}` : '남은 행정 0건';
-    const card = formatElanousCard({ kind: 'coo-admin', items: issues.map(item => ({
-      title: item.title, due: item.dueDate?.slice(0, 10) ?? null,
-      daysLeft: item.dueDate ? daysUntil(item.dueDate) : null,
-      state: item.state.name, owner: item.assignee?.name ?? '미배정', url: item.url,
-    })) });
+    const card = formatElanousCard({ kind: 'coo-admin', items: issues.map(item => {
+      const due = deadlineFor(item);
+      return {
+        title: item.title, due, daysLeft: due ? daysUntil(due) : null,
+        state: item.state.name, owner: item.assignee?.name ?? '미배정', url: item.url,
+      };
+    }) });
     return `${prose}\n${card}`;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);

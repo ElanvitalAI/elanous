@@ -1,10 +1,10 @@
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { DecisionLedger } from '../decisions/decision-ledger.js';
 import { getLastStatus } from '../domains/schedule-registry.js';
 
-export type CompletionEvidenceKind = 'research-report' | 'artifact' | 'content' | 'ops-action' | 'watch-brief' | 'decision-support';
+export type CompletionEvidenceKind = 'research-report' | 'artifact' | 'content' | 'ops-action' | 'watch-brief' | 'decision-support' | 'deliverable';
 export interface CompletionEvidenceDeps {
   ledger?: Pick<DecisionLedger, 'list'>;
   schedulesDb?: Database;
@@ -13,7 +13,7 @@ export interface CompletionEvidenceDeps {
 /** A missing record is negative evidence; a failed read is explicitly unmeasured. No store is opened or mutated here. */
 export function checkCompletionEvidence(
   kind: CompletionEvidenceKind,
-  input: { dir: string; ref: string },
+  input: { dir: string; ref: string; receipt?: boolean },
   deps: CompletionEvidenceDeps = {},
 ): { ok: boolean; ref: string; missing: string[] } {
   const missing: string[] = [];
@@ -38,6 +38,34 @@ export function checkCompletionEvidence(
   };
 
   switch (kind) {
+    case 'deliverable': {
+      const ref = input.ref.trim();
+      if (/^https?:\/\//i.test(ref)) {
+        try {
+          const url = new URL(ref);
+          if (!url.hostname || !['http:', 'https:'].includes(url.protocol)) add('산출물 링크');
+        } catch { add('산출물 링크'); }
+      } else if (!ref || /^[a-z][a-z\d+.-]*:/i.test(ref)) {
+        add('산출물 경로 또는 링크');
+      } else {
+        const path = pathFor(ref);
+        if (!path) add('못 쟀다: 경로');
+        else {
+          try {
+            const root = realpathSync(input.dir);
+            const actual = realpathSync(path);
+            const rel = relative(root, actual);
+            if (rel === '..' || rel.startsWith(`..${sep}`)) add('못 쟀다: 경로');
+            else {
+              const stat = statSync(actual);
+              if (!stat.isFile() || stat.size === 0) add('산출물 파일');
+            }
+          } catch (error) { add((error as NodeJS.ErrnoException).code === 'ENOENT' ? '산출물 파일' : '못 쟀다: 산출물 파일 읽기'); }
+        }
+      }
+      if (input.receipt !== true) add('수신 확인');
+      break;
+    }
     case 'research-report': {
       const path = file();
       if (!path) break;

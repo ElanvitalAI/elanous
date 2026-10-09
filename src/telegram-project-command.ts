@@ -121,6 +121,12 @@ export function attachTelegramProjectButtons(
       await bot.answerCallbackQuery(q.id, { text: '개인 대화에서만 고를 수 있습니다' });
       return;
     }
+    // Reject callbacks outside Telegram's 64-byte limit and empty project ids.
+    if (Buffer.byteLength(q.data, 'utf8') > 64 || q.data.length === 4) {
+      debug.log('telegram.project', 'button-rejected', { reason: 'invalid-callback-data', chatId: q.chatId });
+      await bot.answerCallbackQuery(q.id, { text: '프로젝트를 다시 골라 주세요' });
+      return;
+    }
     const chatId = q.chatId;
     const session = deps.findSession(chatId, q.threadId, bot.botId);
     if (!session) {

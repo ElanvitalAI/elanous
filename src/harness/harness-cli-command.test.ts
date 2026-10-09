@@ -764,6 +764,44 @@ describe('harness CLI command', () => {
     } finally { process.exitCode = previousExit; rmSync(root, { recursive: true, force: true }); }
   });
 
+  test('drafts metrics JSON includes overlap from injected adapters and preserves draft counts when overlap throws', async () => {
+    const lines: string[] = [];
+    const now = new Date('2026-10-08T12:00:00Z');
+    const adapters = {
+      listDrafts: async () => [], listMerged: async () => [], listRecentClosed: async () => [],
+      getActiveClaimOwner: async () => undefined, getRunStatus: async () => undefined,
+      listLiveBranches: async () => new Set<string>(), setLabels: async () => {}, closeDraft: async () => {},
+    };
+    let fail = false;
+    const overlapAdapters = {
+      ...adapters,
+      listPreflightRows: async () => {
+        if (fail) throw new Error('overlap source offline');
+        return [{ ts: now.toISOString(), data: { runId: 'run-abcdef1234', blockers: [],
+          warnings: [{ kind: 'open-pr', name: '#42' }], paths: ['src/a.ts'],
+          openPrs: { state: 'checked' }, liveRuns: { state: 'checked' } } }];
+      },
+      listSalvagedRows: async () => [],
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, overlapAdapters, repository: () => 'my/repo', now: () => now, write: (line) => lines.push(line) });
+    const previousExit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'metrics', '--json']);
+      expect(lines).toHaveLength(1);
+      const measured = JSON.parse(lines[0]!);
+      expect(measured).toMatchObject({ repository: 'my/repo', inventory: 0, needsOwner: 0, overlap: { launches24h: 1 } });
+      expect(process.exitCode).toBe(0);
+      fail = true;
+      lines.length = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'metrics', '--json']);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0]!)).toEqual({ ...measured, overlap: null });
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = previousExit; }
+  });
+
   test('draft sweep is installed by default; dry-run and apply pass repository and actions through the CLI', async () => {
     const labels: unknown[] = [];
     const closed: unknown[] = [];
@@ -790,7 +828,7 @@ describe('harness CLI command', () => {
       { adapters, repository: () => 'default/repo', write: (line) => lines.push(line) });
     const drafts = harness.commands.find((command) => command.name() === 'drafts')!;
     expect(drafts.commands.find((command) => command.name() === 'sweep')?.options.map((option) => option.long))
-      .toEqual(['--apply', '--json', '--repo']);
+      .toEqual(['--apply', '--json', '--repo', '--close-cap']);
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--repo', 'my/repo']);
     expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'my/repo', apply: false, complete: true,
       entries: [{ number: 43, action: 'close', applied: false }] });
@@ -805,6 +843,33 @@ describe('harness CLI command', () => {
     expect(labels).toEqual([]);
     expect(lines.at(-2)).toContain('#43 close:');
     expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0 · 24h 넘음 1 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
+  });
+
+  test('draft sweep --close-cap overrides config tools.selfImplement.draftSweepCloseCap; an invalid config falls back to 10', async () => {
+    const drafts = Array.from({ length: 40 }, (_, i) => ({ number: 300 + i, title: `goal ${i}`, branch: `self-impl/cap-${i}`,
+      labels: ['elanous:stalled'], createdAt: '2026-09-01T00:00:00Z' }));
+    const adapters = {
+      listDrafts: async (page: number) => page === 1 ? drafts : [],
+      listMerged: async () => [],
+      getRunStatus: async () => 'failed',
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {},
+      closeDraft: async () => {},
+    };
+    let configCap: unknown = 30;
+    const lines: string[] = [];
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'default/repo', write: (line) => lines.push(line), closeCapConfig: () => configCap });
+    const run = async (...extra: string[]) => {
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', ...extra]);
+      return JSON.parse(lines.at(-1)!) as { closed: number; closeCap: number; closeCapSource: string };
+    };
+    expect(await run()).toMatchObject({ closed: 30, closeCap: 30, closeCapSource: 'config' });
+    expect(await run('--close-cap', '5')).toMatchObject({ closed: 5, closeCap: 5, closeCapSource: 'flag' });
+    configCap = 500;
+    const errors = await captureError(() => run());
+    expect(errors.join('\n')).toContain('draftSweepCloseCap');
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ closed: 10, closeCap: 10, closeCapSource: 'default' });
   });
 
   test('draft sweep outside a git checkout uses harness.repo and never calls gh repo view', async () => {
@@ -985,7 +1050,7 @@ describe('harness CLI command', () => {
       },
     });
     expect(harness.commands.find((command) => command.name() === 'drafts')?.commands.map((command) => command.name()))
-      .toEqual(['claim', 'sweep']);
+      .toEqual(['claim', 'metrics', 'sweep']);
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', '--owner', 'T', '--note', '재작업 중']);
     expect(requests).toEqual([
       ['api', 'repos/my/repo/pulls/123'],
@@ -3567,11 +3632,12 @@ describe('harness process classification/report helpers', () => {
   });
 });
 
-test('draft sweep gh calls pass env: process.env (cron minimal PATH — Bun resolves against the startup PATH otherwise)', () => {
+test('draft sweep gh calls pass an explicit env built from process.env (cron minimal PATH — Bun resolves against the startup PATH otherwise)', () => {
   const source = require('node:fs').readFileSync(require('node:path').join(import.meta.dir, 'harness-cli-command.ts'), 'utf8') as string;
   const calls = [...source.matchAll(/execFileSync\('gh',[\s\S]*?\)\s*[;.)]/g)].map((m) => m[0]);
   expect(calls.length).toBeGreaterThan(0);
-  expect(calls.filter((call) => !call.includes('env: process.env'))).toEqual([]);
+  expect(calls.filter((call) => !/\benv\b/.test(call))).toEqual([]);
+  expect(source).toContain('const env = ghAutomationEnv(process.env);');
 });
 
 

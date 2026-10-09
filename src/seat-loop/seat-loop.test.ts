@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
+import { resolveSeat } from '../seat-address/seat-address.js';
 import * as runningRunsModule from '../self-implement/running-runs.js';
 import { dispatchHook } from '../hooks/dispatch.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -19,7 +20,8 @@ import type { Checklist } from '../release-loop/checklist.js';
 import { buildUserConfig, parseEventsConfig } from '../user-config.js';
 import { PersonaRegistry } from '../persona/registry.js';
 import { writePersonaTodos } from '../persona/persona-todo.js';
-import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, type SeatDeps } from './seat-loop.js';
+import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopTickLine, seatTargetPaths, seatTaskText, type SeatDeps, type SeatItem } from './seat-loop.js';
+import { parseAskTargetPathHints } from '../self-dev/launch-preflight.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -52,6 +54,39 @@ const neighborConfig = (mode: 'shadow' | 'live-safe') => ({ mode, seats: ['MK'],
   { id: 'op-seat', exchange: ['status' as const], heartbeat: { everyMinutes: 10, missedTicks: 2 },
     onAbsent: { action: 'escalate' as const, delegateTo: 'orchestrator' } },
 ] } });
+
+test('seat execution recognizes the registry and rejects non-seat identities before ledger writes', async () => {
+  const f = fixture();
+  try {
+    expect(resolveSeat('COO')?.id).toBe('OP');
+    expect(await runSeatLoopOnce(resolveSeat('COO')!.id, { ...f.deps, config: { mode: 'off' } }))
+      .toEqual({ seat: 'OP', status: 'skipped-off' });
+    await expect(runSeatLoopOnce('E', f.deps)).rejects.toThrow('unknown seat: E');
+    await expect(runSeatLoopOnce('XX', f.deps)).rejects.toThrow('unknown seat: XX');
+    expect(existsSync(join(f.root, 'seat-loop'))).toBe(false);
+  } finally { f.close(); }
+});
+
+test('registry neighbor title resolves to the same OP heartbeat without changing the seat ledger shape', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const bus = openSurfaceEventsDb(join(f.root, 'surface_events.db'));
+    try { recordEvent(bus, { surface: 'context:session', direction: 'outbound', kind: 'task-done',
+      text: 'OP active', refs: JSON.stringify({ seat: 'OP' }), ts: new Date(now.getTime() - 60_000).toISOString() }); }
+    finally { bus.close(); }
+    const config = neighborConfig('shadow');
+    const result = await runSeatLoopOnce('MK', { ...f.deps, versions: () => [], config: {
+      ...config, neighbors: { MK: [{ ...config.neighbors.MK[0]!, id: 'coo-seat' }] },
+    } });
+    expect(result).toMatchObject({ seat: 'MK', status: 'skipped-empty', action: 'skipped-empty' });
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'loop.neighbors' && event === 'tick'
+      && (data as { state?: string }).state === 'present')).toBe(true);
+    const row = JSON.parse(readFileSync(seatLedgerPath('MK', f.root, now), 'utf8'));
+    // IDLE-LADDER adds the empty-queue metric to skipped-empty rows; the neighbor title adds nothing.
+    expect(Object.keys(row).sort()).toEqual(['action', 'at', 'emptyQueueMinutes', 'seat', 'status', 'ts']);
+  } finally { spy.mockRestore(); f.close(); }
+});
 
 test('live-safe request names the OP shadow-only implementation and emits one downgrade log', async () => {
   const f = fixture();
@@ -2442,4 +2477,35 @@ test('SEAT-FORBID-NEGATION: a forbidden word next to a negation is not a decisio
     const raise = calls.find(args => args[1] === 'raise')!;
     expect(raise[raise.indexOf('--pending-question') + 1]).toContain(FORBID_JUDGMENT_LINE('비밀'));
   } finally { f.close(); }
+});
+
+// AUTO-TARGET: checklist evidence paths become the ask's first-line `대상 경로:` label.
+const targetItem: SeatItem = { source: 'checklist', kind: 'cell', id: 'AUTO-TARGET', version: '0.2.22', title: '자리 루프 발사 경로 자동',
+  text: '자리 루프 발사 경로 자동', evidence: '착지 #1 · 남은 것 src/a/b.ts 와 scripts/c.ts 그리고 src/none.ts', status: 'yellow' };
+const targetOneLine = '[UX 자리 · 0.2.22 체크리스트 칸 AUTO-TARGET · 역할 docs/roles/UX.md] 자리 루프 발사 경로 자동';
+const onlyAB = (path: string) => path === 'src/a/b.ts' || path === 'scripts/c.ts';
+
+test('AUTO-TARGET: evidence paths that exist lead the checklist ask as `대상 경로:` and the old line follows unchanged', () => {
+  const text = seatTaskText('UX', targetItem, onlyAB);
+  const [first, second, ...rest] = text.split('\n');
+  expect(first).toBe('대상 경로: src/a/b.ts · scripts/c.ts');
+  expect(second).toBe(targetOneLine);
+  expect(rest).toEqual([]);
+  expect(seatTaskText('UX', targetItem, onlyAB)).toBe(text);
+});
+
+test('AUTO-TARGET: the label is read back by parseAskTargetPathHints', () => {
+  expect([...parseAskTargetPathHints(seatTaskText('UX', targetItem, onlyAB))]).toEqual(['src/a/b.ts', 'scripts/c.ts']);
+});
+
+test('AUTO-TARGET: items without path fragments and request items keep the old one-line text', () => {
+  const always = () => true;
+  const bare = { ...targetItem, evidence: '착지 #1 · 남은 것 없음' };
+  expect(seatTaskText('UX', bare, always)).toBe(targetOneLine);
+  expect(seatTaskText('UX', { ...targetItem, source: 'request' }, always)).toBe('[UX 자리 · 자리 요청 AUTO-TARGET · 역할 docs/roles/UX.md] 자리 루프 발사 경로 자동');
+});
+
+test('AUTO-TARGET: paths are deduplicated, capped at six, refuse `..` and drop trailing punctuation', () => {
+  const evidence = 'src/x.ts. src/x.ts src/../etc/passwd ' + Array.from({ length: 8 }, (_, i) => `src/f${i}.ts`).join(' ');
+  expect(seatTargetPaths({ ...targetItem, evidence }, () => true)).toEqual(['src/x.ts', 'src/f0.ts', 'src/f1.ts', 'src/f2.ts', 'src/f3.ts', 'src/f4.ts']);
 });

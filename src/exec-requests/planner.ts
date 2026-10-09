@@ -7,6 +7,7 @@ import { defaultGraphsDir } from '../self-implement/graph-templates.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import type { ExecAttachment } from './store.js';
 import { debug } from '../debug/log.js';
+import { peerEditRunGate } from '../nexus/api/graph-peer-edit.js';
 import { OUTPUT_KINDS, pickDefaultOutput, type OutputKind } from './default-outputs.js';
 
 export interface InstalledGraph {
@@ -105,6 +106,11 @@ async function coreAndMineGraphs(coreDir: string, mineDir: string): Promise<Inst
           const id = doc?.graph_id;
           if (typeof id !== 'string' || !/^[a-z0-9-]+$/.test(id) || seen.has(id)) continue;
           if (core && doc?.loop?.exec_request !== true) continue;
+          // W9c — a «mine» graph a peer changed is not runnable until the owner approves it (fail closed).
+          if (!core) {
+            const gate = peerEditRunGate(dir, id);
+            if (!gate.ok) { debug.log('exec-requests', 'skipped-peer-edit', { id, error: gate.error }); continue; }
+          }
           const inputs = doc?.loop?.inputs;
           const inputKeys = core && Array.isArray(inputs)
             ? inputs.filter((key): key is string => typeof key === 'string')

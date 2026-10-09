@@ -33,6 +33,23 @@ export function ChatCurrentProject({ compact = false }: { compact?: boolean }) {
   const [error, setError] = useState('');
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
+  const [folder, setFolder] = useState('');
+  const [browser, setBrowser] = useState<Awaited<ReturnType<ProjectsApi['folders']>> | null>(null);
+  const [folderError, setFolderError] = useState(false);
+  const [folderLoading, setFolderLoading] = useState(false);
+  const folderRequest = useRef(0);
+  const creatingProjectRef = useRef(false);
+  const browse = async (path?: string) => {
+    const request = ++folderRequest.current;
+    setFolderError(false);
+    setFolderLoading(true);
+    setBrowser(null);
+    try {
+      const next = await new ProjectsApi(client).folders(path);
+      if (request === folderRequest.current) setBrowser(next);
+    } catch { if (request === folderRequest.current) setFolderError(true); }
+    finally { if (request === folderRequest.current) setFolderLoading(false); }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -75,7 +92,17 @@ export function ChatCurrentProject({ compact = false }: { compact?: boolean }) {
     return () => { alive = false; };
   }, [client, sessionId, revision]);
 
-  useEffect(() => { setError(''); setCreating(false); refreshedRef.current = null; failedPendingRef.current = null; }, [sessionId]);
+  useEffect(() => {
+    folderRequest.current++;
+    setBrowser(null);
+    setFolder('');
+    setFolderError(false);
+    setFolderLoading(false);
+    setError('');
+    setCreating(false);
+    refreshedRef.current = null;
+    failedPendingRef.current = null;
+  }, [sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -161,7 +188,7 @@ export function ChatCurrentProject({ compact = false }: { compact?: boolean }) {
   const projectLabel = projectId ? projects.find((project) => project.id === projectId)?.name ?? '알 수 없는 프로젝트' : '프로젝트 없음';
 
   return (
-    <div className={compact ? 'relative flex min-w-0 items-center gap-1.5 text-xs' : 'flex min-w-0 items-center gap-1.5 text-xs'}>
+    <div className={compact ? 'relative flex min-w-0 items-center gap-1.5 text-xs' : 'flex min-w-0 flex-wrap items-center gap-1.5 text-xs'}>
       <label htmlFor="chat-current-project" className={compact ? 'sr-only' : 'shrink-0 text-muted-foreground'}>프로젝트</label>
       <select id="chat-current-project" aria-label="현재 대화 프로젝트" title={sessionId && sessionLoaded === sessionId && !loading ? `현재 프로젝트: ${projectLabel}` : '프로젝트 확인 중…'} value={sessionId && sessionLoaded === sessionId && !loading ? projectId ?? '' : 'loading'}
         disabled={!sessionId || sessionLoaded !== sessionId || loading || projectsLoading || saving || assigningRef.current === sessionId || projectsError}
@@ -180,20 +207,31 @@ export function ChatCurrentProject({ compact = false }: { compact?: boolean }) {
       {creating && <form onSubmit={(event) => {
         event.preventDefault();
         const trimmed = name.trim();
-        if (!trimmed || !sessionId || sessionLoaded !== sessionId || loading || projectsLoading || projectsError || saving || creatingProject) return;
+        if (!trimmed || !sessionId || sessionLoaded !== sessionId || loading || projectsLoading || projectsError || saving || creatingProjectRef.current || folderLoading) return;
+        creatingProjectRef.current = true;
         setCreatingProject(true);
         setError('');
-        void new ProjectsApi(client).create(trimmed).then(async ({ project }) => {
+        void new ProjectsApi(client).create(trimmed, folder || undefined).then(async ({ project }) => {
           setProjects((previous) => [...previous, project]);
           const assigned = await change(project.id, true);
           notifyProjectsChanged();
-          if (assigned) { setCreating(false); setName(''); }
+          if (assigned) { folderRequest.current++; setCreating(false); setName(''); setFolder(''); setBrowser(null); }
         }).catch(() => setError('프로젝트를 만들지 못했습니다'))
-          .finally(() => setCreatingProject(false));
-      }} className={compact ? 'absolute right-0 top-full z-50 mt-1 flex items-center gap-1 rounded-lg border border-border bg-popover p-2 shadow-lg' : 'flex min-w-0 items-center gap-1'}>
+          .finally(() => { creatingProjectRef.current = false; setCreatingProject(false); });
+      }} className={compact ? 'absolute right-0 top-full z-50 mt-1 flex flex-wrap items-center gap-1 rounded-lg border border-border bg-popover p-2 shadow-lg' : 'flex min-w-0 flex-wrap items-center gap-1'}>
         <input aria-label="새 프로젝트 이름" autoFocus maxLength={80} value={name} onChange={(event) => setName(event.target.value)} className="w-24 rounded border border-border bg-background px-1 py-1" />
-        <button type="submit" disabled={saving || creatingProject || !sessionId || sessionLoaded !== sessionId || projectsLoading || projectsError} className="rounded border border-border px-1">만들기</button>
+        <button type="submit" disabled={saving || creatingProject || folderLoading || !sessionId || sessionLoaded !== sessionId || projectsLoading || projectsError} className="rounded border border-border px-1">만들기</button>
+        <button type="button" aria-label="원격 폴더 고르기" disabled={creatingProject || folderLoading} onClick={() => void browse()} className="rounded border border-border px-1">폴더</button>
       </form>}
+      {creating && browser && <div role="group" aria-label="원격 폴더 목록" className={compact ? 'absolute right-0 top-full z-50 mt-12 max-h-48 w-64 max-w-[90vw] overflow-y-auto rounded border border-border bg-popover p-2 shadow-lg' : 'max-h-48 w-64 max-w-[90vw] overflow-y-auto rounded border border-border bg-popover p-2 shadow-lg'}>
+        <p className="break-all">{browser.path}</p>
+        {browser.parent && <button type="button" aria-label="상위 폴더" onClick={() => void browse(browser.parent ?? undefined)} className="block w-full text-left">..</button>}
+        {browser.folders.map(item => <button key={item.path} type="button" onClick={() => void browse(item.path)} className="block w-full truncate text-left">{item.name}/</button>)}
+        <button type="button" disabled={folderLoading || creatingProject} onClick={() => { folderRequest.current++; setFolderLoading(false); setFolder(browser.path); setBrowser(null); }} className="rounded border border-border px-1">이 폴더 선택</button>
+      </div>}
+      {creating && folder && <span className="break-all text-xs">선택한 폴더: {folder}</span>}
+      {creating && folderLoading && <span role="status">폴더 불러오는 중…</span>}
+      {creating && folderError && <span role="alert">폴더를 불러오지 못했습니다</span>}
       {((sessionId && sessionLoaded !== sessionId && !loading) || projectsError) && <button type="button" aria-label="프로젝트 다시 확인" onClick={() => { setError(''); setRevision((value) => value + 1); if (projectsError) setProjectsRevision((value) => value + 1); }} className="rounded border border-border px-1">다시 시도</button>}
       {(error || projectsError) && <span role="alert" className="text-destructive">{error || '프로젝트 목록을 불러오지 못했습니다'}</span>}
     </div>

@@ -273,6 +273,20 @@ describe('project callback buttons', () => {
     f.unsubscribe();
   });
 
+  it('rejects empty or oversized project callback ids before session lookup', async () => {
+    const f = callbackFixture(research.id);
+    await f.tap('prj:');
+    await f.tap(`prj:${'가'.repeat(21)}`);
+    expect(f.lookup).toEqual([]);
+    expect(f.updates).toEqual([]);
+    expect(f.current.projectId).toBe(research.id);
+    expect(f.messages).toEqual([]);
+    expect(f.acks).toEqual(['tap', 'tap']);
+    expect(events().filter(call => call[1] === 'button-rejected').map(call => (call[2] as { reason: string }).reason))
+      .toEqual(['invalid-callback-data', 'invalid-callback-data']);
+    f.unsubscribe();
+  });
+
   it('rejects non-owner or non-private taps before looking up a session or updating it', async () => {
     const f = callbackFixture();
     await f.tap(`prj:${research.id}`, { userId: 43 });

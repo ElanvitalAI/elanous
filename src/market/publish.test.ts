@@ -364,6 +364,57 @@ describe('publishMarket', () => {
     expect(existsSync(join(outDir, 'plugins'))).toBe(false);
   }));
 
+  test('keepExisting adds one new plugin and carries the other published entries over byte-identical', () => fixture(root => {
+    for (const name of ['alpha', 'beta']) {
+      mkdirSync(join(root, 'skills', name), { recursive: true });
+      writeFileSync(join(root, 'skills', name, 'SKILL.md'), name);
+    }
+    plugin(root, 'bundled-one');
+    plugin(root, 'bundled-two');
+    plugin(root, 'plain-old');
+    setBundle(root, 'bundled-one', ['skills/alpha']);
+    setBundle(root, 'bundled-two', ['skills/beta']);
+    const pair = generateIndexKeyPair();
+    const outDir = join(root, 'out');
+    const trustedKeys = [{ keyId: pair.keyId, publicKey: pair.publicKey }];
+    const base = { bundleRoot: root, outDir, market: { name: 'elanous', displayName: 'Elanous' }, key: pair };
+    const first = publishMarket({ ...base, pluginsDir: join(root, 'plugins') });
+    expect(first.published.map(item => item.name)).toEqual(['bundled-one', 'bundled-two', 'plain-old']);
+    expect(first.kept).toEqual([]);
+    const before = JSON.parse(readFileSync(join(outDir, 'marketplace.json'), 'utf8'));
+    const archivesBefore = before.plugins.map((item: { artifact: { key: string } }) => readFileSync(join(outDir, item.artifact.key)));
+    const unpackedBefore = before.plugins.map((item: { name: string }) => treeNames(join(outDir, 'plugins', item.name)));
+    // The bundled sources drift, so republishing them would conflict; --keep-existing must not touch them.
+    writeFileSync(join(root, 'skills', 'alpha', 'SKILL.md'), 'alpha changed');
+    const fresh = join(root, 'fresh');
+    mkdirSync(join(fresh, 'new-pack'), { recursive: true });
+    writeFileSync(join(fresh, 'new-pack', 'plugin.json'), JSON.stringify({ name: 'new-pack', version: '1.0.0',
+      description: 'new', extensions: { 'ai.elanous': { capabilities: [], connectors: [] } } }));
+    writeFileSync(join(fresh, 'new-pack', 'payload'), 'new');
+    const second = publishMarket({ ...base, pluginsDir: fresh, keepExisting: true });
+    expect(second).toMatchObject({ ok: true, sequence: 2, skipped: [] });
+    expect(second.published.map(item => item.name)).toEqual(['new-pack']);
+    expect(second.kept).toEqual(before.plugins.map((item: { name: string; version: string; artifact: { sha256: string } }) =>
+      ({ name: item.name, version: item.version, sha256: item.artifact.sha256 })));
+    const bytes = readFileSync(join(outDir, 'marketplace.json'));
+    const after = JSON.parse(bytes.toString());
+    expect(after.sequence).toBe(before.sequence + 1);
+    expect(after.plugins.map((item: { name: string }) => item.name)).toEqual(['bundled-one', 'bundled-two', 'new-pack', 'plain-old']);
+    for (const [i, old] of before.plugins.entries()) {
+      const carried = after.plugins.find((item: { name: string }) => item.name === old.name);
+      expect(JSON.stringify(carried)).toBe(JSON.stringify(old));
+      expect(readFileSync(join(outDir, old.artifact.key)).equals(archivesBefore[i])).toBe(true);
+      expect(treeNames(join(outDir, 'plugins', old.name))).toEqual(unpackedBefore[i]);
+    }
+    expect(verifyIndex({ marketplaceBytes: bytes, signatureText: readFileSync(join(outDir, 'index.sig'), 'utf8'), trustedKeys }))
+      .toMatchObject({ ok: true, sequence: 2 });
+    expect(readFileSync(join(outDir, '.agents', 'plugins', 'marketplace.json')).equals(bytes)).toBe(true);
+    // Without the flag the index still describes only the folders under --dir.
+    const third = publishMarket({ ...base, pluginsDir: fresh });
+    expect(third.kept).toEqual([]);
+    expect(JSON.parse(readFileSync(join(outDir, 'marketplace.json'), 'utf8')).plugins.map((item: { name: string }) => item.name))
+      .toEqual(['new-pack']);
+  }));
   test('bundled skills are canonicalized, signed and unpacked identically for local Codex', () => fixture(root => {
     plugin(root, 'free-plugin');
     for (const [name, filename] of [['alpha', 'SKILL.md'], ['beta', 'skill.md']]) {
@@ -446,7 +497,7 @@ describe('publishMarket', () => {
       market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
     const byName = new Map(result.published.map(item => [item.name, item]));
     expect(result.ok).toBe(false);
-    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-essentials', 'elanous-hwp', 'video-broll', 'video-explainer']);
+    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-essentials', 'elanous-hwp', 'image-first-shorts', 'video-broll', 'video-explainer']);
     expect(byName.get('elanous-basics')?.bundled).toContain('google-workspace');
     expect(byName.get('elanous-hwp')?.bundled).toEqual([]);
     expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.2');
@@ -475,6 +526,11 @@ describe('publishMarket', () => {
       signatureText: readFileSync(join(root, 'out', 'index.sig'), 'utf8'),
       trustedKeys: [{ keyId: pair.keyId, publicKey: pair.publicKey }] }).ok).toBe(true);
     expect(treeNames(join(root, 'out', 'plugins', 'elanous-hwp'))).toEqual(hwp);
+    expect(byName.get('image-first-shorts')?.bundled).toEqual([]);
+    const shorts = archiveNames(readFileSync(join(root, 'out', entry('image-first-shorts').artifact.key)));
+    for (const name of ['LICENSE', 'SOURCE.md', 'graphs/image-first-shorts.yaml', 'graphs/recipes.yaml', 'graphs/run-step.ts', 'skills/image-first-shorts/SKILL.md']) {
+      expect(shorts).toContain(name);
+    }
     expect(existsSync(join(repo, 'packs', 'elanous-basics', 'skills'))).toBe(false);
     expect(existsSync(join(repo, 'packs', 'video-broll', 'graphs'))).toBe(false);
   }));

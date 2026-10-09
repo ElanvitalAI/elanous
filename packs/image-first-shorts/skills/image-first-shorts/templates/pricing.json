@@ -1,0 +1,7 @@
+{
+ "_source": "출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트 pipeline.yaml budgets(2026-10 실측) · 원작자 허락(2026-10-08) · 출처 명기 조건",
+ "_warn": "단가는 바뀐다 — 생성 «직전» 화면에 뜬 비용으로 재확인하고, 다르면 이 파일을 고친다(키트 guard 원칙)",
+ "flow_720p_first_frame": {"4": 7, "6": 10, "8": 12},
+ "flow_ingredients": 20,
+ "regen_per_shot_max": 1
+}

@@ -34,7 +34,9 @@ export function isIrreversible(entry: Pick<DecisionEntry, 'category'>): boolean 
   return IRREVERSIBLE.has(entry.category);
 }
 
-const kst = (at: string) => new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at));
+const kst = (at: string) => Number.isFinite(Date.parse(at))
+  ? new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at))
+  : '읽을 수 없음';
 
 /** The card opens with a short pitch; the full question and choice buttons remain below it. */
 export function renderCardText(e: DecisionEntry, extra: { note?: string; confirm?: string } = {}): string {
@@ -101,6 +103,7 @@ interface CardState {
    *  deploy); they stay reachable through `/decisions`. */
   since?: string;
   cards: Record<string, { refs: CardRef[]; closed?: boolean; remindedAt?: string; note?: string; attempts?: number; noSubscribers?: boolean }>;
+  deferred?: Record<string, true>;
   testOriginQuestions?: Record<string, true>;
 }
 
@@ -113,6 +116,10 @@ export interface DecisionCardServiceOptions {
   /** Where this platform keeps which card it sent (one file per platform — the two bots may run in different processes). */
   statePath?: string;
   now?: () => Date;
+  /** Optional gate for new-card delivery. Omit to send every eligible open decision. */
+  sendFilter?: (entry: DecisionEntry, now: Date) => boolean;
+  /** Label recorded in the `push-deferred` observation when `sendFilter` holds a decision back. */
+  deferredReason?: (entry: DecisionEntry, now: Date) => string;
   /** Tell the seat that raised it. Default: none (observed only). */
   replyToRaiser?: (entry: DecisionEntry, via: CardPlatform) => Promise<void>;
 }
@@ -223,6 +230,18 @@ export class DecisionCardService {
       const card = state.cards[e.id];
       if (e.status === 'open' && (!card || (platform === 'webpush' && !card.refs.length && (card.attempts ?? 0) < WEBPUSH_MAX_SEND_ATTEMPTS))
         && e.options.length >= 2 && e.raisedAt !== undefined && e.raisedAt >= state.since) {
+        if (this.opts.sendFilter) {
+          const now = this.now();
+          if (!this.opts.sendFilter(e, now)) {
+            if (!state.deferred?.[e.id]) {
+              (state.deferred ??= {})[e.id] = true;
+              dirty = true;
+              debug.log(platform === 'webpush' ? 'decisions.webpush' : 'decisions.telegram', 'push-deferred',
+                { ...(platform === 'webpush' ? {} : { platform }), id: e.id, urgency: this.opts.deferredReason?.(e, now) ?? 'filtered' });
+            }
+            continue;
+          }
+        }
         if (platform === 'webpush' && !chats.length) {
           if (!card?.noSubscribers) {
             state.cards[e.id] = { ...(card ?? { refs: [] }), noSubscribers: true };

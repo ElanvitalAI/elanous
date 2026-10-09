@@ -83,6 +83,8 @@ export interface TaskCard {
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
   /** TA-JUDGE-LIVE-SAFE — live `review` 수가 리뷰를 요청한 PR 머리들(머리마다 한 번 · 띄우기 실패면 error · 이력은 지우지 않는다). */
   reviewRequests?: Array<{ pr: number; head: string; at: string; error?: string }>;
+  /** Live land attempts, claimed before invocation, once per PR head even if the command fails. */
+  landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string }>;
 }
 
 /** 런 원장에서 묶은 PR — url 은 원장(pr-opened · Pod job-finished)에 있을 때만(지어내지 않는다). */

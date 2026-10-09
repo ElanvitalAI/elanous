@@ -76,7 +76,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
   edges: readonly ActivityEdge[];
   seenAt: Readonly<Record<string, number>>;
   now: number;
-  state: 'loading' | 'ready' | 'error';
+  state: 'loading' | 'ready' | 'error' | 'unauthorized';
   seatIds?: readonly string[];
   /** near 줌 노드 안쪽 — LoopAgentsScene 이 이미 읽은 자리·런 데이터(노드 id → 칸). */
   details?: Readonly<Record<string, NodeDetailSource>>;
@@ -190,6 +190,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
       </li>)}</ol>}
     </section>}
     {state === 'error' && <p role="alert" className="text-red-300">지도 원천을 읽지 못했습니다. 이전 지도가 보이면 현재 데이터가 아닙니다. 데몬 연결을 확인하세요.</p>}
+    {state === 'unauthorized' && <p role="alert" className="text-red-300">지도 원천에 접근 권한이 없습니다 — 토큰으로 다시 붙으세요</p>}
     {state === 'loading' && <p role="status">지도를 읽는 중…</p>}
     <div className="h-[440px] min-w-0 w-full overflow-hidden rounded-2xl border border-slate-600 bg-[#10243b]" aria-label="자리와 루프 관계도">
       <ReactFlow key={state === 'loading' ? 'loading' : 'loaded'} nodes={flowNodes} edges={flowEdges} nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES} fitView minZoom={0.25} maxZoom={2.5}

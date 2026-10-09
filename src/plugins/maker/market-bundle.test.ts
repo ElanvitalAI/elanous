@@ -111,6 +111,58 @@ test('private identifier in an authored file still fails the leak gate when run 
   expect(existsSync(output)).toBe(false);
 });
 
+test.each([
+  ['secret-value', 'API_KEY=exampleOnlyToken1234567890'],
+  ['secret-value', '{"api_key":"exampleOnlyToken1234567890"}'],
+  ['secret-value', 'password="p@ssw0rd!"'],
+  ['secret-value', '{"client_secret": "x!9"}'],
+  ['secret-value', "db passwd: hunter2"],
+  ['secret-value', "secret: 'k'"],
+  ['personal-information', '담당자 test.person@example.invalid'],
+  ['internal-identifier', '사번: EMP-938475'],
+  ['sales-confidential', '영업 기밀: 가짜 거래처 샘플의 할인율은 47%'],
+])('knowledge-pack DLP refuses %s before creating output without echoing source text', (reason, planted) => {
+  const { plugin, output, root } = fixture();
+  writeFileSync(join(plugin, 'knowledge.md'), planted + '\n');
+  let message = '';
+  try { bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json')); }
+  catch (error) { message = (error as Error).message; }
+  expect(message).toContain(`market bundle DLP: knowledge.md: ${reason}`);
+  expect(message).not.toContain(planted);
+  expect(existsSync(output)).toBe(false);
+});
+
+test('NUL-containing included knowledge is rejected with reasons and no output', () => {
+  const { plugin, output, root } = fixture();
+  const knowledge = join(plugin, 'knowledge.md');
+  writeFileSync(knowledge, '가짜 거래처\u0000영업 기밀: 할인율 47%');
+  expect(() => bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json')))
+    .toThrow('market bundle DLP: knowledge.md: sales-confidential, unscannable-content');
+  expect(existsSync(output)).toBe(false);
+  writeFileSync(knowledge, '공개\u0000자료');
+  expect(() => bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json')))
+    .toThrow('market bundle DLP: knowledge.md: unscannable-content');
+  expect(existsSync(output)).toBe(false);
+});
+
+test('knowledge-pack DLP gives every reason but a clean pack bundles without publishing', () => {
+  const { root, plugin, output } = fixture();
+  const knowledge = join(plugin, 'knowledge.md');
+  writeFileSync(knowledge, 'Bearer abcdefghijklmnopqrst\ncontact@example.invalid\ninternal_id: EMP-938475\nsales confidential\n');
+  expect(() => bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json')))
+    .toThrow('market bundle DLP: knowledge.md: secret-value, personal-information, internal-identifier, sales-confidential');
+  expect(existsSync(output)).toBe(false);
+  writeFileSync(knowledge, '# 공개 가능한 반도체 공정 지식\n공정 노트: 웨이퍼를 세정한 다음 건조합니다.\n');
+  const published = spyOn(globalThis, 'fetch');
+  try {
+    const result = bundleInstalledWizardPlugin(plugin, output, join(root, 'no-config.json'));
+    expect(readdirSync(output).sort()).toEqual(['demo-plugin-0.1.0.tgz', 'marketplace.json']);
+    expect(Bun.spawnSync(['tar', '-xOzf', result.artifact, 'knowledge.md']).stdout.toString())
+      .toContain('웨이퍼를 세정한 다음 건조합니다.');
+    expect(published).toHaveBeenCalledTimes(0);
+  } finally { published.mockRestore(); }
+});
+
 test('malformed manifest and missing referenced asset are refused without output', () => {
   const { plugin, output, root } = fixture();
   writeFileSync(join(plugin, 'plugin.json'), '{bad json');

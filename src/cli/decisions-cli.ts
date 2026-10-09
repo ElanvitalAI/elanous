@@ -11,6 +11,7 @@ import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';
+import { writeStdoutFully } from './stdout-flush.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
 function date(raw?: string): string | undefined {
@@ -75,14 +76,24 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     return hqCliWriteAllowed(`decisions ${command}`, Boolean(override || root.opts().hqOverride),
       (getElanousConfigDirOverride() || config.stateDir) && !hqDeps.store && !getUserConfig().hq?.arbiter ? { ...hqDeps, store: fileLeaseStore(join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'lease.json')), seenPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'seen-generation'), localPath: join(config.stateDir ?? effectiveInstanceRoot(), 'hq', 'local.json') } : hqDeps);
   };
-  const emit = (value: unknown, json?: boolean, text?: string) => out.log(json ? JSON.stringify(value) : text ?? JSON.stringify(value));
-  const fail = (action: () => void) => { try { action(); } catch (e) { throw new Error(`decisions: ${e instanceof Error ? e.message : String(e)}`); } };
+  const emit = (value: unknown, json?: boolean, text?: string): void | Promise<void> => {
+    const line = json ? JSON.stringify(value) : text ?? JSON.stringify(value);
+    if (json && out === console) return writeStdoutFully(line);
+    out.log(line);
+  };
+  const fail = (action: () => void | Promise<void>): void | Promise<void> => {
+    const wrap = (e: unknown) => new Error(`decisions: ${e instanceof Error ? e.message : String(e)}`);
+    try {
+      const result = action();
+      return result instanceof Promise ? result.catch(e => { throw wrap(e); }) : result;
+    } catch (e) { throw wrap(e); }
+  };
   root.command('linear-sync').description('열린 결정을 COO Linear 프로젝트에 투영하고 닫힌 결정을 동기화한다')
     .option('--dry-run').option('--json').option('--hq-override')
     .action(async (o: { dryRun?: boolean; json?: boolean; hqOverride?: boolean }) => {
       if (!o.dryRun && !mayWrite('linear-sync', o.hqOverride)) return;
       const result = await projectDecisionsToLinear({ stateDir: config.stateDir, dryRun: o.dryRun });
-      emit(result, o.json, result.reason ?? `생성 ${result.created} · 닫음 ${result.closed} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${result.plan?.length ? `\n${result.plan.map(p => `${p.action} ${p.decisionId}${p.issue ? ` ${p.issue}` : ''}`).join('\n')}` : ''}`);
+      await emit(result, o.json, result.reason ?? `생성 ${result.created} · 닫음 ${result.closed} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${result.plan?.length ? `\n${result.plan.map(p => `${p.action} ${p.decisionId}${p.issue ? ` ${p.issue}` : ''}`).join('\n')}` : ''}`);
     });
   root.command('raise').description('SCQA·선택지와 권고로 결정 항목을 올린다')
     .requiredOption('--title <text>').requiredOption('--category <category>')
@@ -121,7 +132,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
         ...(o.resumeQuestion !== undefined ? { resume: { questionId: o.resumeQuestion, ...(o.run !== undefined ? { runId: o.run } : {}) } } : {}),
         ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
       if (entry.crossCheckSkipped === 'missing') console.error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
-      emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
+      return emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
   root.command('record-seat').description('위임 범위에서 이미 내린 자리 결정을 사후 보고로 원장에 기록 (대표 카드 아님)')
     .requiredOption('--seat <OP|MK|TC|UX>').requiredOption('--title <text>')
@@ -133,13 +144,13 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (!mayWrite('record-seat', o.hqOverride)) return;
       const entry = new DecisionLedger(config).recordSeatDecision({ seat: o.seat, title: o.title, decision: o.decision,
         delegation: o.delegation, ...(o.at ? { decidedAt: o.at } : {}), ...(o.ref.length ? { refs: o.ref } : {}) });
-      emit(entry, o.json, formatSeatDecisionRow(entry));
+      return emit(entry, o.json, formatSeatDecisionRow(entry));
     }));
   root.command('seat-report').description('밤사이 자리들의 사후 결정을 한 번에 조회 (기본 최근 24시간)')
     .option('--since <date>', '조회 시작 UTC ISO 또는 Nd', '1d').option('--seat <OP|MK|TC|UX>').option('--json')
     .action((o: { since: string; seat?: Seat; json?: boolean }) => fail(() => {
       const rows = new DecisionLedger(config).seatReport({ since: date(o.since), seat: o.seat });
-      emit(rows, o.json, rows.length ? rows.map(formatSeatDecisionRow).join('\n') : '자리 결정 0건');
+      return emit(rows, o.json, rows.length ? rows.map(formatSeatDecisionRow).join('\n') : '자리 결정 0건');
     }));
   root.command('proact').description('선제성 기준선 — 지난 7일, 먼저 낸 수·채택 수·물어서야 드러난 수')
     .option('--days <n>', 'KST 일수 (기본 7)', '7').option('--json')
@@ -147,17 +158,17 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const days = Number(o.days);
       if (!Number.isInteger(days) || days < 1) throw new Error('invalid days');
       const meter = readProactMeter({ ...(config.stateDir ? { stateDir: config.stateDir, instanceRoot: config.stateDir } : {}), ...(config.now ? { now: config.now() } : {}), days });
-      emit(meter, o.json, formatProactMeter(meter));
+      return emit(meter, o.json, formatProactMeter(meter));
     }));
   root.command('list').description('결정 목록 (기본 열린 것)')
     .option('--status <open|decided|all>', '기본 open', 'open').option('--since <date>').option('--version <version>')
     .option('--decided-by <human|auto>').option('--category <category>').option('--json')
     .action((o: { status: 'open' | 'decided' | 'all'; since?: string; version?: string; decidedBy?: 'human' | 'auto'; category?: DecisionCategory; json?: boolean }) => fail(() => {
       const rows = new DecisionLedger(config).list({ status: o.status, since: date(o.since), version: o.version, decidedBy: o.decidedBy, category: o.category });
-      emit(rows, o.json, rows.length ? rows.map(formatDecisionRow).join('\n') : '결정 0건');
+      return emit(rows, o.json, rows.length ? rows.map(formatDecisionRow).join('\n') : '결정 0건');
     }));
   root.command('show <id>').description('SCQA · 선택지 · 권고 · 이력 · 판').option('--json')
-    .action((id: string, o: { json?: boolean }) => fail(() => { const entry = new DecisionLedger(config).show(id); emit(entry, o.json, formatDecisionDetail(entry)); }));
+    .action((id: string, o: { json?: boolean }) => fail(() => { const entry = new DecisionLedger(config).show(id); return emit(entry, o.json, formatDecisionDetail(entry)); }));
   root.command('decide <id> <option>').description('사람 또는 AUTO 위임 결정 기록')
     .option('--note <text>').option('--auto').option('--delegation <reason>').option('--track <track>').option('--agent <agent>').option('--json').option('--hq-override')
     .action((id: string, choice: string, o: { note?: string; auto?: boolean; delegation?: string; track?: DecisionTrack; agent?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
@@ -169,17 +180,16 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (delivery && !delivery.ok) {
         // The decision is recorded; only the answer to the waiting run failed — say so and how to retry, never «success».
         const hint = `⚠ 답 전달 실패(${delivery.questionId} · ${delivery.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-answer ${entry.id}`;
-        emit({ ...entry, delivery }, o.json, `결정: ${formatDecisionDetail(entry)}\n${hint}`);
         process.exitCode = 3;
-        return;
+        return emit({ ...entry, delivery }, o.json, `결정: ${formatDecisionDetail(entry)}\n${hint}`);
       }
-      emit(delivery ? { ...entry, delivery } : entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
+      return emit(delivery ? { ...entry, delivery } : entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
     }));
   root.command('retry-answer <id>').description('기록된 결정의 대기 질문 답 전달만 재시도한다').option('--json').option('--hq-override')
     .action((id: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (!mayWrite('retry-answer', o.hqOverride)) return;
       const entry = new DecisionLedger(config).retryAnswer(id);
-      emit(entry, o.json, `답 전달: ${entry.id} → ${entry.resume?.questionId}`);
+      return emit(entry, o.json, `답 전달: ${entry.id} → ${entry.resume?.questionId}`);
     }));
   root.command('add-options <id>').description('선택지가 미기재된 과거 항목에 확인된 선택지를 추가')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
@@ -188,15 +198,15 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const who = agent(o.agent);
       if (!mayWrite('add-options', o.hqOverride)) return;
       const entry = new DecisionLedger(config).addOptions(id, o.option.map(parseOption), who);
-      emit(entry, o.json, formatDecisionDetail(entry));
+      return emit(entry, o.json, formatDecisionDetail(entry));
     }));
   root.command('withdraw <id>').description('결정 철회도 원장에 남긴다').requiredOption('--reason <reason>').option('--json').option('--hq-override')
-    .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(() => { if (!mayWrite('withdraw', o.hqOverride)) return; const entry = new DecisionLedger(config).withdraw(id, o.reason); emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
+    .action((id: string, o: { reason: string; json?: boolean; hqOverride?: boolean }) => fail(() => { if (!mayWrite('withdraw', o.hqOverride)) return; const entry = new DecisionLedger(config).withdraw(id, o.reason); return emit(entry, o.json, `철회: ${formatDecisionDetail(entry)}`); }));
   root.command('import-markdown <file>').description('기존 대표 결정 문서 씨앗을 가져온다 (재실행 안전)').option('--json').option('--hq-override')
     .action((file: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (!mayWrite('import-markdown', o.hqOverride)) return;
       const result = importDecisionMarkdown(new DecisionLedger(config), file);
-      emit(result, o.json, `가져옴 ${result.imported.length} · 기존 ${result.existing.length} · 불완전 ${result.incomplete.length} · 못 읽음 ${result.unread.length}${result.incomplete.length ? `\n${result.incomplete.join('\n')}` : ''}${result.unread.length ? `\n${result.unread.join('\n')}` : ''}`);
       if (result.unread.length) process.exitCode = 1;
+      return emit(result, o.json, `가져옴 ${result.imported.length} · 기존 ${result.existing.length} · 불완전 ${result.incomplete.length} · 못 읽음 ${result.unread.length}${result.incomplete.length ? `\n${result.incomplete.join('\n')}` : ''}${result.unread.length ? `\n${result.unread.join('\n')}` : ''}`);
     }));
 }

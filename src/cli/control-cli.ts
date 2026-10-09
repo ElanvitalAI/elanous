@@ -13,6 +13,7 @@ import { RESOURCE_KINDS, type ResourceKind } from '../control-plane/ledger.js';
 import { runControlJoin, type ControlJoinOptions } from './control-join-cli.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import { issueMemberToken, revokeMemberToken, listMemberTokens } from '../control-plane/member-tokens.js';
+import { collectControlStatus } from '../control/control-status.js';
 
 function controlPort(flag?: string): number {
   const raw = flag ?? (process.env.ELANOUS_CONTROL_PORT?.trim() || undefined);
@@ -152,6 +153,19 @@ export async function runControlMember(options: { resource?: string[]; interval?
 
 export function registerControlCommands(program: Command): void {
   const control = program.command('control').description('독립 관제부');
+  control.command('status').description('집 하나의 읽기 전용 관제 현황')
+    .option('--json', '일곱 줄을 JSON으로 출력')
+    .action(async (options: { json?: boolean }) => {
+      const rows = await collectControlStatus();
+      if (options.json) console.log(JSON.stringify({ rows }));
+      else for (const { row, state, text, reason } of rows) {
+        const label = state === 'ok' ? '정상' : state === 'warn' ? '주의' : '못 쟀다';
+        console.log(`${row} · ${label} · ${text}${reason ? ` — ${reason}` : ''}`
+          .replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+          // Other C0/C1 controls (ESC, backspace, ...) and line separators must not repaint the terminal table.
+          .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`));
+      }
+    });
   control.command('serve').description('관제부를 포그라운드에서 실행')
     .option('--port <n>', '리스닝 포트(0=임시 포트)')
     .option('--host <addr>', '루프백 또는 tailnet 바인드 주소')

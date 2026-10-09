@@ -111,6 +111,7 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.harvestable === true && r.branch ? { harvestable: true } : {}),
     ...(r.worktreePath ? { worktreePath: r.worktreePath } : {}),
     ...(r.prUrl ? { prUrl: r.prUrl } : {}),
+    ...(r.prNumber !== undefined ? { prNumber: r.prNumber } : {}),
     // TA-LIVE-REVIEW-POD — 작업 트리 없는 런(Pod)의 live review 가 «런이 낸 PR 머리»를 확인하는 근거.
     ...(r.checkedHeadCommit !== undefined ? { checkedHeadCommit: r.checkedHeadCommit } : {}),
     ...(r.merged !== undefined ? { merged: r.merged } : {}),
@@ -121,6 +122,9 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.decomposeProposal ? { decomposeProposal: r.decomposeProposal } : {}),
     ...(r.goalPlanRevision ? { goalPlanRevision: r.goalPlanRevision } : {}),
     ...(r.salvage !== undefined ? { salvage: r.salvage } : {}),
+    ...(r.review?.reviewed === true && r.review.verdict === 'pass'
+      && r.reviewedHeadCommit && /^[0-9a-f]{40}$/i.test(r.reviewedHeadCommit)
+      ? { selfReview: { verdict: r.review.verdict, head: r.reviewedHeadCommit } } : {}),
     ...(r.review?.reviewed !== undefined ? { reviewed: r.review.reviewed } : {}),
     ...(r.review?.failureReason !== undefined ? { reviewReason: r.review.failureReason } : {}),
     // ⭐ 대표 지시(2026-09-08) — 걸음을 슈퍼바이저까지 나른다.

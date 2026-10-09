@@ -623,7 +623,11 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       if (decision.stopReason && opts.taskAgentShadow !== false) {
         // TASK-AGENT-SHADOW — 판단부를 그림자로 부른다(실행 0). 어떤 오류도 런의 결말을 바꾸지 않는다.
         try {
-          await (opts.taskAgentShadow ?? recordTaskAgentShadowMove)({ runId, stopReason: decision.stopReason, results });
+          const pr = results.find((result) => typeof result.prNumber === 'number' && result.prNumber > 0)?.prNumber;
+          const reviewed = results.filter((result) => result.prNumber === pr && result.selfReview && result.merged !== true);
+          const selfReview = pr && reviewed.length === 1 ? reviewed[0]!.selfReview : undefined;
+          await (opts.taskAgentShadow ?? recordTaskAgentShadowMove)({ runId, stopReason: decision.stopReason, results,
+            ...(selfReview ? { selfReview } : {}), cycleId: `${runId ?? 'unknown'}:${decision.round}` });
         } catch (error) {
           try { debug.log('task-agent', 'shadow-move-failed', { runId, stopReason: decision.stopReason, error: String(error) }); } catch { /* fail-open */ }
         }

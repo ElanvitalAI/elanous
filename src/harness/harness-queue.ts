@@ -4,6 +4,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync
 import { join, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { findTreeRoot } from '../cli/test-flag.js';
 import { readLogInstances, type LogInstanceView } from '../mss/logging/instance-registry.js';
 import { effectiveInstanceRoot, prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
@@ -20,6 +21,7 @@ import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js'
 import { leaseKubectl, measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
+import { adviseLaunch, compareLaunchAdvice, type LaunchAdvice } from './launch-advice.js';
 import { finishAdvice, measureFinish, recordFinishHistory, type FinishMetrics } from '../loops/orchestrator/finish-rate.js';
 
 export type QueueSeat = 'OP' | 'TC' | 'MK' | 'UX';
@@ -73,6 +75,8 @@ export interface HarnessQueueDeps {
   configPath?: string;
   cap?: (seat: QueueSeat) => number;
   pool?: () => QueuePool;
+  /** Shadow-only advice seam; exceptions must not affect the queue decision. */
+  advice?: typeof adviseLaunch;
   launch?: (item: QueueItem, args: string[], root: string) => Promise<number>;
   /** Test seam: runs after a direct CLI call enqueued its row and before that call's own tick (race tests). */
   afterEnqueue?: (item: QueueItem) => void | Promise<void>;
@@ -385,24 +389,25 @@ export function listHarnessQueue(deps: HarnessQueueDeps = {}): QueueItem[] {
   return read(harnessQueuePath(deps.root ?? effectiveInstanceRoot()));
 }
 
-/** A missing row is not proof of failure unless the queue left a cancellation marker. */
-export function harnessQueueOutcome(id: string, deps: HarnessQueueDeps = {}): 'pending' | 'succeeded' | 'retryable' | 'unknown' {
+/** A missing row is not proof of failure; explicit removal and terminal receipts have distinct markers. */
+export function harnessQueueOutcome(id: string, deps: HarnessQueueDeps = {}): 'pending' | 'succeeded' | 'retryable' | 'removed' | 'unknown' {
   const root = deps.root ?? effectiveInstanceRoot();
   const row = listHarnessQueue(deps).find((item) => item.id === id);
   if (!row) {
     const marker = join(root, 'harness', `${id}.outcome`);
     if (!existsSync(marker)) return 'unknown';
     const value = readFileSync(marker, 'utf8');
-    return value === 'succeeded' || value === 'retryable' ? value : 'unknown';
+    return value === 'succeeded' || value === 'retryable' || value === 'removed' ? value : 'unknown';
   }
   return queueRowOutcome(row, root);
 }
 
 const keyMarkerPath = (root: string, key: string) => join(root, 'harness', 'by-key', `${createHash('sha256').update(key).digest('hex')}.id`);
 
-function recordQueueOutcome(root: string, id: string, outcome: 'succeeded' | 'retryable', key?: string): void {
+function recordQueueOutcome(root: string, id: string, outcome: 'succeeded' | 'retryable' | 'removed', key?: string): void {
   const path = join(root, 'harness', `${id}.outcome`);
-  if (!existsSync(path)) writeFileSync(path, outcome, { flag: 'wx', mode: 0o600 });
+  if (outcome === 'removed') writeFileSync(path, outcome, { mode: 0o600 });
+  else if (!existsSync(path)) writeFileSync(path, outcome, { flag: 'wx', mode: 0o600 });
   // The row is about to leave the queue; keep «which id last held this key» so a caller that crashed before
   // recording the id can still find the outcome (LOOP-LIVE1 · seat loop recovery).
   if (key) {
@@ -491,10 +496,8 @@ export async function removeHarnessQueue(id: string, deps: HarnessQueueDeps = {}
       if (state !== 'finished' && state !== 'not-started'
         || (deps.processes ?? readHarnessQueueProcesses)().some((row) => row.launchId === item.launchId)) return false;
     }
-    const outcome = item.status === 'queued' ? 'retryable' : queueRowOutcome(item, root);
-    if (item.idempotencyKey && (outcome === 'retryable' || outcome === 'succeeded')) {
-      recordQueueOutcome(root, id, outcome, item.idempotencyKey);
-    }
+    const outcome = queueRowOutcome(item, root) === 'succeeded' ? 'succeeded' : 'removed';
+    if (item.idempotencyKey) recordQueueOutcome(root, id, outcome, item.idempotencyKey);
     save(path, rows.filter((row) => row.id !== id));
     observe('skipped', { id, seat: item.seat, reason: 'removed' }, deps);
     return true;
@@ -699,6 +702,26 @@ export function readHarnessQueueInventory(probe: ProcessProbe = {}): QueueInvent
     if (prior && prior !== record.seat) { ledgerSeats.delete(pid); ambiguousPids.add(pid); }
     else ledgerSeats.set(pid, record.seat!);
   }
+  // One lsof for every candidate: a per-pid lsof (~0.1–0.3 s each) made a tick on a busy host take 10 s+ (10-08). lsof exits 1
+  // when some pid is gone yet still prints the others; a pid it does not print stays unattributed (charged to all seats).
+  let batchCwds: Map<number, string> | undefined;
+  const readBatchCwds = (): Map<number, string> => {
+    const cwds = new Map<number, string>();
+    const started = Date.now();
+    const lsof = run('lsof', ['-a', '-d', 'cwd', '-Fpn', '-p', candidates.map(({ pid }) => pid).join(',')],
+      { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
+    if (!lsof.error && typeof lsof.stdout === 'string') {
+      let current: number | undefined;
+      for (const line of lsof.stdout.split('\n')) {
+        if (line.startsWith('p')) current = Number(line.slice(1));
+        else if (line.startsWith('n/') && current !== undefined) cwds.set(current, line.slice(1));
+      }
+    }
+    try { debug.log('harness.queue', 'cwd-batch', { pids: candidates.length, read: cwds.size, ms: Date.now() - started,
+      ...(lsof.error ? { error: String(lsof.error).slice(0, 240) } : {}) }); }
+    catch { /* Observation cannot affect dispatch. */ }
+    return cwds;
+  };
   const rows: QueueProcess[] = [];
   // Attribute a run after grouping: the orchestrator may switch working trees while its launcher stays in HQ.
   for (const root of candidates.filter((row) => !byPid.has(row.ppid))) {
@@ -736,9 +759,9 @@ export function readHarnessQueueInventory(probe: ProcessProbe = {}): QueueInvent
         if (probe.cwd) cwd = probe.cwd(pid);
         else if (platform === 'linux') cwd = readlinkSync(`/proc/${pid}/cwd`);
         else {
-          const lsof = run('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 5_000 });
-          if (lsof.error || lsof.status !== 0 || typeof lsof.stdout !== 'string') throw new Error('cwd unavailable');
-          cwd = lsof.stdout.split('\n').find((line) => line.startsWith('n/'))?.slice(1) ?? '';
+          const found = (batchCwds ??= readBatchCwds()).get(pid);
+          if (found === undefined) throw new Error('cwd unavailable');
+          cwd = found;
         }
         if (!cwd.startsWith('/')) continue;
         const found = queueSeatForCwd(cwd, trees);
@@ -816,7 +839,8 @@ async function launch(item: QueueItem, args: string[], root: string, command?: s
       harnessQueueReceiptPath(root, item.launchId!), command ?? join(repo, 'bin', 'elanous.mjs'),
       ...(resolve(root) === prodInstanceRoot() ? [] : [`--test=${root}`]), ...args], {
       cwd: item.launchCwd ?? repo, detached: true, stdio: ['ignore', fd, fd],
-      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_HARNESS_SEAT: item.seat,
+      env: { ...process.env, ELANOUS_STATE_DIR: root,
+        ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root), ELANOUS_HARNESS_SEAT: item.seat,
         ELANOUS_HARNESS_QUEUE_LAUNCH: item.launchId! },
     });
     const pid = await new Promise<number>((done, reject) => {
@@ -1187,7 +1211,13 @@ export async function tickHarnessQueue(deps: HarnessQueueDeps = {}, requestedId?
 
 async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string | undefined, followUp: boolean): Promise<QueueTick> {
   const root = deps.root ?? effectiveInstanceRoot();
-  return locked(root, async (path) => {
+  const caller = 'harness-queue-tick' as const;
+  let advice: LaunchAdvice = { verdict: 'unknown', why: 'pool not measured before queue decision' };
+  const shadow = (pool: QueuePool | undefined): void => {
+    try { advice = (deps.advice ?? adviseLaunch)({ pool, caller }); }
+    catch { advice = { verdict: 'unknown', why: 'launch advice unavailable' }; }
+  };
+  const actual = await locked<QueueTick>(root, async (path): Promise<QueueTick> => {
     // A burst follow-up already ran the author shadow and the idle request in this tick's first pass.
     if (!followUp) try {
       const now = (deps.now ?? (() => new Date()))();
@@ -1196,7 +1226,11 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
         debug.log('loops.author-depth', 'shadow-skipped-test', {});
       } else {
         const shadow = deps.authorShadow ?? (await import('../loops/orchestrator/author-depth.js')).runAuthorDepthShadow;
+        const started = Date.now();
         await shadow(root, now);
+        // The shadow runs inside the queue lock; its duration is what other ticks wait on.
+        try { debug.log('harness.queue', 'author-shadow', { ms: Date.now() - started }); }
+        catch { /* Observation cannot affect dispatch. */ }
       }
     } catch (error) {
       try { debug.log('loops.author-depth', 'shadow-failed', { reason: String(error) }); }
@@ -1463,6 +1497,7 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
         if (pool && (![pool.running, pool.pending, pool.reserved, pool.limit].every((n) => Number.isSafeInteger(n) && n >= 0) || pool.limit < 1)) {
           poolReason = 'pod lease status incomplete';
         }
+        shadow(poolReason ? undefined : pool);
         if (pool && !poolReason) {
           const queueLaunching = current.filter((row) => row.status === 'launching' || row.status === 'launched').length;
           // CHILD-UNIV-HOLD: each unreadable child universe is charged one pool slot (conservative), never a seat slot.
@@ -1545,4 +1580,13 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
     }
     return waiting();
   });
+  // An empty queue tick has nothing to advise on; logging it would flood the advice-unknown sample.
+  if (actual.outcome === 'skipped' && !actual.item) return actual;
+  try {
+    const { kind } = compareLaunchAdvice(advice, actual.outcome);
+    debug.log('resource.advice', 'launch-advice', {
+      caller, verdict: advice.verdict, why: advice.why, actual: actual.outcome, kind, itemId: actual.item?.id ?? null,
+    });
+  } catch { /* Shadow observation cannot affect the queue result. */ }
+  return actual;
 }

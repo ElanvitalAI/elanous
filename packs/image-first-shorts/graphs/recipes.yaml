@@ -1,0 +1,56 @@
+# image-first-shorts recipes — 출처: 공냥이 AI 실험실 «악역영애 말포이» AI 영상 제작 키트(https://malfoy-meme-making.vercel.app/) · 원작자 허락(2026-10-08) · 출처 명기 조건
+# 모든 cmd 는 run-step.ts 하나로 간다(생성 호출 0). dry_run_command = 외부 호출 없는 드라이런.
+brief:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" brief'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" brief --dry'
+  timeout_ms: 20000
+storyboard:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" storyboard'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" storyboard --dry'
+  timeout_ms: 20000
+storyboard-approval:
+  approval: '스토리보드 승인 — workspace/storyboard.json ⊕ jobs/(images·video).jsonl ⊕ 크레딧 추정을 확인했나? (반려 = storyboard 로 되돌림)'
+images:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" images'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" images --dry'
+  timeout_ms: 20000
+images-approval:
+  approval: '이미지 대조 승인 — 컷마다 이미지가 프롬프트·캐릭터 설정과 맞고 파일명이 내용과 일치하나? (반려 = images 로 되돌림)'
+video:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" video'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" video --dry'
+  timeout_ms: 20000
+matte:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" matte'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" matte --dry'
+  timeout_ms: 20000
+audio:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" audio'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" audio --dry'
+  timeout_ms: 20000
+fx:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" fx'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" fx --dry'
+  timeout_ms: 20000
+compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" compose'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" compose --dry'
+  timeout_ms: 30000
+final-approval:
+  approval: '최종 판정 — out/final.mp4 를 끝까지 봤나? 워터마크·자막·박자·오디오 레벨 OK? (반려 = compose 로 되돌림)'
+done:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" done'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" done --dry'
+  timeout_ms: 10000
+failed:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" failed'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" failed --dry'
+  timeout_ms: 10000
+wait-storyboard:
+  approval: '대기 — workspace/storyboard.json 을 썼나? 승인하면 storyboard 검사로 되돌아간다(반려 = 제작 중단)'
+wait-images:
+  approval: '대기 — 이미지 생성(tools/imagegen_runner.py)과 «내용 대조·재명명»(manifest content_checked=true)을 끝냈나? 승인하면 images 재검사(반려 = 중단)'
+wait-video:
+  approval: '대기 — 영상 생성(flow-aside | higgsfield)과 크레딧 원장(ledger/video_credits.jsonl) 기록을 끝냈나? 승인하면 video 재검사(반려 = 중단)'
+wait-post:
+  approval: '대기 — 후반 작업(매팅·소리·코드 효과·합성) 중 막힌 것을 끝냈나? 승인하면 matte 부터 순서대로 재검사(반려 = 중단)'

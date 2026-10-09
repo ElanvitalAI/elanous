@@ -10,3 +10,6 @@ audit:
 record:
   command: 'bun scripts/test-diet/node.ts record'
   timeout_ms: 300000
+main-failures:
+  command: 'bun scripts/test-diet/node.ts main-failures'
+  timeout_ms: 2400000

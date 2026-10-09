@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
@@ -10,6 +11,7 @@ import { validateGraphYaml } from './graph-kinds.js';
 import { parseWizardSteps, readWizardSteps, withWizardSteps } from '../../graph-wizard/saved-steps.js';
 import type { WizardNodeStep } from '../../graph-wizard/steps.js';
 import { jsonResponse } from './json-response.js';
+import { clearPeerEdit, peerEditRefusalBody, peerEditRunGate, readPeerEdit, writePeerEdit } from './graph-peer-edit.js';
 
 /** Declared graph ids only. A user string is never joined onto a filesystem path. */
 const GRAPH_ID = /^[a-z0-9-]+$/;
@@ -42,6 +44,93 @@ export interface GraphsApiDeps {
 
 function mineGraphsDir(): string {
   return join(elanousStateRoot(), 'graphs');
+}
+
+export type GraphPermission = 'view' | 'edit';
+type GraphGrant = { recipient: string; permission: GraphPermission };
+const TOKEN_PATTERN = /^eg_[A-Za-z0-9_-]{32,}$/;
+
+function accessFile(dir: string, id: string): string {
+  return join(dir, '.access', `${id}.json`);
+}
+function tokenHash(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+function accessGrants(dir: string, id: string): GraphGrant[] {
+  let text: string;
+  try { text = readFileSync(accessFile(dir, id), 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(text);
+  if (!Array.isArray(parsed) || !parsed.every((entry): entry is GraphGrant => entry !== null && typeof entry === 'object'
+    && typeof entry.recipient === 'string' && /^[a-f0-9]{64}$/.test(entry.recipient)
+    && (entry.permission === 'view' || entry.permission === 'edit'))) throw new Error('invalid graph access store');
+  return parsed;
+}
+
+/** Only a hash is persisted; no owner bearer or raw recipient credential goes into a graph/YAML. */
+export function handleGraphAccess(pathname: string, req: Request, deps: GraphsApiDeps = {}): Response {
+  const match = /^\/v1\/graphs\/([^/]+)\/access$/.exec(pathname);
+  const id = match ? resolveId(match[1]!) : null;
+  if (!id) return jsonResponse({ error: 'bad_request' }, 400);
+  const owned = mineOwnership(id, deps);
+  if (owned instanceof Response) return owned;
+  if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+  try { return jsonResponse({ grants: accessGrants(owned.mineDir, id) }); }
+  catch (error) { return saveFailed(id, error); }
+}
+
+export async function handleGraphAccessPut(pathname: string, req: Request, deps: GraphsApiDeps = {}): Promise<Response> {
+  const match = /^\/v1\/graphs\/([^/]+)\/access$/.exec(pathname);
+  const id = match ? resolveId(match[1]!) : null;
+  if (!id) return jsonResponse({ error: 'bad_request' }, 400);
+  const owned = mineOwnership(id, deps);
+  if (owned instanceof Response) return owned;
+  // Detail GET resolves a core id first; do not grant a token for a shadowed mine id.
+  if (indexByDeclaredId(deps.coreDir ?? defaultGraphsDir()).has(id)) return jsonResponse({ error: 'core-id-conflict', id }, 409);
+  let body: { recipient?: unknown; permission?: unknown };
+  try { body = await req.json() as typeof body; }
+  catch { return jsonResponse({ error: 'bad_request' }, 400); }
+  if (!body || typeof body.recipient !== 'string' || !TOKEN_PATTERN.test(body.recipient)
+    || (body.permission !== 'view' && body.permission !== 'edit')) {
+    return jsonResponse({ error: 'bad_request', reason: 'recipient access token and view/edit permission required' }, 400);
+  }
+  const recipient = tokenHash(body.recipient);
+  const dir = join(owned.mineDir, '.access');
+  try {
+    const grants = accessGrants(owned.mineDir, id).filter((grant) => grant.recipient !== recipient);
+    grants.push({ recipient, permission: body.permission });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = accessFile(owned.mineDir, id);
+    const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, JSON.stringify(grants), { mode: 0o600 });
+      renameSync(temp, target);
+    } finally { rmSync(temp, { force: true }); }
+  } catch (error) { return saveFailed(id, error); }
+  return jsonResponse({ recipient, permission: body.permission });
+}
+
+/** The peer token works only on this graph and the requested read/edit operation. */
+export function graphAccessForRequest(pathname: string, method: string, token: string | null, deps: GraphsApiDeps = {}): boolean {
+  const match = /^\/v1\/graphs\/([^/]+)(?:\/(yaml))?$/.exec(pathname);
+  const id = match ? resolveId(match[1]!) : null;
+  if (!id || !token || !TOKEN_PATTERN.test(token)) return false;
+  if (method !== 'GET' && !(method === 'PUT' && match?.[2] === 'yaml')) return false;
+  try {
+    if (!indexByDeclaredId(deps.mineDir ?? mineGraphsDir()).has(id)) return false;
+    if (indexByDeclaredId(deps.coreDir ?? defaultGraphsDir()).has(id)) return false;
+    const wanted = tokenHash(token);
+    return accessGrants(deps.mineDir ?? mineGraphsDir(), id).some((grant) => {
+      const stored = Buffer.from(grant.recipient, 'hex');
+      return timingSafeEqual(stored, Buffer.from(wanted, 'hex')) && (method === 'GET' || grant.permission === 'edit');
+    });
+  } catch (error) {
+    debug.log('nexus.graphs', 'access-read-failed', { id, reason: String(error) }, { level: 'warn' });
+    return false;
+  }
 }
 
 function resolveId(raw: string): string | null {
@@ -203,7 +292,10 @@ export function handleGraphsGet(pathname: string, dir = defaultGraphsDir(), deps
 }
 
 /** PUT writes only under the state-root graphs directory. Core YAML is never opened for write. */
-export async function handleGraphsPut(pathname: string, req: Request, deps: GraphsApiDeps = {}): Promise<Response> {
+/** Who authorized a save: the owner, or a peer token holding an «edit» grant (raw token; only a hash prefix is kept). */
+export type GraphSaveActor = { peerToken: string } | null;
+
+export async function handleGraphsPut(pathname: string, req: Request, deps: GraphsApiDeps = {}, actor: GraphSaveActor = null): Promise<Response> {
   const match = /^\/v1\/graphs\/([^/]+)\/yaml$/.exec(pathname);
   if (!match) return jsonResponse({ error: 'not-found' }, 404);
   const id = resolveId(match[1]!);
@@ -229,11 +321,21 @@ export async function handleGraphsPut(pathname: string, req: Request, deps: Grap
   // Writes go only to <mine>/<id>.yaml; a hand-placed file under another name is not edited over HTTP.
   if (existing.file !== `${id}.yaml`) return jsonResponse({ error: 'file-name-mismatch', id, file: existing.file }, 409);
   let written: { version: string; previous: string };
-  try { written = withWizardSteps(mineDir, id, steps, () => writeWithVersion(mineDir, id, existing, body.yaml as string)); }
+  const editedBy = actor ? `peer:${tokenHash(actor.peerToken).slice(0, 8)}` : null;
+  try {
+    written = withWizardSteps(mineDir, id, steps, () => {
+      // Peer save: the marker goes down «before» the bytes, so a crash in between still refuses the run.
+      if (editedBy) writePeerEdit(mineDir, id, { editedBy, version: 'pending', at: new Date().toISOString() });
+      const result = writeWithVersion(mineDir, id, existing, body.yaml as string);
+      if (editedBy) writePeerEdit(mineDir, id, { editedBy, version: result.version, at: new Date().toISOString() });
+      else clearPeerEdit(mineDir, id);
+      return result;
+    });
+  }
   catch (error) { return saveFailed(id, error); }
   const { version, previous } = written;
-  debug.log('nexus.graphs', 'saved', { id, version, previous, steps: steps ? Object.keys(steps).length : 0 });
-  return jsonResponse({ id, source: 'mine', editable: true, saved: true, version, previous });
+  debug.log('nexus.graphs', 'saved', { id, version, previous, steps: steps ? Object.keys(steps).length : 0, ...(editedBy ? { editedBy } : {}) });
+  return jsonResponse({ id, source: 'mine', editable: true, saved: true, version, previous, ...(editedBy ? { editedBy } : {}) });
 }
 
 const VERSION_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z(?:-\d{4})?$/;
@@ -408,8 +510,14 @@ export async function handleGraphsClone(pathname: string, req: Request, deps: Gr
   if (reservedId) return reservedId;
   const coreDir = deps.coreDir ?? defaultGraphsDir();
   const mineDir = deps.mineDir ?? mineGraphsDir();
-  const source = indexByDeclaredId(coreDir).get(id) ?? indexByDeclaredId(mineDir).get(id);
+  const fromCore = indexByDeclaredId(coreDir).get(id);
+  const source = fromCore ?? indexByDeclaredId(mineDir).get(id);
   if (!source) return jsonResponse({ error: 'not-found', id }, 404);
+  // A clone would carry a peer's unapproved change into a graph with no marker — approve first.
+  if (!fromCore) {
+    const gate = peerEditRunGate(mineDir, id);
+    if (!gate.ok) return jsonResponse(peerEditRefusalBody(id, gate), 409);
+  }
   if (indexByDeclaredId(mineDir).has(body.newId) || indexByDeclaredId(coreDir).has(body.newId)) {
     return jsonResponse({ error: 'conflict', id: body.newId }, 409);
   }
@@ -422,9 +530,39 @@ export async function handleGraphsClone(pathname: string, req: Request, deps: Gr
   return jsonResponse({ id: body.newId, source: 'mine', editable: true, clonedFrom: id }, 201);
 }
 
-export async function handleGraphsMutation(pathname: string, req: Request, deps: GraphsApiDeps = {}): Promise<Response | null> {
+/** POST /v1/graphs/<id>/approve {version} — owner only (the route never accepts a peer token). Approves the
+ *  exact peer version the run refusal named; a newer peer save is a new version and needs a new approval. */
+export async function handleGraphsApprove(pathname: string, req: Request, deps: GraphsApiDeps = {}): Promise<Response> {
+  const match = /^\/v1\/graphs\/([^/]+)\/approve$/.exec(pathname);
+  if (!match) return jsonResponse({ error: 'not-found' }, 404);
+  const id = resolveId(match[1]!);
+  if (!id) return jsonResponse({ error: 'bad_request', reason: 'invalid graph id' }, 400);
+  const owned = mineOwnership(id, deps);
+  if (owned instanceof Response) return owned;
+  let body: { version?: unknown };
+  try { body = await req.json() as { version?: unknown }; }
+  catch { return jsonResponse({ error: 'bad_request', reason: 'json body required' }, 400); }
+  if (typeof body?.version !== 'string' || !body.version) return jsonResponse({ error: 'bad_request', reason: 'version string required' }, 400);
+  let record;
+  try { record = readPeerEdit(owned.mineDir, id); }
+  catch (error) { return saveFailed(id, error); }
+  if (!record) return jsonResponse({ id, approved: true, version: body.version, pending: false });
+  if (record.version !== body.version) {
+    return jsonResponse({ error: 'version-mismatch', id, version: record.version, reason: '승인하려는 판이 최신 상대 변경과 다르다 — 다시 확인하라' }, 409);
+  }
+  const approved = { version: record.version, at: new Date().toISOString() };
+  try { writePeerEdit(owned.mineDir, id, { ...record, approved }); }
+  catch (error) { return saveFailed(id, error); }
+  debug.log('nexus.graphs', 'peer-edit-approved', { id, version: record.version, editedBy: record.editedBy });
+  return jsonResponse({ id, approved: true, version: record.version, editedBy: record.editedBy });
+}
+
+export async function handleGraphsMutation(pathname: string, req: Request, deps: GraphsApiDeps = {}, actor: GraphSaveActor = null): Promise<Response | null> {
+  // Only PUT …/yaml is open to a peer token; every other mutation is the owner's alone.
+  if (actor && !(req.method === 'PUT' && /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname))) return jsonResponse({ error: 'unauthorized' }, 401);
   if (req.method === 'POST' && pathname === '/v1/graphs') return handleGraphsCreate(req, deps);
-  if (req.method === 'PUT' && /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname)) return handleGraphsPut(pathname, req, deps);
+  if (req.method === 'PUT' && /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname)) return handleGraphsPut(pathname, req, deps, actor);
+  if (req.method === 'POST' && /^\/v1\/graphs\/[^/]+\/approve$/.test(pathname)) return handleGraphsApprove(pathname, req, deps);
   if (req.method === 'POST' && /^\/v1\/graphs\/[^/]+\/clone$/.test(pathname)) return handleGraphsClone(pathname, req, deps);
   if (req.method === 'POST' && /^\/v1\/graphs\/[^/]+\/revert$/.test(pathname)) return handleGraphsRevert(pathname, req, deps);
   return null;

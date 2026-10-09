@@ -7,13 +7,25 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { codexBackend, decideRuntimeFallback, grokBackend, resolveBackend, resolveDefaultBackend } from './driver.js';
+import { claudeBackend, codexBackend, decideRuntimeFallback, grokBackend, initialRuntimeFallback, resolveBackend, resolveDefaultBackend, resolveBackendSpawn } from './driver.js';
+import { decideFallback } from '../oauth/fallback-chain.js';
+import { judgeClaudePtyMaturity } from '../oauth/claude-pty-maturity.js';
 
 describe('⑴ resolveDefaultBackend — 체인이 실행 경로에 «있다»', () => {
   it('체인이 grok 으로 넘기면 grok 백엔드를 낸다', () => {
     const b = resolveDefaultBackend({ decide: () => ({ action: 'switch-backend', backend: 'grok' }) });
     expect(b.name).toBe('grok');
     expect(b).toBe(grokBackend);
+  });
+
+  it('체인이 claude 로 넘기면 구독 claude PTY 백엔드를 낸다', () => {
+    const b = resolveDefaultBackend({ decide: () => ({ action: 'switch-backend', backend: 'claude' }) });
+    expect(b).toBe(claudeBackend);
+    const spawn = resolveBackendSpawn(b, { ANTHROPIC_API_KEY: 'test-key', ANTHROPIC_AUTH_TOKEN: 'test-token', CLAUDE_CODE_OAUTH_TOKEN: 'parent-token' });
+    expect(spawn.cmd).toBe('claude');
+    expect(spawn.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(spawn.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(spawn.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
   it('stay 면 codex 그대로 (기본 체인 = 무변경)', () => {
@@ -36,7 +48,7 @@ describe('⑴ resolveDefaultBackend — 체인이 실행 경로에 «있다»', 
 });
 
 describe('runtime fallback — 한도 실패만 미시도 다음 칸으로 재판정한다', () => {
-  const state = (overrides: Partial<{ attemptedSteps: ReadonlySet<'codex-rotate' | 'grok'>; descents: number; maxDescents: number }> = {}) => ({
+  const state = (overrides: Partial<{ attemptedSteps: ReadonlySet<'codex-rotate' | 'grok' | 'claude-pty'>; descents: number; maxDescents: number }> = {}) => ({
     attemptedSteps: new Set<'codex-rotate' | 'grok'>(['codex-rotate']), descents: 0, maxDescents: 1, ...overrides,
   });
 
@@ -46,6 +58,42 @@ describe('runtime fallback — 한도 실패만 미시도 다음 칸으로 재�
       calls.push(input); return { action: 'switch-backend', backend: 'grok' };
     })).toBe(grokBackend);
     expect(calls).toEqual([{ currentStep: 'codex-rotate', currentCredentialRateLimited: true }]);
+  });
+
+  it('grok 한도 실패는 미시도 claude 칸으로 내려가며 재시도는 차단한다', () => {
+    const attemptedSteps = new Set<'codex-rotate' | 'grok' | 'claude-pty'>(['codex-rotate', 'grok']);
+    const decide = () => ({ action: 'switch-backend', backend: 'claude' });
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', state({ attemptedSteps, maxDescents: 2, descents: 1 }), decide))
+      .toBe(claudeBackend);
+    attemptedSteps.add('claude-pty');
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', state({ attemptedSteps, maxDescents: 2, descents: 1 }), decide))
+      .toBeNull();
+  });
+
+  it('초기 grok 선택 뒤 한도 실패는 남은 명시 claude 칸으로 재시도한다 (기본 체인에는 없다)', () => {
+    const chain = ['codex-rotate', 'grok', 'claude-pty'] as const;
+    const rotation = { reason: 'no-candidate' } as const;
+    const mature = judgeClaudePtyMaturity({ runCount: 10, completedCount: 8, unknownScreenCount: 0, interventionCount: 1 });
+    const first = decideFallback({ chain, rotation, grokAvailable: true, claudePtyMaturity: mature });
+    expect(first).toEqual({ action: 'switch-backend', backend: 'grok' });
+    const backend = resolveDefaultBackend({ decide: () => first });
+    const runtime = initialRuntimeFallback(backend, chain);
+    expect(runtime).toEqual({ fallbackEligible: true, attemptedSteps: new Set(['grok']), descents: 0, maxDescents: 1 });
+    const decide = ({ currentStep, currentCredentialRateLimited }: { currentStep: 'codex-rotate' | 'grok' | 'claude-pty'; currentCredentialRateLimited: true }) =>
+      decideFallback({ chain, rotation, grokAvailable: true, claudePtyMaturity: mature, currentStep, currentCredentialRateLimited });
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', runtime, decide)).toBe(claudeBackend);
+    const attemptedSteps = new Set([...runtime.attemptedSteps, 'claude-pty'] as const);
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'claude-pty', { ...runtime, attemptedSteps, descents: 1 }, decide)).toBeNull();
+    const immature = judgeClaudePtyMaturity({ runCount: 10, completedCount: 6, unknownScreenCount: 0, interventionCount: 1 });
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', runtime, ({ currentStep, currentCredentialRateLimited }) =>
+      decideFallback({ chain, rotation, grokAvailable: true, claudePtyMaturity: immature, currentStep, currentCredentialRateLimited }))).toBeNull();
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', runtime, ({ currentStep, currentCredentialRateLimited }) =>
+      decideFallback({ chain, rotation, grokAvailable: true, currentStep, currentCredentialRateLimited }))).toBeNull();
+    const defaultRuntime = initialRuntimeFallback(backend, ['codex-rotate', 'grok']);
+    expect(defaultRuntime.maxDescents).toBe(0);
+    // 기본 체인의 codex 는 종전 그대로 1칸 · 체인에 codex 가 없어도 0으로 줄지 않는다.
+    expect(initialRuntimeFallback(codexBackend, ['codex-rotate', 'grok']).maxDescents).toBe(1);
+    expect(initialRuntimeFallback(codexBackend, ['grok']).maxDescents).toBe(1);
   });
 
   it('이미 시도한 칸은 반복 한도 오류에도 다시 고르지 않는다', () => {

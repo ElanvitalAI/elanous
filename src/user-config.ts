@@ -214,6 +214,8 @@ export interface LLMConfig {
    *  `within-quota`(한도 안에서만 · 전부 차면 멈춤) · `fallback`(한도 안 ⊕ 폴백 체인 · 기본) · `credits`(크레딧까지).
    *  회전·Pod 배분·폴백·매시 한도 알림이 «이 한 값»을 같이 읽는다. 없으면 옛 `codexCreditsAllowed` 를 읽는다. */
   codexQuotaPolicy?: 'within-quota' | 'fallback' | 'credits';
+  /** Grok weekly launch usage ceiling (percent); defaults to 80. */
+  grokWeeklyCapPct?: number;
   /** ⭐⭐ codex 가 «소진된 뒤» 갈 곳을 «순서»로 정한다 (대표 2026-08-13).
    *
    *  값: `['codex-rotate', 'grok']` — 아는 칸은 그 둘뿐이고, 모르는 이름은 버린다(관측에 남는다).
@@ -431,7 +433,7 @@ export interface RotationEntry {
   label?: string;
 }
 
-const LLM_DEFAULTS: LLMConfig = { provider: 'auto' };
+const LLM_DEFAULTS: LLMConfig = { provider: 'auto', grokWeeklyCapPct: 80 };
 
 // ── Skills ───────────────────────────────────────────────────────────
 
@@ -1149,6 +1151,8 @@ export interface SelfImplementToolConfig {
   clarificationEscalation: SelfImplementClarificationEscalationConfig;
   /** RUN-TTL: hours an open self-impl PR may go without a commit before the draft sweep asks for a rebase. Absent or invalid = 24. */
   runTtlHours?: number;
+  /** DRAFT-CLEANUP-FIX: per-tick close cap of `harness drafts sweep`. Raw value — `resolveDraftSweepCloseCap` validates (1–100, default 10, warns). */
+  draftSweepCloseCap?: unknown;
   /** RUN-TTL sweep step: `shadow` (default) only logs; `live` sends the resync memo / adds `elanous:needs-rebase`. Cap absent or invalid = 30. */
   runTtl?: { mode: 'shadow' | 'live'; cap?: number };
   /** STOP-AUTOHEAL: `shadow` (default) only records what the stop dispatcher would do (`event='autoheal'`); `live` runs the injected heal seams once per run per stop class. */
@@ -2684,6 +2688,8 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
   const childLlm = parseChildLlmPreference(selfImplRaw.childLlm);
   const runTtlHoursRaw = selfImplRaw.runTtlHours;
   const runTtlHours = typeof runTtlHoursRaw === 'number' && Number.isFinite(runTtlHoursRaw) && runTtlHoursRaw > 0 ? runTtlHoursRaw : undefined;
+  // Kept raw: the sweep validates and warns, so an out-of-range value is visible rather than silently dropped.
+  const draftSweepCloseCap = selfImplRaw.draftSweepCloseCap;
   const runTtlRaw = selfImplRaw.runTtl && typeof selfImplRaw.runTtl === 'object' && !Array.isArray(selfImplRaw.runTtl)
     ? selfImplRaw.runTtl as Record<string, unknown> : undefined;
   const runTtl = runTtlRaw ? {
@@ -2729,7 +2735,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 
@@ -3311,8 +3317,22 @@ export interface RoleLlmSpec {
   model?: string;
 }
 
-/** 역할별 LLM 선택(sparse) — provider 를 «역할마다» 정할 수 있는 유일한 자리. */
-export type RoleLlmConfig = Partial<Record<ModelRole, RoleLlmSpec>>;
+/** Reviewer-only ACP subscription selection; it is not a streaming LLM provider. */
+export interface SubscriptionReviewerSpec {
+  provider: 'claude-acp';
+  executor?: 'cct' | 'cc';
+}
+
+export function parseSubscriptionReviewerSpec(raw: unknown): SubscriptionReviewerSpec | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  if (v.provider !== 'claude-acp' || (v.executor !== undefined && v.executor !== 'cct' && v.executor !== 'cc')
+    || Object.keys(v).some(k => k !== 'provider' && k !== 'executor')) return undefined;
+  return { provider: 'claude-acp', ...(v.executor ? { executor: v.executor as 'cct' | 'cc' } : {}) };
+}
+
+/** 역할별 LLM 선택(sparse). `reviewer` is the opt-in harness ACP lane. */
+export type RoleLlmConfig = Partial<Record<ModelRole, RoleLlmSpec>> & { reviewer?: SubscriptionReviewerSpec };
 
 export type ModelResolutionSource = 'config' | 'tier' | 'environment' | 'default';
 
@@ -3603,6 +3623,8 @@ export interface SeatLoopConfig {
   repeatStop?: number;
   /** OP-LOOP-DECIDE: OP seat filters open decision cards (repeat-stop → b · harness scope → b unless money/security/secret/public paths). shadow records only; live decides/routes. Absent = shadow. */
   opDecide?: { mode: 'shadow' | 'live' };
+  /** IDLE-LADDER: when a seat's own queue is empty the loop picks idle work (landed-yellow rebuttal → next-release authoring → standing work → borrow an unlaunched neighbor cell). Absent = off (only the empty-queue minutes metric is recorded); 'shadow' records the pick only; 'live' lets live-safe/on launch it. */
+  idleLadder?: 'shadow' | 'live';
 }
 
 export type EventSeat = 'OP' | 'TC' | 'MK' | 'UX';
@@ -4133,6 +4155,10 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
     const entry = parseRoleLlmEntry(values[role]);
     if (entry.ok) parsed[role] = entry.spec;
     else dropped.push({ role, reason: entry.reason });
+  }
+  if (values.reviewer !== undefined) {
+    parsed.reviewer = parseSubscriptionReviewerSpec(values.reviewer);
+    if (!parsed.reviewer) warnUserConfigDrop('roleLlm.reviewer', 'claude-acp reviewer 설정이 유효하지 않아 무시');
   }
   // ⛔ config 로딩은 «나머지를 살리려고» 잘못된 칸을 버리는데, 그 사실이 어디에도 안 남으면
   //   사용자는 「왜 내 설정이 안 먹지」를 영영 못 푼다(CLI 는 이름을 대며 거부하는데 여기만 조용했다).
@@ -4747,6 +4773,7 @@ function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
       const mode = (raw as Record<string, unknown>).mode;
       return mode === 'shadow' || mode === 'live' ? { opDecide: { mode } } : {};
     })(),
+    ...(values.idleLadder === 'shadow' || values.idleLadder === 'live' ? { idleLadder: values.idleLadder } : {}),
   };
 }
 
@@ -5114,6 +5141,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       // ⛔ 같은 모양(문자열 배열)이라 아래 fallbackChain 과 «같은 자»를 쓴다.
       codexCreditsAllowed: llm.codexCreditsAllowed === true ? true : undefined,
       codexQuotaPolicy: isCodexQuotaPolicy(llm.codexQuotaPolicy) ? llm.codexQuotaPolicy : undefined,
+      grokWeeklyCapPct: typeof llm.grokWeeklyCapPct === 'number' && Number.isFinite(llm.grokWeeklyCapPct)
+        && llm.grokWeeklyCapPct >= 0 && llm.grokWeeklyCapPct <= 100 ? llm.grokWeeklyCapPct : LLM_DEFAULTS.grokWeeklyCapPct,
       codexAccountOrder: Array.isArray(llm.codexAccountOrder)
         ? llm.codexAccountOrder.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
         : undefined,
@@ -6328,6 +6357,7 @@ export function saveUserConfig(
         ...(cfg.loops.seat.stall ? { stall: cfg.loops.seat.stall } : {}),
         ...(cfg.loops.seat.repeatStop === undefined ? {} : { repeatStop: cfg.loops.seat.repeatStop }),
         ...(cfg.loops.seat.opDecide ? { opDecide: cfg.loops.seat.opDecide } : {}),
+        ...(cfg.loops.seat.idleLadder ? { idleLadder: cfg.loops.seat.idleLadder } : {}),
       } } : {}),
     } } : {}),
     ...(cfg.autopilot ? { autopilot: {
@@ -6383,6 +6413,7 @@ export function saveUserConfig(
       // ★ 2026-09-28: 타입·파서에만 넣고 이 whitelist 를 빠뜨려 `config set llm.codexCreditsAllowed true` 가 «직렬화 드롭» 됐다(#21375 직후 운영 실측).
       codexCreditsAllowed: cfg.llm.codexCreditsAllowed,
       codexQuotaPolicy: cfg.llm.codexQuotaPolicy,
+      grokWeeklyCapPct: cfg.llm.grokWeeklyCapPct,
       fallbackChain: cfg.llm.fallbackChain,
       reviewFallbackModels: cfg.llm.reviewFallbackModels,
       codexStore: cfg.llm.codexStore,

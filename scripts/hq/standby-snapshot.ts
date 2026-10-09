@@ -85,7 +85,8 @@ export function planSnapshot(root: string, tier: Tier): PlanItem[] {
 
 const sha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
 
-/** Consistent copy: SQLite through `.backup` (never a live-file copy), other files byte-for-byte. */
+/** Consistent copy: SQLite through `VACUUM INTO` (never a live-file copy), other files byte-for-byte. */
+export const SQLITE_SNAPSHOT_TIMEOUT_MS = 600_000;
 /** Host-specific settings that must never ride a replicated `config.json` (OP 10-04 12:02 · drill step 5:
  *  mbp's `hq.hostName=mbp` reached node-b's promoted universe and made node-b call itself mbp). */
 export const HOST_LOCAL_CONFIG_KEYS = ['hq'] as const;
@@ -105,8 +106,11 @@ export function snapshotItem(root: string, out: string, item: PlanItem, sqlite3 
   const dest = join(out, item.rel);
   mkdirSync(dirname(dest), { recursive: true });
   if (item.kind === 'sqlite') {
-    const r = spawnSync(sqlite3, [join(root, item.rel), `.backup '${dest.replace(/'/g, "''")}'`], { encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`sqlite backup failed: ${item.rel}: ${(r.stderr || '').trim()}`);
+    // `VACUUM INTO` copies one read transaction. The CLI `.backup` restarts from page 1 whenever another connection
+    // writes the source — on a busy logs.db (written every second) it ran 85+ minutes without finishing (10-09 00:43 obs tier).
+    rmSync(dest, { force: true });
+    const r = spawnSync(sqlite3, [join(root, item.rel), `VACUUM INTO '${dest.replace(/'/g, "''")}'`], { encoding: 'utf8', timeout: SQLITE_SNAPSHOT_TIMEOUT_MS });
+    if (r.status !== 0) throw new Error(`sqlite backup failed: ${item.rel}: ${(r.error ? String(r.error) : (r.stderr || '').trim()) || `rc=${r.status}`}`);
   } else if (item.rel === 'config.json') {
     const original = readFileSync(join(root, item.rel), 'utf8');
     const stripped = stripHostLocalConfig(original);

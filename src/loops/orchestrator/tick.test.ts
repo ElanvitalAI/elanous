@@ -9,7 +9,9 @@ import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig, resetUserConfig } from '../../user-config.js';
-import { reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { nextOrchestratorWindowAt, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { openMsgStore } from '../../msg/msg-store.js';
+import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../neighbor-runtime.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
 
 const stages: Node[] = ['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'];
@@ -31,6 +33,61 @@ const invoke = async (root: string, runId: string, window: '08' | '12' | '18', d
     seatTurn: async () => ({ status: 'skipped-empty' }), ...deps });
   return final!;
 };
+
+test('orchestrator renews its signal during a held node and reports a failed node as degraded', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'orch-held-signal-'));
+  const start = new Date('2026-10-05T00:00:00Z');
+  let clock = start;
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const signal = () => {
+    const store = openMsgStore(join(root, 'msg', 'messages.db'));
+    try { return store.db.query('SELECT at, health, ends_at FROM loop_signals WHERE loop_id=?').get('orchestrator'); }
+    finally { store.close(); }
+  };
+  try {
+    await runOrchestratorNode('intake', { root, now: start, mode: 'shadow', runId: 'held', window: '08' });
+    const running = runOrchestratorNode('split', { root, now: () => clock, mode: 'shadow', runId: 'held', window: '08',
+      heartbeatIntervalMs: 10, loadAdapter: async () => { entered(); await held; throw Error('split unavailable'); } });
+    await started;
+    clock = new Date(start.getTime() + 241 * 60_000);
+    const deadline = Date.now() + 1000;
+    while ((signal() as { at: string }).at !== clock.toISOString() && Date.now() < deadline) await Bun.sleep(10);
+    expect(signal()).toEqual({ at: clock.toISOString(), health: 'healthy', ends_at: '2026-10-05T10:00:00.000Z' });
+    release();
+    await expect(running).rejects.toThrow('split unavailable');
+    expect(signal()).toMatchObject({ health: 'degraded' });
+  } finally { release(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('orchestrator node sends the durable signal consumed by seat neighbors', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'orch-signal-'));
+  const now = new Date('2026-10-05T00:00:00Z');
+  try {
+    await runOrchestratorNode('intake', { root, now, mode: 'shadow', runId: 'heartbeat-check', window: '08' });
+    const store = openMsgStore(join(root, 'msg', 'messages.db'));
+    try {
+      expect(store.db.query('SELECT at, health, ends_at FROM loop_signals WHERE loop_id=?').get('orchestrator'))
+        .toEqual({ at: now.toISOString(), health: 'healthy', ends_at: '2026-10-05T04:00:00.000Z' });
+    } finally { store.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the orchestrator lease spans the scheduled gap: no false absence overnight, absence once the next window is missed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'orch-gap-'));
+  const ranAt = new Date('2026-10-05T09:05:00Z'); // 18:05 KST — the last window of the day
+  const orchestrator = SEAT_NEIGHBORS.MK!.filter(peer => peer.id === 'orchestrator');
+  try {
+    expect(nextOrchestratorWindowAt(ranAt).toISOString()).toBe('2026-10-05T23:00:00.000Z'); // 08:00 KST next day
+    await runOrchestratorNode('intake', { root, now: ranAt, mode: 'shadow', runId: 'gap', window: '18' });
+    for (const at of ['2026-10-05T12:00:00Z', '2026-10-05T18:00:00Z', '2026-10-05T23:30:00Z']) // 21:00 · 03:00 · 08:30 KST
+      expect(checkLoopNeighbors(root, 'mk-seat', orchestrator, new Date(at))).toEqual([]);
+    expect(checkLoopNeighbors(root, 'mk-seat', orchestrator, new Date('2026-10-06T00:01:00Z')))
+      .toMatchObject([{ neighbor: 'orchestrator', reason: 'end-expired', action: 'escalate', to: 'human' }]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 describe('orchestrator degradation and per-tick cap', () => {
   test('L1 makes one rule-only cell per card, grades its body, never calls split and leads the briefing', async () => fixture(async (root, id, logged) => {

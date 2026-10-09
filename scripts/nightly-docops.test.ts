@@ -1,8 +1,8 @@
 import { setDefaultTimeout, describe, expect, it } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildStalenessStage, formatNightlyDocOpsCompletion, recordSemanticProposal, stalenessEventName, type SemanticQueueDeps } from './nightly-docops.js';
+import { buildDocRotStage, buildStalenessStage, recordDocRotStage, formatNightlyDocOpsCompletion, recordSemanticProposal, stalenessEventName, type SemanticQueueDeps } from './nightly-docops.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -77,6 +77,98 @@ describe('formatNightlyDocOpsCompletion', () => {
     const line = formatNightlyDocOpsCompletion({ ...base, staleness: { status: 'failed', error: 'shallow clone' } });
     expect(line).toContain('늙음 측정 실패(shallow clone)');
     expect(line).not.toContain('늙음 검사 0');
+  });
+});
+
+describe('nightly doc-rot stage', () => {
+  const base = { processed: 2, candidates: 3, proposals: 4, suppressed: 5, errors: 0, retries: 0, durationMs: 6 };
+
+  it('주입 스캔을 호출하고 낡은 파일과 못 잰 명령을 따로 남긴다', () => {
+    const calls: unknown[] = [];
+    const stage = buildDocRotStage('/repo', {
+      files: () => ['/repo/docs/manual/a.md', '/repo/docs/manual/b.md'],
+      scan: ((input: unknown) => {
+        calls.push(input);
+        return {
+          totals: { files: 2, staleFiles: 1, missingPaths: 1, badCommands: 1, unmeasured: 2, passthrough: 0, globalFlag: 0, intentional: 0 },
+          files: [
+            { file: 'docs/manual/a.md', missingPaths: [{ line: 1, path: 'src/gone.ts' }], commands: [
+              { kind: 'unknown-command', detail: 'elanous gone', ref: { file: 'docs/manual/a.md', line: 2, cmd: 'gone', subcommands: [], flags: [] } },
+              { kind: 'unmeasured', detail: 'help failed', ref: { file: 'docs/manual/a.md', line: 3, cmd: 'help', subcommands: [], flags: [] } },
+            ] },
+            { file: 'docs/manual/b.md', missingPaths: [], commands: [
+              { kind: 'unmeasured', detail: 'help failed', ref: { file: 'docs/manual/b.md', line: 1, cmd: 'help', subcommands: [], flags: [] } },
+            ] },
+          ],
+        };
+      }) as never,
+    });
+    const result = stage();
+    expect(calls).toEqual([{ repoRoot: '/repo', files: ['/repo/docs/manual/a.md', '/repo/docs/manual/b.md'] }]);
+    expect(result.status).toBe('measured');
+    if (result.status !== 'measured') throw new Error('expected measured');
+    expect(result.staleFiles).toHaveLength(1);
+    expect(result.staleFiles[0]?.file).toBe('docs/manual/a.md');
+    expect(result.staleFiles[0]?.badCommands.map(({ kind }) => kind)).toEqual(['unknown-command']);
+    const line = formatNightlyDocOpsCompletion(base, result);
+    expect(line).toContain('doc-rot 낡은 파일 1');
+    expect(line).toContain('없는 경로 1·깨진 명령 1·못 잰 명령 2');
+  });
+
+  it('기본 파일 열거와 실물 스캔을 같은 repoRoot 에서 실행한다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'nightly-doc-rot-'));
+    try {
+      mkdirSync(join(root, 'docs', 'manual'), { recursive: true });
+      writeFileSync(join(root, 'docs', 'manual', 'a.md'), 'See `src/not-present.ts`.');
+      const result = buildDocRotStage(root)();
+      expect(result.status).toBe('measured');
+      if (result.status !== 'measured') throw new Error('expected measured');
+      expect(result.totals.files).toBe(1);
+      expect(result.staleFiles).toEqual([{
+        file: 'docs/manual/a.md', missingPaths: [{ line: 1, path: 'src/not-present.ts' }], badCommands: [],
+      }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('scan 또는 파일 열거가 던져도 실패 결과로 접고 완료 줄에 남긴다', () => {
+    const stage = buildDocRotStage('/repo', {
+      files: () => ['docs/manual/a.md'],
+      scan: (() => { throw new Error('scanner unavailable'); }) as never,
+    });
+    const result = stage();
+    expect(result).toEqual({ status: 'failed', error: 'scanner unavailable' });
+    expect(formatNightlyDocOpsCompletion(base, result)).toContain('doc-rot 측정 실패(scanner unavailable)');
+    expect(buildDocRotStage('/repo', { files: () => { throw new Error('manual directory unavailable'); } })())
+      .toEqual({ status: 'failed', error: 'manual directory unavailable' });
+  });
+  it('결과를 날짜별 보고서와 docs.rot 관측으로 남기고 쓰기 실패도 던지지 않는다', () => {
+    const measured = { status: 'measured' as const, totals: { files: 2, staleFiles: 1, missingPaths: 1, badCommands: 0, unmeasured: 2, passthrough: 0, globalFlag: 0, intentional: 0 }, staleFiles: [] };
+    const writes: Array<[string, string]> = [];
+    const logs: Array<[string, string, Record<string, unknown>]> = [];
+    const ok = recordDocRotStage(measured, {
+      outDir: '/out', nowDate: '2026-10-08', mkdir: () => {},
+      write: (path, body) => { writes.push([path, body]); },
+      log: (c, e, d) => { logs.push([c, e, d]); },
+    });
+    expect(ok).toEqual({ reportPath: '/out/doc-rot-2026-10-08.json', writeError: null });
+    expect(writes[0]?.[0]).toBe('/out/doc-rot-2026-10-08.json');
+    expect(JSON.parse(writes[0]?.[1] ?? '{}').status).toBe('measured');
+    expect(logs[0]?.[0]).toBe('docs.rot');
+    expect(logs[0]?.[1]).toBe('nightly-scanned');
+    expect(logs[0]?.[2]).toMatchObject({ staleFiles: 1, unmeasured: 2, error: null, writeError: null });
+
+    logs.length = 0;
+    const failed = recordDocRotStage({ status: 'failed', error: 'scanner unavailable' }, {
+      outDir: '/out', nowDate: '2026-10-08', mkdir: () => {},
+      write: () => { throw new Error('disk full'); },
+      log: (c, e, d) => { logs.push([c, e, d]); },
+    });
+    expect(failed).toEqual({ reportPath: null, writeError: 'disk full' });
+    expect(logs[0]?.[1]).toBe('nightly-failed');
+    expect(logs[0]?.[2]).toMatchObject({ error: 'scanner unavailable', writeError: 'disk full', reportPath: null });
+    expect(() => recordDocRotStage(measured, { outDir: '/out', nowDate: 'd', mkdir: () => {}, write: () => {}, log: () => { throw new Error('log down'); } })).not.toThrow();
   });
 });
 

@@ -16,6 +16,7 @@ import { createGitHubIssueCommentFetchStatus, lintDocLinks, lintGitHubIssueComme
 import { proposeWikiClaimsFromHandoff, type Claim } from '../src/autopilot/discovery/wiki-claim-proposer.js';
 import { runNightlyDocOpsCycle, assertLoopbackModelUrl } from '../src/autopilot/discovery/nightly-docops-runner.js';
 import { assessDocsStaleness, defaultStalenessRevisions } from '../src/autopilot/discovery/doc-staleness.js';
+import { defaultManualFiles, scanDocRot } from './docs/doc-rot.js';
 import { debug } from '../src/debug/log.js';
 import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
 import {
@@ -51,13 +52,27 @@ const githubHeaders: Record<string, string> = { Accept: 'application/vnd.github+
 if (process.env.GITHUB_TOKEN) githubHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 const issueCommentFetchStatus = createGitHubIssueCommentFetchStatus(fetch, githubHeaders);
 
-export function formatNightlyDocOpsCompletion(metrics: Awaited<ReturnType<typeof runNightlyDocOpsCycle>>): string {
+export type DocRotStageResult =
+  | { status: 'measured'; totals: ReturnType<typeof scanDocRot>['totals']; staleFiles: Array<{
+      file: string;
+      missingPaths: ReturnType<typeof scanDocRot>['files'][number]['missingPaths'];
+      badCommands: ReturnType<typeof scanDocRot>['files'][number]['commands'];
+    }> }
+  | { status: 'failed'; error: string };
+
+export function formatNightlyDocOpsCompletion(
+  metrics: Awaited<ReturnType<typeof runNightlyDocOpsCycle>>,
+  docRot?: DocRotStageResult,
+): string {
   const stalenessLine = metrics.staleness?.status === 'measured'
     ? `늙음 검사 ${metrics.staleness.checked}·사라진 식별자 ${metrics.staleness.byAxis.removedIdentifiers}·깨진 링크 ${metrics.staleness.byAxis.brokenLinks}·superseded ${metrics.staleness.byAxis.supersededMarked}·staleScore ${metrics.staleness.byAxis.staleScoreOverThreshold}·문서목록 ${metrics.staleness.removedIdentifierDocuments.length}${metrics.staleness.removedIdentifierDocumentsTruncated ? '+' : ''}`
     : metrics.staleness?.status === 'failed'
       ? `늙음 측정 실패(${metrics.staleness.error})`
       : '늙음 측정 미지정';
-  return `[nightly-docops] 완료 — 처리 ${metrics.processed}·후보 ${metrics.candidates}·제안 ${metrics.proposals}·억제 ${metrics.suppressed}·에러 ${metrics.errors}·${stalenessLine}·${metrics.durationMs}ms → ${outDir} (HITL 승인 대기)`;
+  const docRotLine = docRot?.status === 'measured'
+    ? `·doc-rot 낡은 파일 ${docRot.totals.staleFiles}·없는 경로 ${docRot.totals.missingPaths}·깨진 명령 ${docRot.totals.badCommands}·못 잰 명령 ${docRot.totals.unmeasured}`
+    : docRot?.status === 'failed' ? `·doc-rot 측정 실패(${docRot.error})` : '';
+  return `[nightly-docops] 완료 — 처리 ${metrics.processed}·후보 ${metrics.candidates}·제안 ${metrics.proposals}·억제 ${metrics.suppressed}·에러 ${metrics.errors}·${stalenessLine}${docRotLine}·${metrics.durationMs}ms → ${outDir} (HITL 승인 대기)`;
 }
 
 /**
@@ -100,6 +115,76 @@ export function buildStalenessStage(
 export function stalenessEventName(staleness: { status: string } | undefined): string {
   if (!staleness) return 'staleness-skipped';
   return staleness.status === 'failed' ? 'staleness-failed' : 'staleness-measured';
+}
+
+export function buildDocRotStage(
+  repoRoot: string,
+  deps: { scan?: typeof scanDocRot; files?: () => string[] } = {},
+): () => DocRotStageResult {
+  const scan = deps.scan ?? scanDocRot;
+  const files = deps.files ?? (() => defaultManualFiles(repoRoot));
+  return () => {
+    try {
+      const report = scan({ repoRoot, files: files() });
+      return {
+        status: 'measured',
+        totals: report.totals,
+        staleFiles: report.files.flatMap((entry) => {
+          const badCommands = entry.commands.filter((finding) =>
+            finding.kind === 'unknown-command' || finding.kind === 'unknown-subcommand' || finding.kind === 'unknown-flag');
+          return entry.missingPaths.length || badCommands.length
+            ? [{ file: entry.file, missingPaths: entry.missingPaths, badCommands }]
+            : [];
+        }),
+      };
+    } catch (error) {
+      return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+}
+
+export interface DocRotRecordDeps {
+  outDir: string;
+  nowDate: string;
+  mkdir?: (dir: string) => void;
+  write?: (path: string, body: string) => void;
+  log?: (category: string, event: string, data: Record<string, unknown>) => void;
+}
+
+/**
+ * doc-rot 단계 결과를 ⑴ `doc-rot-<날짜>.json` 보고서 ⑵ `docs.rot` 관측 이벤트로 남긴다.
+ * 보고서·관측 어느 쪽이 실패해도 던지지 않는다 — 야간 사이클의 종료 코드를 바꾸지 않는다.
+ */
+export function recordDocRotStage(
+  docRot: DocRotStageResult,
+  deps: DocRotRecordDeps,
+): { reportPath: string | null; writeError: string | null } {
+  const mkdir = deps.mkdir ?? ((dir: string) => { mkdirSync(dir, { recursive: true }); });
+  const write = deps.write ?? ((path: string, body: string) => { writeFileSync(path, body); });
+  const log = deps.log ?? ((category: string, event: string, data: Record<string, unknown>) => { debug.log(category, event, data); });
+  const reportPath = join(deps.outDir, `doc-rot-${deps.nowDate}.json`);
+  let writeError: string | null = null;
+  try {
+    mkdir(deps.outDir);
+    write(reportPath, JSON.stringify(docRot, null, 2));
+  } catch (error) {
+    // 보고서 파일을 못 써도 측정 결과는 버리지 않는다 — 원인은 관측 이벤트에 따로 싣는다.
+    writeError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    const totals = docRot.status === 'measured' ? docRot.totals : null;
+    log('docs.rot', docRot.status === 'measured' ? 'nightly-scanned' : 'nightly-failed', {
+      files: totals?.files ?? null,
+      staleFiles: totals?.staleFiles ?? null,
+      missingPaths: totals?.missingPaths ?? null,
+      badCommands: totals?.badCommands ?? null,
+      unmeasured: totals?.unmeasured ?? null,
+      error: docRot.status === 'failed' ? docRot.error : null,
+      reportPath: writeError ? null : reportPath,
+      writeError,
+    });
+  } catch { /* 관측 실패가 야간 사이클의 종료 코드를 바꾸지 않는다 */ }
+  return { reportPath: writeError ? null : reportPath, writeError };
 }
 
 if (import.meta.main) {
@@ -156,7 +241,9 @@ const metrics = await runNightlyDocOpsCycle({
   },
 }, { batchLimit: 15, maxRetryPerItem: 1 });
 
-console.log(formatNightlyDocOpsCompletion(metrics));
+const docRot = buildDocRotStage(repoRoot)();
+recordDocRotStage(docRot, { outDir, nowDate });
+console.log(formatNightlyDocOpsCompletion(metrics, docRot));
 }
 
 // ── arc2 되살리기 · 의미 supersede 계층 (gemma-4 · 제목/토픽 클러스터 bounded · 미션 668871) ──

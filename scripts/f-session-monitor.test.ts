@@ -8,6 +8,8 @@
 import { setDefaultTimeout, describe, expect, test } from "bun:test";
 import {
   buildGates,
+  evaluateTechblog1,
+  type Techblog1Candidate,
   errored,
   measured,
   padW,
@@ -26,6 +28,107 @@ import {
   type LiveProcView,
   type RunsView,
 } from "./f-session-monitor";
+
+describe('TECHBLOG1 독립 게시 판정', () => {
+  const published = [{ installment: 1, publishedAt: '2026-10-01T00:00:00Z' }];
+  const candidate = (): Techblog1Candidate => ({
+    installment: 2,
+    publishAt: '2026-10-03T00:00:00Z',
+    measurements: [{ value: 0, source: '실측 로그', measuredAt: '2026-10-02T00:00:00Z' }],
+    exposure: { publicBeforePublish: false, approved: false, revealsProtectedDetails: false, attorneyReviewed: false },
+  });
+
+  test('연속된 회차·정확히 이틀·출처 있는 0 실측·비공개 초안은 통과', () => {
+    expect(evaluateTechblog1(published, candidate())).toEqual({ verdict: 'pass', reasons: [] });
+  });
+
+  test('회차를 건너뛰거나 중복하면 거부하며 이전 기록의 구멍도 거부', () => {
+    expect(evaluateTechblog1(published, { ...candidate(), installment: 3 }).reasons).toContain('TECHBLOG1 연재 순서 또는 이전 게시 시각이 유효하지 않음');
+    expect(evaluateTechblog1([{ installment: 2, publishedAt: published[0]!.publishedAt }], candidate()).verdict).toBe('fail');
+    expect(evaluateTechblog1([{ ...published[0]! }, { ...published[0]! }], { ...candidate(), installment: 3 }).verdict).toBe('fail');
+    expect(evaluateTechblog1([], { ...candidate(), installment: 1 }).verdict).toBe('pass');
+  });
+
+  test('48시간보다 1밀리초 빠르면 거부, 잘못된 날짜도 통과하지 않는다', () => {
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-02T23:59:59.999Z' }).reasons).toContain('TECHBLOG1 직전 게시에서 이틀이 지나지 않음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: 'bad' }).verdict).toBe('fail');
+    expect(evaluateTechblog1([
+      published[0]!, { installment: 2, publishedAt: '2026-10-02T23:59:59.999Z' },
+    ], { ...candidate(), installment: 3, publishAt: '2026-10-05T00:00:00Z' }).reasons)
+      .toContain('TECHBLOG1 이전 연재의 이틀 간격이 지켜지지 않음');
+  });
+
+  test('밀리초 초과 정밀도의 게시 시각은 거부하고 정확히 48시간인 밀리초 경계는 통과', () => {
+    expect(evaluateTechblog1(
+      [{ installment: 1, publishedAt: '2026-10-01T00:00:00.0009Z' }],
+      { ...candidate(), publishAt: '2026-10-03T00:00:00.0000Z' },
+    ).reasons).toContain('TECHBLOG1 연재 순서 또는 이전 게시 시각이 유효하지 않음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03T00:00:00.0000Z' }).reasons)
+      .toContain('TECHBLOG1 게시 시각을 확인할 수 없음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03T00:00:00.000Z' }))
+      .toEqual({ verdict: 'pass', reasons: [] });
+    expect(evaluateTechblog1(
+      [{ installment: 1, publishedAt: '2026-10-01T00:00:00.001Z' }],
+      { ...candidate(), publishAt: '2026-10-03T00:00:00.001Z' },
+    )).toEqual({ verdict: 'pass', reasons: [] });
+    expect(evaluateTechblog1(
+      [{ installment: 1, publishedAt: '2026-10-01T00:00:00.001Z' }],
+      { ...candidate(), publishAt: '2026-10-03T00:00:00.000Z' },
+    ).reasons).toContain('TECHBLOG1 직전 게시에서 이틀이 지나지 않음');
+  });
+
+  test('publishAt·publishedAt의 시간대 누락은 거부하며 오프셋을 포함한 정확히 48시간은 통과', () => {
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03T00:00:00' }).reasons)
+      .toContain('TECHBLOG1 게시 시각을 확인할 수 없음');
+    expect(evaluateTechblog1([{ installment: 1, publishedAt: '2026-10-01T00:00:00' }], candidate()).reasons)
+      .toContain('TECHBLOG1 연재 순서 또는 이전 게시 시각이 유효하지 않음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03' }).reasons)
+      .toContain('TECHBLOG1 게시 시각을 확인할 수 없음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03T08:59:59.999+09:00' }).reasons)
+      .toContain('TECHBLOG1 직전 게시에서 이틀이 지나지 않음');
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-10-03T09:00:00+09:00' }))
+      .toEqual({ verdict: 'pass', reasons: [] });
+    expect(evaluateTechblog1([
+      published[0]!, { installment: 2, publishedAt: '2026-10-03T09:00:00+09:00' },
+    ], { ...candidate(), installment: 3, publishAt: '2026-10-05T00:00:00Z' }))
+      .toEqual({ verdict: 'pass', reasons: [] });
+  });
+
+  test('달력상 존재하지 않는 게시일은 정규화해 통과시키지 않는다', () => {
+    expect(evaluateTechblog1(published, { ...candidate(), publishAt: '2026-02-30T00:00:00Z' }).reasons)
+      .toContain('TECHBLOG1 게시 시각을 확인할 수 없음');
+    expect(evaluateTechblog1([{ installment: 1, publishedAt: '2026-02-30T00:00:00Z' }], candidate()).reasons)
+      .toContain('TECHBLOG1 연재 순서 또는 이전 게시 시각이 유효하지 않음');
+    expect(evaluateTechblog1([], { ...candidate(), installment: 1, publishAt: '2024-02-29T00:00:00Z',
+      measurements: [{ value: 0, source: '실측 로그', measuredAt: '2024-02-28T00:00:00Z' }],
+    }).verdict).toBe('pass');
+  });
+
+  test('실측 시각에 시간대를 요구하고 게시 시각 경계를 오프셋으로 비교한다', () => {
+    const withMeasuredAt = (measuredAt: string) => ({
+      ...candidate(), measurements: [{ value: 1, source: '로그', measuredAt }],
+    });
+    expect(evaluateTechblog1(published, withMeasuredAt('2026-10-03T00:00:00')).reasons)
+      .toContain('TECHBLOG1 실측 수치·출처·측정 시각이 확인되지 않음');
+    expect(evaluateTechblog1(published, withMeasuredAt('2026-10-03T09:00:00+09:00')).verdict).toBe('pass');
+    expect(evaluateTechblog1(published, withMeasuredAt('2026-10-03T09:00:00.001+09:00')).reasons)
+      .toContain('TECHBLOG1 실측 수치·출처·측정 시각이 확인되지 않음');
+  });
+
+  test('실측 근거가 없거나 무한 수치·빈 출처·미래 측정이면 거부', () => {
+    expect(evaluateTechblog1(published, { ...candidate(), measurements: [] }).verdict).toBe('fail');
+    expect(evaluateTechblog1(published, { ...candidate(), measurements: [{ value: Infinity, source: '로그', measuredAt: '2026-10-02T00:00:00Z' }] }).verdict).toBe('fail');
+    expect(evaluateTechblog1(published, { ...candidate(), measurements: [{ value: 1, source: ' ', measuredAt: '2026-10-02T00:00:00Z' }] }).verdict).toBe('fail');
+    expect(evaluateTechblog1(published, { ...candidate(), measurements: [{ value: 1, source: '로그', measuredAt: '2026-10-04T00:00:00Z' }] }).verdict).toBe('fail');
+  });
+
+  test('공개 전 노출은 승인 필요, 보호 상세는 변리사 검토 필요', () => {
+    const base = candidate();
+    expect(evaluateTechblog1(published, { ...base, exposure: { ...base.exposure, publicBeforePublish: true } }).reasons).toContain('TECHBLOG1 공개 전 노출 승인 없음');
+    expect(evaluateTechblog1(published, { ...base, exposure: { ...base.exposure, revealsProtectedDetails: true, approved: true } }).reasons).toContain('TECHBLOG1 보호 대상 상세는 변리사 검토 전 노출 불가');
+    expect(evaluateTechblog1(published, { ...base, exposure: { publicBeforePublish: true, approved: true, revealsProtectedDetails: true, attorneyReviewed: true } }).verdict).toBe('pass');
+  });
+});
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);

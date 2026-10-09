@@ -1,11 +1,13 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { runGraph } from '../graph-runner/runner.js';
 import { WIZARD_ARCHETYPES } from './archetypes.js';
-import { runWizardStepWithRetries } from './steps.js';
+import { runWizardStep, runWizardStepWithRetries } from './steps.js';
+import { createPack } from '../knowledge/kgs/pack.js';
+import { KgsSqliteStore, setKgsDbPathOverride, _resetKgsStoreSingleton } from '../knowledge/kgs/sqlite-store.js';
 import { GraphWizardInputError, HARNESS_EXAMPLE, parseNodeAnnotations, stepIssues, WORKFLOW_EXAMPLE, generateGraphFromPrompt, pickBaseTemplate, listWizardTemplates, summarizeChange, validateWizardYaml, wizardGraphId } from './generate.js';
 
 const graphsDir = join(import.meta.dir, '../../graphs');
@@ -16,6 +18,63 @@ function stub(replies: string[]) {
   const prompts: string[] = [];
   return { prompts, callLLM: async (prompt: string) => { prompts.push(prompt); return replies[Math.min(prompts.length - 1, replies.length - 1)]!; } };
 }
+
+test('an installed pack powers a runnable knowledge node and the next artifact is grounded in its citation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-pack-'));
+  setKgsDbPathOverride(join(dir, 'kgs.db'));
+  const store = new KgsSqliteStore();
+  const packId = 'pack:fab-knowledge@1.0.0';
+  const card = { schema_version: 2 as const, id: 'card:1234', createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z',
+    author: 'test', title: '식각 온도', body: '식각 온도는 40도', nature: 'fact' as const, kind: 'card' as const,
+    reliability: 'verified' as const, source: { kind: 'manual' as const }, tags: [] };
+  const yaml = `graph_id: pack-rag\nloop: { title: 팩 근거 산출 }\nversion: 1\nentry_node: retrieve\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: retrieve, kind: agent, recipe: 'cmd:retrieve', max_visits: 1 }  # 지식 검색 | knowledge-rag | ${packId}\n  - { node_id: write, kind: agent, recipe: 'cmd:write', max_visits: 1 }  # 산출 | llm | 근거를 인용하여 공정 지침 작성\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }  # 완료\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }  # 실패\nedges:\n  - { from: retrieve, on: outcome, map: { ok: write, fail: failed } }\n  - { from: write, on: outcome, map: { ok: done, fail: failed } }\n`;
+  try {
+    store.writePack(createPack({ id: { slug: 'fab-knowledge', version: '1.0.0' }, title: '공정', intent: '식각',
+      audience: 'team', kind: 'generic', author: 'test', cards: [card] }));
+    store.writePack(createPack({ id: { slug: 'other-pack', version: '1.0.0' }, title: '타 공정', intent: '식각',
+      audience: 'team', kind: 'generic', author: 'test', cards: [{ ...card, id: 'card:9999', body: '식각 온도는 99도' }] }));
+    const llm = stub([fenced(yaml)]);
+    const result = await generateGraphFromPrompt({ prompt: '식각 온도', packId }, { callLLM: llm.callLLM, graphsDir, existingIds: () => new Set() });
+    expect(result.ok).toBe(true);
+    expect(llm.prompts[0]).toContain('식각 온도는 40도');
+    expect(llm.prompts[0]).not.toContain('식각 온도는 99도');
+    expect(result.steps?.retrieve).toMatchObject({ step: 'knowledge-rag', arg: packId });
+    expect(result.recipes).toContain(`graph step knowledge-rag --arg '${packId}'`);
+    const retrieval = runWizardStep('knowledge-rag', packId, { input: { query: '식각' } });
+    expect(retrieval).toMatchObject({ outcome: 'ok' });
+    expect(retrieval.text).toContain(`[${packId}#card:1234] 식각 온도: 식각 온도는 40도`);
+    expect(retrieval.text).not.toContain('99도');
+    expect(runWizardStep('knowledge-rag', packId).text).toContain('식각 온도는 40도');
+    await expect(generateGraphFromPrompt({ prompt: '식각 온도', packId: 'pack:missing-pack@1.0.0' },
+      { callLLM: llm.callLLM, graphsDir, existingIds: () => new Set() })).rejects.toThrow('pack not installed');
+    expect(result.dryRun?.status).toBe('done');
+    writeFileSync(join(dir, 'pack-rag.yaml'), result.yaml);
+    writeFileSync(join(dir, 'recipes.yaml'), result.recipes!);
+    const run = await runGraph(join(dir, 'pack-rag.yaml'), { input: { query: '식각' }, deps: {
+      root: join(dir, 'runs'), runBash: async (body, opts) => {
+        const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: { query: string }; outputs: Record<string, { text?: string }> };
+        const output = context.nodeId === 'retrieve'
+          ? runWizardStep('knowledge-rag', packId, context)
+          : { outcome: 'ok', text: `공정 지침: ${context.outputs.retrieve?.text ?? '근거 없음'}` };
+        expect(body).toContain(context.nodeId === 'retrieve' ? 'knowledge-rag' : 'graph step llm');
+        return { stdout: JSON.stringify(output) + '\n', stderr: '', exitCode: 0 };
+      },
+    } });
+    expect(run.status).toBe('done');
+    expect(run.nodes.find(node => node.nodeId === 'write')?.output).toContain(`[${packId}#card:1234] 식각 온도: 식각 온도는 40도`);
+    expect(run.nodes.find(node => node.nodeId === 'write')?.output).not.toContain('99도');
+    const broken = stub([fenced(yaml.replace(`knowledge-rag | ${packId}`, 'llm | 일반 질의'))]);
+    const rejected = await generateGraphFromPrompt({ prompt: '식각 온도', packId },
+      { callLLM: broken.callLLM, graphsDir, existingIds: () => new Set(), maxAttempts: 1 });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.issues.join(' ')).toContain('knowledge-rag 노드');
+    const disconnected = stub([fenced(yaml.replace('ok: write, fail: failed', 'ok: done, fail: failed'))]);
+    const noArtifact = await generateGraphFromPrompt({ prompt: '식각 온도', packId },
+      { callLLM: disconnected.callLLM, graphsDir, existingIds: () => new Set(), maxAttempts: 1 });
+    expect(noArtifact.ok).toBe(false);
+    expect(noArtifact.issues.join(' ')).toContain('산출 단계에 연결');
+  } finally { store.close(); _resetKgsStoreSingleton(); setKgsDbPathOverride(null); rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
 
 test('examples in the prompt pass the same validator the API uses', () => {
   expect(validateWizardYaml('harness', HARNESS_EXAMPLE)).toEqual([]);

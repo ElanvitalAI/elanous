@@ -171,7 +171,7 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}): Pro
       entry.resolvedFiles = outcome.resolvedFiles ?? [];
       if (outcome.sizeCollapse?.length || outcome.providerFailure?.length || outcome.testDeclarationLoss?.length) {
         entry.verdict = 'guard-tripped';
-      } else if (outcome.status === 'merged' || outcome.status === 'llm-resolved') {
+      } else if (outcome.status === 'merged' || outcome.status === 'llm-resolved' || outcome.status === 'deterministic-resolved') {
         if (entry.testFiles.length === 0) entry.verdict = 'merge-ok-no-tests';
         else {
           const test = (deps.runTests ?? defaultRunTests)(tmp, entry.testFiles);

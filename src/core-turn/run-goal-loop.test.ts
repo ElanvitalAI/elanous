@@ -8,6 +8,8 @@ import { boundReadableText } from '../self-implement/orchestrator.js';
 import {
   CHILD_LIVENESS_HEARTBEAT_ENV,
   GOAL_LOOP_FINAL_TEXT_EXCERPT_MAX_CHARS,
+  GOAL_CONTINUATION_PROMPT,
+  GOAL_READBACK_PROMPT,
   mergeChildLivenessHeartbeat,
   startChildLivenessHeartbeat,
   runGoalLoop,
@@ -129,6 +131,137 @@ describe('runGoalLoop iteration observation final-text excerpt', () => {
       finalTextExcerpt: '',
       finalTextExcerptTruncated: false,
     });
+  });
+});
+
+describe('runGoalLoop completion answer deduplication', () => {
+  test('both continuation prompts tell the model not to repeat an answer without new facts', () => {
+    for (const prompt of [GOAL_CONTINUATION_PROMPT, GOAL_READBACK_PROMPT]) {
+      expect(prompt).toContain('다시 쓰지 마라');
+      expect(prompt).toContain('텍스트 없이 update_goal 만 호출하라');
+    }
+  });
+
+  async function completeAfterAnswer(completionText: string) {
+    const firstText = '결정 카드는 2건입니다';
+    let turns = 0;
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      const result = await runGoalLoop(baseCtx(), {
+        maxIterations: 2,
+        changedFiles: () => [],
+        runTurn: async (ctx) => {
+          turns += 1;
+          if (turns === 1) {
+            ctx.callbacks?.onTurnComplete?.([{
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'lookup', name: 'lookup', input: {} }],
+            }]);
+            return { stopReason: 'end_turn', finalText: firstText } satisfies CoreTurnResult;
+          }
+          expect(ctx.messages.at(-1)?.content).toBe(GOAL_CONTINUATION_PROMPT);
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: '결정 카드 2건을 현재 상태에서 확인' } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: completionText } satisfies CoreTurnResult;
+        },
+      });
+      return { result, events, firstText, turns };
+    } finally {
+      debug.log = originalLog;
+    }
+  }
+
+  test('suppresses an identical completion answer and logs it', async () => {
+    const { result, events, firstText, turns } = await completeAfterAnswer('결정 카드는 2건입니다');
+    expect(turns).toBe(2);
+    expect(result).toMatchObject({ finalText: firstText, stopReason: 'goal_complete', goalComplete: true, iterations: 2 });
+    expect(result.finalText.split(firstText)).toHaveLength(2);
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'goal.loop', event: 'complete-duplicate-answer-suppressed',
+      data: expect.objectContaining({ sessionId: 'child-liveness', iterations: 2, chars: firstText.length }),
+    }));
+  });
+
+  test('compares trimmed and whitespace-normalized answers without rewriting the delivered text', async () => {
+    const { result, firstText } = await completeAfterAnswer('  결정 카드는   2건입니다  ');
+    expect(result.finalText).toBe(firstText);
+    expect(result.stopReason).toBe('goal_complete');
+  });
+
+  test('retains the already delivered answer when completion calls update_goal without text', async () => {
+    const { result, firstText } = await completeAfterAnswer('');
+    expect(result).toMatchObject({ finalText: firstText, stopReason: 'goal_complete', goalComplete: true });
+  });
+
+  test('keeps the previous answer only when the completion text merely contains it', async () => {
+    const { result, firstText } = await completeAfterAnswer('확인 결과 결정 카드는 2건입니다');
+    expect(result.finalText).toBe(firstText);
+    expect(result.stopReason).toBe('goal_complete');
+  });
+
+  test('suppresses a repeated answer after a readback preface, not treating its period as a new fact', async () => {
+    const completionText = '방금 다시 확인했습니다. 결정 카드는 2건입니다';
+    const { result, events, firstText } = await completeAfterAnswer(completionText);
+    expect(result).toMatchObject({ finalText: firstText, stopReason: 'goal_complete', goalComplete: true });
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'goal.loop', event: 'complete-duplicate-answer-suppressed',
+      data: expect.objectContaining({ iterations: 2, chars: completionText.length }),
+    }));
+  });
+
+  test('preserves a completion answer with a new fact', async () => {
+    const completionText = '결정 카드는 2건입니다. 그중 1건은 오늘 만료됩니다';
+    const { result, events } = await completeAfterAnswer(completionText);
+    expect(result.finalText).toBe(completionText);
+    expect(result.finalText).toContain('그중 1건은 오늘 만료됩니다');
+    expect(result.stopReason).toBe('goal_complete');
+    expect(events.some(({ event }) => event === 'complete-duplicate-answer-suppressed')).toBe(false);
+  });
+
+  test('preserves a new fact before the previous answer even when joined by a colon', async () => {
+    const completionText = '오늘 만료되는 카드가 1건입니다: 결정 카드는 2건입니다';
+    const { result, events } = await completeAfterAnswer(completionText);
+    expect(result).toMatchObject({ finalText: completionText, stopReason: 'goal_complete', goalComplete: true });
+    expect(events.some(({ event }) => event === 'complete-duplicate-answer-suppressed')).toBe(false);
+  });
+
+  test('preserves a new fact before the previous answer when joined by a period', async () => {
+    const completionText = '오늘 만료되는 카드가 1건입니다. 결정 카드는 2건입니다';
+    const { result } = await completeAfterAnswer(completionText);
+    expect(result.finalText).toBe(completionText);
+  });
+
+  test('does not accept or suppress an evidence-less completion claim', async () => {
+    let turns = 0;
+    const events: string[] = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string) => {
+      if (category === 'goal.loop') events.push(event);
+    }) as typeof debug.log;
+    try {
+      const result = await runGoalLoop(baseCtx(), {
+        maxIterations: 2,
+        runTurn: async (ctx) => {
+          turns += 1;
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: turns === 1 ? '   ' : '' } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: '결정 카드는 2건입니다' } satisfies CoreTurnResult;
+        },
+      });
+      expect(result).toMatchObject({ finalText: '결정 카드는 2건입니다', stopReason: 'max_iterations', goalComplete: false });
+      expect(events).toContain('complete-rejected-no-evidence');
+      expect(events).not.toContain('complete-duplicate-answer-suppressed');
+    } finally {
+      debug.log = originalLog;
+    }
   });
 });
 

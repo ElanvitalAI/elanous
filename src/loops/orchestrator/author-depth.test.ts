@@ -316,3 +316,17 @@ test('unreadable queue, running or overlap does not masquerade as zero shortfall
   }
   expect(authorDepth({ ...input, caps: { MK: 6, TC: 8 }, running: { MK: 9, TC: 5 } }).seats[0]).toMatchObject({ target: 2, short: 2 });
 });
+
+test('10-08 tick hang: without release cells the shadow reads neither host processes nor open work', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'author-depth-no-cells-'));
+  try {
+    const reads: string[] = [];
+    const result = collectAuthorDepth({ root: dir, now: new Date('2026-10-08T10:00:00Z'), log: () => {},
+      listProcesses: () => { reads.push('processes'); throw new Error('must not read host processes'); } });
+    expect(reads).toEqual([]);
+    expect(result.unreadable).toEqual(expect.arrayContaining([
+      { source: 'running', reason: 'skipped: no release cells to compare' },
+      { source: 'overlap', reason: 'skipped: no release cells to compare' }]));
+    expect(result.seats.every(row => row.wouldAuthor.length === 0)).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

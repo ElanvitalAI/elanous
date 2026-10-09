@@ -33,6 +33,9 @@ import {
 import type { UserConfig } from '../src/user-config.js';
 import type { TgIncoming } from '../src/telegram.js';
 import { renderRunningRuns, type RunningRunsResult } from '../src/self-implement/running-runs.js';
+import { renderChecklistBoard } from '../src/release-loop/checklist-board.js';
+import { checklistDevVersion, type Checklist } from '../src/release-loop/checklist.js';
+import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../src/dashboard/slash-runtime/dashboard-handlers.js';
 
 function fakeCtx(text: string, overrides: Partial<TgIncoming> = {}): TgIncoming {
   return {
@@ -513,6 +516,65 @@ describe('toTelegramBotCommands', () => {
     const [out] = toTelegramBotCommands([{ name: 'a', description: long, handler: async () => '' }]);
     expect(out!.description.length).toBeLessThanOrEqual(256);
     expect(out!.description.endsWith('…')).toBe(true);
+  });
+});
+
+describe('/board — Telegram and TUI checklist board', () => {
+  const item = (id: string, status: Checklist['items'][number]['status'], owner?: string): Checklist['items'][number] =>
+    ({ id, title: id, status, ...(owner ? { owner } : {}), updatedAt: '2026-10-08T00:00:00Z', updatedBy: 'test' });
+  const checklist: Checklist = {
+    version: '0.2.22', released: '0.2.21', dev: '0.2.22', history: [],
+    items: [item('G-1', 'green', 'MK'), item('R-1', 'red', 'TC'), item('Y-1', 'yellow', 'MK/web'),
+      item('Y-2', 'yellow', 'TC'), item('Y-3', 'yellow', 'MK'), item('D-1', 'done', 'TC')],
+  };
+  const send = (text: string, read: (version: string) => Checklist) => {
+    const commands = defaultTelegramCommands(undefined, SLASH_COMMANDS, FEATURE_MATURITY, undefined, read);
+    return dispatchTelegramSlash(fakeCtx(text), { userConfig: baseConfig(), allCommands: commands });
+  };
+  const tui = async (args: string[], read: (version: string) => Checklist) => {
+    const lines: string[] = [];
+    const ctx = { checklistRead: read, pushChatLine: (line: string) => { lines.push(line); }, setChatScrollOffset: () => {} } as unknown as DashboardSlashContext;
+    const result = await buildDashboardSlashRegistry().dispatch('board', args, ctx);
+    expect(result.kind).toBe('continue');
+    return lines.join('\n');
+  };
+
+  it('[tg-board-equals-renderer] one checklist produces identical Telegram, TUI and renderer text with red ids and yellow seat counts', async () => {
+    const seen: string[] = [];
+    const read = (version: string) => { seen.push(version); return checklist; };
+    const expected = renderChecklistBoard(checklist);
+    expect(expected).toBe('판 0.2.22 · 초록 1 · 노랑 3 · 빨강 1 · 끝 1\n빨강 칸: R-1\n자리별 노랑: MK 2 · TC 1');
+    expect(await send('/board 0.2.22', read)).toEqual({ handled: true, reply: expected });
+    expect(await tui(['0.2.22'], read)).toBe(expected);
+    expect(seen).toEqual(['0.2.22', '0.2.22']);
+    const commands = defaultTelegramCommands(undefined, SLASH_COMMANDS, FEATURE_MATURITY, undefined, read);
+    expect(toTelegramBotCommands(commands).map((c) => c.command)).toContain('board');
+    const help = await dispatchTelegramSlash(fakeCtx('/help'), { userConfig: baseConfig(), allCommands: commands });
+    expect(help.handled && help.reply).toContain('/board — ');
+    expect(SLASH_COMMANDS.some((command) => command.name === 'board')).toBe(true);
+  });
+
+  it('[tg-board-default-and-usage] zero args selects checklistDevVersion; two args reject before reading on both surfaces', async () => {
+    const versions: string[] = [];
+    const read = (version: string) => { versions.push(version); return checklist; };
+    const expected = renderChecklistBoard(checklist);
+    expect(await send('/board', read)).toEqual({ handled: true, reply: expected });
+    expect(await tui([], read)).toBe(expected);
+    expect(versions).toEqual([checklistDevVersion(), checklistDevVersion()]);
+    expect(await send('/board 0.2.22 extra', read)).toEqual({ handled: true, reply: '사용법: /board [판]' });
+    expect(await tui(['0.2.22', 'extra'], read)).toBe('사용법: /board [판]');
+    expect(versions).toHaveLength(2);
+  });
+
+  it('[tg-board-read-failure] a throwing reader reports unreadable rather than a zero-filled board on both surfaces', async () => {
+    const read = (_version: string): Checklist => { throw new Error('ledger offline'); };
+    const telegram = await send('/board 0.2.22', read);
+    const dashboard = await tui(['0.2.22'], read);
+    expect(telegram).toEqual({ handled: true, reply: '판 체크리스트를 못 읽었다 — 「없다」가 아니다' });
+    expect(dashboard).toBe('판 체크리스트를 못 읽었다 — 「없다」가 아니다');
+    expect(telegram.handled && telegram.reply).toContain('못 읽었다');
+    expect(telegram.handled && telegram.reply).not.toContain('초록 0');
+    expect(dashboard).not.toContain('초록 0');
   });
 });
 

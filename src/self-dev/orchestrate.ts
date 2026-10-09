@@ -298,6 +298,8 @@ export interface SelfDevJobResult {
   providerErrors?: { count: number; provider: string; category: 'quota' | 'credential' | 'request' | 'other' };
   /** Stable child run identity used to join its run-ledger proposal. */
   runId?: string;
+  /** Self review verdict bound to the PR head observed by the child; absent if either observation is missing. */
+  selfReview?: { verdict: 'pass' | 'fail'; head: string };
   /** Whether the child review actually ran; omitted preserves legacy producers. */
   reviewed?: boolean;
   /** Why the child did not run review; omitted preserves legacy review-unobserved handling. */
@@ -1499,6 +1501,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.prNumber !== undefined ? { prNumber: disp.prNumber } : {}),
           ...(disp?.merged !== undefined ? { merged: disp.merged } : {}),
           ...(disp?.checkedHeadCommit ? { checkedHeadCommit: disp.checkedHeadCommit } : {}),
+          ...(disp?.selfReview ? { selfReview: disp.selfReview } : {}),
           // ⭐ `A1` — 판정 3종을 «끝까지» 옮긴다. 여기서 빠지면 트리아지가 눈을 잃는다.
           ...(disp?.mergeReason ? { mergeReason: disp.mergeReason } : {}),
           ...(!cancelling && disp?.stopReason ? { stopReason: disp.stopReason } : {}),

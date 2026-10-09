@@ -3,13 +3,15 @@
 //   bun scripts/test-diet/node.ts pick|measure|audit|record (test-diet or nightly-audit graph)
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
 import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
-import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, type LedgerLine, type Measurement, type Td1Disposition } from './lib.js';
+import { isCredentialKey } from '../lib/deterministic-env.js';
+import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, mainFailureFiles, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, writeMainFailureDay, type LedgerLine, type MainFailureResult, type Measurement, type Td1Disposition } from './lib.js';
 import { fixedCountAssertions, flakeVerdict, sweepSlice, unreachableImports, type Mutation, type TestRun } from './effectiveness.js';
 
 type Context = { graphId?: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown> | null> };
@@ -235,6 +237,49 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
   return emit({ outcome: 'ok', summary: `test-diet ${line.range} · keep ${counts.keep} · review ${counts.review} · failing ${counts.failing}${card ? ' · card draft' : ''}`, range: line.range, ...counts, ...(card ? { card } : {}) });
 }
 
+export function mainFailures(ctx: Context, deps: { root?: string; checkout?: string; runFile?: (file: string, cwd: string) => MainFailureResult; now?: Date } = {}): number {
+  const selected = mainFailureFiles(ctx.input.files);
+  const root = deps.root ?? effectiveInstanceRoot();
+  const guarded = process.env.NODE_ENV === 'test' || !!process.env.ELANOUS_TEST_HOME;
+  const directory = deps.checkout || guarded ? undefined : mkdtempSync(join(tmpdir(), 'test-diet-main-'));
+  try {
+    let checkout = deps.checkout ?? directory ?? '';
+    let commit: string;
+    if (guarded) {
+      // No clone, install, test subprocess or harness dispatch in the test universe.
+      const at = deps.now ?? new Date();
+      const ledger = join(root, 'test-diet', 'main-failures', `${at.toISOString().slice(0, 10)}-guard.json`);
+      mkdirSync(join(root, 'test-diet', 'main-failures'), { recursive: true });
+      writeFileSync(ledger, JSON.stringify({ at: at.toISOString(), selected, measured: false, reason: 'test environment', owner: 'TC', mode: 'shadow' }) + '\n');
+      return emit({ outcome: 'ok', summary: 'main failures record only: test environment (not measured)', ledger, selected, measured: false });
+    } else if (deps.checkout) {
+      const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: checkout, encoding: 'utf8' });
+      if (head.status !== 0) throw new Error(`main checkout unreadable: ${checkout}`);
+      commit = head.stdout.trim();
+    } else {
+      const source = process.cwd();
+      const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--single-branch', '--branch', 'main', source, checkout], { encoding: 'utf8', timeout: 120_000 });
+      if (clone.status !== 0) return emit({ outcome: 'error', summary: `main checkout failed: ${clone.stderr || clone.error}` });
+      commit = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: checkout, encoding: 'utf8' }).stdout.trim();
+      const install = spawnSync('bun', ['install', '--frozen-lockfile'], { cwd: checkout, encoding: 'utf8', timeout: 300_000, maxBuffer: 1024 * 1024 });
+      if (install.status !== 0) return emit({ outcome: 'error', summary: `main install failed: ${install.stderr || install.error}` });
+    }
+    const runFile = deps.runFile ?? ((file: string, cwd: string): MainFailureResult => {
+      if (!existsSync(join(cwd, file))) return { file, rc: null, stdout: '', stderr: 'test file not present on main' };
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !isCredentialKey(key)));
+      const child = spawnSync('bun', ['run', 'test:deterministic', file], {
+        cwd, encoding: 'utf8', timeout: 300_000, maxBuffer: 4 * 1024 * 1024,
+        env: { ...env, NODE_ENV: 'test', ELANOUS_STATE_DIR: join(root, 'test-diet', 'isolated-test-state') },
+      });
+      return { file, rc: child.status, stdout: child.stdout ?? '', stderr: child.stderr ?? String(child.error ?? ''), timedOut: (child.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT' };
+    });
+    const results = selected.map((file) => runFile(file, checkout));
+    const day = writeMainFailureDay(root, selected, results, commit, deps.now);
+    debug.log('test-diet.main-failures', 'recorded', { selected: selected.length, failingFiles: day.failingFiles, delta: day.delta, guarded });
+    return emit({ outcome: 'ok', summary: `main failures ${day.failingFiles}/${selected.length} · delta ${day.delta ?? 'n/a'} · shadow TC`, ledger: join(root, 'test-diet', 'main-failures', `${day.date}.json`), ...day });
+  } finally { if (directory) rmSync(directory, { recursive: true, force: true }); }
+}
+
 function status(root: string, options: { json?: boolean; days?: number } = {}): number {
   const path = ledgerPath(root);
   const ledger = existsSync(path) ? readFileSync(path, 'utf8') : '';
@@ -286,6 +331,7 @@ if (import.meta.main) {
       const ctx = context();
       const flags = process.argv.slice(3);
       process.exitCode = step === 'pick' ? pick(ctx, flags.includes('--sweep')) : step === 'measure' ? measure(ctx, false, flags.includes('--effectiveness')) : step === 'audit' ? measure(ctx, true)
+        : step === 'main-failures' ? mainFailures(ctx)
         : step === 'record' ? (ctx.graphId === 'nightly-audit' || Object.hasOwn(ctx.outputs, 'audit') ? recordNightlyAudit(ctx) : record(ctx)) : emit({ outcome: 'error', summary: `unknown step: ${step}` });
     }
   } catch (error) {

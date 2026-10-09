@@ -1,13 +1,14 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { runNexus } from '../nexus/index.js';
 import { setTestStateRoot } from '../nexus/paths.js';
-import { measureLoad, readMemberToken, startMemberHeartbeat } from './member.js';
+import { listHarnessParents, measureDiskIoPressure, measureHarnessParents, measureLoad, parseHarnessParentPs, readMemberToken, startMemberHeartbeat } from './member.js';
 import { resolvePrimary, writePrimaryJoin } from './primary.js';
+import { ResourceLedger } from './ledger.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -34,7 +35,20 @@ const options = {
 
 test('registers machine and actual-port instance once, then sends two load heartbeats and stops', async () => {
   const calls: Array<{ path: string; body: any; auth: string | null }> = [];
-  const stop = startMemberHeartbeat({ ...options, now: () => 1234, fetch: async (input, init) => {
+  let sample = 0;
+  const measure = async (now: () => number, baseline: { value: number }) => {
+    sample++;
+    return measureLoad(now, baseline, {
+      listParents: async () => ({ status: 'ok', records: [
+        { pid: 10, elapsedSeconds: 100 + sample, command: 'bun /same/elanous.mjs harness say x', version: 'old-at-start' },
+        { pid: 11, elapsedSeconds: 30, command: 'bun /same/elanous.mjs harness ask x', version: 'new-at-start' },
+      ] }),
+      currentVersion: 'new-at-start',
+      diskIo: at => measureDiskIoPressure(at, { platform: 'linux', readPressure: () =>
+        `some avg10=${sample}.25 avg60=0 total=0\nfull avg10=0.50 avg60=0 total=0\n` }),
+    });
+  };
+  const stop = startMemberHeartbeat({ ...options, now: () => 1234, measure, fetch: async (input, init) => {
     calls.push({ path: new URL(String(input)).pathname, body: JSON.parse(String(init?.body)), auth: new Headers(init?.headers).get('authorization') });
     return Response.json({ ok: true });
   } });
@@ -45,6 +59,18 @@ test('registers machine and actual-port instance once, then sends two load heart
       '/v1/resources/machine%3Alocal/heartbeat', '/v1/resources/machine%3Alocal/heartbeat',
     ]);
     expect(calls[0]?.body).toMatchObject({ id: 'machine:local', kind: 'machine', machine: 'local' });
+    for (const [index, call] of [calls[0], ...calls.slice(2)].entries()) {
+      const load = call?.body.attrs.load;
+      expect(load.harnessParents).toEqual({
+        count: { source: 'ps:harness-processes', observedAt: 1234, status: 'ok', value: 2 },
+        oldestAgeSeconds: { source: 'ps:harness-processes', observedAt: 1234, status: 'ok', value: 101 + index },
+        versionMismatchCount: { source: 'ps:harness-processes', observedAt: 1234, status: 'ok', value: 1 },
+      });
+      expect(load.diskIo).toEqual({
+        pageouts: { source: 'vm_stat:pageouts', observedAt: 1234, status: 'unmeasured', value: null, reason: 'platform' },
+        io: { source: '/proc/pressure/io', observedAt: 1234, status: 'ok', value: { someAvg10: index + 1.25, fullAvg10: 0.5 } },
+      });
+    }
     expect(calls[1]?.body).toMatchObject({ kind: 'instance', endpoint: options.instance.endpoint, attrs: { port: 43210 } });
     expect(calls.slice(0, 2).map(call => call.auth)).toEqual(Array(2).fill(`Bearer ${options.token}`));
     for (const call of calls.slice(2)) {
@@ -55,6 +81,69 @@ test('registers machine and actual-port instance once, then sends two load heart
     stop();
     await Bun.sleep(50);
     expect(calls).toHaveLength(count);
+  } finally { stop(); }
+});
+
+test('failed probes send unmeasured on registration and recurring heartbeat', async () => {
+  const loads: any[] = [];
+  const stop = startMemberHeartbeat({ ...options, now: () => 77,
+    measure: (now, baseline) => measureLoad(now, baseline, {
+      listParents: async () => { throw Error('ps unavailable'); },
+      diskIo: () => Promise.reject(Error('io unavailable')),
+    }),
+    fetch: async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.attrs?.load) loads.push(body.attrs.load);
+      return Response.json({});
+    },
+  });
+  try {
+    await until(() => loads.length >= 2);
+    for (const load of loads.slice(0, 2)) {
+      expect(load.harnessParents).toEqual({
+        count: { source: 'ps:harness-processes', observedAt: 77, status: 'unmeasured', value: null, reason: 'ps-exec' },
+        oldestAgeSeconds: { source: 'ps:harness-processes', observedAt: 77, status: 'unmeasured', value: null, reason: 'ps-exec' },
+        versionMismatchCount: { source: 'ps:harness-processes', observedAt: 77, status: 'unmeasured', value: null, reason: 'ps-exec' },
+      });
+      expect(load.diskIo).toEqual({
+        pageouts: { source: 'vm_stat:pageouts', observedAt: 77, status: 'unmeasured', value: null, reason: 'probe-failed' },
+        io: { source: '/proc/pressure/io', observedAt: 77, status: 'unmeasured', value: null, reason: 'probe-failed' },
+      });
+    }
+  } finally { stop(); }
+});
+
+test('machine heartbeat merges measured load without changing the ledger record format', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'control-member-ledger-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const sent: string[] = [];
+  const stop = startMemberHeartbeat({ ...options, machine: { ...options.machine, attrs: { duties: ['observe'] } }, now: () => 42,
+    measure: (now, baseline) => measureLoad(now, baseline, {
+      listParents: async () => ({ status: 'ok', records: [{ pid: 1, command: 'bun /same/elanous.mjs harness say x', elapsedSeconds: 92 }] }),
+      diskIo: at => measureDiskIoPressure(at, { platform: 'linux', readPressure: () =>
+        'some avg10=2.50 avg60=0 total=0\nfull avg10=0.25 avg60=0 total=0\n' }),
+    }),
+    fetch: async (input, init) => {
+      const body = JSON.parse(String(init?.body));
+      const path = new URL(String(input)).pathname;
+      sent.push(path);
+      if (path.endsWith('/register')) ledger.register(body, 'member-a');
+      else ledger.heartbeat('machine:local', 'member-a', body.attrs, 43);
+      return Response.json({});
+    },
+  });
+  try {
+    await until(() => sent.length >= 3);
+    const rows = JSON.parse(readFileSync(ledger.path, 'utf8'));
+    expect(rows).toHaveLength(2);
+    expect(Object.keys(rows[0]).sort()).toEqual(['attrs', 'id', 'kind', 'machine', 'name', 'observedAt', 'owner', 'ttlMs']);
+    expect(rows[0].attrs.load.harnessParents).toMatchObject({ count: { status: 'ok', value: 1 },
+      oldestAgeSeconds: { status: 'ok', value: 92 }, versionMismatchCount: { status: 'unmeasured', value: null } });
+    expect(rows[0].attrs.load.diskIo.io).toMatchObject({ status: 'ok', value: { someAvg10: 2.5, fullAvg10: 0.25 } });
+    expect(rows[0].attrs.duties).toEqual(['observe']);
+    expect(rows[0].observedAt).toBe(43);
+    expect(rows[1].attrs).toEqual({ port: 43210 });
   } finally { stop(); }
 });
 
@@ -74,8 +163,8 @@ test('default heartbeat interval is thirty seconds', async () => {
   } finally { stop(); timerSpy.mockRestore(); }
 });
 
-test('measurement omits unknown running-run and Pod-slot fields rather than inventing zero', () => {
-  const load = measureLoad(() => 27);
+test('measurement omits unknown running-run and Pod-slot fields rather than inventing zero', async () => {
+  const load = await measureLoad(() => 27);
   expect(load.loadAvg).toHaveLength(3);
   expect(load.cpuCount).toBeGreaterThan(0);
   expect(load.freeMem).toBeGreaterThanOrEqual(0);
@@ -83,6 +172,111 @@ test('measurement omits unknown running-run and Pod-slot fields rather than inve
   expect(load.observedAt).toBe(27);
   expect(load).not.toHaveProperty('runningRuns');
   expect(load).not.toHaveProperty('podSlots');
+});
+
+test('ps harness parents parse elapsed days and reject incomplete observations', () => {
+  expect(parseHarnessParentPs('  10 01:20 bun /a/elanous.mjs harness ask x\n  11 2-03:04:05 bun /a/elanous.mjs harness say y\n'))
+    .toMatchObject({ status: 'ok', records: [
+      { pid: 10, elapsedSeconds: 80, command: 'bun /a/elanous.mjs harness ask x' },
+      { pid: 11, elapsedSeconds: 183845, command: 'bun /a/elanous.mjs harness say y' },
+    ] });
+  expect(parseHarnessParentPs('10 bad bun /a/elanous.mjs harness say x\n').status).toBe('incomplete');
+  expect(parseHarnessParentPs('10 01:20 bash -c "bun /a/elanous.mjs harness say x"\n'))
+    .toMatchObject({ status: 'ok', records: [] });
+  expect(parseHarnessParentPs('').status).toBe('incomplete');
+});
+
+test('ps probe is asynchronous, bounded and fails as unmeasured', async () => {
+  let finish!: (result: { stdout: string; stderr: string }) => void;
+  const pending = new Promise<{ stdout: string; stderr: string }>(resolve => { finish = resolve; });
+  const calls: unknown[] = [];
+  const seenPids: number[] = [];
+  const reading = listHarnessParents(((file: string, args: string[], options: object) => {
+    calls.push({ file, args, options });
+    return pending;
+  }) as Parameters<typeof listHarnessParents>[0], async pid => {
+    seenPids.push(pid);
+    return 'old-at-start';
+  });
+  expect(calls).toEqual([{ file: 'ps', args: ['-axo', 'pid=,etime=,command='],
+    options: { encoding: 'utf8', timeout: 2_000, maxBuffer: 4 * 1024 * 1024 } }]);
+  let eventLoopAdvanced = false;
+  await new Promise<void>(resolve => setTimeout(() => { eventLoopAdvanced = true; resolve(); }, 0));
+  expect(eventLoopAdvanced).toBe(true);
+  finish({ stdout: '10 00:10 bun /same/elanous.mjs harness say x\n', stderr: '' });
+  expect(await reading).toMatchObject({ status: 'ok', records: [{ pid: 10, elapsedSeconds: 10, version: 'old-at-start' }] });
+  expect(seenPids).toEqual([10]);
+  let release!: (value: string) => void;
+  const unavailable = new Promise<string>(resolve => { release = resolve; });
+  const waiting = listHarnessParents((async () => ({ stdout: '10 00:10 bun /same/elanous.mjs harness say x\n', stderr: '' })) as unknown as NonNullable<Parameters<typeof listHarnessParents>[0]>,
+    () => unavailable);
+  let progressed = false;
+  await new Promise<void>(resolve => setTimeout(() => { progressed = true; resolve(); }, 0));
+  expect(progressed).toBe(true);
+  release('new-at-start');
+  expect((await waiting).records?.[0]?.version).toBe('new-at-start');
+  expect(measureHarnessParents(9, await listHarnessParents((async () => { throw Error('timeout'); }) as unknown as NonNullable<Parameters<typeof listHarnessParents>[0]>)).count)
+    .toEqual({ source: 'ps:harness-processes', observedAt: 9, status: 'unmeasured', value: null, reason: 'ps-exec' });
+});
+
+test('harness parent summary counts parents and only compares startup-stamped versions', () => {
+  const list = { status: 'ok' as const, records: [
+    { pid: 10, elapsedSeconds: 3600, command: 'bun /install/current/elanous.mjs harness say x', version: 'old-startup' },
+    { pid: 11, elapsedSeconds: 120, command: 'bun /install/current/elanous.mjs harness ask x', version: 'current-startup' },
+    { pid: 12, elapsedSeconds: 9999, command: 'other process' },
+  ] };
+  const result = measureHarnessParents(27, list, 'current-startup');
+  expect(result).toEqual({
+    count: { value: 2, status: 'ok', observedAt: 27, source: 'ps:harness-processes' },
+    oldestAgeSeconds: { value: 3600, status: 'ok', observedAt: 27, source: 'ps:harness-processes' },
+    versionMismatchCount: { value: 1, status: 'ok', observedAt: 27, source: 'ps:harness-processes' },
+  });
+  const empty = measureHarnessParents(27, { status: 'ok', records: [] });
+  expect(empty.versionMismatchCount.value).toBe(0);
+  expect(empty.oldestAgeSeconds).toMatchObject({ value: null, status: 'unmeasured', reason: 'no-parents' });
+  const failed = measureHarnessParents(27, { status: 'failed', stage: 'ps-exec' });
+  expect(Object.values(failed).map(metric => metric.value)).toEqual([null, null, null]);
+  expect(Object.values(failed).map(metric => metric.status)).toEqual(['unmeasured', 'unmeasured', 'unmeasured']);
+  const unknown = measureHarnessParents(27, { status: 'ok', records: [
+    { pid: 10, elapsedSeconds: 10, command: 'bun /install/current/elanous.mjs harness say x' },
+  ] }, 'current-startup');
+  expect(unknown.count.value).toBe(1);
+  expect(unknown.versionMismatchCount).toMatchObject({ status: 'unmeasured', value: null, reason: 'version-unavailable' });
+  expect(measureHarnessParents(27, list).versionMismatchCount.status).toBe('unmeasured');
+  expect(measureHarnessParents(27, { status: 'incomplete', stage: 'ps-parse', records: [] }).count.value).toBeNull();
+});
+
+test('disk I/O reports platform-specific measurements and explicitly marks unsupported or invalid readings', async () => {
+  expect(await measureDiskIoPressure(27, { platform: 'darwin', vmStat: () => 'Pages paged out: 1,234.\n' })).toEqual({
+    pageouts: { status: 'ok', value: 1234, source: 'vm_stat:pageouts', observedAt: 27 },
+    io: { status: 'unmeasured', value: null, source: '/proc/pressure/io', observedAt: 27, reason: 'platform' },
+  });
+  // Real macOS (Darwin 27) vm_stat line shape.
+  expect((await measureDiskIoPressure(27, { platform: 'darwin', vmStat: () => 'Pageins:                                      9.\nPageouts:                                      55871.\n' })).pageouts)
+    .toEqual({ status: 'ok', value: 55871, source: 'vm_stat:pageouts', observedAt: 27 });
+  expect(await measureDiskIoPressure(27, { platform: 'linux', readPressure: () =>
+    'some avg10=0.25 avg60=0.50 avg300=0.75 total=8\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' })).toEqual({
+    pageouts: { status: 'unmeasured', value: null, source: 'vm_stat:pageouts', observedAt: 27, reason: 'platform' },
+    io: { status: 'ok', value: { someAvg10: 0.25, fullAvg10: 0 }, source: '/proc/pressure/io', observedAt: 27 },
+  });
+  const baseline = { value: Number.NaN };
+  const vmStat = () => 'Pages paged out: 1,234.\n';
+  expect((await measureDiskIoPressure(27, { platform: 'darwin', vmStat }, baseline)).pageouts)
+    .toMatchObject({ status: 'unmeasured', value: null, reason: 'baseline-unavailable' });
+  expect((await measureDiskIoPressure(28, { platform: 'darwin', vmStat: () => 'Pages paged out: 1,240.\n' }, baseline)).pageouts)
+    .toMatchObject({ status: 'ok', value: 6 });
+  expect((await measureDiskIoPressure(27, { platform: 'darwin', vmStat: () => 'no pageouts' })).pageouts)
+    .toMatchObject({ status: 'unmeasured', value: null, reason: 'invalid-output' });
+  expect((await measureDiskIoPressure(27, { platform: 'linux', readPressure: () => { throw Error(); } })).io)
+    .toMatchObject({ status: 'unmeasured', value: null, reason: 'pressure-read-failed' });
+  let finish!: (text: string) => void;
+  const delayed = new Promise<string>(resolve => { finish = resolve; });
+  const reading = measureDiskIoPressure(27, { platform: 'darwin', vmStat: () => delayed });
+  let advanced = false;
+  await new Promise<void>(resolve => setTimeout(() => { advanced = true; resolve(); }, 0));
+  expect(advanced).toBe(true);
+  finish('Pages paged out: 20.\n');
+  expect((await reading).pageouts).toMatchObject({ status: 'ok', value: 20 });
 });
 
 test('retry suppresses identical failure reasons, logs a changed reason, and does not leak the token', async () => {
@@ -198,6 +392,10 @@ test('maximum interval timeout retries before the TTL boundary; 404 re-registers
     await until(() => timers.length > 0);
   };
   const stop = startMemberHeartbeat({ ...options, intervalMs: 300_000, now: () => elapsed,
+    measure: (now, baseline) => measureLoad(now, baseline, {
+      listParents: async () => ({ status: 'ok', records: [] }),
+      diskIo: at => measureDiskIoPressure(at, { platform: 'other' as NodeJS.Platform }),
+    }),
     fetch: async (input) => {
       const path = new URL(String(input)).pathname;
       paths.push(path);
@@ -214,6 +412,8 @@ test('maximum interval timeout retries before the TTL boundary; 404 re-registers
     await advance(5_000);
     expect(timers.some(timer => timer.ms === 30_000)).toBe(true);
     await advance(30_000);
+    // measureLoad is async now: the tick posts after an awaited measure, so wait for the posts, not just a timer.
+    await until(() => paths.length >= 5);
     expect(elapsed).toBe(335_000);
     expect(paths.slice(0, 5)).toEqual([
       '/v1/resources/register', '/v1/resources/register',
@@ -222,8 +422,10 @@ test('maximum interval timeout retries before the TTL boundary; 404 re-registers
       '/v1/resources/instance%3Alocal%3Atest/heartbeat',
     ]);
     await advance(300_000);
+    await until(() => timers.some(timer => timer.ms === 0));
     expect(timers.some(timer => timer.ms === 0)).toBe(true);
     await advance(0);
+    await until(() => paths.length >= 8);
     expect(paths.slice(5, 8)).toEqual([
       '/v1/resources/machine%3Alocal/heartbeat',
       '/v1/resources/register', '/v1/resources/register',

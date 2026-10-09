@@ -36,7 +36,7 @@ export interface CanvasSnapshot { graph: CanvasGraph; yaml: string }
 const FIX_PROMPT = '검증 오류를 고쳐줘';
 
 export function GraphWizardChat({
-  client, current, laid, onApply, onRestore, initialPrompt, className = '',
+  client, current, laid, onApply, onRestore, initialPrompt, packId, className = '',
 }: {
   client: WizardClient;
   /** The canvas as it stands right now (null/empty → the first message creates). */
@@ -51,6 +51,7 @@ export function GraphWizardChat({
   onRestore: (graph: CanvasGraph | null, steps?: GraphWizardSteps) => void;
   /** Sent once on mount — the prompt typed on the entry card before the canvas opened. */
   initialPrompt?: string;
+  packId?: string;
   className?: string;
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -106,7 +107,7 @@ export function GraphWizardChat({
     const controller = new AbortController();
     setPending({ startedAt: Date.now(), controller });
     try {
-      const outcome = await askWizard(client, wizardRequest(prompt, empty ? null : snapshot!.yaml, turns), controller.signal);
+      const outcome = await askWizard(client, { ...wizardRequest(prompt, empty ? null : snapshot!.yaml, turns), ...(packId ? { packId } : {}) }, controller.signal);
       if (outcome.kind === 'cancelled') { push({ role: 'assistant', text: '취소했습니다 — 캔버스는 그대로입니다.', tone: 'warn' }); return; }
       if (outcome.kind === 'unsupported') { push({ role: 'assistant', text: WIZARD_UNSUPPORTED, tone: 'error' }); return; }
       if (outcome.kind === 'empty') { push({ role: 'assistant', text: '무엇을 만들지 한 줄로 적어 주세요.', tone: 'warn' }); return; }

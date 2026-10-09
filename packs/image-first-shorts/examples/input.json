@@ -1,0 +1,9 @@
+{
+  "title": "copper-swordswoman-showcase",
+  "workspace": "/tmp/ifs-example-workspace",
+  "video_backend": "flow-aside",
+  "ip_blocklist_none": true,
+  "ip_blocklist": [],
+  "budget": { "video_credits": 120, "eleven_chars": 25000 },
+  "aspect": "9:16"
+}

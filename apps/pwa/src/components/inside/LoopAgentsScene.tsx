@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getSeats, type OpsSeats } from '@/lib/ops-api';
-import { createNexusClient, type HarnessRunsResponse } from '@/nexus/client';
+import { createNexusClient, NexusApiError, type HarnessRunsResponse } from '@/nexus/client';
 import { loopAgentsView, type LoopAgentsView } from './loop-agents-view';
 import { loadLoopRows, type LoopRow } from '@/components/loops/loop-status';
 import { LoopActivityMap } from './LoopActivityMap';
@@ -62,7 +62,7 @@ export function LoopAgentsScene({ initialMode = 'activity' }: { initialMode?: 'a
   const demo = journeyParam(useSearchParams());
   // 데모 주소로 들어오면 지도부터 연다.
   const [mode, setMode] = useState<'activity' | 'map'>(demo !== null ? 'map' : initialMode);
-  const [map, setMap] = useState<{ source: string; rows: LoopRow[]; edges: ActivityEdge[]; seenAt: Record<string, number>; state: 'ready' | 'error' } | null>(null);
+  const [map, setMap] = useState<{ source: string; rows: LoopRow[]; edges: ActivityEdge[]; seenAt: Record<string, number>; state: 'ready' | 'error' | 'unauthorized' } | null>(null);
   const [now, setNow] = useState(0);
   const source = `${config.baseUrl}\u0000${config.token}`;
   const mapSource = `${source}\u0000${mode}\u0000${demo ?? ''}`;
@@ -117,10 +117,15 @@ export function LoopAgentsScene({ initialMode = 'activity' }: { initialMode?: 'a
         const edges = demo === null ? activityEdges(response, receivedAt) : journeyResponseEdges(response, receivedAt);
         if (active) setMap(previous => ({ source: mapSource, rows: applyLoopOwners(rows, loopOwners, receivedAt), edges,
           seenAt: newlySeenEdges(previous?.source === mapSource ? previous.seenAt : null, edges, receivedAt), state: 'ready' }));
-      } catch {
-        if (active) setMap(previous => ({ source: mapSource, rows: previous?.source === mapSource ? previous.rows : [],
-          edges: previous?.source === mapSource ? previous.edges : [],
-          seenAt: previous?.source === mapSource ? previous.seenAt : {}, state: 'error' }));
+      } catch (error) {
+        if (active) {
+          const unauthorized = error instanceof NexusApiError && (error.status === 401 || error.status === 403);
+          setMap(previous => ({ source: mapSource,
+            rows: unauthorized ? [] : previous?.source === mapSource ? previous.rows : [],
+            edges: unauthorized ? [] : previous?.source === mapSource ? previous.edges : [],
+            seenAt: unauthorized ? {} : previous?.source === mapSource ? previous.seenAt : {},
+            state: unauthorized ? 'unauthorized' : 'error' }));
+        }
       } finally {
         busy = false;
         if (again && active) void refresh();

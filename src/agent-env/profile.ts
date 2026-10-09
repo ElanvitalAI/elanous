@@ -1,8 +1,26 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-type Agent = 'claude' | 'codex' | 'grok';
+type Agent = 'claude' | 'codex' | 'grok' | 'gemini';
+
+function versionOf(binary: string): string | null {
+  const result = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 3000 });
+  const line = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim().split(/\r?\n/, 1)[0];
+  return result.status === 0 && line && /^[\w .+()-]{1,100}$/.test(line) ? line : null;
+}
+
+// Plugin and marketplace keys are `name@marketplace`; check each part instead of redacting every scoped name.
+function safePluginName(name: string): string {
+  const parts = name.split('@');
+  return parts.length <= 2 && parts.every(part => part !== '' && safeIdentifier(part) === part) ? name : '<redacted>';
+}
+
+function safeNames(path: string): string[] | '«없음»' {
+  return !existsSync(path) ? '«없음»' : readdirSync(path, { withFileTypes: true })
+    .filter(entry => entry.isDirectory()).map(entry => safeIdentifier(entry.name) ?? '<redacted>').sort();
+}
 type Presence = 'present' | '«없음»';
 
 function present(path: string): Presence {
@@ -54,7 +72,7 @@ function collectMcp(
   servers: unknown,
   source: McpSource,
 ): void {
-  for (const [name, server] of Object.entries(record(servers))) into[name] = mcpEntry(server, source);
+  for (const [name, server] of Object.entries(record(servers))) into[safeIdentifier(name) ?? '<redacted>'] = mcpEntry(server, source);
 }
 
 function hookGroups(hooks: Record<string, unknown>): Record<string, unknown[]> {
@@ -86,6 +104,7 @@ function claude(home: string): Record<string, unknown> {
   const skillsDir = join(dir, 'skills');
   const team = join(home, '.teamclaude');
   const teamManifest = json(join(team, 'package.json'));
+  const marketplaces = record(data.extraKnownMarketplaces);
   const teamVersion = typeof teamManifest?.version === 'string' && /^\d+\.\d+\.\d+(?:[-+.][a-zA-Z0-9.-]+)?$/.test(teamManifest.version)
     ? teamManifest.version : undefined;
   const mcp: Record<string, unknown> = {};
@@ -98,6 +117,7 @@ function claude(home: string): Record<string, unknown> {
   }
   const mcpFilesMissing = settings === null && user === null;
   return {
+    version: versionOf('claude'),
     settings: settings === null ? '«없음»' : 'present',
     userConfig: user === null ? '«없음»' : 'present',
     permissionMode: safeIdentifier(record(data.permissions).defaultMode),
@@ -106,10 +126,10 @@ function claude(home: string): Record<string, unknown> {
       command: safeCommand(statusLine.command) ?? null,
     },
     hooks: settings === null ? '«없음»' : hookGroups(hooks),
-    enabledPlugins: settings === null ? '«없음»' : Object.fromEntries(Object.entries(plugins).map(([name, enabled]) => [name, enabled === true])),
+    enabledPlugins: settings === null ? '«없음»' : Object.fromEntries(Object.entries(plugins).map(([name, enabled]) => [safePluginName(name), enabled === true])),
+    marketplaces: settings === null ? '«없음»' : Object.keys(marketplaces).map(name => safeIdentifier(name) ?? '<redacted>').sort(),
     mcpServers: mcpFilesMissing ? '«없음»' : mcp,
-    skills: !existsSync(skillsDir) ? '«없음»' : readdirSync(skillsDir, { withFileTypes: true })
-      .filter(entry => entry.isDirectory()).map(entry => entry.name).sort(),
+    skills: safeNames(skillsDir),
     teamclaude: { installed: present(team), version: teamVersion ?? null },
     auth: present(join(dir, 'auth.json')),
     credentials: present(join(dir, '.credentials.json')),

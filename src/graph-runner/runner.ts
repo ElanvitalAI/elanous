@@ -20,6 +20,7 @@ import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec, type Gr
 import { createGraphVariant, type GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
+import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
 
 type BashRun = WorkflowDeps['runBash'];
@@ -59,6 +60,8 @@ export interface GraphRunState {
 
 export interface GraphRunOptions {
   input?: unknown;
+  /** Bytes already checked by the tick gate, used for a current-graph start or legacy resume. */
+  graphSource?: string;
   dryRun?: boolean;
   variant?: { goal: string; plan: GraphVariantPlan };
   runId?: string;
@@ -72,7 +75,7 @@ export interface GraphRunOptions {
    * its own universe and lands in the tree-derived test universe while the run ledger is prod.
    */
   pinChildUniverse?: boolean;
-  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
+  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
 }
 
 function safeSegment(value: string): string {
@@ -83,24 +86,29 @@ function safeSegment(value: string): string {
 }
 
 type CommandRecipe = { command: string; dry_run_command?: string; timeout_ms?: number };
-type Recipe = CommandRecipe | ({ approval: string } & Partial<CommandRecipe>);
+type PromptRecipe = { prompt: string };
+type Recipe = CommandRecipe | PromptRecipe | ({ approval: string } & Partial<CommandRecipe>);
 
 /** 접두 없는 recipe 가 카탈로그 역할이고, 그래프 옆 recipes.yaml 에 같은 키의 `{ command }` 가 있을 때만 cmd 처럼 실행한다. */
 function roleCommand(recipe: string, recipes: Record<string, Recipe>, catalogRoles: ReadonlySet<string>): CommandRecipe | undefined {
   if (!recipe || recipe === 'none' || recipe.includes(':') || !catalogRoles.has(recipe)) return undefined;
   const entry = recipes[recipe];
   // An entry that carries an approval only runs through `approval:` — never as a bare command.
-  return entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: entry.command,
+  return entry && 'command' in entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: entry.command,
     ...(entry.dry_run_command ? { dry_run_command: entry.dry_run_command } : {}),
     ...(entry.timeout_ms ? { timeout_ms: entry.timeout_ms } : {}) } : undefined;
 }
 
-function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>, catalogRoles: ReadonlySet<string>): { command?: CommandRecipe; approval?: { approval: string } } {
+function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>, catalogRoles: ReadonlySet<string>): { command?: CommandRecipe; prompt?: PromptRecipe; approval?: { approval: string } } {
   if (node.recipe === 'none') return {};
+  if (node.kind === 'prompt' && node.recipe.startsWith('prompt:')) {
+    const entry = recipes[node.recipe.slice('prompt:'.length)];
+    return entry && 'prompt' in entry ? { prompt: entry } : {};
+  }
   if (node.recipe.startsWith('cmd:')) {
     const id = node.recipe.slice(4);
     const entry = recipes[id];
-    return entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: { command: entry.command,
+    return entry && 'command' in entry && !('approval' in entry) && typeof entry.command === 'string' ? { command: { command: entry.command,
       ...(entry.dry_run_command ? { dry_run_command: entry.dry_run_command } : {}),
       ...(entry.timeout_ms ? { timeout_ms: entry.timeout_ms } : {}) } } : {};
   }
@@ -133,7 +141,10 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
   for (const [id, raw] of Object.entries(parsed)) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`invalid recipe: ${id}`);
     const item = raw as Record<string, unknown>;
-    if (Object.hasOwn(item, 'approval')) {
+    if (Object.hasOwn(item, 'prompt')) {
+      if (typeof item.prompt !== 'string' || !item.prompt.trim() || Object.keys(item).some(key => key !== 'prompt')) throw new Error(`invalid recipe: ${id}`);
+      recipes[id] = { prompt: item.prompt };
+    } else if (Object.hasOwn(item, 'approval')) {
       if (typeof item.approval !== 'string' || !item.approval.trim() ||
         (item.command !== undefined && (typeof item.command !== 'string' || !item.command.trim())) ||
         (item.timeout_ms !== undefined && (!Number.isSafeInteger(item.timeout_ms) || (item.timeout_ms as number) <= 0)) ||
@@ -382,7 +393,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
   if (matchingRuns.length > 1) throw new Error(`ambiguous run id: ${options.resumeRunId}`);
   const currentSource = options.resumeRunId && (options.resumeGraphId || matchingRuns.length) && !options.useCurrentGraph
-    ? undefined : readFileSync(path, 'utf8');
+    ? undefined : options.graphSource ?? readFileSync(path, 'utf8');
   const currentHeader: unknown = options.resumeRunId && !options.resumeGraphId && !matchingRuns.length ? parseYaml(currentSource!) : undefined;
   const resumeGraphId = options.resumeGraphId ?? matchingRuns[0]?.graphId ?? (currentHeader && typeof currentHeader === 'object' && !Array.isArray(currentHeader)
     ? (currentHeader as Record<string, unknown>).graph_id : undefined);
@@ -393,7 +404,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }
   const snapshotDir = saved ? `${saved.statePath}.graph` : undefined;
   const graphMode: 'snapshot' | 'current' = snapshotDir && saved?.graphSnapshot && !options.useCurrentGraph ? 'snapshot' : 'current';
-  const source = graphMode === 'snapshot' ? readFileSync(join(snapshotDir!, 'graph.yaml'), 'utf8') : currentSource ?? readFileSync(path, 'utf8');
+  const source = graphMode === 'snapshot' ? readFileSync(join(snapshotDir!, 'graph.yaml'), 'utf8') : currentSource ?? options.graphSource ?? readFileSync(path, 'utf8');
   // The shared YAML parser requires a recipe string. A command-less node in
   // this runner is represented internally as `none`, without changing that parser.
   const raw: unknown = parseYaml(source);
@@ -451,7 +462,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   for (const node of graph.nodes) {
     if (node.recipe === 'none') continue;
     const resolved = resolveNodeRecipe(node, recipes, catalogRoles);
-    if (!resolved.command && !resolved.approval) throw new Error(`unknown command recipe for ${node.nodeId}: ${node.recipe}`);
+    if (!resolved.command && !resolved.prompt && !resolved.approval) throw new Error(`unknown command recipe for ${node.nodeId}: ${node.recipe}`);
   }
   const graphId = safeSegment(graph.graphId);
   if (saved && graphId !== saved.graphId) {
@@ -625,6 +636,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     writeFileSync(join(`${statePath}.graph`, 'recipes.yaml'), recipeSource, { flag: 'wx' });
   }
   while (current !== undefined) {
+    options.deps?.beforeNode?.();
     const node = graph.nodes.find((n) => n.nodeId === current);
     if (!node) throw new Error(`undeclared node: ${current}`);
     const resumingPending = state.pending?.nodeId === current;
@@ -643,6 +655,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const resolved = resolveNodeRecipe(node, recipes, catalogRoles);
     const command = resolved.command;
+    const prompt = resolved.prompt;
     const approval = resolved.approval ? { approval: approvalMessage(resolved.approval.approval, state.input) } : undefined;
     if (resumingPending && (!approval || approval.approval !== state.pending?.message)) {
       throw new Error(`pending approval no longer matches graph: ${current}`);
@@ -739,6 +752,25 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       error = result.error ? redactCredentials(result.error) : undefined;
       state.executed++;
     }
+    if (prompt && !state.dryRun && !resumingCompleted) {
+      const outputs: Record<string, { ok: boolean; output: unknown; durationMs: number }> = Object.create(null);
+      for (const previous of state.nodes) outputs[previous.nodeId] = { ok: previous.ok, output: lastJsonObject(previous.output) ?? previous.output ?? null, durationMs: 0 };
+      try {
+        const text = interpolate(prompt.prompt, {
+          arguments: typeof state.input === 'string' ? state.input : state.input === undefined ? '' : JSON.stringify(state.input),
+          artifactsDir: dirname(statePath), outputs,
+        });
+        if (text.missing.length) throw new Error(`missing prompt reference: ${text.missing.join(', ')}`);
+        // The LLM is injected only; production wiring to a provider is a follow-up slice.
+        if (!options.deps?.callLLM) throw new Error('prompt node requires an injected LLM (deps.callLLM)');
+        output = await options.deps.callLLM(text.text);
+        ok = true;
+      } catch (cause) {
+        ok = false;
+        error = cause instanceof Error ? cause.message : String(cause);
+      }
+      state.executed++;
+    }
     const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
     // A wall clock stepped back mid-node must not record an end before the start.
     const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
@@ -753,7 +785,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (approval && !state.dryRun && !command) {
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !!command && (!state.dryRun || !!command.dry_run_command), ...((command || approval) && (!state.dryRun || !!command?.dry_run_command) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun), ...((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }
@@ -761,7 +793,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported = command && (!state.dryRun || command.dry_run_command) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reported = (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });

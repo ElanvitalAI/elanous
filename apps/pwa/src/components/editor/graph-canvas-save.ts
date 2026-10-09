@@ -3,6 +3,22 @@ import { mapServerIssues, type CanvasIssue } from './graph-canvas-model';
 
 export type CanvasSaveClient = Pick<NexusClient, 'createRunGraph' | 'putRunGraphYaml'>;
 
+/** Permission changes require a saved graph; unsaved YAML cannot be granted access. */
+export function shareableCanvasGraphId(context: { graphId: string; saved: boolean }): string | null {
+  return context.saved && context.graphId.trim() ? context.graphId : null;
+}
+
+export type GraphAccessClient = Pick<NexusClient, 'getRunGraphAccess' | 'putRunGraphAccess'>;
+
+export async function grantCanvasGraphAccess(client: GraphAccessClient, graphId: string, recipient: string, permission: 'view' | 'edit') {
+  const applied = await client.putRunGraphAccess(graphId, recipient, permission);
+  const after = await client.getRunGraphAccess(graphId);
+  if (!after.grants.some((grant) => grant.recipient === applied.recipient && grant.permission === permission)) {
+    throw new Error('권한 적용을 확인할 수 없습니다');
+  }
+  return after;
+}
+
 export type CanvasSaveResult =
   | { ok: true; id: string; created: boolean; version?: number }
   | { ok: false; issues: CanvasIssue[] };

@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { createDraftMetricsSource, parseDraftMetricsOutput } from './draft-metrics.js';
-import type { DraftMetrics } from '../../self-dev/draft-sweep.js';
+import type { CeoDraftMetrics } from './draft-metrics.js';
 
-const METRICS: DraftMetrics = { inventory: 168, oldestAgeHours: 119.2, needsOwner: 12, converted48h: 330, cohort48h: 701, conversion48h: 330 / 701 };
+const METRICS: CeoDraftMetrics = { inventory: 168, oldestAgeHours: 119.2, needsOwner: 12, converted48h: 330, cohort48h: 701, conversion48h: 330 / 701, overlap: null };
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -14,7 +14,7 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 test('cold cache answers «measuring» without a value and starts exactly one collection for many reads', async () => {
   let calls = 0;
-  const pending = deferred<DraftMetrics>();
+  const pending = deferred<CeoDraftMetrics>();
   const source = createDraftMetricsSource({ collect: () => { calls++; return pending.promise; }, now: () => 1_000 });
   for (let i = 0; i < 20; i++) expect(source.read()).toEqual({ state: 'measuring', metrics: null, measuredAt: null, refreshing: true, reason: null });
   expect(calls).toBe(1);
@@ -85,4 +85,22 @@ test('CLI output parsing rejects anything that is not a complete metric row', ()
   expect(() => parseDraftMetricsOutput('')).toThrow('no JSON output');
   expect(() => parseDraftMetricsOutput(JSON.stringify({ ...METRICS, inventory: undefined }))).toThrow('malformed');
   expect(() => parseDraftMetricsOutput(JSON.stringify({ ...METRICS, needsOwner: -1 }))).toThrow('malformed');
+});
+
+test('overlap passes through the CLI parser into the ready cache; old or malformed overlap stays null without losing draft values', async () => {
+  const overlap = { launches24h: 3, launched: 4, unmeasured: 0, sourceIncomplete: false,
+    linked: 2, autoLanded: 2, autoRate: 1, secondSiblingMedianHours: 4.5, salvaged: 0, salvageUnmeasured: 0 };
+  const source = createDraftMetricsSource({ collect: async () => parseDraftMetricsOutput(JSON.stringify({ ...METRICS, overlap })), now: () => 1_000 });
+  source.read();
+  await settle();
+  expect(source.read()).toMatchObject({ state: 'ready', metrics: { ...METRICS, overlap } });
+  expect(source.read().metrics?.overlap?.launches24h).toBe(3);
+  for (const row of [{ ...METRICS, overlap: undefined }, { ...METRICS, overlap: { ...overlap, autoRate: '100%' } }]) {
+    const parsed = parseDraftMetricsOutput(JSON.stringify(row));
+    expect(parsed).toEqual(METRICS);
+    const older = createDraftMetricsSource({ collect: async () => parsed, now: () => 1_000 });
+    older.read();
+    await settle();
+    expect(older.read()).toMatchObject({ state: 'ready', metrics: { ...METRICS, overlap: null } });
+  }
 });

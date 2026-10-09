@@ -18,7 +18,9 @@ import {
   kstMinutes,
   sendOutbound,
   setInProcessOutbound,
+  setUndeliverableRecorder,
 } from './outbound-alert.js';
+import { BriefItemsLedger, type AddBriefItem } from '../briefing/brief-items.js';
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
 import { setUserConfigOverlay } from '../user-config.js';
 
@@ -301,6 +303,7 @@ beforeEach(() => {
   discordRequests.length = 0;
   discordBody = '{"id":"posted"}';
   daemonBody = '{"delivered":true}';
+  setUndeliverableRecorder(() => {}); // all tests in this file avoid the real briefing state directory
   originalLog = debug.log.bind(debug) as LogFn;
   (debug as { log: LogFn }).log = ((category: string, event: string, data?: unknown) => {
     logged.push({ category, event, data });
@@ -332,6 +335,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setUndeliverableRecorder(null);
   setResolveDaemonEndpointForTest(null);
   setSystemTime();
   curlSpy?.mockRestore();
@@ -841,6 +845,83 @@ describe('OB8 — inside the daemon, deliver never curls its own /v1/outbound', 
 });
 
 describe('OB8b — when nothing can deliver, say why instead of a silent false', () => {
+  it('no daemon and no token: sendOutbound records one briefing item through the injected writer', () => {
+    setSystemTime(new Date('2026-10-08T03:00:00Z'));
+    setResolveDaemonEndpointForTest(() => null);
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    const items: AddBriefItem[] = [];
+    setUndeliverableRecorder(item => { items.push(item); });
+    const conatus = process.env.CONATUS_ENV;
+    process.env.CONATUS_ENV = join(tmpdir(), 'outbound-alert-ob8b-no-creds.env');
+    try {
+      captureConsole(() => expect(sendOutbound('report body', 'report')).toBe(false));
+    } finally {
+      if (conatus === undefined) delete process.env.CONATUS_ENV; else process.env.CONATUS_ENV = conatus;
+    }
+    const row = logged.find(r => r.category === 'outbound.send' && r.event === 'undeliverable');
+    expect(row?.data).toMatchObject({ kind: 'report', daemonPath: 'not-found', route: 'no-report-channel' });
+    expect(items).toEqual([{
+      domain: '운영', priority: 'P1', source: 'outbound.undeliverable',
+      text: `미전달: kind report · 데몬 not-found · 경로 no-report-channel · 우주 ${(row!.data as { universe: string }).universe}`,
+      evidence: 'elanous logs --category outbound.send --event undeliverable',
+      dedupeKey: 'report · no-report-channel', dedupeWithinMs: 60 * 60_000,
+    }]);
+  });
+
+  it('an injected ledger records repeated failures once and includes the item on the next page', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'outbound-undeliverable-'));
+    setSystemTime(new Date('2026-10-08T03:00:00Z'));
+    setResolveDaemonEndpointForTest(() => null);
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    const conatus = process.env.CONATUS_ENV;
+    process.env.CONATUS_ENV = join(tmpdir(), 'outbound-alert-ob8b-no-creds.env');
+    const ledger = new BriefItemsLedger({ stateDir, log: () => {} });
+    setUndeliverableRecorder(item => { ledger.add(item); });
+    try {
+      captureConsole(() => {
+        expect(sendOutbound('report body', 'report')).toBe(false);
+        expect(sendOutbound('report body', 'report')).toBe(false);
+      });
+      const items = ledger.list();
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ domain: '운영', priority: 'P1', evidence: 'elanous logs --category outbound.send --event undeliverable' });
+      setSystemTime(new Date('2026-10-08T03:00:01Z'));
+      const firstPage = ledger.composeWithIds('after-release');
+      expect(firstPage.markdown).toContain(items[0]!.text);
+      expect(firstPage.ids).toEqual([items[0]!.id]);
+      ledger.markSent(firstPage.ids, 'after-release');
+      setSystemTime(new Date('2026-10-08T03:00:02Z'));
+      captureConsole(() => expect(sendOutbound('report body', 'report')).toBe(false));
+      expect(ledger.list()).toHaveLength(2);
+      setSystemTime(new Date('2026-10-08T03:00:03Z'));
+      expect(ledger.composeWithIds('after-release').ids).toEqual([ledger.list()[1]!.id]);
+    } finally {
+      if (conatus === undefined) delete process.env.CONATUS_ENV; else process.env.CONATUS_ENV = conatus;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('failed briefing write logs record-failed and does not change sendOutbound/deliver results', () => {
+    setSystemTime(new Date('2026-10-08T03:00:00Z'));
+    setResolveDaemonEndpointForTest(() => null);
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    const conatus = process.env.CONATUS_ENV;
+    process.env.CONATUS_ENV = join(tmpdir(), 'outbound-alert-ob8b-no-creds.env');
+    setUndeliverableRecorder(() => { throw new Error('briefing disk full'); });
+    try {
+      captureConsole(() => {
+        expect(sendOutbound('report body', 'report')).toBe(false);
+        expect(deliver('report body', 'report')).toBe(false);
+      });
+    } finally {
+      if (conatus === undefined) delete process.env.CONATUS_ENV; else process.env.CONATUS_ENV = conatus;
+    }
+    expect(logged.filter(r => r.category === 'outbound.send' && r.event === 'undeliverable-record-failed')).toHaveLength(2);
+  });
+
   it('no daemon and no token: false, an undeliverable event with the universe, and one loud stderr line', () => {
     setResolveDaemonEndpointForTest(() => null);
     delete process.env.TELEGRAM_BOT_TOKEN;

@@ -2743,11 +2743,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if ((getUserConfig().raw?.decisions as { cards?: unknown } | undefined)?.cards !== false && !isAutonomousRunContext()) {
       try {
         const { DecisionCardService } = await import('../decisions/decision-cards.js');
-        const { webPushDecisionTransport } = await import('../decisions/web-push-decision-cards.js');
+        const { webPushDecisionTransport, webPushUrgency } = await import('../decisions/web-push-decision-cards.js');
         const { listSubscriptions } = await import('../web-push/subscriptions.js');
         const { DecisionLedger } = await import('../decisions/decision-ledger.js');
         const ledger = new DecisionLedger();
-        const service = new DecisionCardService({ transport: webPushDecisionTransport(ledger), ownerIds: [], ledger });
+        const service = new DecisionCardService({ transport: webPushDecisionTransport(ledger), ownerIds: [], ledger,
+          sendFilter: (entry, now) => webPushUrgency(entry, now) !== 'not-urgent', deferredReason: webPushUrgency });
         await service.tick();
         webPushDecisionTimer = setInterval(() => {
           void service.tick().catch((error: unknown) => {

@@ -9,7 +9,7 @@ import { debug } from '../debug/log.js';
 import { checkLoops } from './checker.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
-import { listAllLoops, listLoops, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
+import { listAllLoops, listLoops, loopRecentRuns, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -149,6 +149,23 @@ test('redirect variants and home expansion use the newest existing file, never /
       });
     }
   } finally { db.close(); }
+});
+
+test('loop status keeps its five-run default while health can read older run history', () => {
+  const f = fixture();
+  const dir = join(f.stateRoot, 'graph-runs', 'daily');
+  mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < 6; i++) {
+    const file = join(dir, `run-${i}.json`);
+    const at = new Date(Date.UTC(2026, 9, 8, i)).toISOString();
+    writeFileSync(file, JSON.stringify({ graphId: 'daily', runId: `run-${i}`, startedAt: at,
+      status: 'failed', nodes: [{ nodeId: 'step', ok: false }], path: ['step'] }));
+    utimesSync(file, new Date(at), new Date(at));
+  }
+  expect(loopStatus('daily', f.opts).recentRuns.map(run => run.runId)).toEqual(['run-5', 'run-4', 'run-3', 'run-2', 'run-1']);
+  expect(loopRecentRuns('daily', f.opts, 50).map(run => run.runId))
+    .toEqual(['run-5', 'run-4', 'run-3', 'run-2', 'run-1', 'run-0']);
+  expect(loopRecentRuns('daily', f.opts, 2).map(run => run.runId)).toEqual(['run-5', 'run-4']);
 });
 
 test('list joins graph and cron by path, excludes untriggered graph, exposes next and last run', () => {

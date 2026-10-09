@@ -5,9 +5,12 @@
 // daemon can drive schedule + webhook + (future) discord/telegram
 // uniformly.
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { isScheduleTriggerNode } from '../schema.js';
 import type { ScheduleTriggerNode, WorkflowEntry } from '../types.js';
-import type { ScheduleEntry } from './registry.js';
+import { graphScheduleEntries, type ScheduleEntry } from './registry.js';
 import { startScheduler, type SchedulerHandle, type SchedulerOpts } from './scheduler.js';
 import type { TriggerEmit, TriggerSource, TriggerSubscription } from './source.js';
 
@@ -25,6 +28,8 @@ export interface ScheduleSource extends TriggerSource {
   handle(): SchedulerHandle | null;
   /** Subscription snapshot for `daemon.status()`. */
   subscriptions(): TriggerSubscription[];
+  /** Subscribe a graph YAML's schedule declarations to the same scheduler. */
+  subscribeGraph(file: string, onFire: () => void | Promise<void>): void;
 }
 
 interface Binding {
@@ -34,14 +39,30 @@ interface Binding {
   onEmit: TriggerEmit;
 }
 
+interface GraphBinding {
+  file: string;
+  scheduleEntry: ScheduleEntry;
+  onFire: () => void | Promise<void>;
+}
+
 export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSource {
   const bindings: Binding[] = [];
+  const graphBindings: GraphBinding[] = [];
   let handle: SchedulerHandle | null = null;
   let started = false;
 
   return {
     kind: 'schedule',
     handle: () => handle,
+    subscribeGraph(file, onFire) {
+      file = resolve(file);
+      const schedules = graphScheduleEntries(parseYaml(readFileSync(file, 'utf8')) as unknown);
+      for (const scheduleEntry of schedules) {
+        if (graphBindings.some(b => b.file === file && b.scheduleEntry.nodeId === scheduleEntry.nodeId)) continue;
+        graphBindings.push({ file, scheduleEntry, onFire });
+        if (started && handle) handle.add(scheduleEntry);
+      }
+    },
     subscribe(entry, onEmit) {
       for (const node of entry.definition.nodes ?? []) {
         if (!isScheduleTriggerNode(node)) continue;
@@ -68,8 +89,13 @@ export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSou
       if (started) return;
       started = true;
       handle = startScheduler({
-        registry: bindings.map(b => b.scheduleEntry),
+        registry: [...bindings.map(b => b.scheduleEntry), ...graphBindings.map(b => b.scheduleEntry)],
         runWorkflow: async (scheduleEntry) => {
+          const graphBinding = graphBindings.find(b => b.scheduleEntry === scheduleEntry);
+          if (graphBinding) {
+            await graphBinding.onFire();
+            return;
+          }
           const binding = bindings.find(b =>
             b.scheduleEntry.workflowName === scheduleEntry.workflowName
             && b.scheduleEntry.nodeId === scheduleEntry.nodeId);
@@ -89,9 +115,10 @@ export function createScheduleSource(opts: ScheduleSourceOpts = {}): ScheduleSou
       handle?.stop();
       handle = null;
       bindings.length = 0;
+      graphBindings.length = 0;
       started = false;
     },
-    subscriptions: () => bindings.map(b => ({
+    subscriptions: () => [...bindings, ...graphBindings].map(b => ({
       kind: 'schedule' as const,
       workflowName: b.scheduleEntry.workflowName,
       nodeId: b.scheduleEntry.nodeId,

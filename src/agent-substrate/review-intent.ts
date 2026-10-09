@@ -525,6 +525,73 @@ function goalFileBlock(goalFile: string | undefined): Block | undefined {
     : undefined;
 }
 
+function isLightweightGoal(goal: string): boolean {
+  try {
+    const tree = unified().use(remarkParse).use(remarkGfm).parse(goal) as MarkdownNode;
+    const nodes = tree.children ?? [];
+    const headings = new Set<string>();
+    const declarations = new Set<string>();
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index]!;
+      if (node.type !== 'heading' || node.depth !== 2) continue;
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start === undefined || end === undefined) return false;
+      const heading = goal.slice(start, end).trim();
+      headings.add(heading);
+      if (heading !== '## 답하지 못하는 것' && heading !== '## 불변식') continue;
+      const next = nodes[index + 1];
+      if (next?.type !== 'list' || next.children?.length !== 1) continue;
+      const item = next.children[0];
+      const itemStart = item?.position?.start.offset;
+      const itemEnd = item?.position?.end.offset;
+      if (itemStart === undefined || itemEnd === undefined) continue;
+      if (goal.slice(itemStart, itemEnd).trim() === '- No persistent grounding was performed in lite authoring.') {
+        declarations.add(heading);
+      }
+    }
+    return headings.has('## WHAT TO BUILD') && headings.has('## ACCEPTANCE CRITERIA')
+      && declarations.has('## 답하지 못하는 것') && declarations.has('## 불변식');
+  } catch {
+    return false;
+  }
+}
+
+function lightweightGoalContext(goal: string, goalFile: string): Block {
+  const nodes = (unified().use(remarkParse).use(remarkGfm).parse(goal) as MarkdownNode).children ?? [];
+  const firstLine = (title: string): string | undefined => {
+    const headingIndex = nodes.findIndex((node) => {
+      if (node.type !== 'heading' || node.depth !== 2) return false;
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      return start !== undefined && end !== undefined && goal.slice(start, end).trim() === `## ${title}`;
+    });
+    if (headingIndex < 0) return undefined;
+    for (const node of nodes.slice(headingIndex + 1)) {
+      if (node.type === 'heading' && (node.depth ?? 0) <= 2) break;
+      if (node.type === 'code') continue;
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start === undefined || end === undefined) continue;
+      const line = goal.slice(start, end).split('\n').find((item) => item.trim());
+      if (line) return line.replace(/^[-*]\s*/, '').replace(/^(?:무엇|왜):\s*/, '').trim();
+    }
+    return undefined;
+  };
+  const brief = (text: string): string => text.length > 350 ? `${text.slice(0, 350)}…[골 원문 참조]` : text;
+  const what = firstLine('WHAT TO BUILD');
+  const why = firstLine('PROBLEM');
+  return {
+    title: '무엇을 왜',
+    text: [
+      '무엇을 왜',
+      ...(what ? [`무엇: ${brief(what)}`] : []),
+      ...(why ? [`왜: ${brief(why)}`] : []),
+      `골 원문·긴 참조: ${goalFile}`,
+    ].join('\n'),
+  };
+}
+
 export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   // ① 조망 — 명시값이 없으면 **골 텍스트에서 추출**한다(생산자는 골 자체다·LLM 없음).
   const mined = extractIntentBlocks(i.goal);
@@ -537,7 +604,9 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   후순위 블록(스코프 경계)이 불필요하게 잘린다.
   const identity = parseShardIdentity(i.goal);
   const shardBoundary = identity ? { title: '조각 경계', text: `조각 경계\n${shardBoundaryBlock(identity)}` } : undefined;
-  const goalBody = stripExtractedSections(identity ? withoutShardIdentity(i.goal) : i.goal).trim();
+  const authoredLiteGoal = isLightweightGoal(i.goal);
+  const liteGoal = authoredLiteGoal && Boolean(i.goalFile?.trim());
+  const goalBody = liteGoal ? '' : stripExtractedSections(identity ? withoutShardIdentity(i.goal) : i.goal).trim();
   const goal = goalBody ? { title: '목표', text: `목표\n${goalBody}` } : undefined;
   // ⭐ **자식이 낸 증거**(diff 밖 이행 · base 적색 · 직전 반영분)를 한 묶음으로 잡아 둔다 — 아래 예산
   //   배분에서 **목표 본문보다 먼저** 채우기 위해서다. 제목 문자열이 아니라 **동일성**으로 가른다.
@@ -553,6 +622,20 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   const coverage = evidenceCoverageBlock(i.evidenceCoverage);
   const goalFile = goalFileBlock(i.goalFile);
   const runFacts = runFactsBlock(i);
+  // Lite authoring keeps its original ask in a fenced block under WHAT TO BUILD.
+  // Review the authored criteria and short context; the goal document is the pointer to the long source.
+  if (liteGoal) {
+    const acceptanceBlock = listBlock('수용기준', acceptance);
+    const context = lightweightGoalContext(i.goal, i.goalFile!.trim());
+    const boundaryBlock = listBlock('의도적 스코프 경계', boundaries);
+    const liteBlocks = [
+      acceptanceBlock, context, boundaryBlock, priorFindings, applied,
+      runFacts, goalType, shardBoundary, preexisting, importerTestsNotRun,
+      gateEvidence, designCheck, designGate, shardSiblings, coverage, claims,
+      listBlock('검증 못 한 경계 후보 (결정 아님 — 이것만으로 must-fix 를 면제하지도, 만들지도 말 것)', unverifiedBoundaryCandidates),
+    ].filter((block): block is Block => Boolean(block));
+    return fitReviewIntentBlocks(liteBlocks, liteBlocks, liteBlocks);
+  }
   // ⛔⭐⭐⭐ **런 사실이 «맨 앞»이다 — 라이브 실측으로 옮겼다**(2026-08-07).
   //   📏 `#7556`(실물 하니스 PR · 본문 37,354자)을 프로덕션 `intentFromPr` 에 태우니
   //     ***`runId` 도 커밋도 변경 파일도 «하나도» 안 남았다***(4,000자 상한 · 살아남은 것은 `목표`·`수용기준`).
@@ -645,7 +728,7 @@ function sectionPriority(title: string): 0 | 1 | 2 {
 const PREAMBLE_TITLE = '(머리말)';
 
 type MarkdownPosition = { readonly start: { readonly offset?: number }; readonly end: { readonly offset?: number } };
-type MarkdownNode = { readonly type: string; readonly position?: MarkdownPosition; readonly children?: readonly MarkdownNode[] };
+type MarkdownNode = { readonly type: string; readonly depth?: number; readonly position?: MarkdownPosition; readonly children?: readonly MarkdownNode[] };
 type MarkdownUnit = { readonly text: string; readonly start: number; readonly end: number };
 
 /** 비교 가능한 CommonMark 단위와 그 원문 범위. 코드 펜스는 원문에 남기되 비교 후보에서는 제외한다. */
@@ -829,6 +912,18 @@ function isTableHeader(line: string, next: string | undefined): boolean {
   return /^\s*\|(\s*:?-{2,}:?\s*\|)+\s*$/.test(next ?? '');
 }
 
+function topLevelCodeLines(goal: string): ReadonlySet<number> {
+  const lines = new Set<number>();
+  try {
+    const tree = unified().use(remarkParse).use(remarkGfm).parse(goal);
+    for (const node of tree.children) {
+      if (node.type !== 'code' || !node.position) continue;
+      for (let index = node.position.start.line - 1; index < node.position.end.line; index += 1) lines.add(index);
+    }
+  } catch { /* unknown syntax: keep existing extraction behavior */ }
+  return lines;
+}
+
 /** 골에서 **추출된 것만** 걷어낸 나머지(목표 서술). 추출 내용이 목표 블록에 중복되지 않게 한다.
  *
  *  ⚠️ **산문은 남긴다**(리뷰 must-fix) — 초판은 인식된 절을 만나면 다음 헤더까지 **통째로** 버려,
@@ -839,7 +934,9 @@ export function stripExtractedSections(goal: string): string {
   const mined = extractIntentBlocks(goal);
   const out: string[] = [];
   let extractedSection: 'acceptance' | 'boundary' | null = null;
-  for (const line of goal.split('\n')) {
+  const fencedLines = topLevelCodeLines(goal);
+  for (const [index, line] of goal.split('\n').entries()) {
+    if (fencedLines.has(index)) { out.push(line); continue; }
     const kind = headKind(line);
     if (kind === 'acceptance' || kind === 'boundary') { extractedSection = kind; continue; }   // 헤더만 제거
     if (kind === 'other') extractedSection = null;
@@ -921,6 +1018,7 @@ function isUnverifiedBoundaryCandidate(item: string): boolean {
 }
 
 export function extractIntentBlocks(goal: string, includeSections = false): ExtractedIntentBlocks {
+  const fencedLines = topLevelCodeLines(goal);
   const acceptanceItems: string[] = [];
   const scopeBoundaryItems: string[] = [];
   const unverifiedBoundaryCandidateItems: string[] = [];
@@ -945,6 +1043,7 @@ export function extractIntentBlocks(goal: string, includeSections = false): Extr
     push();
   }
   for (const [idx, line] of lines.entries()) {
+    if (fencedLines.has(idx)) continue;
     const kind = headKind(line);
     if (kind === 'acceptance') { cur = 'acceptance'; continue; }
     if (kind === 'boundary') { cur = 'boundary'; continue; }

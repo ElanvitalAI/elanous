@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_SWEEP_CLOSE_CAP, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
 
@@ -860,6 +860,40 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
     expect(result.entries.filter((entry) => entry.reason === 'close-cap')).toHaveLength(2);
     expect(result.closed).toBe(DRAFT_SWEEP_CLOSE_CAP);
+  });
+
+  it('close cap: default stays 10; config 30 lets 30 closes through in one tick; flag overrides config; invalid falls back to 10', async () => {
+    expect(DRAFT_SWEEP_CLOSE_CAP).toBe(10);
+    expect(resolveDraftSweepCloseCap({})).toEqual({ closeCap: 10, closeCapSource: 'default', warnings: [] });
+    const fromConfig = resolveDraftSweepCloseCap({ config: 30 });
+    expect(fromConfig).toEqual({ closeCap: 30, closeCapSource: 'config', warnings: [] });
+    expect(resolveDraftSweepCloseCap({ flag: '7', config: 30 })).toEqual({ closeCap: 7, closeCapSource: 'flag', warnings: [] });
+    for (const bad of [0, 101, 2.5, -3, 'thirty', '']) {
+      const resolved = resolveDraftSweepCloseCap({ config: bad });
+      expect(resolved).toMatchObject({ closeCap: 10, closeCapSource: 'default' });
+      expect(resolved.warnings).toHaveLength(1);
+    }
+    // An invalid flag is rejected with a warning and falls through to config.
+    expect(resolveDraftSweepCloseCap({ flag: '0', config: 30 })).toMatchObject({ closeCap: 30, closeCapSource: 'config' });
+
+    const drafts = Array.from({ length: 35 }, (_, i) => draft(400 + i, { updatedAt: idle(72) }));
+    const fixture = make(drafts);
+    for (const pr of drafts) fixture.statuses.set(pr.number, undefined);
+    const logs: unknown[][] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((...args: unknown[]) => { logs.push(args); });
+    try {
+      const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, ...fromConfig });
+      expect(result.closed).toBe(30);
+      expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(30);
+      expect(result.entries.filter((entry) => entry.reason === 'close-cap')).toHaveLength(5);
+      expect(result).toMatchObject({ closeCap: 30, closeCapSource: 'config' });
+      expect(logs).toContainEqual(['self-dev.draft-sweep', 'timing', expect.objectContaining({ phase: 'total', closeCap: 30, closeCapSource: 'config' })]);
+    } finally { spy.mockRestore(); }
+    // A cap that bypassed the resolver is still bounded: invalid ⇒ default 10.
+    const again = make(drafts);
+    for (const pr of drafts) again.statuses.set(pr.number, undefined);
+    const fallback = await runDraftSweep({ repository: 'owner/repo', adapters: again.adapters, apply: true, now, closeCap: 1000, closeCapSource: 'config' });
+    expect(fallback).toMatchObject({ closed: 10, closeCap: 10, closeCapSource: 'default' });
   });
 
   it('records a daily count of 25h harness drafts: one same-goal landing, one review PASS with a green gate, one must-fix', async () => {

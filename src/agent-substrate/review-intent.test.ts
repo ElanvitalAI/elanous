@@ -161,6 +161,108 @@ describe('buildReviewIntent design gate', () => {
 });
 
 describe('buildReviewIntent', () => {
+  test('lite goal leads with acceptance then what/why, boundaries, prior findings and applied items; long ask stays behind a goal-file pointer', () => {
+    const goal = [
+      'Lite goal', '- GoalType: implement',
+      '## PROBLEM', '- 왜: repeated failures hide the cause',
+      '## WHAT TO BUILD', '- 무엇: render the authored contract',
+      'Verbatim ask:', '```', `LONG-SOURCE-ONLY ${'source '.repeat(900)}`, '```',
+      '## ACCEPTANCE CRITERIA', '- AC-FIRST: contract is checked',
+      '## SCOPE BOUNDARY', '- BOUNDARY-NEXT: no remote operations',
+      '## 답하지 못하는 것', '- No persistent grounding was performed in lite authoring.',
+      '## 불변식', '- No persistent grounding was performed in lite authoring.',
+    ].join('\n');
+    const output = buildReviewIntent({
+      goal, goalFile: 'docs/goals/GOAL-lite.md', runId: 'run-lite',
+      priorRunFindings: [{ pr: 123, runId: 'prior', round: 1, items: ['PRIOR-FINDING'] }],
+      appliedLastRound: ['APPLIED-ITEM'],
+    });
+    const markers = ['수용기준\n- AC-FIRST', '무엇을 왜', '의도적 스코프 경계\n- BOUNDARY-NEXT', '앞 런이 남긴 지적', '직전 라운드 반영분\n- APPLIED-ITEM'];
+    expect(output.startsWith('수용기준\n- AC-FIRST')).toBe(true);
+    for (let index = 1; index < markers.length; index += 1) {
+      expect(output.indexOf(markers[index - 1]!)).toBeLessThan(output.indexOf(markers[index]!));
+    }
+    for (const value of ['무엇: render the authored contract', '왜: repeated failures hide the cause', 'PRIOR-FINDING', 'APPLIED-ITEM', '골 원문·긴 참조: docs/goals/GOAL-lite.md', 'runId: run-lite']) expect(output).toContain(value);
+    expect(output).not.toContain('LONG-SOURCE-ONLY');
+    expect(output.length).toBeLessThanOrEqual(MAX_REVIEW_INTENT_CHARS);
+    const withoutPath = buildReviewIntent({ goal: goal.replace('source '.repeat(900), 'source '.repeat(100)) });
+    expect(withoutPath).toContain('목표\nLite goal');
+    expect(withoutPath).toContain('LONG-SOURCE-ONLY');
+    expect(withoutPath).not.toContain('골 원문·긴 참조: 이 런의 골 입력');
+    expect(buildReviewIntent({ goal: goal.replace('source '.repeat(900), 'source '.repeat(100)), goalFile: '   ' })).toContain('LONG-SOURCE-ONLY');
+    expect(buildReviewIntent({ goal: goal.replace('- AC-FIRST: contract is checked', '- AC-CHANGED: contract is checked') })).toContain('수용기준\n- AC-CHANGED');
+  });
+
+  test('lite context selects real top-level what/why rather than earlier fenced quotations', () => {
+    const goal = [
+      'Lite goal',
+      '```md',
+      '## PROBLEM', '- 왜: QUOTED-WHY',
+      '## WHAT TO BUILD', '- 무엇: QUOTED-WHAT',
+      '```',
+      '## PROBLEM', '- 왜: REAL-WHY',
+      '## WHAT TO BUILD', '- 무엇: REAL-WHAT',
+      '## ACCEPTANCE CRITERIA', '- REAL-AC',
+      '## 답하지 못하는 것', '- No persistent grounding was performed in lite authoring.',
+      '## 불변식', '- No persistent grounding was performed in lite authoring.',
+    ].join('\n');
+    const out = buildReviewIntent({ goal, goalFile: 'docs/goals/GOAL-lite.md' });
+    expect(out.startsWith('수용기준\n- REAL-AC\n\n무엇을 왜\n무엇: REAL-WHAT\n왜: REAL-WHY')).toBe(true);
+    expect(out).not.toContain('QUOTED-WHAT');
+    expect(out).not.toContain('QUOTED-WHY');
+    expect(out).toContain('골 원문·긴 참조: docs/goals/GOAL-lite.md');
+  });
+
+  test('lite context keeps bounded what/why and points to the source document instead of copying long material', () => {
+    const goal = [
+      '## PROBLEM', `- 왜: ${'WHY '.repeat(250)}`,
+      '## WHAT TO BUILD', `- 무엇: ${'WHAT '.repeat(250)}`,
+      '## ACCEPTANCE CRITERIA', '- Check the output',
+      '## 답하지 못하는 것', '- No persistent grounding was performed in lite authoring.',
+      '## 불변식', '- No persistent grounding was performed in lite authoring.',
+    ].join('\n');
+    const out = buildReviewIntent({ goal, goalFile: 'docs/goals/GOAL-source.md' });
+    expect(out.startsWith('수용기준\n- Check the output')).toBe(true);
+    expect(out).toContain('무엇: WHAT');
+    expect(out).toContain('왜: WHY');
+    expect(out).toContain('…[골 원문 참조]');
+    expect(out).toContain('골 원문·긴 참조: docs/goals/GOAL-source.md');
+    expect(out).not.toContain('WHY '.repeat(250));
+    expect(out).not.toContain('WHAT '.repeat(250));
+  });
+
+  test('a full goal quoting a lite template inside a code fence retains the original ask even with a goal file', () => {
+    const goal = [
+      'Full goal — implement the real request',
+      '```md',
+      '## PROBLEM', '- 왜: quoted template',
+      '## WHAT TO BUILD', '- 무엇: quoted template',
+      '## ACCEPTANCE CRITERIA', '- Quoted criterion',
+      '## 답하지 못하는 것', '- No persistent grounding was performed in lite authoring.',
+      '## 불변식', '- No persistent grounding was performed in lite authoring.',
+      '```',
+      'REAL-ASK-MUST-SURVIVE',
+    ].join('\n');
+    const out = buildReviewIntent({ goal, goalFile: 'docs/goals/full.md', runId: 'run-full' });
+    expect(out.startsWith('런 사실 — 리뷰어가 관측과 잇는 좌표')).toBe(true);
+    expect(out).toContain('목표\nFull goal — implement the real request');
+    expect(out).toContain('REAL-ASK-MUST-SURVIVE');
+    expect(out).toContain(goal.slice(goal.indexOf('```md'), goal.lastIndexOf('```') + 3));
+    expect(out).not.toContain('골 원문·긴 참조: docs/goals/full.md');
+  });
+
+  test('full goal with matching section names keeps its original render order and source text', () => {
+    const goal = [
+      'Full goal', '## PROBLEM', '- 왜: original context', '## WHAT TO BUILD', '- 무엇: feature',
+      '## ACCEPTANCE CRITERIA', '- Full goal criterion',
+      '## 답하지 못하는 것', '- No persistent grounding was performed in lite authoring. (quoted, not a lite declaration)',
+    ].join('\n');
+    const out = buildReviewIntent({ goal, goalFile: 'docs/goals/full.md', runId: 'run-full' });
+    expect(out.startsWith('런 사실 — 리뷰어가 관측과 잇는 좌표')).toBe(true);
+    expect(out).toContain('목표\nFull goal');
+    expect(out).toContain('quoted, not a lite declaration');
+  });
+
   test('shard boundary gets budget before a long goal; JSON footer is absent from the goal block', () => {
     const identity = {
       orchestrationId: 'run-1', shardId: 'handler', totalShards: 3, position: 1,

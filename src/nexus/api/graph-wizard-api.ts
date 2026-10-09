@@ -1,6 +1,10 @@
 import { debug } from '../../debug/log.js';
-import { GraphWizardInputError, generateGraphFromPrompt, type GraphWizardDeps, type GraphWizardTurn } from '../../graph-wizard/generate.js';
+import { GraphWizardInputError, generateGraphFromPrompt, wizardInstalledPacks, type GraphWizardDeps, type GraphWizardTurn } from '../../graph-wizard/generate.js';
 import { jsonResponse } from './json-response.js';
+
+export function handleGraphWizardPacksGet(deps: GraphWizardDeps = {}): Response {
+  return jsonResponse({ packs: wizardInstalledPacks(deps) });
+}
 
 const MAX_PROMPT = 4000;
 const MAX_YAML = 200_000;
@@ -28,6 +32,9 @@ export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps 
   if (body.currentYaml !== undefined && (typeof body.currentYaml !== 'string' || body.currentYaml.length > MAX_YAML)) {
     return jsonResponse({ error: 'bad_request', reason: 'currentYaml must be a string' }, 400);
   }
+  if (body.packId !== undefined && typeof body.packId !== 'string') {
+    return jsonResponse({ error: 'bad_request', reason: 'packId must be a string' }, 400);
+  }
   let history: GraphWizardTurn[] | undefined;
   if (body.history !== undefined) {
     if (!Array.isArray(body.history) || !body.history.every((t) => t && typeof t === 'object' &&
@@ -42,6 +49,7 @@ export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps 
       ...(body.kind ? { kind: body.kind as 'harness' | 'workflow' } : {}),
       ...(typeof body.currentYaml === 'string' && body.currentYaml.trim() ? { currentYaml: body.currentYaml } : {}),
       ...(history ? { history } : {}),
+      ...(typeof body.packId === 'string' ? { packId: body.packId } : {}),
     }, deps);
     return jsonResponse({ ...result, base: result.base ?? null }, result.ok ? 200 : 422);
   } catch (error) {

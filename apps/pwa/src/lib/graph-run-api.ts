@@ -15,9 +15,13 @@ export type StartResult =
   | { kind: 'started'; runId: string }
   | { kind: 'not-runnable'; issues: string[] }
   | { kind: 'forbidden' }
+  /** W9c — a peer changed this graph; the server runs it only after the owner approves `version` (absent = marker unreadable). */
+  | { kind: 'peer-edit'; message: string; version?: string; editedBy?: string }
   | { kind: 'error'; status: number; message: string };
 
-export type GraphRunClient = Pick<NexusClient, 'startRunGraphRun' | 'getRunGraphRun'>;
+export type GraphRunClient = Pick<NexusClient, 'startRunGraphRun' | 'getRunGraphRun'> & Partial<Pick<NexusClient, 'approveRunGraph'>>;
+
+export const PEER_EDIT_FALLBACK = '상대가 바꾼 그래프 — 변경을 확인하고 승인해야 실행할 수 있다';
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -29,6 +33,13 @@ export async function startGraphRun(client: GraphRunClient, graphId: string): Pr
     if (!(error instanceof NexusApiError)) return { kind: 'error', status: 0, message: '데몬에 닿지 못했다' };
     const body: unknown = error.body;
     if (error.status === 403) return { kind: 'forbidden' };
+    if (error.status === 409 && record(body) && typeof body.error === 'string' && body.error.startsWith('peer-edit-')) {
+      return {
+        kind: 'peer-edit', message: typeof body.reason === 'string' && body.reason ? body.reason : PEER_EDIT_FALLBACK,
+        ...(body.error === 'peer-edit-unapproved' && typeof body.version === 'string' ? { version: body.version } : {}),
+        ...(typeof body.editedBy === 'string' ? { editedBy: body.editedBy } : {}),
+      };
+    }
     if (error.status === 422 && record(body) && Array.isArray(body.issues)) {
       return { kind: 'not-runnable', issues: body.issues.filter((issue): issue is string => typeof issue === 'string') };
     }

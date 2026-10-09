@@ -3,7 +3,8 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireSlot, runHostRegate, type HostRegateDeps } from './host-regate.js';
+import { acquireSlot, defaultInterference, runHostRegate, type HostRegateDeps } from './host-regate.js';
+import { MAX_INSPECTED_TEST_FILES } from '../../scripts/ci-test-interference-gate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { sweepFrozenMerges } from './frozen-merges.js';
@@ -560,5 +561,46 @@ describe('needsPwaBuild — src/** feeds the PWA build', () => {
     expect(needsPwaBuild(['apps/pwa/src/page.tsx'])).toBe(true);
     expect(needsPwaBuild(['src/feature.test.ts', 'src/ui/x.test.tsx'])).toBe(false);
     expect(needsPwaBuild(['docs/a.md', 'scripts/x.ts'])).toBe(false);
+  });
+});
+
+describe('host regate interference: neighbour tests never push the selection over the inspection cap', () => {
+  const root = mkdtempSync(join(tmpdir(), 'host-regate-neighbors-'));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'src/big'), { recursive: true });
+  for (let i = 0; i < 20; i++) writeFileSync(join(root, 'src/big', `n${String(i).padStart(2, '0')}.test.ts`), '');
+  const clean = (paths: readonly string[]) => ({ order: [...paths], isolated: [], combined: { status: 'measured', fail: 0 }, status: 'no-interference', isolatedFailures: 0, combinedFailures: 0, difference: 0 }) as never;
+
+  test('changed test in a directory with 20 siblings is measured, changed test kept, selection ≤ cap', async () => {
+    const seen: string[][] = [];
+    const verdict = await defaultInterference(['src/big/n17.test.ts', 'src/big/impl.ts'], root, { detect: async (paths) => { seen.push([...paths]); return clean(paths); } });
+    expect(verdict.unmeasured).toBeUndefined();
+    expect(verdict.passed).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.length).toBeLessThanOrEqual(MAX_INSPECTED_TEST_FILES);
+    expect(seen[0]!.length).toBe(MAX_INSPECTED_TEST_FILES);
+    expect(seen[0]).toContain('src/big/n17.test.ts');
+    expect(verdict.neighborsTrimmed).toBe(19 - (MAX_INSPECTED_TEST_FILES - 1));
+    expect(verdict.detail).toContain('neighbours trimmed');
+  });
+
+  test('changed tests alone over the cap stay honestly unmeasured', async () => {
+    const changed = Array.from({ length: MAX_INSPECTED_TEST_FILES + 1 }, (_, i) => `src/big/n${String(i).padStart(2, '0')}.test.ts`);
+    const verdict = await defaultInterference(changed, root, { detect: async (paths) => clean(paths) });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.unmeasured).toBe(true);
+  });
+
+  test('host regate log carries failedStep detail and neighborsTrimmed', async () => {
+    const logged: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const { deps } = mock({
+      interference: async () => ({ passed: false, unmeasured: true, neighborsTrimmed: 12, detail: `x${'y'.repeat(400)}` }),
+      log: (event, data) => { logged.push({ event, data }); },
+    });
+    await runHostRegate(input, deps);
+    const entry = logged.find((l) => l.event === 'unmeasured');
+    expect(entry?.data.failedStep).toBe('test-interference');
+    expect(entry?.data.detail).toBe(`x${'y'.repeat(299)}`);
+    expect(entry?.data.neighborsTrimmed).toBe(12);
   });
 });

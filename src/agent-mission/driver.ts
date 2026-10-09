@@ -30,7 +30,7 @@ import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
 import { verdictForFinalPtyScreen } from '../cli/pty-drive-verdict.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
-import type { FallbackStep } from '../oauth/fallback-chain.js';
+import { normalizeFallbackChain, type FallbackStep } from '../oauth/fallback-chain.js';
 import { runPtyControlLoop, controlDepsForHandle, type ControlDecision, type ControlObservation, type RunSupervisor } from '../autopilot/pty-control-loop.js';
 import { probeControlStance, stanceBlocksWrite } from '../pty-shell/pty-control-stance.js';
 import { mapControlStance, supervisionObservationFields } from '../self-implement/supervision-vocabulary.js';
@@ -441,7 +441,7 @@ export function agentBackendNames(): string[] {
  *
  * ⛔ 불변식 셋(윗 모듈에서 그대로 이어받는다):
  *   ① **사람이 이름을 «명시»했으면 이 함수는 «안» 불린다** — 의도가 이긴다(호출자가 위에서 갈린다).
- *   ② **기본 체인은 `['codex-rotate']`** 이라 옵션을 안 켠 사용자는 «항상 codex» — 무변경.
+ *   ② **기본 체인은 `['codex-rotate', 'grok']`** 이며 claude-pty 는 명시 구성에서만 선택된다.
  *   ③ **조용히 바꾸지 않는다** — 바꿨으면 관측에 남긴다. 조용한 폴백은 이 파일이 이미
  *      거부한 형태다(위 `resolveBackend` 주석: *"조용한 codex 폴백은 애그노스틱 위반"*).
  *
@@ -460,9 +460,9 @@ export function resolveDefaultBackend(
         return resolveRunFallback();
       });
     const decision = decide();
-    if (decision.action === 'switch-backend' && decision.backend === 'grok') {
-      debug.log('agent-mission.backend', 'fallback-switch', { from: 'codex', to: 'grok', reason: 'codex-exhausted' });
-      return grokBackend;
+    if (decision.action === 'switch-backend' && (decision.backend === 'grok' || decision.backend === 'claude')) {
+      debug.log('agent-mission.backend', 'fallback-switch', { from: 'codex', to: decision.backend, reason: 'codex-exhausted' });
+      return decision.backend === 'claude' ? claudeBackend : grokBackend;
     }
   } catch (err) {
     debug.log('agent-mission.backend', 'fallback-failed', { message: (err as Error)?.message }, { level: 'warn' });
@@ -503,6 +503,20 @@ interface RuntimeFallbackContext extends RuntimeFallbackState {
   readonly fallbackEligible: boolean;
 }
 
+/** 초기 백엔드의 체인 위치부터 남은 칸만 재시도한다. 실제 전환은 각 칸의 판정이 허용해야 한다. */
+export function initialRuntimeFallback(backend: AgentBackend, chain: readonly FallbackStep[]): RuntimeFallbackContext {
+  const step: FallbackStep = backend.name === 'grok' ? 'grok' : backend.name === 'claude' ? 'claude-pty' : 'codex-rotate';
+  const position = chain.indexOf(step);
+  return {
+    fallbackEligible: true,
+    attemptedSteps: new Set<FallbackStep>([step]),
+    descents: 0,
+    // 초기 칸이 체인에 «없으면»(예: chain=['grok'] 인데 기본 codex 로 떴다) 체인 전체가 남은 칸이다 —
+    // 종전(codex 면 1칸)보다 줄이지 않는다.
+    maxDescents: position < 0 ? chain.filter((s) => s !== step).length : chain.length - position - 1,
+  };
+}
+
 /** 한도 실패에만 재판정한다. 새·미시도 체인 칸과 최초 남은 칸 상한을 모두 만족해야 이동한다. */
 export function decideRuntimeFallback(
   failure: unknown,
@@ -512,8 +526,10 @@ export function decideRuntimeFallback(
 ): AgentBackend | null {
   if (classifyAuthError(failure).errorKind !== 'rate-limited' || state.descents >= state.maxDescents) return null;
   const decision = decide({ currentStep, currentCredentialRateLimited: true });
-  if (decision.action !== 'switch-backend' || decision.backend !== 'grok' || state.attemptedSteps.has('grok')) return null;
-  return grokBackend;
+  if (decision.action !== 'switch-backend') return null;
+  const nextStep = decision.backend === 'grok' ? 'grok' : decision.backend === 'claude' ? 'claude-pty' : null;
+  if (!nextStep || state.attemptedSteps.has(nextStep)) return null;
+  return nextStep === 'claude-pty' ? claudeBackend : grokBackend;
 }
 
 export interface AgentMissionSpec {
@@ -1586,10 +1602,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (spec.plugin && (spec.headless || (backend.name !== 'codex' && backend.name !== 'claude'))) throw new Error('--plugin 은 codex/claude PTY 전용입니다');
   if (spec.workdir && spec.chain) throw new Error('workdir 모드는 넘기기 사슬을 쓰지 않는다');
   const runtimeFallback = deps.runtimeFallback ?? {
+    ...initialRuntimeFallback(backend, normalizeFallbackChain(getUserConfig().llm?.fallbackChain).chain),
     fallbackEligible: spec.agent === undefined && !spec.chain,
-    attemptedSteps: new Set<FallbackStep>([backend.name === 'grok' ? 'grok' : 'codex-rotate']),
-    descents: 0,
-    maxDescents: backend.name === 'codex' ? 1 : 0,
   };
   const spawnPty = deps.startPty ?? startPty;
   const createMissionWorktree = deps.createWorktree ?? createWorktree;
@@ -2279,7 +2293,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
         const { resolveRunFallback: resolve } = require('../oauth/codex-account-store.js') as typeof import('../oauth/codex-account-store.js');
         return resolve(process.env, input);
       });
-    const currentStep: FallbackStep = backend.name === 'grok' ? 'grok' : 'codex-rotate';
+    const currentStep: FallbackStep = backend.name === 'grok' ? 'grok' : backend.name === 'claude' ? 'claude-pty' : 'codex-rotate';
     const nextBackend = runtimeFallback.fallbackEligible ? decideRuntimeFallback(
       failure,
       currentStep,
@@ -2296,7 +2310,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     });
     if (nextBackend && !deps.isMissionAborted?.()) {
       decisionEvent({ step: 'recover', text: `Switching ${backend.name} to ${nextBackend.name}`, detail: { blocked: control.termination.message, action: `Retry with ${nextBackend.name}` } });
-      const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : 'codex-rotate';
+      const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : nextBackend.name === 'claude' ? 'claude-pty' : 'codex-rotate';
       stopLive();
       if (h.pid) await (deps.terminateProcessTree ?? terminateMissionProcessTree)(h.pid);
       try { h.kill(); } catch { /* noop */ }

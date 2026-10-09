@@ -1,9 +1,10 @@
 /**
- * TA-JUDGE-LIVE-SAFE — 판단부의 «안전한 수» 둘만 실제로 한다(10-07 승인 · 그 밖의 수는 그림자 그대로).
+ * TA-JUDGE-LIVE-SAFE — 설정에서 명시한 review · propose-green · propose-land 만 실제로 한다.
  *
  * - `review`: 수확 가능 런의 PR 에 elanous 리뷰를 «한 번» 요청한다 — PR 머리(sha)마다 한 번(카드 `reviewRequests` 이력).
  *   요청만 한다: 결과로 착지·재발사로 잇지 않는다(실행부 `executeNextAction` 의 review→land 사슬을 타지 않는다).
  * - `propose-green`: 카드에 green «제안»(`greenProposal`)만 적는다 — 체크리스트는 손대지 않는다.
+ * - `propose-land`: 카드·현재 머리의 self review pass·non-draft 를 확인하고 기존 `pr land` 를 머리 고정으로 한 번 부른다.
  * - 설정 `taskAgent.liveMoves`(config > env `ELANOUS_TASK_AGENT_LIVE_MOVES` > 없음). 모르는 항목은 경고하고 버린다.
  * - 관측: 실행한 수마다 `debug.log('task-agent', 'live-move', {kind, card, ok, detail, live:true})`.
  */
@@ -16,7 +17,7 @@ import { getUserConfig } from '../user-config.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 
-export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green'] as const;
+export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land'] as const;
 export type TaskAgentLiveMove = typeof TASK_AGENT_LIVE_MOVES[number];
 export const TASK_AGENT_LIVE_MOVES_ENV = 'ELANOUS_TASK_AGENT_LIVE_MOVES';
 
@@ -62,12 +63,16 @@ export interface LiveMoveDeps {
   repoCandidates?: (card: TaskCard) => readonly ReviewRepoCandidate[];
   /** 리뷰 요청(떼어 띄운다) — 시험은 반드시 주입한다. */
   requestReview?: (pr: number, intent: string, cwd?: string) => Promise<void>;
+  /** Fresh PR head and draft flag for landing; separate from the unchanged review lookup. */
+  landPrHead?: (pr: number, cwd: string) => Promise<(PrHeadView & { isDraft: boolean }) | null>;
+  /** One existing pr land operation; inject in tests instead of invoking the CLI. */
+  land?: (pr: number, head: string, cwd: string) => Promise<{ status: number; stdout: string; stderr?: string }>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
 }
 
 /** `executed` = 부작용을 실제로 냈다(리뷰를 띄웠다 · 제안을 적었다). ok 이지만 이미 한 수(같은 머리·이미 제안)면 false. */
 export interface LiveMoveResult {
-  kind: TaskAgentLiveMove; card: string | null; ok: boolean; executed: boolean; detail: string;
+  kind: TaskAgentLiveMove | 'land'; card: string | null; ok: boolean; executed: boolean; detail: string;
   /** TA-LIVE-REVIEW-POD — 작업 트리 없이 리뷰 저장소를 찾았을 때(또는 못 찾았을 때)의 근거 한 줄. */
   reviewRepo?: { resolved: boolean; source?: ReviewRepoCandidate['source']; cwd?: string; proof?: 'head-sha' | 'branch'; reason: string };
 }
@@ -183,6 +188,52 @@ export async function defaultRequestReview(pr: number, intent: string, cwd?: str
   await spawnDetachedConfirmed(opts.spawn ?? (spawn as unknown as DetachedSpawn), process.execPath, liveReviewArgs(opts.entry ?? ELANOUS_CLI_ENTRY, configDir, pr, intent), undefined, cwd);
 }
 
+export function liveLandArgs(entry: string, configDir: string, pr: number, head: string, cwd: string): string[] {
+  return [resolve(entry), '--config-dir', configDir, 'pr', 'land', '--cwd', cwd, '--pr', String(pr), '--expected-head', head];
+}
+
+/** The CLI owns the freeze, gate and merge checks; no direct gh merge or bypass flags. */
+export async function defaultLand(pr: number, head: string, cwd: string): Promise<{ status: number; stdout: string; stderr?: string }> {
+  const { ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
+  const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
+  const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+  const args = liveLandArgs(ELANOUS_CLI_ENTRY, getElanousConfigDirOverride() ?? effectiveInstanceRoot(), pr, head, cwd);
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-300); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-300); });
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code !== 0) { resolveResult({ status: code ?? 1, stdout, stderr }); return; }
+      void defaultLandPrHead(pr, cwd).then((view) => {
+        resolveResult(view?.state === 'MERGED'
+          ? { status: 0, stdout, stderr }
+          : { status: 1, stdout, stderr: (stderr || stdout || 'landing completed without confirmed merge').slice(-300) });
+      }).catch((error) => resolveResult({ status: 1, stdout, stderr: String(error).slice(-300) }));
+    });
+  });
+}
+
+export async function defaultLandPrHead(pr: number, cwd: string): Promise<(PrHeadView & { isDraft: boolean }) | null> {
+  const view = (env: NodeJS.ProcessEnv) => runGh(['pr', 'view', String(pr), '--json', 'headRefOid,headRefName,state,url,isDraft'], { env, cwd });
+  let out = view(process.env);
+  if (out.status !== 0) {
+    const noProxy = { ...process.env };
+    for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) delete noProxy[key];
+    out = view(noProxy);
+  }
+  if (out.status !== 0) return null;
+  try {
+    const value = JSON.parse(out.stdout) as { headRefOid?: unknown; headRefName?: unknown; state?: unknown; url?: unknown; isDraft?: unknown };
+    if (typeof value.headRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(value.headRefOid) || typeof value.state !== 'string' || typeof value.isDraft !== 'boolean') return null;
+    return { head: value.headRefOid, state: value.state, isDraft: value.isDraft,
+      ...(typeof value.headRefName === 'string' ? { branch: value.headRefName } : {}),
+      ...(typeof value.url === 'string' ? { url: value.url } : {}) };
+  } catch { return null; }
+}
+
 export function liveReviewIntent(card: TaskCard, runId: string | null, stopReason: string): string {
   const goal = card.text.split('\n')[0]!.trim().slice(0, 300);
   return [
@@ -253,6 +304,78 @@ export async function executeLiveReview(
     return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: false, detail: `review request failed for #${pr} head ${head.head.slice(0, 12)}: ${reason}` }));
   }
   return observe(deps, withRepo({ kind, executed: true, card: card.id, ok: true, detail: `review requested for #${pr} head ${head.head.slice(0, 12)}` }));
+}
+
+const landedCycles = new Set<string>();
+
+/** `propose-land` — only a passing self review of this exact OPEN, non-draft head may invoke pr land. */
+export async function executeLiveLand(
+  card: TaskCard | undefined, pr: number | undefined,
+  ctx: { runId?: string | null; cycleId?: string; cwd?: string; produced?: { headCommit?: string; branch?: string; prUrl?: string }; review?: { verdict: 'pass' | 'fail'; head: string } },
+  deps: LiveMoveDeps = {},
+): Promise<LiveMoveResult> {
+  const kind = 'land' as const;
+  const reject = (cardId: string | null, detail: string, reviewRepo?: LiveMoveResult['reviewRepo']) =>
+    observe(deps, { kind, card: cardId, ok: false, executed: false, detail, ...(reviewRepo ? { reviewRepo } : {}) });
+  if (!card) return reject(null, 'no task card — stays shadow');
+  if (!pr || !Number.isSafeInteger(pr) || pr < 1) return reject(card.id, 'no PR — stays shadow');
+  let cwd = ctx.cwd;
+  let reviewRepo: LiveMoveResult['reviewRepo'];
+  if (!cwd) {
+    const found = await resolveReviewRepo(card, pr, ctx.produced, deps);
+    if (!found.resolved) return reject(card.id, `PR #${pr} worktree unknown — stays shadow`, { resolved: false, reason: found.reason });
+    cwd = found.cwd;
+    reviewRepo = { resolved: true, source: found.source, cwd, proof: found.proof, reason: found.reason };
+  }
+  const withRepo = (result: LiveMoveResult): LiveMoveResult => reviewRepo ? { ...result, reviewRepo } : result;
+  let view: (PrHeadView & { isDraft: boolean }) | null;
+  try { view = await (deps.landPrHead ?? defaultLandPrHead)(pr, cwd); } catch { view = null; }
+  if (!view || !/^[0-9a-f]{40}$/i.test(view.head)) return reject(card.id, `PR #${pr} head unknown`, reviewRepo);
+  if (view.state !== 'OPEN') return reject(card.id, `PR #${pr} is ${view.state}`, reviewRepo);
+  if (view.isDraft !== false) return reject(card.id, `PR #${pr} is draft or draft status unknown`, reviewRepo);
+  if (ctx.produced?.prUrl && (!view.url || view.url.trim().replace(/\/+$/, '').toLowerCase() !== ctx.produced.prUrl.trim().replace(/\/+$/, '').toLowerCase())) {
+    return reject(card.id, `PR #${pr} URL mismatches run evidence`, reviewRepo);
+  }
+  if (ctx.review?.verdict !== 'pass') return reject(card.id, `PR #${pr} self review pass missing`, reviewRepo);
+  if (!/^[0-9a-f]{40}$/i.test(ctx.review.head) || ctx.review.head.toLowerCase() !== view.head.toLowerCase()) {
+    return reject(card.id, `PR #${pr} review head mismatch: ${ctx.review.head.slice(0, 12)} ≠ ${view.head.slice(0, 12)}`, reviewRepo);
+  }
+  const cycle = ctx.cycleId ?? ctx.runId;
+  if (cycle && landedCycles.has(cycle)) return reject(card.id, `cycle ${cycle} already landed — stays shadow`, reviewRepo);
+  const path = deps.statePath ?? taskAgentStatePath();
+  const at = (deps.now ?? (() => new Date()))().toISOString();
+  let claimed = false;
+  let missing = false;
+  try {
+    updateTaskCard(path, card.id, (current) => {
+      if (!current) { missing = true; return undefined; }
+      if ((current.landAttempts ?? []).some(entry => entry.pr === pr && entry.head.toLowerCase() === view!.head.toLowerCase())) return undefined;
+      claimed = true;
+      return { ...current, landAttempts: [...(current.landAttempts ?? []), { pr, head: view!.head, at }] };
+    });
+  } catch (error) {
+    return reject(card.id, `land attempt could not be recorded: ${String(error).slice(-250)}`, reviewRepo);
+  }
+  if (missing) return reject(card.id, 'task card not in state file', reviewRepo);
+  if (!claimed) return observe(deps, withRepo({ kind, card: card.id, ok: true, executed: false, detail: `already attempted land for #${pr} head ${view.head.slice(0, 12)}` }));
+  if (cycle) landedCycles.add(cycle);
+  let ok = false;
+  let detail: string;
+  try {
+    // The CLI rechecks the pinned PR/head immediately before merge, after its own gates and freeze admission.
+    const outcome = await (deps.land ?? defaultLand)(pr, view.head, cwd);
+    ok = outcome.status === 0;
+    detail = (ok ? outcome.stdout || `land merged #${pr} head ${view.head.slice(0, 12)}` : outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-300);
+  } catch (error) { detail = (error instanceof Error ? error.message : String(error)).slice(-300); }
+  try {
+    updateTaskCard(path, card.id, (current) => current?.landAttempts?.some(entry => entry.pr === pr && entry.head === view!.head && entry.at === at)
+      ? { ...current, landAttempts: current.landAttempts.map(entry => entry.pr === pr && entry.head === view!.head && entry.at === at ? { ...entry, ok, detail } : entry) }
+      : undefined);
+  } catch (error) {
+    return observe(deps, withRepo({ kind, card: card.id, ok: false, executed: true,
+      detail: `land ${ok ? 'succeeded' : 'failed'} but card update failed: ${String(error).slice(-230)}` }));
+  }
+  return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail }));
 }
 
 /** `propose-green` — 비지 않은 근거가 있을 때만 카드에 제안을 적는다(한 번). 체크리스트는 쓰지 않는다. */

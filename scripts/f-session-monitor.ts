@@ -479,6 +479,75 @@ function collectChannel(anchor: Anchor, advance: boolean): Cell<{ pr: number; co
 
 // ── 관문표 ────────────────────────────────
 export type Verdict = "pass" | "fail" | "unknown";
+
+/** TECHBLOG1 판정은 호출자가 제공한 근거만 읽는다. 스냅숏·출력·원장에는 연결하지 않는다. */
+export interface Techblog1Entry {
+  readonly installment: number;
+  readonly publishedAt: string;
+}
+
+export interface Techblog1Candidate {
+  readonly installment: number;
+  readonly publishAt: string;
+  readonly measurements: readonly { readonly value: number; readonly source: string; readonly measuredAt: string }[];
+  readonly exposure: {
+    readonly publicBeforePublish: boolean;
+    readonly approved: boolean;
+    readonly revealsProtectedDetails: boolean;
+    readonly attorneyReviewed: boolean;
+  };
+}
+
+export interface Techblog1Verdict {
+  readonly verdict: Verdict;
+  readonly reasons: readonly string[];
+}
+
+/** 순번은 1부터 빠짐없이, 게시 간격은 직전 게시에서 48시간 이상이어야 한다. */
+export function evaluateTechblog1(
+  published: readonly Techblog1Entry[],
+  candidate: Techblog1Candidate,
+): Techblog1Verdict {
+  const reasons: string[] = [];
+  const validPublicationDate = (iso: string) => {
+    if (typeof iso !== "string") return false;
+    const match = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-](?:0\d|1\d|2[0-3]):[0-5]\d)$/.exec(iso);
+    if (!match || !Number.isFinite(Date.parse(iso))) return false;
+    const day = new Date(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`);
+    return day.getUTCFullYear() === Number(match[1])
+      && day.getUTCMonth() + 1 === Number(match[2])
+      && day.getUTCDate() === Number(match[3]);
+  };
+  const history = [...published].sort((a, b) => a.installment - b.installment);
+  if (history.some((entry, index) => entry.installment !== index + 1 || !validPublicationDate(entry.publishedAt))
+      || candidate.installment !== history.length + 1) {
+    reasons.push("TECHBLOG1 연재 순서 또는 이전 게시 시각이 유효하지 않음");
+  }
+  if (history.some((entry, index) => index > 0 && validPublicationDate(entry.publishedAt)
+      && validPublicationDate(history[index - 1]!.publishedAt)
+      && Date.parse(entry.publishedAt) - Date.parse(history[index - 1]!.publishedAt) < 48 * 60 * 60 * 1000)) {
+    reasons.push("TECHBLOG1 이전 연재의 이틀 간격이 지켜지지 않음");
+  }
+  if (!validPublicationDate(candidate.publishAt)) {
+    reasons.push("TECHBLOG1 게시 시각을 확인할 수 없음");
+  } else if (history.length > 0 && validPublicationDate(history[history.length - 1]!.publishedAt)
+      && Date.parse(candidate.publishAt) - Date.parse(history[history.length - 1]!.publishedAt) < 48 * 60 * 60 * 1000) {
+    reasons.push("TECHBLOG1 직전 게시에서 이틀이 지나지 않음");
+  }
+  if (candidate.measurements.length === 0 || candidate.measurements.some((m) =>
+    !Number.isFinite(m.value) || !m.source.trim() || !validPublicationDate(m.measuredAt)
+    || (validPublicationDate(candidate.publishAt) && Date.parse(m.measuredAt) > Date.parse(candidate.publishAt)))) {
+    reasons.push("TECHBLOG1 실측 수치·출처·측정 시각이 확인되지 않음");
+  }
+  if (candidate.exposure.revealsProtectedDetails && !candidate.exposure.attorneyReviewed) {
+    reasons.push("TECHBLOG1 보호 대상 상세는 변리사 검토 전 노출 불가");
+  }
+  if (candidate.exposure.publicBeforePublish && !candidate.exposure.approved) {
+    reasons.push("TECHBLOG1 공개 전 노출 승인 없음");
+  }
+  return { verdict: reasons.length === 0 ? "pass" : "fail", reasons };
+}
+
 export interface Gate {
   phase: string;
   name: string;

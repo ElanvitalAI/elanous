@@ -53,6 +53,24 @@ export function renderTelegramNow(input: ContextNowAnswer, audience: ContextNowA
   return lines.map(line => line.replace(/\s+/g, ' ').trim()).join('\n');
 }
 
+/** Context-first opening for chat connectors: up to three operational rows (live runs, an unfinished
+ *  release run, late schedules) ahead of the same `/now` body. `/now` itself stays unchanged. */
+export function renderContextFirstNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
+  const answer = forAudience(input, audience);
+  const labels = { run: '도는 런', release: '발행 런', 'schedule-late': '지연 스케줄' } as const;
+  const operational = answer.facts.filter(fact => fact.kind === 'run' ||
+    (fact.kind === 'release' && (fact.unreadable || fact.status !== 'done')) ||
+    (fact.kind === 'schedule-late' && (fact.unreadable || !!fact.count)));
+  // Run goals are whole asks (often thousands of characters); one line each keeps the opening to one screen.
+  const short = (text: string) => { const chars = Array.from(text); return chars.length > 60 ? `${chars.slice(0, 60).join('')}…` : text; };
+  const lines = operational.slice(0, 3).map(fact => {
+    const text = fact.kind === 'run' && !fact.unreadable ? `${short(fact.goal.replace(/\s+/g, ' ').trim())} · ${fact.phase} · ${fact.elapsed}` : factText(fact);
+    return `${labels[fact.kind as keyof typeof labels]}: ${text} — ${fact.source}`.replace(/\s+/g, ' ').trim();
+  });
+  if (operational.length > lines.length) lines.push(`… 운영 항목 ${operational.length - lines.length}개 더 (/now)`);
+  return [...lines, renderTelegramNow(answer, 'operator')].join('\n');
+}
+
 export function renderTuiNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string[] {
   const answer = forAudience(input, audience);
   const shortText = (text: string) => {

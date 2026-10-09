@@ -79,7 +79,7 @@ export function renderModelInput(report: ModelInputReport): string {
     `model input tokens · ${report.since} ~ ${report.until} · stores=${report.stores.join(', ') || '(없음)'} · records=${report.records}`,
     'scope\tnodeKind\tmeasured\tmedian\tp90\t못 잼',
     ...(report.baselines.length === 0 ? ['(관측 표본 없음)'] : report.baselines.map((item) =>
-      `${item.scope}\t${item.nodeKind}\t${item.measured}\t${item.median ?? '—'}\t${item.p90 ?? '—'}\t${item.unmeasured}`)),
+      `${item.scope}\t${item.nodeKind}\t${item.measured}\t${item.median ?? '못 잼'}\t${item.p90 ?? '못 잼'}\t${item.unmeasured}`)),
   ].join('\n');
 }
 

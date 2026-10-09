@@ -59,6 +59,8 @@ export interface ReviewResult {
    * ⚠️ 미주입(`llmReview` 없음)은 «실패가 아니라 미검토»라 이 칸을 안 채운다 — 둘을 구분한다.
    */
   failureReason?: string;
+  /** Subscription reviewer unavailable: the default reviewer produced this verdict. */
+  reviewerFallback?: string;
 }
 
 /** 모든 리뷰 관측 생산자가 공유하는 diff 예산 필드 계약. 예산 부재는 빈 객체로 보존한다.
@@ -300,7 +302,7 @@ export function planReviewChunks(
  */
 export function foldReviewResults(
   results: readonly ReviewResult[],
-): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'requirements' | 'reviewed' | 'failureReason'> {
+): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback'> {
   const dedupe = (values: readonly string[]): string[] => [...new Set(values)];
   const collect = (pick: (r: ReviewResult) => readonly string[] | undefined): string[] =>
     dedupe(results.flatMap((r) => [...(pick(r) ?? [])]));
@@ -311,6 +313,7 @@ export function foldReviewResults(
   const shouldFix = collect((r) => r.shouldFix).slice(0, 6);
   const requirements = collect((r) => r.requirements);
   const failed = results.find((r) => r.reviewed !== true);
+  const reviewerFallback = results.find((r) => r.reviewerFallback)?.reviewerFallback;
   return {
     verdict,
     mustFix,
@@ -318,6 +321,7 @@ export function foldReviewResults(
     ...(requirements.length ? { requirements } : {}),
     reviewed: results.length > 0 && failed === undefined,
     ...(failed?.failureReason ? { failureReason: failed.failureReason } : {}),
+    ...(reviewerFallback ? { reviewerFallback } : {}),
   };
 }
 
@@ -560,6 +564,9 @@ export function buildReviewPrompt(
 
   return [
     'You are a strict staff-engineer reviewing an ALREADY-OPENED pull request from an autonomous coding agent.',
+    // ⚠️ 무표식 절단 금지(리뷰 must-fix) — 잘렸으면 **어느 절부터**인지 리뷰어가 알아야 한다.
+    phaseIntentHeading, phaseIntent,
+    ...(input.acceptance ? ['## Acceptance criteria', input.acceptance.slice(0, 1000)] : []),
     'This is a POST-PR review of the produced artifact. Judge whether the PR actually',
     'delivers the phase intent CORRECTLY and soundly: (1) correctness/latent bugs, (2) does it meet the stated',
     'acceptance criteria, (3) design/regression risk, (4) missing wiring (new code never called), (5) tests present',
@@ -584,9 +591,6 @@ export function buildReviewPrompt(
     '    and check that the error names that site; use values the real caller produces instead of synthetic input.',
     'Do NOT rubber-stamp; an empty review is a failed review — always surface at least a watch item.',
     '',
-    // ⚠️ 무표식 절단 금지(리뷰 must-fix) — 잘렸으면 **어느 절부터**인지 리뷰어가 알아야 한다.
-    phaseIntentHeading, phaseIntent,
-    ...(input.acceptance ? ['## Acceptance criteria', input.acceptance.slice(0, 1000)] : []),
     ...(input.workingMemory ? ['## Prior decisions / reuse boundaries (working memory)', input.workingMemory.slice(0, 1200)] : []),
     // ⭐ 증거가 무엇인지 먼저 말한다 — 규칙 (7) 이 "의도를 넘어선 변경" 을 판정하려면
     //   diff 에 담긴 것이 **이 PR 이 저작한 것인지**를 알아야 한다.
@@ -634,10 +638,12 @@ export function parseReviewResult(text: string): ReviewResult {
     const first = shouldFix.shift() ?? fallbackFinding;
     mustFix.push(first ?? 'PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).');
   }
+  const fallback = text.match(/\n\[reviewer fallback: ([^\r\n]+)\]$/);
   return {
     verdict,
     mustFix: mustFix.slice(0, 6),
     shouldFix: shouldFix.slice(0, 6),
+    ...(fallback ? { reviewerFallback: fallback[1] } : {}),
     ...(requirements.length ? { requirements } : {}),
   };
 }
@@ -830,6 +836,7 @@ export function renderReview(r: ReviewResult): string {
   const icon = r.verdict === 'pass' ? '✅' : r.verdict === 'warn' ? '⚠️' : '⛔';
   const head = `${icon} 자율 PR 리뷰: ${r.verdict.toUpperCase()}`;
   const parts = [head];
+  if (r.reviewerFallback) parts.push(`[reviewer fallback: ${r.reviewerFallback}]`);
   if (r.mustFix.length) parts.push('**Must-fix (blockers)**', ...r.mustFix.map((f) => `- ${f}`));
   if (r.shouldFix.length) parts.push('**Should-fix**', ...r.shouldFix.map((f) => `- ${f}`));
   if (r.mustFix.length === 0 && r.shouldFix.length === 0) parts.push('— 리뷰 통과(블로커·비블로커 지적 없음).');

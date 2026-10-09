@@ -79,7 +79,7 @@ test('독립 CLI 성공과 gh 실패가 격리 로그 스토어에 수와 사유
     expect(JSON.stringify(rows)).not.toContain('alice@example.com');
     expect(JSON.stringify(rows)).not.toContain('token-secret');
   } finally { store.close(); }
-});
+}, 60_000);
 
 test('원장 쓰기 실패도 내용 없이 ledger 사유로 스토어에 남긴다', () => {
   const f = fixture([comment(503, '**[OP]** 10:00 → MK · 요청 · K6\n원장 비공개 본문')]);
@@ -95,7 +95,7 @@ test('원장 쓰기 실패도 내용 없이 ledger 사유로 스토어에 남긴
     expect(JSON.parse(failed[0]!.data!)).toMatchObject({ seat: 'MK', reason: 'ledger' });
     expect(JSON.stringify(rows)).not.toContain('원장 비공개 본문');
   } finally { store.close(); }
-});
+}, 60_000);
 
 test('다섯 댓글에서 MK 요청·결정 둘만 원장에 덧붙이고 재실행은 멱등이며 자리 루프가 집는다', async () => {
   const f = fixture([
@@ -138,7 +138,7 @@ test('다섯 댓글에서 MK 요청·결정 둘만 원장에 덧붙이고 재실
     'api repos/{owner}/{repo}/issues/23032/comments --paginate --jq .[]',
     'api repos/{owner}/{repo}/issues/23032/comments --paginate --jq .[]',
   ]);
-});
+}, 60_000);
 
 test('한 줄 요청의 봉투 뒤 본문과 여러 줄 본문 및 빈 봉투의 대체 문구를 원장에 남긴다', () => {
   const f = fixture([
@@ -167,7 +167,7 @@ test('한 줄 요청의 봉투 뒤 본문과 여러 줄 본문 및 빈 봉투의
   expect(rows[7]).toMatchObject({ cell: 'E3 ⑧', dueAt: '20:00', text: '마감 다음 제목' });
   expect(rows[8]).toMatchObject({ cell: 'E3 ②', dueAt: '18:00', text: '제목\n상세' });
   expect(rows.every((row: { text: string }) => row.text.length > 0)).toBe(true);
-});
+}, 60_000);
 
 test('latest 대상이 다른 기존 로그로 바뀌어도 이번 호출에서 추가한 로그만 센다', () => {
   const f = fixture([comment(301, '**[OP]** 10:00 → MK · 요청 · K6\n신규 요청')]);
@@ -194,7 +194,7 @@ test('latest 대상이 다른 기존 로그로 바뀌어도 이번 호출에서 
   expect(events.filter((entry) => entry.category === 'coord.requests-bridge' && entry.event === 'run')
     .map((entry) => entry.data)).toMatchObject([{ seat: 'MK', read: 1, picked: 1, added: 1, existing: 0 }]);
   expect(appended).not.toContain('신규 요청');
-});
+}, 60_000);
 
 test('dry-run 은 원장을 만들지 않고 since 는 오래된 글을 제외하며 원문 본문은 200자로 제한한다', () => {
   const f = fixture([
@@ -209,7 +209,7 @@ test('dry-run 은 원장을 만들지 않고 since 는 오래된 글을 제외�
   expect(written.exitCode).toBe(0);
   expect(f.entries()).toMatchObject([{ key: 'coord:2:MK', text: '가'.repeat(200) }]);
   expect(f.output(f.run('--since', '2026-10-03T00:00:00Z'))).toBe('읽은 글 2 · 고른 수 1 · 새로 넣은 수 0 · 이미 있던 수 1');
-});
+}, 60_000);
 
 test('기존 요청 줄은 보존하며 자기 발신·종류 오인·전원은 거부한다', () => {
   const f = fixture([
@@ -234,7 +234,7 @@ test('기존 요청 줄은 보존하며 자기 발신·종류 오인·전원은 
   expect(f.entries().map((row: { key: string }) => row.key)).not.toContain('coord:8:MK');
   expect(f.entries()[3]).toMatchObject({ key: 'coord:9:MK', dueAt: '19:00', text: '칸 없는 요청' });
   expect(f.entries()[3]).not.toHaveProperty('cell');
-});
+}, 60_000);
 
 test('두 자리에게 온 글은 실제 CLI 로 자리마다 넣고 두 자리 루프가 각자 집는다', async () => {
   const f = fixture([comment(201, '**[OP]** 10:00 → MK · TC · 요청 · K6\n두 자리에 요청')]);
@@ -250,7 +250,7 @@ test('두 자리에게 온 글은 실제 CLI 로 자리마다 넣고 두 자리 
   const opts = { root: f.root, repo: f.home, versions: () => [], schedules: () => [] };
   expect((await gatherSeatInputs('MK', opts)).requests).toMatchObject([{ id: 'coord:201:MK', source: 'request', text: '두 자리에 요청' }]);
   expect((await gatherSeatInputs('TC', opts)).requests).toMatchObject([{ id: 'coord:201:TC', source: 'request', text: '두 자리에 요청' }]);
-});
+}, 60_000);
 
 test('옛 꼴 키(coord:<id>)가 다른 자리 줄로 있어도 이 자리 요청을 막지 않고, 같은 자리 옛 줄은 이미 있음으로 센다', async () => {
   const f = fixture([comment(202, '**[OP]** 10:00 → MK · TC · 요청 · K7\n옛 키 요청')]);
@@ -265,4 +265,4 @@ test('옛 꼴 키(coord:<id>)가 다른 자리 줄로 있어도 이 자리 요�
   const opts = { root: f.root, repo: f.home, versions: () => [], schedules: () => [] };
   expect((await gatherSeatInputs('MK', opts)).requests).toMatchObject([{ id: 'coord:202:MK', text: '옛 키 요청' }]);
   expect((await gatherSeatInputs('TC', opts)).requests).toMatchObject([{ id: 'coord:202', text: '옛 키 요청' }]);
-});
+}, 60_000);

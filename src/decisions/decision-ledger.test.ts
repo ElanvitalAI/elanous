@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createVersionResolver } from '../directives/version-at.js';
 import { DecisionLedger, importDecisionMarkdown, type RaiseInput } from './decision-ledger.js';
+import { resolveSeat } from '../seat-address/seat-address.js';
 import { formatDecisionDetail } from '../cli/decisions-cli.js';
 import { renderCardText } from './decision-cards.js';
 
@@ -586,6 +587,23 @@ test('seat reporting rejects ungrounded identity and empty delegation without ap
   expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(1);
   expect(store.recordSeatDecision({ ...input, refs: ['coord#457'] }).id).toBe('SD-20261001-02');
   expect(store.recordSeatDecision({ ...input, title: '발사 경로', decision: '임시 경로 전환' }).id).toBe('SD-20261001-03');
+});
+
+test('registry lookup validates canonical seat ids while decision tracks retain legacy aliases and event shape', () => {
+  const store = ledger();
+  const title = resolveSeat('COO')!;
+  const raised = store.raise({ ...base, raisedBy: { agent: 'codex', track: title.id as 'OP' },
+    crossCheck: [{ seat: title.id, at: '2026-10-01T00:00:00Z', note: '근거 확인' }] });
+  expect(raised.raisedBy.track).toBe('OP');
+  expect(raised.crossCheck).toEqual([{ seat: 'OP', at: '2026-10-01T00:00:00.000Z', note: '근거 확인' }]);
+  expect(store.raise({ ...base, raisedBy: { agent: 'codex', track: title.alias as 'S' } }).raisedBy.track).toBe('S');
+  expect(() => store.raise({ ...base, crossCheck: [{ seat: title.alias!, at: '2026-10-01T00:00:00Z', note: 'alias not a seat' }] })).toThrow('invalid cross-check seat');
+  const recorded = store.recordSeatDecision({ seat: title.id as 'OP', title: '검토', decision: '보류', delegation: '운영 위임' });
+  expect(store.seatReport({ seat: title.id as 'OP' })).toEqual([recorded]);
+  expect(() => store.seatReport({ seat: title.alias as never })).toThrow('invalid seat');
+  const lines = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(lines[0]).toEqual({ type: 'raised', entry: raised });
+  expect(lines[2]).toEqual({ type: 'seat-recorded', entry: recorded });
 });
 
 test('raise and auto-decide accept seat names (OP·MK·TC·UX) as track while old letters keep working', () => {

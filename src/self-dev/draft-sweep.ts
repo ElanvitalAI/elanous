@@ -62,6 +62,9 @@ export interface DraftSweepOptions {
   adapters: DraftSweepAdapters;
   apply?: boolean;
   now?: Date;
+  /** Per-tick close cap; resolve it with resolveDraftSweepCloseCap. Absent or invalid ⇒ DRAFT_SWEEP_CLOSE_CAP. */
+  closeCap?: number;
+  closeCapSource?: DraftSweepCloseCapSource;
 }
 
 export interface DraftSweepEntry {
@@ -83,8 +86,11 @@ export interface DraftSweepResult {
   counts: Record<string, number>;
   /** Drafts whose run could not be observed from here (kept, or closed by the idle rule). */
   unobserved?: number;
-  /** Closes decided this tick (at most DRAFT_SWEEP_CLOSE_CAP). */
+  /** Closes decided this tick (at most `closeCap`). */
   closed?: number;
+  /** The per-tick close cap this sweep used, and where it came from. */
+  closeCap?: number;
+  closeCapSource?: DraftSweepCloseCapSource;
   /** Fresh running claims protected this tick. */
   claimed?: number;
   /** Running claims older than the idle window, including those kept by liveness. */
@@ -420,8 +426,36 @@ const approvalLabel = PR_LABELS.find((entry) => entry.axis === 'state' && entry.
 const keepLabel = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')?.name;
 const releaseHoldLabel = PR_LABELS.find((entry) => entry.axis === 'addon' && entry.sweep.action === 'none')?.name;
 const PAGE_SIZE = 100;
-/** At most this many closes per tick, so a wrong rule cannot close everything at once. */
+/** At most this many closes per tick, so a wrong rule cannot close everything at once. Default for `tools.selfImplement.draftSweepCloseCap`. */
 export const DRAFT_SWEEP_CLOSE_CAP = 10;
+export const DRAFT_SWEEP_CLOSE_CAP_MIN = 1;
+export const DRAFT_SWEEP_CLOSE_CAP_MAX = 100;
+export type DraftSweepCloseCapSource = 'flag' | 'config' | 'default';
+
+export interface DraftSweepCloseCapResolution {
+  readonly closeCap: number;
+  readonly closeCapSource: DraftSweepCloseCapSource;
+  /** One line per rejected input (flag or config); each rejection falls through to the next source. */
+  readonly warnings: readonly string[];
+}
+
+function validCloseCap(value: unknown): number | undefined {
+  const parsed = typeof value === 'string' && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
+  return typeof parsed === 'number' && Number.isSafeInteger(parsed)
+    && parsed >= DRAFT_SWEEP_CLOSE_CAP_MIN && parsed <= DRAFT_SWEEP_CLOSE_CAP_MAX ? parsed : undefined;
+}
+
+/** Flag over config over default; a value outside 1–100 (or not an integer) is rejected with a warning. */
+export function resolveDraftSweepCloseCap(input: { flag?: unknown; config?: unknown }): DraftSweepCloseCapResolution {
+  const warnings: string[] = [];
+  for (const [source, value, name] of [['flag', input.flag, '--close-cap'], ['config', input.config, 'tools.selfImplement.draftSweepCloseCap']] as const) {
+    if (value === undefined || value === null) continue;
+    const cap = validCloseCap(value);
+    if (cap !== undefined) return { closeCap: cap, closeCapSource: source, warnings };
+    warnings.push(`${name}=${JSON.stringify(value)} 무시 — ${DRAFT_SWEEP_CLOSE_CAP_MIN}~${DRAFT_SWEEP_CLOSE_CAP_MAX} 정수만 (기본 ${DRAFT_SWEEP_CLOSE_CAP})`);
+  }
+  return { closeCap: DRAFT_SWEEP_CLOSE_CAP, closeCapSource: 'default', warnings };
+}
 
 /** Post-merge shortcut: only the existing superseded-by decision can authorize a close. */
 export async function supersedeDraftsOnMerge(input: {
@@ -571,8 +605,11 @@ export function draftSweepDaily(
 }
 
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
-export async function runDraftSweep({ repository, adapters, apply = false, now = new Date() }: DraftSweepOptions): Promise<DraftSweepResult> {
-  const result: DraftSweepResult = { repository, apply, complete: false, entries: [], counts: {} };
+export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource }: DraftSweepOptions): Promise<DraftSweepResult> {
+  const validCap = validCloseCap(requestedCap);
+  const closeCap = validCap ?? DRAFT_SWEEP_CLOSE_CAP;
+  const closeCapSource: DraftSweepCloseCapSource = validCap === undefined ? 'default' : requestedSource ?? 'flag';
+  const result: DraftSweepResult = { repository, apply, complete: false, entries: [], counts: {}, closeCap, closeCapSource };
   const record = (entry: DraftSweepEntry): void => {
     result.entries.push(entry);
     result.counts[entry.reason] = (result.counts[entry.reason] ?? 0) + 1;
@@ -591,7 +628,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     const at = Date.now();
     try {
       debug.log('self-dev.draft-sweep', 'timing', { phase, ms: at - phaseStarted, count, ...(outcome ? { outcome } : {}) });
-      if (outcome) debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: at - started, count, outcome });
+      if (outcome) debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: at - started, count, outcome, closeCap, closeCapSource });
     } catch { /* fail-soft */ }
     phaseStarted = at;
   };
@@ -706,7 +743,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         record({ number: draft.number, action: 'keep', reason: 'claim-expired-but-live', applied: false });
         continue;
       }
-      const action = closes >= DRAFT_SWEEP_CLOSE_CAP ? 'keep' : 'close';
+      const action = closes >= closeCap ? 'keep' : 'close';
       if (action === 'close') closes += 1;
       const entry: DraftSweepEntry = { number: draft.number, action,
         reason: action === 'close' ? runStatus === 'self-implement.result final'
@@ -737,7 +774,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       finalRunResult, ageHours: runStatus ? ageHours : idleHours });
     if (!runStatus && (decision.reason === 'unobserved' || decision.reason === 'stale-unobserved')) unobserved += 1;
     if (!contradiction && decision.action === 'close') {
-      if (closes >= DRAFT_SWEEP_CLOSE_CAP) decision = { action: 'keep', reason: 'close-cap' };
+      if (closes >= closeCap) decision = { action: 'keep', reason: 'close-cap' };
       else closes += 1;
     }
     const action = contradiction ? 'report' : decision.action;
@@ -772,7 +809,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
   }
   timing('decide', drafts.length);
-  try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: Date.now() - started, count: drafts.length }); } catch { /* fail-soft */ }
+  try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: Date.now() - started, count: drafts.length, closed: closes, closeCap, closeCapSource }); } catch { /* fail-soft */ }
   result.unobserved = unobserved;
   result.closed = closes;
   result.claimed = claimed;

@@ -62,6 +62,37 @@ afterEach(async () => {
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+test('real control status --json returns seven rows and the table distinguishes measurement states', async () => {
+  const dir = root();
+  const result = await command(dir, 'control', 'status', '--json');
+  expect(result.code).toBe(0);
+  const { rows } = JSON.parse(result.stdout) as { rows: Array<{ row: string; state: string; reason?: string }> };
+  expect(rows).toHaveLength(7);
+  expect(rows.map(r => r.row)).toEqual(['집', '판', '자원', '자격', '동결·몫', '루프', 'config']);
+  for (const row of rows.slice(1, 4)) expect(row).toMatchObject({ state: 'unmeasured', reason: expect.any(String) });
+  const table = await command(dir, 'control', 'status');
+  expect(table.code).toBe(0);
+  expect(table.stdout.trim().split('\n')).toHaveLength(7);
+  expect(table.stdout).toContain('판 · 못 쟀다');
+}, 120_000);
+
+test('control status keeps a multiline freeze reason inside one table row', async () => {
+  const dir = root();
+  writeFileSync(join(dir, 'landing-freeze.json'), JSON.stringify({
+    reason: '첫 줄\n둘째 줄\r셋째 줄\u001b[2J', startedAt: new Date().toISOString(), until: null, by: 'OP',
+  }));
+  const json = await command(dir, 'control', 'status', '--json');
+  expect(json.code).toBe(0);
+  const { rows } = JSON.parse(json.stdout) as { rows: Array<{ row: string; text: string }> };
+  expect(rows).toHaveLength(7);
+  expect(rows[4]).toMatchObject({ row: '동결·몫', text: expect.stringContaining('첫 줄\n둘째 줄\r셋째 줄\u001b[2J') });
+  const table = await command(dir, 'control', 'status');
+  expect(table.code).toBe(0);
+  expect(table.stdout.trim().split(/\r?\n/)).toHaveLength(7);
+  expect(table.stdout).toContain('동결·몫 · 주의 · 동결 켬 · 첫 줄\\n둘째 줄\\r셋째 줄\\u001b[2J');
+  expect(table.stdout).not.toContain('\u001b');
+}, 120_000);
+
 test('control member without a machine join gives the join instruction and rc=2', async () => {
   const result = await command(root(), 'control', 'member', '--once');
   expect(result).toEqual({ code: 2, stdout: '', stderr: '먼저 `elanous control join` 을 치세요\n' });

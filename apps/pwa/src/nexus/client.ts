@@ -150,6 +150,8 @@ export interface NexusClient {
   // ---- plugins market (daemon-verified reads and owner-only mutations) ----
   getPluginsIndex(): Promise<MarketIndexResponse>;
   getInstalledPlugins(): Promise<InstalledPluginWire[]>;
+  getWizardPlugins(): Promise<{ plugins: WizardPluginWire[] }>;
+  saveWizardPlugin(body: { name: string; draft: WizardDraftWire; regenerate?: boolean }): Promise<{ name: string; saved: true }>;
   refreshPluginMarket(name: string): Promise<{ ok: boolean; plugins?: MarketPluginWire[]; reason?: string }>;
   installMarketPlugin(spec: string, acceptedCapabilities: string[], onLine: (line: string) => void): Promise<void>;
   removeMarketPlugin(name: string): Promise<{ removed: number }>;
@@ -158,7 +160,9 @@ export interface NexusClient {
   // ---- harness execution graphs (core read-only · mine editable) ----
   getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
   getRunGraph(id: string): Promise<RunGraphDetail>;
-  getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string }>;
+  getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string; steps?: GraphWizardSteps }>;
+  getRunGraphAccess(id: string): Promise<{ grants: Array<{ recipient: string; permission: 'view' | 'edit' }> }>;
+  putRunGraphAccess(id: string, recipient: string, permission: 'view' | 'edit'): Promise<{ recipient: string; permission: 'view' | 'edit' }>;
   /** `steps` (GRAPH-WIZARD-SAVE-RECIPES) — the wizard's node → library step map; the server validates it and builds the run commands itself. */
   putRunGraphYaml(id: string, yaml: string, steps?: GraphWizardSteps): Promise<{ id: string; source: 'mine'; editable: true; saved: true; version?: number; previous?: number | null }>;
   /** Create a «mine» run graph: 409 when the id exists, 403 for a core id, 400/422 for a bad id or an invalid graph. */
@@ -166,6 +170,8 @@ export interface NexusClient {
   /** CGE-RUN — operator-only demo run of a «mine» graph (repository recipes only). */
   startRunGraphRun(id: string): Promise<{ id: string; runId: string; demo?: boolean }>;
   getRunGraphRun(id: string, runId: string): Promise<unknown>;
+  /** W9c — owner-only: approve the exact peer-edited version a run refusal named (409 when a newer peer save exists). */
+  approveRunGraph(id: string, version: string): Promise<{ id: string; approved: true; version: string }>;
   cloneRunGraph(id: string, newId: string): Promise<{ id: string; source: 'mine'; editable: true; clonedFrom: string }>;
   getGraphKinds(graph: 'workflow' | 'harness'): Promise<{ kinds: GraphKindEntry[] }>;
   validateGraph(graph: 'workflow' | 'harness', yaml: string): Promise<GraphValidationResponse>;
@@ -173,6 +179,7 @@ export interface NexusClient {
    *  A 422 draft (ok:false) is returned, not thrown, so the canvas can still show it with its issues.
    *  Optional on the interface so hand-rolled test clients need not stub it; `createNexusClient` always has it. */
   graphWizard?(body: GraphWizardRequest, opts?: { signal?: AbortSignal }): Promise<GraphWizardResponse>;
+  getGraphWizardPacks?(): Promise<{ packs: Array<{ id: string; title: string }> }>;
   // ---- workflows (Archon-port T2.3) ----
   getWorkflows(): Promise<{ workflows: WorkflowSummary[] }>;
   getWorkflow(name: string): Promise<WorkflowDetail>;
@@ -365,6 +372,7 @@ export interface GraphWizardRequest {
   /** The canvas as it stands — the wizard edits it instead of starting over. */
   currentYaml?: string;
   history?: Array<{ role: 'user' | 'assistant'; text: string }>;
+  packId?: string;
 }
 
 export interface GraphWizardResponse {
@@ -391,6 +399,13 @@ export interface GraphValidationResponse {
   errors: Array<{ message: string; path?: string }>;
   ignoredKeys: string[];
 }
+
+export interface WizardDraftWire {
+  description: string;
+  connectors?: Array<{ id: string; credentials?: Array<{ name: string }> }>;
+  skill?: { description: string; instructions: string; requires?: string[] };
+}
+export interface WizardPluginWire { name: string; description: string; draft: WizardDraftWire }
 
 export interface MarketPluginWire {
   name: string;
@@ -1329,6 +1344,8 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     saveTemplate: (body) => request('POST', '/v1/nexus/templates', body),
     getPluginsIndex: () => request('GET', '/v1/plugins/index'),
     getInstalledPlugins: () => request('GET', '/v1/plugins'),
+    getWizardPlugins: () => request('GET', '/v1/plugins/wizard'),
+    saveWizardPlugin: (body) => request('POST', '/v1/plugins/wizard', body),
     refreshPluginMarket: (name) => request('POST', `/v1/plugins/markets/${encodeURIComponent(name)}/refresh`, {}),
     installMarketPlugin,
     removeMarketPlugin: (name) => request('DELETE', `/v1/plugins/${encodeURIComponent(name)}`),
@@ -1337,12 +1354,16 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getRunGraphs: () => request('GET', '/v1/graphs'),
     getRunGraph: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}`),
     getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),
+    getRunGraphAccess: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/access`),
+    putRunGraphAccess: (id, recipient, permission) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/access`, { recipient, permission }),
     putRunGraphYaml: (id, yaml, steps) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml, ...(steps && Object.keys(steps).length ? { steps } : {}) }),
     cloneRunGraph: (id, newId) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/clone`, { newId }),
     createRunGraph: (id, yaml, steps) => request('POST', '/v1/graphs', { id, yaml, ...(steps && Object.keys(steps).length ? { steps } : {}) }),
     startRunGraphRun: (id) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/run`),
+    approveRunGraph: (id, version) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/approve`, { version }),
     getRunGraphRun: (id, runId) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`),
     getGraphKinds: (graph) => request('GET', `/v1/graph/kinds?graph=${graph}`),
+    getGraphWizardPacks: () => request('GET', '/v1/graphs/wizard/packs'),
     graphWizard: async (body, opts) => {
       try {
         // The wizard drafts and validates with an LLM (20–60 s) — the 8 s default would cut it off.

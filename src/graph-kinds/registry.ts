@@ -20,13 +20,13 @@ export interface NodeKindEntry {
   run?: NodeKindRun;
 }
 
-export const HARNESS_CORE_KINDS = ['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph'] as const;
+export const HARNESS_CORE_KINDS = ['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph', 'prompt'] as const;
 
 // Workflow validation, the palette, and executor variant labels read the same keys.
 export const WORKFLOW_CORE_KINDS = ['prompt', 'bash', 'skill', 'cft', 'approval', 'if', 'switch', 'iteration', 'classify', 'extract', 'set', 'filter', 'template', 'http', 'showroom', 'task', 'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger', 'subworkflow', 'knowledge'] as const;
 
 const descriptions: Record<GraphKind, readonly string[]> = {
-  harness: ['Run an agent', 'Check an execution gate', 'Perform git operations', 'Judge an outcome', 'Observe a result', 'Request human input', 'Run a child graph'],
+  harness: ['Run an agent', 'Check an execution gate', 'Perform git operations', 'Judge an outcome', 'Observe a result', 'Request human input', 'Run a child graph', 'Run an LLM prompt'],
   workflow: ['Run an LLM prompt', 'Run a shell command', 'Invoke a skill', 'Invoke a CFT method', 'Request approval', 'Branch on a condition', 'Select a case', 'Iterate items', 'Classify input', 'Extract structured data', 'Assign variables', 'Filter items', 'Render a template', 'Make an HTTP request', 'Run a showroom', 'Create a task', 'Start on a schedule', 'Start on a webhook', 'Start on Discord', 'Start on Telegram', 'Start manually', 'Start on chat', 'Call another workflow', 'Search the vault for context'],
 };
 
@@ -93,21 +93,21 @@ export function getNodeKind(graph: GraphKind, kind: string): NodeKindEntry | und
 
 function isNodeKindRun(run: NodeKindRun): boolean {
   if (!run || typeof run !== 'object' || Array.isArray(run)) return false;
-  if ('bash' in run) return typeof run.bash === 'string' && run.bash.trim().length > 0 && !('http' in run) && !('skill' in run) && !('mcp' in run);
+  if ('bash' in run) return typeof run.bash === 'string' && run.bash.trim().length > 0 && !('prompt' in run) && !('http' in run) && !('skill' in run) && !('mcp' in run);
   if ('http' in run) {
-    return !('skill' in run) && !('mcp' in run)
+    return !('prompt' in run) && !('skill' in run) && !('mcp' in run)
       && typeof run.http === 'object' && run.http !== null
       && typeof run.http.method === 'string' && run.http.method.trim().length > 0
       && typeof run.http.url === 'string' && run.http.url.trim().length > 0
       && (run.http.body === undefined || typeof run.http.body === 'string');
   }
-  if ('skill' in run) return !('mcp' in run)
+  if ('skill' in run) return !('prompt' in run) && !('mcp' in run)
     && typeof run.skill === 'object' && run.skill !== null
     && typeof run.skill.name === 'string' && run.skill.name.trim().length > 0
     && (run.skill.prompt === undefined || typeof run.skill.prompt === 'string');
   if ('mcp' in run) {
     const spec = run.mcp;
-    return typeof spec === 'object' && spec !== null && !Array.isArray(spec)
+    return !('prompt' in run) && typeof spec === 'object' && spec !== null && !Array.isArray(spec)
       && typeof spec.server === 'string' && /^[a-z0-9_-]+$/.test(spec.server)
       && typeof spec.tool === 'string' && /^[a-z0-9_-]+$/.test(spec.tool)
       && (spec.args === undefined || (typeof spec.args === 'object' && spec.args !== null && !Array.isArray(spec.args)));

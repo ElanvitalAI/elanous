@@ -136,7 +136,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'work', href: '/trace', label: 'Trace', hint: '렌즈를 좁혀 런을 따라간다 (플릿 → 런 → 판단)', icon: Crosshair, kind: null },
   { group: 'work', href: '/live-run', label: '런 장면', hint: '하니스 런 하나가 도는 장면 — 노드·간선 (라이브 · 리플레이)', icon: GitBranch, kind: null },
   { group: 'make', href: '/term', label: '터미널', hint: '터미널 + agent dock', icon: TerminalSquare, kind: 'term' },
-  { group: 'make', href: '/editor', label: '편집기', hint: '워크플로 · 실행 그래프 작성·편집', icon: GitBranch, kind: null, activeAlso: ['/workflows'] },
+  { group: 'make', href: '/editor', label: '그래프', hint: '그래프 작성·편집 — 작업 노드 · 실행 단계 노드', icon: GitBranch, kind: null, activeAlso: ['/workflows'] },
   { group: 'make', href: '/design-check', label: '디자인', hint: '디자인 시스템 고르기 · 시안 · URL 로 내 시스템', icon: Palette, kind: null },
   { group: 'make', href: '/workspace', label: '여러 탭', hint: '여러 탭 동시 보기', icon: Layers, kind: null, visibility: 'labs' },
   { group: 'files', href: '/vault', label: 'Obsidian 노트', hint: 'Vault — Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen, kind: null },

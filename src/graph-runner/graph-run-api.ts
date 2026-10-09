@@ -11,6 +11,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { jsonResponse } from '../nexus/api/json-response.js';
+import { peerEditRefusalBody, peerEditRunGate } from '../nexus/api/graph-peer-edit.js';
 import { defaultGraphsDir } from '../self-implement/graph-templates.js';
 import { runGraph, type GraphRunState } from './runner.js';
 import { readWizardSteps, wizardRecipesFor } from '../graph-wizard/saved-steps.js';
@@ -143,6 +144,12 @@ export function handleGraphRunStart(rawId: string, deps: GraphRunApiDeps = {}): 
   if (!id) return jsonResponse({ error: 'bad_request', reason: 'invalid graph id' }, 400);
   const mine = findMine(mineDirOf(deps), id);
   if (!mine) return jsonResponse({ error: 'not-found', id, reason: '내 그래프에만 실행이 있다 — 핵심 그래프는 복제해서 돌린다' }, 404);
+  // W9c — a peer «edit» save runs nothing on this machine until the owner approves it. Unreadable marker = refused.
+  const peerGate = peerEditRunGate(mineDirOf(deps), id);
+  if (!peerGate.ok) {
+    debug.log('graphs.run', 'refused-peer-edit', { id, error: peerGate.error }, { level: 'warn' });
+    return jsonResponse(peerEditRefusalBody(id, peerGate), 409);
+  }
   const recipesFile = deps.recipesFile ?? join(defaultGraphsDir(), 'demo', 'editor-recipes.yaml');
   let recipeText: string;
   let allowed: Set<string>;

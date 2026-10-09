@@ -8,7 +8,8 @@
 //    「넣었나」보다 ***「상한이 낮으면 깎이나」***를 먼저 문다.
 import { describe, expect, it } from 'bun:test';
 import {
-  REASONING_CYCLE, effectiveReasoningLevel, mapReasoningLevelToCodex, nextReasoningLevel, reasoningLevelLabel,
+  _claudeSupportsThinkingForContractTest, REASONING_CYCLE, effectiveReasoningLevel,
+  mapReasoningLevelToCodex, modelSupportsReasoning, nextReasoningLevel, reasoningLevelLabel,
 } from './llm.js';
 import { reasoningEffortCeiling } from './intelligence-map/model-catalog.js';
 import { parseReasoningLevel } from './user-config.js';
@@ -16,6 +17,21 @@ import { parseReasoningLevel } from './user-config.js';
 /** 상한이 «정확히 high» 인 모델 하나를 SSOT 에서 고른다 — 이름을 손으로 박지 않는다. */
 const HIGH_CEILING_MODEL = ['claude-opus-5', 'gemini-3.1-pro-preview', 'grok-4.7', 'gpt-5.5']
   .find((m) => reasoningEffortCeiling(m) === 'high');
+
+describe('Claude extended-thinking capability', () => {
+  it('uses numeric Claude generations from 3.7 onward for both capability and default reasoning', () => {
+    for (const model of [
+      'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5',
+      'claude-sonnet-4-5-20250929', 'claude-3-7-sonnet', 'claude-opus-6',
+    ]) {
+      expect(_claudeSupportsThinkingForContractTest(model)).toBe(true);
+      expect(modelSupportsReasoning('anthropic', model)).toBe(true);
+      expect(effectiveReasoningLevel({}, 'anthropic', model)).toBe('high');
+    }
+    expect(_claudeSupportsThinkingForContractTest('claude-3-5-haiku')).toBe(false);
+    expect(modelSupportsReasoning('anthropic', 'claude-3-5-haiku')).toBe(false);
+  });
+});
 
 describe('ReasoningLevel ⊕ xhigh', () => {
   it('⭐ config 파서가 xhigh 를 «받는다» — 지어낸 값은 «안 받는다»', () => {

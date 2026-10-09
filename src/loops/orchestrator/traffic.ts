@@ -50,6 +50,8 @@ function realOrResolved(path: string): string {
 }
 
 const IS_LAUNCH = /(?:^|\s)(?:\S*\/)?elanous\.mjs\s+(?:(?:--test|--config-dir\s+\S+)\s+)?harness\s+(?:ask|say)(?=\s|$)/;
+/** A `harness ask|say` launch command line — the only processes `trafficTick` counts. */
+export const isTrafficLaunch = (command: string): boolean => IS_LAUNCH.test(command);
 
 /** Process-to-seat resolution occurs at the boundary; this decision does no IO. */
 export function trafficTick({ processes, now, caps, lastLaunchAt, idleSince, openCells, nextRound, totalSlots, idleMinutes = 30 }: {

@@ -16,8 +16,9 @@ import { collectMergeIntent, collectSiblingPrIntents, defaultIntentGit, type Int
 
 function deterministicNextMd(git: MergeGitSeam, worktreePath: string, file: string): string | null {
   try {
+    // stage 1 = base, stage 2 = ours (the checked-out run), stage 3 = theirs (the merged-in main) —
+    // the resolver's contract is (base, ours appends only, theirs may drop released lines on dev-bump).
     const resolved = resolveNextMdConflict(git.readIndexStage(worktreePath, 1, file), git.readIndexStage(worktreePath, 2, file), git.readIndexStage(worktreePath, 3, file));
-    void import('../../debug/log.js').then(({ debug }) => debug.log('self-dev.merge', 'next-md-deterministic', { resolved: resolved !== null })).catch(() => {});
     return resolved;
   } catch {
     return null; // a stage is missing (added/deleted on one side) — the usual resolver decides
@@ -58,9 +59,9 @@ export type LlmMergeErrorStep = 'fetch' | 'merge' | 'conflicted-files' | 'commit
 /** git stderr 첫 줄을 관측에 실을 때 쓰는 길이 상한. 구현이 정한다. */
 export const GIT_ERROR_DETAIL_MAX_CHARS = 240;
 
-/** merge 결과. llm-resolved=충돌을 LLM 이 종합 해결·커밋. conflict-unresolved=LLM 도 못 풀어 abort(base 유지). */
+/** merge 결과. llm-resolved=충돌을 LLM 이 종합 해결·커밋. deterministic-resolved=release/next.md 만 결정적 해결기로 커밋(LLM 0). conflict-unresolved=LLM 도 못 풀어 abort(base 유지). */
 export interface LlmMergeOutcome {
-  status: 'merged' | 'up-to-date' | 'llm-resolved' | 'conflict-unresolved' | 'error';
+  status: 'merged' | 'up-to-date' | 'llm-resolved' | 'deterministic-resolved' | 'conflict-unresolved' | 'error';
   resolvedFiles?: string[];
   sizeChange?: LlmMergeSizeChange;
   testDeclarationLoss?: Array<{ file: string; ours: number; theirs: number; merged: number }>;
@@ -118,7 +119,9 @@ function addSizeChange(size: LlmMergeSizeChange, file: string, before: string, a
 }
 
 export function formatLlmMergeOutcome(outcome: LlmMergeOutcome): string {
-  const files = outcome.resolvedFiles?.length ? ` (LLM 종합 ${outcome.resolvedFiles.length}파일: ${outcome.resolvedFiles.join(', ')})` : '';
+  const files = outcome.resolvedFiles?.length
+    ? ` (${outcome.status === 'deterministic-resolved' ? '결정적 해결' : 'LLM 종합'} ${outcome.resolvedFiles.length}파일: ${outcome.resolvedFiles.join(', ')})`
+    : '';
   if (outcome.status === 'conflict-unresolved') {
     // ⛔ reason·failedFile 은 «선택» 칸이다 — 공급자 오류·시험 선언 유실·크기 붕괴 출구는 계약상 reason 이 없다.
     //   있는 칸만 싣고, 그 출구들은 자기 실제 결과(어느 판정이 멈췄나)를 싣는다 — 「사유 undefined」 금지.
@@ -133,7 +136,7 @@ export function formatLlmMergeOutcome(outcome: LlmMergeOutcome): string {
     ];
     return `${outcome.status}${files}${parts.length ? `; ${parts.join(' · ')}` : ''}`;
   }
-  if (outcome.status !== 'llm-resolved') return `${outcome.status}${files}`;
+  if (outcome.status !== 'llm-resolved' && outcome.status !== 'deterministic-resolved') return `${outcome.status}${files}`;
   const size = outcome.sizeChange;
   if (size === undefined) return `${outcome.status}${files}; 규모 변화: 못 쟀다`;
   const delta = size.totalDeltaLines >= 0 ? `+${size.totalDeltaLines}` : `${size.totalDeltaLines}`;
@@ -233,6 +236,8 @@ export async function mergeMainWithLlmResolve(
   const resolvedFiles: string[] = [];
   const sizeChange: LlmMergeSizeChange = { files: [], totalBeforeLines: 0, totalAfterLines: 0, totalDeltaLines: 0 };
   const testDeclarationUnmeasured: string[] = [];
+  let deterministicResolved = 0;
+  let llmResolved = 0;
   const measuredOutcome = <T extends object>(outcome: T): T & Pick<LlmMergeOutcome, 'testDeclarationUnmeasured'> => ({
     ...outcome,
     ...(testDeclarationUnmeasured.length ? { testDeclarationUnmeasured } : {}),
@@ -245,6 +250,7 @@ export async function mergeMainWithLlmResolve(
     const abs = join(worktreePath, f);
     let conflicted: string;
     let merged: string;
+    let resolvedDeterministically = false;
     try {
       conflicted = git.readFile(abs);
     } catch {
@@ -252,9 +258,15 @@ export async function mergeMainWithLlmResolve(
       return unresolved({ status: 'conflict-unresolved', reason: 'conflict-file-unreadable', failedFile: f, resolvedFiles });
     }
     try {
-      // release/next.md: concurrent landings each append a line — keep both without asking the LLM (REL7c).
+      // release/next.md: concurrent landings each append a line — keep both before the LLM sees the file.
       const deterministic = f === NEXT_MD_PATH ? deterministicNextMd(git, worktreePath, f) : null;
-      merged = deterministic ?? await resolve(f, conflicted);
+      if (deterministic !== null) {
+        merged = deterministic;
+        resolvedDeterministically = true;
+        debug.log('self-implement.main-sync', 'next-md-resolved', { deterministic: true });
+      } else {
+        merged = await resolve(f, conflicted);
+      }
     } catch (error) {
       git.abort(worktreePath); // LLM 예외 → base 유지
       return unresolved({ status: 'conflict-unresolved', resolvedFiles, failedFile: f,
@@ -299,11 +311,13 @@ export async function mergeMainWithLlmResolve(
     git.writeFile(abs, merged);
     git.add(worktreePath, f);
     resolvedFiles.push(f);
+    if (resolvedDeterministically) deterministicResolved += 1;
+    else llmResolved += 1;
   }
   const committed = seamOk(git.commit(worktreePath));
   if (!committed.ok) { git.abort(worktreePath); return measuredOutcome(errorOutcome('commit', committed.errorDetail, resolvedFiles)); }
   return measuredOutcome({
-    status: 'llm-resolved',
+    status: llmResolved === 0 && deterministicResolved > 0 ? 'deterministic-resolved' : 'llm-resolved',
     resolvedFiles,
     sizeChange,
   });

@@ -45,6 +45,7 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
 import { applyLaunchOverloadFailover, codexProviderNamed } from '../oauth/overload-failover-launch.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
+import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { queryAbandonedDraftPrs, type AbandonedDraftPr } from '../cli/logs-abandoned-draft-prs.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
 import { decideDraft, type DraftTriagePr } from './draft-triage-rules.js';
@@ -1494,6 +1495,20 @@ export function formatChildLlmInterpretationLine(
   return `[dev] child-llm: entered=${resolution.entered} · resolved=${resolution.resolvedId} · tier=${resolution.tier} · thinking=${resolution.supportsThinking}${tail}`;
 }
 
+/** Only the weekly Grok credits period measures the weekly cap; missing or malformed periods are unmeasured. */
+export function grokWeeklyUsedPctFromUsageJson(stdout: string): number | undefined {
+  try {
+    const parsed = JSON.parse(stdout) as { rows?: Array<{ provider?: string; credits?: { status?: string; periodType?: string | null; usedPercent?: unknown } }> };
+    if (!Array.isArray(parsed.rows)) return undefined;
+    const percents = parsed.rows
+      .filter((row) => row?.provider === 'grok' && row.credits?.status === 'ok'
+        && row.credits.periodType === 'USAGE_PERIOD_TYPE_WEEKLY')
+      .map((row) => row.credits?.usedPercent)
+      .filter((pct): pct is number => typeof pct === 'number' && Number.isFinite(pct) && pct >= 0 && pct <= 100);
+    return percents.length > 0 ? Math.max(...percents) : undefined;
+  } catch { return undefined; }
+}
+
 /** `elanous usage --json` 의 grok 행 → 잔량 판정. 한 행이라도 100% 미만이면 usable, 모두 100% 이상이면 exhausted. */
 export function grokQuotaFromUsageJson(stdout: string): 'usable' | 'exhausted' | 'unknown' {
   try {
@@ -1519,17 +1534,75 @@ export function setLaunchGrokQuotaReaderForTesting(reader: (() => 'usable' | 'ex
   launchGrokQuotaReaderForTesting = reader;
 }
 
+let launchGrokWeeklyReaderForTesting: (() => number | undefined) | undefined;
+export function setLaunchGrokWeeklyReaderForTesting(reader: (() => number | undefined) | undefined): void {
+  launchGrokWeeklyReaderForTesting = reader;
+}
+
+/**
+ * 발사 한 번에 `elanous usage --json`(약 3초) 을 «한 번만» 부른다 — 주간 사용률(재배분)과 잔량(경고)이 같은 출력을 나눈다.
+ * 한 CLI 프로세스 = 한 발사이므로 프로세스 안 60초 캐시로 충분하다(실패 null 도 캐시 — 같은 발사에서 20초 타임아웃을 두 번 물지 않게).
+ */
+let launchUsageJsonCache: { at: number; stdout: string | null } | undefined;
+const LAUNCH_USAGE_CACHE_MS = 60_000;
+export function runLaunchUsageJsonOnce(): string | null {
+  const now = Date.now();
+  if (launchUsageJsonCache && now - launchUsageJsonCache.at < LAUNCH_USAGE_CACHE_MS) return launchUsageJsonCache.stdout;
+  let stdout: string | null = null;
+  try {
+    const cli = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
+    const r = spawnSync(process.execPath, [cli, ...(IN_TEST_PROCESS() || process.env.ELANOUS_TEST_MODE === '1' ? ['--test'] : []), 'usage', '--json'], { encoding: 'utf8', timeout: 20_000 });
+    stdout = r.status === 0 ? r.stdout : null;
+  } catch { stdout = null; }
+  launchUsageJsonCache = { at: now, stdout };
+  return stdout;
+}
+
+/** Launch's weekly percentage comes from the live usage period, not the coarse cached usable flag. */
+export function readGrokWeeklyUsedPctForLaunch(runUsage?: () => string | null): number | undefined {
+  if (launchGrokWeeklyReaderForTesting && !runUsage) return launchGrokWeeklyReaderForTesting();
+  try {
+    const stdout = (runUsage ?? runLaunchUsageJsonOnce)();
+    return stdout ? grokWeeklyUsedPctFromUsageJson(stdout) : undefined;
+  } catch { return undefined; }
+}
+
+export function rebalanceGrokChildForLaunch(
+  child: ChildLlmSelection,
+  cap: number,
+  used: number | undefined,
+  runId?: string,
+  deps: { write?: (line: string) => void; record?: typeof appendRunLedgerEntry } = {},
+): ChildLlmSelection {
+  if (child.provider !== 'grok') return child;
+  const measured = typeof used === 'number' && Number.isFinite(used) && used >= 0 && used <= 100;
+  const rebalanced = measured && used >= cap;
+  const selected = rebalanced
+    ? { ...child, provider: 'openai-codex', model: defaultChildLlmModel('openai-codex'), codexQuotaPolicy: 'credits' as const }
+    : child;
+  const reason = !measured ? '측정 불가' : rebalanced ? `grok 주간 사용률 ${used}% ≥ 상한 ${cap}%` : `grok 주간 사용률 ${used}% < 상한 ${cap}%`;
+  if (rebalanced || !measured) (deps.write ?? ((line) => process.stderr.write(line)))(
+    `[dev] child-llm ${child.provider} → ${selected.provider} · ${reason}\n`,
+  );
+  if (rebalanced || !measured) {
+    const data = { requestedProvider: child.provider, selectedProvider: selected.provider,
+      weeklyUsedPct: measured ? used : null, capPct: cap, reason, selection: child.source };
+    // 실제 전환과 «측정 못 해 그대로 둠» 을 다른 이벤트로 — 관측에서 둘을 섞지 않는다.
+    const event = rebalanced ? 'launch-provider-rebalanced' : 'launch-provider-weekly-unmeasured';
+    debug.log('self-implement', event, { runId: runId ?? null, ...data });
+    if (runId) (deps.record ?? appendRunLedgerEntry)({ timestamp: new Date().toISOString(), runId,
+      event, data: { runId, ...data } });
+  }
+  return selected;
+}
+
 export function readGrokQuotaForLaunch(
   deps: { readCached?: typeof readCachedGrokQuota; runUsage?: () => string | null } = {},
 ): 'usable' | 'exhausted' | 'unknown' {
   if (launchGrokQuotaReaderForTesting && !deps.readCached && !deps.runUsage) return launchGrokQuotaReaderForTesting();
   const cached = (deps.readCached ?? readCachedGrokQuota)();
   if (cached !== 'unknown') return cached;
-  const runUsage = deps.runUsage ?? (() => {
-    const cli = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
-    const r = spawnSync(process.execPath, [cli, 'usage', '--json'], { encoding: 'utf8', timeout: 20_000 });
-    return r.status === 0 ? r.stdout : null;
-  });
+  const runUsage = deps.runUsage ?? runLaunchUsageJsonOnce;
   let stdout: string | null = null;
   try { stdout = runUsage(); } catch { stdout = null; }
   return stdout ? grokQuotaFromUsageJson(stdout) : 'unknown';
@@ -1851,6 +1924,7 @@ export function buildDriveAliasDevSpec(
   command: string | undefined,
   opts: DevCliOpts,
   explicitOptionNames?: readonly string[],
+  runId?: string,
 ): DevPipelineSpec {
   if (opts.elanous === true) {
     throw new DevPipelineError('drive: --elanous 는 지원하지 않음 — TUI target은 elanous dev --elanous 를 사용');
@@ -1861,7 +1935,7 @@ export function buildDriveAliasDevSpec(
   if (!opts.goal?.trim()) {
     throw new DevPipelineError('drive: --goal 필요');
   }
-  const spec = buildDevCliSpec({ text: command.trim() }, { kind: 'self' }, opts, explicitOptionNames, 'cli-drive');
+  const spec = buildDevCliSpec({ text: command.trim() }, { kind: 'self' }, opts, explicitOptionNames, 'cli-drive', undefined, undefined, runId);
   return { ...spec, completion: 'worktree-only', autoReview: false };
 }
 
@@ -1872,6 +1946,9 @@ export function buildDevCliSpec(
   explicitOptionNames?: readonly string[],
   entrance: EntranceId = 'cli-dev-ask',
   readGrokQuota: typeof readCachedGrokQuota = readGrokQuotaForLaunch,
+  readGrokWeekly: () => number | undefined = readGrokWeeklyUsedPctForLaunch,
+  runId?: string,
+  recordLaunch?: typeof appendRunLedgerEntry,
 ): DevPipelineSpec {
   if (opts.plan === true) {
     throw new DevPipelineError(`--plan 은 은퇴했고 명시적으로 거부됨 · 대응 문: ${DEV_PLAN_REPLACEMENT}`);
@@ -2016,8 +2093,13 @@ export function buildDevCliSpec(
   }
 
   if (path === 'self-mission') {
-    const builtChild = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
-    const childLlm = applyLaunchOverloadFailover(builtChild, {
+    const requestedChildLlm = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
+    // 주간 상한 재배분(grok → codex)을 먼저, 과부하 페일오버(codex → grok)를 그 뒤에 — 과부하는 «지금 실패 중»이라 더 강한 신호다.
+    const capped = requestedChildLlm?.provider === 'grok'
+      ? rebalanceGrokChildForLaunch(requestedChildLlm, getUserConfig().llm.grokWeeklyCapPct ?? 80, readGrokWeekly(), runId,
+        recordLaunch ? { record: recordLaunch } : {})
+      : requestedChildLlm;
+    const childLlm = applyLaunchOverloadFailover(capped, {
       provider: opts.childLlmProvider,
       model: opts.childLlmModel,
       codexPinned: childLlmCodexPinned(opts.childLlmProvider),
