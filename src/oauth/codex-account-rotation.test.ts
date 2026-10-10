@@ -13,9 +13,15 @@ describe('일별 선불 크레딧 페이스', () => {
   const current = { name: 'third', storeKey: 'k-third', home: '/h/third', source: 'default' } as const;
   const team = { name: 'team', storeKey: 'k-team', home: '/h/team', reached: true, usedPercent: 100, creditBalance: 65_833, hasCredits: true };
   const base = { current, explicit: false, enabled: true, currentReached: false, currentUsedPercent: 90, resetCreditAvailability: 'unavailable', candidates: [team] } as const;
+  // CODEX-ORDER(10-09): 구독 → 리셋권 → 크레딧. 페이스는 «구독 남은 계정도 리셋권도 없을 때»만 본다.
+  const exhausted = { ...base, currentReached: true, currentUsedPercent: 100 } as const;
   test('찬 team 구독의 크레딧을 미달 몫만큼 먼저 쓰고, 몫이 차면 기존 판정으로 돌아간다', () => {
-    expect(decideCodexRotation({ ...base, creditPace: { active: true } }).reason).toBe('credit-pace');
-    expect(decideCodexRotation({ ...base, creditPace: { active: true } }).to?.name).toBe('team');
+    expect(decideCodexRotation({ ...exhausted, creditPace: { active: true } }).reason).toBe('credit-pace');
+    expect(decideCodexRotation({ ...exhausted, creditPace: { active: true } }).to?.name).toBe('team');
+    // 순서 ① 구독이 남아 있으면 페이스가 켜져도 구독에 머문다.
+    expect(decideCodexRotation({ ...base, creditPace: { active: true } }).reason).toBe('not-reached');
+    // 순서 ② 리셋권이 있으면 페이스(크레딧)보다 먼저다.
+    expect(decideCodexRotation({ ...exhausted, resetCreditAvailability: 'available', creditPace: { active: true } }).reason).toBe('reset-credit-available');
     expect(decideFallback({ rotation: { reason: 'credit-pace', to: team }, chain: ['codex-rotate', 'grok'], grokAvailable: true }))
       .toEqual({ action: 'codex-rotate', to: team });
     expect(decideFallback({ rotation: { reason: 'credit-pace' }, chain: ['codex-rotate', 'grok'], grokAvailable: true }))
@@ -30,9 +36,15 @@ describe('일별 선불 크레딧 페이스', () => {
   });
   test('잔액 많은 찬 계정을 선택하고 명시/비활성 설정은 페이스보다 우선한다', () => {
     const alternatives = [team, { ...team, name: 'backup', storeKey: 'k-backup', creditBalance: 90_000 }];
-    expect(decideCodexRotation({ ...base, candidates: alternatives, creditPace: { active: true } }).to?.name).toBe('backup');
+    expect(decideCodexRotation({ ...exhausted, candidates: alternatives, creditPace: { active: true } }).to?.name).toBe('backup');
     expect(decideCodexRotation({ ...base, candidates: alternatives, explicit: true, creditPace: { active: true } }).reason).toBe('explicit');
     expect(decideCodexRotation({ ...base, candidates: alternatives, enabled: false, creditPace: { active: true } }).reason).toBe('disabled');
+  });
+  test('순서 ① — 페이스가 켜져도 구독이 남은 다른 계정이 있으면 그 계정으로 회전한다(rotated)', () => {
+    const fresh = { name: 'fresh', storeKey: 'k-fresh', home: '/h/fresh', reached: false, usedPercent: 10, creditBalance: 0, hasCredits: false };
+    const d = decideCodexRotation({ ...exhausted, candidates: [team, fresh], creditPace: { active: true } });
+    expect(d.reason).toBe('rotated');
+    expect(d.to?.name).toBe('fresh');
   });
   test('현재 계정이 찬 구독이며 크레딧을 보유하면 그 자리에 머문다', () => {
     expect(decideCodexRotation({ ...base, currentReached: true, currentUsedPercent: 100, currentCreditBalance: 10, currentHasCredits: true, creditPace: { active: true } }).reason).toBe('credit-pace');
@@ -56,7 +68,7 @@ test('policy + ledger + quota signal feed both inspection and runtime rotation',
       mkdirSync(homes[name]!, { recursive: true });
       saveTokens(`openai-codex:${name}`, { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: homes[name] }, storePath);
     }
-    writeQuotaSignal(undefined, 90, homes.third, undefined, { balance: 0, hasCredits: false });
+    writeQuotaSignal(undefined, 100, homes.third, undefined, { balance: 0, hasCredits: false }); // CODEX-ORDER: 구독이 찬 뒤에만 페이스
     writeQuotaSignal(undefined, 100, homes.team, undefined, { balance: 65_833, hasCredits: true });
     recordCreditBalances({ team: 65_833 }, new Date());
     _setCodexAccountOutboundSenderForTesting(() => true);
@@ -68,8 +80,8 @@ test('policy + ledger + quota signal feed both inspection and runtime rotation',
     expect(resolveCodexAccountForRun(env, { storePath }).name).toBe('team');
     recordCreditBalances({ team: 62_000 }, new Date());
     writeQuotaSignal(undefined, 100, homes.team, undefined, { balance: 62_000, hasCredits: true });
-    expect(inspectCodexRotation(env, { storePath }).reason).toBe('reset-credit-unknown');
-    expect(resolveCodexAccountForRun(env, { storePath }).name).toBe('third');
+    expect(inspectCodexRotation(env, { storePath }).reason).toBe('no-candidate'); // 둘 다 찬 구독 · 페이스 몫 참 → 머문다
+    expect(resolveCodexAccountForRun(env, { storePath }).name).not.toBe('team'); // 페이스 몫이 차면 team 크레딧으로 안 간다
   } finally {
     _setCodexAccountOutboundSenderForTesting(null);
     resetElanousConfigDir();

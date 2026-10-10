@@ -13,6 +13,7 @@
 import type { RunSupervisor, ControlDecision, ControlObservation } from './pty-control-loop.js';
 import { formatStallContext } from './stall-context.js';
 import type { LLMMessage } from '../llm.js';
+import type { LLMProviderName, ReasoningLevel } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';
@@ -30,6 +31,9 @@ export interface LlmControlBrainOpts {
   /** LLM 스트림(미주입 시 실제 streamLLM lazy-import). */
   readonly stream?: StreamLLMFn;
   readonly model?: string;
+  readonly provider?: LLMProviderName;
+  /** Per-brain tier reasoning; applied to provider construction without changing global config. */
+  readonly reasoningLevel?: ReasoningLevel;
   readonly maxTokens?: number;
   readonly temperature?: number;
   /** 스텝당 LLM 호출 상한(ms). 초과 시 wait(fail-soft) — provider 멈춰도 루프의 stuck/budget/
@@ -134,7 +138,15 @@ export function createLlmControlBrain(opts: LlmControlBrainOpts): RunSupervisor 
   };
   // lazy — 테스트가 stream 주입 시 llm.js 로드 안 함.
   const stream: StreamLLMFn = opts.stream
-    ?? (async (m, cb, o) => (await import('../llm.js')).streamLLM(m, cb, o ?? {}));
+    ?? (async (m, cb, o) => {
+      const llm = await import('../llm.js');
+      const config = opts.provider ? (await import('../user-config.js')).getUserConfig() : undefined;
+      const provider = config && opts.provider
+        ? llm.getProviderForConfig({ ...config, llm: { ...config.llm, provider: opts.provider, model: opts.model ?? config.llm.model,
+            ...(opts.reasoningLevel ? { reasoningLevel: opts.reasoningLevel, codexReasoning: undefined } : {}) } }, opts.model)
+        : undefined;
+      return llm.streamLLM(m, cb, { ...o, ...(provider ? { initialProvider: provider } : {}) });
+    });
 
   return {
     async decide(obs: ControlObservation, externalSignal?: AbortSignal): Promise<ControlDecision> {

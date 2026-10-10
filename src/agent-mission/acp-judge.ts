@@ -17,7 +17,12 @@ type AcpAgentManagerPort = {
 };
 
 export type JudgeVerdict = 'merge' | 'rework' | 'reject' | 'ambiguous';
-export interface AcpJudgeResult { verdict: JudgeVerdict; asks: string[]; reason: string; raw: string; }
+export interface AcpJudgeResult {
+  verdict: JudgeVerdict; asks: string[]; reason: string; raw: string;
+  /** TA-LAND-MUSTFIX-ZERO — 심판 JSON 의 asks 가 없거나 배열이 아니거나 문자열 아닌 원소가 섞였다(`asks` 는 소비처 호환으로 `[]`·걸러진 값).
+   *  ⛔ 이때 `asks: []` 는 «남은 지적 0» 이 아니라 «모름» — 자동 병합 관문이 `review-must-fix-unknown` 으로 막는다. */
+  asksUnreadable?: true;
+}
 
 /** ACP 최종심판에 전달하는 PR diff의 기본 문자 상한. */
 export const DEFAULT_JUDGE_DIFF_CHAR_LIMIT = 24_000;
@@ -94,7 +99,8 @@ export function parseJudge(raw: string): AcpJudgeResult {
     const d = JSON.parse(json) as { verdict?: string; asks?: unknown; reason?: string };
     const verdict = (['merge', 'rework', 'reject', 'ambiguous'] as const).includes(d.verdict as JudgeVerdict) ? (d.verdict as JudgeVerdict) : 'ambiguous';
     const asks = Array.isArray(d.asks) ? d.asks.filter((x): x is string => typeof x === 'string') : [];
-    return { verdict, asks, reason: typeof d.reason === 'string' ? d.reason : '', raw };
+    const asksUnreadable = !Array.isArray(d.asks) || asks.length !== d.asks.length;
+    return { verdict, asks, reason: typeof d.reason === 'string' ? d.reason : '', raw, ...(asksUnreadable ? { asksUnreadable: true as const } : {}) };
   } catch { return { verdict: 'ambiguous', asks: [], reason: 'json-parse-fail', raw }; }
 }
 

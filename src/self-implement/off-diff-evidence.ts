@@ -416,6 +416,15 @@ export function renderRequiredEvidencePrompt(items: readonly RequiredEvidenceIte
   ];
 }
 
+/** 안 덮인 필수 증거만 자식에게 재요청한다. 판정은 coverRequiredEvidence의 태그 동등 규칙을 따른다. */
+export function formatUncoveredEvidenceFeedback(uncovered: readonly string[]): string {
+  return [
+    `필수 증거가 아직 안 덮였습니다: ${uncovered.map((tag) => `[${tag}]`).join(', ')}`,
+    ...uncovered.map((tag) => `- [${tag}]에 쓸 줄 꼴:\n  EVIDENCE: [${tag}] <확인한 내용> || <재현 명령>\n  RESULT: <그 명령의 실제 결과>`),
+    '확인한 결과만 보고하고, git/PR 조작은 하지 마라.',
+  ].join('\n');
+}
+
 /** 요구 ↔ 자식이 남긴 증거의 **태그 동등** 대조. ⛔ 문면 해석 금지.
  * 선언 덮임은 별도 값이다. 기존 `covered`/`missing`은 실제 증거 태그 기준으로 보존한다. */
 export function coverRequiredEvidence(

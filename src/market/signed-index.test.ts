@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { generateIndexKeyPair, signIndex, verifyIndex, type MarketplaceIndex } from './signed-index';
+import { generateIndexKeyPair, signIndex, validateMarketplaceIndex, verifyIndex, type MarketplaceIndex } from './signed-index';
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 const validIndex = {
@@ -91,6 +91,69 @@ describe('signed marketplace index', () => {
     const index = structuredClone(validIndex);
     const paidIndex: MarketplaceIndex = { ...index, plugins: [{ ...index.plugins[0]!, source: { source: 'elanous', id: 'video-broll', version: '0.1.0' }, 'ai.elanous': { ...index.plugins[0]!['ai.elanous'], pricing: { model: 'one-time' } } }] };
     expect(verifyIndex(fixture(paidIndex))).toMatchObject({ ok: true, sequence: 42 });
+  });
+
+  test('accepts signed public and enterprise-scoped knowledge packs and loop bundles alongside plugins', () => {
+    const index: MarketplaceIndex = {
+      ...structuredClone(validIndex),
+      plugins: structuredClone(validIndex.plugins) as MarketplaceIndex['plugins'],
+      knowledgePacks: [
+        { name: 'open-process', version: '1.0.0', visibility: 'public', artifact: { sha256: 'b'.repeat(64), bytes: 12, key: 'open-process/1.0.0/archive.tgz' } },
+        { name: 'sales', version: '2.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'c'.repeat(64), bytes: 34, key: 'sales/2.0.0/archive.tgz' } },
+      ],
+      loopBundles: [
+        { name: 'sales-loop', version: '2.0.0', visibility: 'internal', enterpriseId: 'tenant-a', graphs: ['graphs/sales.yaml'], artifact: { sha256: 'd'.repeat(64), bytes: 56, key: 'sales-loop/2.0.0/archive.tgz' } },
+        { name: 'open-loop', version: '1.0.0', visibility: 'public', artifact: { sha256: 'e'.repeat(64), bytes: 78, key: 'open-loop/1.0.0/archive.tgz' } },
+      ],
+    };
+    expect(validateMarketplaceIndex(index)).toBeNull();
+    const signed = fixture(index);
+    expect(verifyIndex({ ...signed, lastSequence: 42 })).toMatchObject({ ok: true, index });
+    expect(verifyIndex({ ...signed, lastSequence: 43 })).toMatchObject({ ok: false, reason: 'sequence-rollback' });
+    const changed = bytes(JSON.stringify({ ...index, knowledgePacks: [] }));
+    expect(verifyIndex({ ...signed, marketplaceBytes: changed })).toMatchObject({ ok: false, reason: 'bad-signature' });
+  });
+
+  test('rejects signed scoped entries with an empty artifact key', () => {
+    for (const collection of ['knowledgePacks', 'loopBundles'] as const) {
+      for (const key of ['', '   ']) {
+        const entry = {
+          name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a',
+          artifact: { sha256: 'b'.repeat(64), bytes: 12, key },
+        };
+        const index = { ...structuredClone(validIndex), [collection]: [entry] };
+        const expected = `${collection}[0] (sales).artifact.key: expected non-empty string`;
+        expect(validateMarketplaceIndex(index)).toBe(expected);
+        expect(verifyIndex(fixture(index))).toMatchObject({
+          ok: false, reason: 'malformed', detail: `marketplace.json.${expected}`,
+        });
+      }
+    }
+  });
+
+  test('rejects signed malformed scoped entries with a named field', () => {
+    const base = { ...structuredClone(validIndex), knowledgePacks: [{ name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'b'.repeat(64), bytes: 12, key: 'sales/1.0.0/archive.tgz' } }] };
+    const cases: Array<[string, unknown]> = [
+      ['enterpriseId', { ...base.knowledgePacks[0], enterpriseId: undefined }],
+      ['enterpriseId', { ...base.knowledgePacks[0], visibility: 'public' }],
+      ['visibility', { ...base.knowledgePacks[0], visibility: 'private' }],
+      ['artifact.sha256', { ...base.knowledgePacks[0], artifact: { ...base.knowledgePacks[0]!.artifact, sha256: 'short' } }],
+      ['artifact.bytes', { ...base.knowledgePacks[0], artifact: { ...base.knowledgePacks[0]!.artifact, bytes: -1 } }],
+    ];
+    for (const [field, entry] of cases) {
+      const result = verifyIndex(fixture({ ...base, knowledgePacks: [entry] }));
+      expect(result).toMatchObject({ ok: false, reason: 'malformed' });
+      if (!result.ok) expect(result.detail).toContain(`knowledgePacks[0] (sales).${field}`);
+    }
+    const invalidBundle = { ...base, loopBundles: [{ ...base.knowledgePacks[0], graphs: [42] }] };
+    const result = verifyIndex(fixture(invalidBundle));
+    expect(result).toMatchObject({ ok: false, reason: 'malformed' });
+    if (!result.ok) expect(result.detail).toContain('loopBundles[0] (sales).graphs');
+    expect(validateMarketplaceIndex({ ...base, knowledgePacks: {} })).toBe('knowledgePacks: expected array');
+    expect(validateMarketplaceIndex({ ...base, loopBundles: {} })).toBe('loopBundles: expected array');
+    const unscopedBundle = verifyIndex(fixture({ ...base, loopBundles: [{ ...base.knowledgePacks[0], enterpriseId: undefined }] }));
+    expect(unscopedBundle).toMatchObject({ ok: false, reason: 'malformed' });
+    if (!unscopedBundle.ok) expect(unscopedBundle.detail).toContain('loopBundles[0] (sales).enterpriseId');
   });
 
   test('rejects invalid signature envelope and raw-key lengths', () => {

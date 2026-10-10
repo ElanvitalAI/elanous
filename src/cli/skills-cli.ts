@@ -75,15 +75,24 @@ export function registerConnectCommand(program: Command): void {
 export function registerSkillsCommands(program: Command): void {
   const skills = program.command('skills').description('Check, install and repair skills');
   skills.command('install <pack>')
-    .description('Install a gift skill pack from a code')
+    .description('Install a gift skill pack from a code or a signed knowledge pack from a configured market')
     .option('--code <code>', 'Gift code')
     .option('--email <address>', 'Email for gift delivery')
     .option('--agree', 'Agree to email collection and retention')
     .option('--endpoint <url>', 'Gift API origin (overrides skills.giftEndpoint)')
+    .option('--market <name>', 'Install a signed knowledge pack from a configured market instead of redeeming a gift')
+    .option('--enterprise <id>', 'Authorized enterprise for an internal knowledge market')
     .option('--json', 'Print the install result as JSON')
-    .action(async (pack: string, opts: { code?: string; email?: string; agree?: boolean; endpoint?: string; json?: boolean }) => {
+    .action(async (pack: string, opts: { code?: string; email?: string; agree?: boolean; endpoint?: string; market?: string; enterprise?: string; json?: boolean }) => {
       const { getUserConfig } = await import('../user-config.js');
-      const { installGiftPack } = await import('../skills/gift-install.js');
+      const { installGiftPack, installMarketKnowledgePack } = await import('../skills/gift-install.js');
+      if (opts.market) {
+        const result = await installMarketKnowledgePack({ pack, market: opts.market, enterpriseId: opts.enterprise });
+        if (opts.json) console.log(JSON.stringify(result));
+        else console.log(result.ok ? `설치한 지식 팩: ${result.packId}` : `지식 팩 설치 실패: ${result.reason}`);
+        if (!result.ok) process.exitCode = 1;
+        return;
+      }
       const result = await installGiftPack({ pack, code: opts.code, email: opts.email, agree: opts.agree,
         endpoint: opts.endpoint ?? getUserConfig().skills.giftEndpoint });
       if (opts.json) console.log(JSON.stringify(result));

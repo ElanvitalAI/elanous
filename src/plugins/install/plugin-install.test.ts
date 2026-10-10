@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dlopen, FFIType } from 'bun:ffi';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { installPlugin, listInstalledPlugins, removePlugin, resolvePluginSource, withLedgerLock } from './plugin-install.js';
+import { installPlugin, listInstalledPlugins, removePlugin, resolvePluginSource, withLedgerLock, type InstallEvent } from './plugin-install.js';
 import { addMarket } from './market-fetch.js';
 import { getNodeKind, registerNodeKind, unregisterPluginNodeKind, getNodeKindRegistration } from '../../graph-kinds/registry.js';
 
@@ -166,6 +166,38 @@ describe('plugin installation', () => {
     delete manifest.extensions['ai.elanous'].researchDraft;
     writeFileSync(manifestPath, JSON.stringify(manifest));
     expect((await installPlugin(pkg, { root, yes: true })).name).toBe('sample-plugin');
+  });
+
+  test('imported JSON knowledge secret fails installation with a dangerous scan and no secret output', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'source'));
+    const secret = 'superlongprivatevalue123456';
+    mkdirSync(join(pkg, 'knowledge'));
+    writeFileSync(join(pkg, 'knowledge', 'private.json'), JSON.stringify({ apiKey: secret }));
+    const events: InstallEvent[] = [];
+    let failure: unknown;
+    try { await installPlugin(pkg, { root, yes: true, onEvent: event => events.push(event) }); }
+    catch (error) { failure = error; }
+    expect(failure).toMatchObject({ reason: 'scan' });
+    expect(events.find(event => event.event === 'verify')).toMatchObject({ event: 'verify', scan: 'dangerous' });
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(String(failure)).not.toContain(secret);
+    expect(listInstalledPlugins(root)).toEqual([]);
+  });
+
+  test('installed bytes are compared to the staged security digest before ledger commit', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'source'));
+    const secret = 'SECRET=superlongprivatevalue123456';
+    await expect(installPlugin(pkg, { root, yes: true, onEvent: event => {
+      if (event.event === 'registered') {
+        const stageRoot = join(root, 'plugins', '.staging');
+        const stage = readdirSync(stageRoot)[0]!;
+        writeFileSync(join(stageRoot, stage, 'package', 'plugin.ts'), `// ${secret}\nexport default {};`);
+      }
+    } })).rejects.toMatchObject({ reason: 'scan', message: 'plugin package integrity changed during installation' });
+    expect(listInstalledPlugins(root)).toEqual([]);
+    expect(existsSync(join(root, 'plugins', 'local', 'sample-plugin', '1.2.3'))).toBe(false);
   });
 
   test('denied consent, duplicate name and symlink never install an artifact', async () => {

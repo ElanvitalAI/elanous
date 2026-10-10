@@ -112,3 +112,18 @@ describe('BACKLOG C7 — OpenRouter reported cost', () => {
     expect(parseOpenAIUsage({ usage: { prompt_tokens: 10, completion_tokens: 2 } })!.reportedCostUsd).toBeUndefined();
   });
 });
+
+describe('parseOpenAIUsage — OpenRouter cache writes (OR-ANTHROPIC-CACHE)', () => {
+  test('prompt_tokens_details.cache_write_tokens → cacheCreationInputTokens, removed from new input', () => {
+    const ev = { usage: { prompt_tokens: 5000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 3000, cache_write_tokens: 1500 } } };
+    expect(parseOpenAIUsage(ev)).toEqual({
+      provider: 'openai', inputTokens: 500, outputTokens: 10, cacheReadInputTokens: 3000, cacheCreationInputTokens: 1500,
+    });
+  });
+  test('first turn: write only (no read yet) → read 0, creation = writes', () => {
+    const ev = { usage: { prompt_tokens: 4000, completion_tokens: 5, prompt_tokens_details: { cache_write_tokens: 3500 } } };
+    expect(parseOpenAIUsage(ev)).toEqual({
+      provider: 'openai', inputTokens: 500, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 3500,
+    });
+  });
+});

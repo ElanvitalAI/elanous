@@ -27,7 +27,7 @@
 // crashed wizard cannot corrupt an existing file. Mode 0600 when the
 // telegram bot token is present.
 
-import { DRAFT_ON_STOP_MODES, parseDraftOnStopMode, type DraftOnStopMode } from './self-implement/blocked-draft-policy.js';
+import { DRAFT_ON_STOP_MODES, parseDraftOnStopMode, type DraftOnStopMode } from './self-implement/draft-on-stop-mode.js';
 import { isCodexQuotaPolicy } from './oauth/codex-quota-policy.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
 import {
@@ -47,7 +47,8 @@ import {
   QWEN_MODEL,
   GLM_MODEL,
 } from './config.js';
-import type { SkillTier } from './skills/runner.js';
+import type { SkillTier } from './skills/skill-tier.js';
+import type { RubricAxis } from './release-loop/rubric-types.js';
 import { sharedAgentSkillRoots } from './skills/shared-agent-skill-roots.js';
 import {
   isModelTier,
@@ -58,6 +59,7 @@ import {
   type SmartDefaultsUserConfig,
 } from './model-tier/types.js';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
+import { BEDROCK_DEFAULT_MODEL } from './llm/bedrock.js';
 import { userConfigPath as nexusUserConfigPath } from './nexus/config/paths.js';
 import { type StreamingMode, isStreamingMode } from './session/streaming/stream-compositor.js';
 import type { DevRequestRoutingConfig } from './skills/dev-request-router.js';
@@ -65,6 +67,7 @@ import type { UrlRoutingConfig } from './skills/url-router.js';
 import { migrateLegacyXdgUserConfig } from './storage/legacy-elanous-config-migrate.js';
 import { withFileLockSync } from './storage/file-lock.js';
 import { debug } from './debug/log.js';
+import { setConfigTimeZoneSource } from './time/format.js';
 import type { FoldMode } from './log-entry.js';
 import {
   CLAUDE_PACKAGE_MISSING,
@@ -138,18 +141,20 @@ export type LLMProviderName =
   // entries name the *cloud* surface only.
   | 'kimi' | 'qwen' | 'glm'
   // 대표 2026-09-23 — OpenAI 호환 게이트웨이. kimi·qwen·glm 의 «첫 실제 경로»(모델 id `openrouter/<vendor>/<model>`).
-  | 'openrouter';
+  | 'openrouter'
+  // 대표 2026-10-10 (BEDROCK-PROVIDER) — AWS Bedrock 의 Claude. 자격 = AWS 기본 자격 체인 · 명시 선택 전용(auto·폴백 후보 아님).
+  | 'bedrock';
 
 /** Stored config retains its established provider normalization contract. */
 // ⛔ 2026-09-23 — 손으로 적은 목록이라 새 provider 를 «조용히» 거른다: `openrouter` 를 배선(#19900)했는데
 //   여기 없어서 config 로 고르면 정규화가 `auto` 로 떨궜다(「직렬화 드롭」). 자 = `test/llm-provider-name-lists.test.ts`.
 export const CONFIG_LLM_PROVIDER_NAMES: readonly LLMProviderName[] = [
-  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'openrouter',
+  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'openrouter', 'bedrock',
 ];
 
 /** `ELANOUS_LLM_PROVIDER` additionally permits every declared runtime provider. */
 export const RUNTIME_LLM_PROVIDER_NAMES: readonly LLMProviderName[] = [
-  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'kimi', 'qwen', 'glm', 'openrouter',
+  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'kimi', 'qwen', 'glm', 'openrouter', 'bedrock',
 ];
 
 /** Provider-agnostic reasoning intensity. The HUD click cycle and the
@@ -173,6 +178,10 @@ export interface LLMConfig {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  /** OpenRouter 설정 한 곳(두 골이 같은 키를 쓴다):
+   *  - `providerPreferences` — 상류 라우팅 선호; 도구 가능 기본값(require_parameters·allow_fallbacks)을 얕게 덮는다(OR-LLM-ROUTING-1).
+   *  - `fallbackModel` — 유료 OpenRouter 폴백 모델; 체인에 openrouter 를 명시하고 모델·키를 모두 줄 때만 선택된다(OR-FALLBACK-TIER-1). */
+  openrouter?: { providerPreferences?: Record<string, unknown>; fallbackModel?: string };
   /** Ordered rotation of providers the user can cycle through with
    *  `elanous provider:rotate` / `/provider next`. Each entry is a
    *  full (provider, model, apiKey, baseUrl) tuple that gets
@@ -186,7 +195,7 @@ export interface LLMConfig {
    *  ⛔ **기본 ON** (대표 결정 2026-08-05) — `false` 일 때만 꺼진다.
    *  ⛔ 이것은 provider 회전(`rotation`)과 «다른 축»이다: 저 축은 provider·모델을 바꾸고,
    *    이 축은 «같은 provider 안에서 어느 계정의 토큰을 쓸지»를 바꾼다.
-   *  ⛔ 리셋 크레딧 «소비»는 여기에 «없다» — 되돌릴 수 없어 사람이 명시적으로 한다. */
+   *  리셋 크레딧 자동 소비는 별도 일일 상한으로 제한한다. */
   codexAccountRotation?: boolean;
   /** ⭐⭐ codex 계정 «알림» — 회전·리셋크레딧 소비를 텔레그램 등 outbound 로 보낼지.
    *  ⛔ **기본 ON** — `false` 일 때만 조용해진다.
@@ -206,6 +215,8 @@ export interface LLMConfig {
    *  🩸 2026-09-24(대표): 「third 부터 소진하고 그다음 team」 — 이름순(default<new<third)으론 못 만든다.
    *  ⛔ 여기 없는 계정은 버리지 않는다 — 뒤로 가서 이름순으로 붙는다. */
   codexAccountOrder?: string[];
+  /** Automatic reset-credit uses across all Codex accounts per UTC day; default 1, 0 disables. */
+  codexResetAutoConsumePerDay?: number;
   /** 대표 2026-09-28 «크레딧 사용 허가» — 주간 한도가 찬 codex 계정도 «선불 크레딧으로 계속» 쓴다(서버가 한도 소진 시 크레딧으로 넘긴다).
    *  켜면 회전이 «후보 없음»(→ grok 폴백) 대신 지금 계정에 머물고, Pod 배분도 찬 계정을 사용률 낮은 순으로 쓴다.
    *  순서는 여전히 «구독 잔량이 남은 계정 먼저». 기본 꺼짐(크레딧은 돈이다). */
@@ -218,7 +229,8 @@ export interface LLMConfig {
   grokWeeklyCapPct?: number;
   /** ⭐⭐ codex 가 «소진된 뒤» 갈 곳을 «순서»로 정한다 (대표 2026-08-13).
    *
-   *  값: `['codex-rotate', 'grok']` — 아는 칸은 그 둘뿐이고, 모르는 이름은 버린다(관측에 남는다).
+   *  값: `['codex-rotate', 'grok']` 등 — 아는 칸은 `FALLBACK_STEPS`, 모르는 이름은 버린다(관측에 남는다).
+   *  `openrouter` 는 명시적 체인·`llm.openrouter.fallbackModel`·API 키가 모두 있어야 한다(유료).
    *  ⛔ **미설정이면 `DEFAULT_FALLBACK_CHAIN`(`src/oauth/fallback-chain.ts`) = `['codex-rotate','grok']`** — 설정이 없어도 grok 으로 샌다(#10575).
    *    막으려면 `['codex-rotate']` 를 «명시»한다. 이 인스턴스의 값은 `elanous config get llm.fallbackChain` 으로 잰다.
    *
@@ -1306,13 +1318,15 @@ export interface LogsConfig {
     maxAgeDays: number;
     /** DB 크기 상한 MB(기본 500). 초과 시 오래된 행부터 삭제. 0 = 무제한. */
     maxDbMb: number;
+    /** 크기 정리 보존 하한 시간(기본 24). 이 시간 안의 행은 크기 정리로 지우지 않는다. 0 = 하한 없음(옛 동작). */
+    minRetainHours: number;
   };
   /** 로그 출처 이름 오버라이드 (LF7-a). 미설정 시 자동 유도 —
    *  prod(기본) 또는 `test:<repo폴더명>` (ELANOUS_STATE_DIR 기준). */
   instanceName?: string;
 }
 
-const LOGS_DEFAULTS: LogsConfig = { retention: { maxAgeDays: 7, maxDbMb: 500 } };
+const LOGS_DEFAULTS: LogsConfig = { retention: { maxAgeDays: 7, maxDbMb: 500, minRetainHours: 24 } };
 
 // ── Shell / PTY ──────────────────────────────────────────────────────
 // Gate for exposing PtyShell* native tools to the dashboard chat loop.
@@ -3315,6 +3329,7 @@ export interface RoleLlmSpec {
   provider?: LLMProviderName;
   tier?: ModelTier;
   model?: string;
+  effort?: 'low' | 'medium' | 'high';
 }
 
 /** Reviewer-only ACP subscription selection; it is not a streaming LLM provider. */
@@ -3396,7 +3411,10 @@ export const ROLE_MODEL_DEFAULTS: Record<ModelRole, { environment: string; tier:
 export function resolveActiveProvider(config: UserConfig): LLMProviderName {
   if (config.llm.provider !== 'auto') return config.llm.provider;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { decideProviderForConfig, getProvider } = require('./llm.js') as typeof import('./llm.js');
+  const { decideProviderForConfig, getProvider } = require('./llm.js') as {
+    decideProviderForConfig: (config: UserConfig) => { provider: LLMProviderName | `auto:${string}` };
+    getProvider: () => { name: string };
+  };
   // ⭐ 2026-09-24 — 런타임이 실제로 보내는 곳과 같은 결정을 쓴다(종전 `getProvider()` 는 auto 에서 codex 를 건너뛰었다).
   const decided = decideProviderForConfig(config).provider;
   if (typeof decided === 'string' && decided.startsWith('auto:')) return decided.slice('auto:'.length) as LLMProviderName;
@@ -3499,10 +3517,12 @@ export interface RoleLlmResolveOptions {
   config?: UserConfig;
   /** 발사 시점에 «한 번» 정해 아래로 내리는 인자 — 사다리 최상층(source='flag'). */
   overrides?: RoleLlmConfig;
+  /** Test seam — 기본 process.env. `ELANOUS_ROLE_LLM_<ROLE>` 을 읽는다(source='environment'). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** ★ 역할별 LLM 해석 SSOT — RFC-role-scoped-llm-selection-2026-08-18 §4c.
- *  사다리: ① overrides(flag) → ② config.roleLlm → ③~⑥ 기존(resolveRoleLlmBaseline).
+ *  사다리: ① overrides(flag) → ①b env 고정 `ELANOUS_ROLE_LLM_<ROLE>`(POD-ROLE-LLM) → ② config.roleLlm → ③~⑥ 기존(resolveRoleLlmBaseline).
  *  ⛔ 아무 override 도 없으면 ③~⑥ 만 타므로 산출이 종전과 «같다»(§4f 불변식 · NL 진입 무변경). */
 export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}): RoleLlmResolution {
   const config = opts.config ?? getUserConfig();
@@ -3511,8 +3531,10 @@ export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}
   const globalProvider = (): LLMProviderName => (activeProvider ??= resolveActiveProvider(config));
   // 명시 인자가 있으면 그것이 진실 — 없을 때만 발사 시점에 정해진 값을 읽는다(둘 다 source='flag').
   const flagSpec = (opts.overrides ?? launchRoleLlmOverrides)?.[role];
+  const envSpec = roleLlmEnvPin(role, opts.env ?? process.env);
   const layers: ReadonlyArray<readonly [RoleLlmSpec | undefined, RoleLlmSource]> = [
     [flagSpec, 'flag'],
+    [envSpec, 'environment'],
     [config.roleLlm?.[role], 'config-role'],
   ];
   for (const [spec, source] of layers) {
@@ -3527,8 +3549,33 @@ export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}
     // 세 칸이 «다 비었으면» 아래 층으로 흘린다 — 빈 칸은 선언이 아니다.
   }
   const baseline = resolveRoleLlmBaseline(role, config, globalProvider());
-  if (opts.overrides || launchRoleLlmOverrides || config.roleLlm?.[role]) observeRoleLlm(role, baseline, flagSpec);
+  if (opts.overrides || launchRoleLlmOverrides || envSpec || config.roleLlm?.[role]) observeRoleLlm(role, baseline, flagSpec);
   return baseline;
+}
+
+/** POD-ROLE-LLM — 역할 고정을 «프로세스 env» 로 받는 칸. `ELANOUS_ROLE_LLM_<ROLE>` = RoleLlmSpec JSON
+ *  (예 `{"provider":"openai-codex","tier":"best","model":"gpt-6-sol"}`).
+ *  ⭐ 왜 env 인가: `--role-llm` 은 부모 프로세스 메모리 값이고 Pod 안엔 운영 config 가 없다 —
+ *    Pod Job 이 실을 수 있는 «비밀 아닌» 길은 armEnv 하나뿐이다(self-implement-pod.ts).
+ *  ⛔ 못 읽는 값은 삼키지 않고 관측을 남긴 뒤 «무시»한다(아래 층으로 흘린다 · 고정 실패가 런을 죽이지 않는다). */
+export function roleLlmEnvName(role: ModelRole): string {
+  return `ELANOUS_ROLE_LLM_${role.toUpperCase().replace(/-/g, '_')}`;
+}
+
+function roleLlmEnvPin(role: ModelRole, env: NodeJS.ProcessEnv): RoleLlmSpec | undefined {
+  const name = roleLlmEnvName(role);
+  const raw = env[name]?.trim();
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
+  const entry = parseRoleLlmEntry(parsed);
+  if (entry.ok) return entry.spec;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { debug } = require('./debug/log.js') as typeof import('./debug/log.js');
+    debug.log('harness.role-llm', 'env-pin-rejected', { role, env: name, reason: parsed === undefined ? 'not-json' : 'invalid-spec' });   // ⛔ 값 원문은 싣지 않는다
+  } catch { /* fail-open */ }
+  return undefined;
 }
 
 /** Resolves a model role without forcing a sparse user setting when it is empty.
@@ -3710,7 +3757,7 @@ export function parseGateRemoteConfig(raw: unknown): GateRemoteConfig | undefine
 
 export interface ProjectConfig {
   /** `axes` is absent when the configured axes are invalid; `error` then carries the config error text. */
-  rubric?: { axes?: import('./release-loop/rubric.js').RubricAxis[]; error?: string };
+  rubric?: { axes?: RubricAxis[]; error?: string };
 }
 
 /** Validate one project's `rubric.axes` — throws the config error text (key duplicate · non-numeric weight). */
@@ -3765,7 +3812,7 @@ export interface UserConfig {
   guardian?: { mode?: 'shadow' | 'live' };
   /** TA-JUDGE-LIVE-SAFE: task-agent judge moves executed for real. Only `review` · `propose-green` are honoured
    *  (`src/task-agent/live-moves.ts` drops anything else with a warning). Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
-  taskAgent?: { liveMoves?: string[]; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string } };
+  taskAgent?: { liveMoves?: string[]; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };
   events?: EventsConfig;
   /** GATE-REMOTE — see GateRemoteConfig. Absent = defaults (auto on · node-b · load 20 · cap 2). */
   gateRemote?: GateRemoteConfig;
@@ -3790,7 +3837,7 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; substrate?: 'local' | 'pod'; podPool?: string; /** IMAGE-ONE-SOURCE: Pod 발사가 당길 기준 이미지 커밋(hex 12~40 · 레지스트리 태그 = 앞 12자리). 없으면 종전대로 HEAD 비교·굽기. */ imageCommit?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
   /** Maximum nested elanous depth; safe positive integer, default 2. */
@@ -4043,22 +4090,32 @@ function parseAutoReviewConfig(raw: unknown): AutoReviewConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Keeps `taskAgent.liveMoves` as raw strings — the allow-list (and the unknown-entry warning) lives in the task agent. */
-/** HARNESS-PARENT-ON-MSB1 — `taskAgent.parentHost` (기본 없음 = 끔). 문자열 칸만 받는다. */
+/** HARNESS-PARENT-ON-MSB1 — `taskAgent.parentHost` (기본 없음 = 끔). 객체 또는 검증된 객체 목록. */
 function parseTaskAgentParentHost(raw: unknown): NonNullable<UserConfig['taskAgent']>['parentHost'] {
   if (raw === undefined) return undefined;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    warnUserConfigDrop('taskAgent.parentHost', '객체가 아니다 — 버림(로컬 발사)');
-    return undefined;
+  if (Array.isArray(raw)) {
+    const hosts = raw.map((entry) => parseParentHostEntry(entry)).filter((entry): entry is NonNullable<ReturnType<typeof parseParentHostEntry>> => entry !== undefined);
+    return hosts.length ? hosts : undefined;
   }
-  const out: Record<string, string> = {};
+  const host = parseParentHostEntry(raw);
+  if (!host) warnUserConfigDrop('taskAgent.parentHost', '객체가 아니다 — 버림(로컬 발사)');
+  return host;
+}
+
+function parseParentHostEntry(raw: unknown): { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: NonNullable<ReturnType<typeof parseParentHostEntry>> = {};
   for (const key of ['host', 'cwd', 'elanous', 'configDir', 'podPool'] as const) {
     const value = (raw as Record<string, unknown>)[key];
     if (typeof value === 'string' && value.trim()) out[key] = value.trim();
   }
+  const capacity = (raw as Record<string, unknown>).approvalCapacity;
+  if (Number.isSafeInteger(capacity) && (capacity as number) > 0) out.approvalCapacity = capacity as number;
+  else if (capacity !== undefined) return undefined;
   return out;
 }
 
+/** Keeps `taskAgent.liveMoves` as raw strings — the allow-list (and the unknown-entry warning) lives in the task agent. */
 function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
   if (raw === undefined) return undefined;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -4152,9 +4209,21 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
   const dropped: Array<{ role: ModelRole; reason: string }> = [];
   for (const role of MODEL_ROLES) {
     if (values[role] === undefined) continue;
-    const entry = parseRoleLlmEntry(values[role]);
-    if (entry.ok) parsed[role] = entry.spec;
-    else dropped.push({ role, reason: entry.reason });
+    const rawEntry = values[role];
+    if (rawEntry && typeof rawEntry === 'object' && !Array.isArray(rawEntry)) {
+      const { effort, ...modelFields } = rawEntry as Record<string, unknown>;
+      const entry = effort !== undefined && Object.keys(modelFields).length === 0 ? undefined : parseRoleLlmEntry(modelFields);
+      if (entry && !entry.ok) { dropped.push({ role, reason: entry.reason }); continue; }
+      const spec: RoleLlmSpec = entry?.ok ? entry.spec : {};
+      if (effort !== undefined) {
+        if (effort === 'low' || effort === 'medium' || effort === 'high') spec.effort = effort;
+        else warnUserConfigDrop(`roleLlm.${role}.effort`, `low|medium|high 가 아니다(${JSON.stringify(effort)}) — 버림`);
+      }
+      if (Object.keys(spec).length > 0) parsed[role] = spec;
+    } else {
+      const entry = parseRoleLlmEntry(rawEntry);
+      if (!entry.ok) dropped.push({ role, reason: entry.reason });
+    }
   }
   if (values.reviewer !== undefined) {
     parsed.reviewer = parseSubscriptionReviewerSpec(values.reviewer);
@@ -4433,7 +4502,7 @@ function runtimeLlmProviderOverride(): LLMProviderName | undefined {
  *  `src/llm/model-defaults.ts` (that module imports this file). */
 export type RuntimeLlmModelFamily =
   | 'grok' | 'anthropic' | 'openai' | 'openai-codex' | 'gemini' | 'local'
-  | 'kimi' | 'qwen' | 'glm' | 'openrouter' | 'unknown';
+  | 'kimi' | 'qwen' | 'glm' | 'openrouter' | 'bedrock' | 'unknown';
 
 export function inferRuntimeLlmModelFamily(model: string | undefined): RuntimeLlmModelFamily {
   if (!model) return 'unknown';
@@ -4442,6 +4511,9 @@ export function inferRuntimeLlmModelFamily(model: string | undefined): RuntimeLl
   // ⛔ 2026-09-23 — 게이트웨이 접두가 «먼저»다. 안 그러면 `openrouter/anthropic/claude-…` 가 `anthropic` 으로
   //   읽혀 openrouter 와 «비호환»이 되고, `openrouter/z-ai/…` 는 `unknown` 이라 아무 provider 와도 «호환»이 됐다.
   if (m.startsWith('openrouter/')) return 'openrouter';
+  // ⭐ BEDROCK-PROVIDER — Bedrock 전용 꼴(`anthropic.claude-…`·지역 접두·`bedrock/…`)이 `includes('claude')` 보다 «먼저».
+  //   1st-party id(`claude-…`)는 그대로 anthropic 이다(불변).
+  if (m.startsWith('bedrock/') || /^(?:[a-z]{2,6}\.)?anthropic\.claude-/.test(m)) return 'bedrock';
   if (m.includes('grok')) return 'grok';
   if (m.includes('claude')) return 'anthropic';
   if (m.startsWith('gemini-') || m.includes('gemini')) return 'gemini';
@@ -4480,6 +4552,8 @@ export function isRuntimeLlmModelCompatibleWithProvider(
   const family = inferRuntimeLlmModelFamily(model);
   if (family === 'unknown') return true;
   if (provider === 'local') return family === 'local';
+  // bedrock 은 1st-party claude id 도 받는다(공급자가 `anthropic.` 접두로 바꿔 보낸다).
+  if (provider === 'bedrock') return family === 'bedrock' || family === 'anthropic';
   return provider === family;
 }
 
@@ -4506,6 +4580,7 @@ function defaultModelForProvider(provider: LLMProviderName): string | undefined 
     case 'kimi': return KIMI_MODEL;
     case 'qwen': return QWEN_MODEL;
     case 'glm': return GLM_MODEL;
+    case 'bedrock': return BEDROCK_DEFAULT_MODEL;
     case 'auto': return undefined;
   }
 }
@@ -5022,6 +5097,13 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       })() },
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
+      ...(() => {
+        if (harness.imageCommit === undefined) return {};
+        const v = typeof harness.imageCommit === 'string' ? harness.imageCommit.trim().toLowerCase() : '';
+        if (/^[0-9a-f]{12,40}$/u.test(v)) return { imageCommit: v };
+        warnUserConfigDrop('harness.imageCommit', `커밋 hex 12~40자리가 아니다(${JSON.stringify(harness.imageCommit)}) — 무시하고 HEAD 비교·굽기로 진행`);
+        return {};
+      })(),
       ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
         && harness.worktreeAddTimeoutSec > 0 && harness.worktreeAddTimeoutSec <= 2_147_483
         ? { worktreeAddTimeoutSec: harness.worktreeAddTimeoutSec } : {}),
@@ -5111,6 +5193,18 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         };
       })(),
       model: resolveRuntimeLlmModel(baseProvider, selectedProvider, str(llm.model), escalationProvider || undefined),
+      openrouter: (() => {
+        const router = llm.openrouter;
+        if (!router || typeof router !== 'object' || Array.isArray(router)) return undefined;
+        const preferences = (router as Record<string, unknown>).providerPreferences;
+        const fallbackModel = (router as Record<string, unknown>).fallbackModel;
+        const out = {
+          ...(preferences && typeof preferences === 'object' && !Array.isArray(preferences)
+            ? { providerPreferences: { ...preferences } as Record<string, unknown> } : {}),
+          ...(typeof fallbackModel === 'string' ? { fallbackModel } : {}),
+        };
+        return Object.keys(out).length > 0 ? out : undefined;
+      })(),
       // ★ escalate effort override(#2·2026-07-22 대표) — ELANOUS_ESCALATE_EFFORT 있으면 reasoning effort 를 그 값으로
       //   (sol high 등 강한 시도). reasoningLevel(anthropic/일반)+codexReasoning(openai-codex/sol) 둘 다 커버. 미설정=종전.
       reasoningLevel: parseReasoningLevel(process.env.ELANOUS_ESCALATE_EFFORT?.trim() || llm.reasoningLevel),
@@ -5146,6 +5240,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       codexAccountOrder: Array.isArray(llm.codexAccountOrder)
         ? llm.codexAccountOrder.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
         : undefined,
+      codexResetAutoConsumePerDay: typeof llm.codexResetAutoConsumePerDay === 'number'
+        && Number.isSafeInteger(llm.codexResetAutoConsumePerDay) && llm.codexResetAutoConsumePerDay >= 0
+        ? llm.codexResetAutoConsumePerDay : undefined,
       // ⛔ 여기선 «배열이고 문자열 원소만» 통과시킨다 — 아는 이름인지의 판정은
       //   `normalizeFallbackChain()` 이 «한 자»로 한다(두 곳에서 정규화하면 자가 갈린다).
       fallbackChain: Array.isArray(llm.fallbackChain)
@@ -5281,6 +5378,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         return {
           maxAgeDays: num(r.maxAgeDays, LOGS_DEFAULTS.retention.maxAgeDays),
           maxDbMb: num(r.maxDbMb, LOGS_DEFAULTS.retention.maxDbMb),
+          minRetainHours: num(r.minRetainHours, LOGS_DEFAULTS.retention.minRetainHours),
         };
       })(),
       ...(typeof logsRaw.instanceName === 'string' && logsRaw.instanceName.trim().length > 0
@@ -5996,6 +6094,13 @@ export function getUserConfig(path: string = defaultPath()): UserConfig {
   return cache;
 }
 
+// Read at call time, not registration time, so reload/reset and on-disk edits keep their semantics.
+// Stored timezone is kept in raw by buildUserConfig; do not change getUserConfig's returned shape.
+setConfigTimeZoneSource(() => {
+  const config = getUserConfig();
+  return config.timezone ?? (typeof config.raw.timezone === 'string' ? config.raw.timezone : undefined);
+});
+
 export function reloadUserConfig(path: string = defaultPath()): UserConfig {
   cache = applyOverlay(buildUserConfig(path));
   cachedPath = path;
@@ -6101,6 +6206,8 @@ export const PROVIDER_DEFAULT_MODEL: Record<LLMProviderName, string> = {
   kimi: 'kimi-k2.6',
   qwen: 'qwen3.6-flash',
   glm: 'glm-5.1',
+  // BEDROCK-PROVIDER (2026-10-10) — Bedrock 의 Claude(`anthropic.` 접두 · 공식 «Supported models» 표).
+  bedrock: BEDROCK_DEFAULT_MODEL,
 };
 
 /** Resolve the display model for a rotation entry — falls back to the
@@ -6415,6 +6522,7 @@ export function saveUserConfig(
       codexQuotaPolicy: cfg.llm.codexQuotaPolicy,
       grokWeeklyCapPct: cfg.llm.grokWeeklyCapPct,
       fallbackChain: cfg.llm.fallbackChain,
+      openrouter: cfg.llm.openrouter,
       reviewFallbackModels: cfg.llm.reviewFallbackModels,
       codexStore: cfg.llm.codexStore,
       geminiSafety: cfg.llm.geminiSafety,

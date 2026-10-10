@@ -21,11 +21,25 @@ export function nestedPodResult(row: Record<string, unknown>): { stage: string; 
   return { stage: result.stage, ok: false, ...(error ? { error } : {}) };
 }
 
+/** One line naming each preflight blocker (`(대상 경로 0) — …`), or '' when the row carries none. */
+function preflightBlockerText(blockers: unknown): string {
+  if (!Array.isArray(blockers)) return '';
+  return blockers.flatMap((blocker) => {
+    if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) return [];
+    const { name, detail } = blocker as Record<string, unknown>;
+    const parts = [name, detail].filter((part): part is string => typeof part === 'string' && part.trim().length > 0).map((part) => part.trim().replace(/\s+/gu, ' '));
+    return parts.length ? [parts.join(' — ')] : [];
+  }).join(' · ');
+}
+
 /** A child terminal row: the legacy flat form {stage, ok, error?} (no kind, or a child kind) or the nested dev result. Any other kind is not a result. */
 export function podTerminalRow(row: Record<string, unknown>): { stage: string; ok: boolean; error?: string } | null {
   if (typeof row.kind === 'string' && !CHILD_RESULT_KINDS.has(row.kind)) return null;
   if (typeof row.stage === 'string' && typeof row.ok === 'boolean') {
-    return { stage: row.stage, ok: row.ok, ...(typeof row.error === 'string' ? { error: row.error } : {}) };
+    if (typeof row.error === 'string') return { stage: row.stage, ok: row.ok, error: row.error };
+    // PREFLIGHT-RESULT-LINE: `{kind:'self', ok:false, stage:'preflight-blocked', blockers}` carries its reason in the blockers, not in `error`.
+    const blockers = row.ok === false && row.stage === 'preflight-blocked' ? preflightBlockerText(row.blockers) : '';
+    return { stage: row.stage, ok: row.ok, ...(blockers ? { error: blockers } : {}) };
   }
   return nestedPodResult(row);
 }
@@ -46,7 +60,7 @@ export function extractPodFailureReason(input: {
   if (input.containerReason === 'OOMKilled') return 'OOMKilled: 컨테이너 메모리 한도 초과';
 
   const isBookkeeping = (line: string): boolean =>
-    /^(?:ELANOUS_(?:MEM|RUN_LEDGER|USAGE_ROLLUP|POD_)|\[graph\] )/u.test(line) || /^(?:at\s+\S|\.\.\.\s+\d+\s+more\b|cleanup\s+(?:complete|done|finished)\b)/iu.test(line);
+    /^(?:ELANOUS_(?:MEM|RUN_LEDGER|USAGE_ROLLUP|POD_)|\[graph\] |\[ask\]\s+\d+\)\s)/u.test(line) || /^(?:at\s+\S|\.\.\.\s+\d+\s+more\b|cleanup\s+(?:complete|done|finished)\b)/iu.test(line);
   const isError = (line: string): boolean =>
     /\berror\b|\bfail(?:ed|ure)?\b|exception|fatal|denied|timed?\s*out|exceeded|overloaded|unavailable|exhausted|오류|실패/iu.test(line);
   const meaningful: Array<{ text: string; terminal: boolean }> = [];

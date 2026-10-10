@@ -3,8 +3,14 @@ provider: anthropic
 displayName: Claude Sonnet 5
 family: claude-5
 familyShortcut: sonnet
-contextSize: 200000
-outputMaxTokens: 64000
+# ⛔ 2026-10-10 정정(MK · MODEL-ROUTING-MATRIX): 200000 · 64000 은 낡은 값이다.
+#   ⑴ Anthropic 공식 https://platform.claude.com/내부 문서 `overview` (2026-10-10T08:38Z 직접 확인)
+#      «Context window: 1M tokens · Max output: 128K tokens»
+#   ⑵ OpenRouter `GET /api/v1/models` 실측 2026-10-10T05:10Z — anthropic/claude-sonnet-5: 1,000,000 · 128,000
+#   ⑶ src/intelligence-map/model-catalog.ts 는 08-18 에 이미 1M 으로 정정해 두었다(이 YAML 만 남아 있었다).
+#   ⚠️ 같은 공식 페이지·OpenRouter 가 가격을 $2 / $10 으로 낸다 — 아래 $3/$15 와 다르다. 이 PR 은 창·출력만 고친다(가격은 비용 집계가 바뀌어 별개).
+contextSize: 1000000
+outputMaxTokens: 128000
 vision: images
 audio: { input: false, output: false }
 reasoning: high

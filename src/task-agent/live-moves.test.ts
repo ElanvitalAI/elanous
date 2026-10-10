@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import type { LandWorktree, LandWorktreeFailure, LandWorktreeInput } from './land-worktree.js';
 import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
@@ -392,7 +393,7 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
 });
 
 describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => {
-  const reviewed = { verdict: 'pass' as const, head: HEAD_A };
+  const reviewed = { verdict: 'pass' as const, head: HEAD_A, mustFixCount: 0 };
   function landFixture() {
     const f = fixture();
     const calls: Array<{ pr: number; head: string; cwd: string }> = [];
@@ -430,6 +431,142 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).detail).toContain('CLOSED');
     expect(t.calls).toHaveLength(0);
     expect(t.card().landAttempts).toBeUndefined();
+  });
+
+  // TA-LAND-MUSTFIX-ZERO — pass ⊕ must-fix 1 → land 안 함 · must-fix 수 모름 → land 안 함(fail-closed) · 둘 다 관측에 사유를 남긴다.
+  test('pass with must-fix or with an unknown must-fix count never lands and leaves the reason in observation', async () => {
+    const t = landFixture();
+    const withMustFix = await executeLiveLand(t.card(), 51, { ...t.ctx, review: { ...reviewed, mustFixCount: 1 } as typeof t.ctx.review }, t.live);
+    expect(withMustFix).toMatchObject({ kind: 'land', executed: false, ok: false, detail: expect.stringContaining('review-warn-with-must-fix') });
+    const unknown = await executeLiveLand(t.card(), 51, { ...t.ctx, review: { verdict: 'pass', head: HEAD_A } }, t.live);
+    expect(unknown).toMatchObject({ kind: 'land', executed: false, ok: false, detail: expect.stringContaining('review-must-fix-unknown') });
+    const moves = t.f.logs.filter(entry => entry.event === 'live-move').map(entry => entry.data);
+    expect(moves).toEqual([expect.objectContaining({ kind: 'land', executed: false, detail: expect.stringContaining('review-warn-with-must-fix') }),
+      expect.objectContaining({ kind: 'land', executed: false, detail: expect.stringContaining('review-must-fix-unknown') })]);
+    expect(t.calls).toHaveLength(0);
+    expect(t.card().landAttempts).toBeUndefined();
+  });
+
+  // TA-LAND-WARN-MUSTFIX0 — 정본 규칙 «warn ⊕ must-fix 0 = 통과»: land 관문은 pass/warn 을 같은 줄로 본다(must-fix 0 · 수 모름 거부는 그대로).
+  test.each([
+    ['warn ⊕ must-fix 0 → land', { verdict: 'warn', mustFixCount: 0 }, 1, null],
+    ['warn ⊕ must-fix 1 → no land', { verdict: 'warn', mustFixCount: 1 }, 0, 'review-warn-with-must-fix'],
+    ['warn ⊕ must-fix unknown → no land', { verdict: 'warn' }, 0, 'review-must-fix-unknown'],
+    ['pass ⊕ must-fix 0 → land (unchanged)', { verdict: 'pass', mustFixCount: 0 }, 1, null],
+    ['fail → no land', { verdict: 'fail', mustFixCount: 0 }, 0, 'pass missing'],
+    ['warn ⊕ must-fix 0 ⊕ reviewed:false → no land', { verdict: 'warn', mustFixCount: 0, reviewed: false }, 0, 'not reviewed'],
+    ['warn ⊕ must-fix 0 ⊕ reviewed:true → land', { verdict: 'warn', mustFixCount: 0, reviewed: true }, 1, null],
+  ] as const)('executeLiveLand: %s', async (_name, review, lands, reason) => {
+    const t = landFixture();
+    const out = await executeLiveLand(t.card(), 51, { ...t.ctx, review: { head: HEAD_A, ...review } as typeof t.ctx.review }, t.live);
+    expect(t.calls).toHaveLength(lands);
+    expect(out.executed).toBe(lands === 1);
+    if (reason) expect(out.detail).toContain(reason);
+  });
+
+  // TA-LAND-WORKTREE — cwd HEAD ≠ PR 머리(Pod 런 PR · 호스트 checkout)면 PR 머리 임시 워크트리에서 land 하고 걷는다.
+  function worktreeSeam(t: ReturnType<typeof landFixture>, opts: { local: string | null; fail?: string }) {
+    const events: string[] = [];
+    const created: Array<Record<string, unknown>> = [];
+    const live = {
+      ...t.live,
+      landPrHead: async () => ({ head: HEAD_A, state: 'OPEN', isDraft: false, branch: 'feature/pod' }),
+      landWorktree: {
+        localHead: (cwd: string) => { events.push(`head:${cwd}`); return opts.local; },
+        create: async (input: LandWorktreeInput): Promise<LandWorktree | LandWorktreeFailure> => {
+          created.push(input as unknown as Record<string, unknown>);
+          if (opts.fail) return { reason: opts.fail, created: false, removed: null };
+          events.push('create');
+          return { cwd: '/state/land-worktrees/x', cleanup: () => { events.push('cleanup'); return { removed: true }; } };
+        },
+      },
+    };
+    return { events, created, live };
+  }
+
+  test('cwd HEAD ≠ PR head → temp worktree on the PR head → land runs there → worktree removed', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B });
+    const out = await executeLiveLand(t.card(), 51, t.ctx, w.live);
+    expect(out).toMatchObject({ kind: 'land', executed: true, ok: true });
+    expect(w.created).toEqual([{ card: 'ta-live-1', pr: 51, head: HEAD_A, branch: 'feature/pod', repoCwd: '/tmp/land-wt', statePath: t.f.statePath }]);
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/state/land-worktrees/x' }]);
+    expect(w.events).toEqual(['head:/tmp/land-wt', 'create', 'cleanup']);
+    expect(t.f.logs.filter(entry => entry.event === 'land-worktree').map(entry => [entry.data.created, entry.data.removed])).toEqual([[true, false], [true, true]]);
+  });
+
+  test('cwd HEAD = PR head (local run worktree) → no worktree, land in cwd as before', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_A });
+    await executeLiveLand(t.card(), 51, t.ctx, w.live);
+    expect(w.created).toEqual([]);
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
+    expect(t.f.logs.some(entry => entry.event === 'land-worktree')).toBe(false);
+  });
+
+  test('a relative overlap-evidence path is pinned to the original cwd when landing from the temp worktree', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B });
+    const seen: Array<string | undefined> = [];
+    await executeLiveLand(t.card(), 51, { ...t.ctx, overlapEvidence: 'evidence/x.json' },
+      { ...w.live, land: async (_pr: number, _head: string, _cwd: string, o?: { overlapEvidence?: string }) => { seen.push(o?.overlapEvidence); return { status: 0, stdout: 'merged' }; } });
+    expect(seen).toEqual(['/tmp/land-wt/evidence/x.json']);
+    // 같은 cwd(로컬 런)면 종전 그대로 넘긴다.
+    const t2 = landFixture();
+    const same = worktreeSeam(t2, { local: HEAD_A });
+    const seen2: Array<string | undefined> = [];
+    await executeLiveLand(t2.card(), 51, { ...t2.ctx, overlapEvidence: 'evidence/x.json' },
+      { ...same.live, land: async (_pr: number, _head: string, _cwd: string, o?: { overlapEvidence?: string }) => { seen2.push(o?.overlapEvidence); return { status: 0, stdout: 'merged' }; } });
+    expect(seen2).toEqual(['evidence/x.json']);
+  });
+
+  test('cwd HEAD unreadable → no worktree, land in cwd as before', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: null });
+    await executeLiveLand(t.card(), 51, t.ctx, w.live);
+    expect(w.created).toEqual([]);
+    expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
+  });
+
+  test('worktree creation fails → land 0 · reason · the head attempt is released for the next tick', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B, fail: 'local branch feature/pod exists at 1234 (not the PR head)' });
+    const out = await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'wt-fail-cycle' }, w.live);
+    expect(out).toMatchObject({ kind: 'land', executed: false, ok: false, detail: expect.stringContaining('land worktree unavailable: local branch feature/pod') });
+    expect(t.calls).toEqual([]);
+    expect(t.card().landAttempts ?? []).toEqual([]);
+    expect(t.f.logs.find(entry => entry.event === 'land-worktree')?.data).toMatchObject({ created: false, removed: null, reason: expect.stringContaining('local branch') });
+    // 다음 틱(같은 주기 id)은 다시 시도할 수 있다.
+    const retry = worktreeSeam(t, { local: HEAD_A });
+    expect(await executeLiveLand(t.card(), 51, { ...t.ctx, cycleId: 'wt-fail-cycle' }, retry.live)).toMatchObject({ executed: true, ok: true });
+  });
+
+  test('land fails in the temp worktree → still removed', async () => {
+    const t = landFixture();
+    const w = worktreeSeam(t, { local: HEAD_B });
+    const out = await executeLiveLand(t.card(), 51, t.ctx, { ...w.live, land: async () => ({ status: 1, stdout: '', stderr: '✗ gate' }) });
+    expect(out).toMatchObject({ executed: true, ok: false, detail: '✗ gate' });
+    expect(w.events).toEqual(['head:/tmp/land-wt', 'create', 'cleanup']);
+  });
+
+  test('child review must-fix count rides the job result: a pass carrying must-fix is refused at the land gate', async () => {
+    const { singleRunAsJobResult } = await import('../self-implement/self-implement-cli.js');
+    const { parseSelfImplementJson } = await import('../task-orchestrator/surfaces/self-implement.js');
+    const t = landFixture();
+    const base = { runId: 'ta-live-1', ok: true, stage: 'pr-opened', prNumber: 51, worktreePath: '/tmp/land-wt', checkedHeadCommit: HEAD_A, reviewedHeadCommit: HEAD_A,
+      review: { verdict: 'pass', reviewed: true, mustFix: ['still broken'], shouldFix: [], summary: 'pass with must-fix' } };
+    const result = singleRunAsJobResult('feature ask', base as unknown as Parameters<typeof singleRunAsJobResult>[1]);
+    expect(result.selfReview).toEqual({ verdict: 'pass', head: HEAD_A, mustFixCount: 1 });
+    expect(parseSelfImplementJson(JSON.stringify(base))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A, mustFixCount: 1 });
+    // 목록 없는 자식 JSON = «모름» — 수를 싣지 않는다(«0» 으로 메우지 않는다).
+    expect(parseSelfImplementJson(JSON.stringify({ ...base, review: { verdict: 'pass', reviewed: true } }))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    // 문자열 아닌 원소가 섞인 목록도 «모름» — actions.ts 와 같은 판정.
+    expect(parseSelfImplementJson(JSON.stringify({ ...base, review: { ...base.review, mustFix: [null] } }))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    expect(singleRunAsJobResult('feature ask', { ...base, review: { ...base.review, mustFix: [null] } } as unknown as Parameters<typeof singleRunAsJobResult>[1]).selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    const move = await recordTaskAgentShadowMove({ runId: 'mustfix-wired', stopReason: 'needs-human', results: [{ ...result, taskId: 'ta-live-1' }], selfReview: result.selfReview },
+      { ...t.f.deps(['propose-land']), live: t.live });
+    expect(move.liveMove?.detail).toContain('review-warn-with-must-fix');
+    expect(t.calls).toHaveLength(0);
   });
 
   test('run PR URL must match the freshly observed PR identity', async () => {
@@ -501,7 +638,7 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
       prNumber: 51, worktreePath: '/tmp/land-wt', checkedHeadCommit: HEAD_A, reviewedHeadCommit: HEAD_A,
       review: { verdict: 'pass', reviewed: true, mustFix: [], shouldFix: [], summary: 'review passed' } };
     const result = singleRunAsJobResult('feature ask', base as unknown as Parameters<typeof singleRunAsJobResult>[1]);
-    expect(result.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    expect(result.selfReview).toEqual({ verdict: 'pass', head: HEAD_A, mustFixCount: 0 });
     await superviseRun({ initial: [{ ...result, harvestable: true, branch: 'feature' }],
       rerun: async () => { throw new Error('unexpected relaunch'); },
       sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
@@ -514,13 +651,13 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     expect(unreviewed.selfReview).toBeUndefined();
     const noHead = singleRunAsJobResult('feature ask', { ...base, reviewedHeadCommit: undefined } as unknown as Parameters<typeof singleRunAsJobResult>[1]);
     expect(noHead.selfReview).toBeUndefined();
-    expect(parseSelfImplementJson(JSON.stringify(base))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    expect(parseSelfImplementJson(JSON.stringify(base))?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A, mustFixCount: 0 });
     expect(parseSelfImplementJson(JSON.stringify({ ...base, reviewedHeadCommit: undefined }))?.selfReview).toBeUndefined();
     const parsed = parseSelfImplementJson(JSON.stringify(base))!;
     const { orchestrateSelfDev } = await import('../self-dev/orchestrate.js');
     const jobs = await orchestrateSelfDev({ goals: [{ id: 'ta-live-1', feature: 'feature ask', openPr: true }],
       spawn: input => ({ address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { ...parsed, branch: 'feature', harvestable: true } }) }) });
-    expect(jobs[0]?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A });
+    expect(jobs[0]?.selfReview).toEqual({ verdict: 'pass', head: HEAD_A, mustFixCount: 0 });
     const stale = singleRunAsJobResult('feature ask', { ...base, reviewedHeadCommit: HEAD_B } as unknown as Parameters<typeof singleRunAsJobResult>[1]);
     const staleMove = await recordTaskAgentShadowMove({ runId: 'stale-wired', stopReason: 'needs-human', results: [{ ...stale, taskId: 'ta-live-1' }], selfReview: stale.selfReview },
       { ...t.f.deps(['propose-land']), live: t.live });
@@ -539,7 +676,7 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
     const t = landFixture();
     expect((await executeLiveLand(t.card(), 51, t.ctx, t.live)).executed).toBe(true);
     t.setView({ head: HEAD_B, state: 'OPEN', isDraft: false });
-    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, review: { verdict: 'pass', head: HEAD_B } }, t.live)).executed).toBe(true);
+    expect((await executeLiveLand(t.card(), 51, { ...t.ctx, review: { verdict: 'pass', head: HEAD_B, mustFixCount: 0 } as typeof t.ctx.review }, t.live)).executed).toBe(true);
     expect(t.calls.map(call => call.head)).toEqual([HEAD_A, HEAD_B]);
   });
 

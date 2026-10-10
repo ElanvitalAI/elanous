@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  collectGithubStars,
+  collectGithubStars as collectGithubStarsWithReadme,
+  type CollectGithubOpts,
   DEFAULT_GITHUB_STAR_DAYS,
   DEFAULT_GITHUB_STAR_PER_QUERY,
   GITHUB_STAR_QUERIES,
@@ -41,6 +42,10 @@ function fake(byQuery: Record<string, GithubStarRepo[]>): SearchGithubRepos & { 
 
 const DAY = '2026-09-26';
 
+// 기존 수집 계약 검증은 네트워크 대신 README 주입을 고정한다.
+const collectGithubStars = (r: string, search: SearchGithubRepos, opts: CollectGithubOpts = {}) =>
+  collectGithubStarsWithReadme(r, search, { fetchReadme: async () => 'test README', ...opts });
+
 test('같은 저장소가 두 질의에서 나와도 원장·수집 결과는 하나다', async () => {
   const r = root();
   const shared = repo('acme/agent', 160);
@@ -66,7 +71,7 @@ test('어제 별 100 · 오늘 별 160 이면 github.starsDelta 는 60 이다', 
   expect(item?.signals['github.starsPerDay']).toBe(60);
   expect(item?.signals['github.stars']).toBe(160);
   expect(item?.url).toBe('https://github.com/acme/agent');
-  expect(item?.text).toBe('라이선스: 미상\nacme/agent desc');
+  expect(item?.text).toBe('라이선스: 미상\nREADME:\ntest README\nacme/agent desc');
   expect(res.repos[0]).toMatchObject({ starsDelta: 60, starsPerDay: 60 });
   const lines = readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   expect(lines.at(-1)).toEqual({ day: DAY, repo: 'acme/agent', stars: 160 });
@@ -129,8 +134,69 @@ test('7일 이전 가장 가까운 스냅숏으로 급등률을 계산하고 별
   expect(res.repos[0]).toMatchObject({ starsDelta: 10, starsPerDay: 500 / 7, baselineDays: 7, license: 'MIT' });
   expect(res.repos[1]).toMatchObject({ starsPerDay: 10, baselineDays: 7 });
   expect(res.repos[2]?.starsPerDay).toBeUndefined();
-  expect(listIntakeItems(r).find((i) => i.title === 'acme/surge')?.text).toBe('라이선스: MIT\nacme/surge desc');
+  expect(listIntakeItems(r).find((i) => i.title === 'acme/surge')?.text).toBe('라이선스: MIT\nREADME:\ntest README\nacme/surge desc');
   expect(readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').at(-1)).toBe(JSON.stringify({ day: DAY, repo: 'new/top', stars: 2000 }));
+});
+
+test('README 는 별 총합이 아니라 starsPerDay 상위 3개만 받으며 라이선스 다음에 1,500자만 싣는다', async () => {
+  const r = root();
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(githubStarsFile(r), [
+    { day: '2026-09-25', repo: 'acme/fast', stars: 10 },
+    { day: '2026-09-25', repo: 'acme/second', stars: 20 },
+    { day: '2026-09-25', repo: 'acme/third', stars: 30 },
+    { day: '2026-09-25', repo: 'acme/slow', stars: 9990 },
+  ].map((snapshot) => JSON.stringify(snapshot)).join('\n') + '\n');
+  const calls: string[] = [];
+  const res = await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: [
+    repo('acme/slow', 9991), repo('acme/third', 33), repo('acme/fast', 110, { license: 'MIT' }),
+    repo('acme/second', 30),
+  ] }), { day: DAY, fetchReadme: async (name) => { calls.push(name); return 'X'.repeat(1501); } });
+  expect(res.repos.map((row) => row.repo)).toEqual(['acme/fast', 'acme/second', 'acme/third', 'acme/slow']);
+  expect(calls).toEqual(['acme/fast', 'acme/second', 'acme/third']);
+  expect(listIntakeItems(r).find((item) => item.title === 'acme/fast')?.text)
+    .toBe(`라이선스: MIT\nREADME:\n${'X'.repeat(1500)}\nacme/fast desc`);
+  expect(listIntakeItems(r).find((item) => item.title === 'acme/slow')?.text)
+    .toBe('라이선스: 미상\nacme/slow desc');
+  expect(readFileSync(githubStarsFile(r), 'utf8').trim().split('\n').at(-1))
+    .toBe(JSON.stringify({ day: DAY, repo: 'acme/slow', stars: 9991 }));
+});
+
+test('dry-run 은 README 조회 없이 기존 저장소 결과만 돌려준다', async () => {
+  const r = root();
+  const calls: string[] = [];
+  const res = await collectGithubStarsWithReadme(r, fake({ [GITHUB_STAR_QUERIES[0]]: [
+    repo('acme/first', 30), repo('acme/second', 20), repo('acme/third', 10),
+  ] }), { day: DAY, dryRun: true, fetchReadme: async (name) => {
+    calls.push(name);
+    throw new Error('dry-run must not fetch README');
+  } });
+  expect(calls).toEqual([]);
+  expect(res.repos.map((row) => row.repo)).toEqual(['acme/first', 'acme/second', 'acme/third']);
+  expect(res.raws).toBe(3);
+  expect(res.ingest).toBeUndefined();
+  expect(listIntakeItems(r)).toHaveLength(0);
+  expect(() => readFileSync(githubStarsFile(r), 'utf8')).toThrow();
+});
+
+test('README 받기 실패는 그 저장소에만 미상 한 줄을 남기고 나머지는 계속 수집한다', async () => {
+  const r = root();
+  const calls: string[] = [];
+  const res = await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: [
+    repo('acme/first', 30), repo('acme/second', 20), repo('acme/third', 10),
+  ] }), { day: DAY, fetchReadme: async (name) => {
+    calls.push(name);
+    if (name === 'acme/first') throw new Error('HTTP 404');
+    return `body ${name}`;
+  } });
+  expect(calls).toEqual(['acme/first', 'acme/second', 'acme/third']);
+  expect(res.raws).toBe(3);
+  expect(res.ingest?.added).toBe(3);
+  const items = listIntakeItems(r);
+  expect(items.find((item) => item.title === 'acme/first')?.text)
+    .toBe('라이선스: 미상\nREADME 미상\nacme/first desc');
+  expect(items.find((item) => item.title === 'acme/second')?.text)
+    .toBe('라이선스: 미상\nREADME:\nbody acme/second\nacme/second desc');
 });
 
 test('7일 이전 스냅숏이 없으면 직전 스냅숏으로 계산한다', async () => {
@@ -154,9 +220,9 @@ test('원장 본문 첫 줄은 언제나 라이선스 — SPDX ID · 확인된 �
   const result = await collectGithubStars(r, fake({ [GITHUB_STAR_QUERIES[0]]: parsed }), { day: DAY });
   expect(result.repos.map((row) => row.license)).toEqual(['MIT', '없음', undefined, undefined]);
   const byTitle = (name: string) => listIntakeItems(r).find((i) => i.title === `acme/${name}`)?.text;
-  expect(byTitle('licensed')).toBe('라이선스: MIT\nMIT project');
-  expect(byTitle('unlicensed')).toBe('라이선스: 없음\nno license');
-  expect(byTitle('unknown')).toBe('라이선스: 미상\nunchecked');
+  expect(byTitle('licensed')).toBe('라이선스: MIT\nREADME:\ntest README\nMIT project');
+  expect(byTitle('unlicensed')).toBe('라이선스: 없음\nREADME:\ntest README\nno license');
+  expect(byTitle('unknown')).toBe('라이선스: 미상\nREADME:\ntest README\nunchecked');
   expect(byTitle('unverified')).toBe('라이선스: 미상\nspdx not reported');
 });
 

@@ -24,7 +24,7 @@ describe('family prompt coverage — 자가 «무엇을 재는지»부터 고정
   it('전 계열을 «빠짐없이» 잰다 — 계열이 늘면 이 수가 어긋나 눈에 띈다', () => {
     const coverage: FamilyPromptCoverage[] = allFamilyPromptCoverage(PROBE);
     expect(coverage.map(c => c.family).sort()).toEqual(
-      ['claude', 'codex', 'gemini', 'gpt', 'grok', 'local'],
+      ['claude', 'codex', 'gemini', 'gpt', 'grok', 'local', 'open-weight'],
     );
   });
 
@@ -68,6 +68,7 @@ describe('2026-08-18 기준선 — ⛔ 「통과」가 목표가 아니라 «값
     gemini: { chat: true, addendum: true },
     grok: { chat: true, addendum: true },
     local: { chat: true, addendum: false },
+    'open-weight': { chat: false, addendum: false },
   };
 
   for (const [family, expected] of Object.entries(BASELINE)) {
@@ -81,17 +82,16 @@ describe('2026-08-18 기준선 — ⛔ 「통과」가 목표가 아니라 «값
     });
   }
 
-  it('⭐ 두 층이 «모두» 빈 계열 — `#10110` 착지로 «없어졌다»', () => {
-    // ⛔ 이 빈 배열을 「끝났다」로 읽지 마라. 이 자는 「두 층 다 빈 계열」만 센다.
-    //   한 층만 빈 계열은 위 BASELINE 이 센다. gemini chat 착지 후에도 둘 다 빈 계열은 없다.
-    expect(familiesWithNeitherLayer(PROBE)).toEqual([]);
+  it('⭐ 두 층이 «모두» 빈 계열 — 측정된 open-weight', () => {
+    // 두 층만 센다. 도구 규율은 이 커버리지 자의 측정 대상이 아니다.
+    expect(familiesWithNeitherLayer(PROBE)).toEqual(['open-weight']);
   });
 
-  it('📏 한 층(chat variant)만 빈 계열 — gemini chat 착지 후 없다', () => {
+  it('📏 chat variant 가 빈 계열 — 측정된 open-weight', () => {
     const missingChat = allFamilyPromptCoverage(PROBE)
       .filter(c => !c.hasDedicatedChatVariant)
       .map(c => c.family)
       .sort();
-    expect(missingChat).toEqual([]);
+    expect(missingChat).toEqual(['open-weight']);
   });
 });

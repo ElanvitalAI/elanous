@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -76,6 +77,128 @@ describe('shared messenger agent final answer', () => {
     })({ userConfig: config, sessionId: 'fake-session', userText: 'question' });
     expect(result.text).toContain('Plain answer.');
     expect(result.text).toContain('elanous');
+  });
+});
+
+describe('empty final answer after tool calls', () => {
+  const toolOnlyResult = (): RunTurnResult => ({
+    text: '', provider: 'fake', model: 'fake-model', usedTokens: 1, droppedMessages: 0, memoryIds: [], meta: {} as never,
+  });
+  const emptyAnswerEvents = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.filter((call) => call[0] === 'agent.turn' && call[1] === 'empty-answer');
+
+  test('a tool-only turn is observed once and the retry turn supplies the answer from the tool results', async () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      const prompts: string[] = [];
+      const toolCounts: number[] = [];
+      const result = await makeElanousAgentRunTurn(config, 'telegram', async (opts) => {
+        prompts.push(opts.userText);
+        toolCounts.push(opts.tools?.length ?? 0);
+        if (prompts.length === 1) {
+          opts.onToolCall?.({ id: 't1', name: 'Read', args: {} });
+          opts.onToolResult?.({ id: 't1', name: 'Read', result: { content: 'RELEASE-READY-42' } });
+          return toolOnlyResult();
+        }
+        return { ...toolOnlyResult(), text: '발행 준비는 끝났습니다.' };
+      })({ userConfig: config, sessionId: 'empty-answer-session', userText: '발행 준비 상태?' });
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('발행 준비 상태?');
+      expect(prompts[1]).toContain('RELEASE-READY-42');
+      expect(toolCounts[1]).toBe(0);
+      expect(result.text).toContain('발행 준비는 끝났습니다.');
+      expect(emptyAnswerEvents(spy)).toHaveLength(1);
+      expect(emptyAnswerEvents(spy)[0]![2]).toMatchObject({ surface: 'telegram', toolCalls: 1, recovered: true });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('when the retry is empty too the user gets a failure sentence, not just the footer', async () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      let calls = 0;
+      const deltas: string[] = [];
+      const result = await makeElanousAgentRunTurn(config, 'telegram', async (opts) => {
+        calls++;
+        opts.onToolCall?.({ id: `t${calls}`, name: 'Read', args: {} });
+        return toolOnlyResult();
+      })({ userConfig: config, sessionId: 'empty-answer-session', userText: 'question', onDelta: (delta) => deltas.push(delta) });
+      expect(calls).toBe(2);
+      expect(result.text).toContain('답을 만들지 못했다 — 툴 1개 실행');
+      expect(result.text).toContain('elanous');
+      expect(result.text.trim().startsWith('답')).toBe(false);
+      expect(deltas).toEqual([]);
+      expect(emptyAnswerEvents(spy)).toHaveLength(1);
+      expect(emptyAnswerEvents(spy)[0]![2]).toMatchObject({ toolCalls: 1, recovered: false });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('a /cancel that lands during the retry turn answers as cancelled, not with the retry text', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const result = await makeElanousAgentRunTurn(config, 'telegram', async (opts) => {
+      calls++;
+      if (calls === 1) {
+        opts.onToolCall?.({ id: 't1', name: 'Read', args: {} });
+        return toolOnlyResult();
+      }
+      controller.abort();
+      return { ...toolOnlyResult(), text: 'retry answer' };
+    })({ userConfig: config, sessionId: 'empty-answer-session', userText: 'question', signal: controller.signal });
+    expect(calls).toBe(2);
+    expect(result.text).toContain('/cancel');
+    expect(result.text.includes('retry answer')).toBe(false);
+    expect(result.text.includes('답을 만들지 못했다')).toBe(false);
+  });
+
+  test('a retry that throws still ends in the failure sentence', async () => {
+    let calls = 0;
+    const result = await makeElanousAgentRunTurn(config, 'telegram', async (opts) => {
+      calls++;
+      if (calls > 1) throw new Error('llm down');
+      opts.onToolCall?.({ id: 't1', name: 'Read', args: {} });
+      return toolOnlyResult();
+    })({ userConfig: config, sessionId: 'empty-answer-session', userText: 'question' });
+    expect(result.text).toContain('답을 만들지 못했다 — 툴 1개 실행');
+  });
+
+  test('turns with text after the tool, a cancelled turn, an empty no-tool turn and a non-Telegram surface never start a retry', async () => {
+    const spy = spyOn(debug, 'log');
+    try {
+      let calls = 0;
+      const normal = await makeElanousAgentRunTurn(config, 'telegram', (opts) => { calls++; return fakeTurn(opts); })({
+        userConfig: config, sessionId: 'empty-answer-session', userText: 'question',
+      });
+      expect(calls).toBe(1);
+      expect(normal.text.startsWith('Final answer.\n\n')).toBe(true);
+      const controller = new AbortController();
+      controller.abort();
+      const cancelled = await makeElanousAgentRunTurn(config, 'telegram', async (opts) => {
+        calls++;
+        opts.onToolCall?.({ id: 't1', name: 'Read', args: {} });
+        return toolOnlyResult();
+      })({ userConfig: config, sessionId: 'empty-answer-session', userText: 'question', signal: controller.signal });
+      expect(calls).toBe(2);
+      expect(cancelled.text).toContain('/cancel');
+      const noTool = await makeElanousAgentRunTurn(config, 'telegram', async () => { calls++; return toolOnlyResult(); })({
+        userConfig: config, sessionId: 'empty-answer-session', userText: 'question',
+      });
+      expect(calls).toBe(3);
+      expect(noTool.text.includes('답을 만들지 못했다')).toBe(false);
+      const discord = await makeElanousAgentRunTurn(config, 'discord', async (opts) => {
+        calls++;
+        opts.onToolCall?.({ id: 't1', name: 'Read', args: {} });
+        return toolOnlyResult();
+      })({ userConfig: config, sessionId: 'empty-answer-session', userText: 'question' });
+      expect(calls).toBe(4);
+      expect(discord.text.includes('답을 만들지 못했다')).toBe(false);
+      expect(emptyAnswerEvents(spy)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

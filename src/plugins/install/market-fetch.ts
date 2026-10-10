@@ -13,7 +13,14 @@ export const ELANOUS_MARKET_URL = 'https://elanvitalai.github.io/elanous-plugins
 const NAME = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const MAX_INDEX_BYTES = 8 * 1024 * 1024;
 
-export interface MarketConfig { name: string; url: string }
+export interface MarketConfig {
+  name: string;
+  url: string;
+  /** Explicit tenant allowlist for a private market; absent for existing plugin markets. */
+  enterpriseIds?: string[];
+  /** Keys bound to this private market, never inherited from the global plugin trust pool. */
+  trustedKeys?: Array<{ keyId: string; publicKey: string }>;
+}
 export interface MarketFetchOptions {
   root?: string;
   marketDir?: string;
@@ -75,6 +82,24 @@ function configuredMarkets(settings: Record<string, unknown>): MarketConfig[] {
     return { name, url: marketUrl(url) };
   });
 }
+function internalMarkets(settings: Record<string, unknown>): MarketConfig[] {
+  const entries = settings.internalMarkets;
+  if (entries === undefined) return [];
+  if (!Array.isArray(entries)) throw new MarketFetchError('io', 'invalid internal markets configuration');
+  const names = new Set<string>();
+  return entries.map((entry: unknown) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new MarketFetchError('io', 'invalid internal market configuration');
+    const { name, url, enterpriseIds, trustedKeys } = entry as Record<string, unknown>;
+    if (typeof name !== 'string' || !NAME.test(name) || names.has(name) || name === 'elanous') throw new MarketFetchError('io', `invalid or duplicate internal market name: ${String(name)}`);
+    if (!Array.isArray(enterpriseIds) || !enterpriseIds.length || !enterpriseIds.every(id => typeof id === 'string' && id.trim() && id === id.trim())
+      || new Set(enterpriseIds).size !== enterpriseIds.length) throw new MarketFetchError('io', `invalid internal market enterprise allowlist: ${name}`);
+    if (!Array.isArray(trustedKeys) || !trustedKeys.length || !trustedKeys.every(key => key && typeof key === 'object' && typeof key.keyId === 'string' && /^[a-fA-F0-9]{8}$/.test(key.keyId) && typeof key.publicKey === 'string' && key.publicKey.length > 0)
+      || new Set(trustedKeys.map(key => key.keyId)).size !== trustedKeys.length) throw new MarketFetchError('io', `invalid internal market trusted keys: ${name}`);
+    names.add(name);
+    return { name, url: marketUrl(url), enterpriseIds: enterpriseIds as string[], trustedKeys: trustedKeys as Array<{ keyId: string; publicKey: string }> };
+  });
+}
+
 function trust(settings: Record<string, unknown>, opts: MarketFetchOptions): ReadonlyArray<{ keyId: string; publicKey: string }> {
   const additional = settings.trustedKeys;
   if (additional !== undefined && (!Array.isArray(additional) || !additional.every(key => key && typeof key.keyId === 'string' && typeof key.publicKey === 'string'))) {
@@ -115,7 +140,7 @@ function location(name: string, opts: MarketFetchOptions): string {
   return join(resolve(opts.marketDir ?? join(opts.root ?? elanousStateRoot(), 'markets')), name);
 }
 
-interface CacheState { url: string; lastSequence: number; indexHash: string; signatureHash: string }
+interface CacheState { url: string; lastSequence: number; indexHash: string; signatureHash: string; trustHash?: string }
 
 function cacheState(path: string): CacheState | undefined {
   if (!existsSync(path)) return undefined;
@@ -123,13 +148,14 @@ function cacheState(path: string): CacheState | undefined {
   try { value = JSON.parse(readFileSync(path, 'utf8')); }
   catch { throw new MarketFetchError('io', 'invalid market cache state'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new MarketFetchError('io', 'invalid market cache state');
-  const { url, lastSequence, indexHash, signatureHash } = value as Record<string, unknown>;
+  const { url, lastSequence, indexHash, signatureHash, trustHash } = value as Record<string, unknown>;
   if (typeof url !== 'string' || !Number.isSafeInteger(lastSequence) || (lastSequence as number) < 0
     || typeof indexHash !== 'string' || !/^[a-f0-9]{64}$/.test(indexHash)
-    || typeof signatureHash !== 'string' || !/^[a-f0-9]{64}$/.test(signatureHash)) {
+    || typeof signatureHash !== 'string' || !/^[a-f0-9]{64}$/.test(signatureHash)
+    || (trustHash !== undefined && (typeof trustHash !== 'string' || !/^[a-f0-9]{64}$/.test(trustHash)))) {
     throw new MarketFetchError('io', 'invalid market cache state');
   }
-  return { url, lastSequence: lastSequence as number, indexHash, signatureHash };
+  return { url, lastSequence: lastSequence as number, indexHash, signatureHash, ...(trustHash === undefined ? {} : { trustHash }) };
 }
 
 function digest(bytes: Uint8Array | string): string {
@@ -147,9 +173,21 @@ function checked(bytes: Uint8Array, signatureText: string, name: string, keys: R
 const marketIndexQueues = new Map<string, Promise<void>>();
 
 export function ensureMarketIndex(name: string, opts: MarketFetchOptions = {}): Promise<MarketIndex> {
-  const directory = location(name, opts);
+  return queuedMarketIndex(name, opts);
+}
+
+/** Private indices require a configured market, a bound signing key and an explicitly allowed enterprise. */
+export function ensureInternalMarketIndex(name: string, enterpriseId: string, opts: MarketFetchOptions = {}): Promise<MarketIndex> {
+  if (typeof enterpriseId !== 'string' || !enterpriseId.trim() || enterpriseId !== enterpriseId.trim()) {
+    return Promise.reject(new MarketFetchError('io', `enterprise not allowed for internal market: ${name}`));
+  }
+  return queuedMarketIndex(name, opts, enterpriseId);
+}
+
+function queuedMarketIndex(name: string, opts: MarketFetchOptions, enterpriseId?: string): Promise<MarketIndex> {
+  const directory = enterpriseId === undefined ? location(name, opts) : join(resolve(opts.marketDir ?? join(opts.root ?? elanousStateRoot(), 'markets')), '.internal', name, digest(enterpriseId));
   const previous = marketIndexQueues.get(directory) ?? Promise.resolve();
-  const result = previous.then(() => fetchMarketIndex(name, opts));
+  const result = previous.then(() => fetchMarketIndex(name, opts, enterpriseId, directory));
   const tail = result.then(() => {}, () => {});
   marketIndexQueues.set(directory, tail);
   void tail.then(() => {
@@ -158,11 +196,25 @@ export function ensureMarketIndex(name: string, opts: MarketFetchOptions = {}): 
   return result;
 }
 
-async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise<MarketIndex> {
-  const market = listMarkets(opts).find(entry => entry.name === name);
+async function fetchMarketIndex(name: string, opts: MarketFetchOptions, enterpriseId: string | undefined, directory: string): Promise<MarketIndex> {
+  const settings = marketSettings(config(opts));
+  const market: MarketConfig | undefined = enterpriseId === undefined
+    ? [{ name: 'elanous', url: ELANOUS_MARKET_URL }, ...configuredMarkets(settings)].find(entry => entry.name === name)
+    : internalMarkets(settings).find(entry => entry.name === name);
   if (!market) throw new MarketFetchError('io', `market not configured: ${name}`);
-  const keys = trust(marketSettings(config(opts)), opts);
-  const directory = location(name, opts);
+  if (enterpriseId !== undefined && !market.enterpriseIds?.includes(enterpriseId)) {
+    throw new MarketFetchError('io', `enterprise not allowed for internal market: ${name}`);
+  }
+  const keys = enterpriseId === undefined ? trust(settings, opts) : market.trustedKeys!;
+  const verificationOptions = enterpriseId === undefined ? opts : { ...opts, verifySignature: verifyIndex };
+  const trustHash = enterpriseId === undefined ? undefined : digest(JSON.stringify(keys));
+  const authorized = (verified: ReturnType<typeof checked>): ReturnType<typeof checked> => {
+    if (enterpriseId !== undefined && [...(verified.index.knowledgePacks ?? []), ...(verified.index.loopBundles ?? [])]
+      .some(entry => entry.visibility !== 'internal' || entry.enterpriseId !== enterpriseId)) {
+      throw new MarketFetchError('io', `internal market contains entries outside enterprise allowlist: ${name}`);
+    }
+    return verified;
+  };
   const indexFile = join(directory, 'marketplace.json');
   const sigFile = join(directory, 'index.sig');
   const stateFile = join(directory, 'cache-state.json');
@@ -170,12 +222,12 @@ async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise
   // The URL is part of the cache identity, not just the market name.
   const lastSequence = state?.url === market.url ? state.lastSequence : undefined;
   let cached: ReturnType<typeof checked> | undefined;
-  if (state?.url === market.url && existsSync(indexFile) && existsSync(sigFile)) {
+  if (state?.url === market.url && (trustHash === undefined || state.trustHash === trustHash) && existsSync(indexFile) && existsSync(sigFile)) {
     const indexBytes = readFileSync(indexFile);
     const signatureText = readFileSync(sigFile, 'utf8');
     if (digest(indexBytes) === state.indexHash && digest(signatureText) === state.signatureHash) {
       try {
-        cached = checked(indexBytes, signatureText, name, keys, opts, lastSequence);
+        cached = authorized(checked(indexBytes, signatureText, name, keys, verificationOptions, lastSequence));
       } catch (error) {
         if (!(error instanceof MarketFetchError)) throw error;
       }
@@ -216,13 +268,13 @@ async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise
   };
   const bytes = await load('marketplace.json');
   const signature = new TextDecoder('utf-8', { fatal: true }).decode(await load('index.sig'));
-  const verified = checked(bytes, signature, name, keys, opts, lastSequence);
+  const verified = authorized(checked(bytes, signature, name, keys, verificationOptions, lastSequence));
   mkdirSync(directory, { recursive: true });
   // Cross-process: another CLI may have published a newer index since we read cache-state. Re-check the high-water
   // mark under a file lock right before publishing, so a slower process cannot roll the cache back (review R3).
   return withFileLockSync(join(directory, '.publish.lock'), () => {
   const current = cacheState(stateFile);
-  if (current?.url === market.url && current.lastSequence !== undefined && current.lastSequence > verified.index.sequence) {
+  if (current?.url === market.url && current.lastSequence > verified.index.sequence) {
     throw new MarketFetchError('signature', `market index rollback refused: ${name} sequence ${verified.index.sequence} < ${current.lastSequence}`);
   }
   const staging = mkdtempSync(join(directory, '.index-'));
@@ -232,7 +284,7 @@ async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise
     const tempState = join(staging, 'cache-state.json');
     writeFileSync(tempIndex, bytes);
     writeFileSync(tempSig, signature);
-    writeFileSync(tempState, JSON.stringify({ url: market.url, lastSequence: verified.index.sequence, indexHash: digest(bytes), signatureHash: digest(signature) } satisfies CacheState));
+    writeFileSync(tempState, JSON.stringify({ url: market.url, lastSequence: verified.index.sequence, indexHash: digest(bytes), signatureHash: digest(signature), ...(trustHash === undefined ? {} : { trustHash }) } satisfies CacheState));
     // Commit the verified high-water mark before replacing either cache file.
     // An interrupted publication then cannot roll back a previously verified index.
     renameSync(tempState, stateFile);

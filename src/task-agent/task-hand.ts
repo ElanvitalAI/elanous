@@ -8,8 +8,8 @@
  * - 관측: `debug.log('task-agent', 'handed', {taskId, seat, checklistId, mode})`.
  */
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, readFileSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
@@ -17,10 +17,68 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 
+export interface ResolveHandTextDeps {
+  cwd: string;
+  stat: (path: string) => Pick<Stats, 'isFile' | 'isDirectory'>;
+  readFile: (path: string, encoding: 'utf8') => string;
+}
+
+export type ResolvedHandText =
+  | { kind: 'unchanged'; text: string }
+  | { kind: 'inlined'; text: string; path: string; chars: number; sha256: string }
+  | { kind: 'rejected'; path: string; reason: '없다' | '디렉터리' | '읽기 실패' | '비었다' };
+
+function missingOrReadFailure(error: unknown): '없다' | '읽기 실패' {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' ? '없다' : '읽기 실패';
+}
+
+/** 파일 판정만 한다. 관측과 카드 작성은 호출자가 결과에 따라 수행한다. */
+export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd: process.cwd(), stat: statSync, readFile: readFileSync }): ResolvedHandText {
+  if (!text || /\s/.test(text)) return { kind: 'unchanged', text };
+  const path = resolve(deps.cwd, text);
+  const extension = /\.(?:md|markdown|txt)$/i.test(text);
+  let file: Pick<Stats, 'isFile' | 'isDirectory'>;
+  try { file = deps.stat(path); } catch (error) {
+    if (!extension) return { kind: 'unchanged', text };
+    return { kind: 'rejected', path, reason: missingOrReadFailure(error) };
+  }
+  if (!file.isFile() && !extension && !file.isDirectory()) return { kind: 'unchanged', text };
+  if (!file.isFile()) return { kind: 'rejected', path, reason: file.isDirectory() ? '디렉터리' : '읽기 실패' };
+  let content: string;
+  // stat 과 read 사이에 지워지거나 경로가 바뀌어도 사유는 같은 규칙(없다/읽기 실패)으로 가른다.
+  try { content = deps.readFile(path, 'utf8'); } catch (error) { return { kind: 'rejected', path, reason: missingOrReadFailure(error) }; }
+  const carried = content.trim();
+  if (!carried) return { kind: 'rejected', path, reason: '비었다' };
+  return { kind: 'inlined', text: content, path, chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
+}
+
 export const TASK_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TaskSeat = typeof TASK_SEATS[number];
 /** 과제 카드 id 접두 — `task show <id>` 가 이 접두로 TOX 태스크와 갈린다. */
 export const TASK_CARD_PREFIX = 'ta-';
+/** Pod Job 의 metadata.labels 에 붙일 카드 식별자 — 원장의 카드 id 와 정확히 같아야 한다. */
+export const TASK_CARD_LABEL = 'elanous.task-card';
+/**
+ * TA-LIVE-LAND-2 — run-level marker set by `tasks hand --ta-land` on the launched `harness say`. The Pod surface
+ * (`self-implement-pod.ts`) reads it: with `taskAgent.liveMoves` ∋ `propose-land` the host re-gates without merging so
+ * the task agent's `executeLiveLand` → `pr land --expected-head` owns the land. Without propose-land it is ignored.
+ */
+export const TA_LAND_ENV = 'ELANOUS_TA_LAND';
+export interface TaskCardLabelContext {
+  cardId: string;
+  labels: Record<typeof TASK_CARD_LABEL, string>;
+}
+
+/** 카드 원장을 변경하지 않는 Pod 라벨 맥락. 정규화하면 다른 카드와 충돌할 수 있으므로 유효하지 않은 id 는 거부한다. */
+export function taskCardLabelContext(card: Pick<TaskCard, 'id'>): TaskCardLabelContext {
+  const id = card.id;
+  if (!id.startsWith(TASK_CARD_PREFIX) || id.length > 63 || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
+    throw new Error(`Pod 라벨에 쓸 수 없는 과제 카드 id: ${id}`);
+  }
+  return { cardId: id, labels: { [TASK_CARD_LABEL]: id } };
+}
+
 /**
  * 과제 종결 종류(RFC-loop-agent-map §A4b③) — 비면 code-pr(PR 병합)로 읽는다.
  * code-pr 밖의 종류는 «확인 증거»(`judge.ts` TaskJudgeInput.evidence)로 종결한다 — 증거를 만드는 일은 DEFAULT-HANDS 몫.
@@ -28,8 +86,22 @@ export const TASK_CARD_PREFIX = 'ta-';
 export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support'] as const;
 export type CompletionKind = typeof COMPLETION_KINDS[number];
 
-/** `run-bound`·`goal-bound`·`pr-bound` 은 runId(⊕ pr)를 싣는다 — 옛 카드의 칸은 at·event·detail 뿐이다. */
-export interface TaskCardEvent { at: string; event: string; detail?: string; runId?: string; pr?: number }
+/**
+ * `run-bound`·`goal-bound`·`pr-bound` 은 runId(⊕ pr)를 싣는다 — 옛 카드의 칸은 at·event·detail 뿐이다.
+ * TA-LIVE-MOVE-CARD-HISTORY — `live-move` 줄만 kind·executed·ok·executorResult·head·effect 를 더 싣는다(`live-move-history.ts`).
+ */
+export interface TaskCardEvent {
+  at: string; event: string; detail?: string; runId?: string; pr?: number;
+  kind?: string; executed?: boolean; ok?: boolean; executorResult?: 'shadow' | 'live'; head?: string; effect?: string;
+  /** TA-REVIEW-RESULT-CAPTURE — review live-move 줄 · 결과 줄(`live-move-result`)의 결과 파일 경로. */
+  resultPath?: string;
+  /** TA-REVIEW-RESULT-CAPTURE — `live-move-result` 줄만: 회수한 `self review --json` 의 칸(못 읽은 칸은 null). */
+  verdict?: string | null; reviewed?: boolean | null; mustFix?: number | null; reviewRoute?: string | null;
+}
+/** 카드 history 의 live-move 줄 이벤트 이름 — 상태 사유(«마지막 칸») 판정에서 뺀다. */
+export const LIVE_MOVE_HISTORY_EVENT = 'live-move';
+/** TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 리뷰의 결과(또는 «결과 없음») 줄 — live-move 줄처럼 상태 사유 판정에서 뺀다. */
+export const LIVE_MOVE_RESULT_EVENT = 'live-move-result';
 export interface TaskCardMove { kind: 'launch' | 'wait'; command?: string[]; reason: string }
 export interface TaskCard {
   id: string;
@@ -82,9 +154,38 @@ export interface TaskCard {
   /** 미션 카드만 — 모든 조각 착지 → 칸 green «제안»(체크리스트는 손대지 않는다 · OP/주인이 뒤집는다). */
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
   /** TA-JUDGE-LIVE-SAFE — live `review` 수가 리뷰를 요청한 PR 머리들(머리마다 한 번 · 띄우기 실패면 error · 이력은 지우지 않는다). */
-  reviewRequests?: Array<{ pr: number; head: string; at: string; error?: string }>;
+  reviewRequests?: Array<{ pr: number; head: string; at: string; error?: string; /** TA-REVIEW-RESULT-CAPTURE — 자식 `--json` stdout 을 받는 파일. */ resultPath?: string }>;
+  /**
+   * TA-REJUDGE-ON-HEAD — 런 멈춤 «뒤» 머리마다 한 번 돌린 호스트 재게이트(병합 없음 · 떼어 띄움). 결과는 `resultPath` 파일에서
+   * 다음 틱이 회수해 passed·status·baseCommit·detail 을 채운다(비어 있으면 아직 도는 중 · 없는 칸을 «통과»로 읽지 않는다).
+   */
+  regates?: Array<{ pr: number; head: string; at: string; resultPath?: string; passed?: boolean; status?: string; baseCommit?: string; detail?: string }>;
   /** Live land attempts, claimed before invocation, once per PR head even if the command fails. */
   landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string }>;
+  /** TA-LIVE-LAND-2 — `tasks hand --ta-land`: this card's run leaves the merge to the task agent (propose-land). */
+  taLand?: true;
+  /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
+  childLlm?: TaskChildLlm;
+}
+
+/** 구현 자식 LLM 선택 — 하니스 `--child-llm-provider/--child-llm-model/--child-llm-effort` 로 그대로 넘긴다(검증 권위는 하니스). */
+export interface TaskChildLlm { provider: string; model: string; effort?: string }
+
+/**
+ * `<provider>/<model>` 을 «첫» `/` 에서만 가른다(모델 id 가 `/` 를 담을 수 있다).
+ * openrouter 는 하니스의 모델 id 가 `openrouter/` 접두를 포함하므로(`openrouter/z-ai/glm-5.3`) 전체 문자열을 모델로 둔다
+ * (`openrouter/openrouter/…` 처럼 접두를 이미 단 입력은 두 번 붙이지 않는다).
+ */
+export function parseChildLlm(value: string, effort?: string): TaskChildLlm {
+  // 원 값 그대로 본다 — 앞뒤 공백·개행도 «잘못된 값»이다(조용히 다듬지 않는다).
+  const slash = value.indexOf('/');
+  const provider = slash < 0 ? '' : value.slice(0, slash);
+  const rest = slash < 0 ? '' : value.slice(slash + 1);
+  if (!provider || !rest || /[\s\p{Cc}]/u.test(value)) throw new Error(`--child-llm 은 <provider>/<model> 이다(예: grok/grok-4.7): ${JSON.stringify(value)}`);
+  const model = provider === 'openrouter' && !rest.startsWith('openrouter/') ? `openrouter/${rest}` : rest;
+  if (effort === undefined) return { provider, model };
+  if (!effort || /[\s\p{Cc}]/u.test(effort)) throw new Error(`--child-llm-effort 가 비었거나 공백·제어 문자를 담았다: ${JSON.stringify(effort)}`);
+  return { provider, model, effort };
 }
 
 /** 런 원장에서 묶은 PR — url 은 원장(pr-opened · Pod job-finished)에 있을 때만(지어내지 않는다). */
@@ -93,6 +194,14 @@ export interface TaskCardPr { number: number; url?: string }
 /** 카드의 PR 번호 — 수동(number)·묶음(`{number,url}`) 둘 다. */
 export function cardPrNumber(card: Pick<TaskCard, 'pr'>): number | undefined {
   return typeof card.pr === 'number' ? card.pr : card.pr?.number;
+}
+
+/** A uniquely launched code-PR card may own a draft through its PR or its opening run. */
+export function draftTaskOwner(cards: readonly TaskCard[], draft: { number: number; runId?: string | null }): TaskCard | undefined {
+  const owners = cards.filter((card) => card.status === 'launched' && (card.completion ?? 'code-pr') === 'code-pr'
+    && card.seat && (card.runId || card.runChildId) && (cardPrNumber(card) === draft.number
+      || (draft.runId && (card.runId === draft.runId || card.runChildId === draft.runId))));
+  return owners.length === 1 ? owners[0] : undefined;
 }
 
 interface TaskAgentStateFile { tasks?: Record<string, TaskCard>; [key: string]: unknown }
@@ -171,8 +280,11 @@ export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard 
 }
 
 /** 첫 수의 elanous 인자(진입점·--config-dir 앞붙임은 launcher 몫). */
-export function launchArgs(card: Pick<TaskCard, 'text' | 'seat'>): string[] {
-  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', card.text];
+export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm'>): string[] {
+  const child = card.childLlm
+    ? ['--child-llm-provider', card.childLlm.provider, '--child-llm-model', card.childLlm.model, ...(card.childLlm.effort ? ['--child-llm-effort', card.childLlm.effort] : [])]
+    : [];
+  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...child, card.text];
 }
 
 /**
@@ -186,7 +298,8 @@ export function nextMoveFor(card: TaskCard, landed?: ReadonlySet<string>): TaskC
   if (card.status !== 'launched' && unmet.length > 0) return { kind: 'wait', reason: `after ${unmet.join(', ')}${landed ? '' : ' · 착지 미확인'}` };
   if (card.status === 'handed') return { kind: 'launch', command: launchArgs(card), reason: '넘겨받은 과제 — 첫 발사' };
   if (card.status === 'launch-failed') return { kind: 'launch', command: launchArgs(card), reason: '직전 발사 실패 — 다시 발사' };
-  if (card.status === 'failed') return { kind: 'wait', reason: card.history.at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
+  // live-move 줄(관측 기록)은 실패 사유가 아니다 — 그 줄을 뺀 마지막 칸이 사유다(live-move 줄 없는 카드는 종전과 같다).
+  if (card.status === 'failed') return { kind: 'wait', reason: card.history.filter((item) => item.event !== LIVE_MOVE_HISTORY_EVENT && item.event !== LIVE_MOVE_RESULT_EVENT).at(-1)?.detail ?? '런 실패 — PR·수확 가지 없음' };
   return { kind: 'wait', reason: '발사됨 — 런 멈춤을 슈퍼바이저 그림자 판단(task-agent.shadow-move)이 받는다' };
 }
 
@@ -195,7 +308,7 @@ export function shellQuote(arg: string): string {
 }
 
 /** 발사기에 넘기는 연결 — env(`ELANOUS_RUN_ID`)를 자식 환경에 얹으면 하니스 런이 `runId` 로 돈다(`resolveRunIdentity` 상속). launchId 는 카드에만 남는 발사 토큰이다. */
-export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string> }
+export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string>; cardLabelContext?: TaskCardLabelContext }
 /** 발사기가 «이 런 id 로 띄웠다»고 돌려주는 영수증 — 없으면 카드에 런 id 를 적지 않는다(추측하지 않는다). */
 export interface TaskLaunchReceipt {
   runId?: string;
@@ -215,6 +328,11 @@ export interface HandTaskOptions {
   goal?: string;
   milestone?: string;
   live?: boolean;
+  /** TA-LIVE-LAND-2 — `--ta-land`: card field `taLand` ⊕ launch env `ELANOUS_TA_LAND=1`. */
+  taLand?: boolean;
+  /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
+  childLlm?: string;
+  childLlmEffort?: string;
   statePath?: string;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
@@ -260,6 +378,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   for (const [flag, value] of [['--goal', opts.goal], ['--milestone', opts.milestone]] as const) {
     if (value !== undefined && (!value.trim() || /\p{Cc}/u.test(value))) throw new Error(`${flag} id 가 비었거나 제어 문자를 담았다: ${JSON.stringify(value)}`);
   }
+  if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
+  const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -287,6 +407,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(project ? { project } : {}),
     ...(opts.goal ? { goal: opts.goal } : {}),
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
+    ...(opts.taLand === true ? { taLand: true as const } : {}),
+    ...(childLlm ? { childLlm } : {}),
     createdAt: now.toISOString(),
     status: 'handed',
     history: [],
@@ -310,12 +432,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (!owned.ok) throw new TaskCardSupersededError(next.id);
   };
   writeCard(path, card);
-  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit }); } catch { /* fail-soft */ }
+  try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true }); } catch { /* fail-soft */ }
+  if (childLlm) {
+    try { debug.log('task-agent', 'child-llm', { taskId: id, input: opts.childLlm, provider: childLlm.provider, model: childLlm.model, effort: childLlm.effort ?? null, mode }); } catch { /* fail-soft */ }
+  }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
   const runId = mintRunId();
   const launchId = `tl-${randomBytes(6).toString('hex')}`;
-  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId } };
+  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card) };
   let receipt: void | TaskLaunchReceipt;
   try {
     receipt = await opts.launcher(move.command!, project?.target, context);

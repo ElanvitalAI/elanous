@@ -6,14 +6,16 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { deferOutbound, deliver, flushDeferred, sendOutbound, sendTelegramDirect, setInProcessOutbound } from '../domains/outbound-alert.js';
-import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { createPendingQuestion, readPendingQuestions, removePendingQuestion, removePendingQuestionAnswer, writePendingQuestion, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
+import * as features from '../release-loop/feature-store.js';
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { getUserConfig } from '../user-config.js';
 import { effectiveInstanceRoot } from './resolve.js';
 import {
-  assertNotTestWritingOps, EXTRA_OPS_ROOTS_ENV, isInsideOpsRoot, opsRoots, setAccountHomeLookupForTesting, setOpsRootsForTesting, testProcessSignal,
+  assertNotTestWritingOps, EXTRA_OPS_ROOTS_ENV, isInsideOpsRoot, opsRoots, physicalPath, setAccountHomeLookupForTesting, setOpsRootsForTesting, testProcessSignal,
   TestOpsWriteRefusedError,
 } from './test-write-guard.js';
 
@@ -36,6 +38,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setOpsRootsForTesting(null);
+  resetElanousConfigDir();
   for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
   rmSync(root, { recursive: true, force: true });
 });
@@ -51,11 +54,16 @@ describe('test-process detection (measured under bun test)', () => {
     expect(testProcessSignal({ NODE_ENV: 'production' }, '/repo/scripts/release.ts')).toBeNull();
   });
 
-  test('the real ops root is the account home, not a redirected HOME', () => {
+  test('the account home is protected even when the account itself lives under tmp', () => {
     setOpsRootsForTesting(null);
-    const [real] = opsRoots();
-    expect(real!.endsWith('/.elanous')).toBe(true);
-    expect(real).not.toContain(tmpdir());
+    const accountHome = join(root, 'account-home');
+    setAccountHomeLookupForTesting(() => accountHome);
+    try {
+      const accountRoot = join(accountHome, '.elanous');
+      expect(opsRoots()).toContain(physicalPath(accountRoot));
+      expect(() => assertNotTestWritingOps(join(accountRoot, 'logs', 'logs.db'), 'probe')).toThrow(TestOpsWriteRefusedError);
+      expect(() => assertNotTestWritingOps(join(isolated, 'logs', 'logs.db'), 'probe')).not.toThrow();
+    } finally { setAccountHomeLookupForTesting(null); }
   });
 
   test('an unreadable account database fails toward protection: conventional homes and HOME are all ops', () => {
@@ -116,6 +124,46 @@ describe('test-process detection (measured under bun test)', () => {
 });
 
 describe('ops-like root → refused · isolated root → allowed', () => {
+  test('checklist ledger open and JSON export refuse before creating ops files; isolated checklist retains its format', () => {
+    const opsDb = join(opsLike, 'release', 'features.sqlite');
+    const opsJson = join(opsLike, 'release', '0.2.26', 'checklist.json');
+    expect(() => features.readSchedules(opsLike)).toThrow(TestOpsWriteRefusedError);
+    expect(existsSync(opsDb)).toBe(false);
+    setElanousConfigDir(opsLike);
+    expect(() => features.exportJson('0.2.26', '', '')).toThrow(TestOpsWriteRefusedError);
+    expect(existsSync(opsDb)).toBe(false);
+    expect(existsSync(opsJson)).toBe(false);
+    setElanousConfigDir(isolated);
+    const item = { id: 'GUARD', title: 'guard', status: 'yellow' as const, updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'OP' };
+    features.add('0.2.26', item, '', '');
+    const data = features.exportJson('0.2.26', '', '');
+    expect(data.items).toContainEqual(item);
+    expect(JSON.parse(readFileSync(join(isolated, 'release', '0.2.26', 'checklist.json'), 'utf8'))).toEqual(data);
+  });
+
+  test('pending questions and answers refuse ops writes and removals before any filesystem mutation', () => {
+    const question = createPendingQuestion('guard', { questions: [{ id: 'choice', header: 'Choice', question: 'Choose?', options: [{ label: 'A', description: 'A' }] }] });
+    const answer = { id: 'guard', result: { answers: { choice: 'A' } } };
+    const ops = { root: () => opsLike };
+    const own = { root: () => isolated };
+    expect(() => writePendingQuestion(question, ops)).toThrow(TestOpsWriteRefusedError);
+    expect(() => writePendingQuestionAnswer(answer, ops)).toThrow(TestOpsWriteRefusedError);
+    expect(() => removePendingQuestion('guard', ops)).toThrow(TestOpsWriteRefusedError);
+    expect(() => removePendingQuestionAnswer('guard', ops)).toThrow(TestOpsWriteRefusedError);
+    expect(existsSync(join(opsLike, 'ask-user-question'))).toBe(false);
+    const alias = join(isolated, 'ops-alias');
+    symlinkSync(opsLike, alias);
+    expect(() => writePendingQuestion(question, { root: () => alias })).toThrow(TestOpsWriteRefusedError);
+    expect(existsSync(join(opsLike, 'ask-user-question'))).toBe(false);
+    writePendingQuestion(question, own);
+    writePendingQuestionAnswer(answer, own);
+    expect(readPendingQuestions(own)).toEqual({ ok: true, questions: [question] });
+    expect(JSON.parse(readFileSync(join(isolated, 'ask-user-question', 'answers', 'guard.json'), 'utf8'))).toEqual(answer);
+    removePendingQuestionAnswer('guard', own);
+    removePendingQuestion('guard', own);
+    expect(readPendingQuestions(own)).toEqual({ ok: true, questions: [] });
+  });
+
   test('deferred-alert queue append', () => {
     const opsQueue = join(opsLike, 'conatus', 'outbound_deferred.jsonl');
     expect(() => deferOutbound('private-alert-body', 'ops-alert', null, opsQueue)).toThrow(TestOpsWriteRefusedError);
@@ -274,6 +322,33 @@ describe('ops-like root → refused · isolated root → allowed', () => {
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout.trim().split('\n').at(-1)!)).toEqual({ refused: 'TestOpsWriteRefusedError', curlCalls: 0 });
   }, 90_000);
+
+  test('real-send eligibility precedes the guard: no target does not send, an eligible ops route cannot send', () => {
+    const base = getUserConfig();
+    const noTarget = { ...base, telegram: { ...base.telegram, channels: [], botToken: undefined, homeChannel: undefined } } as typeof base;
+    let calls = 0;
+    const sendRaw = () => { calls++; return true; };
+    setOpsRootsForTesting([effectiveInstanceRoot(), getElanousConfigDir()]);
+    expect(sendTelegramDirect('body', 'report', { config: noTarget, sendRaw })).toBe(false);
+    expect(calls).toBe(0);
+    const configured = { ...base, telegram: { ...base.telegram, channels: undefined, botToken: '2:fake', homeChannel: 2 } } as typeof base;
+    expect(() => sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw })).toThrow(TestOpsWriteRefusedError);
+    expect(calls).toBe(0);
+  });
+
+  test('route callback and sender exceptions retain the fallback, but an ops send refusal escapes', () => {
+    const base = getUserConfig();
+    const configured = { ...base, telegram: { ...base.telegram, botToken: '2:fake', homeChannel: 2,
+      channels: [{ name: 'ops', botToken: '2:fake', chatId: 303, interactive: true, roles: ['system'] }],
+    } } as typeof base;
+    const onBot = () => { throw new Error('callback failed'); };
+    const sendRaw = () => { throw new Error('sender failed'); };
+    // A resolved channel target is inside the routing fallback, which returns false for an authoritative table.
+    expect(sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw: () => true }, onBot)).toBe(false);
+    expect(sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw })).toBe(false);
+    setOpsRootsForTesting([effectiveInstanceRoot(), getElanousConfigDir()]);
+    expect(() => sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw })).toThrow(TestOpsWriteRefusedError);
+  });
 
   test('an injected sender is still refused when the test resolved the ops universe', () => {
     setOpsRootsForTesting([effectiveInstanceRoot(), getElanousConfigDir()]);

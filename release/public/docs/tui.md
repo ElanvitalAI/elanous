@@ -59,6 +59,14 @@ The commands you will use most. The TUI has more — open the help overlay with 
 
 `elanous keys` prints every keybinding and slash command.
 
+## Folded internal notes in chat
+
+When a final reply contains a `[NO FINAL SYNTHESIS]` tail, the TUI shows the
+preceding text and folds the tail into one `● Internal notes folded · N lines ·
+press f to expand` line. With the log pane focused, press `f` to expand the
+most recent fold; press it again to collapse it. The tail is still available
+when expanded. Replies without that marker keep their usual display.
+
 ## Argument autocomplete
 
 After typing a command name and a space, Tab / Up / Down navigate

@@ -1,0 +1,3 @@
+log-horizon-sample:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/mss/logging/horizon-watch.ts" --json'
+  timeout_ms: 120000

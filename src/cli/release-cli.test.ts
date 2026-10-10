@@ -131,7 +131,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -140,6 +140,27 @@ describe('release checklist CLI', () => {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
     }
+  });
+
+  test('add/set --kind postpub persists; bogus remains rejected and help identifies the post-publication gate exception', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-postpub-cli-'));
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+    try {
+      await run('add', 'POSTPUB-VERIFY', '발행 뒤 실측', '--kind', 'postpub');
+      expect(listChecklist('9.9.9').items[0]?.kind).toBe('postpub');
+      await run('add', 'SCREEN', '다섯 화면', '--kind', 'screen');
+      await run('set', 'SCREEN', '--kind', 'postpub');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'SCREEN')?.kind).toBe('postpub');
+      await expect(run('add', 'INVALID', 'invalid', '--kind', 'bogus')).rejects.toThrow('잘못된 종류: bogus');
+      await expect(run('set', 'SCREEN', '--kind', 'bogus')).rejects.toThrow('잘못된 종류: bogus');
+      expect(listChecklist('9.9.9').items).toHaveLength(2);
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'SCREEN')?.kind).toBe('postpub');
+      const cmd = new Command(); registerReleaseCommands(cmd);
+      const checklist = cmd.commands.find((item) => item.name() === 'release')!.commands.find((item) => item.name() === 'checklist')!;
+      for (const name of ['add', 'set']) expect(checklist.commands.find((item) => item.name() === name)!.options.find((option) => option.long === '--kind')?.description).toContain('postpub = 발행 뒤 실측 칸 — 판 관문이 발행 전 판정에서 빼고 따로 센다');
+    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('DOC-REFS: the real add/set --ref entry stores repo files once, refuses folders and .. segments, and list JSON shows refs', async () => {
@@ -478,6 +499,54 @@ describe('release schedule CLI', () => {
 });
 
 describe('release run CLI', () => {
+  test('--publish-at reaches the publish graph input on direct and --if-ready runs; omission preserves the input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-publish-at-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const inputs: unknown[] = [];
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async (_path, options) => { inputs.push(options.input); return { status: 'done' } as never; } });
+      const run = (...args: string[]) => cli.parseAsync(['release', 'run', '--version', '0.2.4', ...args], { from: 'user' });
+      expect(cli.commands.find((c) => c.name() === 'release')!.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--publish-at <iso>');
+      await run('--publish-at', '2099-10-09T20:00+09:00');
+      await run('--if-ready', '--publish-at', '2099-10-09T20:00+09:00');
+      await run();
+      expect(inputs).toEqual([
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true },
+      ]);
+      process.exitCode = 0;
+      await run('--publish-at', '2099-10-09T20:00');
+      expect(inputs).toHaveLength(3);
+      expect(process.exitCode).toBe(1);
+      // Not ready: --if-ready would defer as a success — a malformed time is refused before readiness is read.
+      let readinessReads = 0;
+      const notReady = new Command();
+      registerReleaseCommands(notReady, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => { readinessReads++; return { ok: false, red: ['X'], undecided: [], blocked: [], moved: [], knownIssues: [] } as never; },
+        graph: async (_path, options) => { inputs.push(options.input); return { status: 'done' } as never; } });
+      process.exitCode = 0;
+      await notReady.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--publish-at', '2099-10-09T20:00'], { from: 'user' });
+      expect(process.exitCode).toBe(1);
+      expect(readinessReads).toBe(0);
+      expect(inputs).toHaveLength(3);
+      // A day that does not exist is refused, not rolled over into the next month — direct and --if-ready alike.
+      for (const args of [['--publish-at', '2099-02-30T20:00+09:00'], ['--if-ready', '--publish-at', '2099-02-30T20:00+09:00'], ['--publish-at', '2099-10-09T24:00+09:00'], ['--if-ready', '--publish-at', '2099-10-09T24:00+09:00']]) {
+        process.exitCode = 0;
+        await notReady.parseAsync(['release', 'run', '--version', '0.2.4', ...args], { from: 'user' });
+        expect(process.exitCode).toBe(1);
+      }
+      expect(readinessReads).toBe(0);
+      expect(inputs).toHaveLength(3);
+    } finally { process.exitCode = before ?? 0; output.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
   test('a direct release run while frozen fails in a real CLI process (exit 1 · JSON failure); --if-ready defers', () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-proc-'));
     try {

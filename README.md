@@ -7,16 +7,19 @@
 
 > **élan, and nous** — The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
 
-**One line in. Merged code out. Watch every decision.**
+**Elanous is the conductor that coordinates many AI agents and brings back only finished results.**
+It works with Codex and Claude (beta) — and gives them wings.
 
-Four pillars in one body: mission fabric · graph engineering · PTY & browser intelligence · loop agents — on observe, understand, heal.
+- **Loop agents** — a team of AI on duty for the work that repeats, kept at it until it is done.
+- **Graph engineering** — work you hand over runs as an execution graph: a work manual you can see, edit and share.
+- **On top: one sentence to start** — the smart wizard turns a request into a plan, an execution graph or a plugin.
+- **Support: harness and PTY intelligence** — it drives other coding agents in real terminals, and carries each change through implementation, tests, review and merge.
+- **Foundation: observe, understand, heal** — every layer stands on a system that watches itself, understands the context and repairs what it can.
 
-**A self-healing coding harness where eyes, hands, and memory all turn on
-one sentence — an agent that develops agents.**
-
-You describe a change in one sentence. elanous writes the goal document,
+For code, you describe a change in one sentence. elanous writes the goal document,
 creates an isolated git worktree, runs a child agent inside it, gates the
-result with tests, reviews it unattended, and merges. You are called when
+result with tests, reviews it unattended, opens a pull request and, when the
+gates and the review hold, merges it. You are called when
 the system cannot converge — not at every step.
 
 ```bash
@@ -38,7 +41,8 @@ Windows (PowerShell):
 irm https://github.com/ElanvitalAI/elanous/releases/latest/download/install.ps1 | iex
 ```
 
-Pin a version with `ELANOUS_VERSION=0.1.1` in front of `bash`. Each version
+Pin a version with `ELANOUS_VERSION=<version>` in front of `bash` (versions are
+listed on the [releases page](https://github.com/ElanvitalAI/elanous/releases)). Each version
 lives in its own folder under `~/.local/share/elanous/versions/`, and
 `~/.local/share/elanous/current` points at the active one, so older versions
 stay on disk for rollback.
@@ -105,10 +109,11 @@ elanous harness ask 내부 문서 `MY-ASK`                        # a written go
 ```
 
 See the [Quickstart](https://docs.elanous.ai/getting-started/quickstart/).
-## What makes it different
+## How it works
 
-Most agents do one of these well. elanous's claim is that **all three
-engage on a single request**.
+Loop agents and execution graphs carry the work: the graph keeps repeated
+work on a known path, and the loop agents handle what falls off it. Under
+them, three abilities engage on a single request:
 
 | | What it means | The real commands |
 |---|---|---|
@@ -120,15 +125,16 @@ Two more properties follow from that:
 
 - **Rigid *and* dynamic.** The contract — gates, unattended review, the
   run ledger — is fixed. The path taken through it is not.
-  ⚠️ Today these are *two* runtimes (the harness pipeline and
-  `elanous wf`'s DAG); connecting them is open work.
+  Workflows (`elanous wf`) and harness runs now share one execution
+  graph — one name, one canvas, one set of triggers — and YAML workflows
+  run on it through a compatibility layer. Merging the executors
+  themselves is still in progress.
 - **The eyes are partly borrowed.** Web and browser sight leans on paid
   services (firecrawl, grok inside omni-crawl, aside, CDP). elanous records
   *what stops working without each one* in `catalog/resources.yaml`.
-  ⚠️ 20 of 27 credentialed entries have that field empty today.
 
 > Lineage: `sync-skills` → `skillpad` → a 3-pane TUI chassis → **this**.
-> The TUI still ships and still works, but it is one surface among
+> The TUI still ships and still works, but it is one interface among
 > several (CLI, NEXUS/PWA dashboard, MCP, chat channels), not the point
 > of the project.
 ## The harness — how a sentence becomes a merged change
@@ -136,7 +142,8 @@ Two more properties follow from that:
 `elanous` carries a **self-implementation harness**. You describe a change
 in one sentence or one file; the harness writes a goal document, creates
 an isolated git worktree, runs a child agent inside it, gates the result
-with the test suite, and opens a pull request.
+with the test suite, opens a pull request and, when the gates and the
+review hold, merges it.
 
 ```bash
 elanous harness say "add a --json flag to the status command"   # one sentence
@@ -152,10 +159,8 @@ What each run leaves behind, so a failure can be read afterwards:
 - a **run ledger** entry (`elanous self run-ledger <id>`)
 - structured logs (`elanous logs --category <c>`)
 
-⚠️ The harness currently assumes it is operating on *this* repository in
-several places — notably the default integrity gate runs
-`bun bin/elanous.mjs --help`, which does not exist in a foreign project.
-Running the harness against another repository is **not supported yet**.
+⚠️ Working in other repositories is experimental: `elanous harness say --target <path>`
+picks the target repository, but the supported scope is not settled yet.
 ## Documentation
 
 All documentation lives at **[docs.elanous.ai](https://docs.elanous.ai/)** (한국어: [/ko](https://docs.elanous.ai/ko/)). <!-- announce:allow B11 -->
@@ -169,7 +174,7 @@ All documentation lives at **[docs.elanous.ai](https://docs.elanous.ai/)** (한�
 | Chat channels | [Telegram](https://docs.elanous.ai/surfaces/telegram/) · [Discord](https://docs.elanous.ai/surfaces/discord/) |
 | Settings and tools | [Configuration](https://docs.elanous.ai/reference/configuration/) · [External commands](https://docs.elanous.ai/reference/external-commands/) · [Source layout](https://docs.elanous.ai/concepts/source-layout/) |
 | Something failed | [Troubleshooting](https://docs.elanous.ai/help/troubleshooting/) |
-| What shipped | [Releases](https://docs.elanous.ai/releases/0-1-0/) |
+| What shipped | [Releases](https://github.com/ElanvitalAI/elanous/releases) |
 ## Requirements
 
 - **bun** — the tested version is pinned in [`.bun-version`](.bun-version); the
@@ -184,7 +189,7 @@ All documentation lives at **[docs.elanous.ai](https://docs.elanous.ai/)** (한�
 git clone https://github.com/ElanvitalAI/elanous && cd elanous
 bun install
 bun run src/index.ts        # dashboard (TUI)
-bun test                    # full suite (4,199 test files) — see AGENTS.md for the gate discipline
+bun test                    # full suite — see AGENTS.md for the gate discipline
 ```
 
 Link the CLI so `elanous` works anywhere:
@@ -199,6 +204,11 @@ Or run the first-run wizard (persists to `~/.elanous/config.json`):
 ```bash
 elanous setup
 ```
+
+## References / 참고한 오픈소스
+
+elanous studied the design and patterns of many open-source projects — the full list with repositories and licenses is in [내부 문서 `REFERENCES`). The most-referenced: [opencode](https://github.com/anomalyco/opencode) · [openclaw](https://github.com/openclaw/openclaw) · [hermes-agent](https://github.com/nousresearch/hermes-agent) · [t3code](https://github.com/pingdotgg/t3code) · [codex](https://github.com/openai/codex) · [gemini-cli](https://github.com/google-gemini/gemini-cli) · [agent-client-protocol](https://github.com/agentclientprotocol/agent-client-protocol) · [deer-flow](https://github.com/bytedance/deer-flow).
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

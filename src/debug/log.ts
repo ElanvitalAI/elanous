@@ -81,8 +81,7 @@ import { redactLogRecord } from '../mss/logging/redaction.js';
 import { isRenderCategory } from '../mss/logging/render-categories.js';
 import type { LogSource, LogLevel } from '../mss/logging/record.js';
 import { cleanupLogDir } from '../mss/logging/retention.js';
-import { createStderrSinkFromFlags } from '../mss/logging/sinks/stderr-sink.js';
-import { createOtelGenAISinkFromFlags } from '../mss/logging/sinks/otel-genai-sink.js';
+import { LogDietGuard, type LogDietSummary } from './log-diet.js';
 
 /** DebugEvent is the legacy shape. Pre-MSS callers only read/write
  *  `ts` / `category` / `event` / `data`. MSS M2.1 adds four optional
@@ -285,6 +284,7 @@ class DebugLog {
   private readonly _ringSink = new RingSink(500);
   private readonly _mirrorSink = new MirrorSink(formatLine);
   private readonly _extraSinks: LogSink[] = [];
+  private _logDietGuard: LogDietGuard | null = new LogDietGuard();
   private readonly _redactEnabled: boolean;
 
   constructor() {
@@ -550,8 +550,20 @@ class DebugLog {
     return this._ringSink.events().map(formatLine).join('\n');
   }
 
+  /** Replace the guard for isolated sink tests; return the previous guard. */
+  setLogDietGuard(guard: LogDietGuard | null): LogDietGuard | null {
+    const previous = this._logDietGuard;
+    this._logDietGuard = guard;
+    return previous;
+  }
+
+  private emitLogDietSummaries(summaries: LogDietSummary[]): void {
+    for (const summary of summaries) this.log('log.diet', 'suppressed', summary);
+  }
+
   /** Force any buffered events to disk immediately. */
   flush(): void {
+    if (this._logDietGuard) this.emitLogDietSummaries(this._logDietGuard.flushPending());
     this._fileSink.flush();
     this._chatFileSink.flush();
     for (const sink of this._extraSinks) {
@@ -599,6 +611,12 @@ class DebugLog {
     // scrubbed payload. Opt-in flag cached at ctor (no per-event cost
     // when off).
     if (this._redactEnabled) rec = redactLogRecord(rec) as DebugEvent;
+
+    if (this._logDietGuard) {
+      const decision = this._logDietGuard.admit(rec);
+      this.emitLogDietSummaries(decision.summaries);
+      if (!decision.pass) return;
+    }
 
     // Ring buffer — always populated when at least one sink is live so
     // `/debug tail` shows activity even when the file write failed.
@@ -767,7 +785,18 @@ function safeStringSlice(value: string, limit: number, fromEnd = false): string 
 /** Format a single event as a compact one-line string. Long payloads
  *  get truncated at ~400 chars so the chat mirror doesn't flood the
  *  log pane on a big LLM response. */
+let configTimeZoneRegistrationLoaded = false;
+
 export function formatLine(ev: DebugEvent): string {
+  // Standalone logger consumers can format before application bootstrap. Load
+  // the config owner once on demand without a static or type import edge.
+  if (!configTimeZoneRegistrationLoaded) {
+    try {
+      const configModulePath: string = '../user-config.js';
+      require(configModulePath);
+      configTimeZoneRegistrationLoaded = true;
+    } catch { /* config unavailable during startup — formatter falls back to env/OS */ }
+  }
   const time = formatClock(ev.ts, { millis: true }); // 사용자 시간대 HH:MM:SS.mmm
   const head = `[${time}] [${ev.category}] ${ev.event}`;
   if (ev.data === undefined) return head;
@@ -905,6 +934,8 @@ const SECRET_TEXT_RULES: readonly { readonly id: string; readonly re: RegExp; re
   { id: 'generic-api-key', re: /\b(api[_-]?key|secret|password|passwd|token|credential)\b(\s*[:=]\s*)["']?[^\s"',;)]{4,}/gi, to: '$1$2***' },
   // 환경변수 형태 `OPENROUTER_API_KEY=…` — 위 규칙은 `_API_KEY` 앞에 단어 경계가 없어 못 잡는다. 값에 글자가 있어야 한다(`MAX_TOKEN=4096` 은 그대로).
   { id: 'env-secret', re: /\b([A-Z][A-Z0-9]*_(?:[A-Z0-9]+_)*(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY))(\s*[:=]\s*)["']?(?=[^\s"',;)]*[A-Za-z])[^\s"',;)]{8,}/g, to: '$1$2***' },
+  // BEDROCK-PROVIDER — `AWS_BEARER_TOKEN_BEDROCK=…` 은 이름이 TOKEN 으로 «끝나지» 않아 위 규칙이 못 잡는다.
+  { id: 'aws-bedrock-bearer-env', re: /\b(AWS_BEARER_TOKEN_BEDROCK)(\s*[:=]\s*)["']?[^\s"',;)]{8,}/g, to: '$1$2***' },
   // Authorization 헤더(로그에서 흔하다).
   { id: 'authorization-header', re: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]{8,}={0,2}/gi, to: '$1 ***' },
 ];
@@ -959,19 +990,23 @@ export function redactSecrets<T>(obj: T): T {
 /** The singleton. Import as `debug` from this module. */
 export const debug = new DebugLog();
 
-// MSS M2.2 Phase A2 — opt-in stderr mirror. Default off, so this is a
-// no-op unless `MSS_STDERR_SINK=1` is set in the environment. Kept as
-// the only "extra sink" wire point baked into the debug module; future
-// sinks should register themselves from their consuming subsystem
-// rather than being listed here, so this stays small.
+// Optional sinks register synchronously after the singleton exists, before
+// its first caller can log. Non-literal require keeps their type graph out of
+// the foundation and avoids losing records during asynchronous import.
 try {
-  const stderrSink = createStderrSinkFromFlags(getFlags());
-  if (stderrSink) debug.registerSink(stderrSink);
-} catch { /* flag-parse failure must not block the rest of the tracer */ }
-
-// PLAN §4.6 / Arc 2.2 — opt-in OTel GenAI sink. Default off; wire only
-// when `MSS_OTEL_ENDPOINT` is set so a missing collector is silent.
-try {
-  const otelSink = createOtelGenAISinkFromFlags(getFlags());
-  if (otelSink) debug.registerSink(otelSink);
-} catch { /* flag-parse / sink-init failure must not block the tracer */ }
+  const flags = getFlags();
+  if (flags.stderrSink) {
+    try {
+      const sinkModulePath: string = '../mss/logging/sinks/stderr-sink.js';
+      const sink = require(sinkModulePath).createStderrSinkFromFlags(flags) as LogSink | null;
+      if (sink) debug.registerSink(sink);
+    } catch { /* one optional sink must not block the other */ }
+  }
+  if (flags.otelEndpoint) {
+    try {
+      const sinkModulePath: string = '../mss/logging/sinks/otel-genai-sink.js';
+      const sink = require(sinkModulePath).createOtelGenAISinkFromFlags(flags) as LogSink | null;
+      if (sink) debug.registerSink(sink);
+    } catch { /* optional sink must not block the tracer */ }
+  }
+} catch { /* flag-parse failure must not block the tracer */ }

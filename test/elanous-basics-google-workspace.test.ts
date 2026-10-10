@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspectPluginSecurity, type PluginSecurityDecision } from '../src/plugins/core/capability-policy.js';
 import { loadPluginManifestFromDir } from '../src/plugins/core/manifest.js';
 import { installPlugin, listInstalledPlugins, type InstallEvent } from '../src/plugins/install/plugin-install.js';
 import { publishMarket } from '../src/market/publish.js';
@@ -20,6 +21,30 @@ const temp = () => {
 };
 afterEach(() => {
   for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+// The official bundle runs processes, so «install after consent» (caution) is the honest verdict.
+// executable-code is an accurate classification and is not hidden — the install screen shows it as is.
+// License labelling is decided in the 0.2.24 MK cell. Anything dangerous, or any other caution reason, still fails.
+const OFFICIAL_CAUTION_REASONS: ReadonlySet<string> = new Set(['private-only-license', 'executable-code']);
+const acceptableOfficialScan = (decision: Pick<PluginSecurityDecision, 'scan' | 'findings'>): boolean =>
+  decision.scan !== 'dangerous' && decision.findings.every(finding => finding.level === 'caution' && OFFICIAL_CAUTION_REASONS.has(finding.code));
+
+test('official bundle scan acceptance: only the license and executable-code cautions pass; anything else fails', () => {
+  const caution = (code: string) => ({ level: 'caution' as const, code });
+  expect(acceptableOfficialScan({ scan: 'safe', findings: [] })).toBe(true);
+  expect(acceptableOfficialScan({ scan: 'caution', findings: [caution('private-only-license'), caution('executable-code')] })).toBe(true);
+  expect(acceptableOfficialScan({ scan: 'caution', findings: [caution('private-only-license'), caution('hooks-disabled')] })).toBe(false);
+  expect(acceptableOfficialScan({ scan: 'dangerous', findings: [caution('private-only-license'), { level: 'dangerous', code: 'embedded-secret' }] })).toBe(false);
+  // Real scanner, real bundle skill plus one planted problem: still rejected.
+  const dir = temp();
+  mkdirSync(join(dir, 'skills'), { recursive: true });
+  writeFileSync(join(dir, 'plugin.json'), readFileSync(join(packDir, 'plugin.json')));
+  mkdirSync(join(dir, 'skills/google-workspace/scripts'), { recursive: true });
+  writeFileSync(join(dir, 'skills/google-workspace/SKILL.md'), readFileSync(join(skillDir, 'SKILL.md')));
+  expect(acceptableOfficialScan(inspectPluginSecurity(dir))).toBe(true);
+  writeFileSync(join(dir, 'skills/google-workspace/scripts/leak.ts'), 'export const apiKey = "superlongprivatevalue123456";\n');
+  expect(acceptableOfficialScan(inspectPluginSecurity(dir))).toBe(false);
 });
 
 const rawManifest = () => JSON.parse(readFileSync(join(packDir, 'plugin.json'), 'utf8')) as {
@@ -96,10 +121,15 @@ test('installed plugin registers the skill and its wrapper emits JSON after the 
     yes: true, onEvent: event => events.push(event),
   });
   expect(events.find(event => event.event === 'resolve')).toMatchObject({ plugin: 'elanous-basics', version: '0.1.3', sha256: published.published[0]?.sha256 });
-  expect(events.find(event => event.event === 'verify')).toMatchObject({ signature: 'ok', scan: 'safe' });
+  const verify = events.find(event => event.event === 'verify');
+  expect(verify).toMatchObject({ signature: 'ok' });
+  expect(['safe', 'caution'].includes(String((verify as { scan?: string } | undefined)?.scan))).toBe(true);
   expect(installed.version).toBe('0.1.3');
   expect(installed.sha256).toBe(published.published[0]?.sha256);
   expect(listInstalledPlugins(installedRoot)).toContainEqual(installed);
+  const security = inspectPluginSecurity(installed.path);
+  expect(security.findings.filter(finding => !OFFICIAL_CAUTION_REASONS.has(finding.code))).toEqual([]);
+  expect(acceptableOfficialScan(security)).toBe(true);
   expect(events.find(event => event.event === 'registered')).toMatchObject({ skills: expect.arrayContaining(['google-workspace']) });
   expect(readFileSync(join(installed.path, 'skills/google-workspace/SKILL.md'))).toEqual(readFileSync(join(skillDir, 'SKILL.md')));
   expect(readFileSync(join(installed.path, 'skills/google-workspace/scripts/gws-safe.sh'))).toEqual(readFileSync(join(root, 'scripts/google/gws-safe.sh')));

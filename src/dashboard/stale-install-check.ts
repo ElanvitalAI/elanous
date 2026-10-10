@@ -12,6 +12,11 @@ export type StaleInstallResult = {
 
 export const STALE_INSTALL_CHECK_INTERVAL_MS = 60_000;
 
+export function formatStaleInstallNotice(result: StaleInstallResult, notifiedCount: number): string {
+  const message = `새 판이 깔렸습니다 (부팅 판 ${result.bootCommit!.slice(0, 7)} → 지금 ${result.installedCommit!.slice(0, 7)}) · TUI 를 다시 띄우면 새 판으로 돕니다`;
+  return notifiedCount >= 2 ? `${message} · 이 TUI 가 뜬 뒤 ${notifiedCount}번째 새 판` : message;
+}
+
 /** Identify the immutable installed version containing this module, never the session cwd. */
 export function versionedDashboardInstallDir(
   codeRoot: string,
@@ -21,8 +26,14 @@ export function versionedDashboardInstallDir(
     const packageRoot = realpathSync(codeRoot);
     if (basename(packageRoot) !== 'elanous' || basename(dirname(packageRoot)) !== 'node_modules') return undefined;
     const versionDir = dirname(dirname(packageRoot));
-    if (dirname(versionDir) !== resolve(installRoot, 'versions')) return undefined;
-    return versionDir;
+    let canonicalInstallRoot: string;
+    try { canonicalInstallRoot = realpathSync(installRoot); }
+    catch { canonicalInstallRoot = resolve(installRoot); }
+    if (dirname(versionDir) !== join(canonicalInstallRoot, 'versions')) return undefined;
+    const requestedVersionDir = dirname(dirname(resolve(codeRoot)));
+    return dirname(requestedVersionDir) === resolve(installRoot, 'versions')
+      && realpathSync(requestedVersionDir) === versionDir
+      ? requestedVersionDir : versionDir;
   } catch {
     return undefined;
   }

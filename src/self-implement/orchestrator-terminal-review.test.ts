@@ -19,7 +19,7 @@ test.each([true, false])('final review fail returns a recoverable terminal resul
   const root = mkdtempSync(join(tmpdir(), 'terminal-review-'));
   const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
   const off = debug.registerSink({ name: `terminal-review-${changes}`, emit: ({ category, event, data }) => {
-    if (category === 'self-implement.terminal') events.push({ category, event, data: data as Record<string, unknown> });
+    if (category === 'self-implement.terminal' || (category === 'self-implement.review-budget' && event === 'pod-accept-decision')) events.push({ category, event, data: data as Record<string, unknown> });
   } });
   let opened: Record<string, unknown> | undefined;
   try {
@@ -54,6 +54,7 @@ test.each([true, false])('final review fail returns a recoverable terminal resul
     expect(parsed?.stage).toBe(changes ? 'review-blocked' : 'no-changes');
     expect(parsed?.mustFix).toEqual(mustFix);
     expect(result.mustFix).toEqual(mustFix);
+    expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement.review-budget', event: 'pod-accept-decision', data: expect.objectContaining({ runId: result.runId, status: 'unmeasured', repeatedCount: 0, newCount: 0, accepted: false }) }));
     if (changes) {
       expect(parsed?.prNumber).toBe(7);
       expect(opened).toMatchObject({ draft: true, labels: ['review-blocked'] });
@@ -63,7 +64,7 @@ test.each([true, false])('final review fail returns a recoverable terminal resul
     } else {
       expect(opened).toBeUndefined();
       expect(parsed?.prNumber).toBeUndefined();
-      expect(events).toHaveLength(0);
+      expect(events.filter(({ category }) => category === 'self-implement.terminal')).toHaveLength(0);
     }
   } finally { off(); rmSync(root, { recursive: true, force: true }); }
 });

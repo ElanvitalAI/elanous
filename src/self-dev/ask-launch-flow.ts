@@ -215,7 +215,7 @@ export type AskLaunchFlowResult =
   /** ⓪ 저작 «전»에 막혔다 — 100초를 안 썼다. */
   | { readonly kind: 'stopped-before-authoring'; readonly goalFile?: undefined }
   /** ⑵⑶⑷ 에서 막혔다 — 골은 «있다»(사람이 열어볼 수 있게 돌려준다). */
-  | { readonly kind: 'stopped-by-preflight'; readonly goalFile: string };
+  | { readonly kind: 'stopped-by-preflight'; readonly goalFile: string; readonly blockers: LaunchPreflightResult['blockers'] };
 
 /** 런 식별자가 흐름 뒤에 확정된 호출자는 이 관측으로 입구와 런을 조인한다. */
 export function observeAskLaunchRunIdentity(
@@ -1103,5 +1103,5 @@ export async function runAskLaunchFlow(
   }
   return launchDecision
     ? { kind: 'launch', goalFile: effectiveGoalFile }
-    : { kind: 'stopped-by-preflight', goalFile: effectiveGoalFile };
+    : { kind: 'stopped-by-preflight', goalFile: effectiveGoalFile, blockers: preflight.blockers };
 }

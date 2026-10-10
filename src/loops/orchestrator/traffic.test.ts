@@ -300,6 +300,18 @@ test('traffic records weighted base shares and lends idle capacity to queued sea
   expect(atPhysicalLimit.seats[2]).toMatchObject({ running: 4, launchCap: 4, idle: false });
 });
 
+test('traffic defers the final launch decision to the shared budget while preserving explicit physical caps', () => {
+  const caps = { OP: 2, TC: 4, MK: 6, UX: 2 };
+  const now = new Date('2026-10-05T00:00:00Z');
+  const processes = Array.from({ length: 4 }, () => ({ seat: 'MK' as const,
+    command: 'bun bin/elanous.mjs harness ask goal', elapsedSeconds: 2400 }));
+  const cells = [{ id: 'MK-1', title: 'one', owner: 'MK', status: 'yellow' as const }];
+  expect(trafficTick({ processes, now, caps, openCells: cells, nextRound: [], totalSlots: 14 }).seats[2])
+    .toMatchObject({ running: 4, cap: 6, launchCap: 6, idle: true, nextCell: cells[0] });
+  expect(trafficTick({ processes: [...processes, ...processes.slice(0, 2)], now, caps, openCells: cells, nextRound: [], totalSlots: 14 }).seats[2])
+    .toMatchObject({ running: 6, cap: 6, idle: false, nextCell: null });
+});
+
 test('outstanding loan blocks a returning lender until the borrowed run finishes', () => {
   const now = new Date('2026-10-05T00:00:00Z');
   const caps = { OP: 2, TC: 4, MK: 4, UX: 2 };

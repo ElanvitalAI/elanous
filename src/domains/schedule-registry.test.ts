@@ -14,7 +14,7 @@ import {
   inventoryCrontab, inventoryInternalSchedules, listSchedules, driftedSchedules,
   buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled,
   deleteScheduleRow, setRunVia, markResult, scheduleHealth, setScheduleMission,
-  parseDisabledCronLine, cronEntryId,
+  parseDisabledCronLine, cronEntryId, markRun,
 } from './schedule-registry.js';
 
 const db = () => openSchedulesDb(':memory:');
@@ -275,6 +275,59 @@ describe('unwrapCronCommand + 래퍼 id 안정성 (RFC-scheduler-execution-obser
     expect(rows.length).toBe(1);          // 새 행 안 생김(같은 id UPSERT)
     expect(rows[0]!.id).toBe(id);
     expect(rows[0]!.last_status).toBe('ok'); // 계보 보존
+  });
+});
+
+describe('hq-fence schedule identity', () => {
+  const cron = '*/10 * * * *';
+  const price = 'cd /r && /b/bun scripts/cron-run.ts scripts/price-guard-cycle.ts >> /tmp/price-guard-cycle.log 2>&1';
+  const posture = `cd /r && /b/bun scripts/cron-run.ts scripts/market-posture-cycle.ts --note 'open' >> /tmp/market-posture-cycle.log 2>&1`;
+  const plain = 'cd /r && /b/bun scripts/cron-run.ts scripts/ordinary-cycle.ts >> /tmp/ordinary-cycle.log 2>&1';
+  const fixtures = [
+    { installed: `${cron} /home/u/.elanous/bin/hq-fence conatus '${price}' >> /tmp/elanous-hq-fence.log 2>&1`, before: `${cron} ${price}` },
+    { installed: `${cron} hq-fence --role cron -- '${posture.replaceAll("'", `'"'"'`)}'`, before: `${cron} ${posture}` },
+    { installed: `${cron} ${plain}`, before: `${cron} ${plain}` },
+  ];
+
+  test('parse → unwrap → id preserves unfenced identity, drops only outer redirects and is idempotent', () => {
+    for (const { installed, before } of fixtures) {
+      const actual = parseCronLine(installed)!;
+      const original = parseCronLine(before)!;
+      const effective = unwrapCronCommand(actual.command);
+      expect(effective).toBe(unwrapCronCommand(original.command));
+      expect(unwrapCronCommand(effective)).toBe(effective);
+      expect(cronEntryId(actual.cron, effective)).toBe(cronEntryId(original.cron, unwrapCronCommand(original.command)));
+      expect(effective).not.toContain('hq-fence');
+      expect(effective).not.toContain('/tmp/elanous-hq-fence.log');
+    }
+    expect(unwrapCronCommand(plain)).toBe('cd /r && /b/bun scripts/ordinary-cycle.ts >> /tmp/ordinary-cycle.log 2>&1');
+    expect(unwrapCronCommand(`hq-fence --role cron '${price}'`)).toBe(unwrapCronCommand(price));
+    expect(unwrapCronCommand(`hq-fence cron '${price}'`)).toBe(unwrapCronCommand(price));
+    expect(unwrapCronCommand('  echo hq-fence cron \'not a wrapper\'  ')).toBe('  echo hq-fence cron \'not a wrapper\'  ');
+  });
+
+  test('installed shapes: trailing # comment is kept, shell-style \'\\\'\' quoting is decoded', () => {
+    const commented = parseCronLine(`${cron} /h/.elanous/bin/hq-fence cron '/h/bin/test-diet.sh' >> /tmp/x.log 2>&1 # TD3 note`)!;
+    expect(unwrapCronCommand(commented.command)).toBe('/h/bin/test-diet.sh # TD3 note');
+    const json = `cd /r && /b/bun bin/elanous.mjs graph run g.yaml --input '{"mode":"live"}' >> /tmp/d.log 2>&1`;
+    const shellQuoted = parseCronLine(`${cron} /h/.elanous/bin/hq-fence cron '${json.replaceAll("'", `'\\''`)}'  # OP note`)!;
+    const effective = unwrapCronCommand(shellQuoted.command);
+    expect(effective).toBe(`${json} # OP note`);
+    expect(unwrapCronCommand(effective)).toBe(effective);
+  });
+
+  test('re-inventory of fenced line keeps one enabled row and the earlier fire', () => {
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: fixtures[0]!.before, now: '2026-10-09T02:00:00Z' });
+      const id = listSchedules(d)[0]!.id;
+      markRun(d, id, '2026-10-09T03:00:00Z');
+      expect(inventoryCrontab(d, { crontab: fixtures[0]!.installed, now: '2026-10-09T03:05:00Z' }))
+        .toMatchObject({ total: 1, added: 0, vanished: 0 });
+      expect(listSchedules(d)).toHaveLength(1);
+      expect(listSchedules(d)[0]).toMatchObject({ id, enabled: 1, disabled_reason: null,
+        name: 'price-guard-cycle', last_run: '2026-10-09T03:00:00Z' });
+    } finally { d.close(); }
   });
 });
 

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { buildBenchReport, renderBenchReport, type LogRow } from './bench-report.js';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { buildBenchReport, renderBenchReport, buildBn1Comparison, renderBn1Comparison, type LogRow, type Bn1Input } from './bench-report.js';
 
 const R = 'run-1';
 const rows: LogRow[] = [
@@ -37,6 +39,87 @@ describe('bench report (RFC F5)', () => {
   test('names the image version it measured and warns when it is not HEAD', () => {
     expect(rep.image).toEqual({ commit: 'abc123', fresh: false });
     expect(renderBenchReport(rep)).toContain('HEAD 와 다르다');
+  });
+});
+
+describe('BN1 — 동일 골 네 팔의 근거 있는 비교', () => {
+  const input: Bn1Input = {
+    runId: R,
+    goals: [{ id: 'g1', text: '같은 골 원문' }],
+    observations: [
+      { goalId: 'g1', arm: 'Codex', completed: false, humanInterventions: 0, durationMs: 0, costUsd: 0, evidence: 'fixture:codex' },
+      { goalId: 'g1', arm: '엘라누스', completed: true, humanInterventions: 1, durationMs: 1200, costUsd: null, evidence: 'fixture:elanous' },
+    ],
+  };
+  test('같은 골의 네 팔을 고정해 미관측은 null, 관측된 0은 0으로 유지한다', () => {
+    const result = buildBn1Comparison(input, R);
+    expect(result.fieldsComplete).toBe(false);
+    expect(result.goals[0]!.text).toBe('같은 골 원문');
+    expect(result.goals[0]!.arms.map((row) => row.arm)).toEqual(['Codex', 'OpenClaw', 'Hermes', '엘라누스']);
+    expect(result.goals[0]!.arms[0]).toMatchObject({ completed: false, humanInterventions: 0, durationMs: 0, costUsd: 0 });
+    expect(result.goals[0]!.arms[1]).toMatchObject({ completed: null, humanInterventions: null, durationMs: null, costUsd: null, evidence: null });
+    expect(renderBn1Comparison(result)).toContain('측정 칸 완비: 아니오 — 미관측 칸 존재');
+    expect(renderBn1Comparison(result)).toContain('| 골 | 공유 골 입력(미확정 가능) | 팔 | 끝까지 | 사람 개입 수 | 시간(ms) | 비용(USD) | 근거 |');
+    expect(renderBn1Comparison(result)).toContain('| g1 | 같은 골 원문 | OpenClaw | 못 잼 | 못 잼 | 못 잼 | 못 잼 | 못 잼 |');
+    expect(renderBn1Comparison(result)).toContain('| g1 | 같은 골 원문 | Codex | 미완주 | 0 | 0 | 0 | fixture:codex |');
+    expect(renderBn1Comparison(result)).toContain('| g1 | 같은 골 원문 | 엘라누스 | 완주 | 1 | 1200 | 못 잼 | fixture:elanous |');
+    expect(renderBn1Comparison(result)).toContain('X1 짝 실측(격리 설치·첫 실행, 개발 골 대조 아님)');
+  });
+  test('네 팔 모든 판정 칸을 관측한 경우에만 비교 입력을 채웠다고 판정한다', () => {
+    const complete = {
+      ...input,
+      observations: [
+        ...input.observations.map((row) => ({ ...row, costUsd: row.costUsd ?? 0 })),
+        ...(['OpenClaw', 'Hermes'] as const).map((arm) => ({ goalId: 'g1', arm, completed: false, humanInterventions: 0, durationMs: 1, costUsd: 0, evidence: `fixture:${arm}` })),
+      ],
+    };
+    expect(buildBn1Comparison(complete, R).fieldsComplete).toBe(true);
+    expect(renderBn1Comparison(buildBn1Comparison(complete, R))).toContain('측정 칸 완비: 네 팔 관측값 기입 완료(출처와 조건 별도 검증 필요)');
+    expect(buildBn1Comparison({ ...complete, observations: complete.observations.map((row) => row.arm === 'Hermes' ? { ...row, costUsd: null } : row) }, R).fieldsComplete).toBe(false);
+    expect(buildBn1Comparison({ ...complete, goals: [...complete.goals, { id: 'g2', text: '두 번째 동일 골' }] }, R).fieldsComplete).toBe(false);
+  });
+  test('다른 런, 중복 팔, 없는 근거, 음수 개입은 비교 근거로 받지 않는다', () => {
+    expect(() => buildBn1Comparison(input, 'other')).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [...input.observations, input.observations[0]!] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, evidence: '' }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, humanInterventions: -1 }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, humanInterventions: 0.5 }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, durationMs: undefined }] } as unknown as Bn1Input, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, arm: 'unknown' }] } as unknown as Bn1Input, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, goalId: 'other' }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, goals: [{ id: 'g1', text: '같은 골 원문' }, { id: 'g1', text: '중복' }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, completed: undefined }] } as unknown as Bn1Input, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, costUsd: -1 }] }, R)).toThrow();
+    expect(() => buildBn1Comparison({ ...input, observations: [{ ...input.observations[0]!, durationMs: Number.NaN }] }, R)).toThrow();
+  });
+  test('실행 입구 --bn1은 외부 팔의 Pod 로그 없이 독립 대조 JSON을 출력한다', () => {
+    const fixture = join(import.meta.dir, '../docs/measurements/bn1-task-agent.first-slice.json');
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'bench-report.ts'), '--run', 'bn1-first-slice-unmeasured', '--bn1', fixture, '--json'], { encoding: 'utf8', timeout: 10_000 });
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as ReturnType<typeof buildBn1Comparison>;
+    expect(report.fieldsComplete).toBe(false);
+    expect(report.goals).toHaveLength(2);
+    expect(report.goals.flatMap((goal) => goal.arms)).toHaveLength(8);
+    expect(report.goals.every((goal) => goal.arms.every((arm) => arm.completed === null && arm.humanInterventions === null && arm.durationMs === null && arm.costUsd === null))).toBe(true);
+    const mismatched = spawnSync(process.execPath, [join(import.meta.dir, 'bench-report.ts'), '--run', 'other', '--bn1', fixture, '--json'], { encoding: 'utf8', timeout: 10_000 });
+    expect(mismatched.status).toBe(2);
+    expect(mismatched.stderr).toContain('BN1 입력 실패: BN1: runId 또는 골 셋이 유효하지 않음');
+    const missing = spawnSync(process.execPath, [join(import.meta.dir, 'bench-report.ts'), '--run', 'bn1-first-slice-unmeasured', '--bn1'], { encoding: 'utf8', timeout: 10_000 });
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain('BN1 입력 실패: --bn1 <관측.json> 경로 필요');
+    const markdown = spawnSync(process.execPath, [join(import.meta.dir, 'bench-report.ts'), '--run', 'bn1-first-slice-unmeasured', '--bn1', fixture], { encoding: 'utf8', timeout: 10_000 });
+    expect(markdown.status).toBe(0);
+    expect(markdown.stdout).toContain('| BN1-G1 | 동일한 격리 저장소에서 동일한 작은 코드 결함 수정·집중 시험 통과·리뷰·병합 (실제 골 원문·커밋 미확정) | Codex | 못 잼 | 못 잼 | 못 잼 | 못 잼 | 못 잼 |');
+    expect(markdown.stdout).toContain('X1 짝 실측(격리 설치·첫 실행, 개발 골 대조 아님)');
+  });
+  test('선택하지 않은 종전 리포트의 출력과 JSON 원장 모양은 그대로다', () => {
+    const old = buildBenchReport(rows, R);
+    expect(Object.keys(old)).toEqual(['runId', 'arms', 'unjoinedJobs', 'image']);
+    expect(JSON.stringify(old)).not.toContain('bn1');
+    expect(renderBenchReport(old)).not.toContain('BN1 · 같은 골 대조');
+    const usage = spawnSync(process.execPath, [join(import.meta.dir, 'bench-report.ts')], { encoding: 'utf8', timeout: 10_000 });
+    expect(usage.status).toBe(2);
+    expect(usage.stderr.trim()).toBe('사용: bun scripts/bench-report.ts --run <runId> [--since 24h] [--json]');
   });
 });
 

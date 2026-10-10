@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { refuseProductionLedgerWriteInTest } from '../src/harness/ledger-write-guard.js';
 import { analyzeRunDriftSignals, renderReworkDriftSignals, runReworkDriftSignals, scanReworkDriftSignals } from './rework-drift-signals.js';
 import type { RunLedgerEntry } from '../src/self-implement/run-ledger.js';
+import { queryRunningRuns } from '../src/self-implement/running-runs.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -31,6 +32,36 @@ function writeLedger(dir: string, runId: string, entries: readonly RunLedgerEntr
   writeFileSync(path, `${entries.map((value) => JSON.stringify(value)).join('\n')}\n`);
   return path;
 }
+
+test('drift reader preserves its verdict and output across running-runs cache reuse', () => {
+  const dir = root();
+  const runId = 'run-00000000-0000-4000-8000-000000000001';
+  writeLedger(dir, runId, [
+    entry(runId, 'reviewed', { round: 1, mustFix: 1, findingIds: ['repeated'], verdict: 'fail' }),
+    entry(runId, 'reviewed', { round: 2, mustFix: 1, findingIds: ['repeated'], verdict: 'fail' }),
+    entry(runId, 'reviewed', { round: 3, mustFix: 1, findingIds: ['repeated'], verdict: 'fail' }),
+    entry(runId, 'run-status', { runStatus: 'failed' }),
+  ].map((value) => ({ ...value, timestamp: '2026-10-09T00:00:00.000Z' })));
+  const deps = {
+    ledgerDirectories: () => [dir],
+    ptyTargets: () => [],
+    listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    observeQuery: () => {},
+  };
+  const before = runReworkDriftSignals(['--dir', dir, '--run', runId]);
+  const cold = queryRunningRuns({}, deps);
+  const warm = queryRunningRuns({}, deps);
+  const after = runReworkDriftSignals(['--dir', dir, '--run', runId]);
+  expect(before.scan.runs[0]).toMatchObject({ runId, verdict: { verdict: 'drift' } });
+  expect([cold.ledger.cacheHits, cold.ledger.cacheMisses]).toEqual([0, 1]);
+  expect([warm.ledger.cacheHits, warm.ledger.cacheMisses]).toEqual([1, 0]);
+  expect(after).toEqual(before);
+  expect(after.exitCode).toBe(0);
+  expect(after.scan.runs[0]).toMatchObject({ runId, outcome: 'failed', verdict: { verdict: 'drift', reason: 'persistent-must-fix' } });
+  expect(after.stdout.split('\n').map((line) => JSON.parse(line))).toHaveLength(3);
+  expect(JSON.parse(after.stdout.split('\n')[2]!)).toMatchObject({ runId, outcome: 'failed', verdict: { verdict: 'drift' }, round: 3 });
+});
 
 test('drift reader remains read-only while the shared writer guard rejects a nested production ledger', () => {
   const production = root();

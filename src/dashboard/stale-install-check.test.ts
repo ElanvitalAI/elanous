@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createStaleInstallCheck, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
+import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 
 const oldCommit = 'a'.repeat(40);
 const newCommit = 'b'.repeat(40);
@@ -61,6 +61,28 @@ describe('stale install check', () => {
       expect(checker.check()).toEqual({ state: 'not-installed', bootCommit: oldCommit, installedCommit: undefined });
       expect(reads).toBe(0);
       expect(checker.shouldNotify(checker.check())).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('formats first and third installed versions from boot and installed commits', () => {
+    const first = formatStaleInstallNotice({ state: 'changed', bootCommit: 'abc1234'.padEnd(40, 'a'), installedCommit: 'def5678'.padEnd(40, 'd') }, 1);
+    const third = formatStaleInstallNotice({ state: 'changed', bootCommit: 'abc1234'.padEnd(40, 'a'), installedCommit: 'ghi9012'.padEnd(40, 'g') }, 3);
+    expect(first).toBe('새 판이 깔렸습니다 (부팅 판 abc1234 → 지금 def5678) · TUI 를 다시 띄우면 새 판으로 돕니다');
+    expect(third).toBe('새 판이 깔렸습니다 (부팅 판 abc1234 → 지금 ghi9012) · TUI 를 다시 띄우면 새 판으로 돕니다 · 이 TUI 가 뜬 뒤 3번째 새 판');
+    expect(first).not.toContain('3번째 새 판');
+  });
+
+  test('realpaths the install root when matching a version but preserves the install-root path for metadata', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dashboard-version-'));
+    try {
+      const actualRoot = join(root, 'actual');
+      const aliasRoot = join(root, 'alias');
+      const version = join(actualRoot, 'versions', 'v1');
+      const packageRoot = join(version, 'node_modules', 'elanous');
+      mkdirSync(packageRoot, { recursive: true });
+      symlinkSync(actualRoot, aliasRoot, 'dir');
+      expect(versionedDashboardInstallDir(join(aliasRoot, 'versions', 'v1', 'node_modules', 'elanous'), aliasRoot))
+        .toBe(join(aliasRoot, 'versions', 'v1'));
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

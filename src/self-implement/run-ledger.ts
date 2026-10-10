@@ -2,14 +2,14 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
-import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight.js';
+import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import { isRunStatus } from './run-status-mapping.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { normalizeRunId } from '../harness/harness-space.js';
 import { resolveLogTargets, type LogTarget } from '../cli/logs-cli.js';
 import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
 import { loadSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
-import { extractHarnessReviewAcceptance } from '../harness/harness-seams.js';
+import { extractHarnessReviewAcceptance } from './goal-digest.js';
 import { resolveGoalDocumentsDir } from './goal-documents-dir.js';
 import { debug } from '../debug/log.js';
 import { withRunLedgerLock, restoreArchivedRunLedger } from './run-ledger-compact.js';
@@ -1561,7 +1561,8 @@ interface UnfinishedLedgerFacts {
   fixedLifecycle: UnfinishedRunLifecycle;
 }
 
-const UNFINISHED_LEDGER_CACHE_LIMIT = 5_000;
+// A full federated scan can exceed 5,000 files; keep the previous scan resident for mtime-checked reuse.
+const UNFINISHED_LEDGER_CACHE_LIMIT = 32_768;
 const unfinishedLedgerCache = new Map<string, { size: number; mtimeMs: number; facts: UnfinishedLedgerFacts }>();
 const unfinishedReaderIds = new WeakMap<RunLedgerReader, number>();
 let nextUnfinishedReaderId = 1;

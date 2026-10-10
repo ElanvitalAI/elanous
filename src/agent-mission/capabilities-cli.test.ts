@@ -2,6 +2,8 @@ import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
 import { registerCapabilitiesCommand } from './capabilities-cli.js';
 import type { CapabilityRun } from './capability-readers.js';
+import type { CapabilityIndexReaders } from '../smart-wizard/capability-index.js';
+import type { SkillIndexEntry } from '../skills/index.js';
 
 const runWith = (codex: string, claude: string) => {
   const calls: Array<[string, readonly string[]]> = [];
@@ -24,10 +26,36 @@ const codex = JSON.stringify([
 const claude = 'Checking MCP server health…\ngithub: https://mcp.github.com (HTTP) - ✓ Connected\nlinear: https://linear.example (HTTP) - ✓ Connected\n';
 
 describe('agent-mission capabilities real CLI wiring', () => {
+  it('exposes provenance, verified auth and unreadable sources via the opt-in index without changing the default JSON', async () => {
+    const indexReaders: CapabilityIndexReaders = {
+      skills: () => [{ name: 'local-skill', rootDir: '/skills' } as SkillIndexEntry], skillProblems: () => [],
+      plugins: () => { throw new Error('ledger unreadable'); }, knowledge: () => { throw new Error('db unreadable'); },
+      codex: async () => ({ status: 'unknown', plugins: [] }),
+      claude: () => ({ status: 'installed-plugins-unreadable', packages: [] }),
+      market: async () => ({ name: 'elanous', interface: { displayName: 'Official' }, sequence: 1,
+        plugins: [{ name: 'tool', version: '1', source: { source: 'url' },
+          artifact: { key: 'x', sha256: '0'.repeat(64), bytes: 0 },
+          'ai.elanous': { capabilities: ['work'], connectors: [], pricing: { model: 'free' } } }] }),
+      matrix: () => [],
+    };
+    let output = '';
+    const program = new Command().exitOverride();
+    registerCapabilitiesCommand(program.command('agent-mission'), { indexReaders, write: text => { output += text; } });
+    await program.parseAsync(['agent-mission', 'capabilities', '--index', '--json'], { from: 'user' });
+    const parsed = JSON.parse(output);
+    expect(parsed.sources).toMatchObject({ plugins: 'unknown', knowledge: 'unknown', codex: 'unknown', claude: 'unknown', market: 'ok' });
+    expect(parsed.entries.find((row: { id: string }) => row.id === 'tool')).toMatchObject({ source: 'market', provenance: 'elanous:url', state: 'unknown', auth: 'unknown' });
+    expect(parsed.entries.find((row: { id: string }) => row.id === 'local-skill')).toMatchObject({ auth: 'unknown', provenance: '/skills' });
+    output = '';
+    await program.parseAsync(['agent-mission', 'capabilities', '--index'], { from: 'user' });
+    expect(output).toContain('plugins\tunknown\n');
+    expect(output).toContain('market\ttool\tplugin\tunknown\tunknown\telanous:url\n');
+  });
   it('routes observed outputs through matrix and ready-only priority for --service --json', async () => {
     const fixture = runWith(codex, claude);
     await fixture.program.parseAsync(['agent-mission', 'capabilities', '--service', 'GITHUB', '--json'], { from: 'user' });
     const parsed = JSON.parse(fixture.output());
+    expect(Object.keys(parsed)).toEqual(['entries', 'selected']);
     expect(parsed.selected).toBe('codex');
     expect(parsed.entries.map((entry: { state: string }) => entry.state)).toEqual(['ready', 'ready', 'unknown']);
     expect(fixture.calls).toEqual([['codex', ['mcp', 'list', '--json']], ['claude', ['mcp', 'list']]]);

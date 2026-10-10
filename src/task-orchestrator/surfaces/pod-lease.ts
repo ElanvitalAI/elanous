@@ -8,7 +8,14 @@ import { dlopen } from 'bun:ffi';
 import { hostLeaseBaseDir, type PendingJobIdentity } from '../../pod-lease/host-lease.js';
 
 /** The harness Pod's container requests (self-implement-pod Job manifest). Lives here so admission reuses the real request. */
-export const POD_CHILD_REQUESTS = { cpu: '1', memory: '6Gi' } as const;
+// POD-CPU-REQUEST-RIGHTSIZE(10-09 · OP 실측): 하니스 Pod 실사용은 대부분 100m 미만(LLM 응답 대기)인데 요청 1 CPU 를
+//   잡아 node-b 32코어가 «요청 31/32»로 막혔다(실사용 4.6코어 · 14%). 요청은 실사용 근처로, 한도(4)는 그대로 — 몰릴 때는 한도까지 쓴다.
+//   게이트·pod-command 기본은 pod-command-job.ts 의 POD_COMMAND_CPU_REQUEST_DEFAULT(1)로 따로 둔다(테스트 조각은 CPU 를 실제로 쓴다).
+export const POD_CHILD_REQUESTS = { cpu: '250m', memory: '6Gi' } as const;
+/** Finished harness and command Jobs release their Pod slots after 30 minutes. */
+export const POD_JOB_TTL_AFTER_FINISHED_SECONDS = 1800;
+/** 게이트가 돌 때 하니스 «한 자리»로 셈하는 CPU — 요청(250m)보다 보수적으로 1 코어를 잡아 게이트 조각의 CPU 를 지킨다(GATE-RESERVE-AUTO 셈은 그대로). */
+export const HARNESS_SLOT_CPU_BESIDE_GATE = '1';
 /** POD-ADMIT-BY-USAGE — observed usage is scaled by this before it reserves memory. */
 const POD_USAGE_HEADROOM = 1.5;
 /** POD-ADMIT-BY-USAGE — a node keeps at least this share of allocatable memory free (real usage and bookkeeping). */
@@ -207,6 +214,7 @@ function runningLimit(spec: Record<string, unknown>): number | null {
 /** A short-lived Pod proves cluster DNS from inside the same namespace as harness Jobs. Image pull failures are not DNS failures. */
 export type PoolDnsProbe = 'ready' | 'dns' | 'image' | 'unknown';
 const DNS_CACHE_MS = 10 * 60_000;
+const DNS_STALE_OK_MS = 30 * 60_000;
 const DNS_LOCK_WAIT_MS = 6 * 60_000;
 // flock is released by the kernel on process exit, including a crash before any cache write.
 // The lock file is never unlinked: unlinking it would let waiters lock different inodes.
@@ -232,6 +240,17 @@ export function probePoolDns(context: string, kubectl: PoolKubectl = leaseKubect
     return record?.result === 'ready' && typeof record.at === 'number' &&
       now() >= record.at && now() - record.at < DNS_CACHE_MS;
   };
+  const withStaleReady = (result: PoolDnsProbe): PoolDnsProbe => {
+    if (result !== 'unknown') return result;
+    const record = readRecord(cache);
+    const readyAgeMs = typeof record?.at === 'number' ? now() - record.at : NaN;
+    if (record?.result === 'ready' &&
+        Number.isFinite(readyAgeMs) && readyAgeMs >= 0 && readyAgeMs < DNS_STALE_OK_MS) {
+      debug.log('pod.lease', 'dns-probe-stale-ready', { context, readyAgeMs });
+      return 'ready';
+    }
+    return result;
+  };
   if (cached()) return 'ready';
   const previous = readRecord(outcome);
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return 'unknown'; }
@@ -251,31 +270,34 @@ export function probePoolDns(context: string, kubectl: PoolKubectl = leaseKubect
     while (!held) {
       if (cached()) return 'ready';
       const shared = sharedFailure();
-      if (shared) return shared;
+      if (shared) return withStaleReady(shared);
       if (dnsFlock(fd, 2 | 4) === 0) { held = true; break; } // LOCK_EX | LOCK_NB
       if (Date.now() >= deadline) return 'unknown';
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     }
     if (cached()) return 'ready';
     const shared = sharedFailure();
-    if (shared) return shared;
-    const result = runPoolDnsProbe(context, kubectl);
+    if (shared) return withStaleReady(shared);
+    const result = runPoolDnsProbe(context, kubectl, now);
     const destination = result === 'ready' ? cache : outcome;
     const temp = `${destination}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temp, JSON.stringify({ result, at: now(), generation: randomUUID() }), { mode: 0o600 });
       renameSync(temp, destination);
     } catch { try { rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ } }
-    return result;
+    return withStaleReady(result);
   } finally {
     if (held) dnsFlock(fd, 8); // LOCK_UN
     closeSync(fd);
   }
 }
 
-function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
+const DNS_PROBE_READY = /\bName:\s*kubernetes\.default\.svc\.cluster\.local\b/u;
+
+function runPoolDnsProbe(context: string, kubectl: PoolKubectl, now: () => number): PoolDnsProbe {
   const name = `elanous-dns-${randomUUID().slice(0, 12)}`;
   const base = ['--context', context, '--request-timeout=10s'];
+  let cleanup = false;
   try {
     const core = kubectl([...base, '-n', 'kube-system', 'get', 'deployment', 'coredns', '-o', 'json']);
     if (core.status !== 0) return 'unknown';
@@ -283,12 +305,61 @@ function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
     const spec = object(deployment?.spec);
     const status = object(deployment?.status);
     if (typeof spec?.replicas !== 'number' || spec.replicas < 1 || status?.readyReplicas !== spec.replicas) return 'dns';
+    const listed = kubectl([...base, '-n', 'elanous-test', 'get', 'pods', '-l', 'elanous.probe=dns', '-o', 'json']);
+    if (listed.status !== 0) return 'unknown';
+    const listedPods = items(JSON.parse(listed.stdout));
+    if (!listedPods) return 'unknown';
+    const probes = listedPods.filter((pod) => {
+      const metadata = object(pod.metadata);
+      return object(metadata?.labels)?.['elanous.probe'] === 'dns' &&
+        (metadata?.namespace === undefined || metadata.namespace === 'elanous-test');
+    });
+    let reaped = 0;
+    for (const probe of probes) {
+      const metadata = object(probe.metadata);
+      const name = metadata?.name;
+      const deletedAt = metadata?.deletionTimestamp;
+      if (typeof name !== 'string' || !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) ||
+          typeof deletedAt !== 'string' || !Number.isFinite(Date.parse(deletedAt)) ||
+          now() - Date.parse(deletedAt) <= 60_000) continue;
+      try {
+        if (kubectl([...base, '-n', 'elanous-test', 'delete', 'pods', '-l', 'elanous.probe=dns', `--field-selector=metadata.name=${name}`, '--grace-period=0', '--force', '--ignore-not-found=true', '--wait=false']).status === 0) reaped++;
+      } catch { /* Reaping is best-effort; the crowded reading still prevents a new probe. */ }
+    }
+    if (reaped) debug.log('pod.lease', 'dns-probe-stale-reaped', { context, count: reaped });
+    // 🩸 10-09 22:1x: node-b had 20 Completed probes left over from older releases (and 7 Terminating). Counting every
+    //   labelled Pod would make the node «crowded» forever and admission would stay 0 — only live probes are crowding.
+    //   Finished probes are removed here so older leftovers drain too.
+    let finished = 0;
+    const live = probes.filter((probe) => {
+      const metadata = object(probe.metadata);
+      if (metadata?.deletionTimestamp !== undefined) return false;
+      const phase = object(probe.status)?.phase;
+      if (phase !== 'Succeeded' && phase !== 'Failed') return true;
+      const name = metadata?.name;
+      if (typeof name === 'string' && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)) {
+        try {
+          if (kubectl([...base, '-n', 'elanous-test', 'delete', 'pods', '-l', 'elanous.probe=dns', `--field-selector=metadata.name=${name}`, '--ignore-not-found=true', '--wait=false']).status === 0) finished++;
+        } catch { /* best-effort: a finished probe never crowds */ }
+      }
+      return false;
+    });
+    if (finished) debug.log('pod.lease', 'dns-probe-finished-reaped', { context, count: finished });
+    if (live.length >= 3) {
+      debug.log('pod.lease', 'dns-probe-skipped-crowded', { context, existing: live.length });
+      return 'unknown';
+    }
+    cleanup = true;
     const manifest = JSON.stringify({ apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } }, spec: {
-      restartPolicy: 'Never', activeDeadlineSeconds: 40, automountServiceAccountToken: false,
-      containers: [{ name: 'dns', image: 'busybox:1.36', command: ['nslookup', 'kubernetes.default.svc.cluster.local'], resources: { requests: { cpu: '10m', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } } }],
+      restartPolicy: 'Never', activeDeadlineSeconds: 120, automountServiceAccountToken: false,
+      // 🩸 10-09 18:2x: 노드 CPU «요청» 100%(32/32) 이면 10m 탐침도 못 떠 측정이 «dns probe unknown» → 승인 추천 null → 전 발사 정지(교착).
+      //   탐침은 CPU 요청 0(명시 · 안 쓰면 k8s 가 한도 100m 를 요청으로 복사)으로 «꽉 찬 노드에도 뜨게» 한다.
+      containers: [{ name: 'dns', image: 'busybox:1.36', command: ['nslookup', 'kubernetes.default.svc.cluster.local'], resources: { requests: { cpu: '0', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } } }],
     } });
     if (kubectl([...base, 'create', '-f', '-'], manifest).status !== 0) return 'unknown';
-    const waited = kubectl([...base, '-n', 'elanous-test', 'wait', '--for=jsonpath={.status.phase}=Succeeded', `pod/${name}`, '--timeout=30s']);
+    // 🩸 10-09 19:3x: 부하 104 노드에선 «배치됨»(PodScheduled=True) 뒤 컨테이너 생성만 30초를 넘겼다 → 30초 wait 가 Pending 을 보고 unknown.
+    //   기다림 90초 · Pod 기한 120초. 성공은 DNS_CACHE_MS 동안 공유 캐시라 매 측정이 이 시간을 물지 않는다.
+    const waited = kubectl([...base, '-n', 'elanous-test', 'wait', '--for=jsonpath={.status.phase}=Succeeded', `pod/${name}`, '--timeout=90s']);
     const pod = kubectl([...base, '-n', 'elanous-test', 'get', `pod/${name}`, '-o', 'json']);
     if (pod.status !== 0) return 'unknown';
     const state = object(JSON.parse(pod.stdout));
@@ -296,14 +367,24 @@ function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
     const statuses = object(state?.status)?.containerStatuses;
     if (Array.isArray(statuses) && statuses.some((c) =>
       ['ErrImagePull', 'ImagePullBackOff', 'InvalidImageName'].includes(String(object(object(object(c)?.state)?.waiting)?.reason)))) return 'image';
+    // 🩸 10-09 18:5x: 부하 걸린 노드(load 78)에선 kubelet 이 «끝난» 탐침의 phase 를 30초 넘게 Running 으로 둔다
+    //   (nslookup 이 답을 찍은 뒤에도 · `timeout 8 nslookup` 도 46초 Running). phase 만 보면 측정이 «unknown» → 승인 0.
+    //   Running 이면 로그를 읽어 해석 성공(이름·주소 줄)이 이미 찍혔는지 본다 — 찍혔으면 DNS 는 된다.
+    if (phase === 'Running') {
+      const early = kubectl([...base, '-n', 'elanous-test', 'logs', `pod/${name}`]);
+      if (early.status === 0 && DNS_PROBE_READY.test(early.stdout) && /\bAddress(?:es)?:\s*\S+/u.test(early.stdout)) {
+        debug.log('pod.lease', 'dns-probe-ready-by-log', { context, phase });
+        return 'ready';
+      }
+    }
     if (phase !== 'Succeeded' && phase !== 'Failed') return 'unknown';
     if (waited.status !== 0 && phase !== 'Failed') return 'unknown';
     const log = kubectl([...base, '-n', 'elanous-test', 'logs', `pod/${name}`]);
     if (log.status !== 0) return 'unknown';
     if (phase === 'Failed') return /can't resolve|server can't find|connection timed out|no servers could be reached|NXDOMAIN|SERVFAIL/iu.test(log.stdout) ? 'dns' : 'unknown';
-    return /\bName:\s*kubernetes\.default\.svc\.cluster\.local\b/u.test(log.stdout) && /\bAddress(?:es)?:\s*\S+/u.test(log.stdout) ? 'ready' : 'dns';
+    return DNS_PROBE_READY.test(log.stdout) && /\bAddress(?:es)?:\s*\S+/u.test(log.stdout) ? 'ready' : 'dns';
   } catch { return 'unknown'; }
-  finally { try { kubectl([...base, '-n', 'elanous-test', 'delete', `pod/${name}`, '--ignore-not-found=true', '--wait=false']); } catch { /* best-effort cleanup */ } }
+  finally { if (cleanup) { try { kubectl([...base, '-n', 'elanous-test', 'delete', `pod/${name}`, '--ignore-not-found=true', '--wait=false']); } catch { /* best-effort cleanup */ } } }
 }
 
 /** Each cluster reads resource reservations; DNS requires a bounded disposable Pod. */
@@ -534,7 +615,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
  */
 export function harnessCpuSlotsBesideGate(measure: PoolLeaseMeasure): number | null | undefined {
   if (!measure.members.some((m) => (m.gateJobs ?? 0) > 0)) return undefined;
-  const perPod = quantity(POD_CHILD_REQUESTS.cpu, 'cpu')!;
+  const perPod = quantity(HARNESS_SLOT_CPU_BESIDE_GATE, 'cpu')!;
   let slots = 0;
   for (const m of measure.members) {
     if (m.gateJobs == null || m.gateUnboundJobs == null || m.cpuFreeByNodeMillicores == null || m.pendingHarnessCpuMillicores == null) return null;

@@ -159,6 +159,58 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
   });
 });
 
+test('installed onActivate cannot register a hook through its context', async () => {
+  const original = process.env.ELANOUS_STATE_DIR;
+  const root = createDir('elanous-host-programmatic-state-');
+  const source = createDir('elanous-host-programmatic-source-');
+  const userDir = createDir('elanous-host-programmatic-user-');
+  const messages: string[] = [];
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'installed-programmatic', version: '1.0.0', main: './plugin.ts' }));
+  writeFileSync(join(source, 'plugin.ts'), `export default {
+    name: 'installed-programmatic', initialState: () => ({}), panes: {},
+    onActivate(ctx) {
+      ctx.log('context hooks available: ' + ('hooks' in ctx));
+      ctx.hooks?.register({ id: 'turn', event: 'Turn', command: 'echo forbidden' });
+    },
+  };`);
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    await installPlugin(source, { root, yes: true });
+    const host = new PluginHost({ ...hooks, log: message => messages.push(message) }, null, { userDir });
+    await host.discover();
+    await host.activate('installed-programmatic');
+    expect(messages).toContain('context hooks available: false');
+    expect(host.active()?.ownedHookDisposers).toHaveLength(0);
+    await host.deactivate();
+  } finally {
+    if (original === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = original;
+  }
+});
+
+test('installed manifest hooks stay off at activation while built-in and user behavior is unchanged', async () => {
+  const original = process.env.ELANOUS_STATE_DIR;
+  const root = createDir('elanous-host-hook-state-');
+  const source = createDir('elanous-host-hook-source-');
+  const userDir = createDir('elanous-host-hook-user-');
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'installed-hook', version: '1.0.0', main: './plugin.ts',
+    contributes: { hooks: [{ id: 'turn', event: 'Turn', command: 'echo hooked' }] } }));
+  writeFileSync(join(source, 'plugin.ts'), "export default { name: 'installed-hook', initialState: () => ({}), panes: {} };\n");
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    await installPlugin(source, { root, yes: true });
+    const host = new PluginHost(hooks, null, { userDir });
+    await host.discover();
+    expect(host.list().find(entry => entry.manifest.id === 'installed-hook')?.source).toBe('installed');
+    await host.activate('installed-hook');
+    expect(host.active()?.ownedHookDisposers).toHaveLength(0);
+    await host.deactivate();
+  } finally {
+    if (original === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = original;
+  }
+});
+
 describe('skill-only packs (no main) boot quietly', () => {
   test('a manifest pack with skills/ and no plugin.ts is not warned as «main not found»; an explicit missing main still is', async () => {
     const userDir = createDir('elanous-host-skill-only-');

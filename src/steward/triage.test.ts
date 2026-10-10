@@ -13,6 +13,9 @@ import { LogStore } from '../mss/logging/log-store.js';
 import { setInProcessOutbound } from '../domains/outbound-alert.js';
 import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
 
+// #25512: live launch resolves the registered HQ OP view from the real HOME; tests run from an isolated view instead.
+const testLaunchSeat = (): string => tmpdir();
+
 // Real Bun subprocesses can exceed Bun's 5 s test default under gate-pod load.
 setDefaultTimeout(60_000);
 
@@ -44,7 +47,7 @@ test('off mode skips the stage command before locking or creating state; shadow 
     writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
     writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
     await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow', launch: 'live' },
-      launchCommand: () => { throw new Error('shadow ran command'); }, spawnLaunch: () => { throw new Error('shadow spawned'); } });
+      launchCommand: () => { throw new Error('shadow ran command'); }, launchSeat: testLaunchSeat, spawnLaunch: () => { throw new Error('shadow spawned'); } });
     expect(readLaunchLedger(root).launches['ELA-1']?.status).toBe('shadow');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -69,7 +72,7 @@ test('one loop.steward decision per graph tick for launch, skip, report and fail
   const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
     launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
     launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-    spawnLaunch: () => ({ pid: 99999999 }), sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
+    launchSeat: testLaunchSeat, spawnLaunch: () => ({ pid: 99999999 }), sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
   try {
     expect(debug.enabled).toBe(false);
     mkdirSync(dir);
@@ -145,7 +148,7 @@ test('a failed launch is recorded once with its goal and cause at the report bou
     const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
       launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-      spawnLaunch: () => { throw new Error('spawn unavailable'); }, sendDigest: async () => {},
+      launchSeat: testLaunchSeat, spawnLaunch: () => { throw new Error('spawn unavailable'); }, sendDigest: async () => {},
       now: () => new Date('2026-10-04T00:00:00Z') };
     await runStewardStage('schedule', deps);
     expect(readLaunchLedger(root).launches['ELA-1']).toMatchObject({ status: 'failed', reason: 'Error: spawn unavailable' });
@@ -186,7 +189,7 @@ test('a later failed launch wins over an earlier success and report retries keep
     const deps = { root, fetch: fetchFn, getSecret: async () => 'key', launchSettings: { mode: 'live' as const, maxParallel: 2 },
       launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-      spawnLaunch: () => { if (++launches === 2) throw new Error('second spawn unavailable'); return { pid: 99999999 }; },
+      launchSeat: testLaunchSeat, spawnLaunch: () => { if (++launches === 2) throw new Error('second spawn unavailable'); return { pid: 99999999 }; },
       sendDigest: async () => {}, now: () => new Date('2026-10-04T00:00:00Z') };
     await runStewardStage('schedule', deps);
     expect(launches).toBe(2);
@@ -225,7 +228,7 @@ test('a failed report supersedes a pending launch without emitting a second deci
     const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
       launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-      spawnLaunch: () => ({ pid: 99999999 }) };
+      launchSeat: testLaunchSeat, spawnLaunch: () => ({ pid: 99999999 }) };
     await runStewardStage('schedule', deps);
     expect(existsSync(join(dir, 'decision-report-failure.json'))).toBe(true);
     expect(await runStewardStageCommand('report', { ...deps, runStage: async () => { throw new Error('report unavailable'); } })).toBe(1);
@@ -291,7 +294,7 @@ test('legacy live launch override still runs the stage and launches only after i
     await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { launch: 'live' },
       launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       launchGate: (_goalId, budget) => { gateCalls++; return { action: 'proceed', sameGoalActiveRuns: [], budget, reason: 'no confirmed duplicate' }; },
-      spawnLaunch: () => { spawnCalls++; return { pid: 99999999 }; },
+      launchSeat: testLaunchSeat, spawnLaunch: () => { spawnCalls++; return { pid: 99999999 }; },
     });
     expect([gateCalls, spawnCalls, readLaunchLedger(root).launches['ELA-1']?.status]).toEqual([1, 1, 'launched']);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -310,7 +313,7 @@ test('legacy launch off skips stages without recording plans or HITL, while expl
       { issue: 'ELA-2', rung: 'hitl', hitlReason: 'money', dependsOn: [], priority: 2, why: 'approve' },
     ]));
     const deps = { root, getSecret: async () => 'key', launchCommand: () => { throw new Error('legacy off ran command'); },
-      spawnLaunch: () => { throw new Error('legacy off spawned'); } };
+      launchSeat: testLaunchSeat, spawnLaunch: () => { throw new Error('legacy off spawned'); } };
     await runStewardStage('schedule', { ...deps, launchSettings: { launch: 'off' } });
     expect(existsSync(join(dir, 'schedule.json'))).toBe(false);
     expect(existsSync(join(dir, 'launches.json'))).toBe(false);
@@ -752,7 +755,7 @@ test('schedule → report: live pod runs yield one landing digest with source, t
   }) as typeof fetch;
   const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { mode: 'live' as const },
     launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-    spawnLaunch: (args: string[], log: string) => { calls.push(args); writeFileSync(log, `starting ${runId}`); return { pid: 99999999 }; },
+    launchSeat: testLaunchSeat, spawnLaunch: (args: string[], log: string) => { calls.push(args); writeFileSync(log, `starting ${runId}`); return { pid: 99999999 }; },
     launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
       : { exitCode: 0, stdout: [{ event: 'pr-opened', data: { number: 77 } }, { event: 'merged', data: { number: 77, merged: true } }, { event: 'run-status', data: { runStatus: 'completed' } }].map(event => JSON.stringify(event)).join('\n') },
     sendDigest: async (text: string) => { messages.push(text); } };
@@ -826,7 +829,7 @@ test('landing still reaches its card and requester after the issue leaves the cu
   const one = { ...issues[0]!, title: 'Departed request', body: 'Build it\n출처: tui' };
   const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
     launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
-    spawnLaunch: (_args: string[], log: string) => { spawned++; writeFileSync(log, `started ${runId}`); return { pid: 99999999 }; },
+    launchSeat: testLaunchSeat, spawnLaunch: (_args: string[], log: string) => { spawned++; writeFileSync(log, `started ${runId}`); return { pid: 99999999 }; },
     launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
       : { exitCode: 0, stdout: '{"event":"merged","data":{"number":88,"merged":true}}' },
     sendDigest: async (text: string) => { messages.push(text); } };
@@ -1294,7 +1297,7 @@ test('a never-resolving wish draft is carried after its item deadline while an e
       ask: async () => new Promise<never>(() => {}),
       launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       launchGate: () => ({ action: 'proceed', sameGoalActiveRuns: [], budget: { action: 'proceed', reasons: [] }, reason: 'no confirmed duplicate' }),
-      spawnLaunch: args => { spawned.push(args.at(-1)!); return { pid: 99999999 }; },
+      launchSeat: testLaunchSeat, spawnLaunch: args => { spawned.push(args.at(-1)!); return { pid: 99999999 }; },
     });
     const rows = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8')) as Array<{ issue: string; disposition: string; deferred?: true }>;
     expect(rows.find(row => row.issue === 'ELA-1')).toMatchObject({ deferred: true, disposition: 'wait' });
@@ -1326,7 +1329,7 @@ test('a wish draft throwing an ordinary error is carried without rejecting the s
     ]));
     await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow' },
       ask: async () => { throw new Error('draft service failed'); },
-      spawnLaunch: () => { throw new Error('shadow spawned'); },
+      launchSeat: testLaunchSeat, spawnLaunch: () => { throw new Error('shadow spawned'); },
     });
     const rows = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8')) as Array<{ issue: string; disposition: string; deferred?: true }>;
     expect(rows.find(row => row.issue === 'ELA-1')).toMatchObject({ deferred: true, disposition: 'wait' });
@@ -1386,7 +1389,7 @@ test('schedule stage reproduced from a copied steward state names the first stac
         fetch: fetchFn,
         launchSettings: { mode: 'shadow' },
         launchCommand: () => { launches.push('command'); throw new Error('real launch'); },
-        spawnLaunch: () => { launches.push('spawn'); throw new Error('real spawn'); },
+        launchSeat: testLaunchSeat, spawnLaunch: () => { launches.push('spawn'); throw new Error('real spawn'); },
       });
     } catch (error) {
       firstLine = (error instanceof Error ? error.stack ?? error.message : String(error)).split('\n')[0] ?? '';

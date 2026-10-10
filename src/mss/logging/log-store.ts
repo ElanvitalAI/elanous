@@ -17,7 +17,8 @@
 //     severity 는 SCHEME(이벤트 접미사) → `level` 컬럼으로 물질화.
 
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { dirname, join } from 'node:path';
 
@@ -81,9 +82,13 @@ export interface LogStoreRetention {
   maxAgeDays: number;
   /** DB 상한(MB). 초과 시 오래된 행부터 삭제. 0 이하 = 크기 정리 안 함. 기본 500. */
   maxDbMb: number;
+  /** 🩸 LOGS-RETENTION-WINDOW-1(10-10): size-cap floor in hours — the size pass never deletes rows newer than
+   *  this; when rows outside the floor are not enough it stops and logs `retention-floor-held`.
+   *  0 = legacy behaviour (oldest-first with no floor). Missing = 24. Age pass (`maxAgeDays`) is unaffected. */
+  minRetainHours?: number;
 }
 
-export const LOG_RETENTION_DEFAULTS: LogStoreRetention = { maxAgeDays: 7, maxDbMb: 500 };
+export const LOG_RETENTION_DEFAULTS: LogStoreRetention = { maxAgeDays: 7, maxDbMb: 500, minRetainHours: 24 };
 
 /** 스토어 OOM 백스톱 — 정책 상한이 아니다. 정책은 각 경계(HTTP·툴)가 갖는다. */
 export const STORE_SAFETY_MAX = 100_000;
@@ -360,20 +365,63 @@ export class LogStore {
     }
     if (policy.maxDbMb > 0) {
       const pageCount = (this.db.query('PRAGMA page_count').get() as { page_count: number }).page_count;
+      const freePages = (this.db.query('PRAGMA freelist_count').get() as { freelist_count: number }).freelist_count;
       const pageSize = (this.db.query('PRAGMA page_size').get() as { page_size: number }).page_size;
-      const sizeMb = (pageCount * pageSize) / (1024 * 1024);
+      // 🩸 OBS-RET-RATCHET(2026-10-09): 빈 페이지까지 세면 VACUUM 없는 파일은 안 줄어든다 → 뜰 때마다 오래된 행 ≈5% 를
+      //   또 지우는 래칫이 됐다(운영 logs.db 528MB · 01:08Z 이전 행 소실). 상한은 «쓰는 페이지»로 잰다.
+      const sizeMb = ((pageCount - freePages) * pageSize) / (1024 * 1024);
       if (sizeMb > policy.maxDbMb) {
         // 초과분 비율만큼 오래된 행 삭제(대략 — 정밀 계산보다 반복 수렴 선호).
         const total = (this.db.query('SELECT COUNT(*) AS c FROM logs').get() as { c: number }).c;
         const dropCount = Math.max(1, Math.floor(total * Math.min(0.5, 1 - policy.maxDbMb / sizeMb)));
-        const r = this.db.run(
-          'DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY ts_ms ASC LIMIT ?)',
-          [dropCount],
-        );
-        deletedBySize = Number(r.changes ?? 0);
+        // 🩸 LOGS-RETENTION-WINDOW-1(10-10): prod write volume made this pass keep only ≈2h of rows, so evidence
+        //   for incidents a few hours old read as «0 rows». Rows inside the floor are never size-deleted.
+        const floorHours = policy.minRetainHours ?? LOG_RETENTION_DEFAULTS.minRetainHours ?? 0;
+        if (floorHours > 0) {
+          const floorCutoff = Date.now() - floorHours * 3_600_000;
+          // Byte-weighted split (payload text + fixed per-row overhead) — row counts alone misjudge mixed row sizes.
+          const split = this.db.query(
+            `SELECT COALESCE(SUM(CASE WHEN ts_ms < ? THEN w ELSE 0 END), 0) AS outsideBytes, COALESCE(SUM(w), 0) AS allBytes
+               FROM (SELECT ts_ms, 64 + LENGTH(ts) + LENGTH(category) + LENGTH(event) + COALESCE(LENGTH(data), 0) AS w FROM logs)`,
+          ).get(floorCutoff) as { outsideBytes: number; allBytes: number };
+          const r = this.db.run(
+            'DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE ts_ms < ? ORDER BY ts_ms ASC LIMIT ?)',
+            [floorCutoff, dropCount],
+          );
+          deletedBySize = Number(r.changes ?? 0);
+          // dropCount is capped at 50% per run; judge the floor against the full overshoot (by bytes) so a cap the
+          // floor can never reach is reported even when this run's capped batch was fully served from outside rows.
+          const neededShare = 1 - policy.maxDbMb / sizeMb;
+          const outsideShare = split.allBytes > 0 ? split.outsideBytes / split.allBytes : 0;
+          if (outsideShare < neededShare) {
+            debug.log('mss.logging', 'retention-floor-held', {
+              totalMb: Math.round(sizeMb * 10) / 10, maxTotalMb: policy.maxDbMb, floorHours,
+              neededShare: Math.round(neededShare * 1000) / 1000, outsideShare: Math.round(outsideShare * 1000) / 1000,
+              deletedRows: deletedBySize,
+            });
+          }
+        } else {
+          const r = this.db.run(
+            'DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY ts_ms ASC LIMIT ?)',
+            [dropCount],
+          );
+          deletedBySize = Number(r.changes ?? 0);
+        }
       }
     }
+    if (deletedByAge > 0 || deletedBySize > 0) {
+      const oldest = (this.db.query('SELECT MIN(ts_ms) AS t FROM logs').get() as { t: number | null }).t;
+      debug.log('log-store.retention', 'deleted', { deletedByAge, deletedBySize, oldestTs: oldest === null ? null : new Date(oldest).toISOString() });
+    }
     return { deletedByAge, deletedBySize };
+  }
+
+  /** Reclaim a bounded number of free pages after retention; legacy databases with auto_vacuum=NONE remain unchanged. */
+  reclaimFreePages(): void {
+    const mode = (this.db.query('PRAGMA auto_vacuum').get() as { auto_vacuum: number }).auto_vacuum;
+    if (mode !== 2) return;
+    const free = (this.db.query('PRAGMA freelist_count').get() as { freelist_count: number }).freelist_count;
+    if (free > 0) this.db.run(`PRAGMA incremental_vacuum(${Math.min(free, 128)})`);
   }
 
   /**
@@ -658,6 +706,12 @@ export class LogStore {
     return (this.db.query('SELECT COUNT(*) AS c FROM logs').get() as { c: number }).c;
   }
 
+  /** Earliest retained event timestamp, regardless of insertion order. No schema or row writes. */
+  horizon(): { status: 'present'; oldestTsMs: number } | { status: 'empty' } {
+    const { oldestTsMs } = this.db.query('SELECT MIN(ts_ms) AS oldestTsMs FROM logs').get() as { oldestTsMs: number | null };
+    return oldestTsMs === null ? { status: 'empty' } : { status: 'present', oldestTsMs };
+  }
+
   close(): void {
     try { this.db.close(); } catch { /* noop */ }
   }
@@ -850,28 +904,163 @@ export class StoreSink implements LogSink {
   }
 }
 
+const RETENTION_INTERVAL_MS = 6 * 3600 * 1000;
+type RetentionLockOwner = { token: string; pid: number; start: string | null };
+
+/** PID reuse must not let a new process inherit a dead process's ownership. */
+function processStart(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null;
+  } catch { return null; }
+}
+
+function ownerDead(owner: RetentionLockOwner): boolean {
+  if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
+  try {
+    process.kill(owner.pid, 0);
+    const currentStart = processStart(owner.pid);
+    if (owner.start !== null && currentStart !== null && owner.start !== currentStart) return true;
+    // A zombie still answers kill(pid, 0), but can no longer run retention.
+    try {
+      const stat = readFileSync(`/proc/${owner.pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ');
+    } catch { return false; }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+/** Only the guard row can authorize removal. A pre-publication temp file belongs to its row's token. */
+function removeRetentionLockDirectory(lockPath: string, token: string, interrupted: boolean): void {
+  if (!existsSync(lockPath)) return;
+  const marker = join(lockPath, 'owner');
+  const temporaryName = `owner.${token}.tmp`;
+  if (readdirSync(lockPath).some((name) => name !== 'owner' && name !== temporaryName)) {
+    throw new Error('retention lock has unknown entries');
+  }
+  if (existsSync(marker)) {
+    const published = readFileSync(marker, 'utf8');
+    if (published !== token && !(interrupted && token.startsWith(published))) {
+      throw new Error('retention lock owner changed');
+    }
+    rmSync(marker);
+  }
+  rmSync(join(lockPath, temporaryName), { force: true });
+  rmdirSync(lockPath);
+}
+
+/** The SQLite guard serializes stale-lock recovery and ownership changes, including process death mid-acquisition. */
+function acquireRetentionLock(lockPath: string): (() => void) | null {
+  const guard = new Database(`${lockPath}.db`);
+  const token = randomUUID();
+  let handedOff = false;
+  try {
+    guard.run('PRAGMA busy_timeout = 100');
+    guard.run('CREATE TABLE IF NOT EXISTS owner (slot INTEGER PRIMARY KEY CHECK(slot = 1), token TEXT NOT NULL, pid INTEGER NOT NULL, start TEXT)');
+    let acquired = false;
+    guard.run('BEGIN IMMEDIATE');
+    try {
+      const previous = guard.query('SELECT token, pid, start FROM owner WHERE slot = 1').get() as RetentionLockOwner | null;
+      if (previous && !ownerDead(previous)) return null;
+      if (existsSync(lockPath)) {
+        // A pre-guard lock has no provable owner: never remove it.
+        if (!previous) return null;
+        try { removeRetentionLockDirectory(lockPath, previous.token, true); }
+        catch { return null; }
+      }
+      guard.run('INSERT OR REPLACE INTO owner (slot, token, pid, start) VALUES (1, ?, ?, ?)', [token, process.pid, processStart(process.pid)]);
+      guard.run('COMMIT');
+      acquired = true;
+    } finally {
+      if (!acquired) guard.run('ROLLBACK');
+    }
+    // The ownership row is committed before mkdir: a crash in this gap is recoverable too.
+    try {
+      mkdirSync(lockPath);
+      const temporary = join(lockPath, `owner.${token}.tmp`);
+      writeFileSync(temporary, token, { flag: 'wx' });
+      renameSync(temporary, join(lockPath, 'owner'));
+    } catch (error) {
+      guard.run('BEGIN IMMEDIATE');
+      try {
+        // Keep the ownership row if cleanup fails: the next process can then
+        // prove who left the directory behind and recover it after this PID dies.
+        removeRetentionLockDirectory(lockPath, token, true);
+        guard.run('DELETE FROM owner WHERE slot = 1 AND token = ?', [token]);
+        guard.run('COMMIT');
+      } catch { guard.run('ROLLBACK'); }
+      throw error;
+    }
+    handedOff = true;
+    return () => {
+      try {
+        guard.run('BEGIN IMMEDIATE');
+        try {
+          const current = guard.query('SELECT token FROM owner WHERE slot = 1').get() as { token: string } | null;
+          if (current?.token === token) {
+            removeRetentionLockDirectory(lockPath, token, false);
+            guard.run('DELETE FROM owner WHERE slot = 1 AND token = ?', [token]);
+          }
+          guard.run('COMMIT');
+        } catch (error) { guard.run('ROLLBACK'); throw error; }
+      } finally { guard.close(); }
+    };
+  } finally { if (!handedOff) guard.close(); }
+}
+
+/** A shared stamp prevents short-lived non-owner processes from repeatedly pruning the same DB. */
+function runStampedRetention(store: LogStore, retention: LogStoreRetention, owner: boolean): void {
+  const stampPath = `${store.path}.retention.stamp`;
+  const lockPath = `${store.path}.retention.lock`;
+  const isFresh = (): boolean => {
+    try {
+      const age = Date.now() - Number(readFileSync(stampPath, 'utf8'));
+      return age >= 0 && age < RETENTION_INTERVAL_MS;
+    } catch { return false; }
+  };
+  if (!owner && isFresh()) return;
+  const release = acquireRetentionLock(lockPath);
+  if (!release) return;
+  try {
+    if (!owner && isFresh()) return;
+    store.enforceRetention(retention);
+    try { store.reclaimFreePages(); }
+    catch (error) { debug.log('log-store.retention', 'reclaim-failed', { reason: error instanceof Error ? error.message : String(error) }); }
+    const temporary = `${stampPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, String(Date.now()));
+      renameSync(temporary, stampPath);
+    } finally { rmSync(temporary, { force: true }); }
+  } finally { release(); }
+}
+
 /** 부팅 1줄 등록 헬퍼 — 데몬/TUI/러너가 자기 surface 를 선언하고 스토어
  *  싱크를 단다. retention 은 호출측이 config 에서 읽어 전달(user-config
- *  순환 의존 회피). 반환 = unregister(테스트용) 또는 null(store 불가). */
+ *  순환 의존 회피). 반환 = unregister(테스트용) 또는 null(store 불가).
+ *  nexus owns the periodic job unless the caller explicitly opts in. */
 export function registerLogStoreSink(
   registerSink: (sink: LogSink) => () => void,
   surface: string,
   retention: LogStoreRetention = LOG_RETENTION_DEFAULTS,
+  opts: { retentionOwner?: boolean } = {},
 ): (() => void) | null {
   const store = getDefaultLogStore();
   if (!store) return null;
   const sink = new StoreSink(store, surface, { installExitHandlers: true });
   const off = registerSink(sink);
   try { nestDepth.observeNestAtBoot(); } catch { /* fail-soft — 관측 실패가 싱크 등록을 막지 않는다. */ }
-  // 보존정책 — 부팅 직후 1회(디퍼) + 6시간 주기. 실패는 조용히.
+  const owner = opts.retentionOwner ?? surface === 'nexus';
   const runRetention = (): void => {
-    try { store.enforceRetention(retention); } catch { /* fail-soft */ }
+    try { runStampedRetention(store, retention, owner); }
+    catch (error) { debug.log('log-store.retention', 'failed', { reason: error instanceof Error ? error.message : String(error) }); }
   };
-  setImmediate(runRetention);
-  const h = setInterval(runRetention, 6 * 3600 * 1000);
-  (h as unknown as { unref?: () => void }).unref?.();
+  const startup = setImmediate(runRetention);
+  const h = owner ? setInterval(runRetention, RETENTION_INTERVAL_MS) : null;
+  (h as unknown as { unref?: () => void } | null)?.unref?.();
   return () => {
-    clearInterval(h);
+    clearImmediate(startup);
+    if (h) clearInterval(h);
     sink.close();
     off();
   };

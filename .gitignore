@@ -56,6 +56,8 @@ reports/ops/
 
 # 자식 실행 하트비트 — 런타임 상태, 소스 아님
 .elanous-child-liveness.hb
+# TYPECHECK-SCOPE-LEAK — 범위 타입검사의 임시 tsconfig(src/self-implement/scoped-typecheck-config.ts). 프로젝트 폴더에 써야 typeRoots·paths 가 같게 풀린다 → 위치는 두고 git 에서만 뺀다.
+.elanous-typecheck-scope-*.json
 
 # ⛔⭐ agent-mission 제어 파일 — 자식의 «입력»이지 산출이 아니다 (2026-08-12 [T] 76차)
 #   driver.ts 가 워크트리 «안»에 쓰고(`join(wt.path,'.mission-prompt.md')`) 자식에게 상대경로로 읽힌다.

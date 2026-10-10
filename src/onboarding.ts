@@ -51,6 +51,7 @@ import { DiscordBot } from './discord.js';
 import { pickCodexAuthMode, pickCodexModel } from './codex/setup.js';
 import { getInventory, resolveBaseUrl } from './llm/local-manager/manager.js';
 import { getMessages, format as i18nFormat } from './expression/i18n/index.js';
+import { messagesEn } from './expression/i18n/messages.en.js';
 import type {
   ChoiceOption,
   ChooseOpts,
@@ -1562,7 +1563,7 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
     io.print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     io.print(`  ${m.setupComplete}`);
     // ER1 — first-run consent notice (default on · 대표 10-01): what is sent and how to turn it off.
-    io.print('  오류가 나면 운영팀에 자동으로 알립니다(오류 내용·버전·무작위 설치 ID — 이름·메일 없이). 끄기: elanous config set errorReports.enabled false');
+    io.print(`  ${m.setupErrorReportNotice ?? messagesEn.setupErrorReportNotice}`);
     io.print(`  Provider : ${marked.llm.provider}${marked.llm.model ? ` (${marked.llm.model})` : ''}`);
     // EN5 — show what the loader will actually read (resolveSkillSources), not the raw preset fields.
     const skillSources = resolveSkillSources(marked).filter((source) => source.enabled);

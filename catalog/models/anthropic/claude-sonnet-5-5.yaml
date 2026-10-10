@@ -1,0 +1,31 @@
+id: claude-sonnet-5-5
+provider: anthropic
+displayName: Claude Sonnet 5.5
+family: claude-5
+# ⛔ `familyShortcut: sonnet` 을 «일부러» 안 붙였다 — 붙이면 `sonnet` 별칭(→ claude-sonnet-5)이
+#    «stale» 로 바뀌고, 별칭을 옮기는 것은 «라우팅 변경»이라 별개 결정이다(grok-4.7 첫 등재와 같은 처리).
+#    이 파일은 「--child-llm-model 로 이 모델을 부를 수 없다」만 닫는다(MK 10-10).
+# 📏 출처 — 2026-10-10T08:38Z 직접 확인:
+#   ⑴ Anthropic 공식 https://platform.claude.com/내부 문서 `overview`
+#      «Released September 28, 2026 · Context window: 1M tokens · Max output: 128K tokens · $2 / $10»
+#      ⊕ https://platform.claude.com/내부 문서 `overview` (API ID `claude-sonnet-5-5`)
+#      ⊕ https://platform.claude.com/내부 문서 `pricing` (캐시 읽기 $0.10 = 입력의 5%)
+#   ⑵ OpenRouter `GET /api/v1/models` 실측 2026-10-10T05:10Z — anthropic/claude-sonnet-5.5: 1,000,000 · 128,000 · $2/$10
+#   🔲 vision·tokenizer 는 안 쟀다 → 비운다.
+contextSize: 1000000
+outputMaxTokens: 128000
+reasoning: adaptive
+toolCalling: native-anthropic
+streamingProtocol: sse
+releaseDate: 2026-09-28
+pricing:
+  inputPerMTok: 2.00
+  outputPerMTok: 10.00
+  cachedInputPerMTok: 0.10
+deprecated: null
+kind: chat
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-10
+  autoFilled: false
+  confidence: high

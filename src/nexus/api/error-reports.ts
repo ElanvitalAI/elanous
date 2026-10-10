@@ -25,19 +25,21 @@ function storeDir(root: string): string { return join(root, 'error-reports'); }
 /** Removes day folders older than the keep window. Returns how many days were removed. */
 export function pruneErrorReports(root: string, now: number): number {
   const base = storeDir(root);
-  if (!existsSync(base)) return 0;
   let removed = 0;
-  for (const year of readdirSync(base).filter((n) => /^\d{4}$/.test(n))) {
-    for (const month of readdirSync(join(base, year)).filter((n) => /^\d{2}$/.test(n))) {
-      for (const day of readdirSync(join(base, year, month)).filter((n) => /^\d{2}$/.test(n))) {
-        const at = Date.parse(`${year}-${month}-${day}T00:00:00Z`);
-        if (Number.isFinite(at) && now - at > ERROR_REPORT_KEEP_DAYS * DAY_MS + DAY_MS) {
-          rmSync(join(base, year, month, day), { recursive: true, force: true });
-          removed++;
+  if (existsSync(base)) {
+    for (const year of readdirSync(base).filter((n) => /^\d{4}$/.test(n))) {
+      for (const month of readdirSync(join(base, year)).filter((n) => /^\d{2}$/.test(n))) {
+        for (const day of readdirSync(join(base, year, month)).filter((n) => /^\d{2}$/.test(n))) {
+          const at = Date.parse(`${year}-${month}-${day}T00:00:00Z`);
+          if (Number.isFinite(at) && now - at > ERROR_REPORT_KEEP_DAYS * DAY_MS + DAY_MS) {
+            rmSync(join(base, year, month, day), { recursive: true, force: true });
+            removed++;
+          }
         }
       }
     }
   }
+  debug.log('error-report.prune', 'done', { pruned: removed });
   return removed;
 }
 
@@ -75,6 +77,26 @@ function count24h(root: string, dedupe: string, now: number): number {
     }
   }
   return n;
+}
+
+/** Retention without a receipt: prune once at daemon boot and then once a day (the ingest path still prunes too). */
+export function startErrorReportPruneTick(deps: {
+  root?: () => string;
+  now?: () => number;
+  schedule?: (tick: () => void, ms: number) => { unref?: () => void };
+} = {}): { stop(): void } {
+  const root = deps.root ?? effectiveInstanceRoot;
+  const now = deps.now ?? Date.now;
+  const run = (trigger: 'boot' | 'tick') => {
+    // pruneErrorReports emits error-report.prune/done { pruned }; only a failure is logged here.
+    try { pruneErrorReports(root(), now()); }
+    catch (error) { debug.log('error-report.prune', 'failed', { trigger, reason: error instanceof Error ? error.message : String(error) }); }
+  };
+  run('boot');
+  let stopped = false;
+  const handle = (deps.schedule ?? ((tick, ms) => setInterval(tick, ms)))(() => { if (!stopped) run('tick'); }, DAY_MS);
+  handle.unref?.();
+  return { stop: () => { stopped = true; if (!deps.schedule) clearInterval(handle as ReturnType<typeof setInterval>); } };
 }
 
 /** POST /v1/reports/ingest — the caller (router) has already checked the ingest token. */

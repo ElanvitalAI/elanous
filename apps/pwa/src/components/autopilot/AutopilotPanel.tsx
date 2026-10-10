@@ -6,14 +6,10 @@
 // 자율 미션화)"는 Missions 탭 인라인 컴포저로 흡수 — 구 최상위 "Triage" 탭 제거
 // (intake 와 "두 개의 문" 겹침 해소). 포착의 리뷰 우선 경로는 Intake 가 담당.
 //   Missions    모든 미션(사람 intake + 자율)의 계보·상태 + 인라인 골 던지기
-//   Repo Watch  참조 에이전트 repo 흡수 후보(hermes/openclaw/codex)
 //   자율행동    자율루프가 무엇을 왜 했나(surface_events domain=elanous)
-//   루프 오케스트라  5 자율루프 순환 그래프(기존 LoopsPanel 결합)
 
 import { useEffect, useMemo, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import { LoopsPanel } from '@/components/loops/LoopsPanel';
-import { AutopilotRepoWatch } from './AutopilotRepoWatch';
 import { AutopilotAutonomyLog } from './AutopilotAutonomyLog';
 import { AutopilotMissions } from './AutopilotMissions';
 import { FabricStageHeader } from '@/components/shell/FabricStageHeader';
@@ -21,9 +17,7 @@ import { AutopilotApi, type ArmingStatus } from '@/lib/autopilot-api';
 
 const TABS = [
   { id: 'missions', label: 'Missions' },
-  { id: 'repo', label: 'Repo Watch' },
   { id: 'autonomy', label: '자율행동' },
-  { id: 'loops', label: '루프 오케스트라' },
 ] as const;
 type TabId = (typeof TABS)[number]['id'];
 
@@ -86,9 +80,7 @@ export function AutopilotPanel() {
       </div>
       <div className="py-4">
         {tab === 'missions' && <AutopilotMissions api={api} />}
-        {tab === 'repo' && <AutopilotRepoWatch api={api} />}
         {tab === 'autonomy' && <AutopilotAutonomyLog api={api} />}
-        {tab === 'loops' && <LoopsPanel />}
       </div>
     </div>
   );

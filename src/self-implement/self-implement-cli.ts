@@ -124,7 +124,9 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.salvage !== undefined ? { salvage: r.salvage } : {}),
     ...(r.review?.reviewed === true && r.review.verdict === 'pass'
       && r.reviewedHeadCommit && /^[0-9a-f]{40}$/i.test(r.reviewedHeadCommit)
-      ? { selfReview: { verdict: r.review.verdict, head: r.reviewedHeadCommit } } : {}),
+      ? { selfReview: { verdict: r.review.verdict, head: r.reviewedHeadCommit,
+        // TA-LAND-MUSTFIX-ZERO — must-fix 수를 같이 나른다(목록이 없으면 «모름» = 안 싣는다 · land 관문이 막는다).
+        ...(Array.isArray(r.review.mustFix) && r.review.mustFix.every((fix) => typeof fix === 'string') ? { mustFixCount: r.review.mustFix.length } : {}) } } : {}),
     ...(r.review?.reviewed !== undefined ? { reviewed: r.review.reviewed } : {}),
     ...(r.review?.failureReason !== undefined ? { reviewReason: r.review.failureReason } : {}),
     // ⭐ 대표 지시(2026-09-08) — 걸음을 슈퍼바이저까지 나른다.

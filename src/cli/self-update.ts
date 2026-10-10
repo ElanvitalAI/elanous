@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, readlinkSync, readdirSync, statSync, rmSync, symlinkSync, renameSync, writeFileSync, lstatSync } from 'node:fs';
-import { resolve, join, basename, dirname } from 'node:path';
+import { resolve, join, basename, dirname, sep } from 'node:path';
 import { homedir, platform, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { decideRestartNeeded, type RestartNeededResult } from './nexus-restart-needed.js';
@@ -455,14 +455,172 @@ export function planVersionPrune(
   return { removed: all.filter((n) => !kept.includes(n)), kept };
 }
 
-function defaultPruneVersions(plan: { current: string; daemonSha: string; keep: number }): VersionPruneOutcome {
-  const dir = join(homedir(), '.local/share/elanous/versions');
+function isInsideVersion(path: string, version: string): boolean {
+  const normalized = path.replace(/ \(deleted\)$/, '');
+  let actual = normalized;
+  try { actual = realpathSync(normalized); } catch { /* A process can exit between observation and resolution. */ }
+  return actual === version || actual.startsWith(`${version}${sep}`)
+    || normalized === version || normalized.startsWith(`${version}${sep}`);
+}
+
+/** Whether a command line names a path inside the version folder (as a whole path token, not a sibling prefix). */
+function argvReferencesVersion(argv: string, version: string): boolean {
+  const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s=:'"])${escaped}(?=$|[\\/\\s:'"])`).test(argv);
+}
+
+/** Linux /proc/<pid>/stat: a zombie has released its cwd/exe, and a kernel thread (PF_KTHREAD) never had them. */
+export function procStatHoldsNothing(stat: string): boolean {
+  // After the comm field: state ppid pgrp session tty_nr tpgid flags …
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  return fields[0] === 'Z' || (Number(fields[6]) & 0x00200000) !== 0;
+}
+
+type ProcessListing = () => { status: number | null; stdout: string; stderr: string; error?: Error };
+type ProcessScan = (pid: string) => { status: number | null; stdout: string; stderr: string; error?: Error };
+
+/** Inspect live cwd and executable references before deleting any candidate; an unavailable scan must not authorize deletion. */
+function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProcesses: ProcessListing = () => spawnSync('ps', ['-axww', '-o', 'pid=,uid=,args='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER }), scanProcess?: ProcessScan): VersionPruneOutcome {
+  if (!outcome.removed.length) return outcome;
+  const probe = scanProcess ?? ((pid: string) => spawnSync('lsof', ['-nP', '-F', 'pfn', '-p', pid], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER }));
+  const candidates = outcome.removed.map((name) => ({ name, path: realpathSync(join(dir, name)) }));
+  const references: Array<{ path: string; kind: string; pid: string }> = [
+    { path: process.cwd(), kind: 'cwd', pid: String(process.pid) },
+    { path: process.execPath, kind: 'exe', pid: String(process.pid) },
+  ];
+  let scanError = '';
+  // Other-UID processes: unreadable without privilege (root alone is ~200 on a Mac),
+  // so requiring them would disable pruning entirely. Counted and observed instead.
+  // Their argv is still readable (ps on macOS, /proc/<pid>/cmdline on Linux): an argv naming
+  // a candidate folder holds it. Only processes whose argv is unreadable too are count-only.
+  const uninspected = new Set<string>();
+  const otherArgv: Array<{ pid: string; argv: string }> = [];
+  const otherUid = (pid: string, argv: string | undefined): void => {
+    if (argv === undefined || !argv.trim() || /^\(.*\)$/.test(argv.trim())) uninspected.add(pid);
+    else otherArgv.push({ pid, argv });
+  };
+  if (platform() === 'linux') {
+    const argvRead = new Set<string>();
+    try {
+      for (const pid of readdirSync('/proc').filter((entry) => /^\d+$/.test(entry))) {
+        for (const [link, kind] of [['cwd', 'cwd'], ['exe', 'exe']] as const) {
+          try { references.push({ path: readlinkSync(join('/proc', pid, link)), kind, pid }); }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            // Only a vanished /proc/<pid> proves exit: a live process whose main thread
+            // ended can also report ENOENT for cwd/exe while worker threads still run.
+            let owner: number | undefined;
+            // Only ENOENT/ESRCH proves the process exited; any other failure leaves the scan incomplete.
+            const exited = (failure: unknown): boolean => ['ENOENT', 'ESRCH'].includes(String((failure as NodeJS.ErrnoException).code));
+            let stat: string;
+            try { owner = statSync(join('/proc', pid)).uid; stat = readFileSync(join('/proc', pid, 'stat'), 'utf8'); }
+            catch (failure) { if (exited(failure) && !existsSync(join('/proc', pid))) continue; throw failure; }
+            if (procStatHoldsNothing(stat)) continue;
+            // Our own links must be readable. Another UID's link failure (denied, or ENOENT from a live process) falls back to its argv.
+            if ((code === 'EACCES' || code === 'EPERM' || code === 'ENOENT') && owner !== process.getuid?.()) {
+              if (!argvRead.has(pid)) {
+                argvRead.add(pid);
+                let argv: string | undefined;
+                try { argv = readFileSync(join('/proc', pid, 'cmdline'), 'utf8').split('\0').join(' '); } catch { argv = undefined; }
+                otherUid(pid, argv);
+              }
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
+    } catch (error) { scanError = String(error); }
+  } else if (platform() === 'darwin') {
+    // Bulk lsof may omit individual files. Only a complete scan of every
+    // still-live process of our own UID permits deletion; other UIDs count
+    // via positive bulk sightings only (lsof cannot inspect them unprivileged).
+    try {
+      const listing = listProcesses();
+      const rows = listing.stdout.trim().split('\n').filter(Boolean);
+      const parsed = rows.map((row) => /^\s*(\d+)\s+(-?\d+)(?:\s+(.*?))?\s*$/.exec(row));
+      if (listing.error || listing.status !== 0 || !rows.length || parsed.some((match) => !match)) {
+        scanError = `lsof scope incomplete (ps unavailable: ${listing.error?.message || listing.stderr.trim() || listing.status})`;
+      } else {
+        const sections = new Map<string, string>();
+        if (!scanProcess) {
+          const bulk = spawnSync('lsof', ['-nP', '-F', 'pfn'], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER });
+          if (bulk.error || bulk.status !== 0) scanError = `lsof scope incomplete: ${bulk.error?.message || bulk.stderr?.trim() || bulk.status}`;
+          else {
+            let id = '';
+            for (const line of bulk.stdout.split('\n')) {
+              if (/^p\d+$/.test(line)) { id = line.slice(1); sections.set(id, ''); }
+              else if (id) sections.set(id, `${sections.get(id)}${line}\n`);
+            }
+          }
+        }
+        const complete = (lines: string): boolean => /(?:^|\n)fcwd\nn[^\n]+\n/.test(lines) && /(?:^|\n)ftxt\nn[^\n]+\n/.test(lines);
+        const readReferences = (id: string, lines: string): void => {
+          let kind = '';
+          for (const line of lines.split('\n')) {
+            if (line.startsWith('f')) kind = line.slice(1);
+            else if (line.startsWith('n') && (kind === 'cwd' || kind === 'txt')) references.push({ path: line.slice(1), kind: kind === 'txt' ? 'exe' : 'cwd', pid: id });
+          }
+        };
+        // Positive bulk sightings matter even if another UID cannot be inspected.
+        for (const [id, lines] of sections) readReferences(id, lines);
+        for (const match of parsed) {
+          const id = match![1]!;
+          // Compare against the complete ps list; lsof may omit even our own UID.
+          if (Number(match![2]) !== process.getuid?.()) { otherUid(id, match![3]); continue; }
+          if (complete(sections.get(id) ?? '')) continue;
+          const state = spawnSync('ps', ['-p', id, '-o', 'stat='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER });
+          if (state.error || (state.status !== 0 && state.status !== 1) || (state.status === 0 && !state.stdout.trim())) {
+            scanError = `lsof scope incomplete (pid=${id} state unavailable: ${state.error?.message || state.stderr?.trim() || state.status})`;
+            break;
+          }
+          if (state.status === 1) {
+            // ps can fail to show another UID as well as a process that exited.
+            // Only ESRCH proves the latter; EPERM/unknown must hold candidates.
+            try { process.kill(Number(id), 0); }
+            catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ESRCH') continue;
+              scanError = `lsof scope incomplete (pid=${id} existence unavailable: ${String(error)})`;
+              break;
+            }
+            scanError = `lsof scope incomplete (pid=${id} still alive but ps unavailable)`;
+            break;
+          }
+          if (state.stdout.trim().startsWith('Z')) continue;
+          const scan = probe(id);
+          if (scan.error || scan.status !== 0 || !scan.stdout.startsWith(`p${id}\n`) || !complete(scan.stdout)) {
+            scanError = `lsof scope incomplete (pid=${id} cwd/executable unavailable: ${scan.error?.message || scan.stderr?.trim() || scan.status})`;
+            break;
+          }
+          readReferences(id, scan.stdout.slice(`p${id}\n`.length));
+        }
+      }
+    } catch (error) { scanError = `lsof scope incomplete: ${String(error)}`; }
+  } else scanError = `unsupported platform: ${platform()}`;
+  const removed: string[] = [];
+  const kept = [...outcome.kept];
+  for (const candidate of candidates) {
+    const literal = join(dir, candidate.name);
+    const ref = references.find((entry) => isInsideVersion(entry.path, candidate.path))
+      ?? otherArgv.filter((entry) => argvReferencesVersion(entry.argv, candidate.path) || argvReferencesVersion(entry.argv, literal))
+        .map((entry) => ({ path: entry.argv, kind: 'argv', pid: entry.pid }))[0];
+    if (scanError || ref) {
+      kept.push(candidate.name);
+      console.error(`self-update: prune kept ${candidate.name} — ${ref ? `live pid=${ref.pid} ${ref.kind}` : `process scan unavailable: ${scanError}`}`);
+    } else {
+      rmSync(join(dir, candidate.name), { recursive: true, force: true });
+      removed.push(candidate.name);
+    }
+  }
+  if (uninspected.size) console.error(`self-update: prune removed ${removed.join(', ') || 'none'} — ${uninspected.size} other-UID process(es) not inspectable without privilege (argv unreadable too)`);
+  return { ...outcome, removed, kept };
+}
+
+export function defaultPruneVersions(plan: { current: string; daemonSha: string; keep: number }, dir: string = VERSIONS_DIR(), listProcesses?: ProcessListing, scanProcess?: ProcessScan): VersionPruneOutcome {
   const entries = readdirSync(dir, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => ({ name: d.name, mtimeMs: statSync(join(dir, d.name)).mtimeMs }));
-  const outcome = planVersionPrune(entries, plan.current, plan.daemonSha, plan.keep);
-  for (const name of outcome.removed) rmSync(join(dir, name), { recursive: true, force: true });
-  return outcome;
+  return pruneUnusedVersions(dir, planVersionPrune(entries, plan.current, plan.daemonSha, plan.keep), listProcesses, scanProcess);
 }
 
 /**
@@ -502,11 +660,15 @@ export interface ReleaseUpdateDeps {
   out?: { log: (text: string) => void; error: (text: string) => void };
   alert?: (text: string) => void;
   pruneVersions?: (plan: { current: string; previous: string; keep: number; prefix: string }) => VersionPruneOutcome;
+  /** Process scope probe for pruning; when absent the host's process list is used. */
+  listPruneProcesses?: ProcessListing;
+  /** Per-process cwd/executable probe; when absent the host's lsof is used. */
+  scanPruneProcess?: ProcessScan;
   /** 릴리스 기준 URL 주입 — 환경변수와 설치 출처보다 우선한다. */
   releaseBase?: string;
 }
 
-function pruneReleaseVersions(plan: { current: string; previous: string; keep: number; prefix: string }): VersionPruneOutcome {
+function pruneReleaseVersions(plan: { current: string; previous: string; keep: number; prefix: string }, listProcesses?: ProcessListing, scanProcess?: ProcessScan): VersionPruneOutcome {
   const dir = join(plan.prefix, 'versions');
   const entries = readdirSync(dir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
@@ -519,8 +681,7 @@ function pruneReleaseVersions(plan: { current: string; previous: string; keep: n
   const newest = [...entries].sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, plan.keep).map((entry) => entry.name);
   const kept = all.filter((name) => name === plan.current || name === plan.previous || newest.includes(name));
   const removed = all.filter((name) => !kept.includes(name));
-  for (const name of removed) rmSync(join(dir, name), { recursive: true, force: true });
-  return { removed, kept };
+  return pruneUnusedVersions(dir, { removed, kept }, listProcesses, scanProcess);
 }
 
 /** The build identity of an install.json — version, version folder and commit; empty when it cannot be read. */
@@ -617,7 +778,8 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     try {
       const current = typeof metadata === 'object' && metadata !== null && 'versionDir' in metadata && typeof metadata.versionDir === 'string'
         && /^versions\/[a-zA-Z0-9._-]+$/.test(metadata.versionDir) && !metadata.versionDir.includes('..') ? basename(metadata.versionDir) : '';
-      prune = (deps.pruneVersions ?? pruneReleaseVersions)({ current, previous, keep: options.keep ?? 3, prefix });
+      // runReleaseUpdate → pruneReleaseVersions → pruneUnusedVersions (all-UID cwd/executable guard).
+      prune = (deps.pruneVersions ?? ((plan) => pruneReleaseVersions(plan, deps.listPruneProcesses, deps.scanPruneProcess)))({ current, previous, keep: options.keep ?? 3, prefix });
     } catch (error) {
       prune = { removed: [], kept: [], skipped: `정리 실패: ${String(error)}` };
     }
@@ -999,6 +1161,7 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     }
     let prune: VersionPruneOutcome;
     try {
+      // runSelfUpdate → defaultPruneVersions → pruneUnusedVersions (all-UID cwd/executable guard).
       prune = (deps.pruneVersions ?? defaultPruneVersions)({ current: installedVersion, daemonSha: decision.from ?? '', keep: options.keep ?? 3 });
     } catch (error) {
       prune = { removed: [], kept: [], skipped: `정리 실패: ${String(error)}` };

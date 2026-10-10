@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
 import { readReportOrigin } from '../../self-implement/report-origin.js';
+import { queryRunningRuns } from '../../self-implement/running-runs.js';
 import { LogStore } from '../../mss/logging/log-store.js';
 import { subscribeInsideEvent } from './inside-events.js';
 import {
@@ -573,6 +574,53 @@ describe('harness API handlers', () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(shared);
+  });
+
+  test('runs handler reuses same-process ledger facts and invalidates the changed file by mtime', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'harness-runs-cache-'));
+    const directory = join(root, 'run-ledger');
+    mkdirSync(directory);
+    const runId = `run-${crypto.randomUUID()}`;
+    const file = join(directory, `${runId}.jsonl`);
+    const entry = (event: string, data: Record<string, unknown>) =>
+      `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event, data })}\n`;
+    const observations: Array<{ caller?: string | null; cacheHits?: number; cacheMisses?: number }> = [];
+    const options: Array<{ includeTest?: boolean; noCache?: boolean; caller?: string }> = [];
+    const deps = {
+      ledgerDirectories: () => [directory],
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+      readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+      observeQuery: (observation: { caller?: string | null; cacheHits?: number; cacheMisses?: number }) => { observations.push(observation); },
+    };
+    const request = new Request('http://nexus.test/v1/harness/runs');
+    const query = ((option: { includeTest?: boolean; noCache?: boolean; caller?: string }) => {
+      options.push(option);
+      return queryRunningRuns(option, deps);
+    }) as typeof queryRunningRuns;
+    try {
+      writeFileSync(file, entry('run-status', { runStatus: 'completed' }));
+      const coldResponse = await handleHarnessRunsGet(request, {}, { queryRunningRuns: query });
+      const cold = await coldResponse.json() as Record<string, unknown>;
+      const warmResponse = await handleHarnessRunsGet(request, {}, { queryRunningRuns: query });
+      const warm = await warmResponse.json() as Record<string, unknown>;
+      expect(coldResponse.status).toBe(200);
+      expect(warmResponse.status).toBe(200);
+      expect(observations.map(({ caller, cacheHits, cacheMisses }) => ({ caller, cacheHits, cacheMisses }))).toEqual([
+        { caller: null, cacheHits: 0, cacheMisses: 1 },
+        { caller: null, cacheHits: 1, cacheMisses: 0 },
+      ]);
+      expect({ ...warm, ledger: { ...(warm.ledger as object), cacheHits: 0, cacheMisses: 1 } } as unknown).toEqual(cold);
+      expect(options).toEqual([{ includeTest: false }, { includeTest: false }]);
+
+      writeFileSync(file, entry('start', { feature: 'now running' }));
+      utimesSync(file, new Date('2026-10-09T00:00:02.000Z'), new Date('2026-10-09T00:00:02.000Z'));
+      const changed = await (await handleHarnessRunsGet(request, {}, { queryRunningRuns: query })).json() as { entries: Array<{ runId: string }> };
+      expect(changed.entries.map((row) => row.runId)).toEqual([runId]);
+      expect(observations[2]).toMatchObject({ caller: null, cacheHits: 0, cacheMisses: 1 });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('runs with finishedSince adds terminated ledger summaries; without it the shape is unchanged', async () => {

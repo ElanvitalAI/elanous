@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { createNexusClient } from '@/nexus/client';
 import { isQuiet } from '@/lib/quiet-surface';
-import { fromYaml, toYaml, type CanvasGraph } from './graph-canvas-model';
+import { applyCanvasRunSteps, fromYaml, toYaml, type CanvasGraph } from './graph-canvas-model';
 import { GraphWizardChat, GraphWizardEntry, type CanvasSnapshot } from './GraphWizardChat';
 import { askWizard, mergeWizardGraph, userMovedNodes, wizardPhase, wizardRequest, WIZARD_UNSUPPORTED, type WizardClient, type WizardDiff } from './graph-wizard';
+import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
 
 const CREATE_YAML = `graph_id: news-digest
 entry_node: fetch
@@ -283,5 +284,20 @@ describe('GRAPH-WIZARD helpers', () => {
     const merged = mergeWizardGraph(moved, fromYaml(EDIT_YAML));
     expect(merged.graph.nodes.find((node) => node.id === 'send')!.x).toBe(moved.nodes.find((node) => node.id === 'send')!.x);
     expect(merged.added.nodes).toEqual(['summarize']);
+  });
+
+  test('re-entering a node after exit clears its previous outcome and exitedAt', () => {
+    const graph = fromYaml(CREATE_YAML);
+    const steps: RunStep[] = [
+      { seq: 1, ts: '2026-10-09T00:01:00.000Z', type: 'node-enter', node: 'fetch', visit: 1 },
+      { seq: 2, ts: '2026-10-09T00:02:00.000Z', type: 'node-exit', node: 'fetch', outcome: 'ok' },
+      { seq: 3, ts: '2026-10-09T00:03:00.000Z', type: 'node-enter', node: 'fetch', visit: 2 },
+    ];
+    const result = applyCanvasRunSteps(graph, steps);
+    expect(result.nodes.fetch).toEqual({
+      visit: 2, enteredAt: '2026-10-09T00:03:00.000Z', outcome: undefined,
+      exitedAt: undefined, skipped: undefined,
+    });
+    expect(result.graph.nodes.map(({ id, x, y }) => ({ id, x, y }))).toEqual(graph.nodes.map(({ id, x, y }) => ({ id, x, y })));
   });
 });

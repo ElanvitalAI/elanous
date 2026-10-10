@@ -1,0 +1,12 @@
+{
+  "name": "web-publish",
+  "version": "0.1.0",
+  "description": "Business websites grounded in the business: claim-graded copy, page map, DESIGN.md, hero slice, role-assigned media, media audit, mobile QA and publishing. Includes business-motion-websites by passeth (MIT).",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "web-publish",
+    "shortDescription": "Business websites from research to publish, with human approval gates",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

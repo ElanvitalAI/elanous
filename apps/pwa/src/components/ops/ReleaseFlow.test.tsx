@@ -132,14 +132,30 @@ test('GATE-LIVE-OBS eta text: overrun beats the plan estimate, and 0 minutes wit
   expect(etaText(75)).toBe('남은 약 1시간 15분');
 });
 
-test('GATE-LIVE-OBS: a done shard with rc 1 reads «끝 · 실패 보고», not a green pass', async () => {
+test('GATE-LIVE-OBS: a done shard with rc 1 is never a green pass — before the verdict it reads «rc≠0 · 판정 전»', async () => {
   const { GateShardsPanel, shardTally } = await import('./GateShards');
   const gate = { version: '0.2.20', updatedAt: '2026-10-08T00:00:00Z',
     shards: [{ id: 'pod-20', state: 'done' as const, rc: 1 }, { id: 'pod-21', state: 'done' as const, rc: 0 }],
     summary: { total: 2, counts: { pending: 0, running: 0, done: 2, retry: 0, timeout: 0, failed: 0 }, waitReasons: [], etaMin: 0, staleMin: 0 } };
-  expect(shardTally(gate)).toBe('조각 2 · 끝 2(실패 보고 1)');
+  expect(shardTally(gate)).toBe('조각 2 · 끝 2(rc≠0 1 · 기존 실패 포함 · 판정 전)');
   const html = renderToStaticMarkup(<GateShardsPanel gate={gate} />);
-  expect(html).toContain('! 끝 · 실패 보고');
+  expect(html).toContain('! 끝 · rc≠0 · 판정 전');
+  expect(html).not.toContain('실패 보고');
   expect(html.indexOf('pod-20')).toBeLessThan(html.indexOf('pod-21'));
   expect(html).not.toContain('통과');
+});
+
+test('GATE-LIVE-OBS-RC-WORDING: after the verdict only new failures alarm — pre-existing rc≠0 reads «기존 실패»', async () => {
+  const { GateShardsPanel, shardTally } = await import('./GateShards');
+  const base = { version: '0.2.21', updatedAt: '2026-10-09T00:00:00Z',
+    shards: [{ id: 'pod-0', state: 'done' as const, rc: 1 }, { id: 'pod-1', state: 'done' as const, rc: 1 }, { id: 'pod-2', state: 'done' as const, rc: 0 }] };
+  const summary = { total: 3, counts: { pending: 0, running: 0, done: 3, retry: 0, timeout: 0, failed: 0 }, waitReasons: [], etaMin: 0, staleMin: 0 };
+  const clean = { ...base, summary: { ...summary, verdict: { introduced: 0, preexisting: 2 } } };
+  expect(shardTally(clean)).toBe('조각 3 · 끝 3');
+  const cleanHtml = renderToStaticMarkup(<GateShardsPanel gate={clean} />);
+  expect(cleanHtml).toContain('끝 · 기존 실패');
+  expect(cleanHtml).not.toContain('rc≠0');
+  const broken = { ...base, summary: { ...summary, verdict: { introduced: 1, preexisting: 1 } } };
+  expect(shardTally(broken)).toBe('조각 3 · 끝 3(새 실패 1)');
+  expect(renderToStaticMarkup(<GateShardsPanel gate={broken} />)).toContain('! 끝 · rc≠0 · 새 실패 있음');
 });

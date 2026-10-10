@@ -14,8 +14,8 @@ import { fenceOutcomeDir, recordFenceOutcome } from './fence-outcomes.js';
 import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';
 import type { HqOpRequestWriter, PromoteResult } from './promote.js';
 import {
-  DEFAULT_TTL_SECONDS, decideAcquire, decideArbiterCheck, decideFence, decideRelease, decideRenew, defaultSshRunner,
-  fileLeaseStore, leaseExpired, parseLease, probeReachable, recordView, serializeLease, sshLeaseStore, sshReachable, localShellRunner,
+  DEFAULT_TTL_SECONDS, LOCAL_LEASE_CACHE_SECONDS, decideAcquire, decideArbiterCheck, decideFence, decideRelease, decideRenew, defaultSshRunner,
+  fileLeaseStore, leaseExpired, parseLease, probeReachable, recordView, serializeLease, serializeLocalLeaseCache, sshLeaseStore, sshReachable, localShellRunner,
   type HostProbe, type LeaseRecord, type LeaseStore, type LocalHqState, type SshRunner,
 } from './lease.js';
 
@@ -163,6 +163,30 @@ function writeLocal(path: string, state: LocalHqState): void {
   renameSync(tmp, path);
 }
 
+/** FENCE-LIGHT host-local hint (`<config>/hq/lease-cache`), not authority: only a successful holder renewal writes it. */
+const leaseCachePath = (r: Resolved): string => join(dirname(r.localPath), 'lease-cache');
+function dropHeartbeatCache(r: Resolved): void {
+  try { rmSync(leaseCachePath(r), { force: true }); }
+  catch (error) { observe(r, 'hq.lease', 'cache-invalidate-failed', { error: String(error).slice(0, 200) }); }
+}
+function writeHeartbeatCache(r: Resolved, record: LeaseRecord): void {
+  const path = leaseCachePath(r);
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const confirmedAt = r.now();
+    const expiresAt = Math.min(confirmedAt + LOCAL_LEASE_CACHE_SECONDS, record.renewedAt + record.ttlSeconds);
+    if (expiresAt <= confirmedAt) return;
+    const tempDir = mkdtempSync(`${path}.`);
+    try {
+      const tmp = join(tempDir, 'cache');
+      writeFileSync(tmp, serializeLocalLeaseCache({ holder: record.holder, generation: record.generation, expiresAt, host: r.me, machine: hostname().replace(/\.local$/, ''), confirmedAt }), { mode: 0o600 });
+      renameSync(tmp, path);
+    } finally { rmSync(tempDir, { recursive: true, force: true }); }
+  } catch (error) {
+    observe(r, 'hq.lease', 'cache-write-failed', { error: String(error).slice(0, 200) });
+  }
+}
+
 /** Highest lease generation this host ever observed (null = never). */
 /** The seen-generation marker this host keeps (hq.seenGenerationFile · default ~/.elanous-hq/seen-generation). */
 export function hqSeenGenerationPath(config: Pick<HqConfig, 'seenGenerationFile'>): string {
@@ -241,6 +265,7 @@ export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: s
   const result = mutate(r, (record, now) => action === 'acquire' ? decideAcquire(record, r.me, now, r.ttl)
     : action === 'renew' ? decideRenew(record, r.me, local.generation, now) : decideRelease(record, r.me, expected));
   noteSeen(r, result.record);
+  if (result.ok) dropHeartbeatCache(r);
   if (result.ok && action !== 'release') writeLocal(r.localPath, { holder: result.record.holder, generation: result.record.generation, confirmedAt: r.now(), ttlSeconds: result.record.ttlSeconds });
   if (result.ok && action === 'release') writeLocal(r.localPath, { ...local, holder: undefined, confirmedAt: undefined });
   observe(r, 'hq.lease', result.ok ? (action === 'acquire' ? 'acquired' : action === 'renew' ? 'renewed' : 'released') : `${action}-refused`,
@@ -255,6 +280,8 @@ export function hqLease(action: LeaseAction, deps: HqDeps = {}, opts: { host?: s
 export function hqHeartbeat(deps: HqDeps = {}) {
   const r = resolve(deps);
   const local = readLocal(r.localPath);
+  // Never extend a prior positive hint through an unreachable/refused heartbeat.
+  dropHeartbeatCache(r);
   let read: { now: number; raw: string | null };
   try { read = r.store.read(); } catch (error) {
     const standbyUp = local.holder === r.me ? sshReachable(r.standby, r.ssh) : false;
@@ -273,6 +300,7 @@ export function hqHeartbeat(deps: HqDeps = {}) {
     if (renewed.ok) {
       noteSeen(r, renewed.record);
       writeLocal(r.localPath, { holder: r.me, generation: renewed.record.generation, confirmedAt: r.now(), ttlSeconds: renewed.record.ttlSeconds });
+      if (record.renewedAt !== 0 && !leaseExpired(renewed.record, r.now())) writeHeartbeatCache(r, renewed.record);
       observe(r, 'hq.lease', 'renewed', { generation: renewed.record.generation });
       return { outcome: 'renewed' as const, generation: renewed.record.generation };
     }
@@ -282,6 +310,7 @@ export function hqHeartbeat(deps: HqDeps = {}) {
   // Not the holder: report the view, keep the granted generation, stay standby.
   const seen = probeReachable(record.holder, r.probe);
   const reachable = seen.reachable;
+  // FENCE-LIGHT: a standby never writes the cache (the shell fence only fast-paths a fresh «this host holds» line).
   mutate(r, (current) => current ? { ok: true, next: recordView(current, r.me, reachable, read.now) } : { ok: false, reason: 'no lease' });
   if (leaseExpired(record, read.now)) observe(r, 'hq.lease', 'expired-seen', { holder: record.holder, generation: record.generation });
   writeLocal(r.localPath, { holder: record.holder, generation: record.generation, ttlSeconds: record.ttlSeconds });
@@ -365,6 +394,8 @@ export function hqFenceDecision(role: HqFenceRole, deps: HqDeps = {}) {
     failOpen: role !== 'ledger-cli' && r.failOpen.has(role),
     ...(seenGeneration !== null ? { seenGeneration } : {}),
   });
+  // FENCE-LIGHT: any CLI «do not run» on this host retires a lingering fast-path hint at once.
+  if (!decided.run) dropHeartbeatCache(r);
   if (decided.run && record !== 'unreachable' && record) writeLocal(r.localPath, { holder: r.me, generation: record.generation, confirmedAt: r.now(), ttlSeconds: record.ttlSeconds });
   observe(r, 'hq.fence', decided.run ? 'allowed' : 'skipped', { role, reason: decided.reason, holder: decided.holder, generation: decided.generation });
   return decided;

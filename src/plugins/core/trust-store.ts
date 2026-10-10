@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DATA_DIR } from '../../config.js';
+import type { PluginSecurityDecision } from './capability-policy.js';
 
 export type PluginTrustScope = 'user' | 'workspace';
 
@@ -14,6 +15,20 @@ export interface PluginTrustRecord {
 interface PluginTrustFile {
   version: 1;
   records: PluginTrustRecord[];
+}
+
+/** Ephemeral installation decision; never persisted as a trust record or a credential. */
+export function decidePluginInstallation(security: PluginSecurityDecision, capabilities: readonly string[], consent: boolean):
+  { ok: true } | { ok: false; reason: 'scan' | 'consent-denied' } {
+  if (security.scan === 'dangerous') return { ok: false, reason: 'scan' };
+  if (capabilities.length > 0 && !consent) return { ok: false, reason: 'consent-denied' };
+  return { ok: true };
+}
+
+/** Hooks default off for installed (imported/generated) plugins: there is no approval path yet, so none run.
+ *  Built-in and user-dir plugins keep their declared hooks unchanged. */
+export function enabledPluginHooks<T>(hooks: readonly T[], source: string): T[] {
+  return source === 'installed' ? [] : [...hooks];
 }
 
 export class PluginTrustStore {

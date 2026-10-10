@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { spawnSync } from 'node:child_process';
 import { measureTuiRegress, tuiNodeOutput } from './tui-sim-node';
-import { parseTuiRegress, regressWarning, tuiChecks, tuiVerdict } from './tui-node-checks';
+import { parseTuiRegress, regressWarning, reusableTui, tuiChecks, tuiVerdict } from './tui-node-checks';
 
 const first = `─┤ ChatLog ├──\n❯ /command, or type a question\n 📁 elan/monad-agent  │ ⌥ main │ some-model │ ctx 0 │ 🖥 mbp`;
 const help = `┌── Dashboard help ──\n│Commands\n│/help  Show help overlay\n${first}`;
@@ -11,6 +11,15 @@ describe('release-loop TUI node checks', () => {
     const checks = tuiChecks({ readyMs: 9000, first, help, afterEsc: first });
     expect(checks.filter((c) => !c.pass)).toEqual([]);
     expect(tuiVerdict(checks)).toBe('pass');
+  });
+
+  test('cached TUI requires matching commit and complete passing checks', () => {
+    const commit = 'a'.repeat(40);
+    const value = { ...tuiNodeOutput(commit, [{ checks: tuiChecks({ readyMs: 9000, first, help, afterEsc: first }) }], { unmeasured: 'not run' }), outcome: 'ok' };
+    expect(reusableTui(value, commit)).toEqual(value);
+    expect(reusableTui(value, 'b'.repeat(40))).toBeNull();
+    expect(reusableTui({ ...value, checks: value.checks.slice(1) }, commit)).toBeNull();
+    expect(reusableTui({ ...value, outcome: 'fail' }, commit)).toBeNull();
   });
 
   test('never ready → boot fails', () => {

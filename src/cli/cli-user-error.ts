@@ -1,5 +1,3 @@
-import { HarnessCliInputError } from '../harness/harness-cli-command.js';
-
 const cliUserErrorBrand = Symbol.for('elanous.cli.CliUserError');
 const harnessCliInputErrorBrand = Symbol.for('elanous.cli.HarnessCliInputError');
 
@@ -8,6 +6,15 @@ export class CliUserError extends Error {
     super(message);
     this.name = 'CliUserError';
     Object.defineProperty(this, cliUserErrorBrand, { value: true });
+  }
+}
+
+/** A command-line value was rejected before any harness work began. */
+export class HarnessCliInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HarnessCliInputError';
+    Object.defineProperty(this, harnessCliInputErrorBrand, { value: true });
   }
 }
 

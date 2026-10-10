@@ -668,6 +668,26 @@ export function buildCliAgentTools(
   const shared = (require('../agent/shared-app-tools.js') as typeof import('../agent/shared-app-tools.js')).buildSharedAppTools(cfg);
   for (const s of shared.specs) specs.push(s);
   for (const name of shared.names) dispatchByName.set(name, async (args) => shared.dispatch(name, args));
+  // Installed knowledge is queryable in CLI chat as well as the dashboard runtime.
+  // No installed packs => preserve the existing CLI tool list and avoid creating a KGS database.
+  const { kgsDefaultDbPath } = require('../knowledge/kgs/sqlite-store.js') as typeof import('../knowledge/kgs/sqlite-store.js');
+  const { existsSync } = require('node:fs') as typeof import('node:fs');
+  let hasInstalledPacks = false;
+  try {
+    if (existsSync(kgsDefaultDbPath())) {
+      const { listInstalledPacks } = require('../knowledge/query.js') as typeof import('../knowledge/query.js');
+      hasInstalledPacks = listInstalledPacks().length > 0;
+    }
+  } catch (err) {
+    // An unreadable/corrupt KGS store must not break chat tool assembly for turns that never query knowledge.
+    debug.log('cli.agent', 'knowledge-query.tool-skipped', { reason: err instanceof Error ? err.message : String(err) });
+  }
+  if (hasInstalledPacks) {
+    const { buildKnowledgeQueryTool, dispatchKnowledgeQuery } = require('../knowledge/tools/knowledge-query.js') as typeof import('../knowledge/tools/knowledge-query.js');
+    const knowledgeSpec = buildKnowledgeQueryTool();
+    specs.push(knowledgeSpec);
+    dispatchByName.set(knowledgeSpec.name, async (args) => dispatchKnowledgeQuery(args));
+  }
   if (harnessPlan) {
     specs.push(buildPlanTool(), buildMarkStepDoneTool());
     const planCtx = {

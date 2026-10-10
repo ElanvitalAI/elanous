@@ -21,7 +21,7 @@ const STAGES = FABRIC_STAGES;
 
 export type FabricStage = (typeof STAGES)[number]['key'];
 
-/** 4 표면 상단 공유 헤더 — Mission Fabric 파이프라인 위치 + 인접 단계 크로스링크. */
+/** 3 표면 상단 공유 헤더 — Mission Fabric 파이프라인 위치 + 인접 단계 크로스링크. */
 export function FabricStageHeader({ active }: { active: FabricStage }) {
   return (
     <nav

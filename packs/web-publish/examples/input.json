@@ -1,0 +1,9 @@
+{
+  "business": "Harbor Lane Bindery — a fictional two-person studio that repairs and rebinds family books and notebooks, quotes by photo, and returns work in two to four weeks.",
+  "goal": "Visitors understand what can be repaired, how the quote-by-photo process works, and send a first quote request.",
+  "mode": "build",
+  "workspace": "/tmp/web-publish-example-workspace",
+  "publish_target": "folder",
+  "reference_urls": [],
+  "budget": { "image_generations": 12, "video_credits": 0, "voice_chars": 0 }
+}

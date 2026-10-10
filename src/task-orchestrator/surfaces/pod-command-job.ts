@@ -15,6 +15,7 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
+import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
 import { podHostDirsInit, podInstallSlotsVolume } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
@@ -41,8 +42,10 @@ export const POD_LITE_MEMORY_LIMIT = '2Gi';
 /** 요청은 한도를 넘을 수 없다(쿠버네티스가 Job 을 거부한다) — lite 2Gi 처럼 한도가 기본 요청보다 작으면 한도로 맞춘다. */
 /** The command Job container's CPU limit when the caller names none (GATE-SPEED A3①: unchanged default). */
 export const POD_COMMAND_CPU_LIMIT_DEFAULT = '4';
+/** 게이트 조각·pod-command 의 CPU 요청 기본 — 하니스 Pod(POD_CHILD_REQUESTS.cpu)와 따로 둔다(조각은 bun test 로 CPU 를 실제로 쓴다). */
+export const POD_COMMAND_CPU_REQUEST_DEFAULT = '1';
 
-/** Container CPU request/limit override. Omitted fields keep the defaults (request `POD_CHILD_REQUESTS.cpu` · limit 4). */
+/** Container CPU request/limit override. Omitted fields keep the defaults (request `POD_COMMAND_CPU_REQUEST_DEFAULT` · limit 4). */
 export interface PodCpu { request?: string; limit?: string }
 
 /** Kubernetes CPU quantity → millicores (`1` · `0.5` · `500m`); null when it is not a positive quantity we accept. */
@@ -55,7 +58,7 @@ export function podCpuMillis(value: string): number | null {
 
 /** Resolve a CPU override against the defaults; throws when a value is malformed or the request exceeds the limit (k8s would refuse the Job). */
 export function resolvePodCpu(cpu: PodCpu | undefined): { request: string; limit: string } {
-  const request = cpu?.request?.trim() || POD_CHILD_REQUESTS.cpu;
+  const request = cpu?.request?.trim() || POD_COMMAND_CPU_REQUEST_DEFAULT;
   const limit = cpu?.limit?.trim() || POD_COMMAND_CPU_LIMIT_DEFAULT;
   const r = podCpuMillis(request), l = podCpuMillis(limit);
   if (r === null) throw new Error(`pod cpu request is not a positive CPU quantity: ${request}`);
@@ -250,7 +253,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
     spec: {
       backoffLimit: 0,
-      ttlSecondsAfterFinished: 7200,
+      ttlSecondsAfterFinished: POD_JOB_TTL_AFTER_FINISHED_SECONDS,
       activeDeadlineSeconds: o.deadlineSeconds,
       template: {
         metadata: { labels: { 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },

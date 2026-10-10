@@ -198,6 +198,7 @@ const CONFIG_WRITES: ReadonlyArray<readonly [string, string]> = [
   ['DELETE', '/v1/llm/hosts'],
   ['POST', '/v1/llm/rotation/next'],
   ['POST', '/v1/autopilot/mission-action'],
+  ['POST', '/v1/autopilot/triage-preview'], // TRIAGE-COMMIT-AUTH(10-09) — commit:true 가 미션을 쓴다
   ['POST', '/v1/intake/route'],
 ];
 describe('config/control write routes — bearer gate', () => {
@@ -215,6 +216,16 @@ describe('config/control write routes — bearer gate', () => {
     const server = startNexusHttpServer(serverFixture());
     try {
       const res = await fetch(`${server.url}${path}`, { method, headers: { 'sec-fetch-site': 'cross-site', 'content-type': 'text/plain' }, body: '{}' });
+      expect(res.status).toBe(401);
+    } finally { server.stop(); }
+  });
+  // TRIAGE-COMMIT-AUTH(10-09): 라우트 줄엔 checkAuth 가 없지만 위 default-deny(isPublicRoute 밖 /v1/*)가 막는다 — 그 계약을 못 박는다.
+  test('TRIAGE-COMMIT-AUTH: 출처 머리 없는 직접 호출(데몬 포트)도 commit:true 미션 쓰기 전에 401', async () => {
+    const server = startNexusHttpServer(serverFixture());
+    try {
+      const res = await fetch(`${server.url}/v1/autopilot/triage-preview`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ goal: 'probe', commit: true }),
+      });
       expect(res.status).toBe(401);
     } finally { server.stop(); }
   });

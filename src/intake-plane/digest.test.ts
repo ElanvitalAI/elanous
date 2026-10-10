@@ -36,6 +36,49 @@ test('filtered digest excludes unowned queues and MK notes; empty user briefing 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('same-day X and GitHub ledger entries keep title, URL, 참고 and pending verdict in both renderers', () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-ledger-digest-'));
+  const day = '2026-10-05';
+  try {
+    for (let n = 0; n < 7; n++) {
+      ingestIntakeItems(root, 'x', [{ title: `X signal ${n}`, url: `https://x.com/alice/status/${1000 + n}` }], '2026-10-04T16:00:00Z');
+      ingestIntakeItems(root, 'github', [{ title: `GitHub repo ${n}`, url: `https://github.com/org/repo-${n}` }], '2026-10-04T16:00:00Z');
+    }
+    ingestIntakeItems(root, 'x', [{ title: 'Yesterday X', url: 'https://x.com/alice/status/999' }], '2026-10-04T14:59:59Z');
+    ingestIntakeItems(root, 'github', [{ title: 'Discarded repo', url: 'https://github.com/org/discarded' }], '2026-10-04T16:00:00Z');
+    const all = listIntakeItems(root);
+    markIntakeItem(root, all.find((item) => item.title === 'Discarded repo')!.id, { status: 'discarded' }, '2026-10-04T16:00:01Z');
+    const lensDir = join(root, 'intake', 'outbox', 'lens');
+    mkdirSync(lensDir, { recursive: true });
+    writeFileSync(join(lensDir, `${day}.jsonl`), [
+      { id: all.find((item) => item.title === 'X signal 0')!.id, lensVerdict: '참고', why: '정보성 트렌드', target: '트렌드' },
+      { id: all.find((item) => item.title === 'GitHub repo 0')!.id, lensVerdict: '보강', why: '에이전트 구현에 보탬', target: '에이전트' },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const digest = buildIntakeDigest(root, day);
+    expect(digest.xTrends).toHaveLength(7);
+    expect(digest.githubNew).toHaveLength(7);
+    expect(digest.xTrends?.[0]).toEqual({ id: all.find((item) => item.title === 'X signal 0')!.id, title: 'X signal 0', url: 'https://x.com/i/status/1000', verdict: '참고' });
+    expect(digest.xTrends?.[1]?.verdict).toBe('판정 대기');
+    expect(digest.githubNew?.[0]?.verdict).toBe('보강');
+    expect(digest.githubNew?.[1]?.verdict).toBe('판정 대기');
+    const md = renderDigestMarkdown(digest);
+    expect(md).toContain('### X 트렌드 (7)');
+    expect(md).toContain('- [X signal 0](https://x.com/i/status/1000) — 참고');
+    expect(md).toContain('- [GitHub repo 6](https://github.com/org/repo-6) — 판정 대기');
+    expect(md).not.toContain('오늘 흡수한 것이 없다.');
+    expect(md).not.toContain('Yesterday X');
+    expect(md).not.toContain('Discarded repo');
+    const tg = renderDigestTelegram(digest);
+    expect(tg).toContain('X 트렌드 (7)\n- [참고] X signal 0 — https://x.com/i/status/1000');
+    expect(tg).toContain('GitHub 신규 (7)\n- [보강] GitHub repo 0 — https://github.com/org/repo-0');
+    expect(tg).toContain('[판정 대기] GitHub repo 4 — https://github.com/org/repo-4');
+    expect(tg).not.toContain('GitHub repo 5');
+    expect(tg).not.toContain('X signal 5');
+    expect(tg).toContain('외 2건 · 원장 `elanous intake items`');
+    expect(buildIntakeDigest(root, day, undefined, undefined, 'user').xTrends).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('seat and whole briefings share the lens headline, S·C·A·note blocks and one reference line without human triage', () => {
   const absorbed: IntakeDigest['absorbed'] = [
     { id: 'touch', sources: ['github'], axis: '영상 자동화', oneLiner: '새 영상 편집 기능', note: '/notes/touch.md', noteName: 'touch', url: 'https://example.com/touch', impact: { verdict: '보강', why: '우리 영상 칸의 편집 소구점을 강화한다', target: '영상' } },

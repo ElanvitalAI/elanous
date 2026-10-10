@@ -1,0 +1,32 @@
+id: claude-haiku-5-5
+provider: anthropic
+displayName: Claude Haiku 5.5
+family: claude-5
+# ⛔ `familyShortcut: haiku` 을 «일부러» 안 붙였다 — 붙이면 `haiku` 별칭(→ claude-haiku-4-5)이
+#    «stale» 로 바뀌고, 별칭을 옮기는 것은 «라우팅 변경»이라 별개 결정이다.
+#    이 파일은 「--child-llm-model 로 이 모델을 부를 수 없다」만 닫는다(MK 10-10).
+# 📏 출처 — 2026-10-10T08:38Z 직접 확인:
+#   ⑴ Anthropic 공식 https://platform.claude.com/내부 문서 `overview`
+#      «Released October 7, 2026 · Context window: 1M tokens · Max output: 128K tokens · From $0.10 / From $0.50»
+#      ⊕ https://platform.claude.com/내부 문서 `overview` (API ID `claude-haiku-5-5`)
+#   ⑵ OpenRouter `GET /api/v1/models` 실측 2026-10-10T05:10Z — anthropic/claude-haiku-5.5: 1,000,000 · 128,000 · $0.10/$0.50
+# ⚠️ 가격이 «프롬프트 길이 구간»으로 갈린다(pricing.md): ≤100,000 토큰 $0.10/$0.50 · 캐시 읽기 $0.01 ·
+#    >100,000 토큰 $0.50/$2.50(요청 전체). 이 칸은 하나라 «≤100k 구간»을 싣는다 — 긴 프롬프트는 실제 5배다.
+#   🔲 vision·tokenizer 는 안 쟀다 → 비운다.
+contextSize: 1000000
+outputMaxTokens: 128000
+reasoning: adaptive
+toolCalling: native-anthropic
+streamingProtocol: sse
+releaseDate: 2026-10-07
+pricing:
+  inputPerMTok: 0.10
+  outputPerMTok: 0.50
+  cachedInputPerMTok: 0.01
+deprecated: null
+kind: chat
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-10
+  autoFilled: false
+  confidence: high

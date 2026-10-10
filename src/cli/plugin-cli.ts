@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { userConfigPath } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
-import { addMarket, listMarkets, MarketFetchError, updateMarket } from '../plugins/install/market-fetch.js';
+import { addMarket, ensureInternalMarketIndex, listMarkets, MarketFetchError, updateMarket } from '../plugins/install/market-fetch.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { installPlugin, listInstalledPlugins, PluginInstallError, removePlugin, type InstallEvent } from '../plugins/install/plugin-install.js';
@@ -145,6 +145,26 @@ export function registerPluginCommands(program: Command): void {
       }
     });
   const market = plugin.command('market').description('Manage signed plugin marketplaces');
+  market.command('internal <name> <enterpriseId>').description('Fetch signed entries from a configured internal HTTPS market for an allowed enterprise')
+    .option('--refresh', 'Refresh the signed internal market index')
+    .option('--json', 'Print verified knowledge packs and loop bundles as JSON')
+    .action(async (name: string, enterpriseId: string, opts: { refresh?: boolean; json?: boolean }) => {
+      try {
+        const root = elanousStateRoot();
+        const result = await ensureInternalMarketIndex(name, enterpriseId, {
+          root, marketDir: join(root, 'plugins', 'markets'), refresh: opts.refresh,
+        });
+        const entries = { name: result.market.name, enterpriseId, sequence: result.index.sequence,
+          knowledgePacks: result.index.knowledgePacks ?? [], loopBundles: result.index.loopBundles ?? [] };
+        debug.log('plugin.cli', 'market.internal', { name: result.market.name, sequence: result.index.sequence });
+        if (opts.json) stdout.write(JSON.stringify(entries) + '\n');
+        else console.log(`Fetched internal market ${entries.name} (sequence ${entries.sequence}): ${entries.knowledgePacks.length} knowledge packs, ${entries.loopBundles.length} loop bundles`);
+      } catch (error) {
+        if (opts.json) stdout.write(JSON.stringify({ event: 'failed', cause: safeCause(error) }) + '\n');
+        else console.error(`plugin market internal failed: ${safeCause(error)}`);
+        process.exitCode = 1;
+      }
+    });
   market.command('add <name> <url>').description('Register a marketplace URL')
     .action((name: string, url: string) => {
       try {

@@ -5,6 +5,8 @@ import { describe, test, expect } from 'bun:test';
 import {
   parseCodexPluginsResponse,
   fetchCodexPlugins,
+  readCodexPluginsObservation,
+  readCodexPluginsFromAppServer,
   clearCodexPluginsCache,
 } from './codex-plugins.js';
 import type { CodexAppServerClient } from './codex-app-server-client.js';
@@ -27,6 +29,23 @@ const REAL_FIXTURE = {
     },
   ],
 };
+
+test('app-server probe initializes a live client and closes it, preserving unknown on failure', async () => {
+  const methods: string[] = [];
+  let closed = 0;
+  let killed = 0;
+  const client = {
+    request: async (method: string) => { methods.push(method); return method === 'plugin/list' ? REAL_FIXTURE : {}; },
+    close: async () => { closed++; },
+  } as unknown as CodexAppServerClient;
+  const spawn = (() => ({ client, child: { kill: () => { killed++; } } })) as unknown as Parameters<typeof readCodexPluginsFromAppServer>[0];
+  const observed = await readCodexPluginsFromAppServer(spawn);
+  expect(observed.status).toBe('ok');
+  expect(observed.plugins.map(plugin => plugin.name)).toEqual(['gmail', 'google-calendar', 'google-drive']);
+  expect(methods).toEqual(['initialize', 'plugin/list']);
+  expect([closed, killed]).toEqual([1, 1]);
+  expect(await readCodexPluginsFromAppServer(() => { throw new Error('no binary'); })).toEqual({ status: 'unknown', plugins: [] });
+});
 
 describe('parseCodexPluginsResponse', () => {
   test('filters installed + available plugins (real-world 3 plugin fixture)', () => {
@@ -159,6 +178,23 @@ function fakeClient(opts: {
     calls: () => count,
   };
 }
+
+describe('readCodexPluginsObservation', () => {
+  test('distinguishes missing session and failed RPC from a successfully empty inventory', async () => {
+    expect(await readCodexPluginsObservation(null)).toEqual({ status: 'unknown', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ throwError: new Error('disconnected') }).client)).toEqual({ status: 'unknown', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ response: { marketplaces: [] } }).client)).toEqual({ status: 'ok', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ response: {} }).client)).toEqual({ status: 'unknown', plugins: [] });
+    // A damaged/changed RPC shape is unknown, not a confirmed empty install list.
+    expect(await readCodexPluginsObservation(fakeClient({ response: { marketplaces: [{ name: 'm', plugins: 'x' }] } }).client)).toEqual({ status: 'unknown', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ response: { marketplaces: [{ plugins: [] }] } }).client)).toEqual({ status: 'unknown', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ response: { marketplaces: [null] } }).client)).toEqual({ status: 'unknown', plugins: [] });
+    expect(await readCodexPluginsObservation(fakeClient({ response: { marketplaces: [{ name: 'm', plugins: [{ installed: true }] }] } }).client)).toEqual({ status: 'unknown', plugins: [] });
+    const observed = await readCodexPluginsObservation(fakeClient({ response: REAL_FIXTURE }).client);
+    expect(observed.status).toBe('ok');
+    expect(observed.plugins.map(plugin => plugin.name)).toEqual(['gmail', 'google-calendar', 'google-drive']);
+  });
+});
 
 describe('fetchCodexPlugins', () => {
   test('returns [] when client is null/undefined', async () => {

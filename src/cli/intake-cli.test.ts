@@ -118,7 +118,7 @@ test('intake candidates --limit validates the raw string: blank, negative and fr
       expect(errors).toEqual([`--limit 는 0 이상의 정수여야 한다: ${JSON.stringify(raw)}`]);
     } finally {
       errorSpy.mockRestore();
-      process.exitCode = previousExitCode;
+      process.exitCode = previousExitCode ?? 0; // Bun 은 undefined 대입으로 값을 지우지 않는다
     }
   }
 
@@ -283,7 +283,14 @@ test('a seat briefing does not resend yesterday\'s items when the same search re
     expect(messages[2]).toContain('fresh');
     expect(messages[2]).not.toContain('example.com/repo');
     ingestIntakeItems(root, 'github', raw, '2026-10-06T23:00:00Z');
-    await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-07' }, { ...deps, sendTelegram: async (text: string) => { messages.push(text); return false; } });
+    // 미전송 경로는 process.exitCode = 3 을 남긴다 — 되돌리지 않으면 bun test 전체가 3으로 끝나 게이트가 «덜 끝난 조각»으로 읽는다.
+    const previousExitCode = process.exitCode;
+    try {
+      await runIntakeDigestCli({ seat: 'user', telegram: true, day: '2026-10-07' }, { ...deps, sendTelegram: async (text: string) => { messages.push(text); return false; } });
+      expect(process.exitCode).toBe(3);
+    } finally {
+      process.exitCode = previousExitCode ?? 0; // Bun 은 undefined 대입으로 값을 지우지 않는다
+    }
     expect(messages[3]).toBe('흡수 0편 → 우리에게 닿는 것 0');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

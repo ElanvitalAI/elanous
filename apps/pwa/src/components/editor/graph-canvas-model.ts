@@ -8,6 +8,7 @@ import {
   writeRunGraphYaml,
 } from '@/lib/run-graph-yaml-edit';
 import { layeredPositions } from '@/lib/graph-edge-route';
+import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
 
 /** Pure model behind the custom graph canvas (CGE-EDIT). No DOM — every edit returns a new graph.
  *  YAML goes through the existing run-graph-yaml-edit helpers; the server loader stays the authority
@@ -43,6 +44,72 @@ export interface CanvasGraph {
   edges: CanvasEdge[];
   /** Top-level loader fields the canvas does not edit (version, loop, run_contract, state…) — kept as loaded. */
   extra?: Record<string, unknown>;
+}
+
+/** Run-time facts live beside the editable YAML graph; replay never writes them into graph.extra. */
+export interface CanvasRunNode {
+  visit?: number;
+  enteredAt?: string;
+  outcome?: string;
+  exitedAt?: string;
+  skipped?: { reason: string; condition?: string; at: string };
+}
+
+export interface CanvasRunUnit {
+  node: string;
+  unit: string;
+  childRunId: string;
+  resolution: number;
+  expanded: boolean;
+}
+
+export interface CanvasRunModel {
+  graph: CanvasGraph;
+  nodes: Record<string, CanvasRunNode>;
+  taken: Array<Extract<RunStep, { type: 'edge-taken' }>>;
+  units: CanvasRunUnit[];
+  lastSeq: number;
+}
+
+/** Construct a run overlay without modifying the source graph or its saved layout. */
+export function initialCanvasRunModel(graph: CanvasGraph): CanvasRunModel {
+  return { graph, nodes: {}, taken: [], units: [], lastSeq: 0 };
+}
+
+/** Apply one projected step. An already-applied seq cannot roll the canvas backwards. */
+export function applyCanvasRunStep(model: CanvasRunModel, step: RunStep): CanvasRunModel {
+  if (step.seq <= model.lastSeq) return model;
+  const { graph, nodes, taken, units } = model;
+  switch (step.type) {
+    case 'node-enter':
+      return { ...model, lastSeq: step.seq, nodes: { ...nodes, [step.node]: { ...nodes[step.node], visit: step.visit, enteredAt: step.ts, outcome: undefined, exitedAt: undefined, skipped: undefined } } };
+    case 'node-exit':
+      return { ...model, lastSeq: step.seq, nodes: { ...nodes, [step.node]: { ...nodes[step.node], outcome: step.outcome, exitedAt: step.ts } } };
+    case 'node-skipped':
+      return { ...model, lastSeq: step.seq, nodes: { ...nodes, [step.node]: { ...nodes[step.node], skipped: { reason: step.reason, ...(step.condition ? { condition: step.condition } : {}), at: step.ts } } } };
+    case 'edge-taken':
+      return { ...model, lastSeq: step.seq, taken: [...taken, step] };
+    case 'node-added':
+      return { ...model, lastSeq: step.seq, graph: addNode(graph, { id: step.node, kind: step.kind }).graph };
+    case 'edge-rerouted':
+      return { ...model, lastSeq: step.seq, graph: {
+        ...graph, edges: graph.edges.map((edge) => edge.from === step.from && edge.outcome === step.outcome && edge.to === step.was
+          ? { ...edge, to: step.to } : edge),
+      } };
+    case 'unit-expanded':
+      return { ...model, lastSeq: step.seq, units: [
+        ...units.filter((unit) => unit.node !== step.node || unit.unit !== step.unit),
+        { node: step.node, unit: step.unit, childRunId: step.childRunId, resolution: step.resolution, expanded: true },
+      ] };
+    case 'unit-collapsed':
+      return { ...model, lastSeq: step.seq, units: units.map((unit) => unit.node === step.node
+        ? { ...unit, resolution: step.resolution, expanded: false } : unit) };
+  }
+}
+
+/** Replay all shared steps in seq order, including the last one (not timestamp or arrival order). */
+export function applyCanvasRunSteps(graph: CanvasGraph, steps: readonly RunStep[]): CanvasRunModel {
+  return [...steps].sort((a, b) => a.seq - b.seq).reduce(applyCanvasRunStep, initialCanvasRunModel(graph));
 }
 
 export interface CanvasIssue {

@@ -1,8 +1,14 @@
 import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
 import { readSchedule, readSchedules, writeSchedule, type ScheduleRow } from './feature-store.js';
+import { checkScheduleCeoLoad } from './placement.js';
 
 export type ReleaseSchedule = ScheduleRow;
+
+/** A release landing and its representative work share the same KST day boundary. */
+export function kstDay(utc: string): string {
+  return new Date(Date.parse(utc) + 9 * 3_600_000).toISOString().slice(0, 10);
+}
 
 function utcIso(input: string): string {
   const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|([+-])(\d{2}):(\d{2}))$/.exec(input);
@@ -36,9 +42,15 @@ export function listSchedules(root?: string): ReleaseSchedule[] {
 }
 
 export function setSchedule(version: string, patch: { cutAt?: string; landBy?: string; freezeFrom?: string; freezeUntil?: string; publishAt?: string }, by: string, root?: string): ReleaseSchedule {
+  const landing = patch.landBy !== undefined ? utcIso(patch.landBy) : undefined;
+  if (landing !== undefined) {
+    const previous = readSchedule(version, root);
+    // Check the landing against the same ledger and configuration root that writeSchedule will use.
+    if (!previous?.landBy || kstDay(previous.landBy) !== kstDay(landing)) checkScheduleCeoLoad(version, landing, root);
+  }
   const schedule = writeSchedule(version, {
     ...(patch.cutAt !== undefined ? { cutAt: utcIso(patch.cutAt) } : {}),
-    ...(patch.landBy !== undefined ? { landBy: utcIso(patch.landBy) } : {}),
+    ...(landing !== undefined ? { landBy: landing } : {}),
     ...(patch.freezeFrom !== undefined ? { freezeFrom: utcIso(patch.freezeFrom) } : {}),
     ...(patch.freezeUntil !== undefined ? { freezeUntil: utcIso(patch.freezeUntil) } : {}),
     ...(patch.publishAt !== undefined ? { publishAt: utcIso(patch.publishAt) } : {}),

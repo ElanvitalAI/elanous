@@ -6,7 +6,7 @@ import {
   worseReviewVerdict, reviewPullRequest, parseReviewResult, buildReviewPrompt, renderReview,
   splitDiffByFile, budgetFileDiff, budgetedDiff, diffSection, diffShownPercent, reviewDiffCharLimit, budgetReviewerContext, capReviewImages,
   planReviewChunks, foldReviewResults, reviewMaxPasses,
-  isScopeRevertMustFix, type ReviewInput, type ReviewerContextItem,
+  isScopeRevertMustFix, NO_VERDICT_LINE_REASON, type ReviewInput, type ReviewerContextItem,
 } from './pr-reviewer.js';
 
 describe('reviewDiffCharLimit — 기본 예산·환경변수 계약', () => {
@@ -59,6 +59,25 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
   });
   it('FAIL 인데 must-fix 미기재 → 최소 1 블로커 보장', () => {
     expect(parseReviewResult('VERDICT: FAIL\nSHOULD-FIX:\n- x').mustFix.length).toBeGreaterThanOrEqual(1);
+  });
+  it('G6 — «없음/none» 표지만 있는 MUST-FIX 항목은 0건으로 접는다(GLM-5.3 응답 모양)', () => {
+    const glm = 'VERDICT: PASS\nMUST-FIX:\n- (없음 — 블로커 수준의 결함은 발견되지 않음)\nSHOULD-FIX:\n- 테스트 이름을 더 구체적으로';
+    expect(parseReviewResult(glm)).toMatchObject({ verdict: 'pass', mustFix: [], shouldFix: ['테스트 이름을 더 구체적으로'] });
+    for (const sentinel of ['none', '(none)', 'None.', '없음', '(없음)', '해당 없음', 'N/A', '[none]', '(none — nothing blocking)', '(none: no blockers found)', '(해당 없음 — 차단 수준 문제 없음)']) {
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${sentinel}`).mustFix).toEqual([]);
+    }
+  });
+  it('G6 — 표지로 «시작하는 지적»은 남기고, FAIL 에서 표지만 있으면 기존 최소 1 블로커 보장을 따른다', () => {
+    const real = [
+      'none of the new tests exercise the stream path', '없음이 아니라 미배선이다', 'Nothing calls the new export',
+      '없음 — 인증 검사가 없어 권한 없이 배포 가능', 'none: the new export is never called',
+      '(none: the new export is never called)', '(none: no blockers are checked because access control is disabled)', '(없음 — 리뷰 테스트가 배선되지 않음)',
+    ];
+    for (const finding of real) {
+      expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
+    }
+    expect(parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- (없음)').mustFix).toEqual(['PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).']);
+    expect(parseReviewResult('VERDICT: WARN\nMUST-FIX:\n- 없음 — 인증 검사가 없어 권한 없이 배포 가능').mustFix).toHaveLength(1);
   });
   it('VERDICT 부재 → pass 폴백', () => {
     expect(parseReviewResult('음').verdict).toBe('pass');
@@ -740,6 +759,177 @@ describe('reviewPullRequest — 분할 리뷰 배선', () => {
   });
 });
 
+describe('reviewPullRequest — 조각별 reviewer context', () => {
+  const twoFileDiff = file('a.ts', '+' + 'x'.repeat(1_100)) + file('b.ts', '+' + 'y'.repeat(1_100));
+  const withSmallDiffLimit = async (run: () => Promise<void>) => {
+    const previous = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+    try { await run(); } finally {
+      if (previous === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = previous;
+    }
+  };
+  const review = async (prDiff: string, reviewerContext: ReviewerContextItem[]) => {
+    const prompts: string[] = [];
+    const result = await reviewPullRequest({ prDiff, phaseIntent: '테스트', reviewerContext }, async (prompt) => {
+      prompts.push(prompt);
+      return 'VERDICT: PASS';
+    });
+    return { prompts, result };
+  };
+
+  it('각 변경 파일의 10,000자 본문은 자기 조각에만 전량 싣고 예산 관측도 패스별로 낸다', async () => {
+    await withSmallDiffLimit(async () => {
+      const a = 'A'.repeat(10_000);
+      const b = 'B'.repeat(10_000);
+      const log = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        const { prompts, result } = await review(twoFileDiff, [{ label: 'a.ts', body: a }, { label: 'b.ts', body: b }]);
+        expect(prompts).toHaveLength(2);
+        expect(prompts[0]).toContain(`### a.ts\n${a}`);
+        expect(prompts[0]).not.toContain('### b.ts');
+        expect(prompts[1]).toContain(`### b.ts\n${b}`);
+        expect(prompts[1]).not.toContain('### a.ts');
+        expect(result.contextBudget).toEqual({
+          itemCount: 2, shownChars: 20_020, totalChars: 20_020, truncated: false,
+          fullyIncludedItems: 2, truncatedItems: 0, omittedItems: 0,
+        });
+        const call = log.mock.calls.find(([category, event]) => category === 'review.images' && event === 'reviewer-context-budget');
+        expect(call?.[2]).toMatchObject({ passes: 2, perPassShownChars: [10_009, 10_009], truncated: false });
+      } finally { log.mockRestore(); }
+    });
+  });
+
+  it('인용된 Git 경로(UTF-8 8진 이스케이프 포함)는 자기 조각에만 문맥을 싣는다', async () => {
+    await withSmallDiffLimit(async () => {
+      const quoted = (path: string) => `diff --git "a/${path}" "b/${path}"\n--- "a/${path}"\n+++ "b/${path}"\n+${'x'.repeat(1_100)}\n`;
+      const diff = quoted('한글.ts') + quoted('\\353\\213\\244\\353\\245\\270.ts');
+      const { prompts, result } = await review(diff, [
+        { label: '한글.ts', body: 'UNICODE_CONTEXT_ONLY' },
+        { label: '다른.ts', body: 'OCTAL_CONTEXT_ONLY' },
+      ]);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain('UNICODE_CONTEXT_ONLY');
+      expect(prompts[0]).not.toContain('OCTAL_CONTEXT_ONLY');
+      expect(prompts[1]).not.toContain('UNICODE_CONTEXT_ONLY');
+      expect(prompts[1]).toContain('OCTAL_CONTEXT_ONLY');
+      expect(result.contextBudget?.truncated).toBe(false);
+    });
+  });
+
+  it('인용된 Git 경로의 이모지(보조 평면 문자)도 자기 조각에만 문맥을 싣는다', async () => {
+    await withSmallDiffLimit(async () => {
+      const quoted = (path: string) => `diff --git "a/${path}" "b/${path}"\n--- "a/${path}"\n+++ "b/${path}"\n+${'x'.repeat(1_100)}\n`;
+      const diff = quoted('😀.ts') + quoted('plain\\tname.ts');
+      const { prompts } = await review(diff, [{ label: '😀.ts', body: 'EMOJI_CONTEXT_ONLY' }, { label: 'plain\tname.ts', body: 'TAB_CONTEXT_ONLY' }]);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain('EMOJI_CONTEXT_ONLY');
+      expect(prompts[0]).not.toContain('TAB_CONTEXT_ONLY');
+      expect(prompts[1]).not.toContain('EMOJI_CONTEXT_ONLY');
+      expect(prompts[1]).toContain('TAB_CONTEXT_ONLY');
+    });
+  });
+
+  it('일치하지 않는 텍스트는 매 조각에 싣되 결과에서는 중복을 세지 않는다', async () => {
+    await withSmallDiffLimit(async () => {
+      const note = { label: 'provided text', body: 'shared guidance' };
+      const a = { label: 'a.ts', body: 'first body' };
+      const b = { label: 'b.ts', body: 'second body' };
+      const { prompts, result } = await review(twoFileDiff, [a, note, b]);
+      expect(prompts).toHaveLength(2);
+      for (const prompt of prompts) expect(prompt).toContain('### provided text\nshared guidance');
+      expect(prompts[0]).toContain('### a.ts\nfirst body');
+      expect(prompts[0]).not.toContain('### b.ts');
+      expect(prompts[1]).toContain('### b.ts\nsecond body');
+      expect(prompts[1]).not.toContain('### a.ts');
+      const full = budgetReviewerContext([a, note, b]);
+      expect(result.contextBudget).toMatchObject({
+        shownChars: full.shownChars, totalChars: full.totalChars, truncated: false,
+        fullyIncludedItems: 3, truncatedItems: 0, omittedItems: 0,
+      });
+    });
+  });
+
+  it('공유 항목이 한 조각에서라도 잘리면 전체 결과에 절단을 표시하고 조각 상한을 지킨다', async () => {
+    await withSmallDiffLimit(async () => {
+      const shared = { label: 'provided text', body: 'S'.repeat(8_000) };
+      const a = { label: 'a.ts', body: 'A'.repeat(8_000) };
+      const { prompts, result } = await review(twoFileDiff, [shared, a]);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain('## Reviewer-provided context (budget-truncated:');
+      expect(prompts[0]).toContain('### a.ts');
+      expect(prompts[1]).toContain(`### provided text\n${shared.body}`);
+      expect(prompts[1]).not.toContain('budget-truncated:');
+      expect(result.contextBudget).toMatchObject({ itemCount: 2, truncated: true, fullyIncludedItems: 0, truncatedItems: 2, omittedItems: 0 });
+      expect(result.contextBudget!.shownChars).toBeLessThanOrEqual(result.contextBudget!.totalChars);
+      for (const prompt of prompts) {
+        const section = prompt.split('## Reviewer-provided context')[1]!.split('## PR diff')[0]!;
+        const rendered = section.slice(section.indexOf('\n') + 1).trim();
+        expect(rendered.length).toBeLessThanOrEqual(12_000);
+      }
+    });
+  });
+
+  it('공유 항목이 한 조각에서만 잘리고 다른 조각에선 온전해도 shownChars 가 그 손실을 드러낸다', async () => {
+    await withSmallDiffLimit(async () => {
+      const shared = { label: 'provided text', body: 'S'.repeat(9_000) };
+      const a = { label: 'a.ts', body: 'A'.repeat(4_000) };
+      const { prompts, result } = await review(twoFileDiff, [shared, a]);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain(`### a.ts\n${a.body}`);
+      expect(prompts[1]).toContain(`### provided text\n${shared.body}`);
+      expect(result.contextBudget).toMatchObject({ itemCount: 2, truncated: true, fullyIncludedItems: 1, truncatedItems: 1, omittedItems: 0 });
+      expect(result.contextBudget!.shownChars).toBeLessThan(result.contextBudget!.totalChars);
+    });
+  });
+
+  it('한 조각은 기존 buildReviewPrompt·예산·관측과 완전히 같은 값을 유지한다', async () => {
+    const reviewerContext = [{ label: 'a.ts', body: 'first' }, { label: 'b.ts', body: 'second' }];
+    const prDiff = file('a.ts', '+small');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const { prompts, result } = await review(prDiff, reviewerContext);
+      const budget = budgetReviewerContext(reviewerContext);
+      expect(prompts).toEqual([buildReviewPrompt({ prDiff, phaseIntent: '테스트', reviewerContext })]);
+      expect(result.contextBudget).toEqual({
+        itemCount: budget.itemCount, shownChars: budget.shownChars, totalChars: budget.totalChars,
+        truncated: budget.truncated, fullyIncludedItems: budget.fullyIncludedItems,
+        truncatedItems: budget.truncatedItems, omittedItems: budget.omittedItems,
+      });
+      expect(log.mock.calls.find(([category, event]) => category === 'review.images' && event === 'reviewer-context-budget')).toEqual([
+        'review.images', 'reviewer-context-budget', result.contextBudget,
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  it('경로가 맞지 않는 참고 파일도 공유하며 원본의 순서를 보존한다', async () => {
+    await withSmallDiffLimit(async () => {
+      const { prompts, result } = await review(twoFileDiff, [
+        { label: 'docs/reference.md', body: 'reference text' },
+        { label: 'a.ts', body: 'a text' },
+        { label: 'b.ts', body: 'b text' },
+      ]);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain('### docs/reference.md\nreference text');
+      expect(prompts[1]).toContain('### docs/reference.md\nreference text');
+      expect(prompts[0]!.indexOf('### docs/reference.md')).toBeLessThan(prompts[0]!.indexOf('### a.ts'));
+      expect(prompts[1]!.indexOf('### docs/reference.md')).toBeLessThan(prompts[1]!.indexOf('### b.ts'));
+      expect(result.contextBudget).toMatchObject({ itemCount: 3, truncated: false, fullyIncludedItems: 3 });
+    });
+  });
+
+  it('이미지는 기존과 같이 첫 조각에만 별도 전달한다', async () => {
+    await withSmallDiffLimit(async () => {
+      const seen: Array<readonly { label: string; mimeType: string; data: string }[] | undefined> = [];
+      const result = await reviewPullRequest({ prDiff: twoFileDiff, phaseIntent: '테스트', reviewerContext: [
+        { label: 'a.ts', body: '[image]', image: { mimeType: 'image/png', data: 'QUJD' } },
+      ] }, async (_prompt, images) => { seen.push(images); return 'VERDICT: PASS'; });
+      expect(result.reviewed).toBe(true);
+      expect(seen).toEqual([[{ label: 'a.ts', mimeType: 'image/png', data: 'QUJD' }], undefined]);
+    });
+  });
+});
+
 describe('reviewMaxPasses — 상한 계약', () => {
   it('기본 6 · env override · 1 미만은 무시', () => {
     const prev = process.env.ELANOUS_PR_REVIEW_MAX_PASSES;
@@ -767,5 +957,67 @@ describe('renderReview — 리뷰가 안 돈 결과', () => {
   it('reviewed 가 없거나 true 면 지금 렌더 그대로', () => {
     expect(renderReview({ verdict: 'pass', mustFix: [], shouldFix: [] })).toContain('자율 PR 리뷰: PASS');
     expect(renderReview({ verdict: 'pass', mustFix: [], shouldFix: [], reviewed: true })).toContain('자율 PR 리뷰: PASS');
+  });
+});
+
+// ── REVIEW-NO-VERDICT-FAILCLOSED(2026-10-10) — 판정 줄 없는 응답은 «리뷰 못 함» ──────────────
+//   실물: run-dbe7b7df(PR #25906) — 자격 없는 codex-app-server 리뷰어가 17초 만에 219자 오류 문구를
+//   돌려줬고 `verdict=pass reviewed=true mustFix 0` 으로 접혔다.
+describe('reviewPullRequest — VERDICT 줄 없는 응답 fail-closed', () => {
+  const input = { prDiff: '+x', phaseIntent: 'p', reviewContext: { runId: 'run-nv' } };
+  const noVerdict = 'Error: not authenticated. Please run `codex login` to sign in with ChatGPT, or set OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx to use an API key. '
+    + 'The reviewer could not start the session and no review was produced for this request.';
+
+  it('(a) 판정 줄 없는 짧은 오류 문구 → reviewed=false · failureReason=no-verdict-line · 관측(가림)', async () => {
+    expect(noVerdict.length).toBeGreaterThan(150);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const r = await reviewPullRequest(input, async () => noVerdict);
+      expect(r).toMatchObject({ verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: NO_VERDICT_LINE_REASON });
+      expect(renderReview(r)).toBe('⚠️ 자율 PR 리뷰: 리뷰 안 돎 — 사유 no-verdict-line (통과 판정 아님)');
+      const call = log.mock.calls.find(([category, event]) => category === 'review.verdict' && event === NO_VERDICT_LINE_REASON);
+      expect(call).toBeDefined();
+      const data = call![2] as { chars: number; head: string; runId?: string };
+      expect(data.chars).toBe(noVerdict.length);
+      expect(data.runId).toBe('run-nv');
+      expect(data.head.length).toBeLessThanOrEqual(80);
+      expect(data.head).not.toContain('sk-abcdefghijklmnopqrstuvwx');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('(b) 판정 줄 있는 응답 3종 → parseReviewResult ⊕ reviewed=true 와 정확히 같다', async () => {
+    for (const raw of [
+      'VERDICT: PASS\n산출물이 의도와 정합.',
+      'VERDICT: WARN\nSHOULD-FIX:\n- 네이밍\nREQUIREMENTS:\n- src/a.ts 를 본다',
+      'VERDICT: FAIL\nMUST-FIX:\n- 미배선\nSHOULD-FIX:\n- 네이밍',
+    ]) {
+      const r = await reviewPullRequest({ prDiff: '+x', phaseIntent: 'p' }, async () => raw);
+      const { diffBudget: _diffBudget, ...rest } = r;
+      expect(rest).toEqual({ ...parseReviewResult(raw), reviewed: true });
+    }
+  });
+
+  it('(c) 분할 리뷰 한 조각만 판정 줄 없음 → 전체 reviewed=false · 사유 no-verdict-line · 다른 조각의 지적은 보존', async () => {
+    const diff = Array.from({ length: 4 }, (_, i) => file(`f${i}.ts`, '+' + 'x'.repeat(800))).join('');
+    const prev = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      let calls = 0;
+      const r = await reviewPullRequest({ prDiff: diff, phaseIntent: 'p' }, async () => {
+        calls += 1;
+        return calls === 1 ? 'VERDICT: FAIL\nMUST-FIX:\n- 미배선' : calls === 2 ? noVerdict : 'VERDICT: PASS';
+      });
+      expect(calls).toBeGreaterThanOrEqual(2);
+      expect(r).toMatchObject({ verdict: 'fail', mustFix: ['미배선'], reviewed: false, failureReason: NO_VERDICT_LINE_REASON });
+      const call = log.mock.calls.find(([category, event]) => category === 'review.verdict' && event === NO_VERDICT_LINE_REASON);
+      expect(call?.[2]).toMatchObject({ pass: 2, passes: calls });
+    } finally {
+      log.mockRestore();
+      if (prev === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = prev;
+    }
   });
 });

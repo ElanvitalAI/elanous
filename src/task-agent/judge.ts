@@ -76,9 +76,10 @@ function base(input: TaskJudgeInput): Omit<TaskJudgement, 'executorKind'> {
   if (input.deliveryEvidence) return input.deliveryEvidence.ok
     ? { move: 'propose-green', stage: 'closing', reason: `전달 근거 확인: ${input.deliveryEvidence.files.join(', ')}` }
     : { move: 'wait', stage: 'waiting', reason: input.deliveryEvidence.reason };
-  if (input.terminalRun && !input.terminalRun.hasPr && !input.terminalRun.hasHarvestBranch) {
-    const disposition = input.terminalRun.kind === STOP_CLASS_POD_FAILURE ? 'needs-owner' : 'needs-relaunch';
-    return { move: 'wait', stage: 'escalated', reason: `failed/${disposition} — ${input.terminalRun.reason.replace(/[\r\n]+/gu, ' ').trim() || input.terminalRun.kind}` };
+  if (input.terminalRun && !input.terminalRun.hasPr && !input.terminalRun.hasHarvestBranch && !input.pr) {
+    const disposition = input.terminalRun.kind === STOP_CLASS_POD_FAILURE ? 'needs-owner'
+      : input.terminalRun.kind === STOP_CLASS_NO_LAUNCH ? 'needs-relaunch' : undefined;
+    if (disposition) return { move: 'wait', stage: 'escalated', reason: `failed/${disposition} — ${input.terminalRun.reason.replace(/[\r\n]+/gu, ' ').trim() || input.terminalRun.kind}` };
   }
   const stop = input.stopReason;
   const kind = input.completion;

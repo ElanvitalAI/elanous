@@ -11,6 +11,7 @@ import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
+import { publishAtError } from './publish-at.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -40,6 +41,7 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   cutCommit?: string;
   gatePodPool: string;
   forceFreeze?: boolean;
+  publishAt?: string;
   /** RELEASE-BRANCH: version-release cuts release/<v> from main HEAD and bumps only the branch. */
   branchCut?: boolean;
 }
@@ -117,7 +119,7 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -134,6 +136,11 @@ export async function runUnattendedRelease(
   }
   const version = resolveRunVersion(opts.version, opts.prerelease, deps);
   const input = buildReleaseRunInput(version, deps, opts.cutCommit);
+  if (opts.publishAt !== undefined) {
+    const invalid = publishAtError(opts.publishAt);
+    if (invalid) throw new Error(invalid);
+    input.publishAt = new Date(opts.publishAt).toISOString();
+  }
   if (opts.forceFreeze) input.forceFreeze = true;
   if (branchCut) input.branchCut = true;
   debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true });

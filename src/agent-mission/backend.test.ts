@@ -66,7 +66,7 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     try {
       const spawn = resolveBackendSpawn(codexBackend, { PATH: '/usr/bin' });
       expect(spawn.args).toContain('-c');
-      expect(spawn.args).toContain(`${CODEX_NESTED_DEPTH_CONFIG_KEY}=1`);
+      expect(spawn.args).toContain(`${CODEX_NESTED_DEPTH_CONFIG_KEY}="1"`);
     } finally {
       if (prev === undefined) delete process.env.ELANOUS_NEST_DEPTH;
       else process.env.ELANOUS_NEST_DEPTH = prev;
@@ -196,7 +196,7 @@ describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U
 
   it('선택된 backend 의 cmd/args 가 spawn 파라미터로 전달', () => {
     const cases: Array<[AgentBackend, string, string[]]> = [
-      [codexBackend, 'codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}`]],
+      [codexBackend, 'codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}="${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}"`]],
       [claudeBackend, 'claude', ['--dangerously-skip-permissions']],
       [geminiBackend, 'agy', ['--dangerously-skip-permissions']],
       [grokBackend, 'grok', ['--always-approve']],
@@ -296,7 +296,7 @@ describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U
     // resolveBackend(레지스트리)와 resolveBackendSpawn(spawn 구성)을 합성해 검증 →
     // AGENT_BACKENDS 의 name→cmd/args 매핑이 어긋나면(오배선) 여기서 실패.
     const expected: Record<string, [string, string[]]> = {
-      codex: ['codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}`]],
+      codex: ['codex', ['--yolo', '-c', 'check_for_update_on_startup=false', '-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}="${(Number(process.env.ELANOUS_NEST_DEPTH) || 0) + 1}"`]],
       claude: ['claude', ['--dangerously-skip-permissions']],
       // ⭐ 이름 gemini → 실행체 agy (2026-08-18 대표 결정 · 죽은 CLI 로 되돌아가면 여기서 잡힌다)
       gemini: ['agy', ['--dangerously-skip-permissions']],

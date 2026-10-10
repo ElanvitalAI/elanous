@@ -33,7 +33,7 @@ import { debug } from '../debug/log.js';
 import { publishGoalLifecycle } from '../goals/loop.js';
 import { boundReadableText } from '../self-implement/orchestrator.js';
 import { changedFiles } from '../self-implement/seams.js';
-import { getHarnessRunId, getHarnessSpace } from '../harness/harness-space.js';
+import { getHarnessRole, getHarnessRunId, getHarnessSpace } from '../harness/harness-space.js';
 import { CONTROL_INBOX_DIR_ENV, drainControlInbox, drainSoftStopControlInbox, enqueueControlMemo, type ControlInboxDrain, type ControlMemoPayload } from '../harness/control-inbox.js';
 import { enqueuePendingUserInput } from '../session/pending-input.js';
 import { getCurrentPtyId } from '../agent/pty-identity.js';
@@ -200,6 +200,22 @@ export const GOAL_READBACK_PROMPT = [
   '이미 사용자에게 한 답을 다시 쓰지 마라 — 새 사실이 없으면 텍스트 없이 update_goal 만 호출하라.',
 ].join('\n');
 
+/** GOAL-LOOP-INTENT-STALL (0.2.24 · OP or-audit-1010) — 구현 자식이 «도구를 한 번도 안 부르고 말만 한 턴»에
+ *  넣는 재촉. hermes-agent stall guard(`agent/turn_final_response.py` 172-205)를 본떴다.
+ *  ⛔ 기존 프롬프트 상수는 건드리지 않는다 — 재촉 문면은 이 상수 하나뿐이다. */
+export const GOAL_INTENT_STALL_PROMPT = [
+  '[act now]',
+  '말로 계획만 적고 도구를 하나도 호출하지 않았다. 지금 바로 실제로 도구를 호출해 첫 스텝을 실행하라(예: 대상 파일 읽기).',
+  '설명 문장만으로 이 턴을 끝내지 마라.',
+].join('\n');
+
+/** 재촉 상한 — 이 횟수를 쓰고도 텍스트만이면 종전 ④(텍스트 수용)로 그대로 떨어진다. */
+export const GOAL_INTENT_STALL_MAX_REPROMPTS = 2;
+
+/** 재촉 가드가 켜지는 provider — ⭐ 이번 조각은 OpenRouter(오픈웨이트 모델) 구현 자식 «한정»이다
+ *  (OP 10-10 결정 · 실측 GLM Flash 첫 턴 40토큰 말만 하고 abandoned). 다른 provider 는 종전 그대로. */
+export const GOAL_INTENT_STALL_PROVIDERS: ReadonlySet<string> = new Set(['openrouter']);
+
 /** evidence 누락 complete 재주입 — update_goal(complete) 를 호출했으나 evidence 가 비었을 때. */
 export const GOAL_EVIDENCE_REQUIRED_PROMPT = [
   '[evidence required]',
@@ -264,6 +280,10 @@ export interface GoalLoopOptions {
   controlSpaceId?: string | null;
   /** Test seam — file-backed child liveness heartbeat. Default starts the workspace-file writer. */
   startLivenessHeartbeat?: typeof startChildLivenessHeartbeat;
+  /** GOAL-LOOP-INTENT-STALL — 구현 자식의 LLM provider. `openrouter` 일 때만 «도구 0회·텍스트만» 턴을
+   *  최대 2번 재촉한다. 생략하면 harness role 이 executor 인 프로세스에서만 활성 provider 로 푼다.
+   *  null = 가드 꺼짐. 시험은 이 인자를 명시해 env 에 기대지 않는다. */
+  intentStallProvider?: string | null;
 }
 
 export type GoalLoopStopReason =
@@ -449,10 +469,17 @@ export async function runGoalLoop(
   //   ※ 객체 홀더: onToolResult 클로저에서 변이하므로 let narrowing 대신 property 타입으로 읽는다.
   const runTests: { last: { ok: boolean; fail: number; unmatchedFilters: string[]; pass: number } | null } = { last: null };
   let lastResult: CoreTurnResult = { stopReason: 'end_turn', finalText: '' };
+  // GOAL-LOOP-INTENT-STALL — provider 는 루프 진입 시 «한 번» 정한다. 런 전체 도구 활동은 누적한다.
+  const intentStallProvider = await resolveIntentStallProvider(opts.intentStallProvider);
+  const intentStallGuard = intentStallProvider !== null && GOAL_INTENT_STALL_PROVIDERS.has(intentStallProvider);
+  let anyToolActivity = false;
+  let intentStallReprompts = 0;
+  // GOAL-LOOP-MIDRUN-STALL — 도구를 쓴 «뒤»의 말뿐인 턴 재촉은 런당 1회뿐이다.
+  let intentStallMidrunUsed = false;
 
   debug.log('goal.loop', 'start', {
     sessionId: ctx.sessionId, ...runAttribution, objective, maxIterations, noProgressLimit,
-    contextTokenLimit, contextPressureRatio,
+    contextTokenLimit, contextPressureRatio, intentStallGuard, intentStallProvider,
   }, { level: 'info' });
   const bus = getChannelBus();
   ensureProcessLifecycleBridge(bus, opts.attachLifecycleBridge ?? attachLifecycleBridge);
@@ -702,6 +729,7 @@ export async function runGoalLoop(
     const goalUpdate = findGoalUpdate(turnNewMessages);
     const rejectedTools = findRejectedToolCalls(turnNewMessages);
     const toolActivity = hadToolActivity(turnNewMessages);
+    if (toolActivity) anyToolActivity = true;
     const markerComplete = hasCompletionMarker(lastResult.finalText);
     const markerBlocked = hasBlockedMarker(lastResult.finalText);
 
@@ -868,6 +896,43 @@ export async function runGoalLoop(
     }
     readbackStreak = 0;
 
+    // ④-0 GOAL-LOOP-INTENT-STALL — OpenRouter 구현 자식이 런 내내 도구를 한 번도 안 부르고 말만 했다
+    //    (예: 「먼저 파일을 읽겠습니다」 후 멈춤). 일상 답변으로 수락하기 전에 «실제로 도구를 호출하라»를
+    //    최대 GOAL_INTENT_STALL_MAX_REPROMPTS 번 넣는다. 재촉 턴도 maxIterations 에 센다(하드캡이 이긴다).
+    //    상한을 쓰고도 텍스트만이면 포기 이벤트만 남기고 아래 ④ 로 «그대로» 떨어진다(포기 경로 불변).
+    //    ⛔ 가드가 꺼졌거나(다른 provider·비-executor) 한 번이라도 도구를 불렀으면 이 블록은 아무것도 안 한다.
+    //    ⭐ 빈 답(finalChars 0)도 «도구 0회»면 같은 정체로 본다 — 빈 답도 종전엔 text-only-accept 로 abandoned 됐다.
+    if (!toolActivity && intentStallGuard && !anyToolActivity) {
+      if (intentStallReprompts < GOAL_INTENT_STALL_MAX_REPROMPTS) {
+        intentStallReprompts += 1;
+        debug.log('goal.loop', 'intent-stall-reprompt', {
+          sessionId: ctx.sessionId, ...runAttribution, iterations, attempt: intentStallReprompts,
+          finalChars: lastResult.finalText.length, provider: intentStallProvider,
+        }, { level: 'info' });
+        messages.push({ role: 'user', content: GOAL_INTENT_STALL_PROMPT });
+        continue;
+      }
+      debug.log('goal.loop', 'intent-stall-exhausted', {
+        sessionId: ctx.sessionId, ...runAttribution, iterations, attempts: intentStallReprompts,
+        provider: intentStallProvider,
+      }, { level: 'warn' });
+    }
+
+    // ④-0b GOAL-LOOP-MIDRUN-STALL — 앞서 도구를 썼는데 이번 턴은 도구 없이 말로 끝났다
+    //    (예: 파일을 읽은 뒤 「이제 수정하겠습니다」 후 멈춤 → 변경 0 abort · 10-10). 같은 가드에서
+    //    같은 GOAL_INTENT_STALL_PROMPT 를 «런당 1회»만 넣는다. 재촉 턴도 maxIterations 에 센다.
+    //    두 번째 중간 정체는 아래 ④ 로 «그대로» 떨어진다(text-only-accept 불변).
+    //    ⛔ 가드가 꺼졌으면(다른 provider·비-executor) 이 블록은 아무것도 안 한다 · ④-0 과는 anyToolActivity 로 배타.
+    if (!toolActivity && intentStallGuard && anyToolActivity && !intentStallMidrunUsed) {
+      intentStallMidrunUsed = true;
+      debug.log('goal.loop', 'intent-stall-midrun', {
+        sessionId: ctx.sessionId, ...runAttribution, iterations,
+        finalChars: lastResult.finalText.length, provider: intentStallProvider,
+      }, { level: 'info' });
+      messages.push({ role: 'user', content: GOAL_INTENT_STALL_PROMPT });
+      continue;
+    }
+
     // ④ 순수 텍스트(도구 없음)로 끝났고 종결 신호도 없음 = 일상 답변(목표성 작업 아님).
     //    재주입하지 않고 그대로 수용해 trivial chat 을 이중 루프하지 않는다.
     if (!toolActivity) {
@@ -906,5 +971,24 @@ export async function runGoalLoop(
   return finish({ finalText: lastResult.finalText, iterations, stopReason: 'max_iterations', goalComplete: false });
   } finally {
     stopLivenessHeartbeat();
+  }
+}
+
+/** 가드 provider 를 정한다. 명시 인자가 이긴다(시험·호출부). 생략하면 «구현 자식»(harness role executor)
+ *  프로세스에서만 활성 provider(`resolveActiveProvider` — `ELANOUS_LLM_PROVIDER` 릴레이 포함)를 읽는다.
+ *  ⛔ executor 가 아닌 프로세스(ACP 대시보드·`chat --goal-loop`)는 읽지도 않는다 ⇒ null = 가드 꺼짐.
+ *  읽기 실패도 null(fail-open = 종전 동작). */
+async function resolveIntentStallProvider(explicit: string | null | undefined): Promise<string | null> {
+  if (explicit !== undefined) return explicit?.trim().toLowerCase() || null;
+  if (getHarnessRole() !== 'executor') return null;
+  try {
+    const { getUserConfig, resolveActiveProvider } = await import('../user-config.js');
+    return resolveActiveProvider(getUserConfig());
+  } catch (error) {
+    // fail-open(가드 꺼짐 = 종전 동작)이지만 «왜 꺼졌나»는 남긴다 — 조용한 꺼짐은 관측 안 한 것이다.
+    debug.log('goal.loop', 'intent-stall-provider-unresolved', {
+      error: error instanceof Error ? error.message : String(error),
+    }, { level: 'warn' });
+    return null;
   }
 }

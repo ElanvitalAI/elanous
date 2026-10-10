@@ -319,7 +319,11 @@ describe('auto provider selection from isolated credentials', () => {
     process.env.OPENROUTER_API_KEY = 'or-test';
     const cfg = baseUserConfig();
     expect(decideProviderForConfig(cfg)).toEqual({ provider: 'auto:openrouter', model: PROVIDERS.openrouter!.defaultModel, auth: 'apikey' });
-    expect(getProviderForConfig(cfg)).toBe(PROVIDERS.openrouter);
+    // Since OR-IMPL-EFFORT-1 (#25979) the auto path returns a config-bearing OpenRouter
+    // instance (it carries llm.reasoningLevel), not the config-free singleton.
+    const selected = getProviderForConfig(cfg);
+    expect(selected.name).toBe('openrouter');
+    expect(selected.defaultModel).toBe(PROVIDERS.openrouter!.defaultModel);
     expect(getProvider()).toBe(PROVIDERS.openrouter);
     process.env.GEMINI_API_KEY = 'gemini-test';
     expect(decideProviderForConfig(cfg).provider).toBe('auto:gemini');

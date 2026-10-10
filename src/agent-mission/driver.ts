@@ -352,7 +352,7 @@ export function resolveBackendSpawn(
   //   ⚠️ 과금 스크럽 키만 — 중첩 표지는 정체성 allowlist 가 다시 싣는 키가 있어 이 PR 의 범위 밖이다.
   const unsetEnv = [...new Set(backend.scrubEnv ?? [])].filter((k) => !(k in env));
   // Codex drops parent env under shell_environment_policy inherit=core, so the nested-depth
-  // marker rides on argv (`-c shell_environment_policy.set.ELANOUS_NESTED_DEPTH=<child>`).
+  // marker rides on argv (`-c shell_environment_policy.set.ELANOUS_NESTED_DEPTH="<child>"` — TOML 문자열).
   // Backends that cannot carry it are refused only when a nested elanous launch was requested.
   const args = [...backend.args, ...nestedDepthCodexArgs(backend.name, getNestDepth() + 1)];
   return { cmd: backend.cmd, args, env, unsetEnv, nestedEnvRemovedCount, forcedEnv };

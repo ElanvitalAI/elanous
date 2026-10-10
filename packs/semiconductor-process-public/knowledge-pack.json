@@ -1,0 +1,31 @@
+{
+  "kind": "knowledge-pack",
+  "name": "semiconductor-process-public",
+  "version": "0.1.0",
+  "description": "Public-source semiconductor process terminology and introductory process flow; no proprietary recipes or operating parameters.",
+  "signature": { "algorithm": "ed25519", "keyId": "00000000" },
+  "dependencies": [],
+  "license": "CC-BY-4.0",
+  "visibility": "public",
+  "content": [
+    { "kind": "document", "path": "content/process-overview.md" },
+    { "kind": "glossary", "path": "content/glossary.md" },
+    { "kind": "procedure", "path": "content/public-source-check.md" },
+    { "kind": "qa", "path": "content/questions.md" }
+  ],
+  "distribution": {
+    "standalone": true,
+    "pluginCombination": true,
+    "internalMarketDownload": "requires enterprise-signed index, authorization and entitlement; not bundled with this sample",
+    "publicMarket": "candidate; publication requires signed index, content review and approval"
+  },
+  "sale": {
+    "targetDate": "2026-10-28",
+    "pricing": { "model": "free" },
+    "paid": "not-enabled-pending-merchant-payment-terms-approval",
+    "seller": "undecided",
+    "rightsHolder": "sample-authored-content; third-party sources linked, not redistributed",
+    "scope": "public and enterprise",
+    "revenueShare": "undecided"
+  }
+}

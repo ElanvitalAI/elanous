@@ -1,15 +1,17 @@
 #!/usr/bin/env bun
 // 벤치 한 판(runId) → 팔 × 지표 표. RFC-fleet-supervisor-substrates-benchmark-and-token-accounting §F5 · 2026-09-25.
-//   bun scripts/bench-report.ts --run <runId> [--since 24h] [--json]
-// 입력은 호스트 로그 셋뿐이다(새 저장소 0):
+//   bun scripts/bench-report.ts --run <runId> [--since 24h] [--json] [--bn1 <관측.json>]
+// 기본 입력은 호스트 로그 셋뿐이다(새 저장소 0). BN1은 선택적 별도 관측 파일이다.
+// 기본 로그 입력:
 //   ① `self-dev.orchestrate substrate`   — 팔 선언(benchArms: id·provider·model)
 //   ② `self-implement.pod job-applied`   — spaceId ↔ armId
 //   ③ `self-dev.orchestrate job.done`    — taskId·stage·prUrl·durationMs ⊕ (E4) gatePassed·reviewVerdict·reviewMustFixCount
 //   ④ `llm-usage` site=`pod-rollup:*`    — Pod 가 잰 사용량(armId 별)
 // ⛔ runId 로만 거른다 — `--all --include-test` 의 «모든 우주»가 섞여도 runId 는 한 판이다.
 // ⛔ 이음이 끊긴 칸은 0 으로 채우지 않고 `null`(못 이음)로 둔다.
-// ⛔ 이 표로 팔을 «비교»하지 않는다 — 팔 밖 모델 행(leak)이 0이고 팔마다 표본이 쌓인 뒤에만(A/B 매뉴얼 · 결론 금지).
+// ⛔ 기본 표로 팔을 «비교»하지 않는다 — 팔 밖 모델 행(leak)이 0이고 팔마다 표본이 쌓인 뒤에만(A/B 매뉴얼 · 결론 금지). BN1도 네 팔 동일 골 측정 전 결론 금지.
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 export interface LogRow { category?: string; event?: string; data?: Record<string, unknown> | null }
@@ -120,6 +122,68 @@ export function buildBenchReport(rows: readonly LogRow[], runId: string): { runI
   return { runId, arms: [...arms.values()].sort((x, y) => (x.armId < y.armId ? -1 : 1)), unjoinedJobs, ...(image ? { image } : {}) };
 }
 
+export const BN1_ARMS = ['Codex', 'OpenClaw', 'Hermes', '엘라누스'] as const;
+export type Bn1Arm = typeof BN1_ARMS[number];
+export interface Bn1Input {
+  runId: string;
+  goals: Array<{ id: string; text: string }>;
+  observations: Array<{
+    goalId: string;
+    arm: Bn1Arm;
+    completed: boolean | null;
+    humanInterventions: number | null;
+    durationMs: number | null;
+    costUsd: number | null;
+    evidence: string;
+  }>;
+}
+
+/** BN1 is a separate, opt-in experiment: no inference from pod stage, calls or known-cost subtotal. */
+export function buildBn1Comparison(input: Bn1Input, runId: string) {
+  if (!input || typeof input.runId !== 'string' || !input.runId.trim() || input.runId !== runId || !Array.isArray(input.goals) || !input.goals.length || !Array.isArray(input.observations)) throw new Error('BN1: runId 또는 골 셋이 유효하지 않음');
+  const goals = new Set<string>();
+  for (const goal of input.goals) {
+    if (typeof goal?.id !== 'string' || !goal.id.trim() || typeof goal.text !== 'string' || !goal.text.trim() || goals.has(goal.id)) throw new Error('BN1: 빈 골 또는 중복 골');
+    goals.add(goal.id);
+  }
+  const observed = new Map<string, Bn1Input['observations'][number]>();
+  for (const row of input.observations) {
+    if (!row || typeof row.goalId !== 'string' || typeof row.arm !== 'string') throw new Error('BN1: 알 수 없거나 중복된 골/팔');
+    const key = `${row.goalId}\u0000${row.arm}`;
+    if (!goals.has(row.goalId) || !BN1_ARMS.includes(row.arm) || observed.has(key)) throw new Error('BN1: 알 수 없거나 중복된 골/팔');
+    if (typeof row.evidence !== 'string' || !row.evidence.trim()) throw new Error('BN1: 관측 근거가 없음');
+    if (row.completed !== null && typeof row.completed !== 'boolean') throw new Error('BN1: 완주 값은 boolean 또는 null');
+    for (const value of [row.humanInterventions, row.durationMs, row.costUsd]) {
+      if (value === undefined || (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0))) throw new Error('BN1: 수치는 0 이상 또는 null');
+    }
+    if (row.humanInterventions !== null && !Number.isInteger(row.humanInterventions)) throw new Error('BN1: 사람 개입 수는 정수');
+    observed.set(key, row);
+  }
+  const comparedGoals = input.goals.map((goal) => {
+    const arms = BN1_ARMS.map((arm) => {
+      const row = observed.get(`${goal.id}\u0000${arm}`);
+      return { arm, completed: row?.completed ?? null, humanInterventions: row?.humanInterventions ?? null,
+        durationMs: row?.durationMs ?? null, costUsd: row?.costUsd ?? null, evidence: row?.evidence ?? null };
+    });
+    return { id: goal.id, text: goal.text, arms };
+  });
+  const fieldsComplete = comparedGoals.every((goal) => goal.arms.every((arm) =>
+    arm.completed !== null && arm.humanInterventions !== null && arm.durationMs !== null && arm.costUsd !== null && arm.evidence !== null));
+  return { runId, fieldsComplete, goals: comparedGoals };
+}
+
+export function renderBn1Comparison(rep: ReturnType<typeof buildBn1Comparison>): string {
+  const value = (v: number | boolean | null): string => v === null ? '못 잼' : typeof v === 'boolean' ? (v ? '완주' : '미완주') : String(v);
+  const cell = (text: string): string => text.replaceAll('|', '\\|').replaceAll('\n', '<br>');
+  return ['## BN1 · 같은 골 대조 (X1 격리 설치와 짝)', '',
+    `측정 칸 완비: ${rep.fieldsComplete ? '네 팔 관측값 기입 완료(출처와 조건 별도 검증 필요)' : '아니오 — 미관측 칸 존재'}`,
+    '', '| 골 | 공유 골 입력(미확정 가능) | 팔 | 끝까지 | 사람 개입 수 | 시간(ms) | 비용(USD) | 근거 |',
+    '|---|---|---|---|---|---|---|---|',
+    ...rep.goals.flatMap((goal) => goal.arms.map((row) => `| ${cell(goal.id)} | ${cell(goal.text)} | ${row.arm} | ${value(row.completed)} | ${value(row.humanInterventions)} | ${value(row.durationMs)} | ${value(row.costUsd)} | ${row.evidence === null ? '못 잼' : cell(row.evidence)} |`)),
+    '', 'X1 짝 실측(격리 설치·첫 실행, 개발 골 대조 아님): docs/measurements/X1-inner-pty-openclaw-hermes-install-2026-10-03.md',
+    '못 잼은 0이 아니라 미관측이다. 동일 골 네 팔의 근거가 모이기 전 비교 우열은 판정하지 않는다.'].join('\n');
+}
+
 export function renderBenchReport(rep: ReturnType<typeof buildBenchReport>): string {
   const k = (n: number): string => (n >= 10_000 ? `${Math.round(n / 1000)}k` : String(n));
   const lines = [
@@ -146,6 +210,21 @@ if (import.meta.main) {
   const arg = (name: string): string | undefined => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined; };
   const runId = arg('--run');
   if (!runId) { console.error('사용: bun scripts/bench-report.ts --run <runId> [--since 24h] [--json]'); process.exit(2); }
+  const bn1Path = arg('--bn1');
+  if (process.argv.includes('--bn1') && (!bn1Path || bn1Path.startsWith('--'))) {
+    console.error('BN1 입력 실패: --bn1 <관측.json> 경로 필요');
+    process.exit(2);
+  }
+  let bn1: ReturnType<typeof buildBn1Comparison> | undefined;
+  if (bn1Path) {
+    try { bn1 = buildBn1Comparison(JSON.parse(readFileSync(bn1Path, 'utf8')) as Bn1Input, runId); }
+    catch (error) { console.error(`BN1 입력 실패: ${error instanceof Error ? error.message : String(error)}`); process.exit(2); }
+  }
+  // BN1 external arms have no self-dev pod logs. Do not require legacy bench arms for their report.
+  if (bn1) {
+    console.log(process.argv.includes('--json') ? JSON.stringify(bn1) : renderBn1Comparison(bn1));
+    process.exit(0);
+  }
   const bin = join(dirname(import.meta.dir), 'bin', 'elanous.mjs');
   const rows: LogRow[] = [];
   for (const q of [['--category', 'self-dev.orchestrate'], ['--category', 'self-implement.pod'], ['--event', 'llm-usage']]) {

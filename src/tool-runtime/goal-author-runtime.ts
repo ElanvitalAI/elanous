@@ -1,3 +1,4 @@
+import '../autopilot/mission-codebase-gate.js';
 import { readFileSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import type { LLMToolSpec } from '../llm.js';

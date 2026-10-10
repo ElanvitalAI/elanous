@@ -73,6 +73,31 @@ test('channel-bot GET and authenticated POST reach HTTP handlers without leaking
   }
 });
 
+test('GET /v1/loops/resources is bearer-gated and read-only, preserving existing route responses', async () => {
+  let observations = 0;
+  const resource: import('../../loops/orchestrator/traffic.js').TrafficResult = { seats: [{ seat: 'MK', cap: 6, running: 2, borrowed: 1, lent: 0, launchCap: 4, idle: true,
+    baseShare: 3, idleFor: 40, nextCell: null }], unassigned: 0, idleMinutes: 30, now: new Date('2026-10-05T00:00:00Z') };
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false }, loopResources: () => { observations++; return resource; } });
+  try {
+    const endpoint = `${server.url}/v1/loops/resources`;
+    const outsider = { 'sec-fetch-site': 'cross-site' };
+    const denied = await fetch(endpoint, { headers: outsider });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual({ error: 'unauthorized' });
+    expect(observations).toBe(0);
+    const headers = { ...outsider, authorization: 'Bearer auth' };
+    const response = await fetch(endpoint, { headers });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ resource: { ...resource, now: resource.now.toISOString() } });
+    expect(observations).toBe(1);
+    const health = await fetch(`${server.url}/v1/health`);
+    expect(health.status).toBe(200);
+    expect((await health.json() as { ok: boolean }).ok).toBe(true);
+    expect(observations).toBe(1);
+  } finally { server.stop(); }
+});
+
 test('GET /v1/grid is bearer-gated, combines HQ and pool data without writes, and leaves existing routes intact', async () => {
   let hqReads = 0, poolReads = 0;
   const fixture = serverFixture();

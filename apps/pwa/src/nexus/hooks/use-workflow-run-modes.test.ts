@@ -42,9 +42,9 @@ test('run wire preserves legacy body, sends selected fields verbatim, returns mo
     bodies.push(JSON.parse(String(init?.body)));
     return new Response(JSON.stringify(missing
       ? { error: 'missing-upstream', nodes: ['a', 'b'] }
-      : { ok: true, runId: 'r', mode: 'test' }), { status: missing ? 400 : 200 });
+      : { ok: true, runId: 'r', mode: 'full' }), { status: missing ? 400 : 200 });
   }) as typeof fetch });
-  expect((await client.runWorkflow('wf', 'hello')).mode).toBe('test');
+  expect((await client.runWorkflow('wf', 'hello')).mode).toBe('full');
   await client.runWorkflow('wf', 'hello', { dryRun: true, onlyNode: 'n', fromRunId: 'old' });
   await client.runWorkflow('wf', '', { fromNode: 'n', fromRunId: 'old' });
   expect(bodies).toEqual([

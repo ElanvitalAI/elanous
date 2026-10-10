@@ -36,6 +36,7 @@ import { parseTelegramEndpoint, isOwnInstanceEndpoint, matchesBot } from '../../
 import { createTelegramStreamSink } from '../../session/streaming/telegram-stream-sink.js';
 import { splitMarkdownForTelegram } from '../../telegram-format.js';
 import { formatTablesAndRules } from '../../discord-markdown.js';
+import { receiveChannelEvent } from '../outbound/router.js';
 
 export interface NexusTelegramTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
@@ -117,11 +118,13 @@ export function createTelegramTriggerLogger(
  *  comment) so the wire is a near-identity with `raw` carrying the
  *  full payload (messageId · isDm) for debugging. */
 export function toTelegramEvent(tap: TgTriggerEvent): TelegramEvent {
+  const envelope = receiveChannelEvent('telegram', tap);
+  if (!envelope || envelope instanceof Promise) throw new Error('telegram connector cannot normalize accepted tap');
   return {
     kind: tap.kind,
-    chat: tap.chat,
-    user: tap.user,
-    body: tap.body,
+    chat: envelope.channel ?? tap.chat,
+    user: envelope.senderId ?? tap.user,
+    body: envelope.text,
     ...(tap.command !== undefined ? { command: tap.command } : {}),
     raw: tap,
   };

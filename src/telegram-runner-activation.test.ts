@@ -25,7 +25,7 @@ describe('installTelegramService', () => {
     const files = { ...initial }; const ran: string[] = [];
     return { files, ran, deps: {
       exists: (p: string) => p in files, readFile: (p: string) => files[p]!, writeFile: (p: string, t: string) => { files[p] = t; },
-      mkdir: () => {}, rename: (a: string, b: string) => { files[b] = files[a]!; delete files[a]; },
+      mkdir: () => {}, chmod: () => {}, rename: (a: string, b: string) => { files[b] = files[a]!; delete files[a]; },
       run: (c: string, a: string[]) => { ran.push(`${c} ${a.join(' ')}`); return { status: 0, stderr: '' }; },
     } };
   };

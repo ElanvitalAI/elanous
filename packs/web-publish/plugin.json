@@ -1,0 +1,42 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "web-publish",
+  "version": "0.1.0",
+  "description": "Plan, build, check and publish a business website grounded in the business itself: claim-graded copy, a page map, a per-project DESIGN.md, a working hero slice, role-assigned media, a media metadata audit, a motion plan by kind, mobile QA with evidence grades, and a publish step with a local-folder default. Two human approvals (plan, release); seven wait points also pause the run until you or your agent produce that stage's output and approve to re-check it. Includes the business-motion-websites skill by passeth (MIT).",
+  "license": "MIT",
+  "attribution": "Includes business-motion-websites © 2026 passeth (MIT) — https://github.com/passeth/business-motion-websites @fe5e8b0ae3a208efba751d3dd13aa168afd4fa74 — used with the author's permission (2026-10-09). See SOURCE.md.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/web-publish.yaml"
+      ],
+      "nodes": [
+        "./nodes/web-publish.yaml"
+      ],
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:node",
+        "proc:ffprobe"
+      ],
+      "connectors": [],
+      "requires": {
+        "tools": [
+          "bun",
+          "node"
+        ],
+        "optionalTools": [
+          "ffprobe",
+          "ffmpeg",
+          "higgsfield",
+          "hyperframes"
+        ]
+      },
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

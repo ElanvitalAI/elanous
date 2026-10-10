@@ -57,3 +57,26 @@ describe('cross-run applied review context', () => {
     expect(intent).toContain('변경 파일: test/review-context-carry.test.ts');
   });
 });
+
+describe('shard review contract through the real reviewDiff seam', () => {
+  it('defaultSeams.reviewDiff hands the shard contract to the reviewer prompt (phaseIntent → reviewPullRequest)', async () => {
+    const { defaultSeams } = await import('../src/self-implement/seams.js');
+    const identity = { orchestrationId: 'carry', shardId: 'task:handler', totalShards: 4, position: 1,
+      summary: 'Implement handler', siblings: [
+        { shardId: 'task:route', summary: 'Register route' },
+        { shardId: 'task:screen', summary: 'Build screen' },
+        { shardId: 'task:docs', summary: 'Write docs' },
+      ] };
+    const goal = ['대상 경로: src/handler.ts', '보존 계약: 원장 형식은 지금과 같다', '',
+      '## Shard identity', JSON.stringify(identity)].join('\n');
+    const prompts: string[] = [];
+    const seams = defaultSeams({
+      llmReview: async (prompt: string) => { prompts.push(prompt); return 'VERDICT: PASS'; },
+      reviewScopeDiff: async () => 'diff --git a/src/handler.ts b/src/handler.ts\n--- a/src/handler.ts\n+++ b/src/handler.ts\n@@ -1 +1 @@\n-a\n+b\n',
+    });
+    await seams.reviewDiff!('/nonexistent-review-carry', { goal, changedFiles: ['src/handler.ts'] });
+    expect(prompts).toHaveLength(1);
+    for (const text of ['샤드 계약 — 리뷰 범위', '- task:route: Register route', '- task:screen: Build screen',
+      '- task:docs: Write docs', 'out-of-scope → 담당 형제 조각 <id>', '반증 확인 한 줄']) expect(prompts[0]).toContain(text);
+  });
+});

@@ -15,11 +15,13 @@ import { debug } from '../debug/log.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { cardPrNumber, taskAgentStatePath, updateTaskCard, readTaskCard, type TaskCard } from './task-hand.js';
-import { judgeNextMove } from './judge.js';
+import { judgeNextMove, type TaskJudgeInput } from './judge.js';
+import { remoteParentAlive, type SshRunner } from './parent-host.js';
 
 const GOAL_ID = /^[a-f0-9]{16}$/;
 const PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)$/;
 const RUN_ID = /^run-[A-Za-z0-9_-]{4,64}$/;
+const LATE_LAUNCH_FAILURE = 'failed/needs-relaunch — card-run-bound 뒤 10분 동안 Pod 발사 근거 없음';
 
 /** 카드 런 하나의 원장 사진 — host = 카드 런 원장(없으면 null) · children = `pod-child-run` 자식 원장 · podFinishes = 호스트 logs. */
 export interface CardRunSnapshot {
@@ -131,6 +133,7 @@ export interface CardRunEvidenceDeps {
   launchBound?: (runId: string) => boolean;
   dispatchPod?: (runId: string, sinceIso: string) => boolean;
   runExit?: (runId: string) => RunExit | undefined;
+  ssh?: SshRunner;
 }
 
 async function defaultLoadLedger(): Promise<(runId: string) => RunLedgerEntry[] | null> {
@@ -212,19 +215,53 @@ export async function readCardRunSnapshot(card: Pick<TaskCard, 'runId' | 'create
  * 찾지 못했으면 쓰지 않는다. 쓴(또는 그대로인) 카드를 돌려준다.
  */
 export async function refreshCardRunBinding(cardId: string, statePath = taskAgentStatePath(), deps: CardRunEvidenceDeps = {}): Promise<{ card: TaskCard | undefined; evidence?: CardRunEvidence }> {
-  const card = readTaskCard(cardId, statePath);
-  // 수동 근거(refSource manual)는 덮지 않는다 · 둘 다 차 있으면 다시 읽지 않는다(한 번만).
-  if (!card?.runId || card.refSource === 'manual' || (card.pr !== undefined && card.goalId !== undefined)) return { card };
+  let card = readTaskCard(cardId, statePath);
+  // 수동 근거(refSource manual)는 덮지 않는다 · 둘 다 차 있으면 다시 읽지 않는다(한 번만) —
+  // 단 «10분 발사 근거 없음»으로 failed 된 카드는 PR·골이 먼저 묶였어도 되살림 판정을 계속 받는다.
+  const awaitingRevival = card?.status === 'failed' && [...card.history].reverse().find((item) => item.event === 'failed')?.detail === LATE_LAUNCH_FAILURE;
+  if (!card?.runId || card.refSource === 'manual' || (card.pr !== undefined && card.goalId !== undefined && !awaitingRevival)) return { card };
+  const runId = card.runId;
   const snapshot = await readCardRunSnapshot(card, deps);
   if (snapshot.readErrors?.length) {
     try { debug.log('task-agent', 'card-bind-failed', { card: cardId, runId: card.runId, errors: snapshot.readErrors }); } catch { /* fail-soft */ }
   }
   const evidence = bindCardEvidence(card, snapshot);
-  if (card.status === 'launched' && !card.pr && !evidence.pr && !snapshot.readErrors?.length) {
+  let revived = false;
+  const lastFailure = [...card.history].reverse().find((item) => item.event === 'failed');
+  if (card.status === 'failed' && lastFailure?.event === 'failed' && lastFailure.detail === LATE_LAUNCH_FAILURE
+    && lastFailure.runId === runId && !snapshot.readErrors?.length) {
+    const afterFailure = (entry: RunLedgerEntry) => entry.runId === runId && Date.parse(entry.timestamp ?? '') > Date.parse(lastFailure.at);
+    const lateChild = (snapshot.host ?? []).some((entry) => entry.event === 'pod-child-run' && afterFailure(entry));
+    const prRows = [...(snapshot.host ?? []), ...Object.values(snapshot.children).flatMap((entries) => entries ?? [])]
+      .filter((entry) => entry.event === 'pr-opened' && entry.data?.number === evidence.pr?.number && (entry.runId === runId || entry.runId === evidence.childRunId));
+    // PR 근거는 원장 `pr-opened`(실패 뒤 시각) 또는 호스트 logs 의 `job-finished`(podFinishes · 시각 없음) — 후자는
+    // `pod-child-run` 자식에게만 붙고, failed 판정은 그 자식이 «없을 때»만 났으므로 지금 보이면 그 자체로 늦은 근거다.
+    const prFromJobFinished = !!evidence.pr && !!evidence.childRunId && prRows.length === 0
+      && (snapshot.podFinishes ?? []).some((row) => row.childRunId === evidence.childRunId && row.prUrl === evidence.pr?.url);
+    const latePr = !!evidence.pr && (prFromJobFinished || prRows.some((entry) => Date.parse(entry.timestamp ?? '') > Date.parse(lastFailure.at)));
+    let lateDispatch = false;
+    try { lateDispatch = (deps.dispatchPod ?? defaultDispatchPod)(runId, new Date(Date.parse(lastFailure.at) + 1).toISOString()); } catch { /* 읽기 실패는 근거가 아니다 */ }
+    if (lateChild || latePr || lateDispatch) {
+      const at = (deps.now ?? (() => new Date()))().toISOString();
+      const next = updateTaskCard(statePath, cardId, (current) => {
+        const failed = [...(current?.history ?? [])].reverse().find((item) => item.event === 'failed');
+        return current?.status === 'failed' && current.runId === runId && current.refSource !== 'manual'
+          && failed?.event === 'failed' && failed.detail === LATE_LAUNCH_FAILURE && failed.runId === runId && failed.at === lastFailure.at
+          ? { ...current, status: 'launched', history: [...current.history, { at, event: 'revived', detail: 'late launch evidence', runId }] } : undefined;
+      });
+      revived = next?.status === 'launched' && next.history.at(-1)?.event === 'revived' && next.history.at(-1)?.at === at;
+      if (revived) {
+        try { debug.log('task-agent', 'card-revived', { card: cardId, runId }); } catch { /* fail-soft */ }
+      }
+      card = next ?? card;
+    }
+  }
+  if (!card) return { card, evidence };
+  if (!revived && card.status === 'launched' && !card.pr && !evidence.pr && !snapshot.readErrors?.length) {
     const rows = [...(snapshot.host ?? []), ...Object.values(snapshot.children).flatMap((entries) => entries ?? [])];
     let exit: RunExit | undefined;
     let exitReadFailed = false;
-    try { exit = (deps.runExit ?? ((id) => readRunExits(effectiveInstanceRoot()).find((row) => row.runId === id)))(card.runId); }
+    try { exit = (deps.runExit ?? ((id) => readRunExits(effectiveInstanceRoot()).find((row) => row.runId === id)))(runId); }
     catch { exitReadFailed = true; }
     const finished = [...(snapshot.podFinishes ?? [])].reverse().find((item) => item.state === 'failed');
     const parentTerminal = [...(snapshot.host ?? [])].reverse().find((item) => item.event === 'run-status');
@@ -234,13 +271,21 @@ export async function refreshCardRunBinding(cardId: string, statePath = taskAgen
     const launched = rows.some((entry) => entry.event === 'pod-child-run');
     let dispatched = false;
     let dispatchReadFailed = false;
-    try { dispatched = (deps.dispatchPod ?? defaultDispatchPod)(card.runId, boundAt ?? card.createdAt); }
+    try { dispatched = (deps.dispatchPod ?? defaultDispatchPod)(runId, boundAt ?? card.createdAt); }
     catch { dispatchReadFailed = true; }
     let launchBound = false;
     let launchReadFailed = false;
-    try { launchBound = (deps.launchBound ?? ((id) => !!readLaunchBinding(id)))(card.runId); }
+    try { launchBound = (deps.launchBound ?? ((id) => !!readLaunchBinding(id)))(runId); }
     catch { launchReadFailed = true; }
-    const timedOut = !finished && !launched && !dispatched && !dispatchReadFailed && !exit && !exitReadFailed && !launchBound && !launchReadFailed && Number.isFinite(elapsed) && elapsed >= 600_000;
+    const missingLaunchTimedOut = !finished && !launched && !dispatched && !dispatchReadFailed && !exit && !exitReadFailed && !launchBound && !launchReadFailed && Number.isFinite(elapsed) && elapsed >= 600_000;
+    let remoteState: ReturnType<typeof remoteParentAlive> | undefined;
+    if (missingLaunchTimedOut && card.parentHost) {
+      remoteState = remoteParentAlive({ ...card.parentHost, runId }, deps.ssh);
+      if (remoteState !== 'dead') {
+        try { debug.log('task-agent', 'card-remote-parent-alive', { card: cardId, runId: card.runId, host: card.parentHost.host, pid: card.parentHost.pid, state: remoteState }); } catch { /* fail-soft */ }
+      }
+    }
+    const timedOut = missingLaunchTimedOut && (!card.parentHost || remoteState === 'dead');
     const hasPr = !!card.pr || !!evidence.pr;
     const exitHarvestBranch = exit?.lastLines?.some((line) => /(?:수확할 브랜치: |ELANOUS_POD_SALVAGE )(?:salvage\/|self-impl\/)[^\s]+/.test(line)) ?? false;
     const ledgerFailure = rows.find((entry) => entry.event === 'run-status' && entry.data?.runStatus === 'failed'
@@ -251,14 +296,15 @@ export async function refreshCardRunBinding(cardId: string, statePath = taskAgen
     const deadExit = (exit?.reason === STOP_CLASS_POD_FAILURE || exit?.reason === 'unknown') && exit.status !== null && exit.status !== 0;
     const podFailure = !noLaunchExit && (launched || dispatched) && (parentFailed && (finished || !!ledgerFailure || !!resultFailure) || deadExit)
       && (finished || ledgerFailure || resultFailure || deadExit);
-    const failure = podFailure ? judgeNextMove({ terminalRun: {
+    const terminalRun: TaskJudgeInput['terminalRun'] = podFailure ? {
       kind: STOP_CLASS_POD_FAILURE,
       reason: finished?.childError || (exit?.status != null ? `exit ${exit.status} · ${exit.reason || STOP_CLASS_POD_FAILURE}` : resultFailure ? 'result-without-error · failed' : finished ? `job-finished failed · ${STOP_CLASS_POD_FAILURE}` : `run-status failed · ${STOP_CLASS_POD_FAILURE}`),
       hasPr,
       hasHarvestBranch: exitHarvestBranch || rows.some((entry) => typeof entry.data?.harvestBranch === 'string' && !!entry.data.harvestBranch) || !!salvageBranchOf(rows),
-    } }) : noLaunchExit ? judgeNextMove({ terminalRun: { kind: STOP_CLASS_NO_LAUNCH, reason: `exit ${exit!.status} · ${exit!.reason}`, hasPr, hasHarvestBranch: false } })
-      : timedOut ? judgeNextMove({ terminalRun: { kind: STOP_CLASS_NO_LAUNCH, reason: 'card-run-bound 뒤 10분 동안 Pod 발사 근거 없음', hasPr: false, hasHarvestBranch: false } }) : undefined;
-    if (failure?.reason.startsWith('failed/')) {
+    } : noLaunchExit ? { kind: STOP_CLASS_NO_LAUNCH, reason: `exit ${exit!.status} · ${exit!.reason}`, hasPr, hasHarvestBranch: false }
+      : timedOut ? { kind: STOP_CLASS_NO_LAUNCH, reason: 'card-run-bound 뒤 10분 동안 Pod 발사 근거 없음', hasPr: false, hasHarvestBranch: false } : undefined;
+    const failure = judgeNextMove({ terminalRun });
+    if (terminalRun && failure.reason.startsWith('failed/')) {
       const at = (deps.now ?? (() => new Date()))().toISOString();
       const next = updateTaskCard(statePath, cardId, (current) => current?.status === 'launched' && current.runId === card.runId && !current.pr && current.refSource !== 'manual' ? {
         ...current, status: 'failed', history: [...current.history, { at, event: 'failed', detail: failure.reason, runId: card.runId }],

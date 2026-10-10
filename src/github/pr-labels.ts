@@ -32,6 +32,7 @@ export const PR_LABELS = [
   { name: 'elanous:release-hold', axis: 'addon', color: 'D4C5F9', description: 'Exclude from release notes until verified in production', appliedBy: ['launcher', 'session', 'human'], sweep: { action: 'none' } },
   { name: 'elanous:idea-stale', axis: 'addon', color: 'FBCA04', description: 'Approval pending beyond the notification threshold', appliedBy: ['sweeper'], sweep: { action: 'notify', afterDays: IDEA_STALE_DAYS } },
   { name: 'elanous:needs-rebase', axis: 'addon', color: 'E99695', description: 'Approval blocked by conflicts or failing checks', appliedBy: ['sweeper'], sweep: { action: 'block-approval' } },
+  { name: 'elanous:harvestable', axis: 'addon', color: 'FBCA04', description: 'Pod terminal marked this PR for harvest', appliedBy: ['harness'], sweep: { action: 'close', afterHours: STALLED_DRAFT_HOURS } },
   { name: 'elanous:from-harness', axis: 'origin', color: 'C5DEF5', description: 'Launched from a harness goal', appliedBy: ['harness'], sweep: { action: 'none' } },
   { name: 'elanous:from-intake', axis: 'origin', color: 'C5DEF5', description: 'Launched from an absorbed idea', appliedBy: ['launcher'], sweep: { action: 'none' } },
   { name: 'elanous:from-linear', axis: 'origin', color: 'C5DEF5', description: 'Launched from a Linear task', appliedBy: ['launcher'], sweep: { action: 'none' } },

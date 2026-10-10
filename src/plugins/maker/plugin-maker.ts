@@ -10,6 +10,7 @@ import { dispatchOmniSearch } from '../../skills/tools/omni-search.js';
 import { runGraph } from '../../graph-runner/runner.js';
 import { parseGraphTemplateYaml } from '../../self-implement/graph-yaml.js';
 import { installPlugin } from '../install/plugin-install.js';
+import { inspectPluginSecurity } from '../core/capability-policy.js';
 import { generateWizardFiles, type WizardResearchDraft } from './wizard-generate.js';
 import { bundleInstalledWizardPlugin, type MarketBundleResult } from './market-bundle.js';
 
@@ -127,7 +128,7 @@ export async function validatePluginDir(dir: string): Promise<string[]> {
     if (lstatSync(file).isSymbolicLink()) errors.push('안전하지 않은 plugin.json 링크');
     else manifest = JSON.parse(readFileSync(file, 'utf8'));
   }
-  catch (error) { errors.push(`plugin.json 파싱 실패: ${String(error)}`); }
+  catch { errors.push('plugin.json 파싱 실패'); }
   const extension = isRecord(manifest) && isRecord(manifest.extensions) ? manifest.extensions['ai.elanous'] : undefined;
   const graphs = isRecord(extension) ? extension.graphs : undefined;
   if (isRecord(extension) && extension.contributes !== undefined) errors.push('extension contributes 덮어쓰기 금지');
@@ -143,69 +144,73 @@ export async function validatePluginDir(dir: string): Promise<string[]> {
     if (lstatSync(file).isSymbolicLink()) errors.push('안전하지 않은 recipes.yaml 링크');
     else recipes = parseYaml(readFileSync(file, 'utf8'));
   }
-  catch (error) { errors.push(`recipes.yaml 파싱 실패: ${String(error)}`); }
+  catch { errors.push('recipes.yaml 파싱 실패'); }
   if (!isRecord(recipes)) errors.push('recipes.yaml 은 맵이어야 한다');
   else for (const [id, recipe] of Object.entries(recipes)) {
     if (!isRecord(recipe) ||
       (!(typeof recipe.command === 'string' && recipe.command.trim()) && !(typeof recipe.approval === 'string' && recipe.approval.trim())) ||
       (recipe.command !== undefined && (typeof recipe.command !== 'string' || !recipe.command.trim())) ||
       (recipe.approval !== undefined && (typeof recipe.approval !== 'string' || !recipe.approval.trim())) ||
-      (recipe.timeout_ms !== undefined && (!Number.isSafeInteger(recipe.timeout_ms) || Number(recipe.timeout_ms) <= 0))) errors.push(`잘못된 recipe: ${id}`);
+      (recipe.timeout_ms !== undefined && (!Number.isSafeInteger(recipe.timeout_ms) || Number(recipe.timeout_ms) <= 0))) errors.push(`잘못된 recipe: ${/^[a-zA-Z0-9_-]+$/.test(id) ? id : 'invalid'}`);
   }
   for (const graph of Array.isArray(graphs) ? graphs : []) {
     if (typeof graph !== 'string') continue;
     const file = inside(dir, graph);
-    if (!file || !/^\.\/graphs\/[a-zA-Z0-9_-]+\.ya?ml$/.test(graph)) { errors.push(`안전하지 않은 graph 경로: ${graph}`); continue; }
+    if (!file || !/^\.\/graphs\/[a-zA-Z0-9_-]+\.ya?ml$/.test(graph)) { errors.push('안전하지 않은 graph 경로'); continue; }
     try {
-      if (lstatSync(file).isSymbolicLink()) { errors.push(`안전하지 않은 graph 링크: ${graph}`); continue; }
+      if (lstatSync(file).isSymbolicLink()) { errors.push('안전하지 않은 graph 링크'); continue; }
       const parsed = parseGraphTemplateYaml(readFileSync(file, 'utf8'), file);
-      errors.push(...parsed.errors.map(issue => `${issue.path}: ${issue.message}`));
+      errors.push(...parsed.errors.map(() => 'graph 정의 오류'));
       const template = parsed.template;
       if (!template) continue;
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(template.graphId)) errors.push(`잘못된 graph_id: ${template.graphId}`);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(template.graphId)) errors.push('잘못된 graph_id');
       if (template.terminalNodes.length !== 2 || !template.terminalNodes.includes('done') || !template.terminalNodes.includes('failed')) errors.push('terminal_nodes 는 done, failed 이어야 한다');
       const executionNodes = template.nodes.filter(node => !template.terminalNodes.includes(node.nodeId));
       if (executionNodes.length < 2) errors.push(`실행 노드는 2개 이상이어야 한다: ${executionNodes.length}개`);
       for (const node of template.nodes) {
         if (node.recipe.startsWith('cmd:')) {
           const id = node.recipe.slice(4);
-          if (!isRecord(recipes) || !isRecord(recipes[id]) || recipes[id].approval !== undefined || typeof recipes[id].command !== 'string' || !recipes[id].command.trim()) errors.push(`recipe ${id} 없음`);
+          if (!isRecord(recipes) || !isRecord(recipes[id]) || recipes[id].approval !== undefined || typeof recipes[id].command !== 'string' || !recipes[id].command.trim()) errors.push(`recipe ${/^[a-zA-Z0-9_-]+$/.test(id) ? id : 'invalid'} 없음`);
         } else if (node.recipe.startsWith('approval:')) {
           const id = node.recipe.slice(9);
-          if (!isRecord(recipes) || !isRecord(recipes[id]) || typeof recipes[id].approval !== 'string' || !recipes[id].approval.trim()) errors.push(`approval recipe ${id} 없음`);
-        } else if (node.recipe !== 'none') errors.push(`지원하지 않는 recipe: ${node.recipe}`);
+          if (!isRecord(recipes) || !isRecord(recipes[id]) || typeof recipes[id].approval !== 'string' || !recipes[id].approval.trim()) errors.push(`approval recipe ${/^[a-zA-Z0-9_-]+$/.test(id) ? id : 'invalid'} 없음`);
+        } else if (node.recipe !== 'none') errors.push(`지원하지 않는 recipe: ${/^[a-zA-Z0-9_:-]+$/.test(node.recipe) ? node.recipe : 'invalid'}`);
       }
-    } catch (error) { errors.push(`${graph} 파싱 실패: ${String(error)}`); }
+    } catch { errors.push('graph 파싱 실패'); }
   }
   const visit = (path: string): void => {
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const file = join(path, entry.name);
-      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) { errors.push(`안전하지 않은 파일: ${file}`); continue; }
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) { errors.push('안전하지 않은 파일'); continue; }
       if (entry.isDirectory()) visit(file);
       else if (/\.[cm]?[jt]sx?$/.test(entry.name)) {
         const source = readFileSync(file, 'utf8');
         for (const match of source.matchAll(/\b(?:import|export)\s*(?:[\s\S]*?\s+from\s*)?["']([^"']+)["']|\b(?:import|require)\s*\(\s*["']([^"']+)["']/g)) {
           const target = match[1] ?? match[2]!;
-          if (/(?:^|\/)src\//.test(target) && (target.startsWith('/') || target.startsWith('.'))) errors.push(`src import 금지: ${file}: ${target}`);
+          if (/(?:^|\/)src\//.test(target) && (target.startsWith('/') || target.startsWith('.'))) errors.push('src import 금지');
         }
       }
     }
   };
-  try { visit(dir); } catch (error) { errors.push(`파일 검사 실패: ${String(error)}`); }
+  try { visit(dir); } catch { errors.push('파일 검사 실패'); }
   try {
     const example = join(dir, 'examples', 'input.json');
     if (lstatSync(example).isSymbolicLink()) errors.push('안전하지 않은 examples/input.json 링크');
     else JSON.parse(readFileSync(example, 'utf8'));
-  } catch (error) { errors.push(`examples/input.json 파싱 실패: ${String(error)}`); }
+  } catch { errors.push('examples/input.json 파싱 실패'); }
+  let security: ReturnType<typeof inspectPluginSecurity>;
+  try { security = inspectPluginSecurity(dir); }
+  catch { errors.push('보안 검사 실패'); return errors; }
+  if (security.scan === 'dangerous') errors.push(...security.findings.filter(f => f.level === 'dangerous').map(f => `보안 검사 차단: ${f.code}`));
   const step = join(dir, 'graphs', 'run-step.ts');
   try {
     if (!existsSync(step)) errors.push('run-step.ts 없음');
-    else if (errors.some(error => error.startsWith('안전하지 않은 파일:'))) return errors;
+    else if (errors.some(error => error.startsWith('안전하지 않은 파일'))) return errors;
     else {
       const build = await Bun.build({ entrypoints: [step], target: 'bun' });
-      if (!build.success) errors.push(...build.logs.map(log => `run-step.ts 문법 오류: ${log.message}`));
+      if (!build.success) errors.push('run-step.ts 문법 오류');
     }
-  } catch (error) { errors.push(`run-step.ts 문법 오류: ${String(error)}`); }
+  } catch { errors.push('run-step.ts 문법 오류'); }
   return errors;
 }
 
@@ -359,7 +364,7 @@ export async function makePlugin({ request, draftFile, name, parentDir, run, mar
   const step = async (stage: keyof MakePluginResult['timings'], action: () => void | Promise<void>): Promise<void> => {
     const start = performance.now();
     try { await action(); }
-    finally { const ms = Math.round(performance.now() - start); timings[stage] = ms; debug.log('plugin.maker', stage, { ms, errors: result.errors }); }
+    finally { const ms = Math.round(performance.now() - start); timings[stage] = ms; debug.log('plugin.maker', stage, { ms, errors: redactSecrets(result.errors) }); }
   };
   try {
     emit('request', request);
@@ -461,7 +466,7 @@ export async function makePlugin({ request, draftFile, name, parentDir, run, mar
     }
   } catch (error) {
     result.status = 'failed';
-    result.errors.push(error instanceof Error ? error.message : String(error));
+    result.errors.push(redactSecretText(error instanceof Error ? error.message : String(error)));
   } finally {
     emit('done', result.status, { errors: result.errors });
   }

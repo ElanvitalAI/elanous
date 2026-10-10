@@ -76,6 +76,14 @@ These apply to both `harness say` and `harness ask`:
 | `--child-llm-effort <level>` | Reasoning effort for that model (`minimal` … `max`); refused if the model does not support it |
 | `--json` | Structured output |
 
+For scripts using the self-development CLI, `elanous dev --say "<sentence>" --json`
+writes one JSON line to stdout if the launch is stopped by the preflight check:
+`{"kind":"self","ok":false,"stage":"preflight-blocked","blockers":[...]}`.
+The CLI exits with code 1 in that case; `blockers` contains the preflight
+blockers. Without `--json`, that stop still exits with code 1 but does not
+print the JSON line. This describes the preflight-blocked result, not a
+promise of JSON output for other outcomes.
+
 `harness plan` also takes `--role-llm <role>=<provider>[/<tier>]` (repeatable) to choose a model per role — for example `implement=grok/best` or `review=anthropic`.
 
 ## Watching and cleaning up

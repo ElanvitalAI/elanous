@@ -1,10 +1,13 @@
 # What is Elanous
 
-**Give it a goal — it plans, builds, verifies and merges on its own. It watches itself, understands what it sees, and heals itself.**
+**Elanous is the conductor that coordinates many AI agents and brings back only finished results.**
+It works with Codex and Claude — and gives them wings.
 
-- **Observe** — it sees its own actions through logs, screens and memory.
-- **Understand** — it judges context on top of what it sees.
-- **Heal** — it fixes itself, and asks a person when it cannot.
+- **A team of AI on duty** — [loop agents](loop-agents.md) take the work that repeats (every morning, every new request) and keep at it until it is done.
+- **Work manuals it can follow and reshape** — every job runs as a [graph](graph-engineering.md): steps you can see, edit and share.
+- **One sentence to start** — say what you want; elanous turns it into a plan, a graph or a [plugin](build-a-plugin.md).
+
+Underneath, it watches itself, understands what it sees, and heals itself — and asks a person only when it cannot.
 
 In practice, `elanous` takes a change described in one sentence, writes a goal document, implements it in an isolated git worktree, gates it with tests, reviews it unattended and merges it. You are called only when the system cannot converge.
 

@@ -12,7 +12,7 @@ import { launchAndVerifyGoalDeliverable } from '../harness/deliverable-verify-cl
 import type { DeployVerifyResult } from '../harness/browser-verify.js';
 import { buildSelfOrchestrateDevSpec, executeOrchestrateReroute } from './dev-pipeline.js';
 import type { DevPipelineDeps, OrchestrateRuntime } from './dev-pipeline.js';
-import { resolveOrchestrateConcurrency } from './orchestrate.js';
+import { resolveOrchestrateConcurrency, resumeKey } from './orchestrate.js';
 import type { FailureClassification, SelfDevGoal, SelfDevJobResult } from './orchestrate.js';
 import { superviseRun, type SupervisorDecision } from './run-supervisor.js';
 import { readDecomposeProposals, applyDecomposeProposals } from './decompose-proposal.js';
@@ -432,6 +432,7 @@ export async function runSelfOrchestrateCliCommand(
         // ⭐ 방금 끝난 결과를 넘긴다 — orchestrateSelfDev 가 classifyResumeDisposition 으로
         //   skip/rerun 을 갈라준다(재발명 0 · 착지한 조각은 다시 안 돈다).
         rerun: async (previous) => {
+          let addedRepairIds: string[] = [];
           if (currentDecision?.action === 'add-repair-task') {
             const appended = appendRepairFragments(currentGoals, currentDecision.classifications, {
               seenFingerprints: repairFingerprints,
@@ -441,6 +442,7 @@ export async function runSelfOrchestrateCliCommand(
             repairFragmentsAdded += appended.added.length;
             for (const outcome of appended.added) repairFingerprints.set(outcome.fingerprint, (repairFingerprints.get(outcome.fingerprint) ?? 0) + 1);
             repairAppend.push({ added: appended.added, skipped: appended.skipped });
+            addedRepairIds = appended.added.map((item) => `repair:${item.fingerprint}`);
             spec = buildSelfOrchestrateDevSpec(currentGoals, input.concurrency);
             if (appended.added.length === 0) {
               currentDecision.why = `${currentDecision.why} — 수리 조각 추가 없음 (${appended.skipped.length}건 건너뜀)`;
@@ -460,6 +462,7 @@ export async function runSelfOrchestrateCliCommand(
           //   판정(decompose-and-retry)은 트리아지가 이미 했다. 여기는 그 답을 집행만 한다.
           //   ⛔ 의존성은 조각이 «들고 온 그대로» 물려준다 ⇒ dependsOn 이 없는 조각은
           //     orchestrateSelfDev 의 위상 병렬로 «자동으로 동시에» 돈다(대표 2026-08-19 기본 동작).
+          const goalsBeforeDecompose = new Set(currentGoals);
           const applied = applyDecomposeProposals(currentGoals, previous, { alreadyDecomposed: decomposedFeatures });
           if (applied.decomposed.length > 0) {
             for (const f of applied.decomposed) decomposedFeatures.add(f);
@@ -485,7 +488,59 @@ export async function runSelfOrchestrateCliCommand(
           // ⛔⭐ 판정이 「사람이 볼 것」이라 한 조각은 집행이 다시 돌리지 않는다 — 판정과 집행이 갈리면
           //   `pr-opened` 조각이 duplicate-risk 로 재실행돼 PR 이 겹친다(2026-09-25 실측).
           const resumeHold = currentDecision?.needsHuman ?? [];
-          const next = await exec(spec, { ...baseRuntime, resumeFrom: [...previous], ...(resumeHold.length > 0 ? { resumeHold } : {}) }, pipelineDeps);
+          // The engine's resume lookup is last-result-wins for each normalized feature.
+          // Use that exact predecessor, not any earlier task sharing the same feature.
+          const selectedPrior = new Map(previous.map((result) => [resumeKey(result.feature), result.taskId]));
+          const strategyByPriorId = new Map<string, 'rerun' | 'rework' | 'decompose-and-retry'>();
+          for (const id of currentDecision?.rerunnable ?? []) strategyByPriorId.set(id, 'rerun');
+          for (const id of currentDecision?.reworkable ?? []) strategyByPriorId.set(id, 'rework');
+          for (const id of currentDecision?.decomposable ?? []) strategyByPriorId.set(id, 'decompose-and-retry');
+          const strategyByGoal = new Map<SelfDevGoal, string>();
+          for (const goal of currentGoals) {
+            const predecessor = selectedPrior.get(resumeKey(goal.feature));
+            if (predecessor && strategyByPriorId.has(predecessor)) strategyByGoal.set(goal, strategyByPriorId.get(predecessor)!);
+            if (goal.id && addedRepairIds.includes(goal.id)) strategyByGoal.set(goal, 'add-repair-task');
+          }
+          // Pieces have fresh goal objects; the selected source must actually have been decomposed.
+          for (const id of currentDecision?.decomposable ?? []) {
+            const source = previous.find((result) => result.taskId === id);
+            if (!source || selectedPrior.get(resumeKey(source.feature)) !== id || !applied.decomposed.includes(source.feature)) continue;
+            for (const piece of source.decomposeProposal?.pieces ?? []) {
+              const goal = currentGoals.find((candidate) => !goalsBeforeDecompose.has(candidate) && candidate.id === piece.id && candidate.feature === piece.feature);
+              if (goal) strategyByGoal.set(goal, 'decompose-and-retry');
+            }
+          }
+          const requested = new Map<string, number>();
+          for (const strategy of strategyByGoal.values()) requested.set(strategy, (requested.get(strategy) ?? 0) + 1);
+          const launchedByStrategy = new Map<string, string[]>();
+          const next = await exec(spec, {
+            ...baseRuntime, resumeFrom: [...previous], ...(resumeHold.length > 0 ? { resumeHold } : {}),
+            onTaskLaunched: (goal, taskId, priorTaskId) => {
+              baseRuntime.onTaskLaunched?.(goal, taskId, priorTaskId);
+              const strategy = strategyByGoal.get(goal);
+              if (!strategy) return;
+              if (strategy === 'add-repair-task' && !addedRepairIds.includes(goal.id ?? '')) return;
+              if (strategy === 'decompose-and-retry' && goalsBeforeDecompose.has(goal)
+                && (priorTaskId === undefined || priorTaskId !== selectedPrior.get(resumeKey(goal.feature)))) return;
+              if (strategy !== 'add-repair-task' && strategy !== 'decompose-and-retry'
+                && (priorTaskId === undefined || priorTaskId !== selectedPrior.get(resumeKey(goal.feature)))) return;
+              const launched = launchedByStrategy.get(strategy) ?? [];
+              launched.push(taskId);
+              launchedByStrategy.set(strategy, launched);
+            },
+          }, pipelineDeps);
+          // runSelfOrchestrateCliCommand → superviseRun.rerun → executeOrchestrateReroute → orchestrateSelfDev.
+          // Only task identities observed at dispatch count; a checkpoint result cannot claim another strategy's launch.
+          for (const [strategy, count] of requested) {
+            const returnedIds = new Set(next.results.map((result) => result.taskId));
+            const taskIds = (launchedByStrategy.get(strategy) ?? []).filter((id) => returnedIds.has(id));
+            try {
+              debug.log('self-dev.supervisor', 'strategy.launch', {
+                strategy, round: supervisedRound + 1, requested: count,
+                launched: taskIds.length, taskIds,
+              });
+            } catch { /* observation must not interrupt execution */ }
+          }
           exitCode = next.exitCode;
           supervisedRound += 1;
           await recordRoundPrs(next.results);

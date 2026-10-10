@@ -18,6 +18,8 @@ import { resetUserConfig } from '../src/user-config';
 import { getMessages, format } from '../src/expression/i18n/index';
 import { messagesEn } from '../src/expression/i18n/messages.en';
 import { messagesKo } from '../src/expression/i18n/messages.ko';
+import { messagesJa } from '../src/expression/i18n/messages.ja';
+import { messagesZh } from '../src/expression/i18n/messages.zh';
 
 let root: string;
 let cfgPath: string;
@@ -68,6 +70,16 @@ describe('i18n bundles · setup wizard keys', () => {
       expect(typeof messagesKo[key]).toBe('string');
       expect((messagesKo[key] as string).length).toBeGreaterThan(0);
     }
+  });
+
+  test('first-run error-report notice exists in every bundle and keeps the off command verbatim', () => {
+    const cmd = 'elanous config set errorReports.enabled false';
+    for (const bundle of [messagesEn, messagesKo, messagesJa, messagesZh]) {
+      expect(bundle.setupErrorReportNotice).toContain(cmd);
+    }
+    expect(messagesEn.setupErrorReportNotice).not.toMatch(/[\uac00-\ud7a3]/);
+    expect(messagesEn.setupErrorReportNotice).toContain('never your name or email');
+    expect(messagesKo.setupErrorReportNotice).toContain('이름·메일 없이');
   });
 
   test('en bundle uses English strings', () => {

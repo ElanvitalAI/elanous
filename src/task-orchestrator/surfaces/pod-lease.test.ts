@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { parsePodPool, type PoolKubectl } from './pod-pool.js';
 import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, recommendConcurrency, POD_HOST_LEASE_ANNOTATION, type PoolLeaseMeasure } from './pod-lease.js';
 import { podJobManifest } from './self-implement-pod.js';
+import { podCommandJobManifest } from './pod-command-job.js';
 import { debug } from '../../debug/log.js';
 
 const uncachedProbe = (context: string, kubectl: PoolKubectl) => {
@@ -14,6 +15,7 @@ const uncachedProbe = (context: string, kubectl: PoolKubectl) => {
   try { return probePoolDns(context, kubectl, { dir }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
 };
+const emptyDnsProbeList = JSON.stringify({ items: [] });
 const gi = 1024 ** 3;
 const node = (memory = '263471132Ki', cpu = '32') => JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory, cpu }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
 interface FixturePod {
@@ -139,21 +141,114 @@ describe('pod lease measurement and recommendation', () => {
           expect(JSON.parse(input!).metadata).toMatchObject({ namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } });
           return { status: 0, stdout: '', stderr: '' };
         }
+        if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
         if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: succeeded ? 'Succeeded' : 'Failed' } }), stderr: '' };
         return { status: args.includes('wait') && !succeeded ? 1 : 0, stdout: args.includes('logs') ? succeeded ? 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1' : 'nslookup: no servers could be reached' : '', stderr: '' };
       };
       expect(uncachedProbe('node-b', kubectl)).toBe(ready === 0 || !succeeded ? 'dns' : 'ready');
       expect(calls.some((args) => args.includes('create'))).toBe(ready === 1);
-      expect(calls.at(-1)).toContain('delete');
+      if (ready === 1) expect(calls.at(-1)).toContain('delete');
+      else expect(calls.some((args) => args.includes('delete'))).toBe(false);
       expect(calls.every((args) => args[1] === 'node-b')).toBe(true);
     }
   });
+  test('three existing DNS probes prevent a new probe and leave the lease decision unknown', () => {
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const kubectl: PoolKubectl = (args) => {
+      calls.push([...args]);
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('pods')) {
+        expect(args).toEqual(['--context', 'node-b', '--request-timeout=10s', '-n', 'elanous-test', 'get', 'pods', '-l', 'elanous.probe=dns', '-o', 'json']);
+        return { status: 0, stdout: JSON.stringify({ items: [1, 2, 3].map((i) => ({ metadata: { name: `elanous-dns-${i}`, namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } } })) }), stderr: '' };
+      }
+      throw new Error(`unexpected kubectl call: ${args.join(' ')}`);
+    };
+    try {
+      expect(uncachedProbe('node-b', kubectl)).toBe('unknown');
+      expect(calls.filter((args) => args.includes('create'))).toHaveLength(0);
+      expect(calls.filter((args) => args.includes('delete'))).toHaveLength(0);
+      expect(log).toHaveBeenCalledWith('pod.lease', 'dns-probe-skipped-crowded', { context: 'node-b', existing: 3 });
+    } finally { log.mockRestore(); }
+  });
+  test('only DNS-labeled probes deleting for over 60 seconds are force-reaped', () => {
+    const now = Date.parse('2026-10-09T12:00:00Z');
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const probes = [
+      { name: 'old', age: 90_000, labels: { 'elanous.probe': 'dns' }, namespace: 'elanous-test' },
+      { name: 'new', age: 10_000, labels: { 'elanous.probe': 'dns' }, namespace: 'elanous-test' },
+      { name: 'harness', age: 90_000, labels: { 'elanous.substrate': 'pod' }, namespace: 'elanous-test' },
+      { name: 'foreign', age: 90_000, labels: { 'elanous.probe': 'dns' }, namespace: 'other' },
+    ];
+    const kubectl: PoolKubectl = (args) => {
+      calls.push([...args]);
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('pods')) return { status: 0, stdout: JSON.stringify({ items: probes.map((p) => ({ metadata: { name: p.name, namespace: p.namespace, labels: p.labels, deletionTimestamp: new Date(now - p.age).toISOString() } })) }), stderr: '' };
+      if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Succeeded' } }), stderr: '' };
+      return { status: 0, stdout: args.includes('logs') ? 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1' : '', stderr: '' };
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'dns-reap-'));
+    try {
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('ready');
+      const forced = calls.filter((args) => args.includes('--force'));
+      expect(forced).toHaveLength(1);
+      expect(forced[0]).toEqual(['--context', 'node-b', '--request-timeout=10s', '-n', 'elanous-test', 'delete', 'pods', '-l', 'elanous.probe=dns', '--field-selector=metadata.name=old', '--grace-period=0', '--force', '--ignore-not-found=true', '--wait=false']);
+      expect(calls.filter((args) => args.includes('delete'))).toHaveLength(2);
+      expect(log).toHaveBeenCalledWith('pod.lease', 'dns-probe-stale-reaped', { context: 'node-b', count: 1 });
+    } finally { log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('finished DNS probes do not crowd the node and are removed', () => {
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    // node-b 10-09 22:1x: 20 Completed leftovers ⊕ 2 live probes — the node is not crowded.
+    const listed = [
+      ...Array.from({ length: 20 }, (_, i) => ({ metadata: { name: `done-${i}`, namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } }, status: { phase: 'Succeeded' } })),
+      { metadata: { name: 'live-1', namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } }, status: { phase: 'Running' } },
+      { metadata: { name: 'live-2', namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } }, status: { phase: 'Pending' } },
+    ];
+    const kubectl: PoolKubectl = (args) => {
+      calls.push([...args]);
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('pods') && args.includes('get')) return { status: 0, stdout: JSON.stringify({ items: listed }), stderr: '' };
+      if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Succeeded' } }), stderr: '' };
+      return { status: 0, stdout: args.includes('logs') ? 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1' : '', stderr: '' };
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'dns-finished-'));
+    try {
+      expect(probePoolDns('node-b', kubectl, { dir })).toBe('ready');
+      expect(calls.filter((args) => args.includes('create'))).toHaveLength(1);
+      const finishedDeletes = calls.filter((args) => args.includes('delete') && args.some((a) => a.startsWith('--field-selector=metadata.name=done-')));
+      expect(finishedDeletes).toHaveLength(20);
+      expect(finishedDeletes.every((args) => !args.includes('--force'))).toBe(true);
+      expect(log).toHaveBeenCalledWith('pod.lease', 'dns-probe-finished-reaped', { context: 'node-b', count: 20 });
+      expect(log).not.toHaveBeenCalledWith('pod.lease', 'dns-probe-skipped-crowded', expect.anything());
+    } finally { log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('unreadable DNS probe list fails closed without creating or deleting Pods', () => {
+    const calls: string[][] = [];
+    const kubectl: PoolKubectl = (args) => {
+      calls.push([...args]);
+      return args.includes('deployment')
+        ? { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' }
+        : { status: 1, stdout: '', stderr: 'forbidden' };
+    };
+    expect(uncachedProbe('node-b', kubectl)).toBe('unknown');
+    expect(calls.filter((args) => args.includes('create') || args.includes('delete'))).toHaveLength(0);
+  });
+  test('both Job manifests share a 30-minute finished TTL without changing retry or active deadline', () => {
+    const harness = podJobManifest({ name: 'si-task-example', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', args: [], passEnv: [], deadlineSeconds: 123 });
+    const command = podCommandJobManifest({ name: 'cmd-example', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', command: ['true'], skills: [], deadlineSeconds: 456 });
+    expect(harness.spec).toMatchObject({ ttlSecondsAfterFinished: 1800, backoffLimit: 0, activeDeadlineSeconds: 123 });
+    expect(command.spec).toMatchObject({ ttlSecondsAfterFinished: 1800, backoffLimit: 0, activeDeadlineSeconds: 456 });
+  });
   test('a successful member lookup is cached for ten minutes, not shared with another member, and expires', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dns-cache-'));
-    let at = 1000, creates = 0;
+    let at = 1000, creates = 0, lists = 0;
     const kubectl: PoolKubectl = (args) => {
       if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
       if (args.includes('create')) creates++;
+      if (args.includes('pods')) { lists++; return { status: 0, stdout: emptyDnsProbeList, stderr: '' }; }
       return { status: 0, stdout: args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } }) : args.includes('logs') ? 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1' : '', stderr: '' };
     };
     try {
@@ -162,12 +257,72 @@ describe('pod lease measurement and recommendation', () => {
       at += 599_999;
       expect(read('node-b')).toBe('ready');
       expect(creates).toBe(1);
+      expect(lists).toBe(1);
       expect(read('other')).toBe('ready');
       expect(creates).toBe(2);
       at++;
       expect(read('node-b')).toBe('ready');
       expect(creates).toBe(3);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('DNS-PROBE-STALE-OK: a failed probe uses a 20-minute ready without refreshing its cache, but a 40-minute ready is unknown', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dns-stale-ready-'));
+    const cache = join(dir, `dns-${createHash('sha256').update('node-b').digest('hex')}.cache`);
+    const now = Date.parse('2026-10-09T12:00:00Z');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let creates = 0;
+    const kubectl: PoolKubectl = (args) => {
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
+      if (args.includes('create')) { creates++; return { status: 1, stdout: '', stderr: 'create failed' }; }
+      throw new Error(`unexpected kubectl call: ${args.join(' ')}`);
+    };
+    try {
+      const ready20 = JSON.stringify({ result: 'ready', at: now - 20 * 60_000, generation: 'original' });
+      writeFileSync(cache, ready20);
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('ready');
+      expect(readFileSync(cache, 'utf8')).toBe(ready20);
+      expect(log).toHaveBeenCalledWith('pod.lease', 'dns-probe-stale-ready', { context: 'node-b', readyAgeMs: 20 * 60_000 });
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('ready');
+      expect(creates).toBe(2); // The stale answer never prevents another measurement.
+      const ready30 = JSON.stringify({ result: 'ready', at: now - 30 * 60_000, generation: 'original' });
+      writeFileSync(cache, ready30);
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('unknown');
+      expect(readFileSync(cache, 'utf8')).toBe(ready30);
+      const ready40 = JSON.stringify({ result: 'ready', at: now - 40 * 60_000, generation: 'original' });
+      writeFileSync(cache, ready40);
+      log.mockClear();
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('unknown');
+      expect(readFileSync(cache, 'utf8')).toBe(ready40);
+      expect(log).not.toHaveBeenCalledWith('pod.lease', 'dns-probe-stale-ready', expect.anything());
+      expect(creates).toBe(4);
+      rmSync(cache);
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('unknown');
+      expect(creates).toBe(5);
+    } finally { log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('DNS-PROBE-STALE-OK: a 15-minute ready cannot override confirmed dns or image failure', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dns-stale-failure-'));
+    const cache = join(dir, `dns-${createHash('sha256').update('node-b').digest('hex')}.cache`);
+    const now = Date.parse('2026-10-09T12:00:00Z');
+    const ready15 = JSON.stringify({ result: 'ready', at: now - 15 * 60_000, generation: 'original' });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let readyReplicas = 0;
+    const kubectl: PoolKubectl = (args) => {
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas } }), stderr: '' };
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
+      if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Pending', containerStatuses: [{ state: { waiting: { reason: 'ImagePullBackOff' } } }] } }), stderr: '' };
+      return { status: args.includes('wait') ? 1 : 0, stdout: '', stderr: '' };
+    };
+    try {
+      writeFileSync(cache, ready15);
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('dns');
+      expect(readFileSync(cache, 'utf8')).toBe(ready15);
+      readyReplicas = 1;
+      expect(probePoolDns('node-b', kubectl, { dir, now: () => now })).toBe('image');
+      expect(readFileSync(cache, 'utf8')).toBe(ready15);
+      expect(log).not.toHaveBeenCalledWith('pod.lease', 'dns-probe-stale-ready', expect.anything());
+    } finally { log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
   test('DNS failures and unknown readings are never cached', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dns-failure-'));
@@ -176,6 +331,7 @@ describe('pod lease measurement and recommendation', () => {
     const kubectl: PoolKubectl = (args) => {
       if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
       if (args.includes('create')) creates++;
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
       if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Failed' } }), stderr: '' };
       return { status: 0, stdout: args.includes('logs') ? 'nslookup: no servers could be reached' : '', stderr: '' };
     };
@@ -199,6 +355,7 @@ import { appendFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args.includes('deployment')) console.log(JSON.stringify({spec:{replicas:1},status:{readyReplicas:1}}));
 else if (args.includes('create')) { appendFileSync(process.env.DNS_CALLS, 'create\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600); }
+else if (args.includes('pods')) console.log(JSON.stringify({items:[]}));
 else if (args.includes('get')) console.log(JSON.stringify({status:{phase:'Succeeded'}}));
 else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluster.local\\nAddress: 10.43.0.1');
 `);
@@ -235,7 +392,7 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
           }
         }
-        return { status: 0, stdout: args.includes('get') ? JSON.stringify({ status: { phase: 'Failed' } }) : args.includes('logs') ? 'nslookup: no servers could be reached' : '', stderr: '' };
+        return { status: 0, stdout: args.includes('pods') ? JSON.stringify({ items: [] }) : args.includes('get') ? JSON.stringify({ status: { phase: 'Failed' } }) : args.includes('logs') ? 'nslookup: no servers could be reached' : '', stderr: '' };
       };
       console.log(probePoolDns('node-b', kubectl, { dir: ${JSON.stringify(dir)} }));
     `;
@@ -260,6 +417,59 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test('DNS-PROBE-STALE-OK: waiters sharing an unknown outcome use stale ready and still retry on a later call', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dns-stale-parallel-'));
+    const cache = join(dir, `dns-${createHash('sha256').update('node-b').digest('hex')}.cache`);
+    const calls = join(dir, 'creates');
+    const waiters = join(dir, 'waiters');
+    const entry = resolve(import.meta.dir, 'pod-lease.ts');
+    const original = JSON.stringify({ result: 'ready', at: Date.now() - 20 * 60_000, generation: 'original' });
+    writeFileSync(cache, original);
+    const script = `
+      import { appendFileSync, readFileSync } from 'node:fs';
+      import { probePoolDns } from ${JSON.stringify(entry)};
+      if (process.env.DNS_WAITER === '1') appendFileSync(${JSON.stringify(waiters)}, 'ready\\n');
+      const kubectl = (args) => {
+        if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+        if (args.includes('pods')) return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+        if (args.includes('create')) {
+          appendFileSync(${JSON.stringify(calls)}, 'create\\n');
+          if (process.env.DNS_HOLDER === '1') {
+            const end = Date.now() + 10_000;
+            while (Date.now() < end) {
+              try { if (readFileSync(${JSON.stringify(waiters)}, 'utf8').split('ready').length - 1 === 3) break; } catch {}
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+            }
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+          }
+          return { status: 1, stdout: '', stderr: 'create failed' };
+        }
+        throw new Error('unexpected kubectl call');
+      };
+      console.log(probePoolDns('node-b', kubectl, { dir: ${JSON.stringify(dir)} }));
+    `;
+    const command = ['bun', '-e', script];
+    const env = { ...process.env };
+    const children: Array<ReturnType<typeof Bun.spawn<"pipe", "pipe", "pipe">>> = [];
+    try {
+      children.push(Bun.spawn(command, { env: { ...env, DNS_HOLDER: '1' }, stdout: 'pipe', stderr: 'pipe' }));
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(calls) && Date.now() < deadline) await Bun.sleep(20);
+      expect(existsSync(calls)).toBe(true);
+      for (let i = 0; i < 3; i++) children.push(Bun.spawn(command, { env: { ...env, DNS_WAITER: '1' }, stdout: 'pipe', stderr: 'pipe' }));
+      const outputs = await Promise.all(children.map(async (child) => ({ code: await child.exited, stdout: await new Response(child.stdout).text(), stderr: await new Response(child.stderr).text() })));
+      expect(outputs).toEqual(Array.from({ length: 4 }, () => ({ code: 0, stdout: 'ready\n', stderr: '' })));
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual(['create']);
+      expect(readFileSync(cache, 'utf8')).toBe(original);
+      const retry = spawnSync('bun', ['-e', script], { env, encoding: 'utf8', timeout: 10_000 });
+      expect(retry.status).toBe(0);
+      expect(retry.stdout.trim()).toBe('ready');
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual(['create', 'create']);
+    } finally {
+      for (const child of children) { child.kill(); await child.exited; }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   test('a process killed while holding the DNS flock before a cache write releases it for the next process', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dns-crash-'));
     const key = createHash('sha256').update('node-b').digest('hex');
@@ -276,7 +486,7 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
           appendFileSync(${JSON.stringify(calls)}, 'create\\n');
           if (process.env.DNS_HOLD === '1') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 360_000);
         }
-        return { status: 0, stdout: args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } }) : args.includes('logs') ? 'Name: kubernetes.default.svc.cluster.local\\nAddress: 10.43.0.1' : '', stderr: '' };
+        return { status: 0, stdout: args.includes('pods') ? JSON.stringify({ items: [] }) : args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } }) : args.includes('logs') ? 'Name: kubernetes.default.svc.cluster.local\\nAddress: 10.43.0.1' : '', stderr: '' };
       };
       console.log(probePoolDns('node-b', kubectl, { dir: ${JSON.stringify(dir)} }));
     `;
@@ -326,12 +536,35 @@ else if (args.includes('logs')) console.log('Name: kubernetes.default.svc.cluste
   test('DNS probe rejects a succeeded Pod without evidence of the requested DNS answer', () => {
     const kubectl: PoolKubectl = (args) => args.includes('deployment')
       ? { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' }
-      : { status: 0, stdout: args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } }) : args.includes('logs') ? 'Name: another.service\nAddress: 10.43.0.1' : '', stderr: '' };
+      : { status: 0, stdout: args.includes('pods') ? emptyDnsProbeList : args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } }) : args.includes('logs') ? 'Name: another.service\nAddress: 10.43.0.1' : '', stderr: '' };
     expect(uncachedProbe('node-b', kubectl)).toBe('dns');
+  });
+  test('부하 노드: wait 시간 초과 · phase Running 이어도 로그에 답이 찍혔으면 ready(10-09 node-b load 78)', () => {
+    const kubectl: PoolKubectl = (args) => {
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('wait')) return { status: 1, stdout: '', stderr: 'timed out waiting for the condition' };
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
+      if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Running' } }), stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: 'Server:\t10.43.0.10\n\nName:\tkubernetes.default.svc.cluster.local\nAddress: 10.43.0.1\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    expect(uncachedProbe('node-b', kubectl)).toBe('ready');
+  });
+  test('Running 이고 로그에 답이 아직 없으면 지금처럼 unknown(추측해서 ready 로 올리지 않는다)', () => {
+    const kubectl: PoolKubectl = (args) => {
+      if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('wait')) return { status: 1, stdout: '', stderr: 'timed out' };
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
+      if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Running' } }), stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: 'Server:\t10.43.0.10\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    expect(uncachedProbe('node-b', kubectl)).toBe('unknown');
   });
   test('image pull failure is not classified as DNS failure or a measured zero slot', () => {
     const kubectl: PoolKubectl = (args) => {
       if (args.includes('deployment')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+      if (args.includes('pods')) return { status: 0, stdout: emptyDnsProbeList, stderr: '' };
       if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Pending', containerStatuses: [{ state: { waiting: { reason: 'ImagePullBackOff' } } }] } }), stderr: '' };
       return { status: args.includes('wait') ? 1 : 0, stdout: '', stderr: '' };
     };

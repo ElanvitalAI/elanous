@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { TelegramBot } from './telegram.js';
 import type { ContextNowAnswer, ContextNowDeps } from './context-bus/context-now.js';
-import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
 import type { UserConfig } from './user-config.js';
 
 const HOUR = 60 * 60 * 1000;
@@ -13,11 +13,12 @@ const answer: ContextNowAnswer = {
     { kind: 'cell', version: '0.2.16', id: 'TG-CTX', title: 'Context first', status: 'red', owner: 'UX', source: 'elanous://release/0.2.16/checklist#TG-CTX' },
     { kind: 'decision', id: 'D1', title: 'Wait on context', status: 'open', dueAt: null, source: 'elanous://decisions/D1' },
     { kind: 'seat', seat: 'UX', at, status: 'shadow', id: 'TG-CTX', title: 'Context first', source: 'elanous://seat-loop/UX/1#1' },
+    { kind: 'run', goal: 'TG-CTX', phase: 'implement', elapsed: '2분', source: 'run://active' },
   ],
   events: [{ at, kind: '보고', summary: '최근 대화', source: 'https://example.org/now' }],
   guide: [],
 };
-const SUMMARY = renderTelegramNow(answer);
+const SUMMARY = renderContextFirstOpening(answer);
 let readContextNow: () => ContextNowAnswer = () => answer;
 const nowDeps: ContextNowDeps = {};
 
@@ -61,8 +62,8 @@ test('첫 말 → 요약 1 ⊕ 답 · 5분 뒤 → 요약 0 · 7시간 뒤 → �
   await (bot as unknown as { handleIncoming: (c: ReturnType<typeof incoming>) => Promise<void> }).handleIncoming(incoming('안녕'));
   expect(sent).toEqual([SUMMARY, '⏳ Working…', '본 답']);
   expect(SUMMARY).toContain('TG-CTX');
-  expect(SUMMARY).toContain('D1 Wait on context');
-  expect(SUMMARY).toContain('최근 대화');
+  expect(SUMMARY).not.toContain('D1 Wait on context');
+  expect(SUMMARY).not.toContain('최근');
 
   clock.now = 5 * 60 * 1000;
   sent.length = 0;

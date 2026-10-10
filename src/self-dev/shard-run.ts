@@ -1,6 +1,7 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { withBaselineWorktree } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt, type GateShardAggregate } from './shard-aggregate.js';
@@ -20,6 +21,13 @@ export type ShardProcess = (cwd: string, files: readonly string[]) => {
   junit?: string;
   rssMb?: number;
   seconds?: number;
+};
+
+/** Absent only when the path provably is not a file there (missing, or not a regular file); any other stat error
+ *  (permissions …) is not evidence of absence, so the file stays in the baseline run (fail-closed: unmeasured). */
+const absentAtBaseline = (path: string): boolean => {
+  try { return !statSync(path).isFile(); }
+  catch (error) { const code = (error as NodeJS.ErrnoException).code; return code === 'ENOENT' || code === 'ENOTDIR'; }
 };
 
 /** One process per bundle and per revision; a failed runner is retried only for its own bundle. */
@@ -71,20 +79,30 @@ export function runShardedGateTests(
   }
   const attempts: GateShardAttempt[] = [];
   const baseline = baselineWorktree(cwd, baseRef, (dir) => {
+    // LIGHT-RC-MEASURE ① — bun silently skips a path that is not in the baseline tree (exit 0), so a shard holding a
+    // new test file could never yield a complete baseline JUnit. Run the baseline side on the files the base has; an
+    // unreadable tree is not evidence of absence, so then every file stays in (the old shape).
+    const treeReadable = (() => { try { return statSync(dir).isDirectory(); } catch { return false; } })();
+    const atBase = (shard: GateTestShard) => treeReadable ? shard.files.filter((file) => !absentAtBaseline(join(dir, file))) : [...shard.files];
     let pending = shards;
     for (let round = 1; round <= 2 && pending.length; round++) {
       for (const shard of pending) {
-        const runSafely = (location: string): ReturnType<ShardProcess> => {
-          try { return run(location, shard.files); }
+        const runSafely = (location: string, selected: readonly string[]): ReturnType<ShardProcess> => {
+          try { return run(location, selected); }
           catch { return { exitCode: null }; }
         };
-        const current = runSafely(cwd);
-        const base = runSafely(dir);
+        const baselineFiles = atBase(shard);
+        if (baselineFiles.length < shard.files.length) {
+          debug.log('self-dev.shard', 'baseline-files-absent', { shardId: shard.id, round, absent: shard.files.filter((file) => !baselineFiles.includes(file)) });
+        }
+        const current = runSafely(cwd, shard.files);
+        const base = baselineFiles.length ? runSafely(dir, baselineFiles) : { exitCode: 0 };
         attempts.push({
           shardId: shard.id, attempt: round,
           currentJUnit: current.junit, baselineJUnit: base.junit,
           currentExitCode: current.exitCode, baselineExitCode: base.exitCode,
           currentSignal: current.signal, baselineSignal: base.signal,
+          baselineFiles,
         });
       }
       const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);

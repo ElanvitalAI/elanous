@@ -185,6 +185,24 @@ test('live sleep-review workers honor coordinator promotion while preserving con
     .toMatchObject([{ owner: 'OP', sources: ['https://example.test/0', 'https://example.test/1'] }]);
 }, 90_000);
 
+test('live sleep review stores promoted sourced events without comparable claims; corrections still choose the latest timestamp', async () => {
+  const { state, input } = fixture();
+  const correction = { ...input.events[0]!, id: 'fake-correction', at: `${input.day}T09:04:00.000Z`,
+    refs: { ...input.events[0]!.refs, url: 'https://example.test/correction' } };
+  const summaries = { ...input.summaries,
+    'https://example.test/0': { project: 'alpha', topic: 'release', summary: 'initial note', promote: true },
+    'https://example.test/correction': { project: 'alpha', topic: 'release', summary: 'corrected note', promote: true },
+  };
+  const result = await runGraph(graph, { input: { ...input, events: [...input.events, correction], summaries }, deps: { root: state } });
+  expect(result.status).toBe('done');
+  const saved = JSON.parse(readFileSync(join(state, 'context-memory', 'alpha', 'TC.json'), 'utf8')) as MemoryItem[];
+  expect(saved).toMatchObject([{ summary: 'corrected note', source: 'https://example.test/correction',
+    updatedAt: correction.at, status: 'active' }]);
+  expect(saved).toHaveLength(1);
+  expect(Object.keys(saved[0]!).sort()).toEqual(['project', 'seat', 'source', 'status', 'summary', 'topic', 'updatedAt']);
+  expect(JSON.parse(readFileSync(join(state, 'context-memory', 'conflict-candidates.json'), 'utf8'))).toEqual([]);
+}, 90_000);
+
 test('nightly task receives the sleep-review recipe and guardian retires only at record boundary', async () => {
   const { state, input } = fixture();
   const old = { project: 'alpha', seat: 'OP', topic: 'old', summary: 'former',

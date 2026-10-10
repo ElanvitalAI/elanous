@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parseRoleLlmFlags, formatRoleLlmSpec } from './role-llm-cli.js';
 import { resolveRoleLlm, resolveRoleModel, MODEL_ROLES, getUserConfig } from '../user-config.js';
 
@@ -72,6 +75,22 @@ describe('role-llm 입력 파서 — ⛔ 조용히 삼키지 않는다', () => {
     expect(formatRoleLlmSpec('implement', undefined)).toContain('없음');
     expect(formatRoleLlmSpec('implement', { provider: 'grok', tier: 'best' })).toContain('provider=grok');
   });
+});
+
+test('config roleLlm.planning invalid effort only drops effort and preserves the model', () => {
+  const root = mkdtempSync(join(tmpdir(), 'author-role-config-'));
+  try {
+    const path = join(root, 'config.json');
+    writeFileSync(path, JSON.stringify({ roleLlm: { planning: { model: 'gpt-6-sol', effort: 'turbo' } } }));
+    const parsed = getUserConfig(path).roleLlm?.planning;
+    expect(parsed).toEqual({ model: 'gpt-6-sol' });
+    writeFileSync(path, JSON.stringify({ roleLlm: { planning: { model: 'gpt-6-sol', effort: 'medium' } } }));
+    expect(getUserConfig(path).roleLlm?.planning).toEqual({ model: 'gpt-6-sol', effort: 'medium' });
+    writeFileSync(path, JSON.stringify({ roleLlm: { planning: { effort: 'low' } } }));
+    expect(getUserConfig(path).roleLlm?.planning).toEqual({ effort: 'low' });
+    writeFileSync(path, JSON.stringify({ roleLlm: { planning: { effort: 'turbo' } } }));
+    expect(getUserConfig(path).roleLlm?.planning).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 describe('resolveRoleLlm 사다리', () => {

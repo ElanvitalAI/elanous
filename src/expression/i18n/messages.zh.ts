@@ -39,6 +39,10 @@ export const messagesZh: Messages = {
   rangeError: '值必须在 {min} 到 {max} 之间。',
   patternError: '"{value}" 不符合预期格式。',
 
+  // Chat fallback
+  chatNoSynthesisLead: '未能写完回答 — 在使用工具 {n} 次之后，整理的时间已用完。请缩小问题范围后再问一次(例如：只问一件事)。',
+  chatFoldedInternalTail: '● 内部记录已折叠 · {n} 行 · 按 f 展开',
+
   // Async + status
   loading: '加载中…',
   saving: '保存中…',
@@ -76,6 +80,7 @@ export const messagesZh: Messages = {
   setupBanner: 'elanous — 设置向导',
   setupWritingTo: '保存到: {path}',
   setupComplete: '设置完成',
+  setupErrorReportNotice: '出错时，elanous 会自动向运营团队报告错误(错误内容、版本和随机安装 ID — 不包含姓名或邮箱)。关闭方法: elanous config set errorReports.enabled false',
   setupRerunHint: '重新运行: {cmd}',
 
   // Setup wizard — Step 1 (LLM provider)

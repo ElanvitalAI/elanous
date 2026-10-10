@@ -89,6 +89,25 @@ function scaled(limit: number): { reserved: number; minSection: number } {
   return { reserved: Math.floor(RESERVED_FOR_NOTICE * k), minSection: Math.max(40, Math.floor(MIN_SECTION_CHARS * k)) };
 }
 
+/** 골 문서에서 `판정 신호` 절만 뽑아 리뷰 acceptance 로 쓴다. 계보 = self-implement seams. */
+export function extractHarnessReviewAcceptance(goalDocument: string | undefined): { goal: string | undefined; acceptance: string | undefined } {
+  let goal: string | undefined;
+  try {
+    goal = goalDocument?.trim() || undefined;
+  } catch {
+    return { goal: undefined, acceptance: undefined };
+  }
+  if (!goal) return { goal: undefined, acceptance: undefined };
+  try {
+    const acceptance = splitGoalSections(supervisorGoalDigest(goal, 3000).text)
+      .find((section) => isSupervisorDecisionSection(section.title) && section.title.includes('판정 신호'))
+      ?.body.trim() || undefined;
+    return { goal, acceptance };
+  } catch {
+    return { goal, acceptance: undefined };
+  }
+}
+
 /** `## <제목>` 기준으로 절을 가른다. 헤더 앞 서두는 제목 `''` 로 담는다. */
 export function splitGoalSections(goal: string): Section[] {
   return extractGoalDocSections(goal, {

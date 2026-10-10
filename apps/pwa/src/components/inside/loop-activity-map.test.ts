@@ -51,6 +51,12 @@ test('initial history stays dim; only events first seen on a later poll highligh
   expect(EDGE_HIGHLIGHT_MS).toBe(1_500);
 });
 
+test('one resource hub in LOOP-INTERACT navigates to the focused resource lens', () => {
+  const nodes = activityNodes([], []);
+  expect(nodes.filter(node => node.id === 'loop:resources')).toEqual([{ id: 'loop:resources', type: 'hub', label: '자원' }]);
+  expect(activityTraceTarget('loop:resources')).toBe('/loops?view=resources');
+});
+
 test('node and edge targets encode trace location; no raw ref becomes an arbitrary URL', () => {
   expect(activityTraceTarget('loop:retro')).toBe('/trace?q=retro');
   expect(activityTraceTarget('schedule:morning')).toBe('/trace?q=morning');
@@ -81,7 +87,7 @@ test('hand, launch and move edges survive the client filter; unknown kinds still
 test('fixed nodes stand without edges and new prefixes get public labels', () => {
   const nodes = activityNodes([row({ id: 'loop:orchestrator', name: '오케스트레이터', owner: 'MK', verdict: '살아 있음' })], journey);
   expect(nodes.filter(n => n.type === 'seat' || n.type === 'hub').map(n => n.label))
-    .toEqual(['COO', 'CMO', 'CTO', 'CXO', '조율', 'TASK-AGENT', '런 묶음', '발행 루프', '수호자']);
+    .toEqual(['COO', 'CMO', 'CTO', 'CXO', '조율', 'TASK-AGENT', '런 묶음', '발행 루프', '수호자', '자원']);
   expect(nodes.find(n => n.id === 'loop:orchestrator')).toMatchObject({ type: 'hub', label: '조율', verdict: '살아 있음' });
   expect(nodes.find(n => n.id === 'pr:24700')?.label).toBe('PR #24700');
   expect(nodes.find(n => n.id === 'release:RELEASE-LIVE2')?.label).toBe('발행 · RELEASE-LIVE2');

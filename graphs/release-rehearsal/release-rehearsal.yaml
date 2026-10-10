@@ -1,0 +1,17 @@
+graph_id: release-rehearsal
+loop:
+  title: 판 컷 전 가벼운 RC 리허설
+  description: 판 일정의 컷 −7h · −150m 단계를 15분마다 살펴서 단계당 한 번만 실행
+  owner: OP
+  trigger:
+    cron: '*/15 * * * *'
+    events: [manual]
+version: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: judge, recipe: 'cmd:tick', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -58,9 +58,12 @@ test('DRAFT-METRIC: needs-owner reads the batched GraphQL comments — no per-dr
   const previous = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = stateDir;
   try {
+    // DRAFT-CLAIM-AUTO (#25838): a claim is live only with the running label ⊕ a fresh update (draftClaimState),
+    // so drafts 1–2 carry both and the batched comments decide the owner.
     const drafts = Array.from({ length: 95 }, (_, i) => ({ number: i + 1, draft: true, title: `d${i}`, body: null,
-      head: { ref: `self-impl/d-${i}`, sha: `h${i}` }, base: { ref: 'main' }, labels: [],
-      created_at: '2026-10-07T00:00:00Z', updated_at: '2026-10-07T00:00:00Z', merged_at: null }));
+      head: { ref: `self-impl/d-${i}`, sha: `h${i}` }, base: { ref: 'main' },
+      labels: i < 2 ? [{ name: 'elanous:running' }] : [],
+      created_at: '2026-10-07T00:00:00Z', updated_at: i < 2 ? '2026-10-07T23:00:00Z' : '2026-10-07T00:00:00Z', merged_at: null }));
     // Draft 1: claimed then released ⇒ no owner. Draft 2: claimed ⇒ owner. The rest: no claim ⇒ needs owner.
     const comments = (number: number) => number === 1
       ? ['🔧 처리 중 — owner OP · 2026-10-07T01:00:00Z', '🔧 처리 끝 — 2026-10-07T02:00:00Z']

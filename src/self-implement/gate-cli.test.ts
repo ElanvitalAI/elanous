@@ -140,6 +140,25 @@ describe('runSelfGateCli', () => {
     expect(result.lines.join('\n')).toContain('[gate-baseline] introduced=1, preexisting=1, unknown=0');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1');
     expect(result.lines.join('\n')).toContain('shard attempt: shard-2 #1');
+    expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1 · 지금 exit 1 · 기준 exit 1');
+  });
+
+  test('--shards names why an attempt was unmeasured — signal, exit and missing JUnit per side (OP 10-09 light RC)', () => {
+    const files = ['src/a.test.ts'];
+    const shards = [{ id: 'shard-1', files, plannedRssMb: 10, plannedSeconds: 1 }];
+    const attempts = [
+      { shardId: 'shard-1', attempt: 1, currentExitCode: null, baselineExitCode: 0, currentSignal: 'SIGTERM', baselineJUnit: '<testsuite/>' },
+      { shardId: 'shard-1', attempt: 2, currentExitCode: 1, baselineExitCode: null },
+    ];
+    const result = runSelfGateCli('/repo', { shards: 1 }, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards, attempts, aggregate: { status: 'unmeasured', retryShardIds: ['shard-1'] } }),
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    const text = result.lines.join('\n');
+    expect(text).toContain('shard attempt: shard-1 #1 · 지금 signal SIGTERM · 기준 exit 0');
+    expect(text).toContain('shard attempt: shard-1 #2 · 지금 exit 1 · junit 없음 · 기준 exit ?');
+    expect(text).toContain('shards: unmeasured (shard-1)');
   });
 
   test('default bun test command uses an isolated deterministic environment and cleans it', () => {

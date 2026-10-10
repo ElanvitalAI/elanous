@@ -2,13 +2,16 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
+import { runGhCliWithResult, type GhCliResult } from '../git-fs/gh-cli.js';
+import { registeredSeats } from '../seat-address/seat-address.js';
+import { debug } from '../debug/log.js';
 
 type HqSeatRole = 'OP' | 'MK' | 'TC' | 'UX';
 const ROLES: readonly string[] = ['OP', 'MK', 'TC', 'UX'];
 interface HouseLedger {
   home: { kind: 'home'; path: string; source: 'cli-resolved' };
-  // `reclaiming` = the merged tip a `work done` proved before it started removing; it lets an interrupted done resume.
-  sandboxes: Record<string, { kind: 'sandbox'; path: string; owner: HqSeatRole; reclaiming?: string }>;
+  // `reclaiming` records the original work branch tip; checkoutTip is needed if done detached a different branch.
+  sandboxes: Record<string, { kind: 'sandbox'; path: string; owner: HqSeatRole; reclaiming?: string; checkoutTip?: string; checkoutBranch?: string }>;
 }
 
 function hqRoot(home = process.env.HOME): string {
@@ -30,6 +33,20 @@ function repository(root: string): string {
 }
 
 function ledgerPath(root: string): string { return join(root, 'house.json'); }
+
+/** Read-only launch lookup: the registered home and detached seat must exist; never create or refresh a view. */
+export function resolveHqLaunchSeat(role: string, home: string, options: { root?: string } = {}): string {
+  if (!registeredSeats().some(seat => seat.id === role)) throw new Error(`unregistered seat: ${role}`);
+  const root = resolve(options.root ?? hqRoot());
+  const registeredHome = readLedger(root).home.path;
+  if (realpathSync(home) !== realpathSync(registeredHome)) throw new Error(`house.json home mismatch: registered ${registeredHome}; requested ${home}`);
+  const path = join(root, 'seats', role);
+  assertRegisteredWorktree(repository(root), path);
+  const head = runGitCommand(path, ['symbolic-ref', '--quiet', 'HEAD'], { encoding: 'utf8' });
+  if (head.status === 0) throw new Error(`not a detached seat: ${path}`);
+  if (head.status !== 1) throw new Error(`git symbolic-ref --quiet HEAD: ${head.stderr.trim() || `exit ${head.status}`}`);
+  return path;
+}
 function readLedger(root: string): HouseLedger {
   const ledger = JSON.parse(readFileSync(ledgerPath(root), 'utf8')) as HouseLedger;
   if (!ledger.home?.path || !ledger.sandboxes || typeof ledger.sandboxes !== 'object') throw new Error('invalid house.json; refusing to guess houses');
@@ -109,6 +126,62 @@ function mergedIntoMain(repo: string, commit: string): boolean {
   const merged = runGitCommand(repo, ['merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main'], { encoding: 'utf8' });
   if (merged.status !== 0 && merged.status !== 1) throw new Error(`cannot verify merge: ${merged.stderr.trim()}`);
   return merged.status === 0;
+}
+
+export type MergedPrProof = { status: 'pr-merged'; number: number } | { status: 'not-merged' | 'unknown' };
+const MERGED_PR_QUERY_LIMIT = 1000;
+
+/** Read-only PR evidence from the HQ mirror's origin, never the caller's current repository. */
+export function proveMergedPr(repo: string, branch: string, tip: string, gh: (args: string[]) => GhCliResult = runGhCliWithResult, base?: string): MergedPrProof {
+  if (!repo || !branch || !tip) return { status: 'unknown' };
+  let result: GhCliResult;
+  try {
+    // Read the unexpanded URL: `git remote get-url` applies url.*.insteadOf, possibly turning a
+    // hosted origin into a local mirror and losing the repository identity gh must query.
+    const origin = git(repo, 'config', '--local', '--get', 'remote.origin.url');
+    const url = /^(?:https?:\/\/|ssh:\/\/)(?:[^@/]+@)?([^/]+)\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(origin);
+    const scp = /^(?:[^@]+@)?([^:/]+):([^/]+)\/([^/]+?)(?:\.git)?$/.exec(origin);
+    if (!url && !scp) return { status: 'unknown' };
+    const target = url ? `${url[1]}/${url[2]}/${url[3]}` : `${scp![1]}/${scp![2]}/${scp![3]}`;
+    result = gh(['pr', 'list', '--state', 'merged', '--head', branch, ...(base ? ['--base', base] : []), '--json', 'number,headRefOid', '--limit', String(MERGED_PR_QUERY_LIMIT), '--repo', target]);
+  } catch { return { status: 'unknown' }; }
+  if (!result.ok || result.maybeTruncated) return { status: 'unknown' };
+  let parsed: unknown;
+  try { parsed = JSON.parse(result.stdout.toString('utf8')); }
+  catch { return { status: 'unknown' }; }
+  if (!Array.isArray(parsed) || !parsed.every((pr): pr is { number: number; headRefOid: string } =>
+    pr !== null && typeof pr === 'object' && Number.isSafeInteger(pr.number) && pr.number > 0
+    && typeof pr.headRefOid === 'string' && pr.headRefOid.length > 0)) return { status: 'unknown' };
+  const matching = parsed.find(pr => pr.headRefOid === tip);
+  return matching ? { status: 'pr-merged', number: matching.number }
+    : { status: parsed.length >= MERGED_PR_QUERY_LIMIT ? 'unknown' : 'not-merged' };
+}
+
+// Every tip checked by done is tied to its own branch, including a different attached branch.
+function landedTip(repo: string, branch: string, tip: string, gh: (args: string[]) => GhCliResult): 'ancestor' | 'pr-merged' | 'tree-equal' | null {
+  if (mergedIntoMain(repo, tip)) return 'ancestor';
+  if (proveMergedPr(repo, branch, tip, gh, 'main').status === 'pr-merged') return 'pr-merged';
+  return treeEqualToMain(repo, tip) ? 'tree-equal' : null;
+}
+
+function judgeLandedTip(repo: string, branch: string, tip: string, gh: (args: string[]) => GhCliResult): boolean {
+  const rule = landedTip(repo, branch, tip, gh);
+  try { debug.log('hq.work', 'done-judged', { branch, tip, rule: rule ?? 'not-merged' }); } catch { /* observation must not change the verdict */ }
+  return rule !== null;
+}
+
+// Squash changes the commit identity. Prove the original commit changed at least one path and
+// that every one of those paths has the same content and mode in the fetched main tree.
+function treeEqualToMain(repo: string, tip: string): boolean {
+  const main = 'refs/remotes/origin/main';
+  const base = git(repo, 'merge-base', tip, main);
+  const changed = runGitCommand(repo, ['diff', '--name-only', '-z', base, tip], { encoding: 'utf8' });
+  if (changed.status !== 0) throw new Error(`cannot verify changed files: ${changed.stderr.trim() || `exit ${changed.status}`}`);
+  const files = changed.stdout.split('\0').filter(Boolean);
+  if (files.length === 0) return false;
+  const equal = runGitCommand(repo, ['diff', '--quiet', tip, main, '--', ...files], { encoding: 'utf8' });
+  if (equal.status !== 0 && equal.status !== 1) throw new Error(`cannot verify tree equality: ${equal.stderr.trim() || `exit ${equal.status}`}`);
+  return equal.status === 0;
 }
 // Git lock files are created exclusively; ours carry our pid. A lock left by a killed `work done` is never
 // removed automatically (between our check and a delete, a live git could have re-taken it): the error names it.
@@ -231,7 +304,7 @@ export function hqSeat(value: string, options: { root?: string; refresh?: boolea
   });
 }
 
-export function hqWork(action: 'new' | 'done', value: string, nameValue: string, options: { root?: string } = {}): { path: string; outcome: 'created' | 'removed' } {
+export function hqWork(action: 'new' | 'done', value: string, nameValue: string, options: { root?: string; gh?: (args: string[]) => GhCliResult } = {}): { path: string; outcome: 'created' | 'removed' } {
   const role = roleOf(value);
   const name = workName(nameValue);
   const root = resolve(options.root ?? hqRoot());
@@ -289,15 +362,19 @@ export function hqWork(action: 'new' | 'done', value: string, nameValue: string,
       const ref = runGitCommand(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { encoding: 'utf8' });
       if (ref.status !== 0) {
         // Without the branch, the only merge proof is the tip an interrupted done recorded before removing.
-        const recorded = readLedger(root).sandboxes[path]?.reclaiming;
-        if (!recorded || !mergedIntoMain(repo, recorded)) throw new Error(`cannot verify merge: branch ${branch} is missing; house.json entry kept: ${path}`);
+        const recordedEntry = readLedger(root).sandboxes[path];
+        const recorded = recordedEntry?.reclaiming;
+        const checkout = recordedEntry?.checkoutTip;
+        if (!recorded || !judgeLandedTip(repo, branch, recorded, options.gh ?? runGhCliWithResult)
+          || (checkout && (!recordedEntry.checkoutBranch || !judgeLandedTip(repo, recordedEntry.checkoutBranch, checkout, options.gh ?? runGhCliWithResult)))) {
+          throw new Error(`cannot verify merge: branch ${branch} is missing; house.json entry kept: ${path}`);
+        }
         updateLedgerLocked(root, ledger => { delete ledger.sandboxes[path]; });
         removeStaleWorktreeAdmin(repo, own);
         return;
       }
       const tip = ref.stdout.trim();
-      const merged = runGitCommand(repo, ['merge-base', '--is-ancestor', tip, 'refs/remotes/origin/main'], { encoding: 'utf8' });
-      if (merged.status !== 0) throw new Error(merged.status === 1 ? `work is not merged into origin/main: ${branch}` : `cannot verify merge: ${merged.stderr}`);
+      if (!judgeLandedTip(repo, branch, tip, options.gh ?? runGhCliWithResult)) throw new Error(`work is not merged into origin/main: ${branch}`);
       // Same order as a normal done: the entry goes first, so a save that fails again keeps the branch (the proof).
       const entry = readLedger(root).sandboxes[path];
       updateLedgerLocked(root, ledger => { delete ledger.sandboxes[path]; });
@@ -322,28 +399,43 @@ export function hqWork(action: 'new' | 'done', value: string, nameValue: string,
     // still at that tip (stopped before the delete) or already deleted (stopped before the removal).
     const branchPresent = branchTip.status === 0;
     const resuming = attached.status !== 0 && entry.reclaiming !== undefined
-      && git(path, 'rev-parse', 'HEAD') === entry.reclaiming
+      && git(path, 'rev-parse', 'HEAD') === (entry.checkoutTip ?? entry.reclaiming)
       && (!branchPresent || branchTip.stdout.trim() === entry.reclaiming);
-    if (!resuming && (attached.status !== 0 || attached.stdout.trim() !== branch)) throw new Error(`work branch mismatch: ${path}`);
-    const tip = resuming ? entry.reclaiming! : branchTip.stdout.trim();
+    if (!resuming && (attached.status !== 0 || !branchPresent)) throw new Error(`work branch mismatch: ${path}`);
+    const ownTip = resuming ? entry.reclaiming! : branchTip.stdout.trim();
+    const checkoutBranch = resuming ? entry.checkoutBranch ?? branch : attached.stdout.trim();
+    const checkoutRef = `refs/heads/${checkoutBranch}`;
+    const differentBranch = checkoutBranch !== branch;
+    const tip = differentBranch
+      ? (resuming ? entry.checkoutTip! : git(repo, 'rev-parse', '--verify', checkoutRef))
+      : ownTip;
+    if (!resuming && differentBranch && git(path, 'rev-parse', 'HEAD') !== tip) throw new Error(`work branch moved before the merge check: ${checkoutBranch}`);
     // The ancestor check is against origin/main, not bare HEAD (which may still point to master).
-    if (!mergedIntoMain(repo, tip)) throw new Error(`work is not merged into origin/main: ${branch}`);
-    // Removal order keeps every interruption resumable: record the proven tip → detach → hold the work's git
-    // locks → compare-and-delete the branch → remove the worktree → drop the registration last.
+    if (!judgeLandedTip(repo, checkoutBranch, tip, options.gh ?? runGhCliWithResult)) throw new Error(`work is not merged into origin/main: ${checkoutBranch}`);
+    if (differentBranch && !judgeLandedTip(repo, branch, ownTip, options.gh ?? runGhCliWithResult)) throw new Error(`work is not merged into origin/main: ${branch}`);
+    if (differentBranch && !resuming) {
+      const current = runGitCommand(repo, ['rev-parse', '--verify', checkoutRef], { encoding: 'utf8' });
+      if (current.status !== 0 || current.stdout.trim() !== tip || git(path, 'rev-parse', 'HEAD') !== tip) throw new Error(`work branch moved before removal: ${checkoutBranch}`);
+    }
+    // Removal order keeps every interruption resumable: record the proven checkout tip and original branch tip
+    // → detach → hold the work's git locks → compare-and-delete the original branch → remove the worktree
+    // → drop the registration last. A different attached branch is proven but its ref is never deleted.
     // Holding this worktree's HEAD.lock and index.lock makes git refuse every commit and `add` in it until the
     // removal ends (`worktree remove` itself does not need them), so no commit can land between the last
     // check and the removal. The locks live in the worktree's admin dir, which the removal deletes.
-    updateLedgerLocked(root, ledger => { ledger.sandboxes[path] = { ...entry, reclaiming: tip }; });
+    updateLedgerLocked(root, ledger => { ledger.sandboxes[path] = { ...entry, reclaiming: ownTip,
+      ...(differentBranch ? { checkoutTip: tip, checkoutBranch } : {}) }; });
     const admin = git(path, 'rev-parse', '--absolute-git-dir');
     const held: string[] = [];
     const release = (): void => { for (const lock of held.splice(0)) rmSync(lock, { force: true }); };
     const restore = (): string => {
       release();
       const head = runGitCommand(path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8' });
-      runGitCommand(repo, ['update-ref', ref, head.status === 0 ? head.stdout.trim() : tip, ''], { encoding: 'utf8' });
-      const reattached = runGitCommand(path, ['symbolic-ref', 'HEAD', ref], { encoding: 'utf8' }).status === 0;
+      runGitCommand(repo, ['update-ref', ref, differentBranch ? ownTip : head.status === 0 ? head.stdout.trim() : tip, ''], { encoding: 'utf8' });
+      const reattached = runGitCommand(path, ['symbolic-ref', 'HEAD', checkoutRef], { encoding: 'utf8' }).status === 0;
       // If HEAD could not be re-attached (e.g. a stale HEAD.lock), keep `reclaiming` so the next done resumes.
-      const restored = reattached ? { kind: entry.kind, path: entry.path, owner: entry.owner } : { ...entry, reclaiming: tip };
+      const restored = reattached ? { kind: entry.kind, path: entry.path, owner: entry.owner } : { ...entry, reclaiming: ownTip,
+        ...(differentBranch ? { checkoutTip: tip, checkoutBranch } : {}) };
       try { updateLedgerLocked(root, ledger => { ledger.sandboxes[path] = restored; }); return reattached ? 'registration restored' : 'left resumable'; }
       catch (error) { return `REGISTRATION NOT RESTORED (fix ${path} in house.json by hand): ${error instanceof Error ? error.message : String(error)}`; }
     };
@@ -356,10 +448,14 @@ export function hqWork(action: 'new' | 'done', value: string, nameValue: string,
     }
     if (git(path, 'rev-parse', 'HEAD') !== tip) fail('work gained a commit after the merge check');
     if (branchPresent) {
-      const deleted = runGitCommand(repo, ['update-ref', '-d', ref, tip], { encoding: 'utf8' });
+      const deleted = runGitCommand(repo, ['update-ref', '-d', ref, ownTip], { encoding: 'utf8' });
       if (deleted.status !== 0) fail(`work branch moved after the merge check: ${deleted.stderr.trim()}`);
     }
     if (!clean(path)) fail('work changed during done');
+    if (differentBranch) {
+      const current = runGitCommand(repo, ['rev-parse', '--verify', checkoutRef], { encoding: 'utf8' });
+      if (current.status !== 0 || current.stdout.trim() !== tip) fail(`work branch moved after the merge check: ${checkoutBranch}`);
+    }
     // Without --force, git also refuses a worktree that became dirty after the check above.
     const removed = runGitCommand(repo, ['worktree', 'remove', path], { encoding: 'utf8' });
     if (removed.status !== 0) fail(`git worktree remove failed: ${removed.stderr.trim()}`);

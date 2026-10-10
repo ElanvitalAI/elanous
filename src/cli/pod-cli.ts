@@ -33,6 +33,27 @@ const HELP = `elanous pod run [--pool <스펙>] [--skill <이름,…>] [--llm gr
   하니스 없이 명령 하나를 Pod 에서 돌리고 산출 경로를 한 줄로 알린다.
   --deadline 생략 시 ${POD_COMMAND_DEADLINE_SECONDS}초(기존 Pod Job 수명 상한).`;
 
+/** clone 트리는 `bun install` 없이 뜨므로 `bun test`·`bun run` 은 «Cannot find package» 로 실패한다
+ *  (실측 2026-10-10 21:47 node-b · `pod run --clone -- bun test src/steward/launch.test.ts` → 1 fail ·
+ *  설치만 붙여 다시 치니 58초 Completed). Pod 문제로 오인하기 쉬워 «발사 전»에 한 줄로 알린다 — 발사는 막지 않는다. */
+export const POD_CLONE_WITHOUT_INSTALL_WARNING =
+  '⚠ --clone 트리에는 node_modules 가 없다 — 시험이면 sh -c "bun install --frozen-lockfile && <명령>" 꼴로 감싸라';
+
+/** `--clone` ⊕ 명령 첫 낱말이 `bun` ⊕ 둘째가 `test`·`run` ⊕ 명령 어디에도 `install` 낱말(토큰)이 없으면 경고 대상이다. */
+export function podCloneWithoutInstallWarning(
+  commandArgs: readonly string[],
+  clone: boolean | undefined,
+): string | null {
+  if (!clone) return null;
+  const [argv0, argv1] = commandArgs;
+  if (argv0 !== 'bun') return null;
+  if (argv1 !== 'test' && argv1 !== 'run') return null;
+  // Exact argv token only: `installation.test.ts` or a single `install helper` argument is not an install
+  // (a shell string like `sh -c "bun install && …"` never reaches here — its argv0 is `sh`).
+  if (commandArgs.includes('install')) return null;
+  return POD_CLONE_WITHOUT_INSTALL_WARNING;
+}
+
 export function registerPodCommands(program: Command, deps: PodCliDeps = {}): void {
   const io = deps.io ?? {
     log: (line: string) => console.log(line),
@@ -148,6 +169,11 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         }
       }
       const skills = (opts.skill ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+      const cloneWarning = podCloneWithoutInstallWarning(commandArgs, opts.clone);
+      if (cloneWarning !== null) {
+        io.error(cloneWarning);
+        debug.log('pod.run', 'clone-without-install', { argv0: commandArgs[0], argv1: commandArgs[1] });
+      }
       try {
         const result = await run({
           command: commandArgs,

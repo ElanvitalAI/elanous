@@ -13,6 +13,7 @@
 // 레포 내부 계약(src/time/format.ts)에 위임한다. 로컬 게터로 시/분/요일을 뽑으면
 // 프로세스 주변 TZ 에 종속돼 launchd 환경에서 조용히 어긋나기 때문.
 import { calendarFields, resolveTimeZone } from '../time/format.js';
+import '../user-config.js'; // Standalone catch-up queries share the saved timezone with the scheduler.
 
 // 한 파트 매칭 — 지원: 별표, 별표+스텝, 범위 a-b, 범위+스텝, 단일 값 n.
 function matchPart(part: string, value: number, min: number, max: number): boolean {

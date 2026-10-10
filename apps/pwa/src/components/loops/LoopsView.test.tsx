@@ -7,6 +7,7 @@ import { LoopAgentsScene } from '@/components/inside/LoopAgentsScene';
 import { _setEventSourceFactoryForTest } from '@/lib/shared-event-source';
 import { LoopInteractPanel, LoopsView } from './LoopsView';
 import { LoopStatusPanel } from './LoopStatusPanel';
+import { ResourceMap, ResourcePanel } from './ResourceMap';
 
 const originalFetch = globalThis.fetch;
 const originalDocument = globalThis.document;
@@ -50,6 +51,9 @@ function mount(search: string) {
   globalThis.fetch = (async () => new Response('{}', { status: 503 })) as unknown as typeof fetch;
   const edgeReads: string[] = [];
   const fetchJson = async (path: string) => {
+    if (path === '/v1/loops/resources') return { resource: { now: '2026-10-05T00:00:00Z', unassigned: 0,
+      seats: [{ seat: 'MK', running: 1, cap: 6, baseShare: 3, borrowed: 1, lent: 0, launchCap: 4, idle: true,
+        nextCell: { id: 'MK-1', title: '다음 잡' } }] } };
     if (path.startsWith('/v1/loops/edges')) { edgeReads.push(path); return { edges: [] }; }
     if (path.includes('includeOwners')) return { owners: [] };
     if (path.includes('schedules')) return { schedules: [] };
@@ -64,6 +68,18 @@ function mount(search: string) {
   const tree = <DaemonContext.Provider value={value}><SearchParamsContext.Provider value={new URLSearchParams(search)}><LoopsView /></SearchParamsContext.Provider></DaemonContext.Provider>;
   return { edgeReads, mount: async () => { await act(async () => { root = create(tree); }); return root!; } };
 }
+
+test('resource view calls its read-only resource endpoint and shows one LOOP-INTERACT resource graph', async () => {
+  const resource = mount('view=resources');
+  const root = await resource.mount();
+  try {
+    expect(root.root.findAllByType(LoopStatusPanel)).toHaveLength(0);
+    expect(root.root.findAllByType(ResourcePanel)).toHaveLength(1);
+    expect(root.root.findAllByType(ResourceMap)).toHaveLength(1);
+    expect(root.root.findByProps({ 'aria-label': '자원 LOOP-INTERACT' })).toBeDefined();
+    expect(resource.edgeReads).toEqual([]);
+  } finally { act(() => root.unmount()); }
+});
 
 test('default /loops keeps the status table; ?view=interact opens the interaction map without the table', async () => {
   const plain = mount('');

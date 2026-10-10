@@ -64,7 +64,7 @@ describe('createTextInputRenderActions', () => {
     }
   });
 
-  test('user-mutation repaint paints and requests modal render', () => {
+  test('user-mutation repaint paints and requests a NON-forced modal render (TUI-SLASH-FLICKER)', () => {
     let paints = 0;
     const renders: Array<{ force?: boolean }> = [];
     const actions = createTextInputRenderActions({
@@ -77,7 +77,9 @@ describe('createTextInputRenderActions', () => {
 
     actions.repaintUserMutation();
     expect(paints).toBe(1);
-    expect(renders).toEqual([{ force: true }]);
+    // force:true reached tui.render as a full-screen erase on every picker keystroke.
+    expect(renders).toEqual([{}]);
+    expect(renders.some((r) => r.force === true)).toBe(false);
   });
 
   test('user-mutation repaint skips modal render when predicate says no picker is visible', () => {

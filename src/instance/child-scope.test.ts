@@ -23,16 +23,26 @@ async function captureChildSpawn(scope: { configDir?: string; stateDir?: string 
   let argv: string[] = [];
   let env: NodeJS.ProcessEnv = {};
   const { defaultSeams } = await import('../self-implement/seams.js');
-  await defaultSeams({
-    ...scope,
-    ptyAvailable: () => false,
-    implementMaxWaitSec: 1,
-    spawnSync: ((_command: string, args: string[], options: { env?: NodeJS.ProcessEnv } | undefined) => {
-      argv = args;
-      env = options?.env ?? {};
-      return { status: 0, stdout: 'GOAL-COMPLETE\n', stderr: '', signal: null };
-    }) as never,
-  }).implement!({ cwd: process.cwd(), feature: 'noop', runId: 'child-scope-capture' });
+  // #25640(BRAIN-FAST) 뒤 implement() 가 control brain 공급자를 먼저 푼다 — 격리 HOME 에 자격이 없으면
+  // NoLlmProviderAvailableError 로 spawn 전에 죽는다(#25951 이 [runtime] 자식에만 준 처방과 같다).
+  // spawn 을 스텁해 brain 은 불리지 않으므로 가짜 키로 해석만 통과시키고 끝나면 되돌린다.
+  const savedXaiKey = process.env.XAI_API_KEY;
+  process.env.XAI_API_KEY = 'child-scope-test-dummy';
+  try {
+    await defaultSeams({
+      ...scope,
+      ptyAvailable: () => false,
+      implementMaxWaitSec: 1,
+      spawnSync: ((_command: string, args: string[], options: { env?: NodeJS.ProcessEnv } | undefined) => {
+        argv = args;
+        env = options?.env ?? {};
+        return { status: 0, stdout: 'GOAL-COMPLETE\n', stderr: '', signal: null };
+      }) as never,
+    }).implement!({ cwd: process.cwd(), feature: 'noop', runId: 'child-scope-capture' });
+  } finally {
+    if (savedXaiKey === undefined) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = savedXaiKey;
+  }
   return { argv, env };
 }
 
@@ -148,9 +158,10 @@ describe('childInstanceScope', () => {
           console.log(JSON.stringify({ scope, argv, stateDir: env.ELANOUS_STATE_DIR }));
         })().catch((error) => { console.error(error); process.exit(1); });
       `;
+      // #25640 뒤 implement() 가 control brain 공급자를 먼저 푼다 — 빈 HOME 에 자격이 없으면 throw(node-b). 이 시험은 spawn 을 스텁해 brain 을 부르지 않으므로 가짜 키로 해석만 통과시킨다.
       const result = spawnSync('bun', ['-e', script], {
         cwd: process.cwd(), encoding: 'utf8', timeout: 60_000,
-        env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '', ELANOUS_NEXUS_DIR: '', ELANOUS_SESSION_ROOT: '' },
+        env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '', ELANOUS_NEXUS_DIR: '', ELANOUS_SESSION_ROOT: '', XAI_API_KEY: 'child-scope-test-dummy' },
       });
       expect(result.status).toBe(0);
       const out = JSON.parse((result.stdout ?? '').trim().split('\n').pop() ?? '{}') as {

@@ -16,7 +16,10 @@ import { readTaskAgentState, readTaskCard, taskAgentStatePath, type CompletionKi
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type DeliveryKind, type NextAction } from './actions.js';
 import { judgeNextMove, type TaskJudgeInput, type TaskJudgement } from './judge.js';
-import { configuredTaskAgentLiveMoves, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
+import { HARNESS_RUN_ID_ENV } from '../harness/harness-space.js';
+import { recordLiveMoveHistory } from './live-move-history.js';
+import { capturedSelfReview, captureReviewResults, hasCapturedPass } from './review-result-capture.js';
+import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
 
 export interface TaskAgentShadowInput {
   runId: string | null;
@@ -25,7 +28,7 @@ export interface TaskAgentShadowInput {
   /** One judgement cycle can attempt at most one land, even across PRs. */
   cycleId?: string;
   /** Reviewed SHA is mandatory for land; a bare pass cannot authorize merging. */
-  selfReview?: { verdict: 'pass' | 'fail'; head: string };
+  selfReview?: { verdict: 'pass' | 'fail'; head: string; mustFixCount?: number };
 }
 
 export interface TaskAgentShadowMove {
@@ -55,6 +58,8 @@ export interface TaskAgentShadowDeps {
   liveMoves?: ReadonlySet<TaskAgentLiveMove>;
   /** live 수의 부작용(리뷰 띄우기·PR 머리 조회·상태 파일) — 시험은 주입한다. */
   live?: LiveMoveDeps;
+  /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** 파일 산출물로 전달(elanous-out)하는 종결 종류 — 그 밖의 code-pr 밖 종류는 확인 증거를 판단부에서 기다린다. */
@@ -149,6 +154,15 @@ function shadowCompletion(card: TaskCard | undefined, lookupFailed: boolean): Co
 }
 
 export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, deps: TaskAgentShadowDeps = {}): Promise<TaskAgentShadowMove> {
+  // TA-REVIEW-RESULT-CAPTURE — 판단 «전»에 지난 live review 의 결과 파일을 회수한다(카드 원장을 아는 때만 · 던지지 않는다).
+  //   대기 중인 요청이 없으면 아무것도 쓰지 않는다(결과 파일 없는 카드의 동작은 종전과 같다).
+  const reviewLedger = deps.live?.statePath ?? (deps.readCard ? undefined : taskAgentStatePath());
+  if (reviewLedger) {
+    try { captureReviewResults(reviewLedger, { ...(deps.live?.now ? { now: deps.live.now } : {}), ...(deps.log ? { log: deps.log } : {}) }); } catch (error) {
+      // fail-soft — 판단은 계속하되 원인은 남긴다.
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'review-result-capture-failed', { statePath: reviewLedger, reason: (error instanceof Error ? error.message : String(error)).slice(-300) }); } catch { /* fail-soft */ }
+    }
+  }
   const successful = input.results.find(result => result.ok === true && result.worktreePath);
   let card: TaskCard | undefined;
   let cardLookupFailed = false;
@@ -165,7 +179,34 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   }
   const kind = card?.completion;
   const judgeInput = shadowJudgeInput(input.stopReason, input.results, kind);
-  if (input.selfReview) judgeInput.review = input.selfReview.verdict;
+  // 슈퍼바이저가 나른 리뷰가 없으면 그 PR 카드에 회수된 리뷰 결과(pass · 실제로 돈 리뷰 · 머리 sha)를 같은 입력 칸으로 쓴다.
+  let selfReview = input.selfReview;
+  let reviewFromCapture = false;
+  if (!selfReview && reviewLedger && typeof judgeInput.pr === 'number') {
+    try {
+      const reviewedPr = judgeInput.pr;
+      const prRun = input.results.find((result) => result.prNumber === reviewedPr);
+      const prCard = prRun ? (card && successful?.taskId === prRun.taskId ? card : liveCardFor([prRun], deps, input.runId)) : undefined;
+      // 회수한 판정은 «리뷰한 머리»의 것이다 — 지금 PR 머리의 결과만 입력으로 쓴다(A 의 pass 로 B 를 land 쪽으로 보내지 않게 ·
+      //   여러 머리 결과가 역순으로 회수돼도 지금 머리 것을 고른다). 지금 머리 = 그 런 작업 트리에서 PR 머리 조회 ·
+      //   작업 트리가 없으면(Pod) 런이 낸 머리. 못 정하면 쓰지 않는다(종전처럼 review 수 → 새 머리면 새 리뷰).
+      if (prRun && hasCapturedPass(prCard, reviewedPr)) {
+        let currentHead: string | undefined;
+        if (prRun.worktreePath) {
+          const view = await (deps.live?.prHead ?? defaultPrHead)(reviewedPr, prRun.worktreePath).catch(() => null);
+          currentHead = view?.state === 'OPEN' ? view.head : undefined;
+        } else if (prRun.checkedHeadCommit && /^[0-9a-f]{40}$/i.test(prRun.checkedHeadCommit)) {
+          currentHead = prRun.checkedHeadCommit;
+        }
+        if (currentHead) selfReview = capturedSelfReview(prCard, reviewedPr, currentHead);
+      }
+      reviewFromCapture = selfReview !== undefined;
+    } catch (error) {
+      selfReview = undefined;
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'review-result-capture-failed', { pr: judgeInput.pr, reason: (error instanceof Error ? error.message : String(error)).slice(-300) }); } catch { /* fail-soft */ }
+    }
+  }
+  if (selfReview) judgeInput.review = selfReview.verdict;
   const delivery = successful?.worktreePath && card?.project?.target && isDeliveryKind(kind)
     ? { kind, worktreePath: successful.worktreePath, projectTarget: card.project.target, files: selectDeliveryCandidates(successful.worktreePath, kind) }
     : undefined;
@@ -224,10 +265,10 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   const boundCard = delivery
     ? card
     : prResult
-      ? (card && successful?.taskId === prResult.taskId ? card : liveCardFor([prResult], deps))
+      ? (card && successful?.taskId === prResult.taskId ? card : liveCardFor([prResult], deps, input.runId))
       : undefined;
   // PR 에 묶인 수는 그 PR 의 카드만 관측에 싣는다(못 찾으면 null — 다른 결과의 카드로 대체하지 않는다).
-  const liveCard = prResult || delivery ? boundCard : card ?? (cardLookupFailed ? undefined : liveCardFor(input.results, deps));
+  const liveCard = prResult || delivery ? boundCard : card ?? (cardLookupFailed ? undefined : liveCardFor(input.results, deps, input.runId));
   let liveMove: LiveMoveResult | undefined;
   if (live) {
     if (liveKind === 'review') {
@@ -244,7 +285,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
         }, { ...(deps.log ? { log: deps.log } : {}), ...deps.live });
     } else if (liveKind === 'propose-land') {
       liveMove = await executeLiveLand(boundCard, prResult?.prNumber,
-        { runId: input.runId, cycleId: input.cycleId, review: input.selfReview,
+        { runId: input.runId, cycleId: input.cycleId, review: selfReview,
           ...(prResult?.worktreePath ? { cwd: prResult.worktreePath } : {}),
           ...(prResult && !prResult.worktreePath ? { produced: {
             ...(prResult.checkedHeadCommit !== undefined ? { headCommit: prResult.checkedHeadCommit } : {}),
@@ -262,12 +303,59 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   // 판단한 수마다 live/shadow 를 남긴다 — OP 가 «오판 건수»·«그림자 일치율»을 카드·수 종류로 잰다.
   (deps.log ?? ((category, event, data) => debug.log(category, event, data)))('task-agent', 'shadow-move', {
     ...move, completion: shadowCompletion(card, cardLookupFailed), card: liveCard?.id ?? null, live, liveExecuted: liveMove?.executed ?? false, ...(liveMove ? { liveOk: liveMove.ok } : {}),
+    ...(reviewFromCapture ? { reviewSource: 'captured-review-result' } : {}),
   });
+  // TA-LIVE-MOVE-CARD-HISTORY — live-move 수(review·propose-green·propose-land)는 실행이든 그림자든 그 카드 history 에 한 줄.
+  // 결정·실행이 끝난 «뒤»에 덧붙이기만 한다(반환값·관측 무변경) · 실패는 관측만(live-move 를 막지 않는다).
+  if (liveKind !== null) recordLiveMoveOnCard({
+    liveKind, live, liveMove, card: live ? boundCard : liveCard, runId: input.runId,
+    pr: prResult?.prNumber ?? (typeof judgeInput.pr === 'number' ? judgeInput.pr : undefined),
+    shadowDetail: move.wouldDo ?? move.reason,
+  }, deps);
   return liveMove ? { ...move, liveMove } : move;
 }
 
+/**
+ * 카드 history 에 live-move 한 줄 — 상태 파일은 카드를 읽은 곳과 같아야 한다: 주입한 경로(`live.statePath`) 또는
+ * 기본 리더를 썼을 때의 기본 경로. 주입한 카드 리더(`readCard`)만 있고 경로가 없으면 그 카드의 원장을 모른다 — 적지 않는다.
+ */
+function recordLiveMoveOnCard(
+  move: { liveKind: TaskAgentLiveMove; live: boolean; liveMove: LiveMoveResult | undefined; card: TaskCard | undefined; runId: string | null; pr: number | undefined; shadowDetail: string },
+  deps: TaskAgentShadowDeps,
+): void {
+  const log = deps.log ?? ((c: string, e: string, d: Record<string, unknown>) => debug.log(c, e, d, { level: 'warn' }));
+  // 모든 기록 실패(경로 해석 · 시각 · 쓰기 · 카드 없음)는 이유 한 줄로 남기고, live-move 의 반환은 막지 않는다.
+  const fail = (reason: string) => {
+    try {
+      log('task-agent', 'live-move-history-failed', {
+        card: move.card?.id ?? null, kind: move.liveKind, executorResult: move.live ? 'live' : 'shadow', executed: move.liveMove?.executed ?? false, reason,
+      });
+    } catch { /* fail-soft — 관측 seam 자체가 던져도 live-move 는 계속 */ }
+  };
+  try {
+    if (!move.card) { fail('no task card bound to this move'); return; }
+    const statePath = deps.live?.statePath ?? (deps.readCard ? undefined : taskAgentStatePath());
+    if (!statePath) { fail('card ledger unknown (injected readCard without live.statePath)'); return; }
+    const card = move.card;
+    // live 인데 실행부 결과가 없으면 «무엇이 일어났는지» 모른다 — 줄을 지어내지 않고 이유를 남긴다.
+    if (move.live && !move.liveMove) { fail('live move returned no executor result'); return; }
+    // recordLiveMoveHistory 는 쓰기 실패를 스스로 관측하고 던지지 않는다.
+    recordLiveMoveHistory(statePath, card.id, {
+      at: (deps.live?.now ?? (() => new Date()))().toISOString(),
+      kind: move.liveKind,
+      ...(move.live ? { executorResult: 'live' as const, result: move.liveMove! } : { executorResult: 'shadow' as const, shadowDetail: move.shadowDetail }),
+      runId: move.runId,
+      ...(move.pr !== undefined ? { pr: move.pr } : {}),
+      // 실행부가 받은 카드(수 «전» 읽음) — 이번 수가 새로 적은 기록만 머리로 읽는다.
+      before: { reviewRequests: card.reviewRequests, landAttempts: card.landAttempts },
+    }, deps.log ? (c, e, d) => deps.log!(c, e, d) : undefined);
+  } catch (error) {
+    fail(`record preparation failed: ${(error instanceof Error ? error.message : String(error)).slice(-250)}`);
+  }
+}
+
 /** live 수의 카드 — 성공한 결과가 없어도(수확 가능 런은 ok 가 아닐 수 있다) 결과의 taskId · 유일한 발사 문장으로 찾는다. */
-function liveCardFor(results: readonly SupervisorJobResult[], deps: TaskAgentShadowDeps): TaskCard | undefined {
+function liveCardFor(results: readonly SupervisorJobResult[], deps: TaskAgentShadowDeps, runId?: string | null): TaskCard | undefined {
   try {
     for (const result of results) {
       const found = deps.readCard ? deps.readCard(result.taskId) : readTaskCard(result.taskId, deps.live?.statePath);
@@ -275,6 +363,14 @@ function liveCardFor(results: readonly SupervisorJobResult[], deps: TaskAgentSha
     }
     if (deps.readCard) return undefined;
     const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.live?.statePath ?? taskAgentStatePath()).tasks ?? {};
+    // TA-LIVE-LAND-2 — a Pod run's results carry the orchestrator task id, not the card id, and its feature may be the
+    // authored goal rather than the handed sentence. `tasks hand --live` launched this process with ELANOUS_RUN_ID = the
+    // card's runId (TA-CARD-RUN-LINK); the supervisor's runId may be the Pod child's. Either id bound to exactly one card is the match.
+    const inherited = (deps.env ?? process.env)[HARNESS_RUN_ID_ENV]?.trim();
+    for (const id of new Set([runId?.trim(), inherited].filter((value): value is string => !!value))) {
+      const bound = Object.values(tasks).filter((candidate) => candidate.runId === id);
+      if (bound.length === 1) return bound[0];
+    }
     const features = new Set(results.map((result) => result.feature));
     const matches = Object.values(tasks).filter(candidate => candidate.status === 'launched' && features.has(candidate.text));
     return matches.length === 1 ? matches[0] : undefined;

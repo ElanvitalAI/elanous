@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { stripVTControlCharacters } from 'node:util';
 import { Terminal } from '@xterm/headless';
 import { renderDashboardFirstScreenBand } from './index.js';
@@ -16,11 +16,12 @@ test('empty chat history gets a band; lookup updates only its address row', asyn
   let draws = 0;
   const pending = renderDashboardFirstScreenBand({
     history, lines, width: 80,
+    daemonLink: async () => ({ status: 'connected', address: 'http://127.0.0.1:31415' }),
     show: () => new Promise((r) => { resolve = r; }),
     draw: () => { draws++; },
     observe: (value) => observations.push(value),
   });
-  expect(lines).toEqual(buildFirstScreenBand({ width: 80, daemon: false }));
+  expect(lines).toEqual(buildFirstScreenBand({ width: 80, daemon: false, link: { status: 'checking' } }));
   await Promise.resolve();
   resolve({ status: 'registered', urls: {
     pwa: { loopback: 'http://127.0.0.1:3000/app/', tailnet: 'https://example.ts.net/app/' },
@@ -29,12 +30,47 @@ test('empty chat history gets a band; lookup updates only its address row', asyn
   } });
   await pending;
   expect(lines).toEqual([
-    buildFirstScreenBand({ width: 80, daemon: false })[0],
+    buildFirstScreenBand({ width: 80, daemon: false, link: { status: 'connected', address: 'http://127.0.0.1:31415' } })[0],
     buildFirstScreenBand({ width: 80, daemon: true, pwa: { loopback: 'http://127.0.0.1:3000/app/', tailnet: 'https://example.ts.net/app/' } })[1],
     buildFirstScreenBand({ width: 80, daemon: false })[2],
   ]);
   expect(observations).toEqual([{ daemon: true, hasPwa: true, hasTailnet: true }]);
-  expect(draws).toBe(1);
+  expect(draws).toBe(2);
+});
+
+test('daemon link settles independently of PWA and never overwrites a replaced first row', async () => {
+  const lines: string[] = [];
+  let finishLink!: (value: { status: 'absent'; startCommand: string }) => void;
+  let finishPwa!: (value: { status: 'absent' }) => void;
+  const pending = renderDashboardFirstScreenBand({
+    history: [], lines, width: 80,
+    daemonLink: () => new Promise((done) => { finishLink = done; }),
+    show: () => new Promise((done) => { finishPwa = done; }),
+    draw: () => {}, observe: () => {},
+  });
+  expect(lines[0]).toBe('elanous | 데몬: 확인 중');
+  await Promise.resolve();
+  finishLink({ status: 'absent', startCommand: 'elanous --test nexus run --hmr' });
+  await Bun.sleep(0);
+  expect(lines[0]).toBe('elanous | 데몬: 없음 · 시작: elanous --test nexus run --hmr');
+  expect(lines[1]).toBe('PWA: not checked');
+  finishPwa({ status: 'absent' });
+  await pending;
+  expect(lines[0]).toContain('데몬: 없음');
+
+  let finishStale!: (value: { status: 'connected'; address: string }) => void;
+  const staleLines: string[] = [];
+  const stale = renderDashboardFirstScreenBand({
+    history: [], lines: staleLines, width: 80,
+    daemonLink: () => new Promise((done) => { finishStale = done; }),
+    show: async () => ({ status: 'absent' }),
+    draw: () => {}, observe: () => {},
+  });
+  await Promise.resolve();
+  staleLines[0] = 'user-owned row';
+  finishStale({ status: 'connected', address: 'http://127.0.0.1:31415' });
+  await stale;
+  expect(staleLines[0]).toBe('user-owned row');
 });
 
 test('already populated session leaves its transcript untouched without probing', async () => {
@@ -43,6 +79,7 @@ test('already populated session leaves its transcript untouched without probing'
   await renderDashboardFirstScreenBand({
     history: [{ role: 'system' }, { role: 'user' }], lines, width: 80,
     show: async () => { called = true; return { status: 'absent' }; },
+    daemonLink: async () => { called = true; return { status: 'absent', startCommand: 'elanous nexus run --hmr' }; },
     draw: () => {}, observe: () => {},
   });
   expect(lines).toEqual(['restored transcript']);
@@ -55,10 +92,11 @@ test('lookup rejection does not block first screen or log secrets', async () => 
   await renderDashboardFirstScreenBand({
     history: [], lines, width: 60,
     show: async () => { throw new Error('secret-token'); },
+    daemonLink: async () => { throw new Error('secret-link'); },
     draw: () => { throw new Error('should not draw'); },
     observe: (value) => observations.push(value),
   });
-  expect(lines).toEqual(buildFirstScreenBand({ width: 60, daemon: false }));
+  expect(lines).toEqual(buildFirstScreenBand({ width: 60, daemon: false, link: { status: 'error', stage: 'health' } }));
   expect(observations).toEqual([{ daemon: false, hasPwa: false, hasTailnet: false }]);
 });
 
@@ -112,7 +150,11 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
       const footer = frame.findIndex((line, index) => index > header && /^─{8}/.test(line));
       return header >= 0 && footer > header ? frame.slice(header + 1, footer) : [];
     };
-    const before = await waitFor((frame) => historyArea(frame).some((line) => line.includes('Type a message to begin')), 'initial band');
+    const before = await waitFor((frame) => historyArea(frame).some((line) => line.includes('Type a message to begin'))
+      && historyArea(frame).some((line) => line.includes('데몬: 없음')), 'resolved daemon link in real TUI');
+    // `--test=<root>` is an explicit root, so the start command names it (or is dropped when it does not fit).
+    expect(historyArea(before).join('\n')).toContain('데몬: 없음');
+    expect(historyArea(before).join('\n')).not.toContain('시작: elanous --test nexus run');
     expect(historyArea(before).join('\n')).toContain('PWA:');
     expect(historyArea(before).join('\n')).not.toContain('band-retention-probe');
     child.stdin!.write('band-retention-probe\r');
@@ -132,5 +174,48 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
     child.kill();
     await exited;
     terminal.dispose();
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test.skipIf(process.platform === 'darwin')('real TUI shows a healthy write daemon in row zero', async () => {
+  mkdirSync(resolve(import.meta.dir, '../../.elanous-test'), { recursive: true });
+  const testRoot = mkdtempSync(resolve(import.meta.dir, '../../.elanous-test/first-screen-connected-'));
+  writeFileSync(resolve(testRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true } }));
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ ok: true, testUniverse: true }) });
+  const address = `http://127.0.0.1:${server.port}`;
+  const preload = resolve(testRoot, 'write-endpoint.ts');
+  writeFileSync(preload, `import { setResolveDaemonEndpointForTest } from ${JSON.stringify(resolve(import.meta.dir, '../nexus/daemon-endpoint.ts'))};\nsetResolveDaemonEndpointForTest(() => ({baseUrl: ${JSON.stringify(address)}, healthUrl: ${JSON.stringify(`${address}/v1/health`)}, pwaUrl: ${JSON.stringify(`${address}/app/`)}, source: 'registry'}));\n`);
+  const command = ['bun', '--preload', preload, 'bin/elanous.mjs', `--test=${testRoot}`, '--chat-only'];
+  const child = spawn('script', ['-qfec', command.join(' '), '/dev/null'], {
+    cwd: resolve(import.meta.dir, '../..'),
+    env: { ...process.env, NODE_ENV: 'test', TERM: 'xterm-256color', NO_COLOR: '1', COLUMNS: '120', LINES: '48' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const terminal = new Terminal({ cols: 120, rows: 48, scrollback: 200, allowProposedApi: true });
+  let status: number | null | undefined;
+  const exited = new Promise<void>((done) => child.on('exit', (code) => { status = code; done(); }));
+  child.stdout!.on('data', (chunk: Buffer) => terminal.write(chunk.toString()));
+  child.stderr!.on('data', (chunk: Buffer) => terminal.write(chunk.toString()));
+  try {
+    const deadline = Date.now() + 20_000;
+    let connected = false;
+    while (!connected && status === undefined && Date.now() < deadline) {
+      await Bun.sleep(50);
+      await new Promise<void>((done) => terminal.write('', done));
+      const buffer = terminal.buffer.active;
+      const frame = Array.from({ length: terminal.rows }, (_, y) => buffer.getLine(buffer.viewportY + y)?.translateToString(true) ?? '');
+      const header = frame.findIndex((line) => line.includes('ChatLog'));
+      const footer = frame.findIndex((line, index) => index > header && /^─{8}/.test(line));
+      const history = header >= 0 && footer > header ? frame.slice(header + 1, footer) : [];
+      connected = history.some((line) => line.includes(`데몬: 연결됨 (${address})`));
+    }
+    expect(connected).toBe(true);
+  } finally {
+    child.kill();
+    await exited;
+    terminal.dispose();
+    server.stop(true);
+    rmSync(testRoot, { recursive: true, force: true });
   }
 }, 30_000);

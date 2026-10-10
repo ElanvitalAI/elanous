@@ -7,12 +7,13 @@ import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { userConfigPath } from '../user-config.js';
 import { addItem, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
-import { move, releasedVersion } from './feature-store.js';
-import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
-import { parseRubric, rubricScore } from './rubric.js';
+import { assignedVersions, move, releasedVersion } from './feature-store.js';
+import { debug } from '../debug/log.js';
+import { kstDay, listSchedules, type ReleaseSchedule } from './release-schedule.js';
+import { parseRubric, rubricScore, type rubricGrade } from './rubric.js';
 
 export type PlacementPriority = 'P0' | 'P1' | 'P2';
-export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }
+export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; grade?: ReturnType<typeof rubricGrade>; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }
 export interface PlacementDecision { id: string; from: string | null; version: string; reason: string; displaced: Array<{ id: string; from: string; to: string; reason: string }> }
 export interface RebalanceResult {
   decisions: PlacementDecision[];
@@ -24,6 +25,7 @@ export interface PlacementDeps {
   merged24h?: number;
   seatCap?: Record<string, number>;
   ceoDailyCap?: number;
+  ceoCalendar?: CeoCalendar;
   checklist?: typeof listChecklist;
   released?: string;
   dryRun?: boolean;
@@ -85,10 +87,18 @@ export function mergedPrsLast24h(now = new Date()): number {
   return rows.filter((row) => Date.parse(row.mergedAt) >= Date.parse(since) && Date.parse(row.mergedAt) <= now.getTime()).length;
 }
 
-function placementConfig(): { seatCap?: Record<string, number>; ceoDailyCap?: number } {
-  const path = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
+export interface CeoCalendar {
+  /** KST inclusive term ranges. A term cap can tighten the normal daily budget. */
+  terms?: Array<{ from: string; to: string; dailyCap: number }>;
+  /** KST event days explicitly override the term/normal cap, including exceptions with extra time. */
+  events?: Record<string, number>;
+}
+
+function placementConfig(root?: string): { seatCap?: Record<string, number>; ceoDailyCap?: number; ceoCalendar?: CeoCalendar } {
+  const path = root !== undefined ? join(root, 'config.json')
+    : getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
   if (!existsSync(path)) return {};
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { placement?: { seatCap?: Record<string, number>; ceoDailyCap?: number } } };
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { placement?: { seatCap?: Record<string, number>; ceoDailyCap?: number; ceoCalendar?: CeoCalendar } } };
   return raw.release?.placement ?? {};
 }
 
@@ -100,23 +110,69 @@ function validCeoCap(cap: number): number {
 
 export function placementCeoDailyCap(): number { return validCeoCap(placementConfig().ceoDailyCap ?? 30); }
 
+function validDay(day: string): boolean {
+  return typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`))
+    && new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day;
+}
+
+function calendarCap(day: string, cap: number, calendar: CeoCalendar): number {
+  if (!calendar || (calendar.terms !== undefined && !Array.isArray(calendar.terms))
+    || (calendar.events !== undefined && (!calendar.events || typeof calendar.events !== 'object' || Array.isArray(calendar.events))))
+    throw new CliUserError('잘못된 대표 달력: release.placement.ceoCalendar');
+  let effective = cap;
+  for (const term of calendar.terms ?? []) {
+    if (!term || typeof term !== 'object') throw new CliUserError('잘못된 대표 학기 달력: release.placement.ceoCalendar.terms');
+    if (!validDay(term.from) || !validDay(term.to) || term.from > term.to) throw new CliUserError('잘못된 대표 학기 달력 날짜: release.placement.ceoCalendar.terms');
+    validCeoCap(term.dailyCap);
+    if (term.from <= day && day <= term.to) effective = Math.min(effective, term.dailyCap);
+  }
+  for (const [date, eventCap] of Object.entries(calendar.events ?? {})) {
+    if (!validDay(date)) throw new CliUserError('잘못된 대표 행사 달력 날짜: release.placement.ceoCalendar.events');
+    validCeoCap(eventCap);
+  }
+  return calendar.events?.[day] ?? effective;
+}
+
 /** Explicit day wins; otherwise a cell uses the target release's landing day in KST. */
 function ceoDay(item: { ceoDate?: string }, row: ReleaseSchedule): string {
-  return item.ceoDate ?? new Date(Date.parse(row.landBy!) + 9 * 3_600_000).toISOString().slice(0, 10);
+  return item.ceoDate ?? kstDay(row.landBy!);
 }
 
 type CeoWork = Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>;
-function ceoOverload(item: CeoWork, row: ReleaseSchedule, snapshots: Map<string, { items: CeoWork[] }>, schedules: ReleaseSchedule[], cap: number): string | null {
+function ceoOverload(item: CeoWork, row: ReleaseSchedule, snapshots: Map<string, { items: CeoWork[] }>, schedules: ReleaseSchedule[], cap: number, calendar: CeoCalendar = {}): string | null {
   if (!item.ceoMinutes) return null;
   const day = ceoDay(item, row);
+  const limit = calendarCap(day, cap, calendar);
   const peers = [...snapshots].flatMap(([version, snapshot]) => {
     const schedule = schedules.find((candidate) => candidate.version === version);
     return snapshot.items.filter((other) => other.id !== item.id && other.ceoMinutes
       && (other.ceoDate === day || (!other.ceoDate && schedule?.landBy && ceoDay(other, schedule) === day)));
   });
   const total = item.ceoMinutes + peers.reduce((sum, other) => sum + other.ceoMinutes!, 0);
-  if (total <= cap) return null;
-  return `대표 손 과부하 ${day} KST: ${[...peers.map((peer) => `${peer.id} ${peer.ceoMinutes}분`), `${item.id} ${item.ceoMinutes}분`].join(' + ')} = ${total}분 > 하루 상한 ${cap}분 — 늦추기(다음 날짜/판) · 자리 대행(대표 분량 축소) · 묶기(촬영·승인 합산 분량 축소)를 제안`;
+  if (total <= limit) return null;
+  const reason = `대표 손 과부하 ${day} KST: ${[...peers.map((peer) => `${peer.id} ${peer.ceoMinutes}분`), `${item.id} ${item.ceoMinutes}분`].join(' + ')} = ${total}분 > 하루 상한 ${limit}분 — 늦추기(다음 날짜/판) · 자리 대행(대표 분량 축소) · 묶기(촬영·승인 합산 분량 축소)를 제안`;
+  debug.log('release.placement', 'ceo-overload', { day, id: item.id, total, cap: limit, reason });
+  return reason;
+}
+
+/** Called by setSchedule before a landing-day change can overload an already placed cell. */
+export function checkScheduleCeoLoad(version: string, landBy: string, root?: string): void {
+  const schedules = listSchedules(root);
+  const proposed = schedules.some((row) => row.version === version)
+    ? schedules.map((row) => row.version === version ? { ...row, landBy } : row)
+    : [...schedules, { version, cutAt: landBy, landBy, updatedAt: '', updatedBy: '' }];
+  const target = proposed.find((row) => row.version === version)!;
+  const targetItems = listChecklist(version, root).items;
+  const changed = targetItems.filter((item) => item.ceoMinutes && !item.ceoDate);
+  if (!changed.length) return;
+  const versions = [...new Set([...proposed.map((row) => row.version), ...assignedVersions(root)])];
+  const snapshots = new Map(versions.map((v) => [v, { items: v === version ? targetItems : listChecklist(v, root).items }]));
+  const config = placementConfig(root);
+  const cap = validCeoCap(config.ceoDailyCap ?? 30);
+  for (const item of changed) {
+    const issue = ceoOverload(item, target, snapshots, proposed, cap, config.ceoCalendar);
+    if (issue) throw new CliUserError(issue);
+  }
 }
 
 function dependencyViolation(
@@ -161,6 +217,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   validateCeoLoad(input);
   const seat = parseOwner(input.owner).seat;
   if (!['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
+  if (input.grade !== undefined && !['P1', 'P2', 'P3', 'P4'].includes(input.grade)) throw new CliUserError(`잘못된 루브릭 등급: ${input.grade}`);
   if (input.accelerator !== undefined && input.accelerator !== true && input.accelerator !== false) throw new CliUserError('가속 등급은 true 이거나 생략한다');
   const now = (deps.now ?? new Date()).getTime();
   const schedules = [...(deps.schedules ?? listSchedules())].sort((a, b) => versionOrder(a.version, b.version));
@@ -171,6 +228,9 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   const snapshots = new Map(sources.map((version) => [version, (deps.checklist ?? listChecklist)(version)]));
   const { locations, conflict } = cellLocations([...snapshots].map(([version, snapshot]) => [version, snapshot.items] as [string, readonly { id: string }[]]), released, backlog);
   if (conflict) throw new CliUserError(`여러 판의 같은 칸: ${conflict}`);
+  if (input.ceoMinutes || [...snapshots.values()].some((snapshot) => snapshot.items.some((item) => item.id === input.id && item.ceoMinutes))) {
+    for (const version of assignedVersions()) if (!snapshots.has(version)) snapshots.set(version, (deps.checklist ?? listChecklist)(version));
+  }
   // A backlog copy never outranks a scheduled cell with the same id.
   for (const version of backlog) for (const item of snapshots.get(version)?.items ?? []) if (!locations.has(item.id)) locations.set(item.id, version);
   const from = locations.get(input.id) ?? null;
@@ -181,6 +241,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   const accelerator = input.accelerator === true || (input.accelerator === undefined && existing?.accelerator === true);
   const load = { id: input.id, ceoMinutes: input.ceoMinutes ?? existing?.ceoMinutes, ceoDate: input.ceoDate ?? existing?.ceoDate };
   const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
+  const ceoCalendar = deps.ceoCalendar ?? placementConfig().ceoCalendar ?? {};
   const predecessors = input.predecessors.map((id) => {
     const version = locations.get(id);
     if (!version) throw new CliUserError(`없는 선행 칸: ${id}`);
@@ -197,9 +258,12 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   if (input.priority === 'P1' && !deadlineVersion) throw new CliUserError(`P1 칸의 마감 판이 없다: ${input.id}`);
   if (input.priority !== 'P0' && deadlineVersion && !schedules.some((row) => row.version === deadlineVersion)) throw new CliUserError(`없는 마감 판: ${deadlineVersion}`);
   const eligible = open.filter((row) => predecessors.every((v) => versionOrder(row.version, v) > 0));
+  // Rubric grades rank discretionary placement, not incident/deadline priority. A P4 needs a separate merge/drop decision.
+  if (input.priority === 'P2' && input.grade === 'P4') throw new CliUserError(`${input.id} 배치할 판이 없다 — 루브릭 P4 칸은 합치거나 빼야 한다`);
+  const discretionary = eligible.filter((row) => !deadlineVersion || versionOrder(row.version, deadlineVersion) <= 0);
   const candidates = input.priority === 'P0' ? eligible.filter((row) => row.version === first?.version)
     : input.priority === 'P1' ? eligible.filter((row) => row.version === deadlineVersion)
-      : eligible.filter((row) => !deadlineVersion || versionOrder(row.version, deadlineVersion) <= 0);
+      : input.grade === 'P3' ? discretionary.reverse() : discretionary;
 
   const occupied = (version: string) => snapshots.get(version)!.items.filter((item) => item.status !== 'done' && item.id !== input.id);
   const capacity = (row: ReleaseSchedule) => Math.floor(rate * (Date.parse(row.landBy!) - now) / 86_400_000 * 0.7);
@@ -207,12 +271,13 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
   let chosen: ReleaseSchedule | undefined;
   let loadIssue: string | null = null;
   const feasible = candidates.filter((row) => !dependencyViolation(snapshots, locations, new Map([[input.id, row.version]]), input, released));
-  // 판은 «마감 안 가장 이른 판»부터 본다(기존 불변식). 가속 등급은 그 판이 찼을 때 같은 우선순위 비가속 칸을 밀 수 있게만 한다.
+  // Without a deferral grade, keep the earliest eligible release; P3 starts at the latest eligible release.
+  // Accelerator displacement still only affects an otherwise full candidate.
   for (const row of feasible) {
     const placement = new Map([[input.id, row.version]]);
     const items = occupied(row.version);
     const seatItems = items.filter((item) => ownerMatches(item.owner, seat));
-    const directIssue = ceoOverload(load, row, snapshots, schedules, ceoCap);
+    const directIssue = ceoOverload(load, row, snapshots, schedules, ceoCap, ceoCalendar);
     if (items.length < capacity(row) && seatItems.length < seatLimit) {
       if (directIssue) { loadIssue ??= directIssue; continue; }
       chosen = row;
@@ -238,8 +303,8 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
       const proposed = new Map<string, { items: CeoWork[] }>([...snapshots].map(([version, snapshot]) => [version, { items: snapshot.items.filter((cell) => cell.id !== input.id && cell.id !== item.id) }]));
       proposed.get(row.version)!.items.push(load);
       proposed.get(next.version)!.items.push(item);
-      const issue = ceoOverload(load, row, proposed, schedules, ceoCap)
-        ?? ceoOverload(item, next, proposed, schedules, ceoCap);
+      const issue = ceoOverload(load, row, proposed, schedules, ceoCap, ceoCalendar)
+        ?? ceoOverload(item, next, proposed, schedules, ceoCap, ceoCalendar);
       if (issue) { loadIssue ??= issue; return false; }
       return true;
     });
@@ -253,7 +318,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
     loadIssue ??= directIssue;
   }
   if (!chosen) throw new CliUserError(loadIssue ?? `${input.id} 배치할 판이 없다 — 용량·선행·마감·동결을 확인하라`);
-  const reason = `${accelerator ? '가속 등급 · ' : ''}${input.priority} ${input.priority === 'P0' ? '사고·회귀·발행 막음: 다음 판' : input.priority === 'P1' ? `지시·행사 마감 판 ${deadlineVersion}` : '착지 마감 내 가장 이른 여유 판'}${accelerator ? ' · 같은 우선순위 안에서 가속 등급을 먼저' : ''} · PR/24h ${rate} · 용량 ${capacity(chosen)} · 자리 ${seatLimit}`;
+  const reason = `${accelerator ? '가속 등급 · ' : ''}${input.priority} ${input.priority === 'P0' ? '사고·회귀·발행 막음: 다음 판' : input.priority === 'P1' ? `지시·행사 마감 판 ${deadlineVersion}` : input.grade === 'P3' ? '루브릭 P3: 착지 마감 내 가장 늦은 여유 판부터' : '착지 마감 내 가장 이른 여유 판'}${accelerator ? ' · 같은 우선순위 안에서 가속 등급을 먼저' : ''} · PR/24h ${rate} · 용량 ${capacity(chosen)} · 자리 ${seatLimit}`;
   const decision = { id: input.id, from, version: chosen.version, reason, displaced };
   if (!deps.dryRun) {
     const by = deps.by ?? 'OP';
@@ -268,7 +333,7 @@ export function placeCell(input: PlacementCell, deps: PlacementDeps = {}): Place
 
 function moveConstraint(
   item: ChecklistItem, to: ReleaseSchedule, backlog: readonly string[],
-  snapshots: Map<string, ChecklistItem[]>, now: number, rate: number, caps: Record<string, number>, rows: ReleaseSchedule[], ceoCap: number,
+  snapshots: Map<string, ChecklistItem[]>, now: number, rate: number, caps: Record<string, number>, rows: ReleaseSchedule[], ceoCap: number, calendar: CeoCalendar,
   released: string | null | undefined,
 ): string | null {
   if (!to.landBy || !available(to, now, backlog)) return '착지 마감이 지났거나 백로그 판이라 이동 불가';
@@ -278,8 +343,11 @@ function moveConstraint(
   const destination = snapshots.get(to.version) ?? [];
   if (destination.filter((cell) => cell.status !== 'done').length >= Math.floor(rate * (Date.parse(to.landBy) - now) / 86_400_000 * 0.7)) return '다음 판 PR 용량 초과';
   if (destination.filter((cell) => cell.status !== 'done' && ownerMatches(cell.owner, seat)).length >= (caps[seat] ?? Infinity)) return '다음 판 자리 용량 초과';
-  const loadIssue = ceoOverload(item, to, new Map([...snapshots].map(([version, items]) => [version, { items }])),
-    rows, ceoCap);
+  const ceoSnapshots = new Map([...snapshots].map(([version, items]) => [version, { items }]));
+  if (item.ceoMinutes) for (const version of assignedVersions()) {
+    if (!ceoSnapshots.has(version)) ceoSnapshots.set(version, { items: listChecklist(version).items });
+  }
+  const loadIssue = ceoOverload(item, to, ceoSnapshots, rows, ceoCap, calendar);
   if (loadIssue) return loadIssue;
   const { locations, conflict } = cellLocations(snapshots, released);
   if (conflict) return `여러 판의 같은 칸: ${conflict}`;
@@ -321,9 +389,10 @@ export function rebalance(version: string, deps: PlacementDeps = {}): RebalanceR
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
   const caps = deps.seatCap ?? placementSeatCap();
   const ceoCap = validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap());
+  const ceoCalendar = deps.ceoCalendar ?? placementConfig().ceoCalendar ?? {};
   const result: RebalanceResult = { decisions: [], blocked: [] };
   for (const { item, score } of unstarted) {
-    const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap, deps.released ?? releasedVersion());
+    const violation = moveConstraint(item, next!, backlog, snapshots, now, rate, caps, rows, ceoCap, ceoCalendar, deps.released ?? releasedVersion());
     if (violation) {
       result.blocked.push({ id: item.id, from: version, to: next!.version, reason: violation });
       continue;
@@ -349,7 +418,7 @@ export function seatMove(id: string, from: string, to: string, by: string, reaso
   if (!ownerMatches(item.owner, parseOwner(by).seat) || next?.version !== to) throw new CliUserError('남의 칸 당기기 거부 — COO 에 요청');
   const now = (deps.now ?? new Date()).getTime();
   const rate = deps.merged24h ?? mergedPrsLast24h(new Date(now));
-  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()), deps.released ?? releasedVersion());
+  const violation = moveConstraint(item, next, backlog, snapshots, now, rate, deps.seatCap ?? placementSeatCap(), rows, validCeoCap(deps.ceoDailyCap ?? placementCeoDailyCap()), deps.ceoCalendar ?? placementConfig().ceoCalendar ?? {}, deps.released ?? releasedVersion());
   if (violation) throw new CliUserError(`${id}: ${violation}`);
   if (!deps.dryRun) move(id, from, to, by, undefined, undefined, reason);
 }

@@ -385,13 +385,18 @@ function buildCatalog(): Catalog {
   };
 }
 
+/** 시험 런타임(NODE_ENV=test)은 카탈로그 스냅숏을 기본 경로에서 접지 않는다 — 이 판정을 쓰는 쪽(자식 모델 형식 검사)과 공유한다. */
+export function isolatedCatalogTestUniverse(): boolean {
+  return process.env.NODE_ENV === 'test';
+}
+
 /** 폴드할 스냅숏을 고른다. ⛔ 시험 런타임은 preload 가 config-dir 를 격리하지 않아 실제
  *  `~/.elanous/discovery-snapshot.json` 을 읽게 되므로(=기계마다 다른 카탈로그), 경로를 «명시»했을
  *  때만 접는다. 운영은 기본 경로를 읽고, 없으면 «모른다»(null) — 접을 것이 없을 뿐 오류가 아니다. */
 function loadFoldSnapshot(): DiscoverySnapshot | null {
   const explicit = process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT?.trim();
   if (explicit) return readDiscoveryCache({ cachePath: explicit });
-  if (process.env.NODE_ENV === 'test') return null;
+  if (isolatedCatalogTestUniverse()) return null;
   return readDiscoveryCache();
 }
 

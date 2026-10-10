@@ -9,6 +9,7 @@ import { MODEL_TIERS } from '../model-tier/types.js';
 import { listModelAliases, resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { resolveRoleLlm } from '../user-config.js';
 import { auditRoutingDrift, summarizeRoutingDrift } from './llm-routing-drift.js';
+import { resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 
 describe('catalog drift — 파생 핀이 catalog SSoT 와 정합(2026-07-15)', () => {
   it('catalog active id + familyShortcut 로드(grok-4.5 SSoT 반영)', () => {
@@ -104,6 +105,10 @@ describe('catalog drift — 파생 핀이 catalog SSoT 와 정합(2026-07-15)', 
       kimi: ['kimi-k3'],
       qwen: ['qwen3.8-27b', 'qwen3.8-flash', 'qwen3.8-max'],
       glm: ['glm-5.3', 'glm-5.3-flash'],
+      // 📏 2026-10-11 (BEDROCK-PROVIDER #25966): Bedrock 와이어 id(`anthropic.` 접두)는 카탈로그 레코드가 없다 —
+      //   가격·창은 1st-party `claude-*-5-5` 레코드와 «같은 모델»이지만 Bedrock 단가는 파트너 책정이라 비용 표는 범위 밖.
+      //   사다리 status 는 `wip`(실호출 전). 레코드를 더하면 이 줄을 지운다.
+      bedrock: ['anthropic.claude-haiku-5-5', 'anthropic.claude-opus-5-5', 'anthropic.claude-sonnet-5-5'],
     });
 
     // ⭐ 그리고 ***닿는 쪽은 「전부」 닿아야 한다*** — 이 줄이 본래 목적(회귀 방어)이다.
@@ -169,6 +174,39 @@ describe('catalog drift — 파생 핀이 catalog SSoT 와 정합(2026-07-15)', 
     //    2_000_000 은 4.5 이전 세대 값이 남아 있던 것.
     expect(f?.contextSize).toBe(500_000);
     expect(catalogModelFacts('grok-3-mini')).toBeNull(); // 미등재
+  });
+
+  it('gpt-6 sol·luna·astra 는 창·출력 상한을 SSoT 에 싣는다 (MODEL-ROUTING-MATRIX 10-10)', () => {
+    // 📏 출처: OpenAI 모델 문서(09-23) ⊕ OpenRouter /api/v1/models 실호출(10-10) — luna 의 출력 상한만 OpenRouter 하나다.
+    //   비어 있으면 resolver 의 minContextSize 판정이 `contextSize ?? 0` 으로 읽어 이 모델을 떨군다.
+    const catalog = reloadCatalog();
+    for (const id of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra']) {
+      expect(catalogModelFacts(id)?.contextSize).toBe(1_050_000);
+      expect(catalog.models.get(id)?.outputMaxTokens).toBe(128_000);
+    }
+  });
+
+  it('claude 5.5 세대 ⊕ sonnet-5 정정 ⊕ opus-5-5 출력 — 창 1M · 출력 128K (Anthropic 공식 10-10)', () => {
+    const catalog = reloadCatalog();
+    for (const id of ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-sonnet-5', 'claude-opus-5-5']) {
+      expect(catalogModelFacts(id)?.contextSize).toBe(1_000_000);
+      expect(catalog.models.get(id)?.outputMaxTokens).toBe(128_000);
+    }
+    expect(catalogModelFacts('claude-sonnet-5-5')?.pricing).toMatchObject({ inputPerMTok: 2, outputPerMTok: 10 });
+    expect(catalogModelFacts('claude-haiku-5-5')?.pricing).toMatchObject({ inputPerMTok: 0.1, outputPerMTok: 0.5 });
+    // 맨몸 별칭은 옮기지 않았다 — 옮기는 것은 라우팅 변경이라 별개 결정이다.
+    expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
+    expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5');
+  });
+
+  it('--child-llm-model 이 claude 5.5 세대를 해석한다 (점·하이픈 둘 다) · 없는 판은 여전히 거부', () => {
+    // 🩸 UX 10-10 17:36 실측: `--child-llm-model claude-haiku-5.5` → «알 수 없음 · 후보: … claude-haiku-4-5 · claude-sonnet-5».
+    expect(resolveImplementationChildModel('anthropic', 'claude-haiku-5.5').resolvedId).toBe('claude-haiku-5-5');
+    expect(resolveImplementationChildModel('anthropic', 'claude-haiku-5-5').resolvedId).toBe('claude-haiku-5-5');
+    expect(resolveImplementationChildModel('anthropic', 'claude-sonnet-5.5').resolvedId).toBe('claude-sonnet-5-5');
+    expect(resolveImplementationChildModel('anthropic', 'claude-sonnet-5-5').resolvedId).toBe('claude-sonnet-5-5');
+    // 대조군 — 해석기가 «무엇이든 통과»시키지 않는지.
+    expect(() => resolveImplementationChildModel('anthropic', 'claude-haiku-9-9')).toThrow('--child-llm-model 알 수 없음');
   });
 
   it('family alias 최신성은 기존 pin 감사 결과에 비차단 값으로 연결되고 실제 별칭을 엄격히 판정한다', () => {

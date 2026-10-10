@@ -17,11 +17,15 @@ import { resolveGrokCredential } from '../src/grok/credential.js';
 import { debug } from '../src/debug/log.js';
 import { getOpenAiRelaySharedSecret, hydrateEnvFromKeyCache } from '../src/config.js';
 import { registerLogStoreSink } from '../src/mss/logging/log-store.js';
+import { getUserConfig } from '../src/user-config.js';
 
 // ⛔ 독립 프로세스라 데몬의 부팅 배선을 안 탄다 — 스토어 싱크를 «직접» 단다.
 //    이걸 안 달면 debug.log 가 화면에만 남고 `elanous logs` 조회에 «영영 안 닿는다»
 //    (2026-08-23 실측: nexus.openai-relay 는 닿았고 이 프로세스 자기 로그는 0건이었다).
-registerLogStoreSink(debug.registerSink.bind(debug), 'openai-relay');
+// 🩸 10-09 22:2x: 보존 설정 없이 등록하면 기본 상한 500MB 로 시작 보존이 돈다 — 운영 config 는 4000MB 인데
+//    레일 설치마다 재기동되는 이 프로세스가 1.1GB logs.db 의 행을 최대 50% 지웠다(«지운 주체가 안 보이는» 소실).
+//    다른 독립 스크립트처럼 config 의 보존 값을 넘긴다.
+registerLogStoreSink(debug.registerSink.bind(debug), 'openai-relay', getUserConfig().logs.retention);
 
 const MODELS_PATH = '/v1/models';
 const HEALTH_PATH = '/healthz';

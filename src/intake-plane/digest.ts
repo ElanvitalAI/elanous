@@ -9,7 +9,8 @@ import { intakeOutboxDir, kstDay } from './route.js';
 
 export type DigestLensVerdict = '대체 후보' | '보강' | '경쟁 대조';
 export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
-export interface IntakeDigest { day: string; seat?: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
+export interface DigestLedgerEntry { id: string; title: string; url: string; verdict: DigestLensVerdict | '참고' | '판정 대기' }
+export interface IntakeDigest { day: string; seat?: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; xTrends?: DigestLedgerEntry[]; githubNew?: DigestLedgerEntry[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
 const AXIS_LABEL: Record<string, string> = {
   video_automation: '영상 자동화', agent_basics: '에이전트 기본', agent_applied: '에이전트 응용', unrelated: '그 밖',
@@ -69,29 +70,31 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
   const briefedEarlier = new Set(selectedSeat
     ? readJsonl(seatBriefFile(root, selectedSeat)).filter((r) => typeof r.id === 'string' && r.day !== day).map((r) => r.id as string)
     : []);
-  const items = [...loadIntakeLedger(root).items.values()]
+  const ledgerItems = [...loadIntakeLedger(root).items.values()];
+  const items = ledgerItems
     .filter((i) => (selectedSeat === undefined || (i.seat === selectedSeat && !briefedEarlier.has(i.id)))
       && (selectedSeat ? i.status !== 'discarded' : (i.status === 'absorbed' || i.status === 'routed') && i.outputs.some((o) => o.kind === 'note'))
       && kstDay(i.lastSeenAt) === day);
   const out = intakeOutboxDir(root);
-  const relevant = new Map<string, NonNullable<DigestEntry['impact']>>();
-  // The lens (src/intake-plane/lens.ts) writes its verdicts to outbox/lens/<day>.jsonl; route folders carry none.
-  for (const folder of ['lens'] as const) {
-    for (const row of readJsonl(join(out, folder, `${day}.jsonl`))) {
-      if (typeof row.id !== 'string' || relevant.has(row.id)) continue;
-      const verdict = row.lensVerdict;
-      if (verdict !== '대체 후보' && verdict !== '보강' && verdict !== '경쟁 대조') continue;
-      const why = typeof row.why === 'string' ? row.why.trim() : '';
-      const target = typeof row.target === 'string' ? row.target.trim() : '';
-      // A check's fact/current or repo path is evidence, not a lens judgement or a reason for us.
-      if (!why || !target || pathOnly(why)) continue;
-      relevant.set(row.id, { verdict, why, target });
-    }
+  const allLensRows = readJsonl(join(out, 'lens', `${day}.jsonl`));
+  const ledgerDecisions = new Map<string, { verdict: Exclude<DigestLedgerEntry['verdict'], '판정 대기'>; why: string; target: string }>();
+  // The first valid lens row owns an ID's verdict for both absorbed notes and same-day ledger sections.
+  for (const row of allLensRows) {
+    if (typeof row.id !== 'string' || ledgerDecisions.has(row.id)) continue;
+    const verdict = row.lensVerdict;
+    if (verdict !== '대체 후보' && verdict !== '보강' && verdict !== '경쟁 대조' && verdict !== '참고') continue;
+    const why = typeof row.why === 'string' ? row.why.trim() : '';
+    const target = typeof row.target === 'string' ? row.target.trim() : '';
+    // A check's fact/current or repo path is evidence, not a lens judgement or a reason for us.
+    if (!why || !target || pathOnly(why)) continue;
+    ledgerDecisions.set(row.id, { verdict, why, target });
   }
   const absorbed = items.map((i: IntakeItem): DigestEntry => {
     const note = [...i.outputs].reverse().find((o) => o.kind === 'note')?.ref;
     const md = note ? readFile(note) : undefined;
-    const impact = relevant.get(i.id);
+    const decision = ledgerDecisions.get(i.id);
+    const impact = decision && decision.verdict !== '참고'
+      ? { verdict: decision.verdict, why: decision.why, target: decision.target } : undefined;
     return {
       id: i.id, sources: i.sources, ...(i.url ? { url: i.url } : {}),
       ...(note ? { note, noteName: basename(note, '.md') } : {}),
@@ -101,11 +104,19 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
     };
   });
   const goals = selectedSeat ? [] : readJsonl(join(out, 'goals', `${day}.jsonl`)).map((g) => ({ fact: String(g.fact ?? ''), ...(g.url ? { url: String(g.url) } : {}) }));
-  const lensRows = selectedSeat ? [] : readJsonl(join(out, 'lens', `${day}.jsonl`));
+  const lensRows = selectedSeat ? [] : allLensRows;
   const news = lensRows.flatMap((row) =>
     typeof row.title === 'string' && typeof row.url === 'string' && Array.isArray(row.summary) && Array.isArray(row.implication)
       ? [{ title: row.title, url: row.url, summary: row.summary.filter((s): s is string => typeof s === 'string'), implication: row.implication.filter((s): s is string => typeof s === 'string') }]
       : []);
+  const ledgerEntry = (item: IntakeItem): DigestLedgerEntry => ({
+    id: item.id, title: item.title?.trim() || item.url!, url: item.url!,
+    verdict: ledgerDecisions.get(item.id)?.verdict ?? '판정 대기',
+  });
+  const sameDayLedger = selectedSeat ? [] : ledgerItems
+    .filter((item) => item.status !== 'discarded' && item.url && kstDay(item.lastSeenAt) === day);
+  const xTrends = sameDayLedger.filter((item) => item.sources.includes('x')).map(ledgerEntry);
+  const githubNew = sameDayLedger.filter((item) => item.sources.includes('github')).map(ledgerEntry);
   const shadowSuggestions = lensRows.flatMap((row) =>
     Array.isArray(row.suggestions) ? row.suggestions.flatMap((raw: unknown) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
@@ -118,7 +129,7 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
   const lastNewAt = selectedSeat ? undefined : readSavedCursorAt(root);
   const silentMs = lastNewAt ? now.getTime() - Date.parse(lastNewAt) : NaN;
   return {
-    day, ...(selectedSeat ? { seat: selectedSeat } : {}), absorbed, goals, ...(news.length ? { news } : {}), ...(shadowSuggestions.length ? { shadowSuggestions } : {}), review, grounding,
+    day, ...(selectedSeat ? { seat: selectedSeat } : {}), absorbed, goals, ...(news.length ? { news } : {}), ...(xTrends.length ? { xTrends } : {}), ...(githubNew.length ? { githubNew } : {}), ...(shadowSuggestions.length ? { shadowSuggestions } : {}), review, grounding,
     release: selectedSeat ? 0 : readJsonl(join(out, 'release', `${day}.jsonl`)).length,
     manual: selectedSeat ? 0 : readJsonl(join(out, 'manual', `${day}.jsonl`)).length,
     ...(!selectedSeat && lastNewAt && silentMs > SAVED_SILENCE_MS ? { savedSilence: { days: Math.floor(silentMs / 86_400_000), lastNewAt } } : {}),
@@ -142,8 +153,10 @@ function digestReferenceLine(entries: DigestEntry[]): string {
 export function renderDigestMarkdown(d: IntakeDigest): string {
   const L: string[] = [`## 📰 오늘의 흡수 요약 (${d.absorbed.length})`, ''];
   if (d.savedSilence) L.push(`> ⚠️ 텔레그램 «저장된 메시지»에서 새 글을 ${d.savedSilence.days}일째 못 받았다(마지막 새 글 수집 ${kstDay(d.savedSilence.lastNewAt)}) — 저장했는데 안 들어왔다면 저장한 곳(본인 «저장된 메시지»인지)을 확인한다.`, '');
-  if (!d.absorbed.length) L.push('오늘 흡수한 것이 없다.', '');
-  if (!d.absorbed.length && !d.news?.length) return L.join('\n');
+  if (!d.absorbed.length && !d.news?.length && !d.xTrends?.length && !d.githubNew?.length) {
+    L.push('오늘 흡수한 것이 없다.', '');
+    return L.join('\n');
+  }
   const byAxis = new Map<string, DigestEntry[]>();
   for (const e of d.absorbed) (byAxis.get(e.axis) ?? byAxis.set(e.axis, []).get(e.axis)!).push(e);
   for (const [axis, rows] of byAxis) {
@@ -158,6 +171,12 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
       for (const line of article.summary) L.push(`  - ${line}`);
       for (const line of article.implication) L.push(`  - 엘라누스 함의: ${line}`);
     }
+    L.push('');
+  }
+  for (const [heading, entries] of [['X 트렌드', d.xTrends], ['GitHub 신규', d.githubNew]] as const) {
+    if (!entries?.length) continue;
+    L.push(`### ${heading} (${entries.length})`, '');
+    for (const entry of entries) L.push(`- [${entry.title}](${entry.url}) — ${entry.verdict}`);
     L.push('');
   }
   if (d.goals.length) {
@@ -189,6 +208,12 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
     L.push(article.url);
   }
   if (d.shadowSuggestions?.length) L.push(`뉴스 칸 제안 ${d.shadowSuggestions.length}건 (그림자·판 미등록): ${d.shadowSuggestions.slice(0, 3).map((s) => `[${s.verdict}] ${s.fact}${s.url ? ` ${s.url}` : ''}`).join(' · ')}`);
+  for (const [heading, entries] of [['X 트렌드', d.xTrends], ['GitHub 신규', d.githubNew]] as const) {
+    if (!entries?.length) continue;
+    L.push('', `${heading} (${entries.length})`);
+    for (const entry of entries.slice(0, 5)) L.push(`- [${entry.verdict}] ${entry.title} — ${entry.url}`);
+    if (entries.length > 5) L.push(`외 ${entries.length - 5}건 · 원장 \`elanous intake items\``);
+  }
   // At most three items are shown, each as its own S·C·A·note block so context and source stay paired.
   // S must be the note's own summary: items without one still count as touching but are not shown (ACP must-fix).
   const shownItems = touching.filter((e) => e.oneLiner?.trim()).slice(0, 3);

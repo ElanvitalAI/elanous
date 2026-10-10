@@ -1,15 +1,25 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
+import { resetUserConfig, setUserConfigOverlay } from '../../user-config.js';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { UserConfig } from '../../user-config.js';
+import { roleForKind } from '../../domains/telegram-kind-route.js';
 import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
+import { ConsultLimiter, ConsultQueue, handleConsultPost, validateConsult } from '../../hooks/consult-intake.js';
 import { routeRequest } from './http-server.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  setUserConfigOverlay(null);
+  resetElanousConfigDir();
+  resetUserConfig();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'consult-requests-'));
@@ -23,7 +33,7 @@ function fixture() {
     metaApi: { bearerToken: 'owner-secret', noAuth: false },
     consultRequests: {
       root: () => root, now: () => '2026-10-02T06:00:00.000Z',
-      send: (text: string, kind = 'alert') => { notifications.push({ text, kind }); return true; },
+      send: (text: string, kind = 'ops-alert') => { notifications.push({ text, kind }); return true; },
     },
   };
   const call = (path: string, method = 'GET', body?: unknown, auth: 'owner' | 'same-origin' | 'none' | 'forged' = 'owner') => routeRequest(
@@ -55,15 +65,18 @@ test('authenticated POST records a private 0600 JSONL receipt and sends one cont
   expect(journal).toHaveLength(1);
   expect(JSON.parse(journal[0]!)).toEqual({ ...valid, ...receipt });
   expect(readdirSync(join(root, 'consult-requests'))).toEqual(['requests.jsonl']);
-  expect(notifications).toEqual([{ text: `📮 상담 문의 ${receipt.receiptId} · 홍길동(AX 연구소) · 관심 A\n앱에서 보기`, kind: 'alert' }]);
+  expect(notifications).toEqual([{ text: `📮 상담 문의 ${receipt.receiptId} · 홍길동(AX 연구소) · 관심 A\n앱에서 보기`, kind: 'ops-alert' }]);
   expect(JSON.stringify(notifications)).not.toContain(valid.contact);
+  const routingConfig = { telegram: { channels: [] } } as unknown as UserConfig;
+  expect(roleForKind(routingConfig, notifications[0]!.kind)).toBe('system');
+  expect(roleForKind(routingConfig, 'alert')).toBe('report');
 
   const second = await call('/v1/consult-requests', 'POST', { ...valid, name: '김나래', org: undefined, kind: 'personal', interest: 'B' });
   expect(second?.status).toBe(202);
   const secondReceipt = await second!.json() as { receiptId: string; receivedAt: string };
   expect(secondReceipt.receiptId).not.toBe(receipt.receiptId);
   expect(notifications).toHaveLength(2);
-  expect(notifications[1]).toEqual({ text: `📮 상담 문의 ${secondReceipt.receiptId} · 김나래(개인) · 관심 B\n앱에서 보기`, kind: 'alert' });
+  expect(notifications[1]).toEqual({ text: `📮 상담 문의 ${secondReceipt.receiptId} · 김나래(개인) · 관심 B\n앱에서 보기`, kind: 'ops-alert' });
   expect(readFileSync(path, 'utf8').trimEnd().split('\n')).toHaveLength(2);
   const list = await call('/v1/consult-requests?limit=1');
   expect(list?.status).toBe(200);
@@ -71,6 +84,59 @@ test('authenticated POST records a private 0600 JSONL receipt and sends one cont
   const all = await (await call('/v1/consult-requests'))!.json() as { items: unknown[] };
   expect(all.items).toHaveLength(2);
   expect(JSON.stringify(all)).not.toContain(valid.contact);
+});
+
+test('default receipt path delivers exactly once to the configured OP Telegram channel, never to report or another surface', async () => {
+  const { root, opts } = fixture();
+  const liveOpts = { ...opts, consultRequests: { root: opts.consultRequests.root, now: opts.consultRequests.now } };
+  setElanousConfigDir(root);
+  resetUserConfig();
+  const opToken = '10001:test-only-ops';
+  const tradeToken = '20002:test-only-trade';
+  setUserConfigOverlay(cfg => ({
+    ...cfg,
+    telegram: {
+      ...cfg.telegram, enabled: true, botToken: opToken, allowedUsers: [303], homeChannel: 303,
+      reportChannel: { botToken: tradeToken, chatId: 404 },
+      channels: [
+        { name: 'trade', botToken: tradeToken, chatId: 404, interactive: false, roles: ['report'] },
+        { name: 'ops', botToken: opToken, chatId: 303, interactive: true, roles: ['system'] },
+      ],
+    },
+  }));
+  const deliveries: Array<{ url: string; method: string | undefined; body: Record<string, unknown> }> = [];
+  let completeDelivery!: () => void;
+  const delivered = new Promise<void>(resolve => { completeDelivery = resolve; });
+  const network = spyOn(globalThis, 'fetch').mockImplementation((async (url: RequestInfo | URL, init?: RequestInit) => {
+    deliveries.push({ url: String(url), method: init?.method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+    completeDelivery();
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch);
+  try {
+    const response = await routeRequest(new Request('http://localhost/v1/consult-requests', {
+      method: 'POST', headers: { origin: 'http://localhost', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify(valid),
+    }), liveOpts, { requestIP: () => ({ address: '127.0.0.1' }) } as never, null, createDevProxyRuntimeRef());
+    expect(response?.status).toBe(202);
+    const receipt = await response!.json() as { receiptId: string; receivedAt: string };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([delivered, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('OP Telegram request not sent')), 3_000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deliveries).toEqual([{
+      url: `https://api.telegram.org/bot${opToken}/sendMessage`, method: 'POST',
+      body: { chat_id: 303, text: `📮 상담 문의 ${receipt.receiptId} · 홍길동(AX 연구소) · 관심 A\n앱에서 보기` },
+    }]);
+    expect(JSON.stringify(deliveries)).not.toContain(valid.contact);
+    expect(readFileSync(join(root, 'consult-requests', 'requests.jsonl'), 'utf8').trimEnd().split('\n').map(line => JSON.parse(line)))
+      .toEqual([{ ...valid, ...receipt }]);
+  } finally {
+    network.mockRestore();
+  }
 });
 
 test('owner authentication gates GET and POST before body parsing; forged same-origin cannot bypass', async () => {
@@ -93,7 +159,9 @@ test('missing fields, invalid consent and invalid limit return field-specific 40
     [{ ...valid, name: '  ' }, 'name'], [{ ...valid, contact: undefined }, 'contact'],
     [{ ...valid, kind: 'other' }, 'kind'], [{ ...valid, interest: 'C' }, 'interest'],
     [{ ...valid, consent: undefined }, 'consent'], [{ ...valid, consent: false }, 'consent'],
-    [{ ...valid, org: 7 }, 'org'], [[], 'body'],
+    [{ ...valid, org: 7 }, 'org'],
+    [{ ...valid, name: 'n'.repeat(257) }, 'name'], [{ ...valid, org: 'o'.repeat(257) }, 'org'],
+    [{ ...valid, contact: 'c'.repeat(513) }, 'contact'], [[], 'body'],
   ];
   for (const [body, field] of invalid) {
     const res = await call('/v1/consult-requests', 'POST', body);
@@ -107,6 +175,41 @@ test('missing fields, invalid consent and invalid limit return field-specific 40
   }
   expect(notifications).toEqual([]);
   expect(readdirSync(root)).toEqual([]);
+});
+
+test('site intake and app receipt agree at each site field length boundary', async () => {
+  const { root, notifications, call } = fixture();
+  const queue = new ConsultQueue(root);
+  const sitePost = (input: unknown) => handleConsultPost(new Request('http://localhost/v1/consult', {
+    method: 'POST', body: JSON.stringify(input),
+  }), { queue, limiter: new ConsultLimiter(), now: () => Date.parse('2026-10-02T06:00:00.000Z') });
+  const boundary = { ...valid, name: 'n'.repeat(256), org: 'o'.repeat(256), contact: 'c'.repeat(512) };
+  expect(validateConsult(boundary)).toMatchObject({ ok: true });
+  const siteResponse = await sitePost(boundary);
+  expect(siteResponse.status).toBe(202);
+  const siteConsult = queue.entries(Date.parse('2026-10-02T06:00:00.000Z'))[0]!.consult;
+  expect(siteConsult).toMatchObject(boundary);
+  const response = await call('/v1/consult-requests', 'POST', siteConsult);
+  expect(response?.status).toBe(siteResponse.status);
+  const receipt = await response!.json() as { receiptId: string; receivedAt: string };
+  expect(JSON.parse(readFileSync(join(root, 'consult-requests', 'requests.jsonl'), 'utf8').trim()))
+    .toEqual({ ...siteConsult, ...receipt });
+  expect(notifications).toHaveLength(1);
+  expect(JSON.stringify(notifications)).not.toContain(siteConsult.contact);
+
+  for (const field of ['name', 'org', 'contact'] as const) {
+    const beyond = { ...boundary, [field]: `${boundary[field]}x` };
+    expect(validateConsult(beyond)).toEqual({ ok: false, field });
+    const site = await sitePost(beyond);
+    expect(site.status).toBe(400);
+    expect(await site.json()).toEqual({ error: 'invalid', field });
+    const app = await call('/v1/consult-requests', 'POST', beyond);
+    expect(app?.status).toBe(site.status);
+    expect(await app!.json()).toEqual({ error: 'bad_request', field });
+  }
+  expect(queue.count()).toBe(1);
+  expect(readFileSync(join(root, 'consult-requests', 'requests.jsonl'), 'utf8').trimEnd().split('\n')).toHaveLength(1);
+  expect(notifications).toHaveLength(1);
 });
 
 test('journal write failure does not accept or notify', async () => {
@@ -131,4 +234,6 @@ test('CS1 — the receipt answers at once even when the alert channel never answ
   // the event loop until it times out (10-01: 25 s · unreachable · alert lost).
   const source = readFileSync(new URL('./consult-requests.ts', import.meta.url), 'utf8');
   expect(source).not.toMatch(/import\s*\{[^}]*\bsendOutbound\b/);
+  expect(source).not.toMatch(/import\s*\{[^}]*\brouteOutbound\b/);
+  expect(source).toContain('sendTelegramReport(getUserConfig(), text, { markdown: false, kind })');
 });

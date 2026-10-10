@@ -6,6 +6,7 @@ import { prepareDeterministicChildEnvironment } from '../../scripts/lib/determin
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { linkWorktreeDependencies } from '../git-fs/worktree.js';
+import { reapStaleGateWorktrees } from './gate-baseline-reap.js';
 
 export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun';
 export type GateBaselinePresence = 'present' | 'missing' | 'unknown';
@@ -25,7 +26,7 @@ export interface GateTestFailure {
   attribution: GateFailureAttribution;
   /** 기준선 실행 산출과 기존 missingAtBase 입력에서 독립적으로 도출한 파일 존재 상태. */
   baselinePresence: GateBaselinePresence;
-  attributedBy?: 'name-across-files';
+  attributedBy?: 'name-across-files' | 'copied-across-files';
   precondition?: GateFailurePrecondition;
   /** 같은 gate 실행 안에서 같은 시험의 통과 기록이 있으면 `may-vary`로 보존한다. 타임아웃은 재실행 결과 변동성도 함께 표현한다. */
   timeoutVariability?: TimeoutVariability;
@@ -564,6 +565,26 @@ export function classifyGateTestFailures(
         debug.log('self-implement.gate', 'attributed-across-files', { name: path, file: failure.file, baselineFile: baseline.file });
         return { ...failure, attribution: 'preexisting' as const, attributedBy: 'name-across-files' as const, baselinePresence };
       }
+      const baseCandidates = path ? baselineFailures.filter((entry) => testPath(entry) === path) : [];
+      const original = baseCandidates.length === 1 ? baseCandidates[0] : undefined;
+      const currentCandidates = path ? worktreeFailures.filter((entry) => testPath(entry) === path) : [];
+      const currentOriginal = original && currentCandidates.length === 2
+        ? currentCandidates.find((entry) => entry.file === original.file)
+        : undefined;
+      const copies = currentCandidates.filter((entry) => entry.file === failure.file);
+      // Only file position tokens (`[file://]<file>.<ext>:<line>:<col>`, any extension) are erased. A token preceded by `:`, `/`,
+      // a word char, `.` or `-` (URL hosts such as `https://a.example.com:443:10`) is part of the message and stays.
+      const comparableDiagnostic = (diagnostic: string): string =>
+        diagnostic.replace(/(?<![:/\w.-])(?:file:\/\/)?(?:\/?[A-Za-z]:)?[^\s():]+\.[A-Za-z][A-Za-z0-9]*:\d+:\d+/g, '');
+      if (original?.file && original.file !== failure.file && currentOriginal && copies.length === 1
+        && original.diagnostic && currentOriginal.diagnostic && failure.diagnostic
+        && ![original, currentOriginal, failure].some((entry) => isTimeoutDiagnostic(entry.diagnostic)
+          || matchedGatePrecondition(entry.diagnostic ?? ''))
+        && comparableDiagnostic(original.diagnostic) === comparableDiagnostic(currentOriginal.diagnostic)
+        && comparableDiagnostic(original.diagnostic) === comparableDiagnostic(failure.diagnostic)) {
+        debug.log('self-implement.gate', 'attributed-copy-across-files', { name: path, file: failure.file, baselineFile: original.file });
+        return { ...failure, attribution: 'preexisting' as const, attributedBy: 'copied-across-files' as const, baselinePresence };
+      }
       return { ...failure, attribution: 'introduced' as const, baselinePresence };
     }
     if (baselineLog === undefined || !failure.file) return { ...failure, attribution: 'unknown' as const, baselinePresence };
@@ -764,11 +785,52 @@ export function classifyBaselineProcess(result: ProcessResult, budget?: { timeou
   };
 }
 
+let lastGateWorktreeReapAt = 0;
+
+function reapBeforeGateAdd(cwd: string): void {
+  const now = Date.now();
+  if (now - lastGateWorktreeReapAt < 10 * 60_000) return;
+  lastGateWorktreeReapAt = now;
+  try {
+    reapStaleGateWorktrees(cwd);
+  } catch (error) {
+    debug.log('self-implement.gate-baseline', 'reap', { ok: false, error: String(error) });
+  }
+}
+
+function gateWorktreeAddArgs(dir: string, ref: string): string[] {
+  return ['worktree', 'add', '--detach', '--lock', '--reason', `elanous-gate pid=${process.pid} started=${Date.now()}`, dir, ref];
+}
+
+function removeGateWorktree(cwd: string, dir: string, addFailed: boolean): void {
+  try {
+    const registered = addFailed
+      ? runGitCommand(cwd, ['worktree', 'list', '--porcelain'], { encoding: 'utf8', timeout: 60_000 })
+      : undefined;
+    if (addFailed) {
+      // git lists real paths (macOS tmpdir() is /var/… while git prints /private/var/…).
+      let real = dir;
+      try { real = realpathSync(dir); } catch { /* dir already gone: compare the spelling we have */ }
+      const lines = registered?.status === 0 ? (registered.stdout ?? '').split('\n') : [];
+      if (!lines.includes(`worktree ${dir}`) && !lines.includes(`worktree ${real}`)) return;
+    }
+    const removed = runGitCommand(cwd, ['worktree', 'remove', '--force', '--force', dir], { encoding: 'utf8', timeout: 60_000 });
+    if (removed.status !== 0) debug.log('self-implement', 'gate.baseline.cleanup', {
+      stage: addFailed ? 'add-failed-remove' : 'worktree-remove', dir, status: removed.status,
+    });
+  } catch (error) {
+    debug.log('self-implement', 'gate.baseline.cleanup', {
+      stage: addFailed ? 'add-failed-remove' : 'worktree-remove', dir, status: null, error: String(error),
+    });
+  }
+}
+
 export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (baselineDir: string) => T): T | BaselineProcessResult {
+  reapBeforeGateAdd(cwd);
   const baselineDir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
   let attached = false;
   try {
-    const add = runGitCommand(cwd, ['worktree', 'add', '--detach', baselineDir, baseRef], { encoding: 'utf8', timeout: 60_000 });
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: 60_000 });
     if (add.status !== 0) return classifyBaselineProcess({ status: add.status, stdout: add.stdout, stderr: add.stderr });
     attached = true;
     linkDependencies(cwd, baselineDir);
@@ -781,8 +843,12 @@ export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (base
       log: `baseline setup failed: ${String(error)}`,
     };
   } finally {
-    if (attached) runGitCommand(cwd, ['worktree', 'remove', '--force', baselineDir], { encoding: 'utf8', timeout: 60_000 });
-    rmSync(baselineDir, { recursive: true, force: true });
+    removeGateWorktree(cwd, baselineDir, !attached);
+    try {
+      rmSync(baselineDir, { recursive: true, force: true });
+    } catch (error) {
+      debug.log('self-implement', 'gate.baseline.cleanup', { stage: 'exception', dir: baselineDir, error: String(error) });
+    }
   }
 }
 
@@ -792,11 +858,12 @@ function linkDependencies(cwd: string, dir: string): void {
 }
 
 function withVerifyWorktree<T>(cwd: string, baseRef: string, run: (dir: string) => T): T | BaselineProcessResult {
+  reapBeforeGateAdd(cwd);
   let dir = '';
   let attached = false;
   try {
     dir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
-    const add = runGitCommand(cwd, ['worktree', 'add', '--detach', dir, baseRef], { encoding: 'utf8', timeout: 60_000 });
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(dir, baseRef), { encoding: 'utf8', timeout: 60_000 });
     if (add.status !== 0) return classifyBaselineProcess({ status: add.status, stdout: add.stdout, stderr: add.stderr });
     attached = true;
     linkDependencies(cwd, dir);
@@ -805,20 +872,15 @@ function withVerifyWorktree<T>(cwd: string, baseRef: string, run: (dir: string) 
     const reason = `baseline setup failed: ${String(error)}`;
     return { status: 'unknown', log: reason, output: reason };
   } finally {
-    try {
-      const removed = attached
-        ? runGitCommand(cwd, ['worktree', 'remove', '--force', dir], { encoding: 'utf8', timeout: 60_000 })
-        : undefined;
-      if (removed && removed.status !== 0) {
+    if (dir) {
+      removeGateWorktree(cwd, dir, !attached);
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (error) {
         debug.log('self-implement', 'gate.verify-by-breaking.cleanup', {
-          stage: 'worktree-remove', dir, status: removed.status, stderr: (removed.stderr ?? '').slice(0, 300),
+          stage: 'exception', dir, error: String(error).slice(0, 300),
         }, { level: 'warn' });
       }
-      if (dir) rmSync(dir, { recursive: true, force: true });
-    } catch (error) {
-      debug.log('self-implement', 'gate.verify-by-breaking.cleanup', {
-        stage: 'exception', dir, error: String(error).slice(0, 300),
-      }, { level: 'warn' });
     }
   }
 }

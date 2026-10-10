@@ -15,7 +15,7 @@ const dirs: string[] = [];
 const slotDir = () => { const d = mkdtempSync(join(tmpdir(), 'gate-remote-slots-')); dirs.push(d); return d; };
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | (() => SshResult) } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
+function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | (() => SshResult); object?: 'commit' | 'tree' | 'missing' } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
   const calls: string[][] = [];
   const scripts: string[] = [];
   return {
@@ -23,6 +23,7 @@ function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | ((
     local(cmd, args) {
       calls.push([cmd, ...args]);
       if (args[0] === 'status') return { rc: 0, stdout: opts.dirty ? ' M src/x.ts\n' : '', stderr: '' };
+      if (args[0] === 'cat-file') return { rc: opts.object === 'missing' ? 1 : 0, stdout: `${opts.object ?? 'commit'}\n`, stderr: '' };
       if (args[0] === 'rev-parse') {
         const ref = args.at(-1)!;
         return { rc: 0, stdout: `${ref.startsWith('HEAD') ? HEAD : ref.startsWith('feature') ? 'c'.repeat(40) : MAIN}\n`, stderr: '' };
@@ -305,6 +306,28 @@ describe('remote run and fallback', () => {
     expect(io.err.join('')).toContain('push-failed');
   });
 
+  test('explicit commit on a dirty worktree uses cat-file and pushes and checks out that commit without status or HEAD lookup', () => {
+    const runner = fakeRunner({ dirty: true });
+    const outcome = runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', commit: MAIN, argv: ['x'] }, runner);
+    expect(outcome).toMatchObject({ kind: 'ran', rc: 0, commit: MAIN });
+    expect(runner.calls[0]).toEqual(['git', 'cat-file', '-t', MAIN]);
+    expect(runner.calls.some((call) => call[1] === 'status' || call.includes('HEAD^{commit}'))).toBe(false);
+    expect(runner.calls.find((call) => call[1] === 'push')).toContain(`${MAIN}:refs/elanous/gate/${MAIN}`);
+    expect(runner.scripts[0]).toContain(`git checkout -q --detach ${MAIN}`);
+  });
+
+  test.each([
+    ['short', 'abc', 'invalid-commit'],
+    ['non-hex', 'g'.repeat(40), 'invalid-commit'],
+    ['missing', MAIN, 'commit-missing'],
+    ['non-commit object', MAIN, 'commit-missing'],
+  ])('explicit commit %s returns infra without push or ssh', (label, commit, reason) => {
+    const runner = fakeRunner({ object: label === 'missing' ? 'missing' : label === 'non-commit object' ? 'tree' : 'commit' });
+    expect(runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', commit, argv: ['x'] }, runner)).toEqual({ kind: 'infra', reason });
+    expect(runner.calls.find((call) => call[1] === 'push')).toBeUndefined();
+    expect(runner.scripts).toEqual([]);
+  });
+
   test('an unresolvable local origin/main falls back before any push', () => {
     const base = fakeRunner();
     const runner: GateRemoteRunner = { ...base, local(cmd, args, cwd, options) {
@@ -430,6 +453,11 @@ describe('the whole remote script, executed (no ssh)', () => {
     if (outcome.kind !== 'ran') return;
     expect(outcome.stdout.toString()).toBe(`${head}|${base}|head\ninstalled\n`);
     expect(outcome.stderr.toString()).toBe('tool err\n');
+    writeFileSync(join(repo, 'marker.txt'), 'dirty\n');
+    const pinned = runOnRemote({ repo, host: 'h', mirror, commit: base, argv: ['sh', '-c', tool], slotDir: join(root, 'slots') }, runner);
+    expect(pinned).toMatchObject({ kind: 'ran', rc: 3, commit: base });
+    if (pinned.kind !== 'ran') return;
+    expect(pinned.stdout.toString()).toBe(`${base}|${base}|base\ninstalled\n`);
   });
 });
 

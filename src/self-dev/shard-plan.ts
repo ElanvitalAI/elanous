@@ -39,7 +39,11 @@ export function planGateTestShards(
       shard = { id: `shard-${shards.length + 1}`, files: [], plannedRssMb: 0, plannedSeconds: 0 };
       shards.push(shard);
     }
-    if (!shard) throw new Error(`test files exceed ${shardCount} shard memory budgets`);
+    if (!shard) {
+      const totalRssMb = sorted.reduce((sum, candidate) => sum + rssMb.get(candidate)!, 0);
+      const largestRssMb = rssMb.get(sorted[0]!)!;
+      throw new Error(`test files exceed ${shardCount} shard memory budgets (files=${unique.length} · totalRssMb=${Math.round(totalRssMb)} · largestRssMb=${Math.round(largestRssMb)} · budgetMb=${capacity} · neededShards≥${Math.ceil(totalRssMb / capacity)})`);
+    }
     shard.files.push(file);
     shard.plannedRssMb += rss;
     shard.plannedSeconds += duration;

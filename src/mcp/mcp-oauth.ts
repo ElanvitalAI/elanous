@@ -5,9 +5,8 @@
 // 다시 실어 보내는 «잇는» 모듈. 주소를 코드에 박지 않는다 — 호스트는
 // 전부 그 401 안내에서 그때 얻는다.
 //
-// 경계: 브라우저에서 누르는 구간은 만들지 않는다. 인가 주소를 조립해
-// AuthorizeHandler 로 돌려주는 데까지가 이 착지다.
-// 경계: 장치 코드 흐름은 다루지 않는다.
+// 브라우저 승인은 호출자(aside/CLI)의 책임이다. 브라우저를 쓸 수 없고
+// 인가 서버가 RFC 8628 을 광고할 때는 장치 코드로 자격을 얻는다.
 // 경계: 새 CLI 하위 명령은 더하지 않는다.
 
 import { join } from 'node:path';
@@ -36,6 +35,7 @@ export type McpOAuthErrorCode =
   | 'identity-mismatch'
   | 's256-unsupported'
   | 'registration'
+  | 'device'
   | 'state-mismatch'
   | 'token'
   | 'refresh';
@@ -70,9 +70,10 @@ export interface ProtectedResourceMetadata {
 
 export interface AuthorizationServerMetadata {
   issuer: string;
-  authorizationEndpoint: string;
+  authorizationEndpoint?: string;
   tokenEndpoint: string;
   registrationEndpoint?: string;
+  deviceAuthorizationEndpoint?: string;
   codeChallengeMethodsSupported: string[];
 }
 
@@ -81,6 +82,9 @@ export interface ClientRegistration {
   clientSecret?: string;
   /** 동적 등록 때 쓴 redirect_uri. 옛 등록에는 없다. */
   redirectUri?: string;
+  /** Registered now but not stored yet: the store still holds another client's tokens, so this registration is
+   *  committed only with its own tokens (exchangeAuthorizationCode). A cancelled login leaves the store as it was. */
+  pending?: boolean;
 }
 
 export interface AuthorizationRequest {
@@ -90,6 +94,8 @@ export interface AuthorizationRequest {
   redirectUri: string;
   issuer: string;
   clientId: string;
+  /** Set when the client registration is pending (see ClientRegistration.pending); in memory only. */
+  pendingRegistration?: { clientSecret?: string };
   scope?: string;
   resource?: string;
 }
@@ -364,14 +370,14 @@ export async function discoverAuthorizationServer(
   const issuer = stringField(body, 'issuer');
   const authorizationEndpoint = stringField(body, 'authorization_endpoint');
   const tokenEndpoint = stringField(body, 'token_endpoint');
-  if (!issuer || !authorizationEndpoint || !tokenEndpoint) {
+  if (!issuer || !tokenEndpoint || (!authorizationEndpoint && !stringField(body, 'device_authorization_endpoint'))) {
     throw new McpOAuthError(
       'discovery',
       'authorization server metadata is missing issuer, authorization_endpoint, or token_endpoint',
     );
   }
   requireHttpUrl(issuer, 'issuer');
-  requireHttpUrl(authorizationEndpoint, 'authorization_endpoint');
+  if (authorizationEndpoint) requireHttpUrl(authorizationEndpoint, 'authorization_endpoint');
   requireHttpUrl(tokenEndpoint, 'token_endpoint');
   // ⛔⭐⭐ RFC 8414 §3.3 — 돌려받은 `issuer` 는 «우리가 물어본» 인가서버
   //    식별자와 «같아야» 한다. 안 대조하면 metadata 를 쥔 쪽이 남의 issuer 를
@@ -385,11 +391,14 @@ export async function discoverAuthorizationServer(
   }
   const registrationEndpoint = stringField(body, 'registration_endpoint');
   if (registrationEndpoint) requireHttpUrl(registrationEndpoint, 'registration_endpoint');
+  const deviceAuthorizationEndpoint = stringField(body, 'device_authorization_endpoint');
+  if (deviceAuthorizationEndpoint) requireHttpUrl(deviceAuthorizationEndpoint, 'device_authorization_endpoint');
   return {
     issuer,
-    authorizationEndpoint,
+    ...(authorizationEndpoint ? { authorizationEndpoint } : {}),
     tokenEndpoint,
     ...(registrationEndpoint ? { registrationEndpoint } : {}),
+    ...(deviceAuthorizationEndpoint ? { deviceAuthorizationEndpoint } : {}),
     codeChallengeMethodsSupported: stringList(body, 'code_challenge_methods_supported'),
   };
 }
@@ -468,13 +477,15 @@ export function loadStoredRegistration(
 
 export async function ensureClientRegistration(
   metadata: AuthorizationServerMetadata,
-  opts: McpOAuthRuntimeOpts & { forceReregister?: boolean } = {},
+  opts: McpOAuthRuntimeOpts & { forceReregister?: boolean; deviceCode?: boolean } = {},
 ): Promise<ClientRegistration> {
   const path = storePath(opts);
   if (!opts.forceReregister) {
     const stored = loadStoredRegistration(metadata.issuer, { storePath: path });
-    // 옛 등록은 redirect_uri 기록이 없다 — 재사용하면 포트 불일치로 영원히 막힌다.
-    if (stored?.redirectUri) return stored;
+    // Browser registrations require a bound loopback URI. Device authorization reuses a client without one
+    // (a prior device client — its stored refresh token stays paired with it), or any client when it cannot register.
+    if (stored && opts.deviceCode && (!stored.redirectUri || !metadata.registrationEndpoint)) return stored;
+    if (stored?.redirectUri && !opts.deviceCode) return stored;
   }
   if (!metadata.registrationEndpoint) {
     throw new McpOAuthError(
@@ -493,9 +504,9 @@ export async function ensureClientRegistration(
       },
       body: JSON.stringify({
         client_name: CLIENT_NAME,
-        redirect_uris: [redirectUri],
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
+        ...(opts.deviceCode ? {} : { redirect_uris: [redirectUri] }),
+        grant_types: opts.deviceCode ? ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'] : ['authorization_code', 'refresh_token'],
+        response_types: opts.deviceCode ? [] : ['code'],
         token_endpoint_auth_method: 'none',
         application_type: 'native',
       }),
@@ -519,8 +530,15 @@ export async function ensureClientRegistration(
   const registration: ClientRegistration = {
     clientId,
     ...(clientSecret ? { clientSecret } : {}),
-    redirectUri,
+    ...(opts.deviceCode ? {} : { redirectUri }),
   };
+  // A device client is stored only with its first tokens (authorizeMcpDevice): until a device login succeeds,
+  // the stored registration and the refresh token paired with it stay as they were.
+  if (opts.deviceCode) return registration;
+  // A browser registration over another client's live tokens (e.g. after a device login) waits for its own
+  // tokens: storing it now would orphan the stored refresh token if this approval is cancelled or fails.
+  const existing = loadTokens(metadata.issuer, path);
+  if (existing?.tokens.refreshToken && existing.accountUuid && existing.accountUuid !== clientId) return { ...registration, pending: true };
   persistRegistration(metadata.issuer, registration, path);
   return registration;
 }
@@ -546,6 +564,7 @@ export function buildAuthorizationRequest(
       'authorization server does not advertise code_challenge_methods_supported=S256',
     );
   }
+  if (!metadata.authorizationEndpoint) throw new McpOAuthError('discovery', 'authorization server has no authorization_endpoint for browser login');
   const pkce = generatePkcePair();
   const redirectUri = opts.redirectUri ?? DEFAULT_REDIRECT_URI;
   const url = new URL(metadata.authorizationEndpoint);
@@ -565,6 +584,7 @@ export function buildAuthorizationRequest(
     redirectUri,
     issuer: metadata.issuer,
     clientId: registration.clientId,
+    ...(registration.pending ? { pendingRegistration: registration.clientSecret ? { clientSecret: registration.clientSecret } : {} } : {}),
     ...(scope ? { scope } : {}),
     ...(opts.resource ? { resource: opts.resource } : {}),
   };
@@ -673,11 +693,105 @@ function persistTokens(
       authMode: AUTH_MODE,
       ...(clientId ? { accountUuid: clientId } : {}),
       ...(clientSecret ? { organizationUuid: clientSecret } : {}),
-      ...(existing?.redirectUri ? { redirectUri: existing.redirectUri } : {}),
+      // A loopback URI belongs to the client that registered it — never carry it onto a different (device) client.
+      ...(existing?.redirectUri && (!registration || registration.clientId === existing.accountUuid) ? { redirectUri: existing.redirectUri } : {}),
       mirrorCodex: false,
     },
     path,
   );
+}
+
+export interface McpDeviceAuthorization {
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete?: string;
+}
+
+/** RFC 8628: only an advertised endpoint enables the fallback; tokens use the same issuer store. */
+export async function authorizeMcpDevice(
+  metadata: AuthorizationServerMetadata,
+  registration: ClientRegistration,
+  opts: McpOAuthRuntimeOpts & {
+    scope?: string;
+    resource?: string;
+    onDeviceCode: (code: McpDeviceAuthorization) => Promise<void> | void;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+  },
+): Promise<OAuthTokens> {
+  const endpoint = metadata.deviceAuthorizationEndpoint;
+  if (!endpoint) throw new McpOAuthError('device', 'authorization server does not advertise device_authorization_endpoint');
+  const fetchFn = fetchImpl(opts);
+  const post = async (url: string, fields: Record<string, string | undefined>) => {
+    let response: Awaited<ReturnType<McpOAuthFetch>>;
+    try {
+      response = await fetchFn(url, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+        body: formBody(fields),
+      });
+    } catch (error) {
+      throw new McpOAuthError('device', `device authorization request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const text = await response.text();
+    return { status: response.status, body: parseJsonObject(text, 'device authorization response', 'device') };
+  };
+  const started = await post(endpoint, {
+    client_id: registration.clientId,
+    client_secret: registration.clientSecret,
+    scope: opts.scope,
+    resource: opts.resource,
+  });
+  const deviceCode = stringField(started.body, 'device_code');
+  const userCode = stringField(started.body, 'user_code');
+  const verificationUri = stringField(started.body, 'verification_uri');
+  if (started.status < 200 || started.status >= 300 || !deviceCode || !userCode || !verificationUri) {
+    const error = stringField(started.body, 'error');
+    throw new McpOAuthError('device', `device authorization returned HTTP ${started.status}${error ? ` (${error})` : ''} or missing required fields`);
+  }
+  requireHttpUrl(verificationUri, 'verification_uri');
+  const verificationUriComplete = stringField(started.body, 'verification_uri_complete');
+  if (verificationUriComplete) requireHttpUrl(verificationUriComplete, 'verification_uri_complete');
+  const seconds = started.body.expires_in;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    throw new McpOAuthError('device', 'device authorization response has invalid expires_in');
+  }
+  const now = opts.now ?? Date.now;
+  const deadline = now() + Math.min(seconds * 1000, 15 * 60_000);
+  let interval = typeof started.body.interval === 'number' && Number.isFinite(started.body.interval) && started.body.interval > 0
+    ? Math.max(1000, started.body.interval * 1000) : 5000;
+  await opts.onDeviceCode({ userCode, verificationUri, ...(verificationUriComplete ? { verificationUriComplete } : {}) });
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let attempts = 0;
+  while (now() < deadline) {
+    if (++attempts > Math.ceil(Math.min(seconds, 900)) + 1) throw new McpOAuthError('device', 'device authorization polling limit exceeded');
+    await sleep(Math.min(interval, deadline - now()));
+    if (now() >= deadline) break;
+    const polled = await post(metadata.tokenEndpoint, {
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: deviceCode,
+      client_id: registration.clientId,
+      client_secret: registration.clientSecret,
+      resource: opts.resource,
+    });
+    if (polled.status >= 200 && polled.status < 300) {
+      const accessToken = stringField(polled.body, 'access_token');
+      if (!accessToken) throw new McpOAuthError('token', 'device token response is missing access_token');
+      const tokens: OAuthTokens = {
+        accessToken,
+        refreshToken: stringField(polled.body, 'refresh_token') ?? '',
+        expiresAt: expiresAtFromSeconds(polled.body.expires_in),
+        tokenType: stringField(polled.body, 'token_type') ?? 'Bearer',
+        ...(stringField(polled.body, 'scope') ? { scope: stringField(polled.body, 'scope') } : {}),
+      };
+      persistTokens(metadata.issuer, tokens, registration, storePath(opts));
+      return tokens;
+    }
+    const error = stringField(polled.body, 'error');
+    if (error === 'slow_down') interval += 5000;
+    else if (error !== 'authorization_pending') throw new McpOAuthError('device', `device token request returned HTTP ${polled.status} (${error ?? 'unknown'})`);
+  }
+  throw new McpOAuthError('device', 'device authorization expired before approval');
 }
 
 export async function exchangeAuthorizationCode(
@@ -688,7 +802,10 @@ export async function exchangeAuthorizationCode(
 ): Promise<OAuthTokens> {
   const code = verifyAuthorizationCallback(request, callback);
   const path = storePath(opts);
-  const registration = loadStoredRegistration(metadata.issuer, { storePath: path });
+  const pending = request.pendingRegistration;
+  const registration: ClientRegistration | null = pending
+    ? { clientId: request.clientId, ...(pending.clientSecret ? { clientSecret: pending.clientSecret } : {}), redirectUri: request.redirectUri }
+    : loadStoredRegistration(metadata.issuer, { storePath: path });
   const tokens = await postToken(
     metadata.tokenEndpoint,
     {
@@ -703,7 +820,9 @@ export async function exchangeAuthorizationCode(
     fetchImpl(opts),
     'token',
   );
-  persistTokens(
+  // A pending registration is committed together with the tokens it just earned.
+  if (pending) persistRegistration(metadata.issuer, registration!, path, tokens);
+  else persistTokens(
     metadata.issuer,
     tokens,
     registration ?? { clientId: request.clientId },

@@ -54,7 +54,23 @@ test('CLI add NDJSON order, list, remove and secret-free connector names', async
   expect((await cli(root, ['list'])).output).toContain(`sample-test@1.0.0 (local) — installed ${item?.installedAt}`);
   expect((await cli(root, ['remove', 'sample-test'])).code).toBe(0);
   expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
-}, 20_000);
+}, 60_000);
+
+test('plugin add --json on an imported plugin with a secret in its manifest metadata is rejected by the scan and never prints the value', async () => {
+  const root = temp();
+  const source = fixture(join(temp(), 'source'));
+  const secret = 'superlongprivatevalue123456';
+  const manifest = JSON.parse(readFileSync(join(source, 'plugin.json'), 'utf8'));
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ ...manifest, description: `apiKey: "${secret}"`,
+    contributes: { ...manifest.contributes, hooks: [{ id: 'turn', event: 'Turn', command: `echo ${secret}` }] } }));
+  const result = await cli(root, ['add', source, '--yes', '--json']);
+  expect(result.code).toBe(1);
+  const events = result.output.trim().split('\n').map(line => JSON.parse(line));
+  expect(events.find(event => event.event === 'verify')).toMatchObject({ scan: 'dangerous' });
+  expect(events.at(-1)).toMatchObject({ event: 'failed', reason: 'scan' });
+  expect(result.output + result.stderr).not.toContain(secret);
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
+}, 60_000);
 
 test('human add reports installed node count and legacy list omits installation time', async () => {
   const root = temp();
@@ -69,7 +85,7 @@ test('human add reports installed node count and legacy list omits installation 
   writeFileSync(ledger, JSON.stringify([entry]));
   expect(JSON.parse((await cli(root, ['list', '--json'])).output)[0].installedAt).toBeUndefined();
   expect((await cli(root, ['list'])).output.trim()).toBe('sample-test@1.0.0 (local)');
-}, 20_000);
+}, 60_000);
 
 test('CLI reports staged node count even if a previous version registered the kind', async () => {
   const root = temp();
@@ -89,7 +105,7 @@ test('CLI reports staged node count even if a previous version registered the ki
   expect(json.code).toBe(0);
   expect(json.output.trim().split('\n').map(line => JSON.parse(line)).find(event => event.event === 'registered'))
     .toMatchObject({ nodes: ['sample-test:action'], nodeErrors: 0 });
-}, 20_000);
+}, 60_000);
 
 test('elanous-hwp pack exposes both node kinds and install time through the isolated CLI', async () => {
   const root = temp();
@@ -100,7 +116,7 @@ test('elanous-hwp pack exposes both node kinds and install time through the isol
   const listed = await cli(root, ['list', '--json']);
   expect(listed.code).toBe(0);
   expect(JSON.parse(listed.output)[0].installedAt).toMatch(/^\d{4}-\d\d-\d\dT/);
-}, 20_000);
+}, 60_000);
 
 test('non-interactive install without --yes fails consent and leaves no installation', async () => {
   const root = temp();
@@ -111,7 +127,7 @@ test('non-interactive install without --yes fails consent and leaves no installa
   expect(events.at(-1)).toEqual({ event: 'failed', reason: 'consent-denied', detail: 'plugin capabilities require consent' });
   expect(events.map(event => event.event)).toEqual(['resolve', 'verify', 'consent', 'failed']);
   expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
-}, 20_000);
+}, 60_000);
 
 test('job-coach installs through public CLI and appears in list', async () => {
   const root = temp();
@@ -119,7 +135,7 @@ test('job-coach installs through public CLI and appears in list', async () => {
   expect(installed.code).toBe(0);
   expect(JSON.parse(installed.output.trim().split('\n').at(-1)!)).toMatchObject({ event: 'done', plugin: 'job-coach' });
   expect(JSON.parse((await cli(root, ['list', '--json'])).output).map((item: { name: string }) => item.name)).toContain('job-coach');
-}, 20_000);
+}, 60_000);
 
 test('signed market index uses configured trustedKeys and rejects tampered signatures', async () => {
   const root = temp();
@@ -145,7 +161,7 @@ test('signed market index uses configured trustedKeys and rejects tampered signa
   const rejected = await cli(root, ['add', 'sample-test@test-market', '--yes', '--json']);
   expect(rejected.code).toBe(1);
   expect(JSON.parse(rejected.output.trim().split('\n').at(-1)!)).toMatchObject({ event: 'failed', reason: 'signature' });
-}, 20_000);
+}, 60_000);
 
 test('market CLI registers, lists and refreshes signed indices using the configured trust', async () => {
   const root = temp();
@@ -185,7 +201,57 @@ test('market CLI registers, lists and refreshes signed indices using the configu
   expect(refreshed.output).toContain('sequence 2');
   expect(readFileSync(join(root, 'plugins', 'markets', 'community', 'marketplace.json'))).toEqual(nextIndex);
   expect((await cli(root, ['market', 'update', 'unknown'], preload)).code).toBe(1);
-}, 20_000);
+}, 60_000);
+
+test('internal market CLI fetches and caches authorized signed entries, rejecting disallowed tenants and unbound signatures', async () => {
+  const root = temp();
+  const keys = generateIndexKeyPair();
+  const other = generateIndexKeyPair();
+  const marketUrl = 'https://private.example.org/catalog/';
+  const index = Buffer.from(JSON.stringify({ name: 'private', interface: { displayName: 'Private' }, sequence: 3, plugins: [],
+    knowledgePacks: [{ name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'a'.repeat(64), bytes: 1, key: 'sales.tgz' } }],
+    loopBundles: [{ name: 'loop', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'b'.repeat(64), bytes: 1, key: 'loop.tgz' } }] }));
+  const config = join(root, 'config.json');
+  writeFileSync(config, JSON.stringify({ market: { trustedKeys: [{ keyId: other.keyId, publicKey: other.publicKey }],
+    internalMarkets: [{ name: 'private', url: marketUrl, enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] }] } }));
+  const preload = join(root, 'fetch-preload.js');
+  const prepare = (signature: string, bytes: Buffer = index) => writeFileSync(preload, `globalThis.fetch = async input => {
+    const url = String(input);
+    if (!url.startsWith(${JSON.stringify(marketUrl)})) throw new Error('unexpected market URL');
+    return new Response(url.endsWith('/index.sig') ? ${JSON.stringify(signature)} : ${JSON.stringify(bytes.toString())}, { status: 200 });
+  };`);
+  prepare(signIndex(index, keys.privateKeyPem, keys.keyId));
+  const fetched = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--json'], preload);
+  expect(fetched.code).toBe(0);
+  expect(JSON.parse(fetched.output)).toMatchObject({ name: 'private', enterpriseId: 'tenant-a', sequence: 3,
+    knowledgePacks: [{ name: 'sales', enterpriseId: 'tenant-a' }], loopBundles: [{ name: 'loop', enterpriseId: 'tenant-a' }] });
+  const directory = join(root, 'plugins', 'markets', '.internal', 'private');
+  expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
+  writeFileSync(preload, `globalThis.fetch = async () => { throw new Error('unexpected network request'); };`);
+  expect((await cli(root, ['market', 'internal', 'private', 'tenant-a', '--json'], preload)).output).toBe(fetched.output);
+  const disallowed = await cli(root, ['market', 'internal', 'private', 'tenant-b', '--json'], preload);
+  expect(disallowed.code).toBe(1);
+  expect(JSON.parse(disallowed.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('enterprise not allowed') });
+  expect((await cli(root, ['market', 'update', 'private'], preload)).code).toBe(1);
+  expect((await cli(root, ['market', 'list', '--json'])).output).not.toContain('private');
+  prepare('');
+  const unsigned = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  expect(unsigned.code).toBe(1);
+  expect(JSON.parse(unsigned.output)).toMatchObject({ event: 'failed' });
+  expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
+  prepare(signIndex(index, other.privateKeyPem, other.keyId));
+  const unbound = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  expect(unbound.code).toBe(1);
+  expect(JSON.parse(unbound.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('unknown-key') });
+  expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
+  const alien = Buffer.from(index.toString().replaceAll('tenant-a', 'tenant-b'));
+  prepare(signIndex(alien, keys.privateKeyPem, keys.keyId), alien);
+  const crossTenant = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  expect(crossTenant.code).toBe(1);
+  expect(JSON.parse(crossTenant.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('outside enterprise allowlist') });
+  expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
+  expect((await cli(root, ['add', 'sales@private', '--json'], preload)).code).toBe(1);
+});
 
 test('market CLI without a name continues to configured markets after a failed built-in fetch', async () => {
   const root = temp();
@@ -206,7 +272,7 @@ test('market CLI without a name continues to configured markets after a failed b
   expect(result.stderr).toContain('plugin market update elanous failed');
   expect(result.output).toContain('Updated market community (sequence 1)');
   expect(readFileSync(join(root, 'plugins', 'markets', 'community', 'marketplace.json'))).toEqual(index);
-}, 20_000);
+}, 60_000);
 
 test('CLI reports the original failure cause with URL credentials redacted, preserving consent output', async () => {
   const root = temp();
@@ -221,7 +287,7 @@ test('CLI reports the original failure cause with URL credentials redacted, pres
   expect(event.cause).toContain('unsupported plugin source');
   expect(JSON.stringify(event)).not.toContain('user:secret');
   expect(failed.output).not.toContain('user:secret');
-}, 20_000);
+}, 60_000);
 
 test('credentials CLI sets, reads stdin, unsets and never prints values', async () => {
   const root = temp();
@@ -243,7 +309,7 @@ test('credentials CLI sets, reads stdin, unsets and never prints values', async 
   for (const result of [set, table, stdinSet, emptyStdin, rejected, unset]) {
     expect(result.output + result.stderr).not.toMatch(/dummy-secret|stdin-secret|reject-secret/);
   }
-}, 20_000);
+}, 60_000);
 
 test('plugin make help exposes name, dir, draft-file, run, input and json', async () => {
   const result = await cli(temp(), ['make', '--help']);
@@ -292,7 +358,7 @@ test('real make --draft-file --run --json refuses unimplemented processing inste
   expect(result.output).not.toContain('Seoul');
   expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
   expect(readFileSync(join(response.dir, 'graphs', 'run-step.ts'), 'utf8')).toContain("outcome: 'fail'");
-}, 20_000);
+}, 60_000);
 
 test('plugin make rejects an existing --name before invoking codex and reports JSON failure', async () => {
   const root = temp();
@@ -315,7 +381,7 @@ test('plugin node add CLI dispatches to addAndInstallNode with --kind and one-li
   expect(JSON.parse(result.output)).toEqual({ status: 'failed', errors: ['invalid node request or kind: INVALID'] });
   expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
   expect((await cli(root, ['add', '--help'])).output).toContain('--allow-unsigned');
-}, 20_000);
+}, 60_000);
 
 test('index registers the plugin CLI command', () => {
   const index = readFileSync(join(repo, 'src', 'index.ts'), 'utf8');

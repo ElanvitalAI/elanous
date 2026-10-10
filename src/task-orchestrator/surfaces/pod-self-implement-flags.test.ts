@@ -31,12 +31,13 @@ describe('Pod → self implement flag contract', () => {
     expect(missing).toEqual([]);
   });
 
+  // LAUNCH-POLICY-UNIV(#25799): the caps come from the operational launch policy, not the universe-local user config.
   test('the Pod account plan receives the per-account caps from config', () => {
     const index = src('index.ts');
     const at = index.indexOf('planPodProvider({');
     expect(at).toBeGreaterThan(0);
     const call = index.slice(at, at + 600);
-    expect(call).toContain('thresholdPercentByAccount: getUserConfig().llm?.codexAccountRotationThresholdPercentByAccount');
+    expect(call).toContain('thresholdPercentByAccount: launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount');
   });
 
   test('--child-llm-provider/--child-llm-model reach the dev spec', () => {

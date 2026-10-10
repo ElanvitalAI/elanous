@@ -8,7 +8,7 @@
 // so ALL outbound routes through elanous's delivery channels. Send-only;
 // auth via bearer (acp-token).
 //
-// Body: { text: string, markdown?: boolean, kind?: string }
+// Body: { text: string, markdown?: boolean, kind?: string, role?: string }
 //   kind routes per-channel since R6 Phase 1 (2026-07-07): the body is
 //   handed to routeOutbound (src/nexus/outbound/router.ts) which fans out
 //   to telegram/discord/pushcut per the `outbound` user-config section.
@@ -53,6 +53,7 @@ interface OutboundBody {
   text?: string;
   markdown?: boolean;
   kind?: string;
+  role?: string;
 }
 
 function json(body: unknown, status: number): Response {
@@ -85,10 +86,14 @@ export async function handleOutboundReport(req: Request, metaApi: MetaApiOpts, r
   const cfg = getUserConfig();
   const kind = typeof body.kind === 'string' ? body.kind : 'report';
   try {
-    // Router is per-channel fail-soft; `delivered` = any channel ok.
+    // routeOutbound dispatches via the channel adapter registry; legacy fan-out
+    // remains per-channel fail-soft and `delivered` = any channel ok.
     // Producers (outbound-alert.ts deliver()) gate their direct-telegram
     // fallback on this top-level boolean — keep it stable.
-    const result = await routeOutbound(cfg, { text, markdown: body.markdown ?? true, kind }, routerDeps);
+    const role = typeof body.role === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(body.role) ? body.role : undefined;
+    // A request that names a role intends that role's recipients — never fall back to the kind route silently.
+    if (body.role !== undefined && role === undefined) return json({ error: 'invalid-role' }, 400);
+    const result = await routeOutbound(cfg, { text, markdown: body.markdown ?? true, kind, ...(role ? { role } : {}) }, routerDeps);
     const clientFallback = req.headers.get('X-Elanous-Client-Fallback') === 'direct';
     const source = req.headers.get('X-Elanous-Outbound-Source') ?? 'daemon-http';
     if (result.delivered || !clientFallback) observeDaemonSend(cfg, text, kind, result, source);

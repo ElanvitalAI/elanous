@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { join } from 'node:path';
 
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { assertNotTestWritingOps } from '../instance/test-write-guard.js';
 import { ASK_USER_QUESTION_DELIVERY_VALUES } from './types.js';
 import type { AskUserQuestionRequest, AskUserQuestionResult, HitlDelivery, Question, QuestionOption } from './types.js';
 
@@ -161,6 +162,7 @@ function pendingQuestionAnswerPath(id: string, root?: string): string {
 
 function writeAtomicRecord(id: string, value: unknown, dir: string, target: string, deps: PendingQuestionStoreDeps): void {
   const temp = join(dir, `.${encodeURIComponent(id)}.${process.pid}.${(deps.now ?? (() => new Date()))().getTime()}.${Math.random().toString(36).slice(2)}.tmp`);
+  assertNotTestWritingOps(target, 'write a pending question record');
   const remove = deps.removeFile ?? rmSync;
   try {
     (deps.makeDir ?? mkdirSync)(dir, { recursive: true });
@@ -230,13 +232,17 @@ export function readPendingQuestionAnswer(id: string, deps: PendingQuestionStore
 
 export function removePendingQuestionAnswer(id: string, deps: PendingQuestionStoreDeps = {}): void {
   const root = (deps.root ?? elanousStateRoot)();
-  (deps.removeFile ?? rmSync)(pendingQuestionAnswerPath(id, root), { force: true });
+  const path = pendingQuestionAnswerPath(id, root);
+  assertNotTestWritingOps(path, 'remove a pending question answer');
+  (deps.removeFile ?? rmSync)(path, { force: true });
 }
 
 /** Best-effort lifecycle observation: callers deliberately ignore failures. */
 export function removePendingQuestion(id: string, deps: PendingQuestionStoreDeps = {}): void {
   const root = (deps.root ?? elanousStateRoot)();
-  (deps.removeFile ?? rmSync)(pendingQuestionPath(id, root), { force: true });
+  const path = pendingQuestionPath(id, root);
+  assertNotTestWritingOps(path, 'remove a pending question');
+  (deps.removeFile ?? rmSync)(path, { force: true });
 }
 
 export function readPendingQuestions(deps: PendingQuestionStoreDeps = {}): PendingQuestionReadResult {

@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, normalizeClaim, type BriefItem } from './brief-items.js';
+import { BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, normalizeClaim, pendingRealtime, type BriefItem } from './brief-items.js';
 import { runRequirementFunnel } from '../intake-plane/requirement-funnel.js';
 import type { DirectiveRow } from '../intake-plane/requirement-funnel.js';
 
@@ -255,6 +255,22 @@ test('sent items and items from other days stay out; originals are not rewritten
   expect(kept.text).toBe('아직');
 });
 
+test('pendingRealtime is pure and selects unsent P0 or KST-today deadlines, regardless of slot cutoff', () => {
+  const base: BriefItem = { id: 1, text: 'P0', domain: '운영', priority: 'P0', deadline: null,
+    evidence: null, source: '루프', created_at: '2026-10-05T00:00:00Z', sent_at: null };
+  const items: BriefItem[] = [
+    base,
+    { ...base, id: 2, priority: 'P1', text: 'today ISO', deadline: '2026-10-04T15:30:00Z' },
+    { ...base, id: 3, priority: 'P2', text: 'today date', deadline: '2026-10-05' },
+    { ...base, id: 4, priority: 'P1', text: 'tomorrow KST', deadline: '2026-10-05T15:00:00Z' },
+    { ...base, id: 5, priority: 'P1', text: 'no deadline' },
+    { ...base, id: 6, text: 'sent P0', sent_at: NOW.toISOString() },
+  ];
+  expect(pendingRealtime(items, NOW).map(item => item.id)).toEqual([1, 2, 3]);
+  expect(items[0]?.sent_at).toBeNull();
+  expect(BRIEF_SLOTS).toEqual(['08:30', 'after-release', '22:00']);
+});
+
 test('invalid item and slot inputs do not add rows', () => {
   const { root, store } = fixture();
   try {
@@ -265,6 +281,7 @@ test('invalid item and slot inputs do not add rows', () => {
     expect(() => store.add({ ...input, deadline: 'next week' })).toThrow('invalid deadline');
     expect(() => store.add({ ...input, evidence: '' })).toThrow('evidence is required');
     expect(() => store.compose('morning')).toThrow('invalid slot');
+    expect(() => store.compose('realtime')).toThrow('invalid slot');
     expect(store.list()).toEqual([]);
     expect(store.list({ domain: '운영' })).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }

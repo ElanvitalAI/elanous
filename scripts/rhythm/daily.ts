@@ -17,6 +17,7 @@ import { recordOutbound } from '../../src/domains/outbound-alert.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../src/self-dev/run-store.js';
 import { runDraftSweep } from '../../src/self-dev/draft-sweep.js';
 import { retroBriefingLines } from '../../src/retro/daily.js';
+import { dispatchCooAdmin } from '../../src/domains/coo-admin-tool.js';
 
 export type Section<T> = { status: 'ok'; value: T } | { status: 'unreadable'; reason: string };
 export type Landing = { title: string; seat: string; mergedAt: string; prNumber?: number };
@@ -348,6 +349,47 @@ function sendReview(file: string, text: string, target: { chatId: number; botTok
   finally { db.close(); }
 }
 
+function adminSection(markdown: string): string {
+  return markdown.split('## ⑧ 행정\n')[1]?.split('\n\n## ')[0]?.trim() ?? '측정 불가 · 행정 절 없음';
+}
+
+function adminMessage(markdown: string): string {
+  const text = adminSection(markdown);
+  if (text.length <= 1_800) return `## ⑧ 행정\n${text}`;
+  // Keep the full ordered read in the report. Reserve one dated link from each required
+  // category before spending the remaining transport budget on earlier deadlines.
+  const groups: { heading: string; items: string[] }[] = [];
+  for (const line of text.split('\n')) {
+    if (/^(?:지난 기한|14일 안 기한) \d+건$/.test(line) || line.startsWith('그 밖 · ')) {
+      groups.push({ heading: line, items: [] });
+    } else if (line.startsWith('- ') && groups.length) {
+      groups.at(-1)!.items.push(line);
+    } else if (line.startsWith('  https://') && groups.at(-1)?.items.length) {
+      const group = groups.at(-1)!;
+      group.items[group.items.length - 1] += `\n${line}`;
+    }
+  }
+  if (!groups.some(group => group.heading.startsWith('지난 기한 ')) || !groups.some(group => group.heading.startsWith('14일 안 기한 ')))
+    return `## ⑧ 행정\n${text.slice(0, 1_800)}\n… 전체 목록은 리뷰 파일 참조`;
+  const compact = (item: string) => item.replace(/^(- [^\n]*? · (?:Urgent|High|우선순위 [^ ·]+) · )([^\n]*?)( · 대표 손이 필요한 날 \d{4}-\d{2}-\d{2})?(\n  https:\/\/[^\n]+)$/, (_match, prefix: string, title: string, action: string | undefined, link: string) =>
+    `${prefix}${title.length > 90 ? `${title.slice(0, 89)}…` : title}${action ?? ''}${link}`);
+  const selected = groups.map(group => ({ heading: group.heading, items: group.items.length ? [compact(group.items[0]!)] : [] }));
+  const warning = text.startsWith('조회 상한 250건 ·') ? `${text.split('\n', 1)[0]}\n` : '';
+  const render = () => warning + selected.map(group => `${group.heading}\n${group.items.join('\n') || '없음'}`).join('\n');
+  const priorityOrder = [...groups.keys()].sort((a, b) =>
+    Number(!groups[a]!.heading.startsWith('14일 안 기한 ')) - Number(!groups[b]!.heading.startsWith('14일 안 기한 ')) || a - b);
+  for (const i of priorityOrder) {
+    const source = groups[i]!;
+    for (const item of source.items.slice(selected[i]!.items.length)) {
+      const next = compact(item);
+      if (render().length + next.length + 1 + '\n… 전체 목록은 리뷰 파일 참조'.length > 1_800) break;
+      selected[i]!.items.push(next);
+    }
+  }
+  const omitted = groups.some((group, i) => group.items.length > selected[i]!.items.length);
+  return `## ⑧ 행정\n${render()}${omitted ? '\n… 전체 목록은 리뷰 파일 참조' : ''}`;
+}
+
 function newsMessage(markdown: string): string | null {
   const section = markdown.split('## ⑦ 외부 동향\n')[1]?.split('\n\n## ')[0];
   if (!section || section.startsWith('못 읽음 ·')) return null;
@@ -366,6 +408,7 @@ function sendNewsAfterReview(delivery: DeliveryResult, file: string, markdown: s
 export type DailyDeps = { now?: () => Date; root?: string; vaultRoot?: string | null; sendEnabled?: boolean; repoRoot?: string; repoName?: string;
   landings?: (now: Date) => Promise<Landing[]>; release?: () => Promise<Release>; loops?: () => Promise<Loop[]>;
   grid?: () => Promise<Seat[]>; decisions?: () => Promise<Pending[]>; news?: () => Promise<News[]>;
+  cooAdmin?: (now: Date) => Promise<string>;
   target?: { chatId: number; botToken: string };
   send?: (request: DailySendRequest) => DailySendConfirmation | null; receipt?: (key: string) => DeliveryReceipt;
   recordDelivery?: (text: string, kind: 'ops-report') => void;
@@ -426,7 +469,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
       catch (error) { sendError = `발송 설정 못 읽음 · ${shortReason(reasonOf(error))}`; deliveryState = 'unknown'; }
     }
     if (options.stage === 'deliver' && !options.dryRun && enabled) {
-      const text = `${header}\n\n## 위험 톱 5\n${riskBlock}${suggestionBlock ? `\n\n## PROACT1-LITE 제안\n${suggestionBlock}` : ''}\n\n${file}`;
+      const text = `${header}\n\n## 위험 톱 5\n${riskBlock}${suggestionBlock ? `\n\n## PROACT1-LITE 제안\n${suggestionBlock}` : ''}\n\n${adminMessage(markdown)}\n\n${file}`;
       chars = `${text}\n${receiptKey}`.length;
       let resolved: ReturnType<typeof recipient> = null;
       try { resolved = recipient(deps); }
@@ -468,6 +511,12 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     news: options.noNews ? unreadable('건너뜀 (--no-news)') : await safe(async () => cleanNews(await (deps.news ?? collectNews)())),
   };
   const review = composeDaily(parts, now);
+  const readAdmin = deps.cooAdmin ?? ((date: Date) => dispatchCooAdmin({}, { now: date, briefing: true }));
+  const admin = await safe(() => readAdmin(now));
+  const adminText = admin.status === 'unreadable' ? `측정 불가 · ${admin.reason}`
+    : admin.value.startsWith('Linear 키가 없습니다') || admin.value.startsWith('못 읽었습니다(')
+      ? `측정 불가 · ${shortReason(admin.value)}` : admin.value;
+  review.markdown += `\n## ⑧ 행정\n${adminText}\n`;
   const root = deps.root ?? effectiveInstanceRoot();
   const observed = await safe(async (): Promise<ProactSignals> => {
     if (deps.proactSignals) return deps.proactSignals();
@@ -553,7 +602,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
   let chars = 0;
   let target = 'unknown';
   if (!options.dryRun && options.stage !== 'collect' && enabled) {
-    const text = `${review.header}\n\n## 위험 톱 5\n${review.risks.map((r, i) => `${i + 1}. ${r.name} — ${r.score}점 · ${r.reason}`).join('\n') || '확인된 위험 없음'}${recorded ? `\n\n## PROACT1-LITE 제안\n${recorded}` : ''}${retroBlock}\n\n${file}`;
+    const text = `${review.header}\n\n## 위험 톱 5\n${review.risks.map((r, i) => `${i + 1}. ${r.name} — ${r.score}점 · ${r.reason}`).join('\n') || '확인된 위험 없음'}${recorded ? `\n\n## PROACT1-LITE 제안\n${recorded}` : ''}${retroBlock}\n\n${adminMessage(review.markdown)}\n\n${file}`;
     chars = `${text}\n${receiptKey}`.length;
     let resolved: ReturnType<typeof recipient> = null;
     try { resolved = recipient(deps); }

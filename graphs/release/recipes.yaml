@@ -45,7 +45,7 @@ publish:
   approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
 publish-command:
   command: 'bun scripts/release-loop/publish-node.ts'
-  timeout_ms: 1800000
+  # The node may wait until input.publishAt; runPublish bounds the actual publication subprocess to 30 minutes.
 npm-publish:
   command: 'bun scripts/release-loop/npm-publish-node.ts'
   # 40m default wait + two 5m commands + up to 83 bounded 15s registry inspections.

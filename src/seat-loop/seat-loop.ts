@@ -29,6 +29,7 @@ import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { checklistHistory, listChecklist, type Checklist } from '../release-loop/checklist.js';
 import { readSchedules, releasedVersion } from '../release-loop/feature-store.js';
 import { runOpDecide, type OpDecideCandidate } from './op-decide.js';
+import { readHandedCells, readTrafficSignal, type TrafficSignalRead } from './traffic-signal.js';
 
 // `kind`/`createdAt` are the V3 shadow-compare keys (내부 문서 `METHOD-v3-shadow-compare-2026-10-02` · MK 10-02 18:54).
 export type SeatItem = { source: 'request' | 'checklist' | 'hook' | 'seat-question' | 'idle'; kind?: 'request' | 'cell' | 'hook-task' | 'seat-question'; id: string; title: string; text: string; evidence?: string; status?: string; version?: string; seat?: string; evidenceHash?: string; asOf?: string; queuedAt?: string; createdAt?: string; from?: SeatId; idleRung?: 1 | 2 | 3 | 4 | 5 };
@@ -81,6 +82,9 @@ export type SeatDeps = {
   schedules?: () => Array<{ version: string; cutAt: string; landBy?: string | null }>;
   /** Checklist items of one version — default reads the release ledger DB (checklist.json is only a legacy import source since REL5b). */
   checklistItems?: (version: string) => Array<{ id: string; title: string; status: string; owner?: string | null; disposition?: string; evidence?: string }>;
+  /** Optional injected traffic/handoff snapshots; defaults read the OP files. */
+  trafficSignal?: TrafficSignalRead;
+  handedCells?: ReadonlySet<string>;
   /** Chronological release-ledger events for a checklist id; injected for isolated release fixtures. */
   checklistHistory?: (id: string) => ReturnType<typeof checklistHistory>;
   /** Full checklist snapshot including history, for stall detection. */
@@ -526,9 +530,29 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
   }
   const checklist: SeatItem[] = [];
   const closed: string[] = [];
-  for (const version of open === null ? [] : versions().sort(versionOrder)) {
+  // runSeatLoopOnce → gatherSeatInputs → pickNext: only checklist construction is gated;
+  // requests, hook cards and seat questions above keep their original selection path.
+  const signal = deps.trafficSignal === undefined ? readTrafficSignal() : deps.trafficSignal;
+  // The signal verdict comes first; the handed ledger is read only when the signal would let cells through,
+  // so a handed read failure never masks `signal-not-green` / `signal-seat-paused`.
+  let handed: ReadonlySet<string> = new Set();
+  let handedUnreadable = false;
+  const signalStops = signal !== null && ('unreadable' in signal || signal.global !== 'green' || Boolean(signal.paused?.[seat]));
+  if (signal !== null && !signalStops) {
+    try { handed = deps.handedCells ?? readHandedCells(); }
+    catch { handedUnreadable = true; }
+  }
+  if (signal !== null && 'unreadable' in signal) debug.log('seat.loop', 'signal-unreadable', { seat });
+  else if (signal !== null && signal.global !== 'green') debug.log('seat.loop', 'signal-not-green', { seat });
+  else if (signal !== null && signal.paused?.[seat]) debug.log('seat.loop', 'signal-seat-paused', { seat });
+  else if (handedUnreadable) debug.log('seat.loop', 'signal-unreadable', { seat, source: 'handed' });
+  else for (const version of open === null ? [] : versions().sort(versionOrder)) {
     if (!open!.has(version)) {
       closed.push(version);
+      continue;
+    }
+    if (signal?.versions && !signal.versions.includes(version)) {
+      debug.log('seat.loop', 'skip-signal-version', { version });
       continue;
     }
     let items: ReturnType<typeof itemsOf>;
@@ -543,6 +567,14 @@ export async function gatherSeatInputs(seat: string, deps: SeatDeps = {}, ledger
     }
     for (const item of items) {
       if (item.owner === seat && (item.status === 'yellow' || item.status === 'red')) {
+        if (signal?.hold?.includes(item.id)) {
+          debug.log('seat.loop', 'skip-signal-cell', { id: item.id, why: 'hold' });
+          continue;
+        }
+        if (handed.has(item.id)) {
+          debug.log('seat.loop', 'skip-signal-cell', { id: item.id, why: 'handed' });
+          continue;
+        }
         checklist.push({ source: 'checklist', kind: 'cell', version, seat, asOf, id: item.id, title: item.title, text: item.title, status: item.status,
           ...(item.evidence ? { evidence: item.evidence } : {}), evidenceHash: createHash('sha256').update(item.evidence ?? '').digest('hex') });
       }
@@ -1389,6 +1421,7 @@ export async function runSeatLoopOnce(seat: string, deps: SeatDeps = {}): Promis
   const failedDecisions = new Set<string>();
   let lastDecisionFailure: SeatEntry | undefined;
   while (true) {
+  // The seat turn reads the signal-gated checklist and ungated requests before pickNext.
   const inputs = await gatherSeatInputs(seat, deps, ledger);
   inputs.requests = inputs.requests.filter((candidate) => !failedDecisions.has(itemKey(candidate)));
   inputs.checklist = inputs.checklist.filter((candidate) => !failedDecisions.has(itemKey(candidate)));

@@ -276,9 +276,9 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 4)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate']);
+    expect(first.path.slice(0, 5)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut]);
+    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });

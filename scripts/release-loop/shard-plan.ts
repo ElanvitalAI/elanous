@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { readJunitFileSeconds } from './gate-method';
 
 /** Plan weights for a Pod sweep: wall-scaled when the previous cut recorded shard wall times, junit seconds otherwise. */
 export function planDurations(durationSource: string | undefined): { durations: Map<string, number>; wall?: { shards: number; scaledFiles: number }; fallback?: string } {
@@ -66,21 +67,12 @@ export function logPlanWalltime(wall: { shards: number; scaledFiles: number } | 
 export function readFileDurations(dir: string): Map<string, number> {
   const durations = new Map<string, number>();
   let names: string[];
-  const entities: Record<string, string> = { '&amp;': '&', '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>' };
   try { names = readdirSync(dir).filter((name) => name.endsWith('.junit.xml')).sort(); }
   catch { return durations; }
   for (const name of names) {
     try {
-      const xml = readFileSync(join(dir, name), 'utf8');
-      for (const match of xml.matchAll(/<testsuite\b([^>]*)>/g)) {
-        const attrs = match[1]!;
-        const file = /\bfile="([^"]+)"/.exec(attrs)?.[1];
-        const rawTime = /\btime="([^"]+)"/.exec(attrs)?.[1];
-        if (!file || rawTime === undefined) continue;
-        const seconds = Number(rawTime);
-        if (!Number.isFinite(seconds) || seconds < 0) continue;
-        const path = file.replace(/&(?:amp|quot|apos|lt|gt);/g, (entity) => entities[entity]!);
-        durations.set(path, Math.max(durations.get(path) ?? 0, seconds));
+      for (const [file, seconds] of readJunitFileSeconds(readFileSync(join(dir, name), 'utf8'))) {
+        durations.set(file, Math.max(durations.get(file) ?? 0, seconds));
       }
     } catch { /* One unreadable report must not discard the others. */ }
   }

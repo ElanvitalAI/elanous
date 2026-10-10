@@ -41,7 +41,8 @@ describe('M2-1 · LLM_TIER_MAP_BY_PROVIDER · invariants', () => {
 
   test('wired cloud providers ship while declared-only and local ladders remain WIP', () => {
     for (const provider of providers) {
-      const status = ['local', 'kimi', 'qwen', 'glm'].includes(provider) ? 'wip' : 'shipping';
+      // bedrock = 배선됐지만 실호출 전(계정별 접근 조건 미측정) — wip (BEDROCK-PROVIDER #25966).
+      const status = ['local', 'kimi', 'qwen', 'glm', 'bedrock'].includes(provider) ? 'wip' : 'shipping';
       for (const tier of MODEL_TIERS) {
         expect(LLM_TIER_MAP_BY_PROVIDER[provider][tier].status).toBe(status);
       }

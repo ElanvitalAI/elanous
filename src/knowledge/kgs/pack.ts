@@ -50,14 +50,17 @@ export interface PackId {
 }
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
-const VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-z0-9-]+)?$/;
+const VERSION_RE = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?$/;
 
 export function isPackSlug(v: unknown): v is string {
   return typeof v === 'string' && SLUG_RE.test(v);
 }
 
 export function isPackVersion(v: unknown): v is string {
-  return typeof v === 'string' && VERSION_RE.test(v);
+  if (typeof v !== 'string' || !VERSION_RE.test(v)) return false;
+  const separator = v.indexOf('-');
+  const prerelease = separator < 0 ? undefined : v.slice(separator + 1);
+  return prerelease === undefined || prerelease.split('.').every(id => !/^\d+$/.test(id) || id === '0' || !id.startsWith('0'));
 }
 
 export function packIdString(id: PackId): string {

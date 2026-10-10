@@ -4,7 +4,7 @@
 //   주간 창이 찬 계정으로 계속 쏘면 런이 「구현 결손」으로 죽는다(그 어휘는 `#7123` 이 냈다).
 //
 // ⛔⭐⭐ **결정 다섯** (대표):
-//   ① 계정 «전환»만 자동이다 — 리셋 크레딧의 실제 소비는 이 판정 밖의 기존 경로가 맡는다.
+//   ① 리셋권 소비는 순수 판정 밖의 적용 경로가 기존 소비 연산으로 맡는다.
 //   ② 기본 ON. config `llm.codexAccountRotation: false` 로 끈다.
 //   ③ 사람이 «명시»한 계정은 전환하지 않는다 — 의도가 이긴다.
 //   ④ 현재 사용률을 모르면 안전한 기본 계정에 고정하지 않는다 — 쓸 후보가 있으면 넘긴다.
@@ -185,23 +185,6 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
   });
   if (input.explicit) return { reason: 'explicit', candidateCount, accountThresholds };
   if (!input.enabled) return { reason: 'disabled', candidateCount, accountThresholds, ...(input.disabledProvenance ? { disabledProvenance: input.disabledProvenance } : {}) };
-  if (input.creditPace?.active) {
-    const self = input.candidates.find((candidate) => candidate.name === input.current.name);
-    const eligible = (name: string, balance: number | undefined, hasCredits: boolean | undefined, home: string | undefined): boolean =>
-      !!home?.trim() && typeof balance === 'number' && Number.isFinite(balance) && balance > 0
-      && hasCredits !== false && accountThresholds.some((row) => row.name === name
-        && (row.status === 'reached' || row.status === 'threshold-reached'));
-    const currentBalance = input.currentCreditBalance ?? self?.creditBalance;
-    const currentHas = input.currentHasCredits ?? self?.hasCredits;
-    const to = otherCandidates.filter((candidate) => eligible(candidate.name, candidate.creditBalance, candidate.hasCredits, candidate.home))
-      .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
-    if (eligible(input.current.name, currentBalance, currentHas, self?.home ?? input.current.home)) {
-      return { reason: 'credit-pace', candidateCount, accountThresholds };
-    }
-    if (to) {
-      return { reason: 'credit-pace', candidateCount, accountThresholds, to };
-    }
-  }
   const currentUsageUnknown = input.currentReached === undefined && input.currentUsedPercent == null;
   if (input.currentReached !== true && !currentUsageUnknown && accountThresholds[0]?.status !== 'threshold-reached') {
     return { reason: 'not-reached', candidateCount, accountThresholds };
@@ -232,6 +215,21 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
   const to = usable[0];
   if (!to) {
     if (input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount, accountThresholds };
+    if (input.creditPace?.active) {
+      const self = input.candidates.find((candidate) => candidate.name === input.current.name);
+      const eligible = (name: string, balance: number | undefined, hasCredits: boolean | undefined, home: string | undefined): boolean =>
+        !!home?.trim() && typeof balance === 'number' && Number.isFinite(balance) && balance > 0
+        && hasCredits !== false && accountThresholds.some((row) => row.name === name
+          && (row.status === 'reached' || row.status === 'threshold-reached'));
+      const currentBalance = input.currentCreditBalance ?? self?.creditBalance;
+      const currentHas = input.currentHasCredits ?? self?.hasCredits;
+      const richest = otherCandidates.filter((candidate) => eligible(candidate.name, candidate.creditBalance, candidate.hasCredits, candidate.home))
+        .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
+      if (eligible(input.current.name, currentBalance, currentHas, self?.home ?? input.current.home)) {
+        return { reason: 'credit-pace', candidateCount, accountThresholds };
+      }
+      if (richest) return { reason: 'credit-pace', candidateCount, accountThresholds, to: richest };
+    }
     // 대표 크레딧 허가: 구독 잔량이 남은 계정이 없으면 크레딧으로 계속 — 한도가 찬 요청은 서버가 선불 크레딧으로 넘긴다.
     // 🩸 09-28 실측: default 크레딧만 시간당 ~5,200 씩 줄고 team·third(합 ~5.5만)는 0 — «지금 계정에 머문다»만으로는
     //   한 계정 크레딧이 바닥나면 남은 크레딧을 두고 폴백(grok)으로 갔다. ⇒ 크레딧이 «더 많이» 남은 계정으로 옮긴다.

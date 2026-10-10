@@ -33,6 +33,8 @@ export interface AcpReviewerOpts {
   model?: string;
   /** 리뷰 1턴 최대 대기(ms). 초과 시 cancel→throw(부분 리뷰로 오판 pass 방지). 기본 300000. */
   timeoutMs?: number;
+  /** One deadline for spawn → initialize → session/new → model select (ms). A child that never answers ACP must not hang the review. Default min(timeoutMs, 60000). */
+  handshakeTimeoutMs?: number;
 }
 
 /**
@@ -152,13 +154,20 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     let text = '';
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? Math.min(timeoutMs, 60_000);
+    const handshakeDeadline = Date.now() + handshakeTimeoutMs;
+    let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+    const withinHandshake = <T>(step: Promise<T>): Promise<T> => Promise.race([step, new Promise<never>((_, reject) => {
+      handshakeTimer = setTimeout(() => {
+        debug.log('acp-review', 'handshake-timeout', { backend, handshakeTimeoutMs }, { level: 'error' });
+        reject(new Error(`ACP handshake timeout (${handshakeTimeoutMs}ms)`));
+      }, Math.max(0, handshakeDeadline - Date.now()));
+    })]).finally(() => { if (handshakeTimer) clearTimeout(handshakeTimer); });
     try {
-      agent = opts.createAgent
-        ? opts.createAgent({ backendId: requestedBackend, ...agentOpts })
-        : opts.backendSpec
-          ? new AcpAgent({ backendId: requestedBackend, ...agentOpts })
-          : await reviewManager!.getAgent(requestedBackend, agentOpts);
-      if (injected || opts.backendSpec) await agent.start();
+      if (opts.createAgent) agent = opts.createAgent({ backendId: requestedBackend, ...agentOpts });
+      else if (opts.backendSpec) agent = new AcpAgent({ backendId: requestedBackend, ...agentOpts });
+      else agent = await withinHandshake(reviewManager!.getAgent(requestedBackend, agentOpts));
+      if (injected || opts.backendSpec) await withinHandshake(agent.start());
       if (!capabilitiesObserved) {
         try {
           debug.log('acp-review', 'capabilities', {
@@ -172,9 +181,9 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
           // Observability must not interrupt a review.
         }
       }
-      const sid = await agent.newSession();
+      const sid = await withinHandshake(agent.newSession());
       if (opts.model) {
-        const picked = await agent.selectSessionModel(sid, opts.model);
+        const picked = await withinHandshake(agent.selectSessionModel(sid, opts.model));
         debug.log('acp-review', 'model', { requested: opts.model, picked: picked?.name ?? null, backend });
       }
       timer = setTimeout(() => { timedOut = true; agent!.cancel(sid).catch(() => { /* noop */ }); }, timeoutMs);

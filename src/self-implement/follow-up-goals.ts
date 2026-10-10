@@ -1,6 +1,6 @@
-// FOLLOWUP-LOOP① — after a harness PR merges, leftover findings become one
-// follow-up goal draft. Default mode is shadow: record only. `live` also
-// enqueues through the same function as `harness queue add`.
+// FOLLOWUP-LOOP① — leftover findings after a merge or blocked run become
+// follow-up drafts. Default mode is shadow; only merged drafts in `live` mode
+// enqueue through the same function as `harness queue add`.
 //
 // The test process injects every store. Nothing here opens the operational
 // ledger or queue unless the caller passes those seams.
@@ -25,6 +25,9 @@ export type FollowUpMode = 'shadow' | 'live';
 
 export interface FollowUpDraftRecord {
   prNumber: number;
+  ending?: 'blocked';
+  runId?: string;
+  stage?: 'review-blocked' | 'gate-failed';
   cellId: string;
   depth: number;
   draftHash: string;
@@ -50,6 +53,17 @@ export interface FollowUpMergeInput {
   /** Original request. Only its first line enters the draft. */
   feature: string;
   /** Release-cell id. Absent means the goal file's GoalId, else the feature's first token. */
+  cellId?: string;
+  goalFile?: string;
+}
+
+export interface FollowUpBlockedInput {
+  runId: string;
+  prNumber?: number;
+  stage: 'review-blocked' | 'gate-failed';
+  unresolvedMustFix?: readonly string[];
+  decompositionPieces?: readonly string[];
+  feature: string;
   cellId?: string;
   goalFile?: string;
 }
@@ -144,10 +158,15 @@ export function followUpDraftHash(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
+/** Legacy merge rows have no ending; blocked rows use run identity even without a PR. */
+function followUpRecordKey(record: Pick<FollowUpDraftRecord, 'prNumber' | 'ending' | 'runId'>): string {
+  return record.ending === 'blocked' ? `run:${record.runId}` : `pr:${record.prNumber}`;
+}
+
 /** Chain length of follow-up goals already recorded for this cell, before this one. */
-export function followUpChainDepth(prior: readonly Pick<FollowUpDraftRecord, 'kind' | 'prNumber'>[]): number {
-  // 한 PR 이 «기록 → 대기열 확정» 두 줄을 남길 수 있으니 PR 번호로 센다.
-  return new Set(prior.filter((record) => record.kind === 'draft' || record.kind === 'op-card-required').map((record) => record.prNumber)).size;
+export function followUpChainDepth(prior: readonly Pick<FollowUpDraftRecord, 'kind' | 'prNumber' | 'ending' | 'runId'>[]): number {
+  // 기록 → 대기열 확정 두 줄은 하나로 세되, PR 없는 서로 다른 런은 분리한다.
+  return new Set(prior.filter((record) => record.kind === 'draft' || record.kind === 'op-card-required').map(followUpRecordKey)).size;
 }
 
 /** Seat = the cell's owner. `TC/rel` keeps the seat `TC`. Unknown or absent owners go to OP (ONEDOOR). */
@@ -175,13 +194,23 @@ function defaultReadDrafts(stateRoot: string, cellId: string): FollowUpDraftReco
   return out;
 }
 
-/** 같은 PR 은 칸과 무관하게 한 번 — 칸 id 가 달리 들어와도 다시 만들지 않는다. */
-function defaultPrRecorded(stateRoot: string, prNumber: number): boolean {
+/** 같은 PR 또는 같은 blocked 런은 칸과 무관하게 한 번 기록한다. */
+function defaultRecordExists(stateRoot: string, key: string): boolean {
   let text = '';
   try { text = readFileSync(followUpDraftsPath(stateRoot), 'utf8'); } catch { return false; }
   return text.split('\n').some((line) => {
     if (!line.trim()) return false;
-    try { return (JSON.parse(line) as FollowUpDraftRecord).prNumber === prNumber; } catch { return false; }
+    try { return followUpRecordKey(JSON.parse(line) as FollowUpDraftRecord) === key; } catch { return false; }
+  });
+}
+
+function defaultAppendFirst(stateRoot: string, record: FollowUpDraftRecord): boolean {
+  const path = followUpDraftsPath(stateRoot);
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLockSync(`${path}.lock`, () => {
+    if (defaultRecordExists(stateRoot, followUpRecordKey(record))) return false;
+    defaultAppendDraft(stateRoot, record);
+    return true;
   });
 }
 
@@ -209,7 +238,10 @@ export async function recordFollowUpOnMerge(input: FollowUpMergeInput, seams: Fo
   const log = seams.log ?? ((category, event, data) => { debug.log(category, event, data); });
   try {
     const remainings = collectRemainings(input);
-    if (remainings.length === 0) return null;
+    if (remainings.length === 0) {
+      log('self-implement.follow-up', 'draft-skipped-empty', { ending: 'merged', prNumber: input.prNumber });
+      return null;
+    }
     // No injected store and no explicit state root: this is the test process.
     // Do not open the operational ledger or the harness queue.
     // A test process handed the operational root (defaultSeams) is refused the same way.
@@ -222,8 +254,9 @@ export async function recordFollowUpOnMerge(input: FollowUpMergeInput, seams: Fo
       return null;
     }
     const prior = (seams.readDrafts ?? ((id) => defaultReadDrafts(stateRoot, id)))(cellId);
-    if (prior.some((record) => record.prNumber === input.prNumber)) return null;
-    if (!seams.readDrafts && defaultPrRecorded(stateRoot, input.prNumber)) return null;
+    const key = followUpRecordKey({ prNumber: input.prNumber });
+    if (prior.some((record) => followUpRecordKey(record) === key)) return null;
+    if (!seams.readDrafts && defaultRecordExists(stateRoot, key)) return null;
     const depth = followUpChainDepth(prior) + 1;
     const firstLine = originalAskFirstLine(input.feature);
     const mode = seams.mode ?? readFollowUpMode();
@@ -245,45 +278,88 @@ export async function recordFollowUpOnMerge(input: FollowUpMergeInput, seams: Fo
     const append = seams.appendDraft ?? ((row: FollowUpDraftRecord) => defaultAppendDraft(stateRoot, row));
     const appendFirst = seams.appendDraft
       ? (row: FollowUpDraftRecord) => { append(row); return true; }
-      : (row: FollowUpDraftRecord) => (mkdirSync(dirname(followUpDraftsPath(stateRoot)), { recursive: true }), withFileLockSync(`${followUpDraftsPath(stateRoot)}.lock`, () => {
-        if (defaultPrRecorded(stateRoot, row.prNumber)) return false;
-        defaultAppendDraft(stateRoot, row);
-        return true;
-      }));
+      : (row: FollowUpDraftRecord) => defaultAppendFirst(stateRoot, row);
     if (!overDepth && mode === 'live' && draft) record.seat = seatForCellOwner((seams.cellOwner ?? defaultCellOwner)(cellId));
     // 원장 기록을 먼저 확정한다 — 기록이 실패하면 대기열에 넣지 않는다(같은 PR 한 번 · 원장 밖 연결골 0).
     if (!appendFirst(record)) return null;
     if (!overDepth && mode === 'live' && draft && record.seat) {
       const seat = record.seat;
-      if (testProcess && !seams.enqueue) return record;
-      try {
-        await (seams.enqueue ?? ((item) => addHarnessQueue({ seat: item.seat, say: item.say, idempotencyKey: item.idempotencyKey })))({
-          seat,
-          say: draft,
-          idempotencyKey: `follow-up:${input.prNumber}`,
-        });
-        record.queued = true;
-      } catch (error) {
-        // 대기열 넣기가 실패해도 초안은 남긴다 — 같은 PR 은 다시 오지 않으므로 여기서 잃으면 영영 없다.
-        // queued=false ⊕ enqueueError 로 원장에 남기고, 재투입은 같은 idempotencyKey 로 사람이·다음 수리 노드가 한다.
-        record.enqueueError = (error instanceof Error ? error.message : String(error)).slice(0, 300);
-        log('self-implement.follow-up', 'enqueue-failed', { prNumber: input.prNumber, seat, error: record.enqueueError });
-      }
-      // 대기열 결과를 원장에 한 줄 더 — 이 쓰기의 실패는 대기열 실패와 다른 사건이다.
-      try {
-        append({ ...record });
-      } catch (error) {
-        log('self-implement.follow-up', 'ledger-confirm-failed', {
-          prNumber: input.prNumber, seat, queued: record.queued, error: error instanceof Error ? error.message : String(error),
-        });
+      if (!(testProcess && !seams.enqueue)) {
+        try {
+          await (seams.enqueue ?? ((item) => addHarnessQueue({ seat: item.seat, say: item.say, idempotencyKey: item.idempotencyKey })))({
+            seat,
+            say: draft,
+            idempotencyKey: `follow-up:${input.prNumber}`,
+          });
+          record.queued = true;
+        } catch (error) {
+          // 대기열 넣기가 실패해도 초안은 남긴다 — 같은 PR 은 다시 오지 않으므로 여기서 잃으면 영영 없다.
+          // queued=false ⊕ enqueueError 로 원장에 남기고, 재투입은 같은 idempotencyKey 로 사람이·다음 수리 노드가 한다.
+          record.enqueueError = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+          log('self-implement.follow-up', 'enqueue-failed', { prNumber: input.prNumber, seat, error: record.enqueueError });
+        }
+        // 대기열 결과를 원장에 한 줄 더 — 이 쓰기의 실패는 대기열 실패와 다른 사건이다.
+        try {
+          append({ ...record });
+        } catch (error) {
+          log('self-implement.follow-up', 'ledger-confirm-failed', {
+            prNumber: input.prNumber, seat, queued: record.queued, error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     }
+    log('self-implement.follow-up', 'drafted', { ending: 'merged', prNumber: input.prNumber, cellId, depth, kind: record.kind, mode, queued: record.queued, remainingCount: remainings.length });
     return record;
   } catch (error) {
     log('self-implement.follow-up', 'draft-failed', {
       prNumber: input.prNumber,
       error: error instanceof Error ? error.message : String(error),
     });
+    return null;
+  }
+}
+
+/** Blocked runs leave a draft in the ledger only, even when follow-up mode is live. */
+export async function recordFollowUpOnBlocked(input: FollowUpBlockedInput, seams: FollowUpSeams = {}): Promise<FollowUpDraftRecord | null> {
+  const log = seams.log ?? ((category, event, data) => { debug.log(category, event, data); });
+  const prNumber = input.prNumber ?? 0;
+  try {
+    const remainings = collectRemainings({ followUpMustFix: input.unresolvedMustFix, shouldFix: input.decompositionPieces });
+    if (remainings.length === 0) {
+      log('self-implement.follow-up', 'draft-skipped-empty', { ending: 'blocked', prNumber, runId: input.runId });
+      return null;
+    }
+    const testProcess = process.env.NODE_ENV === 'test' || !!process.env.ELANOUS_TEST_HOME;
+    if (!seams.readDrafts && !seams.appendDraft && (!seams.stateRoot || (testProcess && seams.stateRoot === elanousStateRoot()))) return null;
+    const stateRoot = seams.stateRoot ?? elanousStateRoot();
+    const cellId = followUpCellId(input);
+    if (!cellId) {
+      log('self-implement.follow-up', 'draft-skipped-no-cell', { ending: 'blocked', prNumber, runId: input.runId });
+      return null;
+    }
+    const prior = (seams.readDrafts ?? ((id) => defaultReadDrafts(stateRoot, id)))(cellId);
+    const key = followUpRecordKey({ ending: 'blocked', runId: input.runId, prNumber });
+    if (prior.some((record) => followUpRecordKey(record) === key)) return null;
+    if (!seams.readDrafts && defaultRecordExists(stateRoot, key)) return null;
+    const depth = followUpChainDepth(prior) + 1;
+    const firstLine = originalAskFirstLine(input.feature);
+    const mode = seams.mode ?? readFollowUpMode();
+    const overDepth = depth > FOLLOW_UP_DEPTH_LIMIT;
+    const draft = overDepth ? undefined : followUpDraftText(firstLine, remainings);
+    const record: FollowUpDraftRecord = {
+      ending: 'blocked', runId: input.runId, stage: input.stage, prNumber, cellId, depth,
+      draftHash: followUpDraftHash(draft ?? `${firstLine}\n${FOLLOW_UP_OP_CARD_REQUIRED}`),
+      kind: overDepth ? 'op-card-required' : 'draft', originalAskFirstLine: firstLine, remainings,
+      ...(draft ? { draft } : {}),
+      ...(overDepth ? { note: FOLLOW_UP_OP_CARD_REQUIRED } : {}),
+      queued: false,
+    };
+    if (seams.appendDraft) seams.appendDraft(record);
+    else if (!defaultAppendFirst(stateRoot, record)) return null;
+    log('self-implement.follow-up', 'drafted', { ending: 'blocked', prNumber, runId: input.runId, stage: input.stage, cellId, depth, kind: record.kind, mode, queued: false, remainingCount: remainings.length });
+    return record;
+  } catch (error) {
+    log('self-implement.follow-up', 'draft-failed', { ending: 'blocked', prNumber, runId: input.runId, stage: input.stage, error: error instanceof Error ? error.message : String(error) });
     return null;
   }
 }

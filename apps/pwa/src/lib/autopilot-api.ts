@@ -2,7 +2,6 @@
  * Autopilot REST surface (Phase B2 · 2026-07-09).
  * Endpoints (all under /v1/autopilot):
  *   POST  /triage-preview   goal -> execution model classification (heuristic)
- *   GET   /repo-watch       watched repo state (hermes/openclaw/codex)
  *   GET   /autonomy         autonomous action log (surface_events domain=elanous)
  *   GET   /arming           autonomy boundary gate status (booleans)
  */
@@ -20,15 +19,6 @@ export interface TriageResult {
   rationale: string;
   confidence: 'high' | 'medium' | 'low';
   refined: boolean;
-}
-
-export interface RepoWatchEntry {
-  key: string;
-  repo: string;
-  note: string;
-  lastSha: string | null;
-  lastSeen: string | null;
-  lastNew: number;
 }
 
 export interface AutonomyAction {
@@ -58,7 +48,7 @@ export interface MissionSummary {
   model: ExecutionModel | null; tier: string | null; engine: string | null;
   kind?: 'finite' | 'continuous' | 'other';   // 수명 성격
   reviewDue?: boolean;                          // 상시 30일+ 드리프트 리뷰
-  createdAt: string; derived?: MissionRollup;
+  createdAt: string; updatedAt?: number; derived?: MissionRollup;
   // ── U1d 통합 표면(/v1/missions) 확장 ──
   isAutopilot?: boolean;                        // false = 사람 intake 미션(autopilot 메타 없음)
   toxStatus?: string;                           // TOX 상태(planning/active/…) — 사람 미션 표시용
@@ -142,6 +132,7 @@ export function missionCardToSummary(w: MissionCardWire): MissionSummary {
     kind: missionKind(a?.executionModel ?? null),
     reviewDue: false,
     createdAt: new Date(w.createdAt).toISOString(),
+    updatedAt: w.updatedAt,
     isAutopilot: a != null,
     toxStatus: w.status,
     taskCount: w.taskCount,
@@ -167,12 +158,6 @@ export class AutopilotApi {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ goal, commit: true, source, ...(category ? { category } : {}) }),
     });
-  }
-
-  async missions(status?: string, source?: string): Promise<{ ok: boolean; count: number; missions: MissionSummary[]; note: string }> {
-    const q = new URLSearchParams({ ...(status ? { status } : {}), ...(source ? { source } : {}) });
-    const qs = q.toString();
-    return this.client.fetchJson(`/v1/autopilot/missions${qs ? `?${qs}` : ''}`);
   }
 
   /** 통합 미션 표면(U1d) — /v1/missions(fabric 전체: 사람 intake + 자율)를 읽어
@@ -208,10 +193,6 @@ export class AutopilotApi {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id, action, ...spec }),
     });
-  }
-
-  async repoWatch(): Promise<{ ok: boolean; repos: RepoWatchEntry[] }> {
-    return this.client.fetchJson('/v1/autopilot/repo-watch');
   }
 
   async autonomy(limit = 50, loop?: string): Promise<{ ok: boolean; actions: AutonomyAction[] }> {

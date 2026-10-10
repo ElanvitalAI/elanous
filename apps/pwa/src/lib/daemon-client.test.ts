@@ -140,6 +140,28 @@ beforeEach(() => {
 });
 afterEach(() => { globalThis.WebSocket = realWebSocket; });
 
+describe('DaemonClient.submitConsultRequest — authenticated app intake', () => {
+  const request = { name: '민지', org: 'AX', kind: 'company', interest: 'B', contact: '010-0000-1234', consent: true } as const;
+
+  it('sends the consultation fields to the daemon and returns its receipt unchanged', async () => {
+    const receipt = { receiptId: 'R-test', receivedAt: '2026-10-02T06:00:00.000Z' };
+    globalThis.fetch = mockResponse({ status: 202, body: receipt });
+    expect(await makeClient({ token: 'owner' }).submitConsultRequest(request)).toEqual(receipt);
+    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/consult-requests');
+    expect(calls[0]!.init?.method).toBe('POST');
+    expect(new Headers(calls[0]!.init?.headers).get('authorization')).toBe('Bearer owner');
+    expect(new Headers(calls[0]!.init?.headers).get('content-type')).toBe('application/json');
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual(request);
+  });
+
+  it('preserves a field-specific rejection and rejects a journal failure', async () => {
+    globalThis.fetch = mockResponse({ status: 400, body: { error: 'bad_request', field: 'org' } });
+    expect(await makeClient().submitConsultRequest(request)).toEqual({ error: 'bad_request', field: 'org' });
+    globalThis.fetch = mockResponse({ status: 503, body: { error: 'journal-unavailable' } });
+    await expect(makeClient().submitConsultRequest(request)).rejects.toThrow('consult-requests 503');
+  });
+});
+
 describe('DaemonClient.health — GET /v1/health (DOGFOOD §0.4)', () => {
   it('hits /v1/health and returns the parsed body', async () => {
     globalThis.fetch = mockResponse({

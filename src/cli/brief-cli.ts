@@ -1,5 +1,5 @@
 import type { Command } from 'commander';
-import { BRIEF_DOMAINS, BRIEF_PRIORITIES, BRIEF_REACTIONS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, type BriefDomain, type BriefPriority, type BriefReaction, type BriefSlot } from '../briefing/brief-items.js';
+import { BRIEF_DOMAINS, BRIEF_PRIORITIES, BRIEF_REACTIONS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, type BriefDomain, type BriefPriority, type BriefReaction, type BriefSendSlot } from '../briefing/brief-items.js';
 import { kindRouteTarget } from '../domains/telegram-kind-route.js';
 import { sendTelegramReturningId } from '../autopilot/mission-notify.js';
 import { getUserConfig } from '../user-config.js';
@@ -31,6 +31,20 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
         output(`이번 주 브리핑 중 대표가 움직인 것 ${acted}/${total}`);
       } catch (cause) { fail('', cause); }
     });
+  const deliver = (slot: BriefSendSlot): string => ledger().withSendLock(slot, ({ markdown, ids }, markSent) => {
+    if (ids.length === 0) return '(보낼 항목 없음)';
+    const send = deps.send ?? ((text: string) => {
+      const target = kindRouteTarget(getUserConfig(), 'ops-report');
+      if (!target) return null;
+      return sendTelegramReturningId(target.botToken, target.chatId, text);
+    });
+    const messageId = send(markdown);
+    if (typeof messageId !== 'number' || !Number.isFinite(messageId) || messageId <= 0) {
+      throw new Error('발송 실패: 양수 메시지 id 없음');
+    }
+    markSent(ids, slot);
+    return `sent ${messageId} (${ids.length} items)`;
+  });
 
   brief.command('add')
     .description('주장 한 줄을 원장에 추가한다 (원문 그대로)')
@@ -41,9 +55,11 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
     .option('--deadline <deadline>', '마감 (YYYY-MM-DD 또는 ISO)')
     .option('--evidence <evidence>', '근거 링크')
     .option('--created-at <iso>', '작성 시각 (ISO, 생략 시 지금)')
+    .option('--send-now', 'P0 추가 직후 실시간 발송')
     .option('--json', 'JSON 출력')
-    .action((opts: { text: string; domain: string; priority: string; source: string; deadline?: string; evidence?: string; createdAt?: string; json?: boolean }) => {
+    .action((opts: { text: string; domain: string; priority: string; source: string; deadline?: string; evidence?: string; createdAt?: string; sendNow?: boolean; json?: boolean }) => {
       try {
+        if (opts.sendNow && opts.priority !== 'P0') throw new BriefItemsInputError('--send-now requires --priority P0');
         const item = ledger().add({
           text: opts.text,
           domain: opts.domain as BriefDomain,
@@ -54,6 +70,7 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
           ...(opts.createdAt !== undefined ? { createdAt: opts.createdAt } : {}),
         });
         output(opts.json ? JSON.stringify(item) : `added ${item.id} [${item.priority}] ${item.domain}`);
+        if (opts.sendNow) output(deliver('realtime'));
       } catch (cause) { fail('add', cause); }
     });
 
@@ -95,31 +112,20 @@ export function registerBriefCommands(program: Command, deps: BriefCliDeps = {})
 
   brief.command('send')
     .description('슬롯 이전의 미발송 항목을 한 장 발송하고 성공한 항목만 표시한다')
-    .requiredOption('--slot <slot>', `슬롯 (${BRIEF_SLOTS.join('|')})`)
+    .option('--slot <slot>', `슬롯 (${BRIEF_SLOTS.join('|')}, --realtime 시 불필요)`)
+    .option('--realtime', '미발송 P0 및 오늘 마감 항목을 즉시 한 장 발송한다')
     .option('--dry-run', '한 장만 출력하고 발송·표시하지 않는다')
-    .action((opts: { slot: string; dryRun?: boolean }) => {
+    .action((opts: { slot?: string; realtime?: boolean; dryRun?: boolean }) => {
       try {
-        const store = ledger();
+        if (opts.realtime && opts.slot !== undefined) throw new BriefItemsInputError('--realtime cannot be combined with --slot');
+        if (!opts.realtime && opts.slot === undefined) throw new BriefItemsInputError('--slot is required unless --realtime');
+        const slot = opts.realtime ? 'realtime' : opts.slot!;
         if (opts.dryRun) {
-          const { markdown, ids } = store.composeWithIds(opts.slot);
+          const { markdown, ids } = ledger().composeWithIds(slot);
           output(ids.length === 0 ? '(보낼 항목 없음)' : markdown);
           return;
         }
-        const result = store.withSendLock(opts.slot, ({ markdown, ids }, markSent) => {
-          if (ids.length === 0) return '(보낼 항목 없음)';
-          const send = deps.send ?? ((text: string) => {
-            const target = kindRouteTarget(getUserConfig(), 'ops-report');
-            if (!target) return null;
-            return sendTelegramReturningId(target.botToken, target.chatId, text);
-          });
-          const messageId = send(markdown);
-          if (typeof messageId !== 'number' || !Number.isFinite(messageId) || messageId <= 0) {
-            throw new Error('발송 실패: 양수 메시지 id 없음');
-          }
-          markSent(ids, opts.slot as BriefSlot);
-          return `sent ${messageId} (${ids.length} items)`;
-        });
-        output(result);
+        output(deliver(slot as BriefSendSlot));
       } catch (cause) { fail('send', cause); }
     });
 }

@@ -22,7 +22,7 @@ import type { RotationCandidate } from './codex-account-rotation.js';
 import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
 
 /** 체인에 놓을 수 있는 칸. ⛔ 모르는 이름은 «조용히 건너뛰지 않고» 거부한다(오타 방어). */
-export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty'] as const;
+export const FALLBACK_STEPS = ['codex-rotate', 'grok', 'claude-pty', 'openrouter'] as const;
 export type FallbackStep = (typeof FALLBACK_STEPS)[number];
 
 /** 기본 체인 — ⛔⭐ **2026-08-20 에 `grok` 이 «기본»으로 들어왔다**(대표 지시).
@@ -78,6 +78,8 @@ export type FallbackDecision =
   | { readonly action: 'codex-rotate'; readonly to: RotationCandidate }
   /** 백엔드를 통째로 바꾼다. */
   | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' }
+  /** 명시한 유료 OpenRouter 모델로 전환한다. 호출부가 모델을 바꾸지 못하면 실행하지 않는다. */
+  | { readonly action: 'switch-backend'; readonly backend: 'openrouter'; readonly model: string }
   /** 아무것도 안 한다 — 이유를 «값으로» 남긴다. */
   | { readonly action: 'stay'; readonly why: StayReason };
 
@@ -98,6 +100,8 @@ export type StayReason =
   | 'grok-unavailable'
   /** grok 자격은 있는데 «잔량이 소진»됐다 — 자격 부재와 «다른 값»이다. */
   | 'grok-exhausted'
+  /** 유료 OpenRouter 모델 또는 키가 없다. */
+  | 'openrouter-unavailable'
   /** claude PTY 의 최근 표본이 성숙 관문을 통과하지 못했거나 읽히지 않는다. */
   | 'claude-pty-immature';
 
@@ -113,6 +117,10 @@ export type FallbackInput = {
   /** grok 자격이 «있나». ⛔ 「모른다」를 boolean 에 접지 마라 — 호출자가
    *  `resolveGrokCredential() !== null` 로 확정해서 준다. */
   readonly grokAvailable: boolean;
+  /** `llm.openrouter.fallbackModel` — 기본 모델로의 유료 폴백은 허용하지 않는다. */
+  readonly openrouterFallbackModel?: string;
+  /** OpenRouter 키 존재 여부(키 값 자체는 판정·관측에 넣지 않는다). */
+  readonly openrouterAvailable?: boolean;
   /**
    * grok 이 «지금 쓸 수 있나» — ⛔ 자격(`grokAvailable`)과 «다른 축»이다.
    *   'usable'    쓸 수 있다(잔량 있음 · 무제한 · 임계 미만)
@@ -154,11 +162,13 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
   const {
     rotation, chain, currentStep, currentCredentialRateLimited = false,
     grokAvailable, grokQuota = 'unknown', claudePtyMaturity, stayOnResetCreditAvailable = false,
+    openrouterFallbackModel, openrouterAvailable = false,
   } = input;
+  const openrouter = { model: openrouterFallbackModel, available: openrouterAvailable };
 
   if (currentCredentialRateLimited) {
     if (currentStep === undefined) return { action: 'stay', why: 'chain-exhausted' };
-    return stepAfter(chain, currentStep, grokAvailable, grokQuota, claudePtyMaturity, 'chain-exhausted');
+    return stepAfter(chain, currentStep, grokAvailable, grokQuota, claudePtyMaturity, openrouter, 'chain-exhausted');
   }
   if (rotation.reason === 'explicit') return { action: 'stay', why: 'explicit' };
   if (rotation.reason === 'not-reached' || (rotation.reason === 'credit-pace' && !('to' in rotation))) {
@@ -172,13 +182,13 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
     // 회전이 답을 냈는데 체인이 codex-rotate 를 «빼» 놨다면 그 뜻을 존중하고
     // 다음 칸으로 간다(회전을 원치 않는 구성).
     if (chain.includes('codex-rotate')) return { action: 'codex-rotate', to: rotation.to };
-    return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, 'chain-exhausted');
+    return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, openrouter, 'chain-exhausted');
   }
 
   // no-candidate | disabled | reset-credit-available(기본) — codex 축이 끝났다. 다음 칸을 본다.
   // ⛔ 다음 칸이 «없을 때»의 이름만 고른다. 진행(stepAfterCodex)은 그대로다.
   const fallbackWhy = stayReasonWhenCodexAxisEnds(rotation.reason === 'credit-pace' ? 'no-candidate' : rotation.reason);
-  return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, fallbackWhy);
+  return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, openrouter, fallbackWhy);
 }
 
 /** codex 축이 끝났는데 체인 다음 칸도 없을 때 머무는 이유.
@@ -197,9 +207,10 @@ function stepAfterCodex(
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
+  openrouter: { readonly model?: string; readonly available: boolean },
   whyIfNone: StayReason,
 ): FallbackDecision {
-  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, whyIfNone);
+  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, openrouter, whyIfNone);
 }
 
 function stepAfter(
@@ -208,12 +219,21 @@ function stepAfter(
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
+  openrouter: { readonly model?: string; readonly available: boolean },
   whyIfNone: StayReason,
 ): FallbackDecision {
   const idx = currentStep === undefined ? -1 : chain.indexOf(currentStep);
   const rest = idx === -1 ? chain : chain.slice(idx + 1);
   let unavailableWhy: StayReason | undefined;
   for (const step of rest) {
+    if (step === 'openrouter') {
+      const model = openrouter.model?.trim();
+      if (!openrouter.available || !model || !/^openrouter\/[^/\s]+\/[^\s]+$/.test(model)) {
+        unavailableWhy = 'openrouter-unavailable';
+        continue;
+      }
+      return { action: 'switch-backend', backend: 'openrouter', model };
+    }
     if (step === 'grok') {
       // 자격 부재와 소진은 다른 값이다. 다음 칸이 있으면 그 칸을 살핀다.
       if (!grokAvailable) { unavailableWhy = 'grok-unavailable'; continue; }
@@ -236,7 +256,9 @@ export function describeFallback(decision: FallbackDecision): string {
     case 'codex-rotate':
       return `codex 계정 전환 → ${decision.to.name}`;
     case 'switch-backend':
-      return `백엔드 전환 → ${decision.backend} (구독)`;
+      return decision.backend === 'openrouter'
+        ? `백엔드 전환 → openrouter (${decision.model} · API 과금)`
+        : `백엔드 전환 → ${decision.backend} (구독)`;
     case 'stay':
       return `전환 없음 (${decision.why})`;
   }

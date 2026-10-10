@@ -43,6 +43,7 @@ describe('recordRunStop', () => {
     expect(classifyMergeHoldStop('main-sync-conflict-unresolved')).toBe('main-sync');
     expect(classifyMergeHoldStop('required-evidence-uncovered')).toBe('evidence-uncovered');
     expect(classifyMergeHoldStop('review-must-fix')).toBe('review-repeat');
+    expect(classifyMergeHoldStop('review-warn-with-must-fix')).toBe('review-repeat');
     expect(classifyMergeHoldStop('no-real-review')).toBe('review-out-of-scope');
     expect(classifyMergeHoldStop('something-new')).toBe('unclassified');
     expect(classifyMergeHoldStop(undefined)).toBe('unclassified');

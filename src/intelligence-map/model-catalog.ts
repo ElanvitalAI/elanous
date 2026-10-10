@@ -794,6 +794,47 @@ export const BUILTIN_CATALOG: ModelCatalog = {
       mlxRepo: 'lmstudio-community/NVIDIA-Nemotron-3-Nano-30B-A3B-MLX-8bit',
       notes: 'NVIDIA Open Model License · 30B/3B MoE · 1M ctx · text+vision+audio+video · Q4 ~28GB / MLX-8bit ~36GB · M5 Max OK',
     },
+    // ⭐ 2026-10-10 (MK · MODEL-ROUTING-MATRIX) — `--child-llm-model` 이 이 둘을 «알 수 없음»으로 거부했다
+    //    (UX 17:36 실측 · 해석은 이 표 ⊕ src/anthropic/models.ts 만 본다). 값은 Anthropic 공식 1차
+    //    (platform.claude.com/내부 문서 `overview` · 2026-10-10T08:38Z 직접 확인)
+    //    ⊕ OpenRouter /api/v1/models 실측(05:10Z) 이 같다. 별칭(`sonnet`·`haiku`)은 옮기지 않는다 — 별개 결정.
+    // ⛔ 표의 «맨 끝»에 둔 것은 의도다 — `recommendModel` 은 같은 가격이면 표 순서로 고른다(안정 정렬).
+    //    haiku-5-5($0.10/$0.50)는 gpt-6-luna 와 값이 같아, 앞에 두면 'cheap' 추천이 조용히 haiku 로 바뀐다
+    //    (게다가 haiku 는 >100k 프롬프트가 5배라 이 칸 하나로는 싸다고 말할 수 없다). 추천 변경은 별개 결정.
+    {
+      // 📏 공식: Released 2026-09-28 · 1M ctx · 출력 128K · $2/$10 · 캐시 읽기 $0.10(입력의 5%) · Adaptive · 기본 effort high.
+      id: 'claude-sonnet-5-5',
+      provider: 'anthropic',
+      family: 'claude',
+      contextWindow: 1_000_000,
+      inputPerMtok: 2,
+      outputPerMtok: 10,
+      local: false,
+      tags: ['reasoning', 'coding', 'balanced', 'long-context'],
+      bestFor: ['daily-coding', 'multi-turn-chat', 'summarization'],
+      envKey: 'ANTHROPIC_API_KEY',
+      reservedOutputTokens: 8_000,
+      reasoningEffortCeiling: 'high',  // adaptive thinking (공식 «Adaptive»)
+      releasedAt: '2026-09-28',
+    },
+    {
+      // 📏 공식: Released 2026-10-07 · 1M ctx · 출력 128K · Adaptive · 기본 effort medium.
+      // ⚠️ 가격이 프롬프트 길이 구간으로 갈린다 — ≤100k 토큰 $0.10/$0.50 · >100k $0.50/$2.50(요청 전체).
+      //    칸이 하나라 «≤100k» 를 싣는다.
+      id: 'claude-haiku-5-5',
+      provider: 'anthropic',
+      family: 'claude',
+      contextWindow: 1_000_000,
+      inputPerMtok: 0.1,
+      outputPerMtok: 0.5,
+      local: false,
+      tags: ['classification', 'summarization', 'cheap', 'fast', 'long-context'],
+      bestFor: ['classification', 'routing', 'bulk-summarization', 'subagent-tasks'],
+      envKey: 'ANTHROPIC_API_KEY',
+      reservedOutputTokens: 8_000,
+      reasoningEffortCeiling: 'high',  // 공식: adaptive thinking ⊕ effort 파라미터 지원(haiku-4-5 의 'low' 와 다르다)
+      releasedAt: '2026-10-07',
+    },
   ],
 };
 

@@ -23,11 +23,19 @@ export interface GateShard {
   plannedMin?: number;
 }
 
+/** 게이트 노드의 판정 결과 — 끝난 조각의 rc≠0 을 «새로 생긴 실패»와 «기존 실패»로 가른 수. */
+export interface GateShardsVerdict {
+  introduced: number;
+  preexisting: number;
+}
+
 export interface GateShardsFile {
   v: 1;
   version: string;
   updatedAt: string;
   shards: GateShard[];
+  /** 판정이 나기 전에는 없다. 옛 파일(필드 없음)도 그대로 읽는다 — `v` 를 올리지 않는다. */
+  verdict?: GateShardsVerdict;
 }
 
 export function gateShardsPath(version: string, root: string = releaseLedgerRoot()): string {
@@ -58,7 +66,15 @@ function shardOf(value: unknown): GateShard | null {
   };
 }
 
-/** 파일이 없거나 깨졌으면 null. 알 수 없는 상태값의 조각은 버리되 파일 전체는 살린다. */
+function verdictOf(value: unknown): GateShardsVerdict | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const introduced = num(raw.introduced);
+  const preexisting = num(raw.preexisting);
+  return introduced !== undefined && preexisting !== undefined ? { introduced, preexisting } : undefined;
+}
+
+/** 파일이 없거나 깨졌으면 null. 알 수 없는 상태값의 조각은 버리되 파일 전체는 살린다(깨진 verdict 도 필드만 버린다). */
 export function readGateShards(path: string): GateShardsFile | null {
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
@@ -68,7 +84,11 @@ export function readGateShards(path: string): GateShardsFile | null {
   const version = str(raw.version, 40);
   const updatedAt = str(raw.updatedAt, 40);
   if (!version || !updatedAt) return null;
-  return { v: 1, version, updatedAt, shards: raw.shards.map(shardOf).filter((s): s is GateShard => s !== null) };
+  const verdict = verdictOf(raw.verdict);
+  return {
+    v: 1, version, updatedAt, shards: raw.shards.map(shardOf).filter((s): s is GateShard => s !== null),
+    ...(verdict ? { verdict } : {}),
+  };
 }
 
 /** tmp → rename — 읽는 쪽이 반쯤 쓴 파일을 보지 않게. */
@@ -77,6 +97,17 @@ export function writeGateShards(path: string, file: GateShardsFile): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(file)}\n`);
   renameSync(tmp, path);
+}
+
+/**
+ * GATE-LIVE-OBS-RC-WORDING ⓒ — the gate node writes its verdict into the board it already keeps, after judging.
+ * No board (a local, non-Pod gate) ⇒ false and nothing is written: a verdict never creates a board out of thin air.
+ */
+export function recordGateShardsVerdict(path: string, verdict: GateShardsVerdict, now: Date = new Date()): boolean {
+  const file = readGateShards(path);
+  if (!file) return false;
+  writeGateShards(path, { ...file, updatedAt: now.toISOString(), verdict });
+  return true;
 }
 
 export interface GateShardsSummary {
@@ -89,6 +120,9 @@ export interface GateShardsSummary {
   /** 끝났지만 rc≠0 인 조각 수 — 쓰는 쪽의 `done` 은 «조각 끝»일 뿐 «통과»가 아니다(판정은 게이트 노드가 기존/새로 가른다).
    *  0.2.20 컷 실측: 끝난 넷이 모두 rc 1 인데 화면이 «통과»로 읽었다. */
   doneWithFailures: number;
+  /** 게이트 노드의 판정(기존/새로). null = «판정 전» — 「새 실패 0」과 다른 값이다.
+   *  `summarizeShards` 는 늘 채운다(선택 필드인 것은 이 요약을 손으로 만드는 픽스처·읽는 쪽을 깨지 않으려는 것). */
+  verdict?: GateShardsVerdict | null;
   /** 도는 조각 중 계획 분을 가장 많이 넘긴 분(없으면 0). 넘겼으면 etaMin 은 «하한»일 뿐이라 화면이 그렇게 말한다
    *  — canary 10-07 실측: 계획 0.1분 · 실제 22분 → 넘김을 안 보이면 내내 «남은 약 0분». */
   overrunMin: number;
@@ -134,6 +168,7 @@ export function summarizeShards(file: GateShardsFile, now: number = Date.now()):
     counts,
     waitReasons: [...reasons].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
     doneWithFailures: file.shards.filter((s) => s.state === 'done' && s.rc !== undefined && s.rc !== 0).length,
+    verdict: file.verdict ?? null,
     etaMin: estimate(file.shards, now),
     overrunMin: Math.floor(overrun),
     staleMin: stale === null ? null : Math.floor(stale),
@@ -144,7 +179,16 @@ export const SHARD_WORD: Record<ShardState, string> = {
   pending: '대기', running: '돌기', done: '끝', retry: '재시도', timeout: '잘림', failed: '실패',
 };
 
-/** 외출 알림·/release 한 줄 — «조각 24 · 돌기 5 · 대기 8(CPU 부족 8) · 잘림 2 · 통과 9 · 남은 약 40분». */
+/**
+ * `끝` 꼬리. 기존 실패가 있는 판에선 조각 전부가 rc 1 로 끝난다(0.2.21 컷: 24/24) — 그래서 판정 전엔 rc≠0 을 «실패»라 부르지 않고,
+ * 판정 뒤엔 새로 생긴 실패만 싣는다(기존 실패 수는 줄에 안 싣는다).
+ */
+function doneTail(summary: GateShardsSummary): string {
+  if (summary.verdict) return summary.verdict.introduced > 0 ? `(새 실패 ${summary.verdict.introduced})` : '';
+  return summary.doneWithFailures ? `(rc≠0 ${summary.doneWithFailures} · 기존 실패 포함 · 판정 전)` : '';
+}
+
+/** 외출 알림·/release 한 줄 — «조각 24 · 돌기 5 · 대기 8(CPU 부족 8) · 잘림 2 · 끝 9(rc≠0 3 · 기존 실패 포함 · 판정 전) · 남은 약 40분». */
 export function shardsLine(summary: GateShardsSummary): string {
   const order: ShardState[] = ['running', 'pending', 'retry', 'timeout', 'failed', 'done'];
   const parts = [`조각 ${summary.total}`];
@@ -153,7 +197,7 @@ export function shardsLine(summary: GateShardsSummary): string {
     if (!n) continue;
     const why = state === 'pending' && summary.waitReasons.length
       ? `(${summary.waitReasons.slice(0, 2).map((w) => `${w.reason} ${w.count}`).join(' · ')})` : '';
-    const reported = state === 'done' && summary.doneWithFailures ? `(실패 보고 ${summary.doneWithFailures})` : '';
+    const reported = state === 'done' ? doneTail(summary) : '';
     parts.push(`${SHARD_WORD[state]} ${n}${why}${reported}`);
   }
   if (summary.overrunMin >= 1) parts.push(`계획보다 ${summary.overrunMin}분 넘게 도는 중 — 남은 시간 추정 불가`);

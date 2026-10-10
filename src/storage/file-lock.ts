@@ -46,7 +46,7 @@ export interface LockOpts {
    * (a holder killed with -9 must not wedge waiters for `staleMs`).
    */
   breakDeadHolder?: boolean;
-  /** Sync lock only: called once, the first time the lock is found held by someone else. */
+  /** Called once, the first time the lock is found held by someone else. */
   onWait?: (holder: string) => void;
 }
 
@@ -137,6 +137,7 @@ export async function acquireLockAsync(lockPath: string, opts: LockOpts = {}): P
   const heartbeatMs = Math.max(50, Math.floor(staleMs / 3));
   // ⭐ **소유 토큰** — inode 보다 강하다(inode 는 재사용된다). 파일 내용이 곧 소유 증명이다.
   const token = `${process.pid}:${randomUUID()}`;
+  let waited = false;
 
   for (let attempt = 0; attempt < maxTries; attempt += 1) {
     try {
@@ -186,6 +187,12 @@ export async function acquireLockAsync(lockPath: string, opts: LockOpts = {}): P
         }
       } catch {
         continue;
+      }
+      if (!waited && opts.onWait) {
+        waited = true;
+        let holder = '';
+        try { holder = readFileSync(lockPath, 'utf8').trim(); } catch { /* gone */ }
+        try { opts.onWait(holder); } catch { /* observer only */ }
       }
       await new Promise((resolve) => { setTimeout(resolve, retryBusyMs); });
     }

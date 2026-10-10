@@ -135,7 +135,8 @@ function compose(parts: WeeklyParts, key: string, now: Date, versions: Section<s
     `# 주간 미팅 — ${key} (KST)`, header,
     section('landings', parts.landings, list => {
       const seats = [...new Set(list.map(i => i.seat))].sort(sortNames).map(s => `${s} ${list.filter(i => i.seat === s).length}`).join(' · ');
-      return `총 ${list.length}건 · 자리별 ${seats || '없음'}\n발행된 판: ${versions.status === 'ok' ? versions.value.join(', ') || '없음' : `못 읽음 · ${versions.reason}`}`;
+      const shown = list.slice(0, 10);
+      return `총 ${list.length}건 · 자리별 ${seats || '없음'}\n발행된 판: ${versions.status === 'ok' ? versions.value.join(', ') || '없음' : `못 읽음 · ${versions.reason}`}\n지난주 지표: 착지 ${list.length}건 · 발행 ${versions.status === 'ok' ? `${versions.value.length}판` : `못 읽음 · ${versions.reason}`}\n지난주 착지:\n${shown.map(i => `- ${i.title} (${i.seat} · ${i.mergedAt})`).join('\n') || '없음'}${list.length > shown.length ? `\n외 ${list.length - shown.length}건` : ''}`;
     }),
     section('release', parts.release, r => `${r.version}: green ${r.green}/${r.total} · 다음 판 ${r.nextVersion ?? '미정'} ${r.nextGreen ?? '못 읽음'}/${r.nextTotal ?? '못 읽음'} · 다음 컷 ${r.cutAt ?? '미정'}\nred 칸: ${r.red.map(i => i.name).join(', ') || '없음'}`),
     section('issues', parts.issues, list => list.map(i => `- ${i.id} ${i.title} · ${i.owner} · 기한 ${i.due}`).join('\n') || '열린 현안 없음'),
@@ -226,7 +227,7 @@ export async function runWeekly(options: { dryRun?: boolean; stage?: 'collect' |
     };
     const issues = await safe(async () => issueHistory(root));
     const parts: WeeklyParts = {
-      landings: await safe(() => deps.landings ? deps.landings(now, { from, to }) : collectLandings(now, { from, to }, { repoRoot: deps.repoRoot, repoName: deps.repoName })),
+      landings: await safe(() => deps.landings ? deps.landings(now, { from, to }) : collectLandings(now, { from, to }, { repoRoot: deps.repoRoot, repoName: deps.repoName, stateRoot: root })),
       release: await safe(deps.release ?? (() => collectWeeklyRelease(now, root))),
       issues: issues.status === 'ok' ? { status: 'ok', value: [...latest(issues.value).values()].filter(i => i.status === 'open') } : issues,
       followThrough: issues.status === 'ok' ? { status: 'ok', value: [...new Set([

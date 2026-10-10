@@ -15,11 +15,27 @@
 //   ELANOUS_CHILD_TOOL_PROFILE=full            전부
 //   ELANOUS_CHILD_TOOL_PROFILE=finance,ops     기본 ⊕ 고른 묶음
 //   (없음)                                   coding(기본)
+//
+// 🩸 CHILD-TOOL-PROFILE-TRIM(10-10 실측 · base 0317d73034 · Plan 켬): `coding` 이 33개 중 27개(스키마 26,742자)를
+//    남겼다 — 판·자리 운영·회수·스킬·서브에이전트 도구가 «어느 묶음에도 안 들어서» 기본으로 갔을 뿐이다.
+//    ⇒ 화이트리스트를 따로 두지 않고(09-25 설계 유지) 그것들을 새 묶음 넷(admin · recall · skills · subagent)으로 옮긴다.
+//    ⇒ `coding` 의 기대 집합 = Read · Grep · Glob · ListDir · Edit · Write · Bash · Plan · MarkStepDone(9개).
+//    빠진 묶음은 상황 신호(골 문면)와 ToolSearch(전체 목록에서 찾는다)로 계속 닿는다.
+
+import { debug } from '../debug/log.js';
 
 /** 추가 묶음 — 코딩 기본에서 빠지고 «고르면 더해지는» 도구들. 접두 ⊕ 정확한 이름. */
 export const TOOL_EXTRA_GROUPS = {
   finance: { prefixes: ['finance_', 'conatus_'], names: [] as string[] },
   ops: { prefixes: [] as string[], names: ['schedule_manage', 'session_manage', 'autopilot_missions', 'ops_status', 'se_build', 'mission_decide'] },
+  /** 판·자리·결정 운영 — 코딩 일에는 안 쓴다. */
+  admin: { prefixes: ['release_'], names: ['coo_admin', 'ops_seats', 'decisions_pending', 'proact_meter'] },
+  /** 기억·회수·관측 조회. */
+  recall: { prefixes: [] as string[], names: ['memory_recall', 'fact_check', 'self_recall', 'context_now', 'logs_query'] },
+  /** 스킬 목록·실행. */
+  skills: { prefixes: [] as string[], names: ['elanous_skills_list', 'skill_exec'] },
+  /** 서브에이전트 — ⚠️ 기본에서 빼도 완주율이 안 떨어지는지는 아직 안 쟀다(SMALL-MODEL-BENCH 가 잰다). 신호·ToolSearch 로 되살린다. */
+  subagent: { prefixes: [] as string[], names: ['Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList'] },
 } as const;
 export type ToolExtraGroup = keyof typeof TOOL_EXTRA_GROUPS;
 const ALL_GROUPS = Object.keys(TOOL_EXTRA_GROUPS) as ToolExtraGroup[];
@@ -45,6 +61,10 @@ export function activeToolProfile(env: NodeJS.ProcessEnv = process.env): ToolPro
 export const SITUATIONAL_GROUP_SIGNALS: Record<ToolExtraGroup, RegExp> = {
   finance: /금융|주식|종목|주가|시세|매매|포트폴리오|포지션|투자|백테스트|13F|재무|finance_|conatus|stock|ticker|portfolio|backtest|trading/i,
   ops: /스케줄|크론|예약 실행|오토파일럿|미션 결정|운영 상태|schedule_manage|autopilot|ops_status|mission_decide|cron/i,
+  admin: /release_(status|change)|coo_admin|ops_seats|decisions_pending|proact_meter|판 칸|칸 근거|칸 상태|체크리스트 칸|checklist (set|status)|결정 대기|자리 현황/i,
+  recall: /memory_recall|fact_check|self_recall|context_now|logs_query|기억 조회|기억을 (찾|조회|회수)|자기 이력|사실 확인|팩트 ?체크/i,
+  skills: /elanous_skills_list|skill_exec|스킬(을)? 실행|스킬 목록|run (a|the) skill/i,
+  subagent: /서브\s?에이전트|하위\s?에이전트|sub-?agents?|에이전트를 (띄|병렬)|병렬 에이전트|Agent(Output|Reply|Stop|List)\b|Agent 도구/i,
 };
 
 export function situationalToolGroups(goalText: string | undefined): ToolExtraGroup[] {
@@ -58,9 +78,15 @@ export function situationalToolGroups(goalText: string | undefined): ToolExtraGr
  *  ③ 둘 다 없으면 `coding`(다이어트) */
 export function childToolProfile(env: NodeJS.ProcessEnv = process.env, goalText?: string): string {
   const explicit = env.ELANOUS_CHILD_TOOL_PROFILE?.trim();
-  if (explicit) return explicit;
+  if (explicit) {
+    const parsed = parseToolProfile(explicit);
+    debug.log('agent.tool-profile', 'child-profile-chosen', { source: 'env', raw: explicit, profile: parsed?.name ?? 'coding', groups: parsed ? [...parsed.groups] : [] });
+    return explicit;
+  }
   const groups = situationalToolGroups(goalText);
-  return groups.length ? groups.join(',') : 'coding';
+  const profile = groups.length ? groups.join(',') : 'coding';
+  debug.log('agent.tool-profile', 'child-profile-chosen', { source: groups.length ? 'situational' : 'default', profile, groups, goalChars: goalText?.length ?? 0 });
+  return profile;
 }
 
 /** 기본 모드에서 뺀 묶음을 자식에게 «한 줄»로 알린다 — 필요하면 ToolSearch 로 불러 쓴다(스키마는 안 싣는다). */

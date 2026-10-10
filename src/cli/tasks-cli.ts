@@ -9,8 +9,9 @@ import { readNexusRuntime } from '../nexus/runtime.js';
 import { checklistDevVersion } from '../release-loop/checklist.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { cardPrNumber, COMPLETION_KINDS, handTask, nextMoveFor, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { cardPrNumber, COMPLETION_KINDS, handTask, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, taskAgentStatePath as taskStatePathDefault, shellQuote, TA_LAND_ENV, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { readCardSalvageBranch, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
+import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 import { formatTaskAgentCover, measureTaskAgentCover, type CoverRow, type TaskAgentCoverInput } from '../task-agent/cover.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
@@ -25,6 +26,8 @@ export interface TasksCliDeps {
   output?: (line: string) => void;
   /** `task hand --live` 의 발사기(시험 주입). 기본은 운영 config-dir 로 `harness say` 를 떼어 띄운다. */
   taskLauncher?: TaskLauncher;
+  /** TA-REVIEW-RESULT-CAPTURE — `tasks show` 의 리뷰 결과 회수 시각(시험 주입 · 기본 지금). */
+  reviewResultNow?: () => Date;
   /** 과제 카드 상태 파일(시험 주입). 기본 = `effectiveInstanceRoot()/task-agent-actions.json`. */
   taskStatePath?: string;
   /** logs.db 싱크 등록(시험 주입). 기본 = `registerStandaloneLogSink`. `hand`·`show` 가 부른다. */
@@ -44,6 +47,10 @@ export interface TasksCliDeps {
   /** `tasks cover` logs 조회 seam. 기본은 등록된 모든 우주(운영 ⊕ test)의 logs.db 를 read-only 로 연다 —
    *  pr land 는 작업 트리마다 파생 test 우주에 기록되므로 현재 우주만 읽으면 분모가 늘 0 이다. */
   coverLogs?: (query: LogQuery) => LogStoreRow[] | CoverLogRead;
+  /** TA-REJUDGE-ON-HEAD — `tasks rejudge` 의 판단 의존(시험 주입 · 기본 = 설정 liveMoves ⊕ 실물 gh·리뷰·재게이트·land). */
+  rejudge?: Partial<import('../task-agent/rejudge-on-head.js').RejudgeDeps>;
+  /** TA-REJUDGE-ON-HEAD — `tasks regate-run` 의 재게이트(시험 주입 · 기본 `runHostRegate`). */
+  hostRegate?: (input: import('../self-implement/host-regate.js').HostRegateInput) => Promise<import('../self-implement/host-regate.js').HostRegateResult>;
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -108,7 +115,7 @@ export interface DefaultTaskLauncherDeps {
   /** 이미 stop 이 있나(시험 주입). 기본 = 이 우주 런 원장 ⊕ 이 프로세스 기록. */
   hasStop?: (runId: string) => boolean;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 대상(시험 주입). undefined = 설정·env 에서 푼다 · null = 끔. */
-  parentHost?: import('../task-agent/parent-host.js').ParentHostConfig | null;
+  parentHost?: import('../task-agent/parent-host.js').ParentHostConfig | readonly import('../task-agent/parent-host.js').ParentHostConfig[] | null;
   /** 원격 ssh(시험 주입). */
   ssh?: import('../task-agent/parent-host.js').SshRunner;
   /** HQ 발사 동결(holdLaunches) 여부(시험 주입). */
@@ -125,21 +132,23 @@ export interface DefaultTaskLauncherDeps {
  */
 async function tryRemoteParent(args: string[], cwd: string | undefined, context: TaskLaunchContext, deps: DefaultTaskLauncherDeps): Promise<TaskLaunchReceipt | null> {
   const parentHostModule = await import('../task-agent/parent-host.js');
-  let target = deps.parentHost;
-  if (target === undefined) {
+  let configured: import('../task-agent/parent-host.js').ParentHostSetting | null | undefined = deps.parentHost;
+  if (configured === undefined) {
     const { getUserConfig } = await import('../user-config.js');
-    let configured: Parameters<typeof parentHostModule.resolveParentHost>[0];
     try { configured = getUserConfig().taskAgent?.parentHost; } catch { configured = undefined; }
-    target = parentHostModule.resolveParentHost(configured);
   }
-  if (!target) return null;
+  const multi = Array.isArray(configured);
+  const targets = configured === null ? [] : parentHostModule.resolveParentHosts(configured, deps.parentHost === undefined ? process.env : { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
+  if (!targets.length) return null;
   const notice = deps.notice ?? ((line: string) => { try { process.stderr.write(`${line}\n`); } catch { /* ignore */ } });
-  const fallback = (gaps: string[], facts: Record<string, string> = {}): null => {
-    try { debug.log('task-agent', 'parent-host-fallback', { host: target!.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
-    notice(`[parent-host] ${target!.host} 로 못 띄움 — 로컬 발사로 간다: ${gaps.join(' · ')}`);
-    return null;
+  const failed = (target: typeof targets[number], gaps: string[], facts: Record<string, string> = {}): void => {
+    try { debug.log('task-agent', 'parent-host-fallback', { host: target.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
+    notice(`[parent-host] ${target.host} 로 못 띄움 — ${multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
   };
-  if (cwd) return fallback(['project-target-is-local']);
+  if (cwd || context.env[TA_LAND_ENV] === '1') {
+    failed(targets[0]!, [cwd ? 'project-target-is-local' : 'ta-land-needs-local-parent']);
+    return null;
+  }
   let launchHoldActive = false;
   try {
     if (deps.launchHoldActive) launchHoldActive = deps.launchHoldActive();
@@ -149,18 +158,28 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
       launchHoldActive = readLandingFreeze(prodInstanceRoot())?.holdLaunches === true;
     }
   } catch { launchHoldActive = true; /* 못 읽으면 막힌 것으로(fail-closed) */ }
-  const preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, ...(deps.ssh ? { ssh: deps.ssh } : {}) });
-  if (!preflight.ok) return fallback(preflight.gaps, preflight.facts);
-  try {
-    const launched = parentHostModule.launchRemoteParent(target, args, context.env, deps.ssh);
-    try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
-    return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
-  } catch (error) {
-    // «확실히 안 떴다»일 때만 로컬로 — 불확실(ssh 끊김 등)은 던져 카드를 launch-failed 로 남긴다(중복 발사 방지).
-    if (error instanceof parentHostModule.RemoteParentNotLaunchedError) return fallback([error.message]);
-    try { debug.log('task-agent', 'parent-host-launch-uncertain', { host: target.host, runId: context.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
-    throw error;
+  const capacities = Object.fromEntries(multi ? targets.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : []);
+  const ordered = multi ? parentHostModule.orderParentHosts(targets, context.runId, capacities) : targets;
+  for (const target of ordered) {
+    if (multi && (!capacities[target.host] || capacities[target.host]!.approvalHeadroom <= 0)) {
+      failed(target, ['capacity-unavailable']);
+      continue;
+    }
+    let preflight: ReturnType<typeof parentHostModule.preflightParentHost>;
+    try { preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, ...(deps.ssh ? { ssh: deps.ssh } : {}) }); }
+    catch (error) { failed(target, [`preflight-error: ${error instanceof Error ? error.message : String(error)}`]); continue; }
+    if (!preflight.ok) { failed(target, preflight.gaps, preflight.facts); continue; }
+    try {
+      const launched = parentHostModule.launchRemoteParent(target, args, context.env, deps.ssh);
+      try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
+      return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
+    } catch (error) {
+      if (error instanceof parentHostModule.RemoteParentNotLaunchedError) { failed(target, [error.message]); continue; }
+      try { debug.log('task-agent', 'parent-host-launch-uncertain', { host: target.host, runId: context.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+      throw error;
+    }
   }
+  return null;
 }
 
 /** stderr 파일의 첫 비어 있지 않은 줄(최대 4KB 만 읽는다 — 원 로그 꼬리를 싣지 않는다). */
@@ -315,8 +334,23 @@ function taskCardLines(card: TaskCard): string[] {
     [card.id, card.status, card.seat ?? '-', card.checklistId ?? '-', card.createdAt, card.text].join('\t'),
     ...(card.mission ? [`미션: ${card.mission} · after: ${card.after?.length ? card.after.join(', ') : '-'}`] : []),
     ...runLinkLine(card),
+    ...liveMoveLines(card),
     `다음 수: ${moveLine(card)}`,
   ];
+}
+
+/** TA-LIVE-MOVE-CARD-HISTORY — 카드 history 의 live-move 줄(실행·그림자)을 한 줄씩. 없으면 없다(옛 카드 그대로). */
+function liveMoveLines(card: TaskCard): string[] {
+  return (card.history ?? []).filter((item) => item.event === LIVE_MOVE_HISTORY_EVENT || item.event === LIVE_MOVE_RESULT_EVENT).map((item) => item.event === LIVE_MOVE_RESULT_EVENT ? [
+    // TA-REVIEW-RESULT-CAPTURE — 회수한 리뷰 결과(또는 «결과 없음») 줄.
+    `결과: ${item.at}`, `${item.kind ?? '?'}`, `PR ${item.pr !== undefined ? `#${item.pr}` : '-'}${item.head ? ` head ${item.head.slice(0, 12)}` : ''}`,
+    `verdict=${item.verdict ?? '—'} reviewed=${item.reviewed ?? '—'} must-fix=${item.mustFix ?? '—'} route=${item.reviewRoute ?? '—'}`,
+    `효과: ${item.effect ?? 'unknown'}`, (item.detail ?? '').replace(/\r\n|\r|\n/g, (match) => (match === '\r' ? '\\r' : '\\n')),
+  ].join(' · ') : [
+    `수: ${item.at}`, `${item.kind ?? '?'} ${item.executorResult ?? '?'}`, `executed=${item.executed === true} ok=${item.ok === undefined ? '—' : item.ok}`,
+    `PR ${item.pr !== undefined ? `#${item.pr}` : '-'}${item.head ? ` head ${item.head.slice(0, 12)}` : ''}`,
+    `효과: ${item.effect ?? 'unknown'}`, (item.detail ?? '').replace(/\r\n|\r|\n/g, (match) => (match === '\r' ? '\\r' : '\\n')),
+  ].join(' · '));
 }
 
 /** 미션 카드 — 머리 한 줄 ⊕ 조각 한 줄씩(상태·다음 수·선행) ⊕ 간선 한 줄씩. */
@@ -553,8 +587,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--milestone <id>', '보드 소속 이정표 id (task board)')
     .option('--target <dir>', '프로젝트 대상 디렉터리(있어야 한다 · 상대 경로는 절대로 · git 이 아니면 --completion 이 code-pr 밖이어야 한다) — 발사기를 이 디렉터리에서 띄운다')
     .option('--live', '실제로 발사한다(기본은 shadow — 명령만 출력)')
+    .option('--ta-land', 'TA-LIVE-LAND-2 — 호스트는 재게이트만 하고 병합은 TASK-AGENT 의 propose-land(`pr land --expected-head`)에 맡긴다 · 카드 taLand ⊕ 발사 env ELANOUS_TA_LAND=1 · taskAgent.liveMoves 에 propose-land 가 없으면 종전대로 호스트가 병합')
+    .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
+    .option('--child-llm-effort <level>', '구현 자식 추론 노력 → 발사 인자 --child-llm-effort(검증은 하니스 · --child-llm 과 함께)')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; json?: boolean }) => {
       await registerTaskAgentSink(deps.registerSink);
       if ((text === undefined) === (opts.mission === undefined)) {
         out('과제 한 줄 «또는» --mission <문면> 중 하나만 준다');
@@ -566,8 +603,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         process.exitCode = 1;
         return;
       }
-      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined)) {
-        out('--completion/--project/--target/--goal/--milestone 은 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
+      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined)) {
+        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm 은 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
         process.exitCode = 1;
         return;
       }
@@ -601,8 +638,18 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         return;
       }
       try {
+        const resolved = resolveHandText(text!);
+        if (resolved.kind === 'rejected') {
+          try { debug.log('task-agent.hand', 'goal-file-rejected', { path: resolved.path, reason: resolved.reason }); } catch { /* fail-soft */ }
+          out(`골 파일 ${resolved.path}: ${resolved.reason}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (resolved.kind === 'inlined') {
+          try { debug.log('task-agent.hand', 'goal-file-inlined', { path: resolved.path, chars: resolved.chars, sha256: resolved.sha256 }); } catch { /* fail-soft */ }
+        }
         const result = await handTask({
-          text: text!,
+          text: resolved.text,
           ...(opts.project !== undefined && opts.target !== undefined ? { project: { id: opts.project, target: opts.target } } : {}),
           ...(opts.goal !== undefined ? { goal: opts.goal } : {}),
           ...(opts.milestone !== undefined ? { milestone: opts.milestone } : {}),
@@ -610,6 +657,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.checklist ? { checklistId: opts.checklist } : {}),
           ...(opts.completion ? { completion: opts.completion } : {}),
           live: opts.live === true,
+          ...(opts.taLand === true ? { taLand: true } : {}),
+          ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
+          ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
           ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
         });
@@ -618,6 +668,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           out(`${result.card.id}\t${result.mode}\t${result.launched ? 'launched' : 'not launched'}`);
           out(`elanous ${result.move.command!.map(shellQuote).join(' ')}`);
           if (result.cwd) out(`(cwd: ${result.cwd})`);
+          if (result.card.taLand) out('(ta-land — 발사 env ELANOUS_TA_LAND=1 · 로컬 부모 · taskAgent.liveMoves 에 propose-land 가 있으면 병합은 TASK-AGENT 몫, 없으면 종전대로 호스트 병합)');
           if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
         }
       } catch (error) {
@@ -785,6 +836,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
               // 근거 없음으로 보인다 — 원장 부재와 갈리게 실패는 남긴다.
               try { debug.log('task-agent', 'card-bind-failed', { card: cardId, via: 'show', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
             }
+            // TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 live review 의 결과 파일을 이 카드 history 로 회수한다(대기 중인 요청이 있을 때만 쓴다 · 던지지 않는다).
+            captureReviewResults(deps.taskStatePath ?? taskStatePathDefault(), { cardIds: [cardId], ...(deps.reviewResultNow ? { now: deps.reviewResultNow } : {}) });
           }
           if (card) card = readTaskCard(id, deps.taskStatePath);
         } catch (error) {
@@ -839,6 +892,59 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           out(JSON.stringify(data, null, 2));
         }
       } catch (error) { handleError(error, out); }
+    });
+
+  tasks.command('rejudge [id]')
+    .description('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 카드 PR 머리가 바뀌었으면 재게이트(떼어 띄움)·리뷰 재요청·land(재게이트 통과 ⊕ 지금 머리 pass ⊕ must-fix 0 · 겹침 증거)를 다시 판단한다 · 허용은 설정 taskAgent.liveMoves 그대로')
+    .option('--all', '묶인 PR 로 TA 리뷰를 요청한 적이 있는 카드 전부')
+    .option('--json', 'JSON 출력')
+    .action(async (id: string | undefined, opts: { all?: boolean; json?: boolean }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      if ((id === undefined) === (opts.all !== true)) { out('카드 id «또는» --all 중 하나만 준다'); process.exitCode = 1; return; }
+      const { rejudgeCandidates, rejudgeCardOnHead } = await import('../task-agent/rejudge-on-head.js');
+      const statePath = deps.taskStatePath ?? taskStatePathDefault();
+      let ids: string[];
+      try { ids = id ? [id] : rejudgeCandidates(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {}); } catch (error) {
+        out(error instanceof Error ? error.message : '과제 카드 읽기 실패'); process.exitCode = 1; return;
+      }
+      const { configuredTaskAgentLiveMoves } = await import('../task-agent/live-moves.js');
+      const liveMoves = deps.rejudge?.liveMoves ?? await configuredTaskAgentLiveMoves();
+      const all = [];
+      for (const cardId of ids) {
+        let outcomes: Awaited<ReturnType<typeof rejudgeCardOnHead>>;
+        try { outcomes = await rejudgeCardOnHead(cardId, { ...deps.rejudge, liveMoves, live: { ...deps.rejudge?.live, statePath } }); } catch (error) {
+          // 카드 하나의 예외가 --all 의 나머지 카드 판단을 멈추지 않게 — 사유를 남기고 다음 카드로.
+          const reason = (error instanceof Error ? error.message : String(error)).slice(-300);
+          try { debug.log('task-agent', 'rejudge-on-head', { card: cardId, pr: null, fromHead: null, toHead: null, step: 'target', decision: 'rejudge-threw', reason }, { level: 'warn' }); } catch { /* fail-soft */ }
+          outcomes = [{ card: cardId, pr: null, fromHead: null, toHead: null, step: 'target', decision: 'rejudge-threw', reason }];
+          process.exitCode = 1;
+        }
+        all.push(...outcomes);
+        if (!opts.json) for (const o of outcomes) out([o.card, `PR ${o.pr === null ? '-' : `#${o.pr}`}`, `${o.fromHead?.slice(0, 12) ?? '-'}→${o.toHead?.slice(0, 12) ?? '-'}`, o.step, o.decision, o.reason].join('\t'));
+      }
+      if (opts.json) out(JSON.stringify(all));
+    });
+
+  tasks.command('regate-run', { hidden: true })
+    .description('TA-REJUDGE-ON-HEAD 내부 — 카드 PR 머리 하나의 호스트 재게이트(병합 없음)를 돌리고 결과를 --out 파일로 쓴다(tasks rejudge 가 떼어 띄운다)')
+    .requiredOption('--card <id>').requiredOption('--pr <n>').requiredOption('--head <sha>').requiredOption('--repo <root>').requiredOption('--out <path>')
+    .action(async (opts: { card: string; pr: string; head: string; repo: string; out: string }) => {
+      await registerTaskAgentSink(deps.registerSink);
+      const pr = Number(opts.pr);
+      const { writeFileSync: write, mkdirSync: mkdir } = await import('node:fs');
+      const { dirname: dir } = await import('node:path');
+      let result: import('../self-implement/host-regate.js').HostRegateResult;
+      try {
+        const regate = deps.hostRegate ?? (await import('../self-implement/host-regate.js')).runHostRegate;
+        result = await regate({ prNumber: pr, headCommit: opts.head, repoRoot: opts.repo, noMerge: true });
+      } catch (error) {
+        result = { passed: false, failures: [{ step: 'host-regate', detail: (error instanceof Error ? error.message : String(error)).slice(-300) }], os: process.platform, status: 'unmeasured' };
+      }
+      const record = { pr, head: opts.head, passed: result.passed, ...(result.status ? { status: result.status } : {}), ...(result.baseCommit ? { baseCommit: result.baseCommit } : {}), failures: result.failures };
+      try { debug.log('task-agent', 'regate-run', { card: opts.card, ...record, failures: result.failures.slice(0, 3) }); } catch { /* fail-soft */ }
+      mkdir(dir(opts.out), { recursive: true });
+      write(opts.out, JSON.stringify(record));
+      if (!result.passed) process.exitCode = 1;
     });
 
   tasks.command('approve <id...>')

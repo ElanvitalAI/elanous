@@ -14,7 +14,6 @@
  *  ⚠️ 이 판정은 «같은 호스트»에서만 뜻이 있다 — pid 는 호스트 지역 값이다.
  *     락처럼 호스트가 섞이는 소비자는 호스트를 «먼저» 가른 뒤 이걸 부른다.
  */
-import { debug } from '../debug/log.js';
 
 /** ⛔ 두 값이 아니라 «셋»이다 — 「살아 있는데 내가 못 건드린다」는 별도의 사실이다.
  *  그것을 `alive` 나 `dead` 어느 쪽으로도 접지 않는 것이 이 타입의 존재 이유다. */
@@ -58,6 +57,7 @@ export function pidLiveness(pid: number): PidLiveness {
   if (verdict === 'alive-not-mine') {
     // ⛔ 「살아 있는데 남의 것」은 조용히 지나가면 안 된다 — 🅢 요청(2026-09-20):
     //   원장에 «대상 pid 와 소유자 축»이 남아야 A 구간(남의 트리에서 도는 자식)과 닿는다.
+    const { debug } = require('../debug/log.js') as { debug: { log: (category: string, event: string, data: Record<string, unknown>) => void } };
     debug.log('process.liveness', 'kill-refused', { pid, myUid: myUid(), errno });
     observer?.({ pid, liveness: verdict, myUid: myUid(), errno });
   }

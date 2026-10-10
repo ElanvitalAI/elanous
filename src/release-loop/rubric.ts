@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import type { ChecklistItem } from './checklist.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
-
-export type RubricAxis = { key: string; weight: number };
+import type { RubricAxis } from './rubric-types.js';
+export type { RubricAxis } from './rubric-types.js';
 
 export const DEFAULT_PROJECT_AXES: readonly RubricAxis[] = [
   { key: 'V', weight: 2 }, { key: 'U', weight: 2 },

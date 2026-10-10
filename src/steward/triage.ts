@@ -62,6 +62,8 @@ export interface StewardDeps {
   launchSettings?: Pick<StewardSettings, 'mode' | 'launch' | 'maxParallel' | 'podPool'>;
   launchCommand?: LaunchDeps['command'];
   spawnLaunch?: LaunchDeps['spawn'];
+  /** Isolated OP view for tests; production resolves the registered HQ seat (launch.ts stewardLaunchSeat). */
+  launchSeat?: LaunchDeps['launchSeat'];
   launchGate?: LaunchDeps['gate'];
   outcomeNotify?: Pick<OutcomeNotifyDeps, 'document' | 'message' | 'worktreeCommand' | 'loadOrigin' | 'loadOrigins'>;
   /** Internal command boundary: the current sync has already claimed this pid. */
@@ -450,7 +452,7 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     }); } catch { /* logging must not change the schedule */ }
     writeFileSync(schedule, JSON.stringify(rows));
     const ledger = readLaunchLedger(root);
-    const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch, gate: deps.launchGate };
+    const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch, gate: deps.launchGate, launchSeat: deps.launchSeat };
     const cardDeps = { root, store: deps.cardStore, now: deps.now };
     collectOutcomes(ledger, launchDeps);
     const plan = planLaunches(rows, issues, ledger, settings);
@@ -510,7 +512,7 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       writeFileSync(path, JSON.stringify(state));
     }
     const ledger = readLaunchLedger(root);
-    const outcomes = collectOutcomes(ledger, { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch });
+    const outcomes = collectOutcomes(ledger, { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch, launchSeat: deps.launchSeat });
     for (const outcome of outcomes) {
       const issue = issues.find(item => item.identifier === outcome.issue) ??
         { identifier: outcome.issue, title: outcome.title, ref: '', body: '' };

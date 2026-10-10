@@ -25,6 +25,31 @@ describe('extractPodFailureReason', () => {
     expect(extractPodFailureReason({ logs })).toBe('GraphQL: API rate limit already exceeded');
   });
 
+  test('does not treat numbered [ask] choice text as an error', () => {
+    const choices = '[ask]       0) Retry after failure\n[ask] 1) Report an error to the user';
+    expect(extractPodFailureReason({ logs: choices })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+    expect(extractPodFailureReason({ logs: `Error: dependency unavailable\n${choices}` })).toBe('Error: dependency unavailable');
+    const terminal = JSON.stringify({ stage: 'error', ok: false, error: `Error: dependency unavailable\n${choices}` });
+    expect(extractPodFailureReason({ logs: terminal })).toBe('Error: dependency unavailable');
+    expect(extractPodFailureReason({ logs: '[ask] error: choice rendering failed' })).toBe('[ask] error: choice rendering failed');
+  });
+
+  test('PREFLIGHT-RESULT-LINE: a preflight-blocked result row reads its blockers, not the [ask] choice lines', () => {
+    // The real Pod tail of AUTHOR-LITE2-POD (10-09): numbered [ask] choices, then the terminal row index.ts writes before exit(1).
+    const row = { kind: 'self', ok: false, stage: 'preflight-blocked', blockers: [{ kind: 'no-target-paths', name: '(대상 경로 0)', detail: '골에 실제 저장소 경로가 없다' }] };
+    const logs = ['[ask] 0) Retry after failure', '[ask] 1) One error-message line', JSON.stringify(row)].join('\n');
+    expect(extractPodFailureReason({ logs })).toBe('(대상 경로 0) — 골에 실제 저장소 경로가 없다');
+    expect(extractPodFailureReason({ logs, result: { stage: 'preflight-blocked' } })).toBe('(대상 경로 0) — 골에 실제 저장소 경로가 없다');
+    // Contrast: without blockers the row stays «result without error» and falls through to the stage.
+    const bare = JSON.stringify({ kind: 'self', ok: false, stage: 'preflight-blocked' });
+    expect(extractPodFailureReason({ logs: bare, result: { stage: 'preflight-blocked' } })).toBe('수렴 못 함(단계 preflight-blocked)');
+    // An explicit error still wins over blockers; a passing row never invents one.
+    expect(extractPodFailureReason({ logs: JSON.stringify({ ...row, error: 'Error: explicit' }) })).toBe('Error: explicit');
+    expect(extractPodFailureReason({ logs: JSON.stringify({ ...row, ok: true }) })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
+    // Only the preflight-blocked stage promotes blockers; another stage keeps its old fallback.
+    expect(extractPodFailureReason({ logs: JSON.stringify({ ...row, stage: 'review-blocked' }), result: { stage: 'review-blocked' } })).toBe('수렴 못 함(단계 review-blocked)');
+  });
+
   test('does not mistake an ordinary cleanup line for a failure reason', () => {
     expect(extractPodFailureReason({ logs: 'starting\ncleanup complete' })).toBe('사유 못 읽음: 로그에 읽을 수 있는 오류 줄 없음');
   });

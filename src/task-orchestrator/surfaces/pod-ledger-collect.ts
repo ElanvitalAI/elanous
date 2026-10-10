@@ -1,7 +1,9 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
-import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
+import { recordFailureEvent } from '../../self-implement/heal-intake.js';
+import { loadRunLedger, runLedgerDir, runLedgerPath, TRAILING_BOOKKEEPING_EVENTS } from '../../self-implement/run-ledger.js';
 import { ledgerLineToLogEvent } from './pod-ledger-events.js';
 import { defaultPodReemit } from './pod-ledger-prod-sink.js';
 
@@ -91,6 +93,24 @@ export function parsePodLedgerChunks(logs: string): ParseResult {
   return error.length ? { error, ledgers } : ledgers;
 }
 
+function intakeCollectedFailure(runId: string, dir: string, log: Emit): void {
+  let ledger: ReturnType<typeof loadRunLedger>;
+  try { ledger = loadRunLedger(runId, dir); }
+  catch { return; }
+  if (!ledger) return;
+  let terminalIndex = ledger.length - 1;
+  while (terminalIndex >= 0 && ledger[terminalIndex]?.event !== 'run-status') terminalIndex -= 1;
+  const terminal = ledger[terminalIndex];
+  if (terminal?.data.runStatus !== 'failed' || !terminal.timestamp || !Number.isFinite(Date.parse(terminal.timestamp))
+    || ledger.slice(terminalIndex + 1).some(entry => !TRAILING_BOOKKEEPING_EVENTS.includes(entry.event as typeof TRAILING_BOOKKEEPING_EVENTS[number]))) return;
+  try {
+    recordFailureEvent({ source: 'harness-run', kind: 'pod-run', ref: runId,
+      summary: `Pod run ${runId} failed`, at: terminal.timestamp }, dirname(dir));
+  } catch (error) {
+    log('self-implement.pod', 'heal-intake-failed', { runId, reason: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 /** Never replace a host ledger, even if another collector races this one —
  *  except a ledger that THIS run's live follower created (`replace`): that one is a partial copy and the final is complete. */
 export function collectPodLedgers(
@@ -116,13 +136,16 @@ export function collectPodLedgers(
       const newLines = Buffer.from(jsonl).subarray(previousBytes).toString('utf8');
       reemitLedgerLines(newLines, runId, previousBytes, emit);
       log('self-implement.pod', 'ledger-collected', { runId, lines: jsonl.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(jsonl) });
+      intakeCollectedFailure(runId, dir, log);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
         // A reattached Job may have already delivered this exact complete snapshot.
         // An unrelated host ledger (or a partial copy) must still remain untouched.
         try {
           const existing = readFileSync(runLedgerPath(runId, dir));
-          log('self-implement.pod', existing.equals(Buffer.from(jsonl)) ? 'ledger-collect-already-complete' : 'ledger-collect-skipped', { runId, reason: 'exists' });
+          const identical = existing.equals(Buffer.from(jsonl));
+          log('self-implement.pod', identical ? 'ledger-collect-already-complete' : 'ledger-collect-skipped', { runId, reason: 'exists' });
+          if (identical) intakeCollectedFailure(runId, dir, log);
         } catch (readError) {
           log('self-implement.pod', 'ledger-collect-incomplete', { runId, reason: readError instanceof Error ? readError.message : String(readError) });
         }

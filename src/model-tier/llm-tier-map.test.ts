@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import {
-  lookupLlmTierSpec, parseTierArg, TIER_PROVIDERS, LLM_TIER_MAP_BY_PROVIDER,
+  lookupLlmTierSpec, parseTierArg, TIER_PROVIDERS, LLM_TIER_MAP_BY_PROVIDER, lookupOpenRouterModelSpec,
 } from './llm-tier-map.js';
 import { MODEL_TIERS } from './types.js';
 
@@ -46,6 +46,23 @@ describe('lookupLlmTierSpec — SSOT 회귀 (대표 지적)', () => {
         expect(lookupLlmTierSpec(p, t)).toEqual(map[t]);
       }
     }
+  });
+  it('OpenRouter GLM-5.3 측정 가격·창과 flash 의 미측정 가격을 구별한다', () => {
+    const balanced = lookupLlmTierSpec('openrouter', 'balanced');
+    expect(balanced.model).toBe('openrouter/z-ai/glm-5.3');
+    expect(balanced.rationale).toContain('$0.039/$4.8');
+    expect(balanced.rationale).toContain('1.05M ctx');
+    const flash = lookupOpenRouterModelSpec('openrouter/z-ai/glm-5.3-flash')!;
+    expect(lookupOpenRouterModelSpec('z-ai/glm-5.3-flash')).toEqual(flash);
+    expect(lookupOpenRouterModelSpec('openrouter/z-ai/glm-5.3')).toEqual(balanced);
+    expect(lookupOpenRouterModelSpec('openrouter/unknown/model')).toBeUndefined();
+    expect(flash.model).toBe('openrouter/z-ai/glm-5.3-flash');
+    expect(lookupLlmTierSpec('openrouter', 'budget').model).toBe('openrouter/qwen/qwen3.8-flash');
+    expect(flash.status).toBe('shipping');
+    expect(flash.rationale).toContain('미측정');
+    expect(flash.rationale).not.toContain('$0');
+    expect(lookupLlmTierSpec('openrouter', 'better').model).toBe('openrouter/qwen/qwen3.8-max-0902');
+    expect(lookupLlmTierSpec('openrouter', 'best').model).toBe('openrouter/moonshotai/kimi-k3');
   });
   it('auto provider uses the Anthropic balanced safe fallback', () => {
     expect(lookupLlmTierSpec('auto', 'budget')).toEqual(LLM_TIER_MAP_BY_PROVIDER.anthropic.balanced);

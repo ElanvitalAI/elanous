@@ -9,6 +9,12 @@ family: gpt-6
 #     sharing a catalog generation family"*. 그 기전을 쓴다(grok 이 이미 이 방식이다).
 #   ⇒ 이제 `sol` 별칭의 후보는 {gpt-6-sol, gpt-5.6-sol} 이고 최신이 «하나»로 정해진다.
 familyShortcut: sol
+# 📏 창·출력 상한 — 2026-10-10 MK(MODEL-ROUTING-MATRIX) · 출처 둘이 «같은 값»일 때만 채운다:
+#   ⑴ developers.openai.com/api/내부 문서 `gpt-6-sol` (2026-09-23 대조 · src/intelligence-map/model-catalog.ts 의 contextWindow 1_050_000 ⊕ sol·astra notes «입력 922K · 출력 128K»)
+#   ⑵ OpenRouter `GET /api/v1/models` 실호출 2026-10-10T05:10Z — openai/gpt-6-sol: context_length 1050000 · top_provider.max_completion_tokens 128000
+#   ⛔ 이 칸이 비어 있으면 `resolver` 의 minContextSize 판정이 `contextSize ?? 0` 으로 읽어 이 모델을 «창 0»으로 떨군다.
+contextSize: 1050000
+outputMaxTokens: 128000
 # 출시일 — 「unknown-missing-release-date」를 «승인 목록에 더하지 않고» 없앤다.
 #   출처: developers.openai.com/api/내부 문서 `gpt-6-sol` (2026-09-23 firecrawl 직접)
 releaseDate: 2026-09-22

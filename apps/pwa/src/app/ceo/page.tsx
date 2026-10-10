@@ -230,7 +230,7 @@ export default function CeoPage() {
         : '못 읽음'}
         <Link href="/ops/release" className="mt-1 block rounded text-xs font-medium text-primary underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="발행 현황 보기 — 운영 › 릴리스">발행 현황 보기 →</Link></Card>
       <Card title="루프 판정">{snapshot.loops === undefined ? '불러오는 중…' : snapshot.loops === null ? '못 읽음' : Object.keys(snapshot.loops).length === 0
-        ? '등록 0' : <div className="flex flex-wrap gap-1 text-xs font-medium">{Object.entries(snapshot.loops).map(([verdict, count]) =>
+        ? '등록된 일정 0' : <div className="flex flex-wrap gap-1 text-xs font-medium">{Object.entries(snapshot.loops).map(([verdict, count]) =>
           <span key={verdict} className="rounded-full bg-muted px-2 py-1">{verdict} {count}</span>)}</div>}
         <Link href={LOOPS_INTERACT_HREF} className="mt-1 block rounded text-xs font-medium text-primary underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="루프 상호작용 보기 — 운영 › 루프 상호작용">루프 상호작용 보기 →</Link></Card>
       <Card title="결정 대기 카드"><Link href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions === undefined ? '불러오는 중…' : snapshot.decisions ?? '못 읽음'}</Link></Card>

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { syncMergedPrChecklist, type MergedPrChecklistDeps } from './merged-pr-checklist.js';
@@ -22,12 +22,60 @@ function fixture(items: ChecklistItem[], title = 'unrelated', body = '칸: X', g
     checklist: (version) => ({ version, released: '', dev: version, items, history: [] }),
     addEvidence: (id, _version, ref) => { calls.push(`evidence ${id} ${ref}`); items.find((entry) => entry.id === id)!.evidence = ref; },
     setStatus: (_version, id, patch) => { calls.push(`status ${id} ${patch.status}`); items.find((entry) => entry.id === id)!.status = patch.status!; return { version: '0.2.12', released: '', dev: '0.2.12', items, history: [] }; },
+    judgeLanded: () => undefined,
     log: (_category, event) => { events.push(event); },
   };
   return { root, path, calls, events, deps, items };
 }
 
 describe('confirmed main merge checklist sync', () => {
+  test('invariant: any judgment verdict leaves evidence, completion green writes and merged-pr events identical to no judgment', () => {
+    // Same PR, same goal (completion declared for X only), every verdict the judge can return — the merge path's
+    // observable effects (addEvidence/setStatus calls, final statuses, release.checklist events) must not move.
+    const run = (judgeLanded: MergedPrChecklistDeps['judgeLanded']) => {
+      const f = fixture([item('X', 'red'), item('Y'), item('Z', 'green')], 'misc', '칸: X, Y, Z', '칸: X\n이 칸 완료\n');
+      try {
+        syncMergedPrChecklist(51, f.root, f.path, { ...f.deps, judgeLanded });
+        return { calls: f.calls, statuses: f.items.map(({ id, status, evidence }) => `${id}:${status}:${evidence}`), events: f.events };
+      } finally { rmSync(f.root, { recursive: true, force: true }); }
+    };
+    const baseline = run(() => undefined);
+    expect(baseline.calls).toEqual(['evidence X #51', 'status X green', 'evidence Y #51', 'evidence Z #51']);
+    for (const verdict of ['proposed', 'unmeasurable', 'not-passed'] as const) expect(run(() => verdict)).toEqual(baseline);
+  });
+
+  test('judges only a unique non-green/done cell once; a throwing judgment cannot change status or evidence', () => {
+    const f = fixture([item('X'), item('Y', 'green'), item('Z', 'done')], 'unrelated', '칸: X, Y, Z');
+    const judgments: unknown[] = [];
+    try {
+      const judgeLanded: NonNullable<MergedPrChecklistDeps['judgeLanded']> = (cell, deps) => { judgments.push({ cell, deps }); throw new Error('judge failure'); };
+      expect(() => syncMergedPrChecklist(42, f.root, undefined, { ...f.deps, judgeLanded })).not.toThrow();
+      expect(judgments).toEqual([{ cell: { version: '0.2.12', id: 'X', title: 'X', pr: 42 }, deps: { cwd: f.root } }]);
+      expect(f.calls).toEqual(['evidence X #42', 'evidence Y #42', 'evidence Z #42']);
+      expect(f.items.map(({ status }) => status)).toEqual(['yellow', 'green', 'done']);
+      expect(f.events.filter((event) => event === 'merged-pr-evidence-added')).toHaveLength(3);
+      expect(f.events.filter((event) => event === 'landed-green-error')).toHaveLength(1);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test('the real merge path writes a proposal but never greens a cell without completion', () => {
+    const root = mkdtempSync(join(tmpdir(), 'merged-pr-proposal-'));
+    setElanousConfigDir(root);
+    try {
+      addItem('0.2.12', { id: 'X', title: '판정 신호: 조건 = 확인; 관측 = bun test ok.test.ts; 기대 = 0 fail' });
+      const goal = join(root, 'ok.test.ts');
+      writeFileSync(goal, "import { test, expect } from 'bun:test'; test('ok', () => expect(true).toBe(true));\n");
+      syncMergedPrChecklist(42, root, undefined, {
+        readPr: () => ({ state: 'MERGED', baseRefName: 'main', title: '칸: X', body: '', mergedAt: '2026-10-02T00:00:00Z' }),
+        versions: () => ['0.2.12'], log: () => {},
+      });
+      const proposal = JSON.parse(readFileSync(join(root, 'release', '0.2.12', 'green-proposals.jsonl'), 'utf8').trim());
+      expect(proposal).toMatchObject({ version: '0.2.12', id: 'X', pr: 42, verdict: 'proposed' });
+      expect(listChecklist('0.2.12').items[0]).toMatchObject({ status: 'yellow', evidence: '#42' });
+      expect(listChecklist('0.2.12').history.filter(({ field }) => field === 'status')).toHaveLength(0);
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  }, 65_000);
+
   test('completion declaration adds evidence before green once in the isolated ledger', () => {
     const root = mkdtempSync(join(tmpdir(), 'merged-pr-checklist-ledger-'));
     const goal = join(root, 'goal.txt');
@@ -251,6 +299,8 @@ describe('confirmed main merge checklist sync', () => {
       versions: () => versions,
       checklist: (version) => ({ version, released: '', dev: version, items: byVersion.get(version)!, history: [] }),
       addEvidence: (id, version, ref) => { writes.push(`${version} ${id} ${ref}`); },
+      // No ledger isolation here: the default judge would append to the operational release ledger.
+      judgeLanded: () => undefined,
       log: (_category, event) => { events.push(event); },
     });
     expect(writes).toEqual(['0.2.12 Y #57']);

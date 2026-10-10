@@ -6,12 +6,15 @@
 // ⛔ 토큰 «값»은 어디에도 출력하지 않는다 — accountId 앞 8자만(R-LLM2).
 
 import { readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
+import { codexCredentialRoot, readAvailabilityState, writeAvailabilityState } from '../budget/codex-reset-credit-state.js';
 import {
   DEFAULT_CODEX_ACCOUNT, codexStoreKey, accountNameFromStoreKey, isValidAccountName, isCodexStoreKey,
   resolveCodexAccount, effectiveCodexHome, type CodexHomeSource, type CodexAccountResolution,
 } from './codex-account.js';
-import { authStorePath, defaultCodexHome, listProviders, loadTokens, saveTokens } from './store.js';
+import { authStorePath, defaultCodexHome, isUnderTestRunner, listProviders, loadTokens, saveTokens } from './store.js';
 import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
 import { creditPaceStatus } from '../budget/codex-credit-pace.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
@@ -29,6 +32,8 @@ import {
   type FallbackDecision, type FallbackInput, type RotationOutcome,
 } from './fallback-chain.js';
 import { resolveGrokCredential } from '../grok/credential.js';
+import { getOpenRouterApiKey } from '../config.js';
+import { lookupOpenRouterModelSpec } from '../model-tier/llm-tier-map.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 
 type CodexAccountOutboundSender = (text: string, kind?: string) => boolean;
@@ -47,7 +52,7 @@ export function _setCodexAccountOutboundSenderForTesting(sender: CodexAccountOut
 /** ⛔⭐ 정적 import 로 읽는다 — 종전 `require()` 는 ESM 에서 «정의되지 않을 수 있고», 그러면
  *  fail-soft 가 삼켜 ***config false 가 영영 무시된다***(리뷰 should-fix: 노브가 no-op 이 된다).
  *  ⚠️ 순환 없음을 확인했다 — user-config 는 oauth 를 안 끌어온다. */
-type RotationConfig = { llm?: { codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexQuotaPolicy?: unknown; fallbackChain?: unknown } };
+type RotationConfig = { llm?: { codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
 
 function readUserConfig(): RotationConfig {
   return getUserConfig();
@@ -636,6 +641,9 @@ export function resolveCodexAccountForRun(
     to: decision.reason === 'credit-pace' ? decision.to?.name ?? current.name : decision.to?.name,
   });
   observeRotation(decision, current.name);
+  // 순서 ② — 구독 남은 계정이 없고 리셋권이 있으면 «스스로 1개» 쓴다(일일 상한 · 비동기 · 이번 호출은 종전대로 머문다).
+  //   ⛔ 판정이 `reset-credit-available` 일 때만 닿는다 — 구독 남은 계정이 있으면(rotated) 여기 안 온다.
+  if (decision.reason === 'reset-credit-available') void autoConsumeCodexResetCredit({ storePath: path });
   const resolved = applyRotation(current, decision);
   if (resolved.source === 'rotated') {
     notifyCodexAccountEventWithUsage('rotation', path, now,
@@ -656,6 +664,111 @@ export function resolveCodexAccountForRun(
     pinnedByRun.set(runKey, { resolution: resolved, home: effectiveCodexHome(resolved, loadTokens(resolved.storeKey, path), env).home });
   }
   return resolved;
+}
+
+/** 리셋권 자동 소비 결과 — 소비했거나, 왜 안 했는지(관측 `reset-consume-skipped` 와 같은 이유). */
+export type CodexResetAutoConsumeOutcome =
+  | { readonly consumed: true; readonly account: string; readonly expiresAt: string | null; readonly todayCount: number; readonly redecision?: string }
+  | { readonly consumed: false; readonly reason: 'disabled' | 'daily-cap-reached' | 'test-runtime-guard' | 'in-flight' | 'lock-held' | 'no-available-credit' | 'consume-failed' | 'error'; readonly detail?: string };
+
+export interface CodexResetAutoConsumeDeps {
+  readonly storePath?: string;
+  readonly now?: number;
+  /** ⛔ 테스트는 «반드시» 가짜를 준다 — 안 주면 실물이고, 테스트 러너 안에서는 실물을 «부르지 않는다». */
+  readonly consume?: typeof consumeCodexResetCredits;
+  readonly list?: typeof listCodexResetCredits;
+  /** 일일 카운터 파일(테스트 격리). 기본 = 자격 뿌리 `budget/codex-reset-auto-consume.json`. */
+  readonly counterPath?: string;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+/** `llm.codexResetAutoConsumePerDay` — 기본 1 · 0 이면 끔 · 못 읽으면 기본. */
+function resetAutoConsumePerDayFromConfig(): number {
+  try {
+    const v = (configReader().llm as { codexResetAutoConsumePerDay?: unknown } | undefined)?.codexResetAutoConsumePerDay;
+    return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 1;
+  } catch { return 1; }
+}
+
+function readAutoConsumeCount(path: string, day: string): number {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { day?: unknown; count?: unknown };
+    return parsed.day === day && typeof parsed.count === 'number' && Number.isFinite(parsed.count) ? parsed.count : 0;
+  } catch { return 0; }
+}
+
+let autoConsumeInFlight = false;
+
+/**
+ * 순서 ② «리셋권» — 만료가 가장 이른 계정의 리셋권을 «하나» 쓴다. ⛔ 되돌릴 수 없다.
+ * ⛔ 소비는 기존 `consumeCodexResetCredits` 한 연산뿐이다(새 API 경로 없음).
+ * ⛔ 하루 상한(UTC 일) — 소비 «전»에 칸을 잡는다(실패해도 그날 칸은 쓴 것으로 센다: 되돌릴 수 없는 일은 덜 하는 쪽).
+ * 성공 → `codex.rotation reset-consumed` ⊕ 소비 알림 ⊕ 판정을 한 번 다시 돈다(조회 전용).
+ * 실패·상한 → `codex.rotation reset-consume-skipped { reason }` — 호출부는 종전대로 크레딧 단계로 간다.
+ */
+export async function autoConsumeCodexResetCredit(deps: CodexResetAutoConsumeDeps = {}): Promise<CodexResetAutoConsumeOutcome> {
+  const skip = (reason: Extract<CodexResetAutoConsumeOutcome, { consumed: false }>['reason'], extra: Record<string, unknown> = {}): CodexResetAutoConsumeOutcome => {
+    debug.log('codex.rotation', 'reset-consume-skipped', { reason, ...extra });
+    return { consumed: false, reason, ...(typeof extra.detail === 'string' ? { detail: extra.detail } : {}) };
+  };
+  const cap = resetAutoConsumePerDayFromConfig();
+  if (cap <= 0) return skip('disabled', { cap });
+  const now = deps.now ?? Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const counterPath = deps.counterPath ?? join(codexCredentialRoot(), 'budget', 'codex-reset-auto-consume.json');
+  const before = readAutoConsumeCount(counterPath, day);
+  if (before >= cap) return skip('daily-cap-reached', { cap, todayCount: before });
+  // ⛔⭐ 되돌릴 수 없는 실물 소비를 테스트가 «절대» 못 부르게 — 가짜를 안 줬고 테스트 러너면 멈춘다.
+  if ((!deps.consume || !deps.list) && isUnderTestRunner(deps.env ?? process.env)) return skip('test-runtime-guard');
+  const consume = deps.consume ?? consumeCodexResetCredits;
+  const list = deps.list ?? listCodexResetCredits;
+  if (autoConsumeInFlight) return skip('in-flight');
+  const lockPath = `${counterPath}.lock`;
+  let lockFd: number | undefined;
+  autoConsumeInFlight = true;
+  try {
+    mkdirSync(dirname(counterPath), { recursive: true });
+    try { lockFd = openSync(lockPath, 'wx'); } catch {
+      // 죽은 프로세스가 남긴 잠금(10분 넘음)은 걷고 한 번만 다시 잡는다 — 안 그러면 자동 소비가 영영 꺼진다.
+      try { if (now - statSync(lockPath).mtimeMs > 10 * 60_000) { unlinkSync(lockPath); lockFd = openSync(lockPath, 'wx'); } } catch { /* */ }
+      if (lockFd === undefined) return skip('lock-held');
+    }
+    // 다른 프로세스가 방금 썼을 수 있다 — 잠근 «뒤»에 다시 센다.
+    const locked = readAutoConsumeCount(counterPath, day);
+    if (locked >= cap) return skip('daily-cap-reached', { cap, todayCount: locked });
+    const path = deps.storePath ?? authStorePath();
+    let earliest: { name: string; home: string; expiresAt: string | null; expiresMs: number } | undefined;
+    for (const candidate of buildRotationCandidates(path, now, deps.env ?? process.env)) {
+      if (!candidate.home) continue;
+      const listed = await list({ authFilePath: join(candidate.home, 'auth.json'), env: { CODEX_HOME: candidate.home } as unknown as NodeJS.ProcessEnv });
+      if (!listed.ok) continue;
+      for (const credit of listed.value.credits) {
+        if (credit.status !== 'available' || credit.redeemed_at) continue;
+        const ms = credit.expires_at ? Date.parse(credit.expires_at) : Number.POSITIVE_INFINITY;
+        const expiresMs = Number.isFinite(ms) || ms === Number.POSITIVE_INFINITY ? ms : Number.POSITIVE_INFINITY;
+        if (!earliest || expiresMs < earliest.expiresMs) earliest = { name: candidate.name, home: candidate.home, expiresAt: credit.expires_at, expiresMs };
+      }
+    }
+    if (!earliest) return skip('no-available-credit');
+    const todayCount = locked + 1;
+    writeFileSync(counterPath, `${JSON.stringify({ day, count: todayCount, lastAccount: earliest.name, at: new Date(now).toISOString() })}\n`, 'utf8');
+    const result = await consume({ authFilePath: join(earliest.home, 'auth.json'), env: { CODEX_HOME: earliest.home } as unknown as NodeJS.ProcessEnv });
+    if (!result.ok) return skip('consume-failed', { account: earliest.name, kind: result.kind, detail: result.message.slice(0, 200), todayCount });
+    const previous = readAvailabilityState(earliest.home);
+    const remaining = typeof previous === 'number' ? Math.max(0, previous - 1) : undefined;
+    if (remaining !== undefined) { try { writeAvailabilityState(remaining, earliest.home); } catch { /* 관측 갱신 실패는 소비를 되돌리지 않는다 */ } }
+    debug.log('codex.rotation', 'reset-consumed', { account: earliest.name, expiresAt: earliest.expiresAt, todayCount });
+    notifyCodexResetCreditConsumed({ name: earliest.name }, remaining, { storePath: path, now });
+    // 판정을 한 번 다시 돈다 — 조회 전용(관측·고정 없음). 다음 런 판정이 그 계정을 구독으로 고른다.
+    let redecision: string | undefined;
+    try { redecision = inspectCodexRotation(deps.env ?? process.env, { storePath: path }).reason; } catch { /* 재판정 실패는 소비 결과를 바꾸지 않는다 */ }
+    return { consumed: true, account: earliest.name, expiresAt: earliest.expiresAt, todayCount, ...(redecision ? { redecision } : {}) };
+  } catch (error) {
+    return skip('error', { detail: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200) });
+  } finally {
+    if (lockFd !== undefined) { try { closeSync(lockFd); } catch { /* */ } try { unlinkSync(lockPath); } catch { /* */ } }
+    autoConsumeInFlight = false;
+  }
 }
 
 /**
@@ -738,6 +851,8 @@ export function resolveRunFallback(
     readonly grokAvailable?: boolean;
     /** ⛔ grok «잔량» seam — 안 주면 재지 «않고» 'unknown' 이다(이 판정은 네트워크를 안 친다). */
     readonly grokQuota?: 'usable' | 'exhausted' | 'unknown';
+    /** OpenRouter 키 «존재» seam(테스트 격리) — 안 주면 `getOpenRouterApiKey()` 로 잰다. 키 값은 기록하지 않는다. */
+    readonly openrouterAvailable?: boolean;
   } & Pick<FallbackInput, 'currentStep' | 'currentCredentialRateLimited'> = {},
 ): FallbackDecision {
   try {
@@ -777,11 +892,18 @@ export function resolveRunFallback(
     // ⛔ 「지금 쓸 수 있나」는 «자격과 다른 축»이다. 안 주면 'unknown' — 그리고 unknown 은 «통과»다.
     //   ⇒ 「모르고 갔다」와 「알고 갔다」가 관측에서 갈린다(아래 grokQuota).
     const grokQuota = deps.grokQuota ?? readCachedGrokQuota();
-    const fallbackBase = { rotation, chain, grokAvailable, grokQuota };
+    const fallbackModel = configReader().llm?.openrouter?.fallbackModel;
+    const openrouterFallbackModel = typeof fallbackModel === 'string' ? fallbackModel : undefined;
+    const openrouterAvailable = chain.includes('openrouter')
+      && (deps.openrouterAvailable ?? Boolean(getOpenRouterApiKey()?.trim()));
+    const fallbackBase = { rotation, chain, grokAvailable, grokQuota, openrouterFallbackModel, openrouterAvailable };
     const fallbackInput: FallbackInput = deps.currentCredentialRateLimited === true && deps.currentStep
       ? { ...fallbackBase, currentStep: deps.currentStep, currentCredentialRateLimited: true }
       : { ...fallbackBase, ...(deps.currentStep ? { currentStep: deps.currentStep } : {}) };
     const decision = decideFallback(fallbackInput);
+    // tier-map 칸(가격·창 근거) — 유료 전환은 «무슨 값으로 가는지»를 관측에 남긴다. 미등록이면 'unregistered'.
+    const openrouterSpec = decision.action === 'switch-backend' && decision.backend === 'openrouter'
+      ? lookupOpenRouterModelSpec(decision.model) : undefined;
 
     debug.log('oauth.fallback-chain', 'decide', {
       rotationReason: rotation.reason,
@@ -797,16 +919,23 @@ export function resolveRunFallback(
       ...(dropped.length > 0 ? { droppedSteps: dropped } : {}),
       grokAvailable,
       grokQuota,
+      ...(chain.includes('openrouter') ? { openrouterAvailable, openrouterModelConfigured: Boolean(openrouterFallbackModel?.trim()) } : {}),
       action: decision.action,
       ...(decision.action === 'switch-backend' ? { backend: decision.backend } : {}),
+      ...(decision.action === 'switch-backend' && decision.backend === 'openrouter'
+        ? { model: decision.model, modelSpec: openrouterSpec ? `${openrouterSpec.label} · ${openrouterSpec.rationale}` : 'unregistered' }
+        : {}),
       ...(decision.action === 'stay' ? { why: decision.why } : {}),
       ...(decision.action === 'codex-rotate' ? { to: decision.to.name } : {}),
     });
     if (decision.action === 'switch-backend') {
+      const openrouterNote = decision.backend === 'openrouter'
+        ? ` · API 과금 ${decision.model} (${openrouterSpec ? `${openrouterSpec.label} · ${openrouterSpec.rationale}` : 'tier-map 미등록'})`
+        : '';
       emitDecision({
         kind: 'ROUTE',
         what: `공급자 전환 codex → ${decision.backend}`,
-        reason: `회전 ${rotation.reason} · 정책 ${quotaPolicy}${fallbackInput.currentCredentialRateLimited ? ' · 한도 오류' : ''}`,
+        reason: `회전 ${rotation.reason} · 정책 ${quotaPolicy}${openrouterNote}${fallbackInput.currentCredentialRateLimited ? ' · 한도 오류' : ''}`,
         purpose: '작업을 멈추지 않고 이어 간다',
         target: decision.backend,
         paths: chain.length,

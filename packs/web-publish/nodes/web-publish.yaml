@@ -1,0 +1,18 @@
+# 출처: 방법론 = passeth/business-motion-websites (MIT · © 2026 passeth) · 원작자 허락(2026-10-09). 이 노드 정의는 새로 씀.
+kind: web-publish
+graph: workflow
+title: 비즈니스 웹사이트 기획(기획만)
+description: 워크플로 한 칸에서 business-motion-websites 스킬로 «기획만» 만든다 — 주장 근거 표·페이지 지도·DESIGN.md·제작 계획. 구현·유료 생성·발행은 하지 않는다(스킬의 «시작 범위» 규칙). 만들고 발행까지 가려면 승인 관문·예산 장부·발행 어댑터가 있는 그래프 graphs/web-publish.yaml 을 쓴다
+inputs:
+  type: object
+  required: [business, goal]
+  properties:
+    business: { type: string, title: 사업 설명(대상 고객·제공 방식·입증 가능한 경험) }
+    goal: { type: string, title: 이 사이트로 얻으려는 것 }
+    workspace: { type: string, title: 작업 폴더(절대 경로) }
+outputs:
+  type: object
+  properties:
+    plan: { type: string }
+run:
+  skill: { name: business-motion-websites, prompt: "범위: 방법론·기획만 — 구현·유료 생성·배포로 넘어가지 않는다. 구현·제작·검증 단계는 향후 계획으로만 적는다.\n사업: {{inputs.business}}\n목표: {{inputs.goal}}\n작업 폴더: {{inputs.workspace}}" }

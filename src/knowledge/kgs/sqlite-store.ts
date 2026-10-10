@@ -209,6 +209,21 @@ export class KgsSqliteStore {
     );
   }
 
+  /** Remove only the selected version; standalone pack cards live inside its payload. */
+  deletePack(slug: string, version: string): boolean {
+    return this.db.run('DELETE FROM kgs_pack WHERE slug = ? AND version = ?', [slug, version]).changes > 0;
+  }
+
+  /** Switch versions as one SQLite transaction so failed upgrades retain the old index. */
+  replacePack(previous: { slug: string; version: string }, next: Pack): void {
+    this.db.transaction(() => {
+      if (!this.readPack(previous.slug, previous.version)) throw new Error('pack not installed');
+      if (this.readPack(next.metadata.id.slug, next.metadata.id.version)) throw new Error('pack version already installed');
+      this.writePack(next);
+      if (!this.deletePack(previous.slug, previous.version)) throw new Error('pack not removed');
+    })();
+  }
+
   readPack(slug: string, version: string): Pack | null {
     const row = this.db
       .query(`SELECT payload FROM kgs_pack WHERE slug = ? AND version = ?`)

@@ -9,7 +9,7 @@ import type { VerifierSpec } from './verifier/types.js';
 import type { GuardianSpec } from './guardian/types.js';
 import { ptyAvailable } from './pty-shell/registry.js';
 import { krFlowAvailable } from './skills/tools/kr-flow.js';
-import { SELF_COGNITION_MCP_CATALOG_ENTRIES } from './tool-runtime/self-cognition-runtimes.js';
+import { SELF_COGNITION_MCP_CATALOG_ENTRIES } from './tool-runtime/self-cognition-catalog.js';
 import { SKILLS_LIST_DESCRIPTION } from './onboarding/entry-hints.js';
 
 export type { NativeToolHost } from './tool-surface.js';

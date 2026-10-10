@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { assertNotTestWritingOps } from '../instance/test-write-guard.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
@@ -46,6 +47,7 @@ function schemaCurrent(db: Database): boolean {
 }
 function open(root = releaseLedgerRoot()): Database {
   const path = join(root, 'release', 'features.sqlite');
+  assertNotTestWritingOps(path, 'open the checklist ledger');
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true, strict: true });
   try {
@@ -546,6 +548,7 @@ export function details(id: string): { id: string; title: string; owner: string 
 export function exportJson(version: string, released = releasedVersion(), dev = devVersion()): Checklist {
   const data = list(version, released, dev);
   const path = jsonPath(version);
+  assertNotTestWritingOps(path, 'export the checklist ledger');
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   const contents = `${JSON.stringify(data, null, 2)}\n`;

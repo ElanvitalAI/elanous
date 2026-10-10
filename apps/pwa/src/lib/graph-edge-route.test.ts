@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { autoLayout, autoLayoutToFit, CANVAS_NODE_SIZE, canvasOutcomeLabel, fromYaml, type CanvasGraph } from '../components/editor/graph-canvas-model';
-import { dfsBackEdges, edgeFamily, hoverFocus, labelCollisions, mergeParallelEdges, routeEdges, type RouteNode } from './graph-edge-route';
+import { applyCanvasRunSteps, autoLayout, autoLayoutToFit, CANVAS_NODE_SIZE, canvasOutcomeLabel, fromYaml, type CanvasGraph } from '../components/editor/graph-canvas-model';
+import { dfsBackEdges, edgeFamily, hoverFocus, labelCollisions, mergeParallelEdges, routeEdges, WIRING_STYLE, wiringEdgeStyle, type RouteNode } from './graph-edge-route';
+import type { RunStep } from '../../../../src/self-implement/run-step-projection';
 
 const repoGraph = (name: string) => readFileSync(join(import.meta.dir, '../../../../graphs', name), 'utf8');
 
@@ -43,6 +44,21 @@ describe('graph editor hover focus', () => {
     expect(hoverFocus(null, edges)).toBeNull();
     expect(hoverFocus('isolated', edges)).toEqual({ nodes: new Set(['isolated']), edges: new Set() });
     expect(hoverFocus('isolated', [])).toEqual({ nodes: new Set(['isolated']), edges: new Set() });
+  });
+});
+
+describe('wiring edge focus', () => {
+  test('highlights the direct edge and dims an unrelated edge', () => {
+    const focus = hoverFocus('a', [{ id: 'ab', from: 'a', to: 'b' }, { id: 'cd', from: 'c', to: 'd' }]);
+    expect(WIRING_STYLE).toEqual({ gold: '#D4AF37', flowDash: '3 14', dimNode: 0.22, dimEdge: 0.15, width: 3 });
+    expect(wiringEdgeStyle(focus, 'ab')).toEqual({
+      style: { stroke: '#D4AF37', strokeWidth: 3, strokeDasharray: '3 14' }, animated: true,
+    });
+    expect(wiringEdgeStyle(focus, 'cd')).toEqual({ style: { opacity: 0.15 } });
+  });
+
+  test('leaves edge style and animation unset when no node is hovered', () => {
+    expect(wiringEdgeStyle(null, 'ab')).toEqual({});
   });
 });
 
@@ -155,5 +171,21 @@ describe('GRAPH-EDGE-TIDY · layout and routing on the shipped graphs', () => {
       const singleXs = single.nodes.map((node) => node.x);
       expect(Math.max(...singleXs) - Math.min(...singleXs)).toBeGreaterThan(1100);
     }
+  });
+
+  test('re-entering a laid-out node clears its prior exit without moving the static layout', () => {
+    const graph = autoLayout(fromYaml(repoGraph('research-loop.yaml')), 'horizontal');
+    const positions = graph.nodes.map(({ id, x, y }) => ({ id, x, y }));
+    const steps: RunStep[] = [
+      { seq: 1, ts: '2026-10-09T00:01:00.000Z', type: 'node-enter', node: 'investigate', visit: 1 },
+      { seq: 2, ts: '2026-10-09T00:02:00.000Z', type: 'node-exit', node: 'investigate', outcome: 'code-changed' },
+      { seq: 3, ts: '2026-10-09T00:03:00.000Z', type: 'node-enter', node: 'investigate', visit: 2 },
+    ];
+    const result = applyCanvasRunSteps(graph, steps);
+    expect(result.nodes.investigate).toEqual({
+      visit: 2, enteredAt: '2026-10-09T00:03:00.000Z', outcome: undefined,
+      exitedAt: undefined, skipped: undefined,
+    });
+    expect(result.graph.nodes.map(({ id, x, y }) => ({ id, x, y }))).toEqual(positions);
   });
 });

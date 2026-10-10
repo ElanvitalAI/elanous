@@ -1,6 +1,9 @@
 import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { KgsSqliteStore } from '../knowledge/kgs/sqlite-store.js';
+import { createPack } from '../knowledge/kgs/pack.js';
+import { buildCliAgentTools } from './agent-cli.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
@@ -11,6 +14,54 @@ setDefaultTimeout(60_000);
 
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
+
+test('CLI chat keeps its default tools until a knowledge pack is installed, then cites that pack', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-cli-kpack-'));
+  const dbPath = join(dir, 'kgs.db');
+  const { setKgsDbPathOverride, _resetKgsStoreSingleton } = await import('../knowledge/kgs/sqlite-store.js');
+  try {
+    _resetKgsStoreSingleton();
+    setKgsDbPathOverride(dbPath);
+    expect(buildCliAgentTools().specs.some(spec => spec.name === 'KnowledgeQuery')).toBe(false);
+    const store = new KgsSqliteStore(dbPath);
+    try {
+      const now = new Date().toISOString();
+      store.writePack(createPack({ id: { slug: 'cli-sample', version: '0.1.0' }, title: 'CLI sample',
+        intent: 'query test', audience: 'public', kind: 'generic', author: 'test', cards: [
+          { schema_version: 2, id: 'content/source.md', createdAt: now, updatedAt: now,
+            author: 'test', title: 'Sales source', body: 'CARD1 connects to CS1', nature: 'fact',
+            kind: 'note', reliability: 'self-reported', source: { kind: 'external', url: 'https://example.org/' }, tags: [] },
+        ] }));
+    } finally { store.close(); }
+    const tools = buildCliAgentTools();
+    expect(tools.specs.some(spec => spec.name === 'KnowledgeQuery')).toBe(true);
+    const result = await tools.dispatch('KnowledgeQuery', { pack_id: 'pack:cli-sample@0.1.0', question: 'CARD1' });
+    expect(result).toMatchObject({ total: 1 });
+    expect((result as { output: string }).output).toContain('[pack:cli-sample@0.1.0#content/source.md]');
+  } finally {
+    _resetKgsStoreSingleton();
+    setKgsDbPathOverride(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt knowledge store does not break CLI chat tool assembly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-cli-kpack-corrupt-'));
+  const dbPath = join(dir, 'kgs.db');
+  writeFileSync(dbPath, 'this is not a sqlite database');
+  const { setKgsDbPathOverride, _resetKgsStoreSingleton } = await import('../knowledge/kgs/sqlite-store.js');
+  try {
+    _resetKgsStoreSingleton();
+    setKgsDbPathOverride(dbPath);
+    const tools = buildCliAgentTools();
+    expect(tools.specs.length).toBeGreaterThan(0);
+    expect(tools.specs.some(spec => spec.name === 'KnowledgeQuery')).toBe(false);
+  } finally {
+    _resetKgsStoreSingleton();
+    setKgsDbPathOverride(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe('agent CLI onboarding refusal', () => {
   test('unconfigured agent with closed stdin exits 2 with one English stderr hint and no stack', () => {

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, devVersion, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, lintDocRefs, listChecklist, normalizeRefs, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -153,6 +153,63 @@ describe('release checklist ledger', () => {
     expect(checklistHistory('K1')).toEqual(entries);
   });
 
+  test('cut gate carries OP-recorded P0 known-issue and observes the last decision without changing checklistGate', () => {
+    root();
+    const version = '9.9.9';
+    addItem(version, { id: 'P0KNOWN', title: 'known defect', priority: 'P0' });
+    setItem(version, 'P0KNOWN', { disposition: 'known-issue', evidence: 'documented defect' }, 'OP');
+    const decision = [...listChecklist(version).history].reverse().find((entry) => entry.id === 'P0KNOWN' && entry.field === 'disposition');
+    expect(decision).toMatchObject({ by: 'OP', to: 'known-issue' });
+    const raw = checklistGate(version);
+    const logs: unknown[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'release-loop.checklist' && event === 'p0-known-issue-allowed') logs.push(data);
+    });
+    try {
+      const cut = cutChecklistGate(version, '2026-10-06T20:30:00.000Z', new Date('2026-10-06T21:00:00.000Z'));
+      expect(cut).toMatchObject({ ok: true, blocked: [], moved: [], undecided: [], autoMoved: [], knownIssues: [{ id: 'P0KNOWN', title: 'known defect', evidence: 'documented defect' }] });
+      expect(logs).toEqual([{ version, id: 'P0KNOWN', by: 'OP', at: decision!.at }]);
+      expect(checklistGate(version)).toEqual(raw);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('cut gate blocks undecided, moved, blocked, and non-OP P0 yellow; only the last known-issue decision can allow it', () => {
+    root();
+    const version = '9.9.9';
+    const cut = () => cutChecklistGate(version, '2026-10-06T20:30:00.000Z', new Date('2026-10-06T21:00:00.000Z'));
+    for (const id of ['NONE', 'MOVE', 'BLOCK', 'CLI', 'MK', 'LAST']) addItem(version, { id, title: id, priority: 'P0' });
+    setItem(version, 'MOVE', { disposition: 'move' }, 'OP');
+    setItem(version, 'BLOCK', { disposition: 'block' }, 'OP');
+    setItem(version, 'CLI', { disposition: 'known-issue' }, 'cli');
+    setItem(version, 'MK', { disposition: 'known-issue' }, 'MK');
+    setItem(version, 'LAST', { disposition: 'known-issue' }, 'OP');
+    setItem(version, 'LAST', { disposition: 'move' }, 'OP');
+    setItem(version, 'LAST', { disposition: 'known-issue' }, 'cli');
+    const raw = checklistGate(version);
+    expect(cut()).toMatchObject({ ok: false, blocked: ['BLOCK', 'NONE', 'MOVE', 'CLI', 'MK', 'LAST'], knownIssues: [], moved: [], undecided: [], autoMoved: [] });
+    expect(checklistGate(version)).toEqual(raw);
+    setItem(version, 'LAST', { disposition: 'move' }, 'MK');
+    setItem(version, 'LAST', { disposition: 'known-issue' }, 'OP');
+    const allowed = cut();
+    expect(allowed.blocked).toEqual(['BLOCK', 'NONE', 'MOVE', 'CLI', 'MK']);
+    expect(allowed.knownIssues.map((item) => item.id)).toEqual(['LAST']);
+    expect(allowed.ok).toBe(false);
+  });
+
+  test('cut gate preserves non-P0 autoMoved, undecided, moved and knownIssues decisions', () => {
+    root();
+    const version = '9.9.9';
+    for (const id of ['AUTO', 'UNDECIDED', 'MOVE', 'KNOWN']) addItem(version, { id, title: id, priority: 'P1' });
+    setItem(version, 'MOVE', { disposition: 'move' }, 'TC');
+    setItem(version, 'KNOWN', { disposition: 'known-issue' }, 'MK');
+    const raw = checklistGate(version);
+    const before = cutChecklistGate(version, '2026-10-06T22:00:00.000Z', new Date('2026-10-06T21:00:00.000Z'));
+    expect(before).toMatchObject({ undecided: ['AUTO', 'UNDECIDED'], moved: ['MOVE'], knownIssues: [{ id: 'KNOWN', title: 'KNOWN', evidence: '' }], autoMoved: [], ok: false });
+    const after = cutChecklistGate(version, '2026-10-06T20:30:00.000Z', new Date('2026-10-06T21:00:00.000Z'));
+    expect(after).toMatchObject({ undecided: [], moved: ['MOVE', 'AUTO', 'UNDECIDED'], knownIssues: [{ id: 'KNOWN', title: 'KNOWN', evidence: '' }], autoMoved: ['AUTO', 'UNDECIDED'], ok: true });
+    expect(checklistGate(version)).toEqual(raw);
+  });
+
   test('짝 판정 문면과 조건을 보존하고 짝 경고만으로 gate ok 를 바꾸지 않는다', () => {
     root();
     const valid = '짝: PWA ✅ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅';
@@ -166,6 +223,78 @@ describe('release checklist ledger', () => {
     expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [{ id: 'K1', why: '근거에 짝: 줄이 없다' }] });
     setItem('9.9.9', 'K1', { evidence: valid }, 'TC');
     expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [] });
+  });
+
+  test('postpub P0 노랑은 컷을 막지 않고, kind 없는 동일 칸은 P0 막힘으로 돌아온다', () => {
+    root();
+    const version = '9.9.9';
+    addItem(version, { id: 'POSTPUB-VERIFY', title: '발행 뒤 실측', kind: 'postpub', priority: 'P0' });
+    addItem(version, { id: 'READY', title: '발행 전 준비' });
+    setItem(version, 'READY', { status: 'green' }, 'MK');
+    const logs: unknown[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'release-loop.checklist' && event === 'gate-postpub-excluded') logs.push(data);
+    });
+    try {
+      expect(listChecklist(version).items.find((item) => item.id === 'POSTPUB-VERIFY')?.kind).toBe('postpub');
+      expect(cutChecklistGate(version, '2026-01-01T00:00:00Z', new Date('2026-01-02T00:00:00Z'))).toMatchObject({
+        ok: true, postpub: ['POSTPUB-VERIFY'], red: [], undecided: [], blocked: [], moved: [], knownIssues: [], autoMoved: [], parity: [],
+      });
+      expect(logs).toContainEqual({ version, ids: ['POSTPUB-VERIFY'] });
+      removeItem(version, 'POSTPUB-VERIFY', 'MK');
+      addItem(version, { id: 'POSTPUB-VERIFY', title: '발행 뒤 실측', priority: 'P0' });
+      expect(listChecklist(version).items.find((item) => item.id === 'POSTPUB-VERIFY')?.kind).toBeUndefined();
+      expect(cutChecklistGate(version, '2026-01-01T00:00:00Z', new Date('2026-01-02T00:00:00Z'))).toMatchObject({
+        ok: false, postpub: [], red: [], undecided: [], blocked: ['POSTPUB-VERIFY'], moved: [], knownIssues: [], autoMoved: [], parity: [],
+      });
+      expect(checklistGate(version)).toMatchObject({ ok: false, undecided: ['POSTPUB-VERIFY'], blocked: [], postpub: [] });
+      expect(logs).toHaveLength(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('postpub 상태·처분은 발행 전 다섯 분류에서 빠지고 마감 뒤 자동 이월도 안 된다; 일반·screen 칸은 유지된다', () => {
+    root();
+    const version = '9.9.9';
+    for (const [id, status, disposition] of [
+      ['POST-RED', 'red', undefined], ['POST-BLOCK', 'yellow', 'block'], ['POST-MOVE', 'yellow', 'move'],
+      ['POST-ISSUE', 'yellow', 'known-issue'], ['POST-AUTO', 'yellow', undefined],
+    ] as const) {
+      addItem(version, { id, title: id, kind: 'postpub', priority: 'P1' });
+      if (status !== 'yellow' || disposition !== undefined) setItem(version, id, { status, disposition }, 'MK');
+    }
+    addItem(version, { id: 'NORMAL', title: 'ordinary', priority: 'P1' });
+    addItem(version, { id: 'SCREEN', title: 'five surfaces', kind: 'screen' });
+    setItem(version, 'SCREEN', { status: 'green' }, 'MK');
+    const gate = checklistGate(version);
+    expect(gate).toMatchObject({
+      ok: false, postpub: ['POST-RED', 'POST-BLOCK', 'POST-MOVE', 'POST-ISSUE', 'POST-AUTO'],
+      red: [], blocked: [], moved: [], knownIssues: [], undecided: ['NORMAL'],
+      parity: [{ id: 'SCREEN', why: '근거에 짝: 줄이 없다' }],
+    });
+    expect(cutChecklistGate(version, '2026-01-01T00:00:00Z', new Date('2026-01-02T00:00:00Z'))).toMatchObject({
+      ok: true, postpub: gate.postpub, red: [], blocked: [], undecided: [], moved: ['NORMAL'], knownIssues: [], autoMoved: ['NORMAL'], parity: gate.parity,
+    });
+    expect(() => addItem(version, { id: 'INVALID', title: 'invalid', kind: 'bogus' as 'screen' })).toThrow('잘못된 종류: bogus');
+    expect(() => setItem(version, 'SCREEN', { kind: 'bogus' as 'screen' }, 'MK')).toThrow('잘못된 종류: bogus');
+    expect(listChecklist(version).items.find((item) => item.id === 'SCREEN')?.kind).toBe('screen');
+  });
+
+  test('kind 없는 칸과 screen 칸은 기존 red·undecided·blocked·moved·knownIssues·parity 판정을 유지한다', () => {
+    root();
+    const version = '9.9.9';
+    for (const [id, status, disposition] of [
+      ['RED', 'red', undefined], ['UNDECIDED', 'yellow', undefined], ['BLOCK', 'yellow', 'block'],
+      ['MOVE', 'yellow', 'move'], ['ISSUE', 'yellow', 'known-issue'],
+    ] as const) {
+      addItem(version, { id, title: id });
+      if (status !== 'yellow' || disposition !== undefined) setItem(version, id, { status, disposition, evidence: id }, 'MK');
+    }
+    addItem(version, { id: 'SCREEN', title: 'screen', kind: 'screen' });
+    setItem(version, 'SCREEN', { status: 'green' }, 'MK');
+    expect(checklistGate(version)).toMatchObject({
+      ok: false, postpub: [], red: ['RED'], undecided: ['UNDECIDED'], blocked: ['BLOCK'], moved: ['MOVE'],
+      knownIssues: [{ id: 'ISSUE', title: 'ISSUE', evidence: 'ISSUE' }], parity: [{ id: 'SCREEN', why: '근거에 짝: 줄이 없다' }],
+    });
   });
 
   test('입력 오류 여덟 곳은 문구를 보존하고 이미/없는 칸에만 hint를 제공한다', () => {

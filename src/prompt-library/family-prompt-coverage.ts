@@ -31,6 +31,7 @@ export const FAMILY_PROBE_MODEL_IDS: Readonly<Record<Exclude<ModelFamily, 'other
   grok: 'grok-4.7',
   gemini: 'gemini-3-pro',
   local: 'local:qwen',
+  'open-weight': 'openrouter/z-ai/glm-5.3',
 };
 
 export interface FamilyPromptCoverage {

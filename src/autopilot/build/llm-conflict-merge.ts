@@ -244,6 +244,7 @@ export async function mergeMainWithLlmResolve(
   });
   const unresolved = (outcome: LlmMergeOutcome & { status: 'conflict-unresolved'; failedFile: string }): LlmMergeOutcome => {
     debug.log('self-dev.merge', 'conflict-unresolved', { reason: outcome.reason, failedFile: outcome.failedFile, resolvedCount: resolvedFiles.length });
+    debug.log('self-dev.merge', 'merge-conflict-resolve', { attempt: 'merge', result: 'unresolved', files: [outcome.failedFile], ...(outcome.reason ? { reason: outcome.reason } : {}) });
     return measuredOutcome(outcome);
   };
   for (const f of files) {
@@ -315,7 +316,12 @@ export async function mergeMainWithLlmResolve(
     else llmResolved += 1;
   }
   const committed = seamOk(git.commit(worktreePath));
-  if (!committed.ok) { git.abort(worktreePath); return measuredOutcome(errorOutcome('commit', committed.errorDetail, resolvedFiles)); }
+  if (!committed.ok) {
+    git.abort(worktreePath);
+    debug.log('self-dev.merge', 'merge-conflict-resolve', { attempt: 'merge', result: 'unresolved', files: resolvedFiles, reason: 'commit-failed' });
+    return measuredOutcome(errorOutcome('commit', committed.errorDetail, resolvedFiles));
+  }
+  debug.log('self-dev.merge', 'merge-conflict-resolve', { attempt: 'merge', result: 'resolved', files: resolvedFiles });
   return measuredOutcome({
     status: llmResolved === 0 && deterministicResolved > 0 ? 'deterministic-resolved' : 'llm-resolved',
     resolvedFiles,
@@ -393,6 +399,157 @@ export function defaultGitMergeSeam(): MergeGitSeam {
   };
 }
 
+/**
+ * MERGE-CONFLICT-AUTO — 큰 파일의 충돌을 «hunk 단위»로 푼다.
+ * 🩸 10-10 run-448e450f: `src/llm.ts`(11k+ 줄) 충돌이 전체 파일 프롬프트 상한(`mergeConflictInputMaxChars`)을 넘어
+ *   `conflict-input-too-large` 로 시도조차 못 하고 사람 넘김(main-sync-blocked)이 됐다.
+ * ⇒ 파일 전체 대신 충돌 블록(`<<<<<<< `…`>>>>>>> `)과 앞뒤 문맥만 잘라 LLM 에 주고, 해결된 블록을 원 파일 자리에 다시 꿰맨다.
+ *   충돌 밖의 줄은 바이트 그대로다. 해결본은 호출부(`mergeMainWithLlmResolve`)의 마커·시험 선언·크기 붕괴 검사를 그대로 탄다.
+ */
+export interface ConflictHunk {
+  /** 블록 첫 줄(`<<<<<<< `)의 0-기준 줄 번호. */
+  start: number;
+  /** 블록 끝 줄(`>>>>>>> `)의 0-기준 줄 번호(포함). */
+  end: number;
+}
+
+/** 충돌 블록을 찾는다(순수). 짝이 안 맞으면 null — 꿰맬 수 없으니 hunk 경로를 쓰지 않는다. */
+export function findConflictHunks(content: string): ConflictHunk[] | null {
+  const lines = content.split('\n');
+  const hunks: ConflictHunk[] = [];
+  let open = -1;
+  let base = false;
+  let separator = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^<{7}(?: |\r?$)/.test(line)) {
+      if (open !== -1) return null;
+      open = i; base = false; separator = false;
+    } else if (/^>{7}(?: |\r?$)/.test(line)) {
+      // ⛔ 구분자(`=======`) 없는 블록은 꿰맬 수 없는 모양이다 — 종전 출구로.
+      if (open === -1 || !separator) return null;
+      hunks.push({ start: open, end: i });
+      open = -1;
+    } else if (open !== -1 && /^\|{7}(?: |\r?$)/.test(line)) {
+      // diff3 base 구간은 구분자 «앞»에 한 번만.
+      if (base || separator) return null;
+      base = true;
+    } else if (open !== -1 && /^={7}\r?$/.test(line)) {
+      if (separator) return null;
+      separator = true;
+    }
+  }
+  return open === -1 ? hunks : null;
+}
+
+/** hunk 해결 기본 문맥 줄 수(앞뒤 각각). */
+export const DEFAULT_CONFLICT_HUNK_CONTEXT_LINES = 40;
+
+export function conflictHunkResolvePrompt(
+  filePath: string, before: string, block: string, after: string, mergeTarget: string, index: number, total: number,
+  intent?: ResolverIntent,
+): string {
+  return [
+    '너는 git merge 충돌을 지능적으로 해결하는 엔지니어다. 파일이 커서 충돌 블록 «하나»와 그 앞뒤 문맥만 보여 준다.',
+    '  <<<<<<< ours   = 현재 브랜치(walker 가 이 미션에서 만든 산출물)',
+    '  ======= 사이   = 양쪽 버전',
+    `  >>>>>>> theirs = ${mergeTarget}(호출자가 해석해 전달한 정합 대상)`,
+    '',
+    ...resolverIntentLines(intent),
+    '해결 원칙:',
+    '- 양쪽의 의도를 **모두 보존**하며 종합한다(한쪽을 통째로 버리지 않는다).',
+    `- 같은 목적의 중복은 **theirs(${mergeTarget}) 버전을 채택**하고 ours 의 중복은 제거.`,
+    '- ours 에만 있는 고유 추가분은 **보존**해 theirs 와 합친다.',
+    '- 앞·뒤 문맥은 «참고용»이다 — 출력하지 않는다. 해결본이 그 문맥 사이에 들어가 문법적으로 이어져야 한다.',
+    '',
+    '⚠️ 충돌 블록(<<<<<<< 부터 >>>>>>> 까지)을 «대체할 줄들만» 출력하라. 충돌 마커 없이, 설명·코드펜스 없이.',
+    '',
+    `파일: ${filePath} · 충돌 블록 ${index + 1}/${total}`,
+    '앞 문맥(출력 금지):',
+    '```',
+    before,
+    '```',
+    '충돌 블록(이것을 대체):',
+    '```',
+    block,
+    '```',
+    '뒤 문맥(출력 금지):',
+    '```',
+    after,
+    '```',
+  ].join('\n');
+}
+
+/**
+ * 충돌 블록마다 `resolveHunk` 로 대체 줄을 받아 원 파일에 꿰맨다. 블록 하나라도 상한을 넘으면
+ * `MergeConflictInputTooLarge` 를 던진다(종전과 같은 사람 넘김). 짝이 안 맞는 마커면 null.
+ */
+export async function resolveConflictByHunks(
+  filePath: string, conflicted: string, mergeTarget: string, maxChars: number,
+  resolveHunk: (prompt: string) => Promise<string>,
+  contextLines = DEFAULT_CONFLICT_HUNK_CONTEXT_LINES,
+  intent?: ResolverIntent,
+): Promise<string | null> {
+  const hunks = findConflictHunks(conflicted);
+  if (hunks === null || hunks.length === 0) return null;
+  const lines = conflicted.split('\n');
+  // 1차: 블록마다 프롬프트를 «먼저» 다 만든다 — 하나라도 상한을 넘으면 LLM 을 한 번도 안 부르고 종전 출구.
+  const prompts: string[] = [];
+  for (let k = 0; k < hunks.length; k++) {
+    const { start, end } = hunks[k]!;
+    const prevEnd = k === 0 ? -1 : hunks[k - 1]!.end;
+    const nextStart = k === hunks.length - 1 ? lines.length : hunks[k + 1]!.start;
+    const block = lines.slice(start, end + 1).join('\n');
+    // 상한 안에 들 때까지 — 의도(ours·theirs·형제 PR)가 문맥보다 먼저다:
+    //   ① 의도 포함으로 문맥을 반씩 줄여(0 까지) 본다 → ② 그래도 안 들면 의도 없이 같은 순서로.
+    //   블록만으로도(문맥 0 · 의도 없음) 넘으면 그때만 종전 출구(too-large).
+    const hunkPrompt = (ctx: number, withIntent: ResolverIntent | undefined): string => {
+      const before = lines.slice(Math.max(prevEnd + 1, start - ctx), start).join('\n');
+      const after = lines.slice(end + 1, Math.min(nextStart, end + 1 + ctx)).join('\n');
+      return conflictHunkResolvePrompt(filePath, before, block, after, mergeTarget, k, hunks.length, withIntent);
+    };
+    let prompt = '';
+    for (const withIntent of intent ? [intent, undefined] : [undefined]) {
+      for (let ctx = contextLines; ; ctx = Math.floor(ctx / 2)) {
+        prompt = hunkPrompt(ctx, withIntent);
+        if (prompt.length <= maxChars || ctx === 0) break;
+      }
+      if (prompt.length <= maxChars) break;
+    }
+    if (prompt.length > maxChars) throw new MergeConflictInputTooLarge(prompt.length);
+    prompts.push(prompt);
+  }
+  // 2차: 해결하고 꿰맨다.
+  const out: string[] = [];
+  let cursor = 0;
+  for (let k = 0; k < hunks.length; k++) {
+    const { start, end } = hunks[k]!;
+    const raw = await resolveHunk(prompts[k]!);
+    const replacement = raw.replace(/^```[\w.-]*\r?\n?/, '').replace(/\r?\n?```\s*$/, '').replace(/(?:\r?\n)+$/, '');
+    // ⛔ 스프레드 대신 줄 단위 — 충돌 밖 구간이 아주 길어도 인자 수 한도에 안 걸린다.
+    for (let i = cursor; i < start; i++) out.push(lines[i]!);
+    // CRLF 파일이면 해결 줄도 CRLF 로 맞춘다(블록 끝 마커 줄의 줄 끝을 따른다).
+    const crlf = lines[end]!.endsWith('\r');
+    // ⛔ 해결 줄도 펼침(`push(...x)`) 없이 — 입력 상한은 LLM «출력» 줄 수를 막지 않는다(펼침은 인자 수 한도에서 RangeError).
+    if (replacement.length > 0) {
+      for (const line of replacement.split('\n')) out.push(crlf ? `${line.replace(/\r$/, '')}\r` : line.replace(/\r$/, ''));
+    }
+    // ⛔ 파일 끝 블록이 빈 해결본이면 앞 줄의 개행이 사라진다 — 빈 줄 하나로 그 개행을 남긴다(충돌 밖 바이트 불변).
+    else if (end === lines.length - 1 && start > 0) out.push('');
+    cursor = end + 1;
+  }
+  for (let i = cursor; i < lines.length; i++) out.push(lines[i]!);
+  return out.join('\n');
+}
+
+/** `tools.selfImplement.mergeConflictAuto` — 기본 on. `false` 면 큰 파일 hunk 해결을 끄고 종전(사람 넘김) 그대로. */
+export function mergeConflictAutoEnabled(raw: Record<string, unknown> | undefined): boolean {
+  const tools = raw?.tools;
+  const selfImplement = tools && typeof tools === 'object' ? (tools as Record<string, unknown>).selfImplement : undefined;
+  const value = selfImplement && typeof selfImplement === 'object' ? (selfImplement as Record<string, unknown>).mergeConflictAuto : undefined;
+  return value !== false;
+}
+
 /** 실 LLM 충돌 해결 어댑터(streamLLM·sol). 코드펜스/설명 제거해 완결 파일만. */
 export async function defaultLlmResolve(
   filePath: string, conflicted: string, mergeTarget: string,
@@ -404,10 +561,13 @@ export async function defaultLlmResolve(
     siblingIntent?: 'on' | 'off';
     /** Receives each resolver-phase `intent-resolve` decision (carried onto the merge outcome). */
     onIntentResolve?: (record: IntentResolveRecord) => void;
+    /** MERGE-CONFLICT-AUTO seam — overrides `tools.selfImplement.mergeConflictAuto` (default on). */
+    mergeConflictAuto?: boolean;
   } = {},
 ): Promise<string> {
   let rawConfig: { mergeConflictInputMaxChars?: unknown; mergeIntent?: unknown; siblingIntent?: unknown } | undefined;
-  try { rawConfig = getUserConfig().raw.selfImplement as typeof rawConfig; }
+  let rawRoot: Record<string, unknown> | undefined;
+  try { rawRoot = getUserConfig().raw; rawConfig = rawRoot.selfImplement as typeof rawConfig; }
   catch { /* unreadable config keeps the old resolver and default input limit */ }
   const configuredMax = rawConfig?.mergeConflictInputMaxChars;
   const maxChars = typeof configuredMax === 'number' && Number.isSafeInteger(configuredMax) && configuredMax > 0
@@ -417,13 +577,52 @@ export async function defaultLlmResolve(
     rawMode = rawConfig?.mergeIntent;
   }
   const mode = rawMode === 'shadow' || rawMode === 'on' ? rawMode : 'off';
-  const resolve = async (intent?: ResolverIntent): Promise<string> => {
-    const prompt = conflictResolvePrompt(filePath, conflicted, mergeTarget, intent);
-    if (prompt.length > maxChars) throw new MergeConflictInputTooLarge(prompt.length);
+  const conflictModel = process.env.ELANOUS_CONFLICT_MODEL || tierModel('better');
+  const ask = async (prompt: string): Promise<string> => {
     const streamLLM = options.stream ?? (await import('../../llm.js')).streamLLM;
-    const out = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
+    const out = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model: conflictModel, reasoningEffort: 'medium' });
     // ⛔ 라우터는 공급자가 전부 막히면 던지지 않고 오류 문구를 돌려준다 — 그것은 파일 내용이 아니다.
     if (PROVIDER_FAILURE_TEXT.test(out)) throw new Error(`conflict resolve: LLM provider failure for ${filePath}`);
+    return out;
+  };
+  const resolve = async (intent?: ResolverIntent): Promise<string> => {
+    const prompt = conflictResolvePrompt(filePath, conflicted, mergeTarget, intent);
+    const autoOn = prompt.length > maxChars && (options.mergeConflictAuto ?? mergeConflictAutoEnabled(rawRoot));
+    if (autoOn && intent !== undefined) {
+      // 의도 때문에만 상한을 넘으면 의도 없는 전체 파일 프롬프트가 먼저다(hunk 로 가지 않는다).
+      const plain = conflictResolvePrompt(filePath, conflicted, mergeTarget);
+      if (plain.length <= maxChars) {
+        const out = await ask(plain);
+        return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;
+      }
+    }
+    if (prompt.length > maxChars) {
+      // MERGE-CONFLICT-AUTO — 전체 파일이 상한을 넘으면 충돌 hunk 와 앞뒤 문맥만 잘라 푼다(노브 off 면 종전 그대로).
+      // 노브 off 면 종전 그대로(LLM 호출 0) — 위 의도 없는 전체 파일 재시도도 노브 on 에서만.
+      if (!autoOn) throw new MergeConflictInputTooLarge(prompt.length);
+      let stitched: string | null;
+      try {
+        stitched = await resolveConflictByHunks(filePath, conflicted, mergeTarget, maxChars, ask, DEFAULT_CONFLICT_HUNK_CONTEXT_LINES, intent);
+      } catch (error) {
+        debug.log('self-dev.merge', 'merge-conflict-resolve', {
+          attempt: 'hunk', result: 'unresolved', files: [filePath], model: conflictModel, inputChars: prompt.length,
+          error: error instanceof MergeConflictInputTooLarge ? 'hunk-input-too-large' : String((error as Error)?.message ?? error).slice(0, 200),
+        }, { level: 'warn' });
+        throw error instanceof MergeConflictInputTooLarge ? new MergeConflictInputTooLarge(prompt.length) : error;
+      }
+      if (stitched === null) {
+        debug.log('self-dev.merge', 'merge-conflict-resolve', { attempt: 'hunk', result: 'unresolved', files: [filePath], model: conflictModel, inputChars: prompt.length, error: 'hunk-markers-unbalanced' }, { level: 'warn' });
+        throw new MergeConflictInputTooLarge(prompt.length);
+      }
+      const hunks = findConflictHunks(conflicted)?.length ?? 0;
+      // ⚠️ `stitched` 는 «꿰맴»까지다 — 최종 판정(마커·시험 선언·크기 붕괴)은 mergeMainWithLlmResolve 의 merge-conflict-resolve(attempt: 'merge').
+      debug.log('self-dev.merge', 'merge-conflict-resolve', {
+        attempt: 'hunk', result: hasConflictMarkers(stitched) ? 'unresolved' : 'stitched', files: [filePath], model: conflictModel, inputChars: prompt.length, hunks,
+      });
+      // 끝 개행 상태도 원본 그대로(충돌 밖 줄 바이트 불변).
+      return stitched;
+    }
+    const out = await ask(prompt);
     return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;
   };
   const collect = () => collectMergeIntent({ worktreePath: options.worktreePath ?? process.cwd(), filePath, mergeTarget, git: options.git ?? defaultIntentGit });
@@ -558,6 +757,16 @@ function siblingIntentLines(siblings: SiblingPrIntent[] | undefined): string[] {
   ];
 }
 
+/** 전체 파일·hunk 프롬프트가 공유하는 의도 줄(ours·theirs·형제 PR). */
+function resolverIntentLines(intent: ResolverIntent | undefined): string[] {
+  return intent ? [
+    `ours 의 의도: ${intent.ours ?? '(확인 불가)'}`,
+    `theirs 에 먼저 착지한 변경: ${intent.theirs.length ? intent.theirs.join(' · ') : '(확인 불가)'}`,
+    '',
+    ...siblingIntentLines(intent.siblings),
+  ] : [];
+}
+
 export function conflictResolvePrompt(filePath: string, conflictedContent: string, mergeTarget: string, intent?: ResolverIntent): string {
   return [
     '너는 git merge 충돌을 지능적으로 해결하는 엔지니어다. 아래 파일은 3-way merge 충돌 마커를 포함한다:',
@@ -565,12 +774,7 @@ export function conflictResolvePrompt(filePath: string, conflictedContent: strin
     '  ======= 사이   = 양쪽 버전',
     `  >>>>>>> theirs = ${mergeTarget}(호출자가 해석해 전달한 정합 대상)`,
     '',
-    ...(intent ? [
-      `ours 의 의도: ${intent.ours ?? '(확인 불가)'}`,
-      `theirs 에 먼저 착지한 변경: ${intent.theirs.length ? intent.theirs.join(' · ') : '(확인 불가)'}`,
-      '',
-      ...siblingIntentLines(intent.siblings),
-    ] : []),
+    ...resolverIntentLines(intent),
     '해결 원칙:',
     '- 양쪽의 의도를 **모두 보존**하며 종합한다(한쪽을 통째로 버리지 않는다).',
     `- 같은 목적의 중복(예: 같은 테스트·같은 함수)은 **theirs(${mergeTarget}) 버전을 채택**하고 ours 의 중복은 제거.`,

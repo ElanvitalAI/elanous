@@ -915,3 +915,40 @@ describe('runNexus · MCP widget server binding', () => {
     }
   }, 15_000);
 });
+
+test('NEXUS boot prunes 30-day error reports without a receipt and arms a daily tick', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-er-prune-'));
+  let nexus: Awaited<ReturnType<typeof runNexus>>;
+  let tick = () => {};
+  let interval = 0;
+  try {
+    setElanousConfigDir(root);
+    setTestStateRoot(root);
+    const now = new Date();
+    const dayDir = (daysAgo: number) => {
+      const at = new Date(now.getTime() - daysAgo * 86_400_000);
+      const dir = join(root, 'error-reports', String(at.getUTCFullYear()), String(at.getUTCMonth() + 1).padStart(2, '0'), String(at.getUTCDate()).padStart(2, '0'));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'er_x.json'), '{}');
+      return dir;
+    };
+    const old = dayDir(40);
+    const recent = dayDir(3);
+    nexus = await runNexus({ detachForTesting: true, skipHttpServer: true, skipRuntimeApi: true,
+      skipSupervisor: true, mcpEnabled: false, skipRestoreFromPending: true, toolCwd: root,
+      cleanGhostTailscaleServeFn: async () => {},
+      errorReportPruneScheduleForTesting: (fn, ms) => { tick = fn; interval = ms; return {}; } });
+    if (!nexus) throw new Error('NEXUS failed to start');
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(recent)).toBe(true);
+    expect(interval).toBe(86_400_000);
+    const later = dayDir(45);
+    tick();
+    expect(existsSync(later)).toBe(false);
+  } finally {
+    nexus?.release();
+    resetElanousConfigDir();
+    setTestStateRoot(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

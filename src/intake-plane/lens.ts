@@ -1,10 +1,11 @@
-// 흡수 렌즈 — outbox 항목마다 «우리에게 무엇인가»를 판정해 outbox/lens/<day>.jsonl 에만 남긴다.
-// 원 갈래(goals·manual·review·release)는 읽기만 한다. LLM 은 judge 한 번(id 당).
+// 흡수 렌즈 — E1 outbox 와 같은 날 공개 GitHub·X 원장 항목을 판정해 outbox/lens/<day>.jsonl 에만 남긴다.
+// 원 갈래(goals·manual·review·release)와 원장은 읽기만 한다. LLM 은 judge 한 번(id 당).
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { judge } from '../llm/judge-layer.js';
-import { intakeOutboxDir } from './route.js';
+import { loadIntakeLedger } from './items.js';
+import { intakeOutboxDir, kstDay } from './route.js';
 
 export const LENS_VERDICTS = ['대체 후보', '보강', '경쟁 대조', '참고'] as const;
 export type LensVerdict = (typeof LENS_VERDICTS)[number];
@@ -98,6 +99,26 @@ function groupOutbox(root: string, day: string): GroupedItem[] {
   return order.map((id) => groups.get(id)!);
 }
 
+function ledgerLensItems(root: string, day: string, existing: ReadonlySet<string>): GroupedItem[] {
+  const items: GroupedItem[] = [];
+  const seen = new Set(existing);
+  const ledger = [...loadIntakeLedger(root).items.values()];
+  for (const source of ['github', 'x'] as const) {
+    for (const item of ledger) {
+      if (!item.id || seen.has(item.id) || item.status === 'discarded' || item.privacy !== 'public'
+        || !item.url || kstDay(item.lastSeenAt) !== day || !item.sources?.includes(source)) continue;
+      const title = item.title?.trim();
+      const text = item.text?.trim();
+      const facts = [title, text].filter((value): value is string => Boolean(value)).slice(0, LENS_FACT_CAP)
+        .map((fact) => ({ fact, current: '' }));
+      if (!facts.length) continue;
+      seen.add(item.id);
+      items.push({ id: item.id, facts, url: item.url });
+    }
+  }
+  return items;
+}
+
 function judgedIds(file: string): Set<string> {
   return new Set(readJsonl(file).flatMap((row) => typeof row.id === 'string' && row.id ? [row.id] : []));
 }
@@ -130,7 +151,7 @@ async function defaultJudge(item: GroupedItem): Promise<unknown> {
   return decision.value;
 }
 
-/** 그날 outbox 를 id 로 묶어 아직 없는 판정만 남긴다. 원 갈래 파일은 쓰지 않는다. */
+/** 그날 E1 outbox 뒤에 공개 GitHub·X 원장을 붙여 아직 없는 판정만 남긴다. 원천 파일은 쓰지 않는다. */
 export async function annotateIntakeLens(
   root: string,
   day: string,
@@ -142,13 +163,20 @@ export async function annotateIntakeLens(
     log('skipped-test', {});
     return empty;
   }
-  const items = groupOutbox(root, day);
+  const outbox = groupOutbox(root, day);
+  const ledger = ledgerLensItems(root, day, new Set(outbox.map((item) => item.id)));
+  const items = [...outbox, ...ledger];
   const file = join(intakeOutboxDir(root), 'lens', `${day}.jsonl`);
   const done = judgedIds(file);
   const pending = items.filter((item) => !done.has(item.id));
-  const capped = pending.length > LENS_DAILY_CAP;
-  const batch = pending.slice(0, LENS_DAILY_CAP);
-  if (capped) log('capped', { day, total: pending.length, judged: batch.length });
+  const remaining = Math.max(0, LENS_DAILY_CAP - done.size);
+  const capped = pending.length > remaining;
+  const batch = pending.slice(0, remaining);
+  if (capped) {
+    const skippedIds = pending.slice(remaining).map((item) => item.id);
+    log('capped', { day, total: pending.length, judged: batch.length, skippedIds,
+      ...(skippedIds.length ? { marker: `외 ${skippedIds.length}건 · 원장 \`elanous intake items\`` } : {}) });
+  }
   const judgeOne = deps.judge ?? ((input: LensJudgeInput) => defaultJudge(input));
   const now = deps.now ?? (() => new Date().toISOString());
   let judged = 0;

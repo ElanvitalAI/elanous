@@ -41,6 +41,34 @@ export interface RecurrenceFinding {
   readonly item: string;
 }
 
+/** Pod 리뷰 예산 소진 잔여 분류(FLEX-POD-ACCEPT-1).
+ *  `repeatedIds` = 앞 라운드와 id(내용 해시) 또는 비지 않은 `reviewFindingKey` 가 같은 지적.
+ *  `keyOnlyRepeatedIds` = 그중 «키로만» 반복된 것(문면이 달라 내용 해시는 다르다).
+ *  ⛔ 사양 v2(OP 18:1x (a)): Pod 수락은 «전부 내용 해시 반복»일 때만 — 키로만 반복된 지적은 관측만 하고 수락 근거로 쓰지 않는다. */
+export function classifyPodReviewBudgetResidue(
+  current: readonly RecurrenceFinding[] | undefined,
+  previous: readonly RecurrenceFinding[] | undefined,
+): { status: 'all-repeated' | 'has-new' | 'unmeasured'; repeatedIds: string[]; newIds: string[]; keyOnlyRepeatedIds: string[] } {
+  if (!previous?.length || !current?.length) return { status: 'unmeasured', repeatedIds: [], newIds: [], keyOnlyRepeatedIds: [] };
+  const previousIds = new Set(previous.map(({ id }) => id));
+  const previousKeys = new Set(previous.map(({ item }) => reviewFindingKey(item).key).filter(Boolean));
+  const repeatedIds: string[] = [];
+  const newIds: string[] = [];
+  const keyOnlyRepeatedIds: string[] = [];
+  for (const { id, item } of current) {
+    if (previousIds.has(id)) {
+      repeatedIds.push(id);
+      continue;
+    }
+    const key = reviewFindingKey(item).key;
+    if (key !== '' && previousKeys.has(key)) {
+      repeatedIds.push(id);
+      keyOnlyRepeatedIds.push(id);
+    } else newIds.push(id);
+  }
+  return { status: newIds.length ? 'has-new' : 'all-repeated', repeatedIds, newIds, keyOnlyRepeatedIds };
+}
+
 export interface AcceptedRefutationHistory {
   /** 반박이 수용되어 앞 라운드에 기각된 stable must-fix ID. */
   readonly acceptedRefutationFindingIds?: readonly string[];

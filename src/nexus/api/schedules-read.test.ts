@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { LogStore } from '../../mss/logging/log-store.js';
-import type { ScheduleRow } from '../../domains/schedule-registry.js';
+import { cronEntryId, unwrapCronCommand, type ScheduleRow } from '../../domains/schedule-registry.js';
 import { handleSchedulesList, handleScheduleDetail, handleScheduleRuns, type SchedulesReadDeps } from './schedules-read.js';
 import { ensureScheduleRunsSchema, recordScheduleRun } from '../../domains/schedule-runs.js';
 import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
@@ -63,6 +63,35 @@ describe('schedule run history API (S2)', () => {
 });
 
 describe('schedule read API', () => {
+  test('fenced crontab jobs retain the unfenced cards and their fire history', async () => {
+    const cron = '*/10 * * * *';
+    const price = 'cd /r && /b/bun scripts/cron-run.ts scripts/price-guard-cycle.ts >> /tmp/price-guard-cycle.log 2>&1';
+    const posture = `cd /r && /b/bun scripts/cron-run.ts scripts/market-posture-cycle.ts --note 'open' >> /tmp/market-posture-cycle.log 2>&1`;
+    const ordinary = 'cd /r && /b/bun scripts/cron-run.ts scripts/ordinary-cycle.ts >> /tmp/ordinary-cycle.log 2>&1';
+    const installed = [
+      `${cron} /home/u/.elanous/bin/hq-fence conatus '${price}' >> /tmp/elanous-hq-fence.log 2>&1`,
+      `${cron} hq-fence --role cron -- '${posture.replaceAll("'", `'"'"'`)}'`,
+      `${cron} ${ordinary}`,
+    ];
+    const rows: ScheduleRow[] = [price, posture, ordinary].map((cmd, index) => ({
+      ...row, id: cronEntryId(cron, unwrapCronCommand(cmd)), name: ['price-guard-cycle', 'market-posture-cycle', 'ordinary-cycle'][index]!,
+      cron, command: cmd, raw: `${cron} ${cmd}`, enabled: 1, last_run: '2026-10-09T02:55:00Z',
+    }));
+    const actualDeps: SchedulesReadDeps = {
+      ...deps, rows: () => rows, crontab: () => installed.join('\n'), launchd: () => [],
+      now: () => new Date('2026-10-09T03:00:00Z'),
+    };
+    const response = handleSchedulesList(request('/v1/schedules?includeOff=1'), meta, actualDeps);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { schedules: Array<{ id: string; state: string; flags: string[]; lastRun: { at: string } | null }> };
+    expect(body.schedules).toHaveLength(3);
+    for (const card of body.schedules) {
+      expect(rows.map(r => r.id)).toContain(card.id);
+      expect(['firing', 'live']).toContain(card.state);
+      expect(card.flags).not.toContain('no-history');
+      expect(card.lastRun?.at).toBe('2026-10-09T02:55:00Z');
+    }
+  });
   test('opt-in owner projection joins graph jobs without changing the ordinary response or leaking private fields', async () => {
     const withOwners = { ...deps, loopOwners: () => [
       { id: 'morning', title: '아침', owner: 'OP', enabled: true, lastRun: { at: '2026-10-05T09:00:00Z', status: 'success' }, jobs: [{ id: 'abc' }], file: '/home/alice/private' },

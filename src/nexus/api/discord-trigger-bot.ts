@@ -36,6 +36,7 @@ import { parseDiscordEndpoint, isOwnInstanceEndpoint } from '../../session/sessi
 import { createDiscordStreamSink } from '../../session/streaming/discord-stream-sink.js';
 import { splitForDiscord } from '../../discord.js';
 import { formatForDiscord } from '../../discord-markdown.js';
+import { receiveChannelEvent } from '../outbound/router.js';
 
 export interface NexusDiscordTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
@@ -109,11 +110,13 @@ export function createDiscordTriggerLogger(
  *  (`src/discord.ts:160-172` comment) so the wire is a near-identity
  *  with `raw` carrying the full gateway payload for debugging. */
 export function toDiscordEvent(tap: DcTriggerEvent): DiscordEvent {
+  const envelope = receiveChannelEvent('discord', tap);
+  if (!envelope || envelope instanceof Promise) throw new Error('discord connector cannot normalize accepted tap');
   return {
     kind: tap.kind,
-    channel: tap.channel,
-    user: tap.user,
-    body: tap.body,
+    channel: envelope.channel ?? tap.channel,
+    user: envelope.senderId ?? tap.user,
+    body: envelope.text,
     raw: tap,
   };
 }

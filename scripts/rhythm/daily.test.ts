@@ -7,6 +7,7 @@ import { composeDaily, main, runDaily, collectGrid, collectLoops, collectRelease
 import { devVersion, listChecklist } from '../../src/release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
+import { dispatchCooAdmin } from '../../src/domains/coo-admin-tool.js';
 
 const now = new Date('2026-10-05T00:00:00Z');
 const parts: DailyParts = {
@@ -17,6 +18,136 @@ const parts: DailyParts = {
   decisions: { status: 'ok', value: [{ name: 'old', openedAt: '2026-10-01T00:00:00Z' }, { name: 'new', openedAt: '2026-10-04T00:00:00Z' }, { name: 'middle', openedAt: '2026-10-03T00:00:00Z' }] },
   news: { status: 'unreadable', reason: 'crawl unavailable' },
 };
+
+test('⑧ 행정 reads verified dates in deadline order, with priority ties, representative action and links', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-coo-'));
+  const today = new Date('2026-10-09T00:00:00Z');
+  const project = '12345678-1234-1234-1234-123456789abc';
+  const issue = (name: string, priority: number) => ({ identifier: name, title: name, priority,
+    url: `https://linear.app/issue/${name}`, dueDate: '2026-10-10', state: { name: '진행', type: 'started' }, assignee: null, updatedAt: today.toISOString() });
+  const issues = [issue('later', 1), issue('high', 2), issue('overdue', 2), issue('urgent', 1), issue('unknown', 1), issue('boundary', 2), issue('outside', 1)];
+  const due: Record<string, string | null> = { later: '2026-10-15', high: '2026-10-10', overdue: '2026-10-08', urgent: '2026-10-10', unknown: null, boundary: '2026-10-23', outside: '2026-10-24' };
+  const evidence = { project, verifiedIssues: issues.map(item => ({ identifier: item.identifier, title: item.title, url: item.url,
+    officialDeadline: due[item.title] ?? null, preparationPeriod: null, representativeActionDate: item.title === 'high' ? '2026-10-09' : null })) };
+  const read = (date: Date) => dispatchCooAdmin({}, { project, now: date, briefing: true, dateEvidence: evidence,
+    getSecret: async () => 'key', fetch: (async () => Response.json({ data: { issues: { nodes: issues, pageInfo: { hasNextPage: false } } } })) as unknown as typeof fetch });
+  const base: DailyDeps = { now: () => today, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' }, print: () => {},
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [], cooAdmin: read,
+    send: request => { sent.push(request.text); return { chatId: 42, messageId: 1 }; }, log: () => {} };
+  const sent: string[] = [];
+  const previous = process.env.ELANOUS_GRAPH_DIR;
+  process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+  try {
+    const collected = await main(['collect'], base);
+    const admin = collected.markdown.split('## ⑧ 행정\n')[1]!;
+    expect(admin).toContain('지난 기한 1건');
+    expect(admin).toContain('14일 안 기한 4건');
+    expect(admin).toContain('그 밖 · 14일 이후 1건 · 기한 미확인 1건');
+    expect(admin.indexOf('overdue')).toBeLessThan(admin.indexOf('urgent'));
+    expect(admin.indexOf('urgent')).toBeLessThan(admin.indexOf('high'));
+    expect(admin.indexOf('high')).toBeLessThan(admin.indexOf('later'));
+    expect(admin.indexOf('later')).toBeLessThan(admin.indexOf('boundary'));
+    expect(admin).toContain('High · high · 대표 손이 필요한 날 2026-10-09\n  https://linear.app/issue/high');
+    expect(admin).toContain('Urgent · urgent\n  https://linear.app/issue/urgent');
+    expect(admin).not.toContain('```elanous-card');
+    expect(admin).not.toContain('확인된 마감일 2026-10-10 · Urgent · unknown');
+    expect(readFileSync(collected.file, 'utf8')).toBe(collected.markdown);
+    const delivered = await main(['deliver'], { ...base, cooAdmin: async () => { throw new Error('deliver recollected Linear'); } });
+    expect(delivered.sent).toBe(true);
+    expect(sent[0]).toContain('## ⑧ 행정\n지난 기한 1건');
+    expect(sent[0]).toContain('https://linear.app/issue/high');
+    expect(sent[0]).toContain('RHYTHM-DAILY:2026-10-09');
+    expect((await dispatchCooAdmin({}, { project, now: today, getSecret: async () => 'key',
+      fetch: (async () => Response.json({ data: { issues: { nodes: issues, pageInfo: { hasNextPage: false } } } })) as unknown as typeof fetch,
+      dateEvidence: evidence })).includes('```elanous-card')).toBe(true);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('⑧ 행정 preserves a Linear title containing a section delimiter and the following due item through collect and deliver', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-coo-delimiter-'));
+  const today = new Date('2026-10-09T00:00:00Z');
+  const project = '12345678-1234-1234-1234-123456789abc';
+  const issues = [
+    { identifier: 'one', title: '첫 행정\n\n## 가짜 절', url: 'https://linear.app/issue/one', priority: 1 },
+    { identifier: 'two', title: '뒤 행정', url: 'https://linear.app/issue/two', priority: 2 },
+  ].map(item => ({ ...item, dueDate: null, state: { name: '진행', type: 'started' }, assignee: null, updatedAt: today.toISOString() }));
+  const evidence = { project, verifiedIssues: issues.map((item, i) => ({ identifier: item.identifier, title: item.title, url: item.url,
+    officialDeadline: i ? '2026-10-10' : '2026-10-08', preparationPeriod: null, representativeActionDate: null })) };
+  const sent: string[] = [];
+  const deps: DailyDeps = { now: () => today, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [],
+    cooAdmin: date => dispatchCooAdmin({}, { project, now: date, briefing: true, dateEvidence: evidence, getSecret: async () => 'key',
+      fetch: (async () => Response.json({ data: { issues: { nodes: issues, pageInfo: { hasNextPage: false } } } })) as unknown as typeof fetch }),
+    send: request => { sent.push(request.text); return { chatId: 42, messageId: 1 }; }, log: () => {} };
+  try {
+    const collected = await runDaily({ stage: 'collect' }, deps);
+    expect(collected.markdown).toContain('첫 행정 ## 가짜 절\n  https://linear.app/issue/one');
+    expect(collected.markdown).not.toContain('\n\n## 가짜 절');
+    await runDaily({ stage: 'deliver' }, deps);
+    expect(sent[0]).toContain('첫 행정 ## 가짜 절\n  https://linear.app/issue/one');
+    expect(sent[0]).toContain('확인된 마감일 2026-10-10 · High · 뒤 행정\n  https://linear.app/issue/two');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('⑧ 행정 reserves a linked upcoming deadline despite many overdue items in staged and direct delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-coo-overflow-'));
+  const today = new Date('2026-10-09T00:00:00Z');
+  const project = '12345678-1234-1234-1234-123456789abc';
+  const issues = [...Array.from({ length: 50 }, (_, i) => ({ identifier: `old-${i}`, title: `지난 항목 ${i} ${'길'.repeat(60)}`,
+    url: `https://linear.app/issue/old-${i}`, priority: 1 })),
+    { identifier: 'soon', title: '다가오는 필수 항목', url: 'https://linear.app/issue/soon', priority: 2 }]
+    .map(item => ({ ...item, dueDate: null, state: { name: '진행', type: 'started' }, assignee: null, updatedAt: today.toISOString() }));
+  const evidence = { project, verifiedIssues: issues.map(item => ({ identifier: item.identifier, title: item.title, url: item.url,
+    officialDeadline: item.identifier === 'soon' ? '2026-10-10' : '2026-10-08', preparationPeriod: null, representativeActionDate: null })) };
+  const sent: string[] = [];
+  const deps: DailyDeps = { now: () => today, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [],
+    cooAdmin: date => dispatchCooAdmin({}, { project, now: date, briefing: true, dateEvidence: evidence, getSecret: async () => 'key',
+      fetch: (async () => Response.json({ data: { issues: { nodes: issues, pageInfo: { hasNextPage: false } } } })) as unknown as typeof fetch }),
+    send: request => { sent.push(request.text); return { chatId: 42, messageId: sent.length }; }, log: () => {} };
+  try {
+    const collected = await runDaily({ stage: 'collect' }, deps);
+    expect(collected.markdown).toContain('지난 기한 50건');
+    expect(collected.markdown).toContain('14일 안 기한 1건\n- 확인된 마감일 2026-10-10 · High · 다가오는 필수 항목\n  https://linear.app/issue/soon');
+    await runDaily({ stage: 'deliver' }, deps);
+    const direct = await runDaily({}, { ...deps, root: join(root, 'direct') });
+    expect(direct.sent).toBe(true);
+    for (const text of sent) {
+      expect(text).toContain('지난 기한 50건');
+      expect(text).toContain('https://linear.app/issue/old-0');
+      expect(text).toContain('14일 안 기한 1건');
+      expect(text).toContain('확인된 마감일 2026-10-10 · High · 다가오는 필수 항목\n  https://linear.app/issue/soon');
+      expect(text.indexOf('https://linear.app/issue/old-0')).toBeLessThan(text.indexOf('https://linear.app/issue/soon'));
+      expect(text).toContain('전체 목록은 리뷰 파일 참조');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('⑧ 행정 explicitly reports missing Linear token or unreadable read without claiming zero items', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-coo-unread-'));
+  const base: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: false, print: () => {},
+    landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+    loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [], log: () => {} };
+  try {
+    const keyless = await main(['--dry-run'], { ...base, cooAdmin: date => dispatchCooAdmin({}, { now: date, getSecret: async () => undefined }) });
+    expect(keyless.markdown).toContain('## ⑧ 행정\n측정 불가 · Linear 키가 없습니다');
+    expect(keyless.markdown).not.toContain('남은 행정 0건');
+    const outbound: string[] = [];
+    const staged = await main([], { ...base, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+      cooAdmin: date => dispatchCooAdmin({}, { now: date, getSecret: async () => undefined }),
+      send: request => { outbound.push(request.text); return { chatId: 42, messageId: 3 }; } });
+    expect(staged.sent).toBe(true);
+    expect(outbound[0]).toContain('## ⑧ 행정\n측정 불가 · Linear 키가 없습니다');
+    const unreadable = await main(['--dry-run'], { ...base, cooAdmin: async () => { throw new Error('Linear unavailable'); } });
+    expect(unreadable.markdown).toContain('## ⑧ 행정\n측정 불가 · Linear unavailable');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('SCQA · six other sections · deterministic top risk and unreadable external trend', () => {
   const result = composeDaily(parts, now);
@@ -97,7 +228,7 @@ test('yesterday landing section uses one bounded line per success, failure and r
     const baseline = composeDaily({ ...parts, landings: { status: 'ok', value: [{ title: rawGoal, seat: 'MK', mergedAt: '2026-10-04T02:00:00Z', prNumber: 17 }] },
       loops: { status: 'ok', value: [] }, grid: { status: 'ok', value: [] },
       decisions: { status: 'ok', value: [] }, news: { status: 'ok', value: [] } }, now).markdown;
-    expect(review.markdown.split('## ② 판\n')[1]).toBe(baseline.split('## ② 판\n')[1]);
+    expect(review.markdown.split('## ② 판\n')[1]!.split('\n\n## ⑧ 행정')[0]! + '\n').toBe(baseline.split('## ② 판\n')[1]);
     expect(landing.split('\n').slice(0, 2)).toEqual(['총 1건 · 자리별 MK 1', 'CTX-SUCCESS · merged · PR #17']);
     expect(existsSync(review.file)).toBe(false);
     const failed = await main(['--dry-run'], { ...deps, landings: async () => { throw new Error('PR collection unavailable'); } });
@@ -109,7 +240,7 @@ test('yesterday landing section uses one bounded line per success, failure and r
     expect(unreadableLanding).not.toContain('CTX-ONGOING');
     expect(unreadableLanding).not.toContain(rawGoal);
     expect(unreadableLanding).not.toContain(prBody);
-    expect(failed.markdown.split('## ② 판\n')[1]).toBe(review.markdown.split('## ② 판\n')[1]);
+    expect(failed.markdown.split('## ② 판\n')[1]!.split('\n\n## ⑧ 행정')[0]).toBe(review.markdown.split('## ② 판\n')[1]!.split('\n\n## ⑧ 행정')[0]);
     const truncated = await main(['--dry-run'], { ...deps, landings: async () => [
       { title: '[MK] unrelated', seat: 'MK', mergedAt: '2026-10-04T02:00:00Z' },
     ] });
@@ -149,7 +280,7 @@ test('two merged PRs from one harness run both replace raw landing titles with t
     expect(landing).not.toContain(rawGoal);
     expect(landing).not.toContain(prBody);
     expect(landing).not.toContain('s'.repeat(120));
-    expect(review.markdown.split('## ② 판\n')[1]).toBe(composeDaily({ ...parts,
+    expect(review.markdown.split('## ② 판\n')[1]!.split('\n\n## ⑧ 행정')[0]! + '\n').toBe(composeDaily({ ...parts,
       landings: { status: 'ok', value: [] }, loops: { status: 'ok', value: [] }, grid: { status: 'ok', value: [] },
       decisions: { status: 'ok', value: [] }, news: { status: 'ok', value: [] },
     }, now).markdown.split('## ② 판\n')[1]);

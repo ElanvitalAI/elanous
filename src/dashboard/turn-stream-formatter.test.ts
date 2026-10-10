@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { FoldMode } from '../log-entry.js';
+import { FoldStack } from '../fold-stack.js';
+import { createDashboardRenderedToolRuntime } from './rendered-tool-runtime.js';
 import {
   createTurnStreamFormatter,
   type TurnStreamCall,
@@ -46,6 +48,84 @@ function makeFormatter(
 function call(id: string, name: string): TurnStreamCall {
   return { id, name, args: {} };
 }
+
+describe('no-synthesis authoritative replacement', () => {
+  const finalText = '사람 줄\n\n[NO FINAL SYNTHESIS] The model used …\n\nExplored: a, b';
+
+  test('emits a committed lead and one folded tool block with the marker only in its expanded lines', () => {
+    const { formatter, events } = makeFormatter('generic', {
+      formatResponse: (full) => full.split('\n'),
+    });
+    formatter.onText('', finalText);
+
+    expect(events.map((event) => event.type)).toEqual([
+      'assistant.replaceBlock', 'assistant.commit', 'tool.appendBlock', 'tool.replaceBlock',
+    ]);
+    const lead = events[0] as Extract<TurnStreamPresentationEvent, { type: 'assistant.replaceBlock' }>;
+    const append = events[2] as Extract<TurnStreamPresentationEvent, { type: 'tool.appendBlock' }>;
+    const replacement = events[3] as Extract<TurnStreamPresentationEvent, { type: 'tool.replaceBlock' }>;
+    expect(lead.lines).toEqual(['사람 줄']);
+    expect(lead.lines.join('\n')).not.toContain('[NO FINAL SYNTHESIS]');
+    expect(append.callId).toBe('no-synthesis-tail-1');
+    expect(append.args).toEqual({});
+    expect(append.lines).toEqual(replacement.collapsedLines);
+    expect(replacement.collapsedLines).toHaveLength(1);
+    expect(replacement.collapsedLines[0]).toMatch(/^● /);
+    expect(replacement.expandedLines).toHaveLength(3);
+    expect(replacement.collapsedLines[0]).toContain('3');
+    expect(replacement.expandedLines?.join('\n')).toContain('[NO FINAL SYNTHESIS]');
+  });
+
+  test('streaming and marker-free authoritative replacement retain their event sequences', () => {
+    const { formatter, events } = makeFormatter('generic');
+    formatter.onText('부분', '부분');
+    formatter.onText('', '그냥 답');
+    expect(events).toEqual([
+      { type: 'assistant.replaceBlock', lines: ['부분'] },
+      { type: 'assistant.replaceBlock', lines: ['그냥 답'] },
+    ]);
+  });
+
+  test('real rendered tool runtime and FoldStack expand and recollapse the hidden marker', () => {
+    const chatLines: string[] = [];
+    const foldStack = new FoldStack({ chatLines });
+    const renderedToolRuntime = createDashboardRenderedToolRuntime({
+      chatLines, foldStack, draw: () => {}, pinChatTail: () => {},
+    });
+    const runtime = createDashboardTurnStreamRuntime({
+      initialAssistantStart: 0,
+      chatLines,
+      thinking: { update: () => {}, updateMetrics: () => {} },
+      draw: () => {},
+      pinChatTail: () => {},
+      termCols: () => 80,
+      wrapOpts: {},
+      formatResponse: (full) => full.split('\n'),
+      text: (line) => line,
+      muted: (line) => line,
+      ptyCallLine: () => null,
+      ptyResultLine: () => null,
+      renderToolCallEvent: () => null,
+      renderToolResultVariants: () => null,
+      toolRendering: {},
+      renderedToolRuntime,
+      brainIcon: '[B]',
+    });
+
+    runtime.onText('', finalText);
+    expect(chatLines[0]).toBe('사람 줄');
+    expect(chatLines[1]).toMatch(/^● /);
+    expect(chatLines.join('\n')).not.toContain('[NO FINAL SYNTHESIS]');
+    expect(foldStack.size()).toBe(1);
+    expect(foldStack.toggleTop()).toBe(true);
+    expect(chatLines.join('\n')).toContain('[NO FINAL SYNTHESIS]');
+    expect(foldStack.toggleTop()).toBe(true);
+    expect(chatLines.join('\n')).not.toContain('[NO FINAL SYNTHESIS]');
+    expect(chatLines[1]).toMatch(/^● /);
+    expect(foldStack.toggleAtLine(1)).toBe(true);
+    expect(chatLines.join('\n')).toContain('[NO FINAL SYNTHESIS]');
+  });
+});
 
 describe('createTurnStreamFormatter activity labels', () => {
   test('shows each tool name and increments the per-formatter count', () => {

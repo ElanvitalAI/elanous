@@ -5,9 +5,11 @@ import { getUserConfig, reloadUserConfig, saveUserConfig, type McpServerSpec } f
 import {
   discoverMcpOAuth,
   exchangeAuthorizationCode,
+  ensureClientRegistration,
   loadStoredRegistration,
   loopbackRedirectPort,
   prepareMcpOAuthAuthorization,
+  authorizeMcpDevice,
   type McpOAuthFetch,
 } from '../mcp/mcp-oauth.js';
 import { parseWwwAuthenticate } from '../mcp/client.js';
@@ -31,7 +33,15 @@ export interface McpLoginOpts {
   out?: Output;
   readConfigFn?: () => { mcp?: { servers: McpServerSpec[] } };
   fetch?: McpOAuthFetch;
+  storePath?: string;
   openBrowser?: (url: string) => Promise<void>;
+  /** Aside browser agent; failures fall back to the existing browser flow. */
+  approveBrowser?: (url: string) => Promise<void>;
+  /** How long to wait for the approval callback after aside returns before falling back to the browser. */
+  asideCallbackGraceMs?: number;
+  /** Device-poll timing seam (test only). */
+  deviceSleep?: (ms: number) => Promise<void>;
+  deviceNow?: () => number;
   browserEnv?: NodeJS.ProcessEnv;
   browserPlatform?: NodeJS.Platform;
   createListener?: (handler: (req: IncomingMessage, res: ServerResponse) => void) => Server;
@@ -69,21 +79,58 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
 
   let server: Server | undefined;
   try {
-    const early = await listenForCallback(opts.createListener, 0);
-    server = early.server;
+    const why = browserUnavailableReason(opts.browserEnv ?? process.env, opts.browserPlatform ?? process.platform);
+    const oauthOpts = { ...(opts.fetch ? { fetch: opts.fetch } : {}), ...(opts.storePath ? { storePath: opts.storePath } : {}) };
+    const early = why && !opts.createListener ? undefined : await listenForCallback(opts.createListener, 0);
+    server = early?.server;
     const challenge = await requestChallenge(spec.url, opts.fetch);
     if (!challenge.resourceMetadata) {
       out.error(`✗ server '${opts.serverId}' did not provide a 401 Bearer resource_metadata challenge`);
       return { exitCode: 1 };
     }
+    const discovered = await discoverMcpOAuth(challenge.resourceMetadata, {
+      resourceUrl: spec.url, ...oauthOpts,
+    });
+    if ((why || !discovered.metadata.authorizationEndpoint) && discovered.metadata.deviceAuthorizationEndpoint) {
+      if (early?.server.listening) await closeServer(early.server);
+      if (why) out.log(why);
+      const stored = loadStoredRegistration(discovered.metadata.issuer, oauthOpts);
+      const deviceRegistration = await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true });
+      const authorizeDevice = (registration: typeof deviceRegistration) => authorizeMcpDevice(discovered.metadata, registration, {
+        scope: challenge.scope,
+        resource: discovered.resource.resource,
+        ...oauthOpts,
+        ...(opts.deviceSleep ? { sleep: opts.deviceSleep } : {}),
+        ...(opts.deviceNow ? { now: opts.deviceNow } : {}),
+        onDeviceCode: ({ userCode, verificationUri, verificationUriComplete }) => {
+          out.log(`Authorize '${opts.serverId}' at ${verificationUriComplete ?? verificationUri}`);
+          out.log(`Device code: ${userCode}`);
+        },
+      });
+      try {
+        await authorizeDevice(deviceRegistration);
+      } catch (error) {
+        // A reused client the server does not accept for the device grant (e.g. an old browser client stored
+        // without its loopback URI) gets one fresh device registration; anything else fails as before.
+        const reused = stored?.clientId === deviceRegistration.clientId;
+        if (!reused || !discovered.metadata.registrationEndpoint || !/\((?:unauthorized_client|invalid_client)\)/.test(String(error))) throw error;
+        await authorizeDevice(await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true, forceReregister: true }));
+      }
+      out.log(`✓ credentials saved for '${opts.serverId}' (${discovered.metadata.issuer})`);
+      persistLoginDiscovery(opts, discovered.metadata, out);
+      return { exitCode: 0 };
+    }
+    const callbackListener = early ?? await listenForCallback(opts.createListener, 0);
+    server = callbackListener.server;
     const opened = await openLoginListener({
-      early,
+      early: callbackListener,
       serverId: opts.serverId,
       resourceMetadataUrl: challenge.resourceMetadata,
       ...(challenge.scope ? { scope: challenge.scope } : {}),
       resourceUrl: spec.url,
-      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      ...oauthOpts,
       ...(opts.createListener ? { createListener: opts.createListener } : {}),
+      onListener: (openedServer) => { server = openedServer; },
     });
     const listener = opened.listener;
     server = listener.server;
@@ -94,47 +141,39 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     void callbackPromise.catch(() => undefined);
     out.log(`Open this URL to authorize '${opts.serverId}':`);
     out.log(authorization.request.url);
-    const why = browserUnavailableReason(opts.browserEnv ?? process.env, opts.browserPlatform ?? process.platform);
     if (why) {
       out.log(why);
       debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
     } else {
       try {
-        await (opts.openBrowser ?? openDefaultBrowser)(authorization.request.url);
+        if (opts.approveBrowser || !opts.openBrowser) {
+          await (opts.approveBrowser ?? approveWithAside)(authorization.request.url);
+          // A clean aside exit is not an approval: only the loopback callback is. If it has not arrived
+          // shortly after aside finished, fall back to the browser (the listener stays open for it).
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const arrived = await Promise.race([
+            callbackPromise.then(() => true, () => true),
+            new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), opts.asideCallbackGraceMs ?? 15_000); }),
+          ]);
+          if (timer) clearTimeout(timer);
+          if (!arrived) throw new Error('aside finished without an approval callback');
+        } else await opts.openBrowser(authorization.request.url);
       } catch {
-        out.error('Could not open the default browser; open the URL above manually.');
+        if (!opts.approveBrowser && opts.openBrowser) {
+          out.error('Could not open the default browser; open the URL above manually.');
+        } else {
+          try {
+            await (opts.openBrowser ?? openDefaultBrowser)(authorization.request.url);
+          } catch {
+            out.error('Could not open the default browser; open the URL above manually.');
+          }
+        }
       }
     }
     const callback = await callbackPromise;
-    await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, {
-      ...(opts.fetch ? { fetch: opts.fetch } : {}),
-    });
+    await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, oauthOpts);
     out.log(`✓ credentials saved for '${opts.serverId}' (${authorization.metadata.issuer})`);
-    // ⭐⭐ 🔴 여기가 이 파일의 «가장 중요한» 여덟 줄이다 (대표 2026-09-10).
-    //
-    //   초판은 issuer 를 «화면에 찍고 끝»이었다. 그런데 자격증명 저장소는
-    //   issuer 를 «키»로 쓰고(`getValidAccessToken(issuer, …)`), 데몬은 그
-    //   issuer 를 오직 config 의 `mcp.servers[].oauthIssuer` 에서만 얻는다
-    //   (`register-mcp-clients.ts` 는 spec 에 «있을 때만» 넘기고,
-    //    `McpClient.oauthAccessToken()` 은 `if (!this.oauthIssuer) return null`).
-    //
-    //   ⇒ 그래서 `mcp login` 이 «성공하고 ✓ 를 찍어도» 사람이 config 를 손으로
-    //      고치지 않으면 그 토큰은 영영 안 쓰인다. 2026-09-10 에 krea 를 붙이며
-    //      실제로 그 두 줄을 손으로 박았다. 「로그인했는데 도구가 0개」의 원인이다.
-    const persist = (opts.persistDiscoveryFn ?? persistDiscoveredIssuer)({
-      serverId: opts.serverId,
-      issuer: authorization.metadata.issuer,
-      ...(authorization.metadata.tokenEndpoint ? { tokenEndpoint: authorization.metadata.tokenEndpoint } : {}),
-    });
-    if (persist.error) {
-      // ⛔ 자격증명은 «이미 저장됐다» — 되쓰기 실패로 로그인 자체를 실패로 접으면
-      //    사람이 같은 브라우저 왕복을 또 한다. 경고로 내고 손 처방을 같이 준다.
-      out.error(`⚠ config 에 oauthIssuer 를 못 적었습니다: ${persist.error}`);
-      out.error(`  손으로: mcp.servers[] 의 '${opts.serverId}' 칸에 "oauthIssuer": "${authorization.metadata.issuer}" 를 더하세요.`);
-    } else if (persist.written) {
-      out.log(`✓ config 갱신 — '${opts.serverId}'.oauthIssuer = ${authorization.metadata.issuer}`);
-    }
-    out.log(`  도는 데몬에 반영하려면: elanous mcp reload`);
+    persistLoginDiscovery(opts, authorization.metadata, out);
     return { exitCode: 0 };
   } catch (error) {
     const stage = loginFailureStage(error);
@@ -146,8 +185,29 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     out.error(`✗ MCP login failed: ${error instanceof Error ? error.message : String(error)}`);
     return { exitCode: 1 };
   } finally {
-    if (server) await closeServer(server);
+    if (server?.listening) await closeServer(server);
   }
+}
+
+function persistLoginDiscovery(
+  opts: McpLoginOpts,
+  metadata: { issuer: string; tokenEndpoint: string },
+  out: Output,
+): void {
+  // ⭐⭐ issuer 를 config 에도 적어야 저장한 토큰을 데몬이 찾는다.
+  const persist = (opts.persistDiscoveryFn ?? persistDiscoveredIssuer)({
+    serverId: opts.serverId,
+    issuer: metadata.issuer,
+    tokenEndpoint: metadata.tokenEndpoint,
+  });
+  if (persist.error) {
+    // 자격은 이미 저장됐다. config 쓰기 실패는 경고로 남긴다.
+    out.error(`⚠ config 에 oauthIssuer 를 못 적었습니다: ${persist.error}`);
+    out.error(`  손으로: mcp.servers[] 의 '${opts.serverId}' 칸에 "oauthIssuer": "${metadata.issuer}" 를 더하세요.`);
+  } else if (persist.written) {
+    out.log(`✓ config 갱신 — '${opts.serverId}'.oauthIssuer = ${metadata.issuer}`);
+  }
+  out.log(`  도는 데몬에 반영하려면: elanous mcp reload`);
 }
 
 async function requestChallenge(url: string, fetchFn?: McpOAuthFetch): Promise<{ resourceMetadata?: string; scope?: string }> {
@@ -175,7 +235,9 @@ async function openLoginListener(opts: {
   scope?: string;
   resourceUrl: string;
   fetch?: McpOAuthFetch;
+  storePath?: string;
   createListener?: McpLoginOpts['createListener'];
+  onListener?: (server: Server) => void;
   early: Awaited<ReturnType<typeof listenForCallback>>;
 }): Promise<{ listener: Awaited<ReturnType<typeof listenForCallback>>; authorization: Awaited<ReturnType<typeof prepareMcpOAuthAuthorization>> }> {
   const prior = await priorRegistration(opts);
@@ -189,6 +251,7 @@ async function openLoginListener(opts: {
       redirectUri: listener.redirectUri,
       resourceUrl: opts.resourceUrl,
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      ...(opts.storePath ? { storePath: opts.storePath } : {}),
     });
     return { listener, authorization };
   }
@@ -196,6 +259,7 @@ async function openLoginListener(opts: {
   if (preferred !== null) {
     try {
       const listener = await listenForCallback(opts.createListener, preferred);
+      opts.onListener?.(listener.server);
       debug.log('mcp.login', 'callback-port', { serverId: opts.serverId, source: 'registered' });
       const authorization = await prepareMcpOAuthAuthorization({
         resourceMetadataUrl: opts.resourceMetadataUrl,
@@ -203,6 +267,7 @@ async function openLoginListener(opts: {
         redirectUri: listener.redirectUri,
         resourceUrl: opts.resourceUrl,
         ...(opts.fetch ? { fetch: opts.fetch } : {}),
+        ...(opts.storePath ? { storePath: opts.storePath } : {}),
       });
       return { listener, authorization };
     } catch (error) {
@@ -210,6 +275,7 @@ async function openLoginListener(opts: {
     }
   }
   const listener = await listenForCallback(opts.createListener, 0);
+  opts.onListener?.(listener.server);
   debug.log('mcp.login', 'callback-port', {
     serverId: opts.serverId,
     source: 'reregistered',
@@ -221,6 +287,7 @@ async function openLoginListener(opts: {
     redirectUri: listener.redirectUri,
     resourceUrl: opts.resourceUrl,
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    ...(opts.storePath ? { storePath: opts.storePath } : {}),
     forceReregister: true,
   });
   return { listener, authorization };
@@ -230,13 +297,14 @@ async function priorRegistration(opts: {
   resourceMetadataUrl: string;
   resourceUrl: string;
   fetch?: McpOAuthFetch;
+  storePath?: string;
 }): Promise<ReturnType<typeof loadStoredRegistration>> {
   try {
     const discovered = await discoverMcpOAuth(opts.resourceMetadataUrl, {
       resourceUrl: opts.resourceUrl,
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
     });
-    return loadStoredRegistration(discovered.metadata.issuer);
+    return loadStoredRegistration(discovered.metadata.issuer, opts);
   } catch {
     return null;
   }
@@ -366,6 +434,12 @@ async function listenForCallback(
 
 async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function approveWithAside(url: string): Promise<void> {
+  // Aside decides how to interact with the provider page; only the state-checked
+  // loopback callback (not the agent's answer) can complete this login.
+  await execFileAsync('aside', ['exec', '--effort', 'low', `Open this OAuth authorization URL in your browser and approve access for elanous: ${url}. Do not reveal passwords, codes or tokens in your response.`], { timeout: 90_000 });
 }
 
 async function openDefaultBrowser(url: string): Promise<void> {

@@ -13,6 +13,7 @@ import {
   toOpenAIMessage,
   toOpenAIMessages,
   toAnthropicMessage,
+  buildNoFinalSynthesisLead,
   streamLLMWithTools,
   type LLMMessage,
   type ContentBlock,
@@ -508,9 +509,12 @@ describe('streamLLMWithTools — onTurnComplete', () => {
         ? (m.content as ContentBlock[]).filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         : [],
     );
-    // Assistant text may only be the intentional give-up diagnostic marker.
-    expect(assistantTextBlocks.every(b => b.text.startsWith('[NO FINAL SYNTHESIS]'))).toBe(true);
+    // Assistant text may only be the intentional give-up diagnostic: since
+    // TUI-NO-SYNTH-FALLBACK (#25454) it opens with the localized human lead,
+    // then the [NO FINAL SYNTHESIS] marker paragraph.
+    const giveUpPrefix = `${buildNoFinalSynthesisLead('empty-turn', 0)}\n\n[NO FINAL SYNTHESIS]`;
+    expect(assistantTextBlocks.every(b => b.text.startsWith(giveUpPrefix))).toBe(true);
     // No non-marker assistant text may be presented as a synthesised answer.
-    expect(assistantTextBlocks.some(b => !b.text.startsWith('[NO FINAL SYNTHESIS]'))).toBe(false);
+    expect(assistantTextBlocks.some(b => !b.text.startsWith(giveUpPrefix))).toBe(false);
   });
 });

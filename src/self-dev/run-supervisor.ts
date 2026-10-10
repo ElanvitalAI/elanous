@@ -2,11 +2,12 @@
 
 import { hasDelivered, triageRun, type FailureClassification } from './orchestrate.js';
 import type { DeployVerifyFinding } from '../harness/browser-verify.js';
-import type { SelfDevJobResult } from './orchestrate.js';
+import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext } from './run-types.js';
+export type { SupervisorStopReason } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
-import { routeSupervisorVerdict, type SupervisorNext } from './supervisor-verdict-edges.js';
+import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
 import { recordTaskAgentShadowMove, type TaskAgentShadowInput } from '../task-agent/shadow.js';
 
 export interface SupervisorRound {
@@ -23,26 +24,6 @@ export interface SupervisorRound {
   actionable: number;
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'];
 }
-
-export type SupervisorStopReason =
-  | 'converged'
-  /** 사람이 명시적으로 이 런을 중단했다. */
-  | 'human-stopped'
-  /** 승격 분해는 끝났지만 부모 결정 신호가 적색이라 완주를 승인할 수 없다. */
-  | 'parent-signals-red'
-  | 'needs-human'
-  | 'no-actionable-work'
-  | 'harvestable-awaiting-human'
-  | 'handed-off-to-salvage'
-  | 'max-rounds'
-  | 'no-progress'
-  | 'provider-exhausted'
-  /** 제자리인데 이번 라운드 재시도 후보가 전부 단계 시간 초과(`timed-out`) — 판정을 못 내고 다시 걸었다. */
-  | 'step-timeout'
-  | 'decomposable-no-progress'
-  | 'review-unobserved'
-  | 'deliverable-unobserved'
-  | 'deliverable-merged';
 
 export const SUPERVISOR_STOP_REASONS = [
   'converged',

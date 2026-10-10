@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import type { Keybinding, SlashCommand } from './types.js';
+import type { Keybinding, PluginDependency, SlashCommand } from './types.js';
 import type { PromptKind, PromptScope, PromptTargetSlot } from '../../prompt-bank/types.js';
 import type {
   MissionDefinition,
@@ -223,6 +223,8 @@ export interface PluginManifest {
   activationEvents: string[];
   contributes: PluginManifestContributes;
   capabilities: PluginCapability[];
+  /** `plugin.json` requirement metadata; does not trigger installation. */
+  requires?: PluginDependency;
   dependencies?: {
     widgets?: string[];
     plugins?: string[];
@@ -328,6 +330,7 @@ export function parsePluginManifest(
       ? raw.capabilities
       : [...parseCapabilities(raw.capabilities), ...parseCapabilities(extension.capabilities)]);
   const dependencies = parseDependencies(raw.dependencies);
+  const requires = parsePluginRequires(raw.requires === undefined ? extension.requires : raw.requires);
   const description = typeof raw.description === 'string' ? raw.description : undefined;
   const allowMultiActive = typeof raw.allowMultiActive === 'boolean' ? raw.allowMultiActive : undefined;
   const activePeerCompat = parseActivePeerCompat(raw.activePeerCompat);
@@ -341,6 +344,7 @@ export function parsePluginManifest(
     activationEvents,
     contributes,
     capabilities,
+    ...(requires ? { requires } : {}),
     ...(dependencies ? { dependencies } : {}),
     ...(allowMultiActive !== undefined ? { allowMultiActive } : {}),
     ...(activePeerCompat ? { activePeerCompat } : {}),
@@ -354,7 +358,7 @@ function objectOrEmpty(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function parseElanousExtension(value: unknown): { contributes: Record<string, unknown>; capabilities?: unknown } {
+function parseElanousExtension(value: unknown): { contributes: Record<string, unknown>; capabilities?: unknown; requires?: unknown } {
   const extensions = objectOrEmpty(value, 'extensions');
   const extension = objectOrEmpty(extensions['ai.elanous'], 'extensions["ai.elanous"]');
   const contributes = objectOrEmpty(extension.contributes, 'extensions["ai.elanous"].contributes');
@@ -365,6 +369,7 @@ function parseElanousExtension(value: unknown): { contributes: Record<string, un
         .map(key => [key, extension[key]])),
     },
     capabilities: extension.capabilities,
+    requires: extension.requires,
   };
 }
 
@@ -1115,6 +1120,18 @@ function parseCapabilities(value: unknown): PluginCapability[] {
     const raw = item as Record<string, unknown>;
     return { ...raw, kind: stringOr(raw.kind) } as PluginCapability;
   });
+}
+
+function parsePluginRequires(value: unknown): PluginDependency | undefined {
+  if (value === undefined) return undefined;
+  const raw = objectOrEmpty(value, 'requires');
+  return {
+    ...(raw.elanous !== undefined ? { elanous: stringOr(raw.elanous) } : {}),
+    ...(raw.tools !== undefined ? { tools: stringArrayOr(raw.tools, []) } : {}),
+    ...(raw.optionalTools !== undefined ? { optionalTools: stringArrayOr(raw.optionalTools, []) } : {}),
+    ...(raw.optionalPython !== undefined ? { optionalPython: stringArrayOr(raw.optionalPython, []) } : {}),
+    ...(raw.knowledgePacks !== undefined ? { knowledgePacks: stringArrayOr(raw.knowledgePacks, []) } : {}),
+  };
 }
 
 function parseDependencies(value: unknown): PluginManifest['dependencies'] | undefined {

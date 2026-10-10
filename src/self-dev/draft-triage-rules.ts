@@ -1,5 +1,21 @@
-import { PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
+import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
+
+export function draftClaimComment(owner: string, at: Date, note?: string): string {
+  return `🔧 처리 중 — owner ${owner} · ${at.toISOString()}${note?.trim() ? ` · ${note.trim()}` : ''}`;
+}
+
+export function draftReleaseComment(at: Date, note?: string): string {
+  return `🔧 처리 끝 — ${at.toISOString()}${note?.trim() ? ` · ${note.trim()}` : ''}`;
+}
+
+/** No timestamp is an observation gap, not an expired claim. */
+export function draftClaimState(draft: { labels: readonly string[]; updatedAt?: string }, now: Date): 'claimed' | 'expired' | 'unclaimed' | 'unobserved' {
+  if (!draft.labels.includes('elanous:running') || draft.labels.includes('elanous:harvestable')) return 'unclaimed';
+  const updated = typeof draft.updatedAt === 'string' ? Date.parse(draft.updatedAt) : NaN;
+  if (!Number.isFinite(updated)) return 'unobserved';
+  return (now.getTime() - updated) / 3_600_000 < CLAIM_IDLE_HOURS ? 'claimed' : 'expired';
+}
 
 export interface DraftTriagePr {
   number: number;
@@ -44,6 +60,16 @@ export const isAutoTitle = (title: string): boolean =>
   /^[\w./-]+:\s*[^\s,]+\.[a-z0-9]+(?:\s*,\s*[^\s,]+\.[a-z0-9]+)*$/i.test(title.trim());
 
 /** Same goal (TC 10-05): ① both carry a goal identifier → compare it ② otherwise exact title ⊕ both harness drafts ⊕ same branch stem, never an auto title ③ else false. */
+/** Same goal only when a verified goal identifier matches on both sides (branch goal id, else the body's «골:» line).
+ *  Unlike sameGoalPr it never falls back to titles or branch stems — used where a match closes a PR. */
+export function sameVerifiedGoal(a: DraftTriagePr, b: DraftTriagePr): boolean {
+  const idA = goalId(a.branch), idB = goalId(b.branch);
+  if (idA && idB) return idA === idB;
+  // Review r7: a branch goal id on only one side cannot be checked against the other — never close on body text then.
+  if (idA || idB) return false;
+  const textA = goalText(a.body), textB = goalText(b.body);
+  return Boolean(textA && textB && textA === textB);
+}
 export function sameGoalPr(a: DraftTriagePr, b: DraftTriagePr): boolean {
   const idA = goalId(a.branch), idB = goalId(b.branch);
   if (idA && idB) return idA === idB;

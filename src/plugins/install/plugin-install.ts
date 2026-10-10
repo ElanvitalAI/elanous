@@ -2,14 +2,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { dlopen, FFIType } from 'bun:ffi';
 import { loadPluginManifestFromDir, type PluginManifest } from '../core/manifest.js';
+import { inspectPluginSecurity } from '../core/capability-policy.js';
+import { decidePluginInstallation } from '../core/trust-store.js';
 import { loadPluginNodes } from '../../graph-kinds/plugin-nodes.js';
 import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind } from '../../graph-kinds/registry.js';
 import { verifyIndex, type MarketplaceIndex, type VerifyIndexResult } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { ensureMarketIndex, MarketFetchError, type MarketFetchOptions } from './market-fetch.js';
+import { ensureInternalMarketIndex, ensureMarketIndex, MarketFetchError, type MarketFetchOptions } from './market-fetch.js';
 
 const NAME = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?$/;
@@ -48,6 +50,8 @@ export interface InstallOptions {
   consent?: (capabilities: string[]) => boolean | Promise<boolean>;
   fetcher?: MarketFetchOptions['fetcher'];
   configPath?: string;
+  /** Enterprise context for knowledge packs in a private market. */
+  enterpriseId?: string;
 }
 
 export class PluginInstallError extends Error {
@@ -81,6 +85,53 @@ function safeTree(root: string): void {
     if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) fail('scan', `unsafe plugin entry: ${entry.name}`);
     if (entry.isDirectory()) safeTree(path);
   }
+}
+
+function packPathExists(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** Never follow a linked installation root or parent while reusing, moving or rolling back a package. */
+function assertInstallParents(root: string, destination: string): void {
+  const parts = relative(root, dirname(destination)).split(sep).filter(Boolean);
+  if (parts.some(part => part === '..') || isAbsolute(relative(root, destination))) fail('io', `unsafe installation path: ${destination}`);
+  // macOS exposes system aliases such as /var -> /private/var; inspect the
+  // canonical path after that alias, without exempting any caller-owned parent.
+  const systemAlias = process.platform === 'darwin' && ['/var', '/tmp'].find(path => root === path || root.startsWith(`${path}${sep}`));
+  const checkedRoot = systemAlias ? resolve(realpathSync(systemAlias), relative(systemAlias, root)) : root;
+  const parents = [checkedRoot];
+  while (dirname(parents[0]!) !== parents[0]) parents.unshift(dirname(parents[0]!));
+  let parent = checkedRoot;
+  for (const part of parts) {
+    parent = join(parent, part);
+    parents.push(parent);
+  }
+  for (const path of parents) {
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) fail('io', `unsafe installation parent: ${path}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+/** Only an unchanged, ordinary extracted tree can satisfy the verified staged artifact. */
+function samePackTree(existing: string, verified: string): boolean {
+  if (!lstatSync(existing).isDirectory()) return false;
+  const current = readdirSync(existing, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  const expected = readdirSync(verified, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  if (current.length !== expected.length) return false;
+  return current.every((entry, i) => {
+    const other = expected[i]!;
+    if (entry.name !== other.name || entry.isSymbolicLink() || other.isSymbolicLink()) return false;
+    if (entry.isDirectory() && other.isDirectory()) return samePackTree(join(existing, entry.name), join(verified, entry.name));
+    return entry.isFile() && other.isFile() && readFileSync(join(existing, entry.name)).equals(readFileSync(join(verified, entry.name)));
+  });
 }
 
 function copyPlugin(source: string, destination: string): void {
@@ -189,21 +240,33 @@ async function fetchedMarketSource(spec: string, target: string, opts: InstallOp
       refresh: opts.refresh, verifySignature: opts.verifySignature, trustedKeys: opts.trustedKeys,
     });
   } catch (error) {
-    if (error instanceof MarketFetchError && /^market not configured: /.test(error.message) && hasLocalMarketIndex(marketName, opts)) {
+    if (error instanceof MarketFetchError && /^market not configured: /.test(error.message) && opts.enterpriseId !== undefined) {
+      try {
+        marketIndex = await ensureInternalMarketIndex(marketName, opts.enterpriseId, {
+          root: opts.root, marketDir: opts.marketDir, configPath: opts.configPath, fetcher: opts.fetcher, refresh: opts.refresh,
+        });
+      } catch (internalError) {
+        if (internalError instanceof MarketFetchError) throw new PluginInstallError(internalError.reason, internalError.message);
+        throw internalError;
+      }
+    } else if (error instanceof MarketFetchError && /^market not configured: /.test(error.message) && hasLocalMarketIndex(marketName, opts)) {
       return localMarketSource(spec, target, opts);
-    }
-    if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
-    throw error;
+    } else if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
+    else throw error;
   }
   const matches = marketIndex.index.plugins.filter(entry => entry.name === name);
   if (matches.length !== 1) fail('io', `plugin not found or ambiguous in ${marketName}: ${name}`);
   const entry = matches[0]!;
-  const artifact = entry.artifact;
+  await fetchVerifiedArtifact(entry.artifact, marketIndex.market.url, target, opts);
+  return { market: marketName, sha256: entry.artifact.sha256, signature: marketIndex.signature, expectedName: name, expectedVersion: entry.version };
+}
+
+async function fetchVerifiedArtifact(artifact: MarketplaceIndex['plugins'][number]['artifact'], marketUrl: string, target: string, opts: InstallOptions): Promise<void> {
   if (!artifact || typeof artifact.key !== 'string' || !artifact.key || !HASH.test(artifact.sha256)
     || !Number.isSafeInteger(artifact.bytes) || artifact.bytes < 0) fail('io', 'invalid artifact key, hash or size');
   // Check the key as written, before URL resolution folds `..`/`.` or percent-encoded separators away.
   if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(artifact.key) || artifact.key.split('/').some(part => part === '.' || part === '..')) fail('io', 'unsafe artifact key');
-  const base = new URL(marketIndex.market.url);
+  const base = new URL(marketUrl);
   const url = new URL(artifact.key, base);
   if (url.protocol !== 'https:' || url.origin !== base.origin || !url.pathname.startsWith(base.pathname)
     || url.username || url.password || url.search || url.hash || /[\\?#]/.test(artifact.key)) fail('io', 'unsafe artifact key');
@@ -235,7 +298,77 @@ async function fetchedMarketSource(spec: string, target: string, opts: InstallOp
     fail('scan', 'artifact sha256 or size mismatch');
   }
   unpackArchive(bytes, target);
-  return { market: marketName, sha256: artifact.sha256, signature: marketIndex.signature, expectedName: name, expectedVersion: entry.version };
+}
+
+async function stageRequiredKnowledgePacks(names: string[], market: string, stage: string, root: string, opts: InstallOptions): Promise<Array<{ name: string; destination: string; staged: string }>> {
+  if (!names.length) return [];
+  if (market === 'local') fail('io', 'knowledge pack requires need a signed market');
+  const unique = [...new Set(names)];
+  if (unique.some(name => !NAME.test(name))) fail('io', 'invalid required knowledge pack name');
+  let index: MarketplaceIndex;
+  let url: string | undefined;
+  let directory: string | undefined;
+  let internalVerified = false;
+  try {
+    const options = { root, marketDir: opts.marketDir, configPath: opts.configPath, fetcher: opts.fetcher,
+      refresh: opts.refresh, verifySignature: opts.verifySignature, trustedKeys: opts.trustedKeys };
+    let result: Awaited<ReturnType<typeof ensureMarketIndex>>;
+    try { result = await ensureMarketIndex(market, options); }
+    catch (error) {
+      if (!(error instanceof MarketFetchError) || !/^market not configured: /.test(error.message) || opts.enterpriseId === undefined) throw error;
+      result = await ensureInternalMarketIndex(market, opts.enterpriseId, options);
+      internalVerified = true;
+    }
+    index = result.index;
+    url = result.market.url;
+  } catch (error) {
+    if (error instanceof MarketFetchError && /^market not configured: /.test(error.message) && hasLocalMarketIndex(market, opts)) {
+      const path = indexPath(market, opts);
+      directory = dirname(path);
+      const sig = join(directory, 'index.sig');
+      if (!existsSync(sig)) fail('signature', `missing index.sig: ${market}`);
+      const result = (opts.verifySignature ?? verifyIndex)({ marketplaceBytes: readFileSync(path), signatureText: readFileSync(sig, 'utf8'), trustedKeys: opts.trustedKeys ?? [] });
+      if (!result.ok) fail('signature', `${result.reason}: ${result.detail}`);
+      if (result.index.name !== market) fail('io', `market index name mismatch: ${market}`);
+      index = result.index;
+    } else if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
+    else throw error;
+  }
+  const packs: Array<{ name: string; destination: string; staged: string }> = [];
+  for (const name of unique) {
+    const matches = (index.knowledgePacks ?? []).filter(entry => entry.name === name);
+    if (matches.length !== 1) fail('io', `required knowledge pack not found or ambiguous: ${name}`);
+    const entry = matches[0]!;
+    if (!VERSION.test(entry.version)) fail('io', `invalid required knowledge pack version: ${name}`);
+    if (entry.visibility === 'internal') {
+      if (!opts.enterpriseId || entry.enterpriseId !== opts.enterpriseId) fail('io', `knowledge pack not authorized: ${name}`);
+      if (!internalVerified) {
+        try {
+          const authorized = await ensureInternalMarketIndex(market, opts.enterpriseId, {
+            root, marketDir: opts.marketDir, configPath: opts.configPath, fetcher: opts.fetcher, refresh: opts.refresh,
+          });
+          if (!authorized.index.knowledgePacks?.some(pack => pack.name === name && pack.version === entry.version
+            && pack.artifact.sha256 === entry.artifact.sha256 && pack.artifact.bytes === entry.artifact.bytes
+            && pack.artifact.key === entry.artifact.key)) fail('io', `knowledge pack not authorized: ${name}`);
+        } catch (error) {
+          if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
+          throw error;
+        }
+      }
+    }
+    const staged = join(stage, `knowledge-${packs.length}`);
+    if (directory) {
+      const artifactPath = inside(directory, entry.artifact.key);
+      if (!existsSync(artifactPath) || !realpathSync(artifactPath).startsWith(`${realpathSync(directory)}${sep}`)) fail('scan', `unsafe knowledge pack artifact: ${name}`);
+      const bytes = readFileSync(artifactPath);
+      if (bytes.length !== entry.artifact.bytes || (opts.hashArtifact ?? (data => createHash('sha256').update(data).digest('hex')))(bytes).toLowerCase() !== entry.artifact.sha256.toLowerCase()) fail('scan', 'artifact sha256 or size mismatch');
+      unpackArchive(bytes, staged);
+    } else {
+      await fetchVerifiedArtifact(entry.artifact, url!, staged, opts);
+    }
+    packs.push({ name, staged, destination: join(root, 'knowledge-packs', market, name, entry.version) });
+  }
+  return packs;
 }
 
 export function resolvePluginSource(spec: string, target: string, opts: InstallOptions = {}): ResolvedPluginSource {
@@ -308,7 +441,9 @@ function declaresMain(packageRoot: string): boolean {
 export async function installPlugin(spec: string, opts: InstallOptions = {}): Promise<InstalledPlugin> {
   const root = resolve(opts.root ?? elanousStateRoot());
   const stageRoot = join(root, 'plugins', '.staging');
+  assertInstallParents(root, join(stageRoot, 'plugin'));
   mkdirSync(stageRoot, { recursive: true });
+  assertInstallParents(root, join(stageRoot, 'plugin'));
   const stage = mkdtempSync(join(stageRoot, 'plugin-'));
   try {
     const source = marketSpec(spec, opts)
@@ -348,11 +483,20 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const destination = join(root, 'plugins', source.market, name, version);
     const emit = (event: InstallEvent) => opts.onEvent?.(event);
     emit({ event: 'resolve', plugin: name, version, sha256: source.sha256 });
-    emit({ event: 'verify', signature: source.signature, scan: 'safe' });
+    let security: ReturnType<typeof inspectPluginSecurity>;
+    try { security = inspectPluginSecurity(packageRoot); }
+    catch { fail('scan', 'plugin static security scan failed'); }
+    emit({ event: 'verify', signature: source.signature, scan: security.scan });
     const capabilities = manifest.capabilities.map(capability => capability.kind);
     const required = capabilities.length > 0;
+    const preConsent = decidePluginInstallation(security, capabilities, false);
+    if (!preConsent.ok && preConsent.reason === 'scan') fail('scan', 'plugin static security scan rejected package');
     emit({ event: 'consent', capabilities, required });
-    if (required && !(opts.yes || await opts.consent?.(capabilities))) fail('consent-denied', 'plugin capabilities require consent');
+    const consented = !required || !!(opts.yes || await opts.consent?.(capabilities));
+    const decision = decidePluginInstallation(security, capabilities, consented);
+    if (!decision.ok) fail(decision.reason, decision.reason === 'scan'
+      ? 'plugin static security scan rejected package' : 'plugin capabilities require consent');
+    const packs = await stageRequiredKnowledgePacks(manifest.requires?.knowledgePacks ?? [], source.market, stage, root, opts);
     emit({ event: 'credentials', connectors: (manifest.contributes.connectors ?? []).map(connector => ({
       id: connector.id, fields: (connector.fields ?? connector.userConfig?.map(field => ({ name: field.key, secret: field.secret })) ?? [])
         .map(field => ({ name: field.name, secret: field.secret === true })),
@@ -370,17 +514,44 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const { nodes, nodeErrors } = inspectPluginNodes(packageRoot, manifest);
     emit({ event: 'registered', kinds, nodes, nodeErrors, graphs, skills });
     const installed = withLedgerLock(root, () => {
+      assertInstallParents(root, destination);
       if (existsSync(destination)) fail('conflict', `plugin already installed: ${name}@${version}`);
-      mkdirSync(dirname(destination), { recursive: true });
-      renameSync(join(stage, 'package'), destination);
-      const item = { name, version, market: source.market, path: destination, sha256: source.sha256, installedAt: new Date().toISOString() };
+      for (const pack of packs) {
+        assertInstallParents(root, pack.destination);
+        if (packPathExists(pack.destination) && !samePackTree(pack.destination, pack.staged)) {
+          fail('conflict', `installed knowledge pack differs from verified artifact: ${pack.name}`);
+        }
+      }
+      const moved: string[] = [];
       try {
+        for (const pack of packs) {
+          assertInstallParents(root, pack.destination);
+          if (packPathExists(pack.destination)) continue;
+          mkdirSync(dirname(pack.destination), { recursive: true });
+          assertInstallParents(root, pack.destination);
+          renameSync(pack.staged, pack.destination);
+          moved.push(pack.destination);
+        }
+        mkdirSync(dirname(destination), { recursive: true });
+        assertInstallParents(root, destination);
+        renameSync(join(stage, 'package'), destination);
+        moved.push(destination);
+        const item = { name, version, market: source.market, path: destination, sha256: source.sha256, installedAt: new Date().toISOString() };
+        let installedSecurity: ReturnType<typeof inspectPluginSecurity>;
+        try { installedSecurity = inspectPluginSecurity(destination); }
+        catch { fail('scan', 'plugin package integrity verification failed'); }
+        if (installedSecurity.integrity !== security.integrity || installedSecurity.scan === 'dangerous') {
+          fail('scan', 'plugin package integrity changed during installation');
+        }
         writeLedger(root, [...listInstalledPlugins(root), item]);
+        return item;
       } catch (error) {
-        rmSync(destination, { recursive: true, force: true });
+        for (const path of moved.reverse()) {
+          assertInstallParents(root, path);
+          rmSync(path, { recursive: true, force: true });
+        }
         throw error;
       }
-      return item;
     });
     // The install is committed above; a listener that throws must not turn a finished install into a failure
     // (the ledger would say «installed» while the caller saw «io», and a retry would hit «conflict»).

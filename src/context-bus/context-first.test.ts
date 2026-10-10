@@ -1,14 +1,14 @@
 import { expect, test } from 'bun:test';
-import { createContextFirstGate, renderContextFirst } from './context-first.js';
+import { createContextFirstFileStore, createContextFirstGate, isOperationalQuery, renderContextFirst } from './context-first.js';
 import type { ContextNowAnswer } from './context-now.js';
-import { renderContextFirstNow, renderTelegramNow } from './context-now-surfaces.js';
-import { botFromConfig } from '../telegram.js';
+import { renderContextFirstNow, renderContextFirstOpening, renderTelegramNow } from './context-now-surfaces.js';
+import { TelegramBot, botFromConfig } from '../telegram.js';
 import { runTurn } from '../session/chat.js';
 import type { LLMProvider } from '../llm.js';
 import { buildAcpContextPreamble } from '../telegram-commands.js';
 import { contextNow } from './context-now.js';
 import { appendMessage, createSession, findSessionByTelegramChat, loadSession } from '../session/index.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UserConfig } from '../user-config.js';
@@ -132,23 +132,26 @@ test('Telegram /attach routes a follow-up into the TUI transcript after context-
     expect(seen[0]).toMatchObject({ sessionId: tui.id, userText: '아까 그거 어떻게 됐어?' });
     expect(seen[0]!.llmMessages).toContain('TG-CTX 배포는 승인 대기야');
     expect(buildAcpContextPreamble(7, undefined, undefined)).toContain('TG-CTX 배포는 승인 대기야');
-    const firstIndex = delivered.findIndex(s => s.method === 'sendMessage' && s.text.includes('판: 0.2.22'));
+    const firstIndex = delivered.findIndex(s => s.method === 'sendMessage' && s.text.includes('도는 런: TG-CTX'));
     const replyIndex = delivered.findIndex(s => s.text.includes('TG-CTX는 아직 승인 대기입니다'));
     expect(firstIndex).toBeGreaterThanOrEqual(0);
     expect(replyIndex).toBeGreaterThan(firstIndex);
     expect(delivered[replyIndex]?.method).toBe('editMessageText');
-    expect(sent.filter(s => s.includes('판: 0.2.22'))).toHaveLength(1);
-    for (const item of ['도는 런: TG-CTX', '맥락 연결 막힘', '발행 런: 0.2.22', 'D1 배포 승인 대기', 'TUI에서 배포 논의']) {
+    expect(sent.filter(s => s.includes('도는 런: TG-CTX'))).toHaveLength(1);
+    for (const item of ['도는 런: TG-CTX', '발행 런: 0.2.22']) {
       expect(delivered[firstIndex]?.text).toContain(item);
+    }
+    for (const absent of ['최근:', '판: 0.2.22', '결정:', 'TUI에서 배포 논의']) {
+      expect(delivered[firstIndex]?.text).not.toContain(absent);
     }
     expect(loadSession(tui.id)!.messages.slice(0, 2)).toEqual(before);
     expect(loadSession(tui.id)!.messages.at(-1)?.content).toBe('TG-CTX는 아직 승인 대기입니다');
     clock.now = 5 * 60 * 60_000;
     await send(incoming('5시간 뒤에도 그거?', 3));
-    expect(sent.filter(s => s.includes('판: 0.2.22'))).toHaveLength(1);
+    expect(sent.filter(s => s.includes('도는 런: TG-CTX'))).toHaveLength(1);
     clock.now = 11 * 60 * 60_000;
     await send(incoming('6시간 뒤에는?', 4));
-    expect(sent.filter(s => s.includes('판: 0.2.22'))).toHaveLength(2);
+    expect(sent.filter(s => s.includes('도는 런: TG-CTX'))).toHaveLength(2);
     expect(loadSession(tui.id)!.messages.slice(0, 2)).toEqual(before);
   } finally {
     if (oldRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = oldRoot;
@@ -161,4 +164,89 @@ test('rendering failure yields the shared unreadable message', () => {
   expect(renderContextFirst(() => answer, undefined, () => '요약')).toBe('요약');
   expect(renderContextFirst(() => { throw Error('ledger unavailable'); }, undefined, () => '요약')).toBe('맥락 못 읽음');
   expect(renderContextFirst(() => answer, undefined, () => { throw Error('renderer unavailable'); })).toBe('맥락 못 읽음');
+});
+
+const busyAnswer: ContextNowAnswer = {
+  at: '2026-10-10T12:00:00.000Z', topic: null,
+  facts: [
+    { kind: 'version', version: '0.2.24', source: 'release://current' },
+    ...Array.from({ length: 5 }, (_, i) => ({ kind: 'run' as const, goal: `G${i}`, phase: 'implement', elapsed: '1분', source: `run://${i}` })),
+    { kind: 'release', version: '0.2.24', node: 'publish', status: 'blocked', source: 'release://run' },
+  ],
+  events: [{ at: '2026-10-10T11:00:00.000Z', kind: 'report', summary: 'Claude Code tool', source: 'event://tool' }], guide: [],
+};
+
+test('the opening is at most three operational rows: no /now body, no «최근:» row, nothing when idle', () => {
+  const opening = renderContextFirstOpening(busyAnswer);
+  expect(opening.split('\n')).toHaveLength(3);
+  expect(opening.split('\n').every(line => /^(도는 런|발행 런|지연 스케줄):/.test(line))).toBe(true);
+  expect(opening).not.toContain('최근:');
+  expect(opening).not.toContain('Claude Code tool');
+  expect(opening).not.toContain('판:');
+  expect(renderContextFirstOpening({ ...busyAnswer, facts: [{ kind: 'version', version: '0.2.24', source: 'release://current' }] })).toBe('');
+  expect(renderContextFirstNow(busyAnswer)).toContain('최근: Claude Code tool');
+});
+
+test('operational and release-state questions are told apart from ordinary talk', () => {
+  expect(isOperationalQuery('현재 버전 발행 준비 상태?')).toBe(true);
+  expect(isOperationalQuery('what is the release status')).toBe(true);
+  expect(isOperationalQuery('아까 그거 어떻게 됐어?')).toBe(false);
+  expect(isOperationalQuery('안녕')).toBe(false);
+  expect(isOperationalQuery(undefined)).toBe(false);
+});
+
+test('a persisted gate does not re-arm after a restart; a restart after six hours still does', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-first-store-'));
+  try {
+    const store = createContextFirstFileStore(join(dir, 'state.json'));
+    let time = 1_000_000;
+    const before = createContextFirstGate({ now: () => time, store });
+    before.note('chat');
+    expect(before.take('chat')).toBe(true);
+    time += 10 * 60_000;
+    const restarted = createContextFirstGate({ now: () => time, store });
+    restarted.note('chat');
+    expect(restarted.take('chat')).toBe(false);
+    time += 7 * 60 * 60_000;
+    const later = createContextFirstGate({ now: () => time, store });
+    later.note('chat');
+    expect(later.take('chat')).toBe(true);
+    writeFileSync(join(dir, 'state.json'), 'not json');
+    expect(createContextFirstFileStore(join(dir, 'state.json')).load()).toEqual({});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makeTelegramBot(sent: string[], reply: string) {
+  const bot = new TelegramBot({
+    token: 'test:token', allowedUsers: [7], perChatGapMs: 0, nowImpl: () => 0, sleepImpl: async () => {}, log: () => {},
+    onMessage: async () => reply, readContextNow: () => busyAnswer,
+    slashContext: { userConfig: { telegram: { allowedUsers: [7], enabled: true }, intake: { telegram: { ambientCapture: 'off' } } } as unknown as UserConfig },
+    fetchImpl: (async (_url: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(init?.body ?? '{}') as { text?: string };
+      if (body.text) sent.push(body.text);
+      return new Response(JSON.stringify({ ok: true, result: { message_id: sent.length } }), { status: 200 });
+    }) as typeof fetch,
+  });
+  const handle = (bot as unknown as { handleIncoming: (ctx: object) => Promise<void> }).handleIncoming.bind(bot);
+  return (text: string, id: number) => handle({ updateId: id, chatId: 7, userId: 7, text, messageId: id, isDm: true, isGroup: false, attachments: [] });
+}
+
+test('right after a restart, a release-state question gets the answer without the opening', async () => {
+  const sent: string[] = [];
+  await makeTelegramBot(sent, '발행 준비 답')('현재 버전 발행 준비 상태?', 1);
+  expect(sent).toContain('발행 준비 답');
+  expect(sent.join('\n')).not.toContain('최근: Claude Code tool');
+  expect(sent.filter(text => text.startsWith('도는 런:'))).toHaveLength(0);
+});
+
+test('an ordinary first message after a restart still gets an opening of at most three operational rows', async () => {
+  const sent: string[] = [];
+  await makeTelegramBot(sent, '본 답')('안녕', 2);
+  const opening = sent.find(text => text.startsWith('도는 런:'));
+  expect(opening).toBeDefined();
+  expect(opening!.split('\n').length).toBeLessThanOrEqual(3);
+  expect(sent.join('\n')).not.toContain('최근:');
+  expect(sent).toContain('본 답');
 });

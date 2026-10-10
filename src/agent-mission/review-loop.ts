@@ -31,6 +31,8 @@ export interface ReviewClassification {
   asks: string[];
   reason: string;
   classificationSource: ReviewClassificationSource;
+  /** TA-LAND-MUSTFIX-ZERO — 분류 JSON 의 asks 가 없거나 배열이 아니거나 문자열 아닌 원소가 섞였다. `asks: []` 는 그때 «0» 이 아니라 «모름». */
+  asksUnreadable?: true;
 }
 
 export interface ReviewLoopOpts {
@@ -113,6 +115,16 @@ export interface ReviewLoopResult {
 function gh(args: string[]): string {
   // env: process.env — 최소 PATH(cron)에서도 ensure-bin-path 보강 PATH 로 gh 를 찾도록 명시 전달.
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 20 * 1024 * 1024, env: process.env });
+}
+
+/** TA-LAND-MUSTFIX-ZERO — 자동 병합 «직전» must-fix 관문(#25941 `canAuto` 와 같은 축).
+ *  남은 지적(asks)이 있으면 `review-warn-with-must-fix` · 목록 자체가 배열이 아니면 «0» 이 아니라
+ *  «모름» = `review-must-fix-unknown`(fail-closed). 막을 때 `review-loop` 범주에 `auto-merge-blocked` 를 남긴다. */
+function reviewMergeMustFixBlock(pr: string, stage: 'initial-ok' | 'final-judge', asks: unknown, unreadable: boolean, round?: number): 'review-warn-with-must-fix' | 'review-must-fix-unknown' | null {
+  const known = Array.isArray(asks) && !unreadable;
+  const reason = !known ? 'review-must-fix-unknown' : (asks as unknown[]).length > 0 ? 'review-warn-with-must-fix' : null;
+  if (reason) debug.log('review-loop', 'auto-merge-blocked', { pr, stage, reason, mustFixCount: known ? (asks as unknown[]).length : null, ...(round !== undefined ? { round } : {}) });
+  return reason;
 }
 
 /** Check every page of the PR file list immediately before an unattended review-loop merge. */
@@ -254,10 +266,16 @@ export async function judgeAndFinalize(
   debug.log('review-loop', 'judge-start', { pr, round, diffChars: preparedDiff.totalChars, judgeBackend: judgeBackendResolution.backend, judgeBackendSource: judgeBackendResolution.source });
   const judge = opts.judge ?? judgeWithAcp;
   const j = await judge({ diff, context: `반영한 지적:\n${asks.join('\n')}${reviewerContext}`, gatePassed: true, cwd, backend: judgeBackendResolution.backend, ...(opts.judgeModel ? { model: opts.judgeModel } : {}) });
-  debug.log('review-loop', 'judge-verdict', { pr, round, verdict: j.verdict, asks: j.asks.length });
+  debug.log('review-loop', 'judge-verdict', { pr, round, verdict: j.verdict, asks: Array.isArray(j.asks) ? j.asks.length : null });
   const diffScope = `심판 diff 범위: 본 ${preparedDiff.judgeChars}자 / 전체 ${preparedDiff.totalChars}자`;
 
   if (j.verdict === 'merge') {
+    // TA-LAND-MUSTFIX-ZERO — 심판이 «merge» 라도 남긴 asks(미해결 지적)가 있으면 자동 병합하지 않는다 → HITL.
+    const mustFixBlock = opts.autoMerge ? reviewMergeMustFixBlock(pr, 'final-judge', j.asks, j.asksUnreadable === true, round) : null;
+    if (mustFixBlock) {
+      try { runGh(['pr', 'comment', pr, '--body', `🛑 ACP Claude Code 2차 최종심판: **MERGE** 이나 미해결 지적이 남아 자동 병합하지 않음(${mustFixBlock} · 라운드 ${round}) → 대표 결정 필요.\n${diffScope}\n사유: ${j.reason}`]); } catch { /* noop */ }
+      return { pr, branch, verdict: 'reinforce', asks: Array.isArray(j.asks) ? j.asks : asks, action: 'parked', reworkOk: true, pushed: lastPushed, rounds: round, detail: `2차 심판 MERGE ⊕ ${mustFixBlock} → HITL: ${j.reason}` };
+    }
     if (opts.autoMerge) {
       if (holdReleasePathBeforeReviewMerge(pr, runGh)) return { pr, branch, verdict: 'reinforce', asks, action: 'parked', reworkOk: true, pushed: lastPushed, rounds: round, detail: 'OP approval required: release-path hold or PR file inspection unavailable' };
       const approve = opts.approve ?? approvePr;
@@ -279,7 +297,7 @@ export async function judgeAndFinalize(
     try { runGh(['pr', 'comment', pr, '--body', `🛑 ACP Claude Code 2차 최종심판: **${j.verdict.toUpperCase()}** (라운드 ${round}) → 대표 결정 필요.\n${diffScope}\n사유: ${j.reason}`]); } catch { /* noop */ }
     return { pr, branch, verdict: 'reinforce', asks, action: 'parked', reworkOk: true, pushed: lastPushed, rounds: round, detail: `2차 심판 ${j.verdict} → HITL: ${j.reason}` };
   }
-  return { rework: j.asks.length > 0 ? j.asks : asks };
+  return { rework: Array.isArray(j.asks) && j.asks.length > 0 ? j.asks : asks };
 }
 
 export interface LatestReviewSource {
@@ -429,7 +447,8 @@ JSON 만: {"verdict":"...","asks":["..."],"reason":"..."}`;
     const d = JSON.parse(jm[0]) as { verdict?: string; asks?: unknown; reason?: string };
     const verdict = (['ok', 'reinforce', 'reject', 'ambiguous'] as const).includes(d.verdict as ReviewVerdict) ? (d.verdict as ReviewVerdict) : 'ambiguous';
     const asks = Array.isArray(d.asks) ? d.asks.filter((x): x is string => typeof x === 'string') : [];
-    return { verdict, asks, reason: typeof d.reason === 'string' ? d.reason : '', classificationSource: 'llm' };
+    const asksUnreadable = !Array.isArray(d.asks) || asks.length !== d.asks.length;
+    return { verdict, asks, reason: typeof d.reason === 'string' ? d.reason : '', classificationSource: 'llm', ...(asksUnreadable ? { asksUnreadable: true as const } : {}) };
   } catch { return { verdict: 'ambiguous', asks: [], reason: 'JSON 파싱 실패', classificationSource: 'llm' }; }
 }
 
@@ -497,15 +516,24 @@ export async function runReviewLoop(pr: string, opts: ReviewLoopOpts = {}): Prom
   debug.log('review-loop', 'classified', {
     pr,
     verdict: cls.verdict,
-    asks: cls.asks.length,
+    asks: Array.isArray(cls.asks) ? cls.asks.length : null, // 목록 없음 = null(«0» 아님) — 아래 must-fix 관문이 막는다
     source: opts.injectedReview ? 'injected' : 'gh',
     reason: cls.reason,
     classificationSource: cls.classificationSource,
   });
 
-  let asks = cls.asks;
+  let asks = Array.isArray(cls.asks) ? cls.asks : []; // 목록 없음·못 읽음은 아래 자동 병합 관문이 cls 로 막는다 · rework/명확화 소비처만 `[]` 로 읽는다
 
   if (cls.verdict === 'ok') {
+    // TA-LAND-MUSTFIX-ZERO — 1차 «ok» 에 지적(asks)이 남았거나 목록을 못 읽으면 자동 병합 경로로 가지 않는다(승인도 안 함) → HITL.
+    //   light·heavy 둘 다 — heavy 는 심판에 asks 를 안 넘기므로(`[]`) 여기서 막지 않으면 심판 merge 가 1차 must-fix 를 덮는다.
+    //   관문은 «이 경로가 실제로 자동 병합할 때»만 — light 는 autoMergeOnOk||autoMerge, heavy 는 심판 merge 의 autoMerge 뿐(autoMergeOnOk 만이면 종전대로 심판 → ready-to-merge).
+    const autoMergesHere = effectiveFinalJudge ? opts.autoMerge === true : (opts.autoMergeOnOk || opts.autoMerge);
+    const mustFixBlock = autoMergesHere ? reviewMergeMustFixBlock(pr, 'initial-ok', cls.asks, cls.asksUnreadable === true) : null;
+    if (mustFixBlock) {
+      try { runGh(['pr', 'comment', pr, '--body', `🛑 1차 리뷰 ok 이나 미해결 지적이 남아 자동 병합하지 않음(${mustFixBlock}) → 대표 결정 필요.`]); } catch { /* noop */ }
+      return { pr, branch, verdict: 'ok', asks: Array.isArray(cls.asks) ? cls.asks : [], action: 'parked', detail: `${depth}·1차 ok ⊕ ${mustFixBlock} → HITL(자동 병합 안 함)` };
+    }
     // light: 1차 clean 으로 충분 → approve + 머지. heavy: 1차 ok 여도 2차 심판 머스트.
     if (!effectiveFinalJudge) {
       if ((opts.autoMergeOnOk || opts.autoMerge) && holdReleasePathBeforeReviewMerge(pr, runGh)) {

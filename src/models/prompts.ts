@@ -29,7 +29,11 @@ export type ModelFamily =
   | 'grok'
   | 'gemini'
   | 'local'
+  | 'open-weight'
   | 'other';
+
+/** OpenRouter gateway prefix for OpenAI-served models (see OR-FAMILY-GPT6 in getModelFamily). */
+const OPENROUTER_OPENAI_PREFIX = 'openrouter/openai/';
 
 /** Infer the family from a model id. Mirrors `inferProviderFromModel`
  *  in llm.ts but returns a finer-grained tag (codex vs other gpt,
@@ -45,6 +49,23 @@ export function getModelFamily(modelId: string | undefined): ModelFamily {
   if (m.includes('grok')) return 'grok';
   if (m.startsWith('gemini-')) return 'gemini';
   if (m.startsWith('local:')) return 'local';
+  // OR-FAMILY-GPT6 — `openrouter/openai/<gpt-* | o1-/o3-/o4-*>` is the same model the direct
+  // path serves; when its bare id is 'gpt' there (gpt-6-*, gpt-4*, o-series) it gets 'gpt' here
+  // too, so it carries the gpt prompt pieces (hygiene addon · preamble addendum · chat variant ·
+  // tool-hint cap). Without this it fell to 'other'. ⛔ A 'codex' verdict (bare gpt-5*) is NOT
+  // taken: in llm.ts 'codex' also switches tool-loop behaviour (inspect/repair stops, Read
+  // auto-narrowing, exploration exemptions, idle timeout) — not just prompt text — and that is a
+  // separate decision. Ids with `codex` in them were already 'codex' above. Gateway-prefixed ids
+  // only — bare `openai/...` ids are not touched (same LM Studio reason as below).
+  if (m.startsWith(OPENROUTER_OPENAI_PREFIX) && getModelFamily(m.slice(OPENROUTER_OPENAI_PREFIX.length)) === 'gpt') {
+    return 'gpt';
+  }
+  // OpenRouter gateway ids only (`openrouter/<vendor>/<model>`). Bare vendor ids such as
+  // `qwen/qwen3-coder-30b` stay 'other' on purpose: LM Studio publishes native ids in that
+  // same shape (see getModelTier's local pattern), and this family must not reach local runs.
+  if (m.startsWith('openrouter/') && (m.includes('glm') || m.includes('kimi') || m.includes('qwen'))) {
+    return 'open-weight';
+  }
   return 'other';
 }
 
@@ -68,7 +89,7 @@ export function getModelFamily(modelId: string | undefined): ModelFamily {
 //     localhost).
 
 import type { LLMProviderName } from '../user-config.js';
-import type { SkillTier } from '../skills/runner.js';
+import type { SkillTier } from '../skills/skill-tier.js';
 import { LLM_TIER_MAP_BY_PROVIDER, TIER_PROVIDERS } from '../model-tier/llm-tier-map.js';
 
 function matchesAny(s: string, needles: string[]): boolean {

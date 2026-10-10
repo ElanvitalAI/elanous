@@ -17,6 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 
@@ -226,12 +227,12 @@ export function draftActions(insights: readonly Insight[], recurrences: readonly
   });
 }
 
-export function summaryLines(recurrences: readonly Recurrence[], actions: readonly DraftCell[], factCount: number, mode: RetroMode): string[] {
+export function summaryLines(recurrences: readonly Recurrence[], actions: readonly DraftCell[], factCount: number, mode: RetroMode, factsUnmeasurable = factCount === 0): string[] {
   const top = recurrences.filter(r => r.recurring);
   const first = top[0];
   return [
-    first ? `회고 1순위: ${first.title} ${first.count}건${first.reBrokeAfterGreen ? ' · 초록 뒤 재발' : first.recurAfterAction ? ' · 조치 뒤 재발' : first.daysSeen.length ? ` · ${first.daysSeen.length}일째` : ''}` : '회고: 반복 없음',
-    `사실 ${factCount} · 반복 주제 ${top.length}(${top.slice(0, 5).map(r => r.title).join(' · ') || '없음'})`,
+    first ? `회고 1순위: ${first.title} ${first.count}건${first.reBrokeAfterGreen ? ' · 초록 뒤 재발' : first.recurAfterAction ? ' · 조치 뒤 재발' : first.daysSeen.length ? ` · ${first.daysSeen.length}일째` : ''}` : factsUnmeasurable ? '회고: 반복 판정 불가' : '회고: 반복 없음',
+    `사실 ${factsUnmeasurable ? '측정 불가' : factCount} · 반복 주제 ${factsUnmeasurable ? '측정 불가' : top.length}(${factsUnmeasurable ? '판정 불가' : top.slice(0, 5).map(r => r.title).join(' · ') || '없음'})`,
     `조치 초안 ${actions.length}: ${actions.map(a => `${a.id}(${a.owner})`).join(', ') || '없음'} · ${mode}`,
   ];
 }
@@ -249,10 +250,10 @@ export type RetroDeps = { now?: Date; readFacts?: (since: string, root: string) 
 
 const repoRoot = resolve(import.meta.dir, '..', '..');
 
-function readFactsViaCli(since: string, root: string, repo = repoRoot): unknown {
-  const args = ['bin/elanous.mjs', ...(root === prodInstanceRoot() ? [] : [`--test=${root}`]), 'retro', 'facts', '--since', since, '--json'];
+function readFactsViaCli(since: string, root: string, configDir: string, repo = repoRoot): unknown {
+  const args = ['bin/elanous.mjs', ...(root === prodInstanceRoot() ? [] : [`--test=${root}`]), 'retro', 'facts', '--since', since, '--json', '--config-dir', resolve(configDir)];
   const result = spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 570_000, maxBuffer: 64 * 1024 * 1024 });
-  if (result.error || result.status !== 0) throw new Error(`retro facts failed: ${result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status}`}`);
+  if (result.error || result.status !== 0) throw new Error(`retro facts failed: ${result.error?.message || result.stderr?.trim() || `exit ${result.status ?? 'unknown'}`}`);
   return JSON.parse(result.stdout);
 }
 
@@ -294,15 +295,26 @@ export async function runRetroStage(stage: RetroStage, ctx: Ctx, root: string, d
       let raw: unknown;
       if (typeof input.factsFile === 'string') { raw = JSON.parse(readFileSync(input.factsFile, 'utf8')); sources.facts = `file:${input.factsFile}`; }
       else if (Array.isArray(input.facts)) { raw = input.facts; sources.facts = 'input'; }
-      else { raw = (deps.readFacts ?? ((s, r) => readFactsViaCli(s, r, deps.repo)))(since, root); sources.facts = `retro facts --since ${since}`; }
+      else {
+        sources.facts = `retro facts --since ${since}`;
+        try { raw = (deps.readFacts ?? ((s, r) => readFactsViaCli(s, r, getElanousConfigDir(), deps.repo)))(since, root); }
+        catch (error) {
+          raw = { facts: [] };
+          sources.facts = `unreadable: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`;
+        }
+      }
       const { facts, truncated } = normalizeFacts(raw);
+      const unavailable: unknown[] = Array.isArray(record(raw).unavailable) ? record(raw).unavailable as unknown[] : [];
+      const rawFacts = Array.isArray(raw) ? raw : record(raw).facts;
+      const factsUnmeasurable = facts.length === 0 && (sources.facts.startsWith('unreadable:') ||
+        !Array.isArray(rawFacts) || rawFacts.length > 0 || unavailable.length > 0);
+      if (factsUnmeasurable && !sources.facts.startsWith('unreadable:')) sources.facts = `unreadable: ${sources.facts}`;
       let greenCells: GreenCell[] = [];
       if (Array.isArray(input.greenCells)) { greenCells = input.greenCells.map(record).map(c => ({ id: str(c.id), title: str(c.title), status: str(c.status), version: str(c.version) || undefined, greenAt: str(c.greenAt) || undefined })); sources.green = 'input'; }
       else {
         try { greenCells = (deps.readGreenCells ? deps.readGreenCells() : await readGreenCellsFromChecklist()).map(c => ({ ...c, title: (c.title ?? "").slice(0, 120) })); sources.green = 'checklist'; }
         catch (error) { sources.green = `unreadable: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`; }
       }
-      const unavailable = Array.isArray(record(raw).unavailable) ? record(raw).unavailable : [];
       return { outcome: 'ok', day, since, mode: resolveRetroMode(input, deps.readConfig), facts, factCount: facts.length, truncated, unavailable, greenCells, sources };
     }
     case 'cluster': {
@@ -329,7 +341,9 @@ export async function runRetroStage(stage: RetroStage, ctx: Ctx, root: string, d
       const facts = (out.collect?.facts ?? []) as RetroFact[];
       const recurrences = (out.recur?.recurrences ?? []) as Recurrence[];
       const actions = (out.act?.actions ?? []) as DraftCell[];
-      const summary = summaryLines(recurrences, actions, facts.length, mode);
+      const sources = record(out.collect?.sources);
+      const summary = summaryLines(recurrences, actions, facts.length, mode,
+        facts.length === 0 && (!str(sources.facts) || str(sources.facts).startsWith('unreadable:')));
       const themes = recurrences.map(r => ({ theme: r.theme, title: r.title, count: r.count, recurring: r.recurring, reBrokeAfterGreen: r.reBrokeAfterGreen, recurAfterAction: r.recurAfterAction, greenCells: r.greenCells, rank: r.rank }));
       const dayFile = { day, mode, briefing: mode === 'live', generatedAt: now.toISOString(), factCount: facts.length,
         truncated: out.collect?.truncated === true, unavailable: out.collect?.unavailable ?? [], sources: out.collect?.sources ?? {},

@@ -117,13 +117,16 @@ describe('aggregateGateTestShards', () => {
     }
   });
 
-  test('skipped cases are unmeasured even when another case in the same file passes', () => {
+  test('a case skipped now but passed at base is counted unknown, not unmeasured — skips no longer void the shard, but a skip must not hide a regression (TC decision 10-10 · LIGHT-RC-MEASURE ②)', () => {
     const file = 'test/a.test.ts';
     const full = junit(file, [{ name: 'ran' }, { name: 'required' }]);
     const skipped = full.replace(`<testcase file="${file}" name="required"></testcase>`,
       `<testcase file="${file}" name="required"><skipped/></testcase>`);
     const result = aggregateGateTestShards([shards[0]!], [attempt(1, skipped, full, 0, 0)]);
-    expect(result).toEqual({ status: 'unmeasured', retryShardIds: ['shard-1'] });
+    expect(result.status).toBe('failed');
+    expect(result.retryShardIds).toEqual([]);
+    expect(result.report).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(result.report?.failures.map((failure) => [failure.name, failure.attribution])).toEqual([[`${file} > required`, 'unknown']]);
   });
 
   test('signal or exit 137 requires reassignment even with complete preexisting failure JUnit', () => {

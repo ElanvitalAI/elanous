@@ -430,14 +430,38 @@ function referencedRepositoryPaths(prDiff: string): string[] {
 
 const REVIEWER_CONTEXT_MAX_CHARS = 12_000;
 
+/** Decode the a-side of a diff header, including Git's quoted UTF-8 octal paths. */
+function reviewerContextDiffPath(chunk: string): string | undefined {
+  const header = /^diff --git ("(?:\\.|[^"\\])*"|a\/[^ \n]+) (?:"(?:\\.|[^"\\])*"|b\/[^ \n]+)(?:\r?\n|$)/.exec(chunk);
+  if (!header) return undefined;
+  const token = header[1]!;
+  if (!token.startsWith('"')) return token.slice(2);
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  const body = token.slice(1, -1);
+  for (let i = 0; i < body.length; i += 1) {
+    // Decode by code point so astral characters (emoji) keep both surrogate halves.
+    const codePoint = body.codePointAt(i)!;
+    const char = String.fromCodePoint(codePoint);
+    if (char !== '\\') { bytes.push(...Buffer.from(char, 'utf8')); if (codePoint > 0xffff) i += 1; continue; }
+    const octal = body.slice(i + 1, i + 4);
+    if (/^[0-7]{3}$/.test(octal)) { bytes.push(parseInt(octal, 8)); i += 3; continue; }
+    const next = body[++i]!;
+    if (escapes[next] !== undefined) bytes.push(escapes[next]);
+    else bytes.push(...Buffer.from(next, 'utf8'));
+  }
+  const path = Buffer.from(bytes).toString('utf8');
+  return path.startsWith('a/') ? path.slice(2) : undefined;
+}
+
 /** Bound each ordered human-supplied item independently so an early large item cannot evict later context. */
-export function budgetReviewerContext(
-  items: readonly ReviewerContextItem[] = [],
-  maxChars = REVIEWER_CONTEXT_MAX_CHARS,
-): ReviewerContextBudget {
+function budgetReviewerContextWithParts(
+  items: readonly ReviewerContextItem[],
+  maxChars: number,
+): { budget: ReviewerContextBudget; partsByItem: (string | undefined)[] } {
   const fullText = items.map((item) => `### ${item.label}\n${item.body}`).join('\n\n');
   if (items.length === 0) {
-    return { text: '', itemCount: 0, shownChars: 0, totalChars: 0, truncated: false, fullyIncludedItems: 0, truncatedItems: 0, omittedItems: 0 };
+    return { budget: { text: '', itemCount: 0, shownChars: 0, totalChars: 0, truncated: false, fullyIncludedItems: 0, truncatedItems: 0, omittedItems: 0 }, partsByItem: [] };
   }
   const separatorChars = (items.length - 1) * 2;
   const itemBudget = Math.max(0, Math.floor((maxChars - separatorChars) / items.length));
@@ -489,15 +513,25 @@ export function budgetReviewerContext(
   const omittedItems = items.length - parts.length;
   const text = parts.join('\n\n');
   return {
-    text,
-    itemCount: items.length,
-    shownChars: text.length,
-    totalChars: fullText.length,
-    truncated: text.length < fullText.length,
-    fullyIncludedItems,
-    truncatedItems,
-    omittedItems,
+    budget: {
+      text,
+      itemCount: items.length,
+      shownChars: text.length,
+      totalChars: fullText.length,
+      truncated: text.length < fullText.length,
+      fullyIncludedItems,
+      truncatedItems,
+      omittedItems,
+    },
+    partsByItem,
   };
+}
+
+export function budgetReviewerContext(
+  items: readonly ReviewerContextItem[] = [],
+  maxChars = REVIEWER_CONTEXT_MAX_CHARS,
+): ReviewerContextBudget {
+  return budgetReviewerContextWithParts(items, maxChars).budget;
 }
 
 function reviewerContextSection(
@@ -609,10 +643,38 @@ export function buildReviewPrompt(
   ].join('\n');
 }
 
+/** «지적 없음» 표지 — 일부 모델(GLM-5.3 실측)이 빈 섹션 대신 `- (없음 — …)` / `- none` 을 항목으로 쓴다.
+ *  ⭐ 표지 «만»인 항목을 0건으로 접는다. 두 모양뿐이다:
+ *   ① 낱말 하나(`none`·`없음`·`N/A`·`해당 없음` · 끝 마침표 허용)
+ *   ② 항목 «전체»가 괄호에 싸인 표지 — 설명이 붙으면 그 설명이 «지적이 없다»는 말일 때만
+ *      (`(없음 — 블로커 수준의 결함은 발견되지 않음)` · `(none — no blockers)`).
+ *  ⛔ 그 밖은 «지적»으로 남긴다 — `없음 — 인증 검사가 없어 …` · `(none: the new export is never called)` ·
+ *  `none of the tests …`. 표지 낱말로 시작하는 실제 블로커를 지우면 PASS/WARN 리뷰에서 블로커가 사라진다. */
+const NONE_WORD = String.raw`(?:없음|해당\s*없음|n\/a|none|nothing)`;
+const BARE_SENTINEL = new RegExp(String.raw`^${NONE_WORD}\s*[.。]?$`, 'i');
+const BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*${NONE_WORD}(?:\s*[—–\-:.,;]\s*([^)\]）】]*))?\s*[)\]）】]$`, 'i');
+// ⭐ 설명 «전체»가 「지적 없음」 한 문장일 때만 — 일부만 맞아도 접으면 `(none: no blockers are checked because …)` 같은 지적이 사라진다.
+const NO_FINDING_REMARK = new RegExp([
+  String.raw`^(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))[.。]?$`,
+  String.raw`^(?:no|zero)\s+(?:blocking\s+)?(?:blockers?|issues?|problems?|findings?|must-?fix(?:es)?)(?:\s+found)?\.?$`,
+  String.raw`^nothing\s+(?:blocking|to\s+fix)\.?$`,
+].join('|'), 'i');
+function isNoneSentinelFinding(finding: string): boolean {
+  const text = finding.trim();
+  if (BARE_SENTINEL.test(text)) return true;
+  const bracketed = BRACKETED_SENTINEL.exec(text);
+  if (!bracketed) return false;
+  const remark = bracketed[1]?.trim();
+  return !remark || NO_FINDING_REMARK.test(remark);
+}
+
 /** critic 응답 파싱 → ReviewResult. 순수함수. VERDICT + MUST-FIX/SHOULD-FIX/REQUIREMENTS 섹션 분해.
  *  verdict=FAIL 인데 must-fix 미기재면 첫 finding 을 must 로 승격(블로커 근거 보존). */
+/** ⭐ `VERDICT: PASS|WARN|FAIL` 판정 줄 — `parseReviewResult` 와 `reviewedResultFromRaw` 가 «같은» 정규식을 쓴다(존재 판정이 갈리면 안 된다). */
+const VERDICT_LINE = /VERDICT:\s*(PASS|WARN|FAIL)/i;
+
 export function parseReviewResult(text: string): ReviewResult {
-  const vm = /VERDICT:\s*(PASS|WARN|FAIL)/i.exec(text);
+  const vm = VERDICT_LINE.exec(text);
   const verdict = (vm ? vm[1]!.toLowerCase() : 'pass') as ReviewVerdict;
   const lines = text.split('\n').map((l) => l.trim());
   const mustFix: string[] = [];
@@ -628,7 +690,7 @@ export function parseReviewResult(text: string): ReviewResult {
     if (l.startsWith('- ')) {
       const f = l.slice(2).trim();
       if (!f) continue;
-      if (section === 'must') mustFix.push(f);
+      if (section === 'must') { if (!isNoneSentinelFinding(f)) mustFix.push(f); }
       else if (section === 'should') shouldFix.push(f);
       else if (section === 'requirements') requirements.push(f);
       else fallbackFinding ??= f;
@@ -646,6 +708,34 @@ export function parseReviewResult(text: string): ReviewResult {
     ...(fallback ? { reviewerFallback: fallback[1] } : {}),
     ...(requirements.length ? { requirements } : {}),
   };
+}
+
+/** 판정 줄 없는 응답의 사유 값 — 기존 «리뷰 못 함» 경로(`reviewed:false` ⊕ `failureReason`)를 그대로 탄다. */
+export const NO_VERDICT_LINE_REASON = 'no-verdict-line';
+
+/**
+ * ⛔⭐⭐ REVIEW-NO-VERDICT-FAILCLOSED(2026-10-10) — 리뷰어 응답 «하나»를 결과로 접는다.
+ *   `parseReviewResult` 는 `VERDICT:` 줄이 없으면 `pass` 로 기본값을 둔다. 종전 호출부는 거기에
+ *   `reviewed: true` 를 붙여서, 자격 없는 리뷰어의 219자 오류 문구가 «지적 0 인 PASS» 로 접혔다
+ *   (실물: run-dbe7b7df · PR #25906 · codex-app-server 17초).
+ *   ⇒ 판정 줄이 없으면 «리뷰 못 함»(`reviewed:false` · `failureReason=no-verdict-line`)이다 —
+ *   catch 경로와 «같은 모양»이라 소비처(orchestrator·seams·renderReview·fold)가 이미 «통과 판정 아님»으로 다룬다.
+ *   ⭐ 판정 줄이 «있는» 응답은 `parseReviewResult(raw)` ⊕ `reviewed:true` 그대로 — 바이트 동일.
+ *   ⛔ 계약: `reviewed:false` 일 때 `verdict` 는 «의미 없는 자리값»(`pass`)이다 — catch·미주입 경로와 같다.
+ *      소비처는 `reviewed` 를 «먼저» 본다(`renderReview`·`self-review-cli`·`review-adapter`·orchestrator).
+ */
+function reviewedResultFromRaw(raw: string, runId: string | undefined, pass?: { index: number; of: number }): ReviewResult {
+  if (VERDICT_LINE.test(raw)) return { ...parseReviewResult(raw), reviewed: true };
+  try {
+    debug.log('review.verdict', NO_VERDICT_LINE_REASON, {
+      chars: raw.length,
+      head: safeLogText(raw, 80),
+      ...(pass ? { pass: pass.index + 1, passes: pass.of } : {}),
+      // ⛔ backend 는 안 남긴다 — 이 함수는 어느 백엔드로 불렸는지 «모른다»(catch 주석 `#7495` 와 같은 이유).
+      ...(runId !== undefined ? { runId } : {}),
+    });
+  } catch { /* Observation must not prevent the review. */ }
+  return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: NO_VERDICT_LINE_REASON };
 }
 
 function failureReasonText(error: unknown): string {
@@ -675,7 +765,56 @@ export async function reviewPullRequest(
   if (!llmReview) return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false }; // 리뷰어 미주입=미검토.
   try {
     const diffBudget = budgetedDiff(input.prDiff);
-    const reviewerContextBudget = input.reviewerContext?.length ? budgetReviewerContext(input.reviewerContext) : undefined;
+    // Existing caller: self-review-cli.ts runSelfReviewCliCommand → deps.reviewPullRequest(reviewInput, llmReview).
+    const plan = planReviewChunks(input.prDiff);
+    const chunked = plan.passes.length > 1;
+    const contextItems = input.reviewerContext ?? [];
+    const passPaths = chunked ? plan.passes.map((pass) => new Set(
+      splitDiffByFile(pass).flatMap((chunk) => {
+        // self-review-cli.ts runSelfReviewCliCommand → deps.reviewPullRequest(reviewInput, llmReview) → this pass.
+        const path = reviewerContextDiffPath(chunk);
+        return path === undefined ? [] : [path];
+      }),
+    )) : [];
+    const matchedLabels = new Set(passPaths.flatMap((paths) => [...paths]));
+    const passContext = chunked && contextItems.length ? passPaths.map((paths, passIndex) => {
+      const indices = contextItems.flatMap((item, index) =>
+        item.image ? (passIndex === 0 ? [index] : [])
+          : !matchedLabels.has(item.label) || paths.has(item.label) ? [index] : []);
+      const { budget, partsByItem } = budgetReviewerContextWithParts(indices.map((index) => contextItems[index]!), REVIEWER_CONTEXT_MAX_CHARS);
+      return { indices, budget, partsByItem };
+    }) : [];
+    const chunkContextBudget = passContext.length ? (() => {
+      const shownByItem: Array<number | undefined> = contextItems.map(() => undefined);
+      const status: Array<'omitted' | 'truncated' | 'full' | undefined> = contextItems.map(() => undefined);
+      for (const { indices, partsByItem } of passContext) {
+        indices.forEach((itemIndex, position) => {
+          const part = partsByItem[position];
+          // Count each item once at its narrowest pass: a loss in any pass must show in shownChars.
+          const shown = part?.length ?? 0;
+          shownByItem[itemIndex] = Math.min(shownByItem[itemIndex] ?? shown, shown);
+          const full = `### ${contextItems[itemIndex]!.label}\n${contextItems[itemIndex]!.body}`;
+          if (part !== full) status[itemIndex] = part === undefined && status[itemIndex] !== 'truncated' ? 'omitted' : 'truncated';
+          else if (status[itemIndex] === undefined) status[itemIndex] = 'full';
+        });
+      }
+      const shownCount = shownByItem.filter((length) => (length ?? 0) > 0).length;
+      const fullyIncludedItems = status.filter((value) => value === 'full').length;
+      const truncatedItems = status.filter((value) => value === 'truncated').length;
+      const omittedItems = contextItems.length - fullyIncludedItems - truncatedItems;
+      return {
+        itemCount: contextItems.length,
+        // Same scale as totalChars (items joined by "\n\n"): each item counts once at its narrowest
+        // shown part, so shownChars === totalChars exactly when no item lost anything in any pass.
+        // perPassShownChars in the budget log keeps the raw per-pass sizes.
+        shownChars: shownByItem.reduce<number>((sum, length) => sum + (length ?? 0), 0) + Math.max(0, shownCount - 1) * 2,
+        totalChars: contextItems.map((item) => `### ${item.label}\n${item.body}`).join('\n\n').length,
+        truncated: truncatedItems > 0 || omittedItems > 0,
+        fullyIncludedItems, truncatedItems, omittedItems,
+      };
+    })() : undefined;
+    const singleContextBudget = !chunked && contextItems.length ? budgetReviewerContext(contextItems) : undefined;
+    const reviewerContextBudget = chunkContextBudget ?? singleContextBudget;
     if (reviewerContextBudget) {
       try {
         debug.log('review.images', 'reviewer-context-budget', {
@@ -686,6 +825,7 @@ export async function reviewPullRequest(
           fullyIncludedItems: reviewerContextBudget.fullyIncludedItems,
           truncatedItems: reviewerContextBudget.truncatedItems,
           omittedItems: reviewerContextBudget.omittedItems,
+          ...(chunked ? { passes: plan.passes.length, perPassShownChars: passContext.map(({ budget }) => budget.shownChars) } : {}),
           ...(input.reviewContext?.runId !== undefined ? { runId: input.reviewContext.runId } : {}),
           ...(input.reviewContext?.round !== undefined ? { round: input.reviewContext.round } : {}),
         });
@@ -716,8 +856,7 @@ export async function reviewPullRequest(
     //     *"64,000자는 **분할 리뷰 도입을 전제로 한 조각별 고정 예산**"*. 부품(`splitDiffByFile`)도
     //     서 있었다. 없던 것은 「조각들을 리뷰하고 결과를 «접는» 자」 하나였다.
     //   ⛔ 상한을 «올리는» 것이 아니다 — 조각마다 상한을 «지킨다».
-    const plan = planReviewChunks(input.prDiff);
-    if (plan.passes.length > 1) {
+    if (chunked) {
       try {
         debug.log('review.diff-plan', 'chunked', {
           passes: plan.passes.length, files: plan.files, coversAll: plan.coversAll,
@@ -740,6 +879,7 @@ export async function reviewPullRequest(
         const passInput: ReviewInput = {
           ...input,
           prDiff: passDiff,
+          reviewerContext: passContext[index]?.indices.map((itemIndex) => contextItems[itemIndex]!),
           // ⭐ 리뷰어에게 «자기가 몇 분의 몇을 보는지» 알린다 — 이것 없이는 조각 리뷰어가
           //   "다른 파일이 안 보인다"를 SCOPE/미배선 결함으로 오판한다(규칙 (7) 오작동).
           evidenceNote: [
@@ -749,13 +889,10 @@ export async function reviewPullRequest(
             + ' 「여기 안 보인다」를 결함으로 판정하지 마십시오.',
           ].filter(Boolean).join('\n'),
         };
-        passResults.push({
-          ...parseReviewResult(await llmReview(
-            buildReviewPrompt(passInput, passBudget, '', reviewerContextBudget),
-            reviewImages.length > 0 && index === 0 ? reviewImages : undefined,
-          )),
-          reviewed: true,
-        });
+        passResults.push(reviewedResultFromRaw(await llmReview(
+          buildReviewPrompt(passInput, passBudget, '', passContext[index]?.budget),
+          reviewImages.length > 0 && index === 0 ? reviewImages : undefined,
+        ), input.reviewContext?.runId, { index, of: plan.passes.length }));
       }
       return {
         ...foldReviewResults(passResults),
@@ -780,12 +917,11 @@ export async function reviewPullRequest(
       };
     }
     const raw = await llmReview(
-      buildReviewPrompt(input, diffBudget, referencedContext.text, reviewerContextBudget),
+      buildReviewPrompt(input, diffBudget, referencedContext.text, singleContextBudget),
       reviewImages.length > 0 ? reviewImages : undefined,
     );
     return {
-      ...parseReviewResult(raw),
-      reviewed: true,
+      ...reviewedResultFromRaw(raw, input.reviewContext?.runId),
       diffBudget: {
         truncated: diffBudget.truncated,
         shownChars: diffBudget.shownChars,

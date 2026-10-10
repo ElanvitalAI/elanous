@@ -19,7 +19,8 @@ function fixture() {
 }
 
 function observations(log: ReturnType<typeof spyOn<typeof debug, 'log'>>, seat: string) {
-  return log.mock.calls.filter(([category]) => category === `loop.${seat.toLowerCase()}-seat`)
+  // #24224 NBR1 — 이웃 런타임이 같은 카테고리에 heartbeat 를 남긴다(돈 턴마다 둘). 이 시험은 «틱» 계약만 센다.
+  return log.mock.calls.filter(([category, event]) => category === `loop.${seat.toLowerCase()}-seat` && event !== 'heartbeat')
     .map(([, event, data]) => ({ event, data }));
 }
 

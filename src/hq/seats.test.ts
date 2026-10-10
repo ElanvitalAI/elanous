@@ -118,6 +118,219 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
 }, 120_000);
 
+test('work done accepts a clean squash-landed tip with a nonempty changed-file list', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'squash').status).toBe(0);
+  const work = join(root, 'work', 'TC-squash');
+  writeFileSync(join(work, 'squashed'), 'landed\n');
+  git(['add', 'squashed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'work'], work);
+  const tip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'squashed'), 'landed\n');
+  writeFileSync(join(seed, 'other-main-change'), 'unrelated\n');
+  git(['add', 'squashed', 'other-main-change'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  git(['push', 'origin', 'main'], seed);
+  expect(git(['rev-parse', 'HEAD'], seed)).not.toBe(tip);
+  const done = hq('work', 'done', 'TC', 'squash');
+  expect(done.status, done.stderr).toBe(0);
+  expect(existsSync(work)).toBe(false);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeUndefined();
+}, 120_000);
+
+test('work done keeps a worktree whose different attached branch has an unlanded current tip', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'switched').status).toBe(0);
+  const work = join(root, 'work', 'TC-switched');
+  writeFileSync(join(work, 'landed'), 'landed\n');
+  git(['add', 'landed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'landed'], work);
+  const originalTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'landed'), 'landed\n');
+  git(['add', 'landed'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  git(['push', 'origin', 'main'], seed);
+  git(['switch', '-c', 'work/TC-different'], work);
+  writeFileSync(join(work, 'not-landed'), 'unfinished\n');
+  git(['add', 'not-landed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unfinished'], work);
+  const currentTip = git(['rev-parse', 'HEAD'], work);
+  const refused = hq('work', 'done', 'TC', 'switched');
+  expect(refused.status).toBe(1);
+  expect(existsSync(work)).toBe(true);
+  expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-different');
+  expect(git(['rev-parse', 'HEAD'], work)).toBe(currentTip);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-switched'])).toBe(originalTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
+test('work done keeps an unlanded registered tip even if a different attached tip landed', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'own-unlanded').status).toBe(0);
+  const work = join(root, 'work', 'TC-own-unlanded');
+  writeFileSync(join(work, 'unfinished'), 'keep this branch\n');
+  git(['add', 'unfinished'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unfinished'], work);
+  const originalTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '-c', 'work/TC-other-landed', 'refs/remotes/origin/main'], work);
+  writeFileSync(join(work, 'finished'), 'landed\n');
+  git(['add', 'finished'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'finished'], work);
+  const checkoutTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'finished'), 'landed\n');
+  git(['add', 'finished'], seed);
+  git(['commit', '-m', 'squash finished'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const refused = hq('work', 'done', 'TC', 'own-unlanded');
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('not merged');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-other-landed');
+  expect(git(['rev-parse', 'HEAD'], work)).toBe(checkoutTip);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-own-unlanded'])).toBe(originalTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
+test('work done on a different attached branch proves its tip and preserves that branch', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'switched-done').status).toBe(0);
+  const work = join(root, 'work', 'TC-switched-done');
+  const originalTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '-c', 'work/TC-landed'], work);
+  writeFileSync(join(work, 'landed'), 'same contents\n');
+  git(['add', 'landed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'work tip'], work);
+  const currentTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'landed'), 'same contents\n');
+  git(['add', 'landed'], seed);
+  git(['commit', '-m', 'squashed tip'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const done = hq('work', 'done', 'TC', 'switched-done');
+  expect(done.status, done.stderr).toBe(0);
+  expect(existsSync(work)).toBe(false);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-landed'])).toBe(currentTip);
+  expect(command('git', ['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', '--quiet', 'refs/heads/work/TC-switched-done']).status).toBe(1);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeUndefined();
+  expect(currentTip).not.toBe(originalTip);
+}, 120_000);
+
+test('work done keeps a different attached branch when checkout is blocked by its work lock', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'other-busy').status).toBe(0);
+  const work = join(root, 'work', 'TC-other-busy');
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '-c', 'work/TC-other-busy-tip'], work);
+  writeFileSync(join(work, 'same'), 'landed\n');
+  git(['add', 'same'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'landed'], work);
+  const checkoutTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'same'), 'landed\n');
+  git(['add', 'same'], seed);
+  git(['commit', '-m', 'squash landed'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const lock = join(git(['rev-parse', '--absolute-git-dir'], work), 'index.lock');
+  writeFileSync(lock, '');
+  const refused = hq('work', 'done', 'TC', 'other-busy');
+  rmSync(lock);
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('index.lock');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-other-busy-tip');
+  expect(git(['rev-parse', 'HEAD'], work)).toBe(checkoutTip);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-other-busy'])).toBe(ownTip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
+test('work done resumes an interrupted different-branch removal using the recorded checkout tip', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'resume-switched').status).toBe(0);
+  const work = join(root, 'work', 'TC-resume-switched');
+  const ownTip = git(['rev-parse', 'HEAD'], work);
+  git(['switch', '-c', 'work/TC-resume-landed'], work);
+  writeFileSync(join(work, 'resumed'), 'same contents\n');
+  git(['add', 'resumed'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'branch tip'], work);
+  const checkoutTip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'resumed'), 'same contents\n');
+  git(['add', 'resumed'], seed);
+  git(['commit', '-m', 'landed contents'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const ledgerFile = join(root, 'house.json');
+  const ledger = JSON.parse(readFileSync(ledgerFile, 'utf8'));
+  ledger.sandboxes[work] = { ...ledger.sandboxes[work], reclaiming: ownTip,
+    checkoutBranch: 'work/TC-resume-landed', checkoutTip };
+  writeFileSync(ledgerFile, JSON.stringify(ledger));
+  git(['checkout', '--quiet', '--detach'], work);
+  const resumed = hq('work', 'done', 'TC', 'resume-switched');
+  expect(resumed.status, resumed.stderr).toBe(0);
+  expect(existsSync(work)).toBe(false);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-resume-landed'])).toBe(checkoutTip);
+  expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).sandboxes[work]).toBeUndefined();
+}, 120_000);
+
+test('work done refuses an empty changed-file list when main moves past an empty work commit', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'empty').status).toBe(0);
+  const work = join(root, 'work', 'TC-empty');
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'empty'], work);
+  const tip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'main-only'), 'main changed\n');
+  git(['add', 'main-only'], seed);
+  git(['commit', '-m', 'advance main'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const refused = hq('work', 'done', 'TC', 'empty');
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('not merged');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-empty'])).toBe(tip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
+test('work done rejects a clean unlanded change despite equal unrelated paths and keeps branch and ledger', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(hq('work', 'new', 'TC', 'unlanded').status).toBe(0);
+  const work = join(root, 'work', 'TC-unlanded');
+  writeFileSync(join(work, 'missing'), 'not landed\n');
+  git(['add', 'missing'], work);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'not landed'], work);
+  const tip = git(['rev-parse', 'HEAD'], work);
+  writeFileSync(join(seed, 'unrelated'), 'new main path\n');
+  git(['add', 'unrelated'], seed);
+  git(['commit', '-m', 'unrelated'], seed);
+  git(['push', 'origin', 'main'], seed);
+  const refused = hq('work', 'done', 'TC', 'unlanded');
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain('not merged');
+  expect(existsSync(work)).toBe(true);
+  expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-unlanded');
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-unlanded'])).toBe(tip);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
+}, 120_000);
+
 test('work done refuses a branch that gained an unmerged commit after its merge, keeping work and branch', () => {
   const root = join(home, 'elanous-hq');
   const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,

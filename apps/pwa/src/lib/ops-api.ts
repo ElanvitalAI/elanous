@@ -11,7 +11,9 @@ export interface GateShard {
 }
 export interface GateShards {
   version: string; updatedAt: string; shards: GateShard[];
-  summary: { total: number; counts: Record<GateShardState, number>; waitReasons: Array<{ reason: string; count: number }>; etaMin: number | null; staleMin: number | null; overrunMin?: number; doneWithFailures?: number };
+  summary: { total: number; counts: Record<GateShardState, number>; waitReasons: Array<{ reason: string; count: number }>; etaMin: number | null; staleMin: number | null; overrunMin?: number; doneWithFailures?: number;
+    /** 게이트 노드 판정(기존/새로). null·없음 = «판정 전» — 「새 실패 0」과 다르다(src/release-loop/gate-shards.ts). */
+    verdict?: { introduced: number; preexisting: number } | null };
 }
 export interface ReleaseRun {
   runId: string;

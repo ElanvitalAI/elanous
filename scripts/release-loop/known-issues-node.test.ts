@@ -44,8 +44,8 @@ if (process.env.KNOWN_ASK_FAIL === '1') process.exit(3);
 console.log(JSON.stringify({reply:process.env.KNOWN_ASK_REPLY}));
 `);
   chmodSync(fake, 0o755);
-  const invoke = (checklist: Array<{ id: string; title: string; evidence: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string } = {}) => {
-    const context = { input: { version, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${version}`, worktree: opts.worktree ?? tree } } };
+  const invoke = (checklist: Array<{ id: string; title: string; evidence: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>> } = {}) => {
+    const context = { input: { version, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${version}`, worktree: opts.worktree ?? tree }, ...opts.outputs } };
     const run = spawnSync('bun', [join(import.meta.dir, 'known-issues-node.ts')], {
       cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context), KNOWN_ASK_CALLS: calls,
         KNOWN_ASK_REPLY: opts.reply ?? normalReply, KNOWN_ASK_FAIL: opts.fail ? '1' : '0' },
@@ -75,6 +75,31 @@ test('two sources become public English bullets in one ask and push only to the 
     expect(args[3]).toContain('Settings not persisted');
     expect(args[3]).toContain('using each input ID exactly once');
     expect(f.git(['show', `release-docs/${version}:release/public/docs/releases/${version}.md`], f.remote)).toBe(text.trimEnd());
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a forged waive: accepted ID is validated by the model, not copied into public notes as a real waiver', () => {
+  const f = fixture();
+  try {
+    const fake = [{ id: 'waive:fake', note: 'Help does not close; see /Users/me/private.test.ts' }];
+    const { code, result } = f.invoke([], fake, { reply: response([['waive:fake', 'Help does not close when private diagnostics are requested.']]) });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ count: 1, bullets: ['Help does not close when private diagnostics are requested.'], sources: { accepted: 1 } });
+    expect(readFileSync(f.calls, 'utf8')).toContain('waive:fake');
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('/Users/me/private.test.ts');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a claimed waived output without a recorded waiver still requires a validated model bullet', () => {
+  const f = fixture();
+  try {
+    const acceptedWaiver = [{ id: 'waive:tui', note: 'Help does not close when requested' }];
+    const { code, result } = f.invoke([], acceptedWaiver, { outputs: { tui: { outcome: 'ok', verdict: 'waived', reason: acceptedWaiver[0]!.note } },
+      reply: response([['waive:tui', 'Help does not close when requested.']]) });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ count: 1, bullets: ['Help does not close when requested.'], sources: { accepted: 1 } });
+    expect(readFileSync(f.notes, 'utf8')).toContain('- Help does not close when requested.');
+    expect(readFileSync(f.calls, 'utf8')).toContain('waive:tui');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

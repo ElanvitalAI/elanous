@@ -1,4 +1,8 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { debug } from '../debug/log.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { LLMMessage, LLMProvider, StreamWithToolsHandlers } from '../llm.js';
 import * as llmActual from '../llm.js';
@@ -19,6 +23,8 @@ const body = (count: number): string =>
 const toolBody = (text: string): LogEntry => ({ kind: 'tool-body', text });
 
 const TOOL_OUTPUT = body(4);
+/** When set, the mocked tool loop throws this exact object (SK1 failure path). */
+let streamFailure: Error | null = null;
 
 const testProvider: LLMProvider = {
   name: 'test',
@@ -36,6 +42,7 @@ mock.module('../llm.js', () => ({
     _messages: LLMMessage[],
     handlers: StreamWithToolsHandlers,
   ) => {
+    if (streamFailure) throw streamFailure;
     const call = { id: 'call-1', name: 'Read', args: { file_path: '/tmp/demo.txt' } };
     handlers.onToolCall?.(call);
     handlers.onToolResult?.({ id: call.id, name: call.name, result: TOOL_OUTPUT });
@@ -44,6 +51,17 @@ mock.module('../llm.js', () => ({
 }));
 
 const { executeSkill, skillFoldRenderOpts } = await import('./runner.js');
+
+// Every executeSkill run now appends to <state>/skills/feedback.jsonl — keep this
+// whole file on a throwaway state root (SK1 tests below nest their own).
+const fileStateRoot = mkdtempSync(join(tmpdir(), 'runner-test-state-'));
+const fileStatePrev = process.env.ELANOUS_STATE_DIR;
+beforeAll(() => { process.env.ELANOUS_STATE_DIR = fileStateRoot; });
+afterAll(() => {
+  if (fileStatePrev === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = fileStatePrev;
+  rmSync(fileStateRoot, { recursive: true, force: true });
+});
 
 const demoManifest: SkillManifest = {
   name: 'demo-fold',
@@ -121,4 +139,120 @@ describe('executeSkill foldMode seam', () => {
     expect(unfoldedDisplay).toContain('line 4');
     expect(unfoldedDisplay).not.toContain(foldHint('line', 4));
   }, 20_000);
+});
+
+type LedgerLine = { skill: string; outcome: string; failureKind?: string; runId: string };
+const readLedger = (root: string): LedgerLine[] =>
+  readFileSync(join(root, 'skills', 'feedback.jsonl'), 'utf8')
+    .split('\n').filter((l) => l.trim() !== '').map((l) => JSON.parse(l) as LedgerLine);
+
+describe('executeSkill feedback ledger (SK1)', () => {
+  test('success and thrown runs each leave one line under the state root; the original error object is rethrown', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sk1-runner-'));
+    const prevState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const manifest: SkillManifest = { ...demoManifest, name: 'sk1-in-process' };
+      const ok = await executeSkill(manifest, '', () => {});
+      expect(ok.fullResponse).toContain('line 4');
+
+      const boom = new RangeError('provider exploded');
+      streamFailure = boom;
+      let caught: unknown;
+      try {
+        await executeSkill(manifest, '', () => {});
+      } catch (error) {
+        caught = error;
+      } finally {
+        streamFailure = null;
+      }
+      expect(caught).toBe(boom);
+
+      const lines = readLedger(root).filter((l) => l.skill === 'sk1-in-process');
+      expect(lines.map((l) => l.outcome)).toEqual(['success', 'failure']);
+      expect(lines[0]!.failureKind).toBeUndefined();
+      expect(lines[1]!.failureKind).toBe('RangeError');
+      expect(lines[0]!.runId).not.toBe(lines[1]!.runId);
+      expect(existsSync(join(demoManifest.skillDir, '.skill-feedback.jsonl'))).toBe(false);
+    } finally {
+      streamFailure = null;
+      if (prevState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = prevState;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test('unwritable state root: result and original error pass through, one record-failed per run', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sk1-unwritable-'));
+    const blocker = join(root, 'a-file');
+    writeFileSync(blocker, 'not a directory');
+    const prevState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = join(blocker, 'state');
+    const skill = `sk1-unwritable-${Date.now()}`;
+    const failed = () => debug.events(5000).filter((e) => e.category === 'skill.feedback'
+      && e.event === 'record-failed' && (e.data as { skill?: string } | undefined)?.skill === skill).length;
+    try {
+      const manifest: SkillManifest = { ...demoManifest, name: skill };
+      const ok = await executeSkill(manifest, '', () => {});
+      expect(ok.fullResponse).toContain('line 4');
+      expect(failed()).toBe(1);
+
+      const boom = new SyntaxError('bad turn');
+      streamFailure = boom;
+      let caught: unknown;
+      try {
+        await executeSkill(manifest, '', () => {});
+      } catch (error) {
+        caught = error;
+      } finally {
+        streamFailure = null;
+      }
+      expect(caught).toBe(boom);
+      expect(failed()).toBe(2);
+      expect(readFileSync(blocker, 'utf8')).toBe('not a directory');
+    } finally {
+      streamFailure = null;
+      if (prevState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = prevState;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test('a separate process with ELANOUS_STATE_DIR writes <state>/skills/feedback.jsonl through the real root resolution', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sk1-spawn-'));
+    let proc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const runner = join(import.meta.dir, 'runner.ts');
+      const code = `
+        const { executeSkill } = await import(${JSON.stringify(runner)});
+        const provider = { name: 'sk1-test', defaultModel: 'sk1-model', available: () => true,
+          async *chat() { yield 'pong'; } };
+        const r = await executeSkill(
+          { name: 'sk1-spawn-skill', description: 'sk1', content: '# sk1', skillDir: ${JSON.stringify(join(root, 'no-skill-dir'))} },
+          '', () => {}, { provider, maxTurns: 1 });
+        console.log('SK1_RESULT ' + JSON.stringify(r.fullResponse));
+        process.exit(0);
+      `;
+      const env: Record<string, string> = { ...process.env as Record<string, string>, ELANOUS_STATE_DIR: root };
+      const child = Bun.spawn(['bun', '-e', code], {
+        cwd: process.cwd(), env, stdout: 'pipe', stderr: 'pipe', timeout: 110_000, killSignal: 'SIGKILL',
+      });
+      proc = child;
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      expect(exitCode === 0 ? 'ok' : `exit ${exitCode}\n${stderr.slice(-2000)}`).toBe('ok');
+      expect(stdout).toContain('SK1_RESULT');
+      expect(existsSync(join(root, 'skills', 'feedback.jsonl'))).toBe(true);
+      const successes = readLedger(root).filter((l) => l.skill === 'sk1-spawn-skill' && l.outcome === 'success');
+      expect(successes).toHaveLength(1);
+      expect(existsSync(join(root, 'no-skill-dir'))).toBe(false);
+    } finally {
+      if (proc && proc.exitCode === null) {
+        proc.kill('SIGKILL');
+        await proc.exited;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

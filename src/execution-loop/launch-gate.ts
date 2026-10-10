@@ -22,7 +22,7 @@ export interface ActiveRunsForGoalDeps {
 /** Only a live process with an exact goal ID or verbatim authored ask is a duplicate. Incomplete observation is not absence. */
 export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = {}): ActiveRunsForGoal {
   try {
-    const observation = (deps.queryRuns ?? (() => queryRunningRuns({ includeTest: true, caller: 'execution-loop.launch-gate', noCache: true })))();
+    const observation = (deps.queryRuns ?? (() => queryRunningRuns({ includeTest: true, caller: 'execution-loop.launch-gate' })))();
     const loadLedger = deps.loadLedger ?? loadRunLedger;
     const readGoalDocument = deps.readGoalDocument ?? ((path: string) => readFileSync(path, 'utf8'));
     let unknown = observation.completeness !== 'complete' || observation.pty.unreadable.length > 0;

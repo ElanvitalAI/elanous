@@ -36,6 +36,19 @@ export function parseLease(raw: string | null): LeaseRecord | null {
 export const serializeLease = (record: LeaseRecord): string => `${JSON.stringify(record)}\n`;
 export const leaseExpired = (record: LeaseRecord, now: number): boolean => record.renewedAt + record.ttlSeconds < now;
 
+/** Host-local, short-lived shell fence snapshot; never the arbiter's CAS lease ledger. */
+export interface LocalLeaseCache { holder: string; generation: number; expiresAt: number; host: string; machine: string; confirmedAt: number }
+export const LOCAL_LEASE_CACHE_SECONDS = 660; // heartbeat cadence 600s + 60s scheduling slack; still below the 1500s lease TTL
+/** A single whitespace-delimited line so /bin/sh can read it without bun or JSON tools. */
+export function serializeLocalLeaseCache(cache: LocalLeaseCache): string {
+  if (![cache.holder, cache.host, cache.machine].every(value => /^[A-Za-z0-9_.-]+$/.test(value))
+    || !Number.isSafeInteger(cache.generation) || cache.generation < 1
+    || !Number.isSafeInteger(cache.expiresAt) || cache.expiresAt < 1
+    || !Number.isSafeInteger(cache.confirmedAt) || cache.confirmedAt < 1
+    || cache.expiresAt <= cache.confirmedAt || cache.expiresAt - cache.confirmedAt > LOCAL_LEASE_CACHE_SECONDS) throw new Error('invalid local lease cache');
+  return `${cache.holder} ${cache.generation} ${cache.expiresAt} ${cache.host} ${cache.machine} ${cache.confirmedAt}\n`;
+}
+
 /** acquire: only when there is no lease or it has expired; a new holder gets the next generation. */
 export function decideAcquire(record: LeaseRecord | null, me: string, now: number, ttlSeconds = DEFAULT_TTL_SECONDS):
   { ok: true; next: LeaseRecord } | { ok: false; reason: string } {

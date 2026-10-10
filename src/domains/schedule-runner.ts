@@ -26,6 +26,7 @@ import { openSchedulesDb, listSchedules, readCrontab, parseCronLine, scriptName,
 import { recordScheduledExecution } from './schedule-observability.js';
 import { prevScheduledFire } from './cron-match.js';
 import { resolveTimeZone } from '../time/format.js';
+import '../user-config.js'; // Register the saved timezone before selecting the firing and catch-up clock.
 import { debug } from '../debug/log.js';
 
 interface CronTaskLike { stop(): void }

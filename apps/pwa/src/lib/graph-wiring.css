@@ -1,0 +1,9 @@
+/* The highlighted route uses one 17-unit dash cycle in both graph views. */
+@keyframes graph-wiring-flow {
+  to { stroke-dashoffset: -17; }
+}
+
+.react-flow__edge.wiring-edge-flow .react-flow__edge-path {
+  stroke-dasharray: 3 14;
+  animation: graph-wiring-flow 1.1s linear infinite;
+}

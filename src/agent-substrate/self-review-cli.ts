@@ -21,6 +21,7 @@ import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js'
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
 import { budgetReviewerContext, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
+import type { SubscriptionReviewerSpec } from '../user-config.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 
 export interface SelfReviewCliOpts {
@@ -30,6 +31,8 @@ export interface SelfReviewCliOpts {
   acpModel?: string | undefined;
   acpBackend?: string | undefined;
   configuredAcpBackend?: string | undefined;
+  /** `roleLlm.reviewer` (same resolution as the harness). Used only when no explicit reviewer flag is given. */
+  roleReviewer?: SubscriptionReviewerSpec | undefined;
   acpTimeout?: string | undefined;
   context?: string[] | undefined;
   contextText?: string[] | undefined;
@@ -65,6 +68,14 @@ export interface SelfReviewCliDeps {
    * ⚠️ API 백엔드(`makeApiLlm`)는 이 인자를 안 받는다 — ACP 경로만 이미지를 나른다.
    */
   makeAcpLlm(o: { backend: string; model?: string; timeoutMs: number }): (prompt: string, images?: readonly ReviewImage[]) => Promise<string>;
+  /**
+   * Reviewer ACP lane selected by `roleLlm.reviewer` (no explicit flag). Returns the LLM when the
+   * subscription is usable, or a reason code when it is not — the caller then reviews on the API
+   * exactly as before. Absent seam = the lane is unavailable (`role-reviewer-seam-missing`).
+   */
+  makeRoleReviewerLlm?(spec: SubscriptionReviewerSpec, o: { timeoutMs: number }):
+    | { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; backend: string }
+    | { reason: string };
   /** 관측 sink 등록 — ⭐ 이 호출이 분기 밖에 있는지가 이 트랙의 계약이다. */
   registerSink(surface: string): Promise<void>;
   /** `data` 는 payload 객체 — 순수 헬퍼가 만든 관측 타입도 그대로 받는다(인덱스 시그니처 강요 금지). */
@@ -1083,6 +1094,12 @@ function reviewerContextOutput(loaded: LoadedReviewerContext, decomposition?: De
 
 const MAX_ACP_REVIEW_FALLBACK_CANDIDATES = 4;
 
+/** Same reason codes as the harness lane (`runSubscriptionReviewer`) — a raw message may carry account or proxy details. */
+function roleAcpErrorReason(error: unknown): 'acp-handshake-timeout' | 'acp-error' {
+  const message = error instanceof Error ? error.message : String(error);
+  return /handshake timeout/i.test(message) ? 'acp-handshake-timeout' : 'acp-error';
+}
+
 type AcpFallbackSkip = { backend: string; reason: string };
 
 function orderedAcpReviewFallbackBackends(configuredBackend: string | undefined): {
@@ -1133,6 +1150,14 @@ export function renderReviewerContextStatus(loaded: LoadedReviewerContext, decom
 }
 
 /** `elanous self review <pr...>` 본문. read-only — 머지하지 않는다. */
+/**
+ * `self review --json` stdout 한 줄 — 결과가 하나면 객체, 여럿이면 배열. index.ts 액션이 이것을 그대로 쓴다.
+ * TA-REVIEW-RESULT-CAPTURE — task agent 는 떼어 띄운 리뷰의 stdout 을 파일로 받아 이 줄을 읽는다(형식 계약 = 이 함수).
+ */
+export function selfReviewJsonLine(results: readonly unknown[]): string {
+  return JSON.stringify(results.length === 1 ? results[0] : results) + '\n';
+}
+
 export async function runSelfReviewCliCommand(
   prArgs: string[],
   opts: SelfReviewCliOpts,
@@ -1173,6 +1198,41 @@ export async function runSelfReviewCliCommand(
     acpReviewLLM = deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: acpTimeoutSec * 1000 });
   }
   const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || deps.envModel() || tierModel('better'));
+  // ⭐ Reviewer selection source. An explicit flag always wins byte-for-byte; only without one does
+  //    `roleLlm.reviewer` (the harness's reviewer row) pick the ACP lane. Worst case = today's API review.
+  const explicitReviewerFlag = opts.acp === true || Boolean(opts.acpBackend) || Boolean(opts.acpModel?.trim()) || Boolean(opts.model?.trim());
+  const reviewerSource: 'cli' | 'role-config' | 'default' = explicitReviewerFlag ? 'cli' : opts.roleReviewer ? 'role-config' : 'default';
+  let roleReviewer: { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; model: string } | undefined;
+  let roleReviewerUnavailableReason: string | undefined;
+  let roleReviewerAvailabilityMs: number | undefined;
+  // ⚠️ Availability (subscription ⊕ usage cap ⊕ proxy URL) is checked once per command, not per PR —
+  //    a mid-run change is caught by the per-PR review attempt failing and falling back to the API.
+  if (reviewerSource === 'role-config' && opts.roleReviewer) {
+    const availabilityStartedAt = deps.now();
+    try {
+      const made = deps.makeRoleReviewerLlm
+        ? deps.makeRoleReviewerLlm(opts.roleReviewer, { timeoutMs: acpTimeoutSec * 1000 })
+        : { reason: 'role-reviewer-seam-missing' };
+      if ('llm' in made) roleReviewer = { llm: made.llm, model: `acp:${made.backend}` };
+      else roleReviewerUnavailableReason = safeLogText(made.reason, 400);
+    } catch (error) {
+      roleReviewerUnavailableReason = roleAcpErrorReason(error);
+    }
+    roleReviewerAvailabilityMs = deps.now() - availabilityStartedAt;
+    if (roleReviewerUnavailableReason) {
+      deps.log('role-reviewer-fallback', {
+        reviewerSource, roleReviewerProvider: opts.roleReviewer.provider, roleReviewerAvailabilityMs,
+        stage: 'availability', reason: roleReviewerUnavailableReason, fallbackModel: safeLogText(model),
+      }, { level: 'warn' });
+    }
+  }
+  const primaryModel = roleReviewer?.model ?? model;
+  const reviewerSourceObservation = (): Record<string, unknown> => ({
+    reviewerSource,
+    ...(reviewerSource === 'role-config' && opts.roleReviewer ? { roleReviewerProvider: opts.roleReviewer.provider } : {}),
+    ...(roleReviewerAvailabilityMs !== undefined ? { roleReviewerAvailabilityMs } : {}),
+    ...(roleReviewerUnavailableReason ? { roleReviewerFallbackReason: roleReviewerUnavailableReason } : {}),
+  });
   const results: Array<Record<string, unknown>> = [];
   const providedReviewerContext = loadReviewerContext(opts, deps.readReferencedFile);
   const hasProvidedReviewerContext = (opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0;
@@ -1220,8 +1280,10 @@ export async function runSelfReviewCliCommand(
       if (!intent) intent = `PR ${pr}`;
     }
     const startObservation = (extra: Record<string, unknown> = {}) => deps.log('start', {
-      pr: safeLogText(pr), model: safeLogText(model),
-      backend: safeLogText(useAcp ? `acp:${acpBackend}` : 'api'),
+      pr: safeLogText(pr), model: safeLogText(primaryModel),
+      ...reviewerSourceObservation(),
+      ...(roleReviewer ? { roleReviewerModel: safeLogText(roleReviewer.model) } : {}),
+      backend: safeLogText(useAcp ? `acp:${acpBackend}` : roleReviewer ? roleReviewer.model : 'api'),
       ...(useAcp ? { acpBackend: safeLogText(acpBackend), acpBackendSource: acpBackendResolution.source } : {}),
       intentChars: intent.length, intentGiven: opts.intent !== undefined, intentSource,
       reviewerContextLoaded: reviewerContext.items.length, reviewerContextFailed: reviewerContext.failed.length,
@@ -1279,7 +1341,7 @@ export async function runSelfReviewCliCommand(
     if (mismatchWarning) deps.error(mismatchWarning.warning);
     // ⚠️ 「1차」라고 못 박는다 — 폴백은 이 줄 «뒤»에 일어난다. 그냥 model= 로 두면
     //    사용자가 이 줄에서 «최종» 리뷰 주체를 읽으려다 오해한다(리뷰 should-fix).
-    if (!opts.json) deps.info(`[self-review] PR ${pr} · 1차 model=${model} · 리뷰 중…`);
+    if (!opts.json) deps.info(`[self-review] PR ${pr} · 1차 model=${primaryModel} · 리뷰 중…`);
     const provenance = {
       headCommit: diffRead.headCommit,
       currentHeadCommit: diffRead.currentHeadCommit,
@@ -1295,24 +1357,25 @@ export async function runSelfReviewCliCommand(
       ...(mismatchWarning ?? {}),
     };
     if (diffRead.stale) {
-      deps.log('done', buildReviewObservation({
-        pr, model, intent, review: null, durationMs: 0,
+      deps.log('done', { ...buildReviewObservation({
+        pr, model: primaryModel, intent, review: null, durationMs: 0,
         ...intentTruncation,
         headCommit: diffRead.headCommit, headCommitState: diffRead.headCommitState,
         currentHeadCommit: diffRead.currentHeadCommit, currentHeadCommitState: diffRead.currentHeadCommitState,
         stale: true, refetched: diffRead.refetched,
-      }), { level: 'warn' });
+      }), ...reviewerSourceObservation() }, { level: 'warn' });
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
       const refused = {
-        pr, model, verdict: null, mustFix: [], shouldFix: [], reviewed: false,
-        refusal: 'stale-head', ...provenance, ...contextOutput,
+        pr, model: primaryModel, verdict: null, mustFix: [], shouldFix: [], reviewed: false,
+        refusal: 'stale-head', ...provenance, ...reviewerSourceObservation(), ...contextOutput,
       };
       if (opts.json) results.push(refused);
-      else deps.print(`\n━━ PR ${pr} (${model}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
+      else deps.print(`\n━━ PR ${pr} (${primaryModel}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
       continue;
     }
     const startedAt = deps.now();
-    const llmReview = acpReviewLLM ?? deps.makeApiLlm(model);
+    // Role-config lane builds the API reviewer only when it falls back (`made().api` stays 0 on ACP success).
+    const llmReview = roleReviewer ? undefined : (acpReviewLLM ?? deps.makeApiLlm(model));
     // ⛔ evidenceNote 는 **별도 채널**이다 — phaseIntent 에 섞으면 의도 채널이 오염된다(실측: 그렇게
     //   했다가 intent 배선 테스트 3개가 즉시 깨졌다).
     // ⛔ 사람 `--intent`(phaseIntent) 와 골 acceptance 는 다른 인자 — 충돌하지 않고, 충돌해도 intent 가 이긴다.
@@ -1325,15 +1388,41 @@ export async function runSelfReviewCliCommand(
       ...(deps.readReferencedFile ? { readReferencedFile: deps.readReferencedFile } : {}),
       ...(goalAcceptance.acceptance ? { acceptance: goalAcceptance.acceptance } : {}),
     };
-    let review = await deps.reviewPullRequest(reviewInput, llmReview);
-    let selectedModel = model;
-    let reviewRoute: 'api' | 'acp' | 'acp-fallback' = useAcp ? 'acp' : 'api';
+    // ⭐ Role-config ACP lane: a completed ACP review is used as-is; anything else (throw, reviewed≠true)
+    //    falls to the same API review this command ran before the lane existed — and is observed.
+    // ⚠️ Stricter than the harness lane on purpose: `runSubscriptionReviewer` accepts any non-empty text;
+    //    here only a parsed, completed review (`reviewed === true`) is adopted, else the API review runs.
+    let roleReview: ReviewResult | undefined;
+    let roleReviewerFallbackReason = roleReviewerUnavailableReason;
+    let roleReviewMs: number | undefined;
+    if (roleReviewer) {
+      const roleStartedAt = deps.now();
+      try {
+        const attempt = await deps.reviewPullRequest(reviewInput, roleReviewer.llm);
+        if (attempt.reviewed === true) roleReview = attempt;
+        // Code, not the reviewer's raw failure text (same rule as the throw path above).
+        else roleReviewerFallbackReason = 'acp-review-not-completed';
+      } catch (error) {
+        roleReviewerFallbackReason = roleAcpErrorReason(error);
+      }
+      roleReviewMs = deps.now() - roleStartedAt;
+      if (!roleReview) {
+        deps.log('role-reviewer-fallback', {
+          roleReviewMs,
+          pr: safeLogText(pr), reviewerSource, roleReviewerProvider: opts.roleReviewer?.provider,
+          stage: 'review', reason: roleReviewerFallbackReason ?? 'acp-review-not-completed', fallbackModel: safeLogText(model),
+        }, { level: 'warn' });
+      }
+    }
+    let review = roleReview ?? await deps.reviewPullRequest(reviewInput, llmReview ?? acpReviewLLM ?? deps.makeApiLlm(model));
+    let selectedModel = roleReview && roleReviewer ? roleReviewer.model : model;
+    let reviewRoute: 'api' | 'acp' | 'acp-fallback' = useAcp || roleReview ? 'acp' : 'api';
     let fallbackAttempted = false;
     let fallbackBackend: string | undefined;
     let fallbackTriggerReason: string | undefined;
     let fallbackNotAttemptedReason: 'explicit-acp' | 'primary-review-succeeded' | undefined;
     const fallbackFailures: Array<{ backend: string; reason: string }> = [];
-    if (!useAcp && review.reviewed !== true) {
+    if (!useAcp && !roleReview && review.reviewed !== true) {
       fallbackAttempted = true;
       fallbackTriggerReason = safeLogText(review.failureReason || 'reviewed=false', 400);
       for (const backend of fallbackAcpBackends) {
@@ -1374,6 +1463,11 @@ export async function runSelfReviewCliCommand(
       ...(fallbackFailures.length ? { fallbackFailures } : {}),
       ...(skippedAcpFallbackBackends.length ? { skippedAcpFallbackBackends } : {}),
     };
+    // ⚠️ `buildReviewObservation` drops unknown keys — the selection rides next to it, not inside it.
+    const reviewerSelection = {
+      ...reviewerSourceObservation(),
+      ...(roleReviewerFallbackReason !== undefined ? { roleReviewerFallbackReason } : {}),
+    };
     // ⚠️ verdict=fail 은 **정상 동작**(리뷰가 일한 것)이라 warn 으로 올리지 않는다. 대신 `reviewed:false`
     //    (fail-soft pass·리뷰 미실행)는 조용히 통과로 읽히면 위험하므로 warn 이다.
     deps.log('done',
@@ -1391,19 +1485,20 @@ export async function runSelfReviewCliCommand(
         }),
         goalLoaded: goalAcceptance.goalLoaded,
         acceptanceChars: goalAcceptance.acceptanceChars,
+        ...reviewerSelection,
       },
       { level: review.reviewed === false ? 'warn' : 'info' });
     // --acp 는 대표가 명시 요청한 리뷰 — fail-soft(reviewed=false)면 조용히 pass 하지 말고 표면화(관측=acp-review).
     if (useAcp && review.reviewed === false) {
       const err = 'ACP 리뷰 실행 실패(reviewed=false) — 관측: elanous logs --category acp-review';
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...provenance, ...contextOutput });
+      if (opts.json) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...reviewerSelection, ...provenance, ...contextOutput });
       else deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
       continue;
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
     const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
-    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    if (opts.json) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...reviewerSelection, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
     else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
   }
   return { results };

@@ -26,9 +26,7 @@ import { isPidAlive } from '../git-fs/worktree.js';
 import type { EmbodiedTransportKind } from '../agent/embodiment.js';
 import type { RunIdSource } from '../harness/harness-space.js';
 import { withFileLockSync } from '../storage/file-lock.js';
-import type { SelfDevJobResult, SelfDevGoal } from './orchestrate.js';
-import type { SupervisorStopReason } from './run-supervisor.js';
-import type { SupervisorNext } from './supervisor-verdict-edges.js';
+import type { SelfDevJobResult, SelfDevGoal, SupervisorStopReason, SupervisorNext } from './run-types.js';
 import { loadMirroredRunRecord, mirrorRunRecord } from './run-record-mirror.js';
 
 export interface SelfDevRunParticipant {

@@ -20,6 +20,7 @@ import type { ToolRenderModel } from '../chat/tool-render/types.js';
 import { toolOperationKind, type FoldMode } from '../log-entry.js';
 import { stripAnsi } from '../tui.js';
 import type { TurnStreamPresentationEvent } from './turn-stream-presentation-applier.js';
+import { buildFoldedTailLine, splitNoSynthesisTail } from './chat-fold.js';
 
 /** Drop leading/trailing blank (whitespace-only, ANSI-stripped) rows
  *  from a rendered assistant block. Codex-family models frequently
@@ -181,6 +182,7 @@ export function createTurnStreamFormatter(
   const toolArgsByCallId = new Map<string, Record<string, unknown>>();
   const nonGenericCallIds = new Set<string>();
   let toolCallCount = 0;
+  let noSynthesisTailCount = 0;
 
   const emitAssistantBlock = (): void => {
     deps.thinking.update('Streaming');
@@ -219,6 +221,29 @@ export function createTurnStreamFormatter(
       }
       if (chunk === '') {
         // Path 2 — authoritative replacement (W5-E/F/G force-synthesis).
+        const split = splitNoSynthesisTail(accumulated);
+        if (split) {
+          perRoundText = split.head;
+          emitAssistantBlock();
+          closeRound();
+          deps.emit({ type: 'assistant.commit' });
+          const callId = `no-synthesis-tail-${++noSynthesisTailCount}`;
+          const expandedLines = trimBlankEdges(
+            deps.formatResponse(split.tail, deps.termCols() - 6, deps.wrapOpts),
+          ).map(deps.text);
+          const collapsedLines = [buildFoldedTailLine(expandedLines.length)];
+          if (debug.enabled) {
+            debug.log('dashboard.chat.stream', 'formatter.noSynthesisTail.folded', {
+              callId,
+              headLen: split.head.length,
+              tailLen: split.tail.length,
+              expandedLineCount: expandedLines.length,
+            });
+          }
+          deps.emit({ type: 'tool.appendBlock', callId, lines: collapsedLines, args: {} });
+          deps.emit({ type: 'tool.replaceBlock', callId, collapsedLines, expandedLines });
+          return;
+        }
         perRoundText = accumulated;
       } else {
         // Path 3 — streaming delta. accumulated 무시 (cross-turn fullText).

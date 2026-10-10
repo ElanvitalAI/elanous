@@ -39,6 +39,10 @@ export const messagesEn: Messages = {
   rangeError: 'Value must be between {min} and {max}.',
   patternError: '"{value}" does not match the expected pattern.',
 
+  // Chat fallback
+  chatNoSynthesisLead: 'I could not finish the answer — the time to summarize ran out after {n} tool calls. Please ask a narrower question (for example, just one thing).',
+  chatFoldedInternalTail: '● Internal notes folded · {n} lines · press f to expand',
+
   // Async + status
   loading: 'Loading…',
   saving: 'Saving…',
@@ -76,6 +80,7 @@ export const messagesEn: Messages = {
   setupBanner: 'elanous — setup wizard',
   setupWritingTo: 'Writing to: {path}',
   setupComplete: 'Setup complete',
+  setupErrorReportNotice: 'If something breaks, elanous reports the error to our team automatically (error details, version and a random install ID — never your name or email). To turn it off: elanous config set errorReports.enabled false',
   setupRerunHint: 'Re-run: {cmd}',
 
   // Setup wizard — Step 1 (LLM provider)

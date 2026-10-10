@@ -162,6 +162,9 @@ test('weekly CLI dry-run JSON aggregates last week, current issues and deduplica
     expect(result.header.split('\n').map(line => line.slice(0, 2))).toEqual(['S:', 'C:', 'Q:', 'A:']);
     for (const label of ['① 지난주 성과', '② 이번 주 판 계획', '③ 주간 현안', '④ 지난주 현안 이행 대조', '⑤ 결정 필요', '⑥ 주간 외부 동향']) expect(result.markdown).toContain(`## ${label}`);
     expect(result.markdown).toContain('총 9건 · 자리별 TC 9');
+    expect(result.markdown).toContain('지난주 지표: 착지 9건 · 발행 1판');
+    expect(result.markdown).toContain('지난주 착지:\n- [TC] 착지 0 v0.2.14 (TC · 2026-10-07T02:00:00Z)');
+    expect(result.markdown).toContain('- [TC] 착지 8 v0.2.14 (TC · 2026-10-07T02:00:00Z)');
     expect(result.markdown).toContain('green 21/21');
     expect(result.markdown).toContain('발행된 판: 0.2.14');
     expect(result.markdown).toContain('late 늦은 현안 · OP');
@@ -212,6 +215,66 @@ test('daily entrypoint output flows into weekly news, while malformed article li
     expect(broken.markdown).toContain('외부 동향 기사 형식 오류: - 공통 기사 (링크 손상)');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('10-12 Monday review joins real weekly landing collector, scheduled release and daily news without the first-tick mislabels', async () => {
+  const root = temp();
+  const bin = join(root, 'bin'); mkdirSync(bin);
+  const oldPath = process.env.PATH, oldState = process.env.ELANOUS_STATE_DIR, oldGraph = process.env.ELANOUS_GRAPH_DIR;
+  try {
+    setElanousConfigDir(root);
+    process.env.ELANOUS_STATE_DIR = join(root, 'ambient-state');
+    process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+    const runs = join(root, 'self-dev-runs'); mkdirSync(runs);
+    writeFileSync(join(runs, 'landing.json'), JSON.stringify({ runId: 'landing', createdAt: 1, updatedAt: 2, seat: 'TC',
+      results: [{ prNumber: 42, prUrl: 'https://github.com/example/agent/pull/42' }] }));
+    writeFileSync(join(bin, 'bun'), `#!/bin/sh\nprintf '%s\\n' '[{"number":42,"title":"[TC] 지난주 착지","mergedAt":"2026-10-07T02:00:00Z"}]'\n`);
+    chmodSync(join(bin, 'bun'), 0o755);
+    process.env.PATH = `${bin}:${oldPath ?? ''}`;
+    setSchedule('0.2.14', { cutAt: '2026-10-05T00:00:00Z' }, 'OP', root);
+    setSchedule('0.2.16', { cutAt: '2026-10-13T00:00:00Z' }, 'OP', root);
+    addItem('0.2.16', { id: 'WEEK', title: '이번 주 칸' });
+    setItem('0.2.16', 'WEEK', { status: 'red' }, 'TC');
+    daily(root, '2026-10-09', '- 외부 기사 — https://example.org/week');
+    const published = join(root, 'release', '0.2.15'); mkdirSync(published, { recursive: true });
+    writeFileSync(join(published, 'release.json'), JSON.stringify({ version: '0.2.15', publishedAt: '2026-10-08T00:00:00Z' }));
+    const { landings: _landing, release: _release, ...deps } = fixtures(root);
+    let sends = 0;
+    const graphDeps = { ...deps, repoName: 'example/agent', print: () => {}, log: () => {},
+      send: (text: string, kind: string) => {
+        sends++;
+        expect(kind).toBe('ops-report');
+        expect(text).toContain('RHYTHM-WEEKLY:2026-W42');
+        expect(text).toContain('2026-W42.md');
+        return true;
+      } };
+    const collected = await main(['collect', '--json'], graphDeps);
+    if (!collected || !('markdown' in collected)) throw new Error('report missing');
+    const result = await main(['compose', '--json'], graphDeps);
+    if (!result || !('markdown' in result)) throw new Error('report missing');
+    expect(result.markdown).toBe(collected.markdown);
+    expect(sends).toBe(0);
+    expect(result.sections).toMatchObject({ landings: 'ok', release: 'ok', news: 'ok' });
+    expect(result.markdown).toContain('## ① 지난주 성과\n총 1건 · 자리별 TC 1\n발행된 판: 0.2.15\n지난주 지표: 착지 1건 · 발행 1판\n지난주 착지:\n- [TC] 지난주 착지 (TC · 2026-10-07T02:00:00Z)');
+    expect(result.markdown).toContain('## ② 이번 주 판 계획\n0.2.16: green 0/1');
+    expect(result.markdown).toContain('## ⑥ 주간 외부 동향\n- 외부 기사 — https://example.org/week');
+    expect(result.markdown).not.toContain('데일리 없음');
+    expect(result.markdown).not.toContain('## ② 이번 주 판 계획\n0.2.14:');
+    const delivered = await main(['deliver', '--json'], graphDeps);
+    if (!delivered || !('sent' in delivered)) throw new Error('delivery missing');
+    expect(delivered.sent).toBe(true);
+    expect(sends).toBe(1);
+    const duplicate = await main(['deliver', '--json'], graphDeps);
+    if (!duplicate || !('sent' in duplicate)) throw new Error('delivery missing');
+    expect(duplicate.sent).toBe(false);
+    expect(sends).toBe(1);
+  } finally {
+    resetElanousConfigDir();
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldState;
+    if (oldGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = oldGraph;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test('published-version read failure marks the combined landing section unreadable', async () => {
   const root = temp();

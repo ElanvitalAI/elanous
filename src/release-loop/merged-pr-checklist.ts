@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { listChecklist, setItem } from './checklist.js';
+import { judgeLandedCell } from './landed-to-green.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
 import { assignedVersions, evidenceAdd } from './feature-store.js';
 
@@ -13,6 +14,7 @@ export interface MergedPrChecklistDeps {
   checklist?: typeof listChecklist;
   addEvidence?: typeof evidenceAdd;
   setStatus?: typeof setItem;
+  judgeLanded?: typeof judgeLandedCell;
   log?: typeof debug.log;
 }
 
@@ -57,6 +59,14 @@ export function syncMergedPrChecklist(number: number, cwd: string, goalFile?: st
     for (const { id, ref } of evidencePlan([row])) {
       (deps.addEvidence ?? evidenceAdd)(id, version, ref, 'harness', snapshot.released, snapshot.dev);
       log('release.checklist', 'merged-pr-evidence-added', { version, id, pr: number, ref });
+    }
+    const cell = snapshot.items.find((item) => item.id === row.id)!;
+    if (cell.status !== 'green' && cell.status !== 'done') {
+      try {
+        (deps.judgeLanded ?? judgeLandedCell)({ version, id: row.id, title: cell.title, pr: number }, { cwd });
+      } catch (error) {
+        try { log('release.checklist', 'landed-green-error', { version, id: row.id, pr: number, error: String(error) }); } catch { /* Judgment remains fail-soft. */ }
+      }
     }
     if (goal && declaresCompletion(goal)) {
       if (!goalCells(goal).has(row.id)) {

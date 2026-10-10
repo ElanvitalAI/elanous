@@ -28,6 +28,7 @@ import type { TaskSurface } from '../src/task-orchestrator/types.ts';
 import { setIntakeStoreForTest } from '../src/intake-plane/runtime.ts';
 import { createIntakeStore } from '../src/intake-plane/store.ts';
 import { setDaemonInputHostForTesting } from '../src/voice/daemon-input-host-singleton';
+import type { ContextNowAnswer } from '../src/context-bus/context-now.js';
 import { setDaemonSttProviderForTesting } from '../src/voice/voice-rest-handler';
 import { setDaemonTtsProviderForTesting } from '../src/voice/voice-tts-singleton';
 import type { STTProvider } from '../src/voice/stt-provider';
@@ -120,6 +121,12 @@ function makeStubFetch(responder: (call: Call) => any): { fetchImpl: typeof fetc
   };
   return { fetchImpl, calls };
 }
+
+// Since TG-EMPTY-ANSWER (#26014) the context-first opening is sent only when there are live
+// operational rows. Tests that pin the «opening, then placeholder» ordering inject one live run
+// (same fixture as telegram-owner-gate.test.ts) instead of depending on the host's ledgers.
+const CONTEXT_LIVE: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [{ kind: 'run', goal: 'G', phase: 'implement', elapsed: '1분', source: 'run://g' }], events: [], guide: [] };
+const LIVE_CONTEXT_OPTS = { readContextNow: () => CONTEXT_LIVE } as const;
 
 const FAST_TG_OPTS = {
   errorBackoffMs: 0,
@@ -416,6 +423,7 @@ describe('TelegramBot', () => {
       onMessage: async (ctx) => { gotTexts.push(ctx.text); return `echo: ${ctx.text}`; },
       fetchImpl,
       ...FAST_TG_OPTS,
+      ...LIVE_CONTEXT_OPTS,
     });
     await bot.start();
 
@@ -463,6 +471,7 @@ describe('TelegramBot', () => {
       onMessage: async () => { clock += 25_000; return '리드미갱신완료'; },
       fetchImpl, nowImpl: () => clock,
       ...FAST_TG_OPTS,
+      ...LIVE_CONTEXT_OPTS,
     });
     await bot.start();
 
@@ -1105,6 +1114,7 @@ describe('TelegramBot', () => {
       },
       fetchImpl,
       ...FAST_TG_OPTS,
+      ...LIVE_CONTEXT_OPTS,
     });
     await bot.start();
 
@@ -1329,6 +1339,7 @@ describe('TelegramBot', () => {
       onMessage: async () => { throw new Error('boom'); },
       fetchImpl,
       ...FAST_TG_OPTS,
+      ...LIVE_CONTEXT_OPTS,
     });
     await bot.start();
 

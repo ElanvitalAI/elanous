@@ -11,8 +11,8 @@ import {
 } from './nested-elanous-policy.js';
 describe('nested elanous policy', () => {
   it('codex argv carries the child depth marker', () => {
-    expect(nestedDepthCodexArgs('codex', 1)).toEqual(['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=1`]);
-    expect(nestedDepthCodexArgs('codex', 2)).toEqual(['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=2`]);
+    expect(nestedDepthCodexArgs('codex', 1)).toEqual(['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}="1"`]);
+    expect(nestedDepthCodexArgs('codex', 2)).toEqual(['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}="2"`]);
   });
 
   it('a requested nested launch on a backend that cannot carry the marker is refused', () => {

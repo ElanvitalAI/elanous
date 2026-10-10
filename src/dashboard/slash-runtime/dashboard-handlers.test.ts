@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { ProjectStore } from '../../project/project-store.js';
 import { CardStore } from '../../task-cards/card-store.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
+import { getUserConfig, reloadUserConfig, saveUserConfig } from '../../user-config.js';
+import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveSurfaceUx } from '../../agent/surface-ux/build.js';
 import { debug } from '../../debug/log.js';
@@ -370,6 +372,52 @@ test('/session new suggests a matching project once without assigning it to a se
     lines.length = 0;
     await buildDashboardSlashRegistry().dispatch('session', ['clear'], ctx);
     expect(lines.join('\n')).not.toContain('Project suggestion:');
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/model without arguments shows the current model, tier name, and effective thinking depth', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-tui-model-overview-'));
+  setElanousConfigDir(root);
+  try {
+    const spec = lookupLlmTierSpec('openai-codex', 'better');
+    const config = getUserConfig();
+    saveUserConfig({
+      ...config,
+      llm: {
+        ...config.llm,
+        provider: 'openai-codex', model: spec.model,
+        reasoningLevel: 'medium', codexReasoning: undefined,
+      },
+    });
+    reloadUserConfig();
+    const lines: string[] = [];
+    const ctx = createContext(lines);
+    ctx.refreshReasoningHudSegment = () => {};
+    // Live caller: src/dashboard/index.ts showDashboard → dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx).
+    await expect(buildDashboardSlashRegistry().dispatch('model', [], ctx))
+      .resolves.toEqual({ kind: 'continue' });
+    expect(lines[0]).toBe(`지금: ${spec.model} (보통 · 생각 medium) · 고르기: /model 빠름 | 보통 | 깊음`);
+    expect(lines[1]).toContain('코드명도 됨: codex · terra · sol · luna · opus · sonnet · grok');
+    expect(getUserConfig().llm.model).toBe(spec.model);
+
+    for (const [word, tier] of [['빠름', 'budget'], ['보통', 'better'], ['깊음', 'best']] as const) {
+      const selected = lookupLlmTierSpec('openai-codex', tier);
+      await buildDashboardSlashRegistry().dispatch('model', [word], ctx);
+      expect(getUserConfig().llm).toMatchObject({ provider: 'openai-codex', model: selected.model, reasoningLevel: selected.reasoningLevel });
+    }
+    await buildDashboardSlashRegistry().dispatch('model', ['opus'], ctx);
+    expect(getUserConfig().llm).toMatchObject({ provider: 'anthropic', model: 'claude-opus-4-8', reasoningLevel: lookupLlmTierSpec('openai-codex', 'best').reasoningLevel });
+
+    // Outside the tier map: the tier slot is explicit, not silently dropped.
+    const custom = getUserConfig();
+    saveUserConfig({ ...custom, llm: { ...custom.llm, provider: 'anthropic', model: 'some-custom-model', reasoningLevel: 'medium' } });
+    reloadUserConfig();
+    lines.length = 0;
+    await buildDashboardSlashRegistry().dispatch('model', [], ctx);
+    expect(lines[0]).toBe('지금: some-custom-model (단계 밖 · 생각 medium) · 고르기: /model 빠름 | 보통 | 깊음');
   } finally {
     resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });

@@ -63,7 +63,7 @@ export function classifyMergeHoldStop(mergeReason: string | undefined): RunStopC
   const reason = mergeReason ?? '';
   if (reason.startsWith('main-sync') || reason === 'default-branch-unresolved') return 'main-sync';
   if (reason === 'required-evidence-uncovered') return 'evidence-uncovered';
-  if (reason === 'review-must-fix' || reason.startsWith('review-budget')) return 'review-repeat';
+  if (reason === 'review-must-fix' || reason === 'review-warn-with-must-fix' || reason.startsWith('review-budget')) return 'review-repeat';
   if (reason.startsWith('review-diff') || reason === 'no-real-review') return 'review-out-of-scope';
   return 'unclassified';
 }

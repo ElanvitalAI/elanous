@@ -156,6 +156,8 @@ export interface RemoteRunOptions {
   repo: string;
   host: string;
   mirror: string;
+  /** Exact local commit to run instead of HEAD; permits a dirty worktree. */
+  commit?: string;
   /** argv run from the remote checkout root, e.g. ['bun', 'bin/elanous.mjs', 'self', 'gate', ...]; a function receives
    *  `sha(ref)` for each of `refs` so the remote command names the exact commit, not a ref the host may not have. */
   argv: RemoteArgv;
@@ -233,12 +235,21 @@ function revParse(runner: GateRemoteRunner, repo: string, ref: string): string |
 
 export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = realGateRemoteRunner): RemoteRunOutcome {
   const started = Date.now();
-  const status = runner.local('git', ['status', '--porcelain'], opts.repo);
-  if (status.rc !== 0) return { kind: 'infra', reason: 'git-status-failed' };
-  // A remote checkout can only reproduce a commit — uncommitted or untracked files would silently not be measured.
-  if (status.stdout.trim()) return { kind: 'infra', reason: 'dirty-tree' };
-  const commit = revParse(runner, opts.repo, 'HEAD');
-  if (!commit) return { kind: 'infra', reason: 'head-unresolved' };
+  let commit: string;
+  if (opts.commit !== undefined) {
+    if (!shaPattern.test(opts.commit)) return { kind: 'infra', reason: 'invalid-commit' };
+    const object = runner.local('git', ['cat-file', '-t', opts.commit], opts.repo);
+    if (object.rc !== 0 || object.stdout.trim() !== 'commit') return { kind: 'infra', reason: 'commit-missing' };
+    commit = opts.commit;
+  } else {
+    const status = runner.local('git', ['status', '--porcelain'], opts.repo);
+    if (status.rc !== 0) return { kind: 'infra', reason: 'git-status-failed' };
+    // A remote checkout can only reproduce a commit — uncommitted or untracked files would silently not be measured.
+    if (status.stdout.trim()) return { kind: 'infra', reason: 'dirty-tree' };
+    const head = revParse(runner, opts.repo, 'HEAD');
+    if (!head) return { kind: 'infra', reason: 'head-unresolved' };
+    commit = head;
+  }
   // Every check measures against merge-base(origin/main); without the local one the host would fall back to its mirror's
   // (possibly stale) branch — not the same measurement.
   const mainSha = revParse(runner, opts.repo, 'origin/main');

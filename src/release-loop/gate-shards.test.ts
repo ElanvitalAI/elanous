@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateShardsPath, readGateShards, shardsLine, summarizeShards, writeGateShards, type GateShardsFile } from './gate-shards.js';
+import { gateShardsPath, readGateShards, recordGateShardsVerdict, shardsLine, summarizeShards, writeGateShards, type GateShardsFile } from './gate-shards.js';
 
 const NOW = Date.parse('2026-10-07T12:00:00.000Z');
 const ago = (min: number) => new Date(NOW - min * 60_000).toISOString();
@@ -73,7 +73,7 @@ test('a running shard past its plan says so instead of «남은 약 0분» (cana
   expect(summarizeShards(file(), NOW).overrunMin).toBe(0);
 });
 
-test('a finished shard with rc≠0 is «끝 · 실패 보고», never «통과» (0.2.20 cut: four done shards were all rc 1)', () => {
+test('a finished shard with rc≠0 is never «통과» — before the verdict it is «rc≠0 · 판정 전» (0.2.20 cut: four done shards were all rc 1)', () => {
   const f: GateShardsFile = { v: 1, version: '0.2.20', updatedAt: ago(0), shards: [
     { id: 'pod-20', state: 'done', rc: 1, plannedMin: 3.9, startedAt: ago(14), endedAt: ago(1) },
     { id: 'pod-21', state: 'done', rc: 0, plannedMin: 3.9, startedAt: ago(14), endedAt: ago(1) },
@@ -81,5 +81,63 @@ test('a finished shard with rc≠0 is «끝 · 실패 보고», never «통과»
   ] };
   const s = summarizeShards(f, NOW);
   expect(s.doneWithFailures).toBe(1);
-  expect(shardsLine(s)).toBe('조각 3 · 돌기 1 · 끝 2(실패 보고 1) · 남은 약 16분');
+  expect(s.verdict).toBeNull();
+  expect(shardsLine(s)).toBe('조각 3 · 돌기 1 · 끝 2(rc≠0 1 · 기존 실패 포함 · 판정 전) · 남은 약 16분');
+});
+
+describe('GATE-LIVE-OBS-RC-WORDING — the done tail splits before/after the gate verdict', () => {
+  const done = (verdict?: GateShardsFile['verdict']): GateShardsFile => ({
+    v: 1, version: '0.2.21', updatedAt: ago(0), shards: [
+      { id: 'pod-0', state: 'done', rc: 1 },
+      { id: 'pod-1', state: 'done', rc: 1 },
+      { id: 'pod-2', state: 'done', rc: 0 },
+    ],
+    ...(verdict ? { verdict } : {}),
+  });
+
+  test('without a verdict, rc≠0 shards are «판정 전», not «실패 보고» (0.2.21 cut alarmed 24/24 on pre-existing failures)', () => {
+    const line = shardsLine(summarizeShards(done(), NOW));
+    expect(line).toContain('rc≠0 2 · 기존 실패 포함 · 판정 전');
+    expect(line).not.toContain('실패 보고');
+  });
+
+  test('with a verdict, only introduced failures are shown; pre-existing ones are not', () => {
+    const clean = shardsLine(summarizeShards(done({ introduced: 0, preexisting: 2 }), NOW));
+    expect(clean).not.toContain('rc≠0');
+    expect(clean).not.toContain('새 실패');
+    expect(clean).toBe('조각 3 · 끝 3 · 남은 약 0분');
+    expect(shardsLine(summarizeShards(done({ introduced: 1, preexisting: 1 }), NOW))).toContain('끝 3(새 실패 1)');
+  });
+
+  test('readGateShards keeps a numeric verdict, drops a broken one without dropping the file, and still reads old files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gate-verdict-'));
+    try {
+      const path = join(root, 'shards.json');
+      writeGateShards(path, done({ introduced: 1, preexisting: 3 }));
+      expect(readGateShards(path)?.verdict).toEqual({ introduced: 1, preexisting: 3 });
+      writeFileSync(path, JSON.stringify({ ...done(), verdict: { introduced: 'x', preexisting: 2 } }));
+      const broken = readGateShards(path);
+      expect(broken?.shards).toHaveLength(3);
+      expect(broken && 'verdict' in broken).toBe(false);
+      writeFileSync(path, JSON.stringify(done()));
+      expect(summarizeShards(readGateShards(path)!, NOW).verdict).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+test('GATE-LIVE-OBS-RC-WORDING ⓒ: recordGateShardsVerdict writes the verdict into an existing board only', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-verdict-write-'));
+  try {
+    const path = join(root, 'shards.json');
+    expect(recordGateShardsVerdict(path, { introduced: 1, preexisting: 2 })).toBe(false);
+    expect(readdirSync(root)).toEqual([]);
+    writeGateShards(path, { v: 1, version: '0.2.23', updatedAt: ago(5), shards: [{ id: 'pod-0', state: 'done', rc: 1 }, { id: 'pod-1', state: 'done', rc: 1 }] });
+    expect(shardsLine(summarizeShards(readGateShards(path)!, NOW))).toContain('판정 전');
+    expect(recordGateShardsVerdict(path, { introduced: 0, preexisting: 2 }, new Date(NOW))).toBe(true);
+    const after = readGateShards(path)!;
+    expect(after.verdict).toEqual({ introduced: 0, preexisting: 2 });
+    expect(after.shards).toHaveLength(2);
+    expect(after.updatedAt).toBe(new Date(NOW).toISOString());
+    expect(shardsLine(summarizeShards(after, NOW))).toBe('조각 2 · 끝 2 · 남은 약 0분');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

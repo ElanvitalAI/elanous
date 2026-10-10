@@ -31,7 +31,7 @@ export {
   type PrEvidenceInput,
 } from './pr-evidence-artifact.js';
 import { judgePredictionAccuracy } from './judge-prediction-accuracy.js';
-import { measureReviewFindingRecurrence, type ReviewFindingRecurrence } from './review-finding-recurrence.js';
+import { classifyPodReviewBudgetResidue, measureReviewFindingRecurrence, type ReviewFindingRecurrence } from './review-finding-recurrence.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { writeGoalDocumentAtomic } from './goal-document-write.js';
@@ -64,7 +64,7 @@ import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-ru
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
-import { classifyMergeHoldStop, forgetRunStop, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
+import { classifyMergeHoldStop, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
@@ -108,7 +108,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge, owningRepoRoot } from './frozen-merges.js';
-import { recordFollowUpOnMerge, type FollowUpMergeInput, type FollowUpSeams } from './follow-up-goals.js';
+import { recordFollowUpOnBlocked, recordFollowUpOnMerge, type FollowUpBlockedInput, type FollowUpMergeInput, type FollowUpSeams } from './follow-up-goals.js';
 
 /** Merge result and exit stay untouched: a draft failure is one debug line. */
 async function draftFollowUpAfterMerge(input: FollowUpMergeInput, followUp: FollowUpSeams | undefined): Promise<void> {
@@ -128,10 +128,29 @@ async function draftFollowUpAfterMerge(input: FollowUpMergeInput, followUp: Foll
     debug.log('self-implement.follow-up', 'draft-failed', { prNumber: input.prNumber, error: error instanceof Error ? error.message : String(error) });
   }
 }
+
+async function draftFollowUpAfterBlocked(input: FollowUpBlockedInput, followUp: FollowUpSeams | undefined): Promise<void> {
+  try {
+    await recordFollowUpOnBlocked(input, {
+      ...(followUp ? {
+        ...(followUp.mode ? { mode: followUp.mode } : {}),
+        ...(followUp.readDrafts ? { readDrafts: followUp.readDrafts } : {}),
+        ...(followUp.appendDraft ? { appendDraft: followUp.appendDraft } : {}),
+        ...(followUp.enqueue ? { enqueue: followUp.enqueue } : {}),
+        ...(followUp.cellOwner ? { cellOwner: followUp.cellOwner } : {}),
+        ...(followUp.stateRoot ? { stateRoot: followUp.stateRoot } : {}),
+      } : {}),
+      log: (category, event, data) => { debug.log(category, event, data); },
+    });
+  } catch (error) {
+    debug.log('self-implement.follow-up', 'draft-failed', { ending: 'blocked', runId: input.runId, prNumber: input.prNumber ?? 0, stage: input.stage, error: error instanceof Error ? error.message : String(error) });
+  }
+}
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
+import { renderRoundSummaryCard, type RoundSummaryEntry } from './round-summary-card.js';
 import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import { classifyReworkBudgetShadow } from './classify-shadow.js';
@@ -139,7 +158,7 @@ import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT, reworkBudgetEvidenc
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, runRequiredEvidenceChecks, coverRequiredEvidence, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, runRequiredEvidenceChecks, coverRequiredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
 
@@ -815,6 +834,11 @@ function declaredRevertGuardPaths(text: string): string[] {
 function revertGuardTargetPaths(feature: string, goalDocument?: string): string[] {
   const originalAsk = goalDocument ? extractVerbatimOriginalAsk(goalDocument)?.ask : undefined;
   return [...new Set([...declaredRevertGuardPaths(feature), ...(originalAsk ? declaredRevertGuardPaths(originalAsk) : [])])];
+}
+
+/** 하니스가 작업 트리에 잠깐 쓰는 임시물 — 범위 판정·결정 카드에서 뺀다. */
+export function isHarnessTempArtifact(file: string): boolean {
+  return /(^|\/)\.elanous-typecheck-scope-[^/]+\.json$/.test(file);
 }
 
 export function detectDeclaredScopeDiff(input: {
@@ -4868,6 +4892,7 @@ async function runSelfImplementInner(
   // ⛔ 승격이 꺼져 있으면 «심지 않는다» — 그러면 예산 관측도 안 난다(운영 원장이 오늘과 같다).
   if (graphAuthority.enabled) onGraphTemplateResolved(graphTemplate);
   // ⛔ 선택을 «전부» 싣는다 — 얹힌 것만 실으면 「왜 안 얹혔나」를 사후에 못 묻는다.
+  let reviewRepeat: number | undefined;
   /** ⭐ ③ «다이나믹» — 라운드마다 runtime 오버레이를 다시 고른다.
    *  ⛔ **매번 «기준 선언»에서 다시 얹는다** — 이전 라운드 결과 위에 겹쳐 얹으면
    *    「이 걸음을 무엇이 만들었나」가 «누적»이 되어 사후에 못 푼다.
@@ -4875,7 +4900,19 @@ async function runSelfImplementInner(
   const applyRuntimeOverlays = (round: number): void => {
     if (!graphAuthority.enabled) return;
     // ⛔ 「지금 아는 것」만 준다 — 없는 값을 0 으로 지어내지 않는다(key-absent 가 그것을 말한다).
-    const runtimeOverlayState = { attempts: round, ...(opts.goalId === undefined ? {} : { goal_id: opts.goalId }) };
+    let stopClass: import('./run-stop.js').RunStopClass | undefined;
+    try {
+      const { runId } = identity ?? resolveRunIdentity({ explicit: opts.runId });
+      const entries = loadRunLedger(runId);
+      const lastStop = entries?.slice().reverse().find((entry) => entry.event === 'stop');
+      if (lastStop && isRunStopClass(lastStop.data.class)) stopClass = readRunStopRecord(lastStop)?.class;
+    } catch { /* Unreadable STOP-RECORD is unknown, not an invented class. */ }
+    const runtimeOverlayState = {
+      attempts: round,
+      ...(opts.goalId === undefined ? {} : { goal_id: opts.goalId }),
+      ...(stopClass === undefined ? {} : { stop_class: stopClass }),
+      ...(reviewRepeat === undefined ? {} : { review_repeat: reviewRepeat }),
+    };
     const decision = decideTemplate({
       goalType: graphGoalType,
       authority: graphAuthority,
@@ -5210,6 +5247,7 @@ async function runSelfImplementInner(
   let offDiffEvidence: OffDiffEvidenceParse = { items: [], discardedMissingVerify: 0, discardedEmptyClaim: 0, missingResult: 0, orphanResult: 0, truncatedResult: 0, anchoredEvidence: 0 };
   let evidenceSource: 'diff-added-lines' | 'harvested' | 'summary-tail' = 'summary-tail';
   // ⛔⭐ 하니스가 센 증거 충족도 — **로그에만 남기면 판정자가 못 본다**(원장 `JDG-S4`·`JDG-S5`).
+  let uncoveredFeedbackUsed = false;
   let evidenceCoverage: {
     required: number;
     covered: number;
@@ -5337,6 +5375,7 @@ async function runSelfImplementInner(
   // 직전 gate 실패 라운드의 미검증 집합(정렬 키). 통과하면 비운다 — «연속» 반복만 센다.
   let lastGateUnverifiedKey: string | undefined;
   const reworkHistory: string[] = [];
+  const roundSummaryEntries: RoundSummaryEntry[] = [];
   const supervisorDecisionHistory: Array<{ round: number; verdict: ReworkBudgetVerdict; reason: string }> = [];
   let judgedEffectiveMax: number | undefined;
   let lastReworkVerdict: ReworkBudgetVerdict | undefined;
@@ -6100,7 +6139,7 @@ async function runSelfImplementInner(
     'missing-cited-path': refutations.filter(({ kind }) => kind === 'missing-cited-path').length,
     'found-cited-path': refutations.filter(({ kind }) => kind === 'found-cited-path').length,
   });
-  const acceptReviewBudget = async (unresolvedMustFix: readonly string[], hasNonReviewResidualWork: boolean) => {
+  const acceptReviewBudget = async (unresolvedMustFix: readonly string[], hasNonReviewResidualWork: boolean, repeatedPod = false) => {
     const decision = decideReworkSalvage({
       hardCapBlockedExtend: false,
       reviewBudgetExhausted: true,
@@ -6120,7 +6159,7 @@ async function runSelfImplementInner(
       }, { level: 'warn' });
       return { decision };
     }
-    const followUpMustFix = `\n\n## Follow-up must-fix (${decision.unresolvedMustFix.length})\n${decision.unresolvedMustFix.map((finding) => `- ${finding}`).join('\n')}`;
+    const followUpMustFix = `\n\n## Follow-up must-fix (${decision.unresolvedMustFix.length})\n${decision.unresolvedMustFix.map((finding) => `- ${repeatedPod ? '[repeated] ' : ''}${finding}`).join('\n')}`;
     const releaseNote = releaseNoteForRun(opts.goalFile, opts.feature);
     // openPr's default seam delegates to PrManager.upsertPr, which stages, commits,
     // and pushes this worktree after the note is written and before creating the PR.
@@ -6366,6 +6405,7 @@ async function runSelfImplementInner(
           }
         }
         const before = effectiveMax;
+        const gateBaselineOnly = baselineOnlyGate();
         const budgetDecision = applyReworkBudgetDecision(
           effectiveMax,
           parsedDecision,
@@ -6374,7 +6414,13 @@ async function runSelfImplementInner(
           priorHistory.length,
           consecutiveUnresolvedBudget >= 2 ? false : shadowStop,
           supervisorDecisionHistory.at(-1)?.verdict,
+          gateBaselineOnly,
         );
+        if (reworkKind === 'gate' && parsedDecision?.verdict === 'SUFFICIENT' && gateBaselineOnly && budgetDecision.exit === 'proceed') {
+          debug.log('self-implement.rework-budget', 'gate-sufficient-proceed', {
+            runId, round, preexisting: gate!.baselineFailures!.filter(({ attribution }) => attribution === 'preexisting').length, introduced: 0,
+          });
+        }
         effectiveMax = budgetDecision.effectiveMax;
         if (parsedDecision) {
           if (diagnosisRefutations) {
@@ -6575,12 +6621,14 @@ async function runSelfImplementInner(
             if (isReviewRework(reworkKind)) {
               if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
               const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', verdict: parsedDecision.verdict, reason: parsedDecision.reason, gate, decomposition: terminalDecomposition, salvageStatusExpected: false });
+              await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'review-blocked', unresolvedMustFix: review?.mustFix, decompositionPieces: terminalDecomposition?.pieces?.map((p) => p.feature), feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
               const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
               return { ok: false, node: 'rework', ...terminal, ...supervisorOutcome, sessionId, worktreePath: wt.path, branch: wt.branch, gate, review, quotaExhaustionAssessment, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...reviewBlockedResult(pr), detail: `${blockedDraftPrFailure ? `${blockedDraftPrFailure}; ` : ''}rework judged unconvergeable after ${round} rework round(s): ${parsedDecision.reason}` };
             }
             const baselineStop = noRetryBaseline();
             const reason = baselineStop.terminationReason ?? parsedDecision.reason;
             const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: parsedDecision.verdict, reason, gate, decomposition: terminalDecomposition, salvageStatusExpected: false });
+            await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'gate-failed', decompositionPieces: terminalDecomposition?.pieces?.map((p) => p.feature), feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
             const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
             return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, ...supervisorOutcome, ...baselineStop, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: baselineStop.terminationReason ?? `rework judged unconvergeable after ${round} rework round(s): ${parsedDecision.reason}` };
           }
@@ -6604,10 +6652,12 @@ async function runSelfImplementInner(
         if (isReviewRework(reworkKind)) {
           if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
           const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', verdict: lastReworkVerdict, reason, gate, salvageStatusExpected: false });
+          await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'review-blocked', unresolvedMustFix: review?.mustFix, feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
           return { ok: false, node: 'rework', ...terminal, sessionId, worktreePath: wt.path, branch: wt.branch, gate, review, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...reviewBlockedResult(pr), detail: blockedDraftPrFailure ?? reason };
         }
         const baselineStop = noRetryBaseline();
         const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: lastReworkVerdict, reason: baselineStop.terminationReason ?? reason, gate, salvageStatusExpected: false });
+        await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'gate-failed', feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
         return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, ...baselineStop, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: baselineStop.terminationReason ?? reason };
       }
       const terminal = resolveRunOutcome({ termination: 'budget-exhausted', ...(lastReworkVerdict ? { lastVerdict: lastReworkVerdict } : {}) });
@@ -6620,14 +6670,38 @@ async function runSelfImplementInner(
       if (isReviewRework(reworkKind)) {
         if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
         const reason = `review must-fix unresolved after ${round - 1} rework round(s)`;
-        // Pod keeps review-blocked work as a labelled draft (or aborts with the preserved branch) instead of
-        // accepting the review budget into a non-draft PR — restored after #24341 (0.2.16 gate shard 5).
-        if (!podReviewBlockedDraft) {
+        const podResidue = podReviewBlockedDraft
+          ? classifyPodReviewBudgetResidue(currentBlockingFindings, previousBlockingFindings)
+          : undefined;
+        // ⛔ 사양 v2(OP 18:1x (a)): Pod 는 «전부 내용 해시(id) 반복»일 때만 수락한다 — 키로만 반복된 지적은 draft.
+        //   수락은 draft→non-draft ⊕ followUpMustFix 기록까지다. 병합 판단은 언제나 hitl(자동 병합 없음 · #25941
+        //   `review-warn-with-must-fix` 와 같은 방향 — must-fix 가 남은 런은 어느 출구로도 자동 병합하지 않는다).
+        const podAcceptable = podResidue?.status === 'all-repeated' && podResidue.keyOnlyRepeatedIds.length === 0;
+        const podDecision = (accepted: boolean) => {
+          if (!podResidue) return;
+          debug.log('self-implement.review-budget', 'pod-accept-decision', {
+            runId, status: podResidue.status, repeatedCount: podResidue.repeatedIds.length,
+            newCount: podResidue.newIds.length, keyOnlyRepeatedCount: podResidue.keyOnlyRepeatedIds.length,
+            accepted, merge: 'hitl',
+          });
+        };
+        if (!podReviewBlockedDraft || podAcceptable) {
           const acceptance = await acceptReviewBudget(
             review?.mustFix ?? [],
             reworkParts.some((part) => part.source === 'supervisor'),
+            podReviewBlockedDraft,
           );
+          podDecision(acceptance.decision.action === 'accept');
           if (acceptance.decision.action === 'accept') {
+            if (podReviewBlockedDraft) {
+              observe('merge-decision', {
+                autoMerge: autoMergeEnabled(opts), reviewed: review?.reviewed === true, verdict: review?.verdict ?? 'none',
+                decision: 'hitl', reason: 'review-budget-follow-up-required',
+                mustFixCount: acceptance.decision.unresolvedMustFix.length,
+                followUpMustFix: acceptance.decision.unresolvedMustFix,
+                ...(acceptance.pr ? { prNumber: acceptance.pr.number } : {}),
+              });
+            }
             if (acceptance.pr) {
               await draftFollowUpAfterMerge({
                 prNumber: acceptance.pr.number,
@@ -6656,7 +6730,7 @@ async function runSelfImplementInner(
               detail: `${reason}; accepted with ${acceptance.decision.unresolvedMustFix.length} follow-up must-fix item(s)`,
             };
           }
-        }
+        } else podDecision(false);
         const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', reason, gate, salvageStatusExpected: true });
         const salvage = blockedDraftNoChanges || blockedDraftPrFailure ? 'parked' : await salvageHardCap(canSalvage, pr);
         const disposition = { ...terminal, ...(salvage ? { salvage } : {}) };
@@ -6689,9 +6763,20 @@ async function runSelfImplementInner(
         }, { level: 'warn' });
       }
     }
-    const feature = round === 0
-      ? round0Feature
+    const reworkFeature = round === 0 ? ''
       : buildReworkFeature(opts.feature, round, effectiveMax, reworkPromptNote, stripReworkBudgetHeaders(diagnosis), appliedLastRound, refutableFindings, pendingPlanRevision, reworkKind, buildRefutationGuidance(), escalationJudgement);
+    const card = round === 0 ? '' : renderRoundSummaryCard(roundSummaryEntries);
+    const feature = round === 0 ? round0Feature : reworkFeature + (card ? `\n\n${card}` : '');
+    if (card) {
+      const latest = roundSummaryEntries[roundSummaryEntries.length - 1]!;
+      const lastKey = latest.failedIds?.length ? JSON.stringify([...new Set(latest.failedIds)].sort()) : undefined;
+      const repeatedWithRound = lastKey === undefined ? undefined : roundSummaryEntries.slice(0, -1)
+        .find((entry) => entry.failedIds?.length && JSON.stringify([...new Set(entry.failedIds)].sort()) === lastKey)?.round;
+      const omittedRounds = Number(/…\(앞 라운드 (\d+)개 생략\)/.exec(card)?.[1] ?? 0);
+      observe('round-card', { round, entries: roundSummaryEntries.length, chars: card.length,
+        ...(repeatedWithRound === undefined ? {} : { repeatedWithRound }), omittedRounds,
+      }, { category: 'self-dev.rework' });
+    }
     const refutationGuidanceEligible = round > 0 && refutableFindings.length > 0;
     const dispatchedRefutationGuidance = refutationGuidancePresented(feature, refutationGuidanceEligible);
     pendingPlanRevision = undefined;
@@ -7011,7 +7096,9 @@ async function runSelfImplementInner(
     if (opts.goalFile) {
       let goalDocument: string | undefined;
       try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* unknown scope */ }
-      const scope = detectDeclaredScopeDiff({ goalDocument, changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file)), nameCap: gateRouteFiles?.length });
+      // 🩸 10-09: 범위 타입검사 임시 tsconfig(.elanous-typecheck-scope-*.json · scoped-typecheck-config.ts)가 옛 가지에 커밋된 뒤 지워지면
+      //   «추적 파일 삭제» 라 impact=critical → 결정 카드가 «irreversible» 로 대표에게 갔다(D-20·35·43·80). 하니스 임시물은 범위 판정 밖이다.
+      const scope = detectDeclaredScopeDiff({ goalDocument, changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file) && !isHarnessTempArtifact(file)), nameCap: gateRouteFiles?.length });
       if (scope.status === 'known' && scope.outsideCount !== null && scope.outsideCount > 0) {
         const result: ExecutionClarificationResult = await (s.askExecutionClarification ?? askAtExecution)({
           id: 'execution_scope', decision: 'Changing files outside the authored target paths',
@@ -7272,6 +7359,10 @@ async function runSelfImplementInner(
         return { ok: false, stage: 'gate-failed', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
       lastGateUnverifiedKey = unverifiedRepeatKey(gate.unverified);
+      roundSummaryEntries.push({ round, kind: 'gate', tried: impl.summary.replace(/\s+/g, ' ').trim().slice(0, 200),
+        failedIds: gate.baselineFailures?.map(({ name, file, attribution }) => `${name}@${file ?? '?'} (${attribution})`),
+        filesTouched: gateRouteFiles,
+      });
       round++;
       continue;
       }
@@ -7425,7 +7516,11 @@ async function runSelfImplementInner(
         ...(review.failureReason !== undefined ? { failureReason: review.failureReason } : {}),
         ...(reviewArtifactPath ? { artifactPath: reviewArtifactPath } : {}),
       });
-      if (review.reviewed) reviewMustFixCountHistory.push(review.mustFix.length);
+      if (review.reviewed) {
+        reviewMustFixCountHistory.push(review.mustFix.length);
+        // The next runtime overlay sees completed review rounds, not consecutive repeats of one finding.
+        reviewRepeat = reviewMustFixCountHistory.length - 1;
+      }
       progress('reviewed', review.reviewed
         ? `리뷰: ${review.verdict} (must-fix ${review.mustFix.length}·should-fix ${review.shouldFix.length}) · 추이 ${reviewMustFixCountHistory.join('→')} (${reviewMustFixTrend()})`
         : `리뷰 미실행${review.failureReason !== undefined ? ` (${review.failureReason})` : ''}`);
@@ -7555,6 +7650,9 @@ async function runSelfImplementInner(
           break;
         }
         appliedLastRound = [...effectiveMustFix];
+        roundSummaryEntries.push({ round, kind: 'review', tried: impl.summary.replace(/\s+/g, ' ').trim().slice(0, 200),
+          failedIds: effectiveMustFix.map(stableMustFixId), filesTouched: runFacts.changedFiles,
+        });
         refutableFindings = reviewMustFixFindings.filter(({ item }) => effectiveMustFix.includes(item));
         const reviewFindingKeys = effectiveMustFix
           .map(reviewFindingKey)
@@ -7604,6 +7702,18 @@ async function runSelfImplementInner(
         continue;
       }
     }
+    if (gate.passed && autoMergeEnabled(opts) && evidenceCoverage?.uncoveredCount && !uncoveredFeedbackUsed && round < effectiveMax) {
+      const uncovered = [...evidenceCoverage.uncovered];
+      const nextRound = round + 1;
+      setReworkPart('review', formatUncoveredEvidenceFeedback(uncovered));
+      uncoveredFeedbackUsed = true;
+      debug.log('self-implement.evidence', 'uncovered-feedback', { uncovered, round: nextRound });
+      bufferPrComment(round, 'author', `Round ${round}: child implementation completed.`, [
+        `Child completion: ${impl.summary.trim() || '(summary unavailable)'}`,
+      ]);
+      round = nextRound;
+      continue;
+    }
     bufferPrComment(round, 'author', `Round ${round}: child implementation completed.`, [
       `Child completion: ${impl.summary.trim() || '(summary unavailable)'}`,
     ]);
@@ -7636,7 +7746,12 @@ async function runSelfImplementInner(
   const { latestSignalIncomplete } = signalIncompleteState(roundClassifications);
   const autoMerge = autoMergeEnabled(opts);
   const gateTimeoutUnmeasured = isTimeoutOnlyUnmeasuredGate(gate.reflectGateFacts);
-  let canAuto = !gateTimeoutUnmeasured && autoMerge && reviewReal && review!.verdict !== 'fail' && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
+  // ⛔⭐ AUTOMERGE-WARN-MUSTFIX(0.2.24): 판정이 warn 이어도 must-fix 가 «남아» 있으면 자동 병합하지 않는다.
+  //   루프 «안»은 `verdict === 'fail'` 일 때만 재작업하므로, warn ⊕ must-fix≥1 은 루프를 그대로 빠져나와
+  //   종전 `verdict !== 'fail'` 만 보던 이 자리에서 auto 가 됐다(#25914 · #25934 · #25918 실물).
+  //   ⭐ 반사가 must-fix 를 «전부» 기각하면 위에서 `review.mustFix = []` 로 비우므로 그 길은 종전 그대로다.
+  const reviewMustFixCount = review?.mustFix?.length ?? 0;
+  let canAuto = !gateTimeoutUnmeasured && autoMerge && reviewReal && review!.verdict !== 'fail' && reviewMustFixCount === 0 && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
   // ⭐⭐ 통과의 «이유»를 둘로 가른다 — ⛔ 막지는 «않는다»(대표 판단 2026-08-11: ⓐ 문면만).
   //   📏 근거(`JDG-T36` · merge-decision 300건 전수): `verifyByBreaking` 이 실린 8건의 auto 중 ***5건***이
   //     ***ran=true 인데 distinguishes=0***(아무것도 안 가르는 자기검증)이었고, 그 다섯이 «전부»
@@ -7655,6 +7770,7 @@ async function runSelfImplementInner(
         : latestSignalIncomplete ? 'signal-incomplete'
         : !reviewReal ? 'no-real-review'
           : review!.verdict === 'fail' ? 'review-must-fix'
+          : reviewMustFixCount > 0 ? 'review-warn-with-must-fix'
             : review!.diffTruncated === true ? 'review-diff-truncated'
               : 'review-diff-budget-unknown';
   let mergeSkipReason = canAuto ? undefined : mergeReason;
@@ -7662,6 +7778,7 @@ async function runSelfImplementInner(
   const mergeDecisionObservation = {
     autoMerge, reviewed: reviewReal, verdict: review?.verdict ?? 'none',
     decision: canAuto ? 'auto' : 'hitl', reason: mergeReason,
+    mustFixCount: reviewMustFixCount,
     ...mergeDecisionEvidenceCoverage(evidenceCoverage),
     ...(evidenceCoverage ? {
       evidenceSource,

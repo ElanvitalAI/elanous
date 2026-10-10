@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { FabricStageHeader } from '@/components/shell/FabricStageHeader';
 import { LoopAgentsScene } from '@/components/inside/LoopAgentsScene';
 import { LoopStatusPanel } from './LoopStatusPanel';
+import { ResourcePanel } from './ResourceMap';
 import { loopsView } from './loops-view';
 
 /** 루프 상호작용 — /inside 장면③ 지도를 그대로 쓴다(로직 복제 0). `?journey=<카드 id>` 는 지도가 직접 읽는다. */
@@ -22,5 +23,6 @@ export function LoopInteractPanel() {
 
 export function LoopsView() {
   const searchParams = useSearchParams();
-  return loopsView(searchParams) === 'interact' ? <LoopInteractPanel /> : <LoopStatusPanel />;
+  const view = loopsView(searchParams);
+  return view === 'resources' ? <ResourcePanel /> : view === 'interact' ? <LoopInteractPanel /> : <LoopStatusPanel />;
 }

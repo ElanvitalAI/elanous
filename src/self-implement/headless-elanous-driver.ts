@@ -996,8 +996,8 @@ export interface HeadlessGoalLoopPtyOptions {
   /** 밖에서 쓴 이력 조회 심 — 기본은 실물(`pty-control-ipc`). ⭐ 테스트가 전역을 찌르지 않게
    *  `spawn`·`ptyAvailable` 과 **같은 방식**으로 주입한다(새 패턴 아님 · 테스트 전용 export 도 아님). */
   externalWriteProvenance?: (ptyId: string) => { externalWrites: number; externalWriteAgoMs: number; externalWriteActor: string } | undefined;
-  /** ★S4 P2b — brain 상담 1회 최대 대기(ms·기본 15초). 초과 시 abort + fail-soft(`brain.fail`).
-   *  ⚠️ **테스트 seam 겸용**(리뷰 must-fix — 이게 없으면 timeout fail-soft 경로를 15초 없이 검증할 수
+  /** ★S4 P2b — brain 상담 1회 최대 대기(ms·기본 45초). 초과 시 abort + fail-soft(`brain.fail`).
+   *  ⚠️ **테스트 seam 겸용**(리뷰 must-fix — 이게 없으면 timeout fail-soft 경로를 45초 없이 검증할 수
    *  없다). 프로덕션은 기본값을 쓴다(호출부 미지정). */
   brainTimeoutMs?: number;
   /** ★S4 P3 **관측 시계 seam**(테스트 전용·기본 `Date.now`).
@@ -1520,8 +1520,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     let previousStallMetrics: { toolCalls: number; chars: number } | undefined;
     let keyframeSeq = 0; // 이 run 의 키프레임 순번(파일 키·seq 순 추출).
     // ⭐⭐ **wall-clock 상한**(리뷰 must-fix 2026-07-26) — 이 루프의 회계는 `i`(≈초·pollMs≈1000ms 가정)
-    //   기반이다. S4 P2b brain 상담이 tick 당 최대 `brainTimeoutMs`(기본 15초)를 **직렬 await** 하므로
-    //   전이가 반복되면 1 tick 이 ~16초가 되어 `maxWaitSec` 계약을 **최대 16배 초과**한다(600s → ~2.7h).
+    //   기반이다. S4 P2b brain 상담이 tick 당 최대 `brainTimeoutMs`(기본 45초)를 **직렬 await** 하므로
+    //   전이가 반복되면 1 tick 이 ~46초가 되어 `maxWaitSec` 계약을 초과할 수 있다.
     //   ⇒ 기존 활동-grace 의미(i 기반)는 **그대로 두고** 절대 경과시간을 **추가 상한**으로만 얹는다.
     //   단조 안전: 더 **일찍** 멈출 뿐 늦게 멈추는 경우가 없다. brain 미주입이면 i≈초라 두 조건이 일치
     //   (무회귀). ROADMAP §2 P1(종료 지연)의 회계 구조를 재작성하지 않는 최소 개입이다.
@@ -1563,7 +1563,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
         debug.log('self-implement', 'poll.heartbeat', { ptyId, runId, i, alive: h.isAlive(), lastActivityI, silentFor, ...parentObservation });
       }
       // #24 finer 마커 — stall 시 "poll 루프 안(자식 구동·정상)" vs "다른 동기 op" 구분.
-      setEventLoopActivity(`headless:poll-${i}:alive-${h.isAlive() ? 1 : 0}`);
+      setEventLoopActivity(`headless:poll:alive-${h.isAlive() ? 1 : 0}`);
       const delta = h.drainDelta();
       phase = 'snapshot';
       const snap = h.snapshot();   // ★ 1회 캡처 — 화면 릴레이 + GOAL-COMPLETE 공용(중복 snapshot 제거)
@@ -1697,6 +1697,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                 if (opts.signal?.aborted) onBrainAbort();
                 else opts.signal?.addEventListener('abort', onBrainAbort, { once: true });
                 let timer: ReturnType<typeof setTimeout> | undefined;
+                const brainStartedMs = Date.now();
                 try {
                   // Lost and unknown are the same ownership axis exercised by the stalled-screen
                   // tests, not separate stances. Preserve their measured ownership and observation
@@ -1709,12 +1710,12 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                     Promise.resolve(opts.brain.decide(controlObs, controller.signal)),
                     new Promise<ControlDecision>((_, reject) => {
                       // ⭐ **남은 절대 예산으로 clamp**(리뷰 must-fix 2R) — wall-clock 상한은 **tick 시작**에서만
-                      //   검사하므로, deadline 직전에 시작된 상담이 그대로면 최대 brainTimeoutMs(기본 15초)만큼
+                      //   검사하므로, deadline 직전에 시작된 상담이 그대로면 최대 brainTimeoutMs(기본 45초)만큼
                       //   hard deadline 을 **초과**한다. 상담 자체를 남은 예산 안으로 묶어 창을 닫는다.
                       //   최소 1ms(음수·0 이면 즉시 timeout → 다음 tick 상단 wall-clock 체크가 루프를 끊는다).
                       const remainMs = Math.max(1, hardI * 1000 - (Date.now() - loopStartedMs));
                       timer = setTimeout(() => { controller.abort(); reject(new Error('brain suggestion timeout')); },
-                        Math.min(opts.brainTimeoutMs ?? 15_000, remainMs));
+                        Math.min(opts.brainTimeoutMs ?? 45_000, remainMs));
                     }),
                     ...(parentAbort ? [parentAbort] : []),
                   ]);
@@ -1761,6 +1762,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                     // 관측 계약은 화면 분류 원문을 보존한다. 완료 정보량·자동 정지는 아래의
                     // `completionState` 폐쇄형 정규화만 소비하므로 blocked/idle 기록을 잃지 않는다.
                     ptyId: h.id, runId, moment: 'in-round', step: i, trigger, state: curState, action: decision.action,
+                    durationMs: Date.now() - brainStartedMs,
                     // `delivery-outcome` is a follow-up observation, not another verdict. Consumers count
                     // either initial stage once per decision and can distinguish verdicts without input.
                     supervisionRecordStage: decision.action === 'input' ? 'verdict-input' : 'verdict-no-input',
@@ -1848,7 +1850,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                   }
                 } catch (e) {
                   // Parent cancel outranks suggestion observation: leave the poll loop immediately so PTY cleanup is not
-                  // held by the 15s consultation timeout, even when a custom brain ignores its AbortSignal.
+                  // held by the 45s consultation timeout, even when a custom brain ignores its AbortSignal.
                   if (opts.signal?.aborted) {
                     timedOut = false;
                     exitReason = 'abort';
@@ -1856,7 +1858,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                   }
                   debug.log('self-implement', 'brain.fail', {
                     ptyId: h.id, runId, step: i, trigger, state: curState,
-                    roundContextPresent,
+                    roundContextPresent, durationMs: Date.now() - brainStartedMs,
                     error: String(e instanceof Error ? e.message : e).slice(0, 120),
                   });
                 } finally {

@@ -1,0 +1,12 @@
+tick:
+  command: >-
+    bun -e 'const repo=process.env.ELANOUS_GRAPH_DIR+"/../..";
+    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "release", "rehearsal", "tick", "--apply", "--json"],
+    {cwd:process.env.ELANOUS_REHEARSAL_GIT_CWD || repo,stdout:"pipe",stderr:"pipe"});
+    const stdout=new TextDecoder().decode(run.stdout).trim();
+    const stderr=new TextDecoder().decode(run.stderr).trim();
+    if (run.exitCode !== 0) { let why=""; try { why=JSON.parse(stdout).error ?? ""; } catch {} throw new Error(stderr || why || "rehearsal tick exit " + run.exitCode); }
+    const result=JSON.parse(stdout);
+    if (result.ok !== true) throw new Error(result.error ?? "rehearsal tick failed");
+    console.log(JSON.stringify({outcome:"ok",tick:result}));'
+  timeout_ms: 5400000

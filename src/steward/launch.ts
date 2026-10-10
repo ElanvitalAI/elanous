@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { resolveHqLaunchSeat } from '../hq/seats.js';
 import { debug } from '../debug/log.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { redactSecrets } from '../task-cards/card-store.js';
@@ -42,9 +44,11 @@ export interface LaunchDeps {
   settings: StewardSettings;
   ledger: LaunchLedger;
   /** Injected command boundary; the production adapter runs only argv, never a shell. */
-  command?: (args: string[]) => { exitCode: number; stdout: string; stderr?: string };
-  spawn?: (args: string[], log: string) => { pid: number };
+  command?: (args: string[], seat?: string) => { exitCode: number; stdout: string; stderr?: string };
+  spawn?: (args: string[], log: string, seat?: string) => { pid: number };
   gate?: (goalId: string, budget: BudgetDecision | 'unknown') => PreLaunchGateDecision;
+  /** Production commands run from the registered OP view; tests can supply an isolated view. */
+  launchSeat?: () => string;
 }
 
 const RUN_ID = /\brun-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
@@ -52,7 +56,7 @@ const DEFAULT_POOL = 'pool-node-b@node-b:8';
 // `harness budget --json` outcomes: proceed | next-provider | wait-reset | stop. next-provider still runs (the harness switches provider itself).
 const BUDGET_PROCEED: readonly string[] = ['proceed', 'next-provider'];
 const launchMode = (settings: StewardSettings): 'off' | 'shadow' | 'live' => launchModeOf(settings.mode ?? settings.launch ?? 'shadow');
-const cli = (args: string[]) => ['bun', 'bin/elanous.mjs', ...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args];
+const cli = (args: string[]) => [process.execPath, resolve(import.meta.dir, '../../bin/elanous.mjs'), ...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args];
 const sourceOf = (issue: TriageIssue): string => /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1] ?? `linear:${issue.identifier}`;
 const promptOf = (issue: TriageIssue): string => `${issue.title}\n${issue.body.slice(0, 1500)}`;
 const argvFor = (issue: TriageIssue, settings: StewardSettings): string[] =>
@@ -100,15 +104,19 @@ export function planLaunches(rows: ScheduledDecision[], issues: TriageIssue[], l
   return { launches, hitl };
 }
 
-function runCommand(args: string[]): { exitCode: number; stdout: string; stderr: string } {
-  const result = Bun.spawnSync(args, { cwd: resolve(import.meta.dir, '../..'), stdout: 'pipe', stderr: 'pipe' });
+function stewardLaunchSeat(): string {
+  return resolveHqLaunchSeat('OP', getElanousConfigDir());
+}
+
+function runCommand(args: string[], cwd = resolve(import.meta.dir, '../..')): { exitCode: number; stdout: string; stderr: string } {
+  const result = Bun.spawnSync(args, { cwd, stdout: 'pipe', stderr: 'pipe' });
   return { exitCode: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
 }
 
-function spawnDetached(args: string[], log: string): { pid: number } {
+function spawnDetached(args: string[], log: string, seat = stewardLaunchSeat()): { pid: number } {
   const fd = openSync(log, 'a');
   try {
-    const child = Bun.spawn(args, { cwd: resolve(import.meta.dir, '../..'), stdout: fd, stderr: fd, stdin: 'ignore', detached: true });
+    const child = Bun.spawn(args, { cwd: seat, stdout: fd, stderr: fd, stdin: 'ignore', detached: true });
     child.unref();
     return { pid: child.pid };
   } finally { closeSync(fd); }
@@ -149,9 +157,12 @@ export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
   // L6: a launch must remain on the isolated Pod pool, never fall back to the host or another substrate.
   if (!/^[a-zA-Z0-9_-]+(?:@[a-zA-Z0-9._-]+(?::[1-9][0-9]*)?)?$/.test(settings.podPool ?? DEFAULT_POOL))
     return blocked('blocked-location', 'invalid steward pod pool');
+  let seat: string;
+  try { seat = (deps.launchSeat ?? stewardLaunchSeat)(); }
+  catch (error) { return blocked('blocked-location', `steward OP seat unavailable: ${String(error)}`); }
   let budget: BudgetDecision | 'unknown' = 'unknown';
   try {
-    const result = command(cli(['harness', 'budget', '--json']));
+    const result = command(cli(['harness', 'budget', '--json']), seat);
     const decision = result.exitCode === 0 ? lastJson(result.stdout) : {};
     if (!BUDGET_PROCEED.includes(String(decision.outcome)))
       return blocked('skipped-budget', result.exitCode === 0 ? JSON.stringify(decision.reasons ?? ['budget unavailable']) : result.stderr ?? 'budget unavailable');
@@ -171,7 +182,7 @@ export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
   ledger.launches[key] = entry;
   saveLaunchLedger(root, ledger);
   try {
-    entry.pid = (deps.spawn ?? spawnDetached)(argvFor(item.issue, settings), entry.log).pid;
+    entry.pid = (deps.spawn ?? spawnDetached)(argvFor(item.issue, settings), entry.log, seat).pid;
   } catch (error) {
     entry.status = 'failed';
     entry.reason = redactSecrets(String(error));

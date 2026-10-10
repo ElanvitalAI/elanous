@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { OFFICIAL_INDEX_KEYS } from '../../market/official-keys.js';
-import { addMarket, ELANOUS_MARKET_URL, ensureMarketIndex, listMarkets, updateMarket } from './market-fetch.js';
+import { addMarket, ELANOUS_MARKET_URL, ensureInternalMarketIndex, ensureMarketIndex, listMarkets, updateMarket } from './market-fetch.js';
 
 const dirs: string[] = [];
 function setup() {
@@ -233,6 +233,82 @@ describe('signed market fetch', () => {
     await expect(ensureMarketIndex('community', { ...opts, fetcher: (async (_input: string | URL | Request) => new Response('', { status: 404 })) as typeof fetch })).rejects.toThrow('HTTP 404');
     const other = signed('other', 1);
     await expect(ensureMarketIndex('community', { ...opts, fetcher: server(other.bytes, other.signature).fetcher, trustedKeys: [{ keyId: other.keys.keyId, publicKey: other.keys.publicKey }] })).rejects.toThrow('market index name mismatch');
+  });
+
+  test('fetches and caches signed internal packs and bundles only for a bound key and allowed tenant', async () => {
+    const opts = setup();
+    const keys = generateIndexKeyPair();
+    const index = { name: 'private', interface: { displayName: 'Private' }, sequence: 1, plugins: [],
+      knowledgePacks: [{ name: 'sales', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'a'.repeat(64), bytes: 1, key: 'sales.tgz' } }],
+      loopBundles: [{ name: 'loop', version: '1.0.0', visibility: 'internal', enterpriseId: 'tenant-a', artifact: { sha256: 'b'.repeat(64), bytes: 1, key: 'loop.tgz' } }] };
+    const bytes = Buffer.from(JSON.stringify(index));
+    const signature = signIndex(bytes, keys.privateKeyPem, keys.keyId);
+    writeFileSync(opts.configPath, JSON.stringify({ market: { internalMarkets: [{ name: 'private', url: 'https://private.example.org/catalog/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] }] } }));
+    const { fetcher, requests } = server(bytes, signature);
+    const result = await ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher });
+    expect(result.index).toMatchObject(index);
+    expect(result.signature).toBe('ok');
+    expect(requests).toEqual(['https://private.example.org/catalog/marketplace.json', 'https://private.example.org/catalog/index.sig']);
+    expect(readFileSync(join(result.directory, 'marketplace.json'))).toEqual(bytes);
+    const cached = await ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: (async () => { throw new Error('cache missed'); }) as unknown as typeof fetch });
+    expect(cached.index).toMatchObject(index);
+    expect(listMarkets(opts)).toEqual([{ name: 'elanous', url: ELANOUS_MARKET_URL }]);
+    await expect(ensureMarketIndex('private', { ...opts, fetcher })).rejects.toThrow('market not configured');
+    await expect(ensureInternalMarketIndex('private', 'tenant-b', { ...opts, fetcher })).rejects.toThrow('enterprise not allowed');
+    writeFileSync(opts.configPath, JSON.stringify({ market: { internalMarkets: [{ name: 'private', url: 'https://private.example.org/catalog/', enterpriseIds: ['tenant-b'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] }] } }));
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher })).rejects.toThrow('enterprise not allowed');
+    expect(requests).toHaveLength(2);
+  });
+
+  test('rejects private rollback even after a bound signing key rotates', async () => {
+    const opts = setup();
+    const first = generateIndexKeyPair();
+    const second = generateIndexKeyPair();
+    const index = (sequence: number) => Buffer.from(JSON.stringify({ name: 'private', interface: { displayName: 'Private' }, sequence, plugins: [], knowledgePacks: [] }));
+    const configure = (keys: typeof first) => writeFileSync(opts.configPath, JSON.stringify({ market: { internalMarkets: [
+      { name: 'private', url: 'https://private.example.org/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] },
+    ] } }));
+    configure(first);
+    const old = index(9);
+    const saved = await ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(old, signIndex(old, first.privateKeyPem, first.keyId)).fetcher });
+    configure(second);
+    const next = index(1);
+    const fetched = server(next, signIndex(next, second.privateKeyPem, second.keyId));
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: fetched.fetcher })).rejects.toMatchObject({ reason: 'signature', message: expect.stringContaining('sequence-rollback') });
+    expect(fetched.requests).toHaveLength(2);
+    expect(JSON.parse(readFileSync(join(saved.directory, 'cache-state.json'), 'utf8')).lastSequence).toBe(9);
+  });
+
+  test('rejects unsigned, globally trusted and cross-enterprise entries without publishing private cache', async () => {
+    const opts = setup();
+    const bound = generateIndexKeyPair();
+    const global = generateIndexKeyPair();
+    writeFileSync(opts.configPath, JSON.stringify({ market: { trustedKeys: [{ keyId: global.keyId, publicKey: global.publicKey }], internalMarkets: [
+      { name: 'private', url: 'https://private.example.org/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: bound.keyId, publicKey: bound.publicKey }] },
+    ] } }));
+    const index = (enterpriseId: string, visibility = 'internal') => Buffer.from(JSON.stringify({ name: 'private', interface: { displayName: 'Private' }, sequence: 1, plugins: [],
+      knowledgePacks: [{ name: 'sales', version: '1.0.0', visibility, ...(visibility === 'internal' ? { enterpriseId } : {}), artifact: { sha256: 'a'.repeat(64), bytes: 1, key: 'sales.tgz' } }] }));
+    const alien = index('tenant-b');
+    const forged = index('tenant-a');
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(alien, signIndex(alien, bound.privateKeyPem, bound.keyId)).fetcher })).rejects.toThrow('outside enterprise allowlist');
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(forged, signIndex(forged, global.privateKeyPem, global.keyId)).fetcher })).rejects.toMatchObject({ reason: 'signature', message: expect.stringContaining('unknown-key') });
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(forged, '').fetcher })).rejects.toMatchObject({ reason: 'signature' });
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(forged, '').fetcher,
+      verifySignature: () => ({ ok: true, keyId: bound.keyId, sequence: 1, index: JSON.parse(forged.toString()) }),
+    })).rejects.toMatchObject({ reason: 'signature' });
+    const publicIndex = index('tenant-a', 'public');
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(publicIndex, signIndex(publicIndex, bound.privateKeyPem, bound.keyId)).fetcher })).rejects.toThrow('outside enterprise allowlist');
+    expect(existsSync(join(opts.root, 'markets', '.internal', 'private'))).toBe(false);
+    expect(() => addMarket('unsafe', 'http://private.example.org/', opts)).toThrow('invalid market URL');
+    writeFileSync(opts.configPath, JSON.stringify({ market: { internalMarkets: [{ name: 'private', url: 'http://private.example.org/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: bound.keyId, publicKey: bound.publicKey }] }] } }));
+    await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(forged, '').fetcher })).rejects.toThrow('invalid market URL');
+    for (const change of [
+      { enterpriseIds: [], trustedKeys: [{ keyId: bound.keyId, publicKey: bound.publicKey }] },
+      { enterpriseIds: ['tenant-a'], trustedKeys: [] },
+    ]) {
+      writeFileSync(opts.configPath, JSON.stringify({ market: { internalMarkets: [{ name: 'private', url: 'https://private.example.org/', ...change }] } }));
+      await expect(ensureInternalMarketIndex('private', 'tenant-a', { ...opts, fetcher: server(forged, '').fetcher })).rejects.toThrow('invalid internal market');
+    }
   });
 
   // 🅢 R3 must-fix ① — the config may hold secrets: addMarket keeps its permission bits.

@@ -28,6 +28,28 @@ export function tuiVerdict(checks: readonly TuiCheck[]): 'pass' | 'fail' {
   return checks.every((c) => c.pass) ? 'pass' : 'fail';
 }
 
+/** `tui-sim-node.ts --json` prints the raw result (no `outcome`); `node-verdict.ts tui` adds it. Same rule here so a
+ *  prefetched raw result is judged exactly like the wrapped node result: exit 0 with pass|flaky → ok. */
+export function withTuiOutcome(status: number | null, data: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!data) return null;
+  const outcome = status === 0 && (data.verdict === 'pass' || data.verdict === 'flaky') ? 'ok' : status === 1 ? 'fail' : 'error';
+  return { ...data, outcome };
+}
+
+export function reusableTui(data: unknown, commit: string): Record<string, unknown> | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const value = data as Record<string, unknown>;
+  if (value.outcome !== 'ok' || value.commit !== commit || (value.verdict !== 'pass' && value.verdict !== 'flaky')
+    || (value.verdict === 'pass' ? value.attempts !== 1 : value.attempts !== 2)
+    || !Array.isArray(value.checks) || value.checks.length !== 6) return null;
+  const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
+  if (value.checks.some((check: unknown, i: number) => !check || typeof check !== 'object'
+    || (check as TuiCheck).id !== ids[i] || (check as TuiCheck).pass !== true
+    || typeof (check as TuiCheck).detail !== 'string')) return null;
+  if (value.regress === null || typeof value.regress !== 'object' || Array.isArray(value.regress)) return null;
+  return value;
+}
+
 export type TuiRegress = {
   pass: number;
   fail: number;

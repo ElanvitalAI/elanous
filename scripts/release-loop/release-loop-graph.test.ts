@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as yaml } from 'yaml';
-import { decideGraphApproval, runGraph } from '../../src/graph-runner/runner.js';
+import { decideGraphApproval, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { runPrLand as realRunPrLand } from '../../src/cli/pr-cli.js';
 import { ClaimsLedger } from '../../src/claims/claims-ledger.js';
 import { addItem, setItem } from '../../src/release-loop/checklist.js';
@@ -54,7 +54,7 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.status).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -67,13 +67,57 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
     const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
     expect(graph.edges.filter((e) => Object.values(e.map).includes('publish')).map((e) => e.from)).toEqual(['auto-approve', 'approve-publish']);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function elapsedSeconds(startedAt: string | undefined, endedAt: string | undefined): number | null {
+  const start = Date.parse(startedAt ?? '');
+  const end = Date.parse(endedAt ?? '');
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? (end - start) / 1000 : null;
+}
+
+function releaseDurations(state: GraphRunState): { totalSeconds: number | null; gateToPublishSeconds: number | null } {
+  const gate = state.nodes.find((node) => node.nodeId === 'gate');
+  const publish = state.nodes.find((node) => node.nodeId === 'publish');
+  return { totalSeconds: elapsedSeconds(state.startedAt, state.finishedAt),
+    gateToPublishSeconds: elapsedSeconds(gate?.endedAt, publish?.startedAt) };
+}
+
+test('serial release baseline: RFC #24935 recorded figures (not a live measurement) vs projected savings, and graph boundaries', () => {
+  // #24935 measured one 0.2.19 ledger: gate end → publish start ≈663s (11.1m).
+  // A1's ≈646s (10.8m) is a projection, not a measured reduction; post-change runs measured: 0.
+  const rfc = { measuredPostGateSeconds: 663, projectedA1SavingsSeconds: 646, measuredA1Runs: 0 };
+  expect(rfc.measuredPostGateSeconds / 60).toBeCloseTo(11.1, 1);
+  expect(rfc.projectedA1SavingsSeconds / 60).toBeCloseTo(10.8, 1);
+  expect(rfc.measuredA1Runs).toBe(0);
+  expect(rfc.measuredPostGateSeconds - rfc.projectedA1SavingsSeconds).toBe(17);
+  expect(releaseDurations({ startedAt: '2026-10-08T00:00:00Z', finishedAt: '2026-10-08T01:15:00Z',
+    nodes: [{ nodeId: 'gate', endedAt: '2026-10-08T00:00:00Z' },
+      { nodeId: 'publish', startedAt: '2026-10-08T00:11:03Z' }] } as GraphRunState)).toEqual({ totalSeconds: 4500, gateToPublishSeconds: 663 });
+  expect(releaseDurations({ nodes: [{ nodeId: 'gate' }, { nodeId: 'publish' }] } as GraphRunState)).toEqual({ totalSeconds: null, gateToPublishSeconds: null });
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
+    nodes: Array<{ node_id: string; recipe?: string }>;
+    edges: Array<{ from: string; map: Record<string, string> }>;
+  };
+  expect(graph.nodes.find((node) => node.node_id === 'prefetch')?.recipe).toBe('cmd:docs');
+  expect(graph.nodes.find((node) => node.node_id === 'tui')?.recipe).toBe('cmd:docs');
+  expect(graph.nodes.find((node) => node.node_id === 'docs')?.recipe).toBe('cmd:docs');
+  const next = (from: string) => graph.edges.find((edge) => edge.from === from)?.map.ok;
+  expect(['gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
+    .map(next)).toEqual(['mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
+  expect(graph.edges.find((edge) => edge.from === 'prefetch')?.map).toEqual({ ok: 'gate', fail: 'gate', error: 'gate' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'mac-smoke', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'tui')?.map).toEqual({ ok: 'docs', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'docs')?.map).toEqual({ ok: 'known-issues', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'auto-approve')?.map).toEqual({ ok: 'publish', fail: 'approve-publish', error: 'approve-publish' });
+  expect(graph.edges.find((edge) => edge.from === 'approve-publish')?.map).toEqual({ ok: 'publish', fail: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'publish')?.map).toEqual({ ok: 'npm-publish', fail: 'failed', error: 'failed' });
 });
 
 test('cutoff routes through checklist-gate before the costly gate', () => {
@@ -84,7 +128,7 @@ test('cutoff routes through checklist-gate before the costly gate', () => {
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'checklist-gate')).toMatchObject({ kind: 'gate', recipe: 'cmd:checklist-gate', max_visits: 1 });
   expect(graph.edges.find((edge) => edge.from === 'cutoff')?.map).toEqual({ ok: 'checklist-gate', fail: 'failed', error: 'failed' });
-  expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'gate', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'prefetch', fail: 'failed', error: 'failed' });
   expect(recipes['checklist-gate']).toEqual({ command: 'bun scripts/release-loop/checklist-gate-node.ts', timeout_ms: 600000 });
 });
 
@@ -109,7 +153,7 @@ test('public export check routes gate ok before pwa and failure to failed', asyn
       stdout: JSON.stringify(body.includes('export-check-node.ts') ? { outcome: 'fail', verdict: 'fail', summary: 'leak', step: 'export', tail: 'leak' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
     }) } });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'failed']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'failed']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -123,7 +167,23 @@ test('mac-smoke fail and error are warning-only: the graph continues to export-c
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+      expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('GATE-NODES-PARALLEL: a crashed or failed prefetch node never stops the release — the graph continues to the gate', async () => {
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  for (const outcome of ['fail', 'error'] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'release-prefetch-failed-'));
+    try {
+      const state = await runGraph(graphPath, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body, opts) => {
+        const prefetch = body.includes('docs-node.ts') && JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId === 'prefetch';
+        return prefetch ? { exitCode: outcome === 'fail' ? 1 : 2, stdout: '', stderr: 'worker spawn error' }
+          : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
+      } } });
+      expect(state.path.slice(0, 5)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate']);
+      expect(state.status).toBe('done');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -334,6 +394,10 @@ test('measured graph decision publishes without human approval', async () => {
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', ...fields }) + '\n', stderr: '' };
     };
     const state = await runGraph(graph, { input: { version: '0.2.5', previousVersion: '0.2.4' }, deps: { root, runBash: fake } });
+    const durations = releaseDurations(state);
+    expect(durations.totalSeconds).toBeNumber();
+    expect(durations.gateToPublishSeconds).toBeNumber();
+    // This is an isolated fake-run clock check, not a post-change production speedup measurement.
     expect(state.status).toBe('done');
     expect(state.path).toContain('auto-approve');
     expect(state.path).not.toContain('approve-publish');
@@ -350,9 +414,9 @@ test('real graph commands stop at approval before publish', async () => {
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({ exitCode: body.includes('auto-approve-node.ts') ? 1 : 0, stdout: body.includes('auto-approve-node.ts') ? '{"outcome":"fail","verdict":"fail","summary":"unmeasured"}\n' : '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
     expect(state.pending?.nodeId).toBe('approve-publish');
-    expect(state.executed).toBe(14);
+    expect(state.executed).toBe(15);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -399,8 +463,8 @@ test('gate regression routes to failed before preparing or publishing', async ()
       } },
     });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'failed']);
-    expect(commands).toHaveLength(4);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'failed']);
+    expect(commands).toHaveLength(5);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -447,6 +511,8 @@ test('actual docs output reaches the real notes checker and B11 blocks approval'
           return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
         }
         if (body.includes('docs-node.ts')) {
+          const nodeId = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId as string;
+          if (nodeId !== 'docs') return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
           const run = spawnSync(process.execPath, [join(import.meta.dir, 'docs-node.ts'), '--version', '9.9.9', '--base', root, '--json'], {
             cwd: root, encoding: 'utf8', env: { ...opts.env, ELANOUS_GRAPH_CONTEXT: '', ELANOUS_STATE_DIR: root },
           });
@@ -489,12 +555,12 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
   try {
     const first = await runGraph(graph, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: fake } });
     expect(first.status).toBe('awaiting-approval');
-    expect(commands).toHaveLength(14);
+    expect(commands).toHaveLength(15);
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
     expect(resumed.path.slice(-10)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
-    expect(commands).toHaveLength(22); // + vault-note and release-story
+    expect(commands).toHaveLength(23); // + vault-note and release-story
     expect(commands.at(-8)).toContain('publish-node.ts');
     expect(commands.at(-7)).toContain('npm-publish-node.ts');
     expect(commands.at(-1)).toContain('version-node.ts dev-bump');
@@ -541,7 +607,7 @@ if (tool === 'git') {
     if (args[args.indexOf('--source')+1] !== sha || args[args.indexOf('--notes-from')+1] !== 'b'.repeat(40)) process.exit(1);
     fs.mkdirSync(path.join(out,'dist'),{recursive:true});
     fs.writeFileSync(path.join(out,'dist/elanous.tgz'),'candidate');
-    fs.writeFileSync(path.join(root,'release/0.2.4/manifest.json'),JSON.stringify({version:'0.2.4',in:[{sha:'a',title:'Release change',kind:'feat',line:'Release change'}]}));
+    fs.writeFileSync(path.join(root,'release/0.2.4/manifest.json'),JSON.stringify({version:'0.2.4',cutoff:{sha},in:[{sha:'a',title:'Release change',kind:'feat',line:'Release change'}]}));
     console.log(JSON.stringify({manifest:{version:'0.2.4',sourceCommit:sha,distDir:path.join(out,'dist')}}));
   } else if (args.includes('publish')) {
     if (!fs.existsSync(path.join(args[args.indexOf('--dir')+1],'dist/elanous.tgz'))) process.exit(1);
@@ -562,6 +628,14 @@ if (tool === 'git') {
     process.env.ELANOUS_STATE_DIR = root;
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RELEASE_WIRING_ROOT: root, ELANOUS_STATE_DIR: root };
     const real = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      const nodeId = body.includes('docs-node.ts') ? JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId : undefined;
+      if (nodeId === 'prefetch') {
+        return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"prefetch fixture"}\n', stderr: '' };
+      }
+      // The tui node now enters through docs-node.ts (cache join → node-verdict.ts tui fallback); keep the costly TUI check isolated as before.
+      if (nodeId === 'tui') {
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'isolated costly check' }) + '\n', stderr: '' };
+      }
       if (body.includes('node-verdict.ts') || body.includes('gate-node.ts') || body.includes('export-check-node.ts')) {
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'isolated costly check' }) + '\n', stderr: '' };
       }

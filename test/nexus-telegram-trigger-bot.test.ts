@@ -20,6 +20,7 @@ import {
   toTelegramEvent,
 } from '../src/nexus/api/telegram-trigger-bot';
 import { debug } from '../src/debug/log';
+import { receiveChannelEvent } from '../src/nexus/outbound/router';
 import { GRACEFUL_EXIT_CODE } from '../src/nexus/supervisor/graceful-exit';
 import type { TgTriggerEvent } from '../src/telegram';
 import type { TelegramEvent } from '../src/workflow-runtime/triggers/telegram-source';
@@ -110,6 +111,7 @@ describe('createNexusTelegramTriggerBot · factory + tap wiring', () => {
       messageId: 42,
       isDm: true,
     };
+    expect(receiveChannelEvent('telegram', tap)).toEqual({ text: 'hi', kind: 'message', channel: 'chat-1', senderId: 'user-1', messageId: 42 });
     const out = toTelegramEvent(tap);
     expect(out).toMatchObject({
       kind: 'message',

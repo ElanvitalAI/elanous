@@ -28,6 +28,13 @@ test('empty baseline cut falls back to the sibling cut with the newest junit, no
   expect(plan.durations).toEqual(new Map([['a.test.ts', 7]]));
 });
 
+test('fallback does not promote a nested suite after CDATA closes a suite in text', () => {
+  const release = ledger();
+  const sibling = cut(release, '0.2.18');
+  writeFileSync(join(sibling, 'pod-0.junit.xml'), '<testsuites><testsuite file="a.test.ts" time="7"><system-out><![CDATA[</testsuite>]]></system-out><testsuite file="nested.test.ts" time="99"/></testsuite></testsuites>');
+  expect(planDurations(cut(release, '0.2.19')).durations).toEqual(new Map([['a.test.ts', 7]]));
+});
+
 test('fallback keeps the wall-time scaling of the sibling cut', () => {
   const release = ledger();
   const sibling = cut(release, '0.2.18');

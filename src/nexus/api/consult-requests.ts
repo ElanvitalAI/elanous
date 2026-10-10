@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import { routeOutbound } from '../outbound/router.js';
+import { sendTelegramReport } from '../../telegram-report.js';
 import { getUserConfig } from '../../user-config.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { jsonResponse } from './json-response.js';
@@ -23,7 +23,7 @@ interface ConsultRequest {
 export interface ConsultRequestsDeps {
   root?: () => string;
   now?: () => string;
-  /** Owner alert. Default = the daemon's own in-process router (the same one `/v1/outbound` uses).
+  /** Owner alert. Default = the daemon's in-process Telegram sender (operations role only).
    *  ⛔ Never `sendOutbound` here: it is a synchronous curl to this very daemon's `/v1/outbound`, so inside the
    *  daemon it blocks the event loop until it times out (~25 s · `unreachable`) and the alert is lost (CS1 · 10-01). */
   send?: (text: string, kind: string) => unknown;
@@ -88,9 +88,9 @@ export async function handleConsultRequests(req: Request, deps: ConsultRequestsD
   if (!body || typeof body !== 'object' || Array.isArray(body)) return rejected('body');
   const input = body as Record<string, unknown>;
   for (const field of ['name', 'contact'] as const) {
-    if (typeof input[field] !== 'string' || !input[field].trim()) return rejected(field);
+    if (typeof input[field] !== 'string' || !input[field].trim() || input[field].length > (field === 'name' ? 256 : 512)) return rejected(field);
   }
-  if (input.org !== undefined && (typeof input.org !== 'string' || !input.org.trim())) return rejected('org');
+  if (input.org !== undefined && (typeof input.org !== 'string' || !input.org.trim() || input.org.length > 256)) return rejected('org');
   if (input.kind !== 'company' && input.kind !== 'personal') return rejected('kind');
   if (input.interest !== 'A' && input.interest !== 'B') return rejected('interest');
   if (input.consent !== true) return rejected('consent');
@@ -114,15 +114,12 @@ export async function handleConsultRequests(req: Request, deps: ConsultRequestsD
   const alert = `📮 상담 문의 ${entry.receiptId} · ${entry.name}(${entry.kind === 'personal' ? '개인' : (entry.org ?? '회사')}) · 관심 ${entry.interest}\n앱에서 보기`;
   // Fire and forget — the receipt is already on disk; the answer must not wait for the channel.
   void Promise.resolve()
-    .then(() => (deps.send ?? notifyInProcess)(alert, 'alert'))
+    .then(() => (deps.send ?? notifyInProcess)(alert, 'ops-alert'))
     .catch((error: unknown) => { debug.log('consult.request', 'notify-failed', { receiptId: entry.receiptId, reason: error instanceof Error ? error.message : String(error) }); });
   return jsonResponse({ receiptId: entry.receiptId, receivedAt: entry.receivedAt }, 202);
 }
 
 async function notifyInProcess(text: string, kind: string): Promise<void> {
-  const result = await routeOutbound(getUserConfig(), { text, markdown: false, kind });
-  debug.log('consult.request', result.delivered ? 'notified' : 'notify-failed', {
-    delivered: result.delivered,
-    channels: result.channels.map((channel) => `${channel.type}:${channel.ok ? 'ok' : 'fail'}`),
-  });
+  const delivered = await sendTelegramReport(getUserConfig(), text, { markdown: false, kind });
+  debug.log('consult.request', delivered ? 'notified' : 'notify-failed', { delivered, channels: [`telegram:${delivered ? 'ok' : 'fail'}`] });
 }

@@ -81,8 +81,8 @@ import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-follow
 import { attachTelegramProjectButtons } from './telegram-project-command.js';
 import { attachTelegramFabricPlan } from './telegram-fabric-plan.js';
 import { contextNow as readContextNow, type ContextNowDeps } from './context-bus/context-now.js';
-import { renderContextFirstNow } from './context-bus/context-now-surfaces.js';
-import { createContextFirstGate, renderContextFirst } from './context-bus/context-first.js';
+import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
+import { createContextFirstFileStore, createContextFirstGate, isOperationalQuery, renderContextFirst, type ContextFirstStore } from './context-bus/context-first.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -239,6 +239,8 @@ export interface TelegramBotOpts {
   /** 시험 seam — `/v1/context/now` 와 같은 `contextNow` 읽기. 던지면 «맥락 못 읽음». */
   readContextNow?: typeof readContextNow;
   contextNowDeps?: ContextNowDeps;
+  /** Keeps last-utterance times across a daemon restart so a restart does not re-send the context-first opening. */
+  contextFirstStore?: ContextFirstStore;
 }
 
 /** Surface-unification v2 (FU-2) — Telegram trigger event passed to
@@ -363,7 +365,7 @@ export class TelegramBot {
   private readonly handleFabricPlan: (ctx: TgIncoming) => Promise<boolean>;
   private readonly readContextNow: typeof readContextNow;
   private readonly contextNowDeps?: ContextNowDeps;
-  private readonly contextFirstGate = createContextFirstGate({ now: () => this.nowImpl() });
+  private readonly contextFirstGate: ReturnType<typeof createContextFirstGate>;
   private seatAskTimer: ReturnType<typeof setInterval> | null = null;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
@@ -390,6 +392,10 @@ export class TelegramBot {
     this.log = opts.log ?? ((m: string) => debug.log('telegram.core', m));
     this.sleepImpl = opts.sleepImpl ?? sleep;
     this.nowImpl = opts.nowImpl ?? (() => Date.now());
+    this.contextFirstGate = createContextFirstGate({
+      now: () => this.nowImpl(),
+      ...(opts.contextFirstStore ? { store: opts.contextFirstStore } : {}),
+    });
     this.perChatGapMs = opts.perChatGapMs ?? DEFAULT_PER_CHAT_GAP_MS;
     this.globalMaxPerSec = opts.globalMaxPerSec ?? DEFAULT_GLOBAL_MAX_PER_SEC;
     this.streamEditGapMs = opts.streamEditGapMs ?? DEFAULT_STREAM_EDIT_GAP_MS;
@@ -436,8 +442,11 @@ export class TelegramBot {
     if (!this.contextFirstGate.take(key)) return;
     const cfg = this.slashContext?.userConfig.telegram;
     if (cfg?.contextFirst === false) return;
+    if (isOperationalQuery(ctx.text)) return;
     try {
-      await this.sendMessage(ctx.chatId, renderContextFirst(this.readContextNow, this.contextNowDeps, renderContextFirstNow), { replyTo: ctx.messageId, threadId: ctx.threadId });
+      const opening = renderContextFirst(this.readContextNow, this.contextNowDeps, renderContextFirstOpening);
+      if (!opening) return;
+      await this.sendMessage(ctx.chatId, opening, { replyTo: ctx.messageId, threadId: ctx.threadId });
     } catch (err) {
       this.log(`telegram context-first failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2988,6 +2997,10 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
       ...(opts.daemonBridge !== undefined ? { daemonBridge: opts.daemonBridge } : {}),
     },
     ...(voiceAdapter ? { voiceAdapter } : {}),
+    // An injected clock marks a test/replay harness: it must not read or write the live daemon's state file.
+    ...(opts.telegramBotOpts?.nowImpl === undefined
+      ? { contextFirstStore: createContextFirstFileStore(joinPath(getElanousConfigDir(), 'telegram-context-first.json')) }
+      : {}),
     ...opts.telegramBotOpts,
   });
   // Register the surface-HITL callback subscription up front so the

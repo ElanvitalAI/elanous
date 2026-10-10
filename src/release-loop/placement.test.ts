@@ -70,6 +70,67 @@ test('P0 next; P1 named deadline; P2 earliest capacity, seat cap and predecessor
   expect(placeCell(cell('overflow'), { ...deps(), seatCap: { TC: 1 } }).version).toBe('0.2.17');
 });
 
+test('rubric grades defer discretionary P3, keep P1/P2 earliest, and leave priority distinct', () => {
+  setup();
+  const options = { ...deps(), dryRun: true };
+  expect(placeCell({ ...cell('grade-p1'), grade: 'P1' }, options).version).toBe('0.2.14');
+  expect(placeCell({ ...cell('grade-p2'), grade: 'P2' }, options).version).toBe('0.2.14');
+  expect(placeCell({ ...cell('grade-p3'), grade: 'P3' }, options).version).toBe('0.2.17');
+  expect(placeCell({ ...cell('deadline', 'P1'), grade: 'P3', deadlineVersion: '0.2.15' }, options).version).toBe('0.2.15');
+  expect(placeCell({ ...cell('incident', 'P0'), grade: 'P4' }, options).version).toBe('0.2.14');
+  expect(() => placeCell({ ...cell('no-deadline'), grade: 'P1', priority: 'P1' }, options)).toThrow('P1 칸의 마감 판이 없다');
+  expect(() => placeCell({ ...cell('drop'), grade: 'P4' }, deps())).toThrow('루브릭 P4 칸은 합치거나 빼야 한다');
+  expect(() => placeCell({ ...cell('invalid'), grade: 'P0' as 'P1' }, options)).toThrow('잘못된 루브릭 등급');
+  expect(listChecklist('0.2.17').items).toHaveLength(0);
+});
+
+test('cards-supplied rubric grade changes only discretionary release order, not ledger priority or capacity', () => {
+  setup();
+  addItem('0.2.17', { ...cell('full') });
+  const options = { ...deps(), merged24h: 10, seatCap: { TC: 1 }, dryRun: true };
+  const high = placeCell({ ...cell('high'), grade: 'P1' }, options);
+  const low = placeCell({ ...cell('low'), grade: 'P3' }, options);
+  expect(high.version).toBe('0.2.14');
+  expect(low.version).toBe('0.2.16');
+  expect(low.reason).toContain('P2 루브릭 P3: 착지 마감 내 가장 늦은 여유 판부터');
+  expect(low.displaced).toEqual([]);
+  expect(listChecklist('0.2.16').items).toHaveLength(0);
+  expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['full']);
+});
+
+test('rubric P3 remains bounded by capacity, deadline and predecessor releases', () => {
+  setup();
+  addItem('0.2.14', { ...cell('base') });
+  addItem('0.2.17', { ...cell('full') });
+  const options = { ...deps(), seatCap: { TC: 1 }, merged24h: 10, dryRun: true };
+  expect(placeCell({ ...cell('deferred'), grade: 'P3', predecessors: ['base'], deadlineVersion: '0.2.16' }, options).version).toBe('0.2.16');
+  expect(placeCell({ ...cell('fallback'), grade: 'P3', predecessors: ['base'] }, options).version).toBe('0.2.16');
+  expect(() => placeCell({ ...cell('too-late'), grade: 'P3', predecessors: ['full'], deadlineVersion: '0.2.16' }, options)).toThrow('배치할 판이 없다');
+  expect(listChecklist('0.2.16').items).toHaveLength(0);
+  expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['full']);
+});
+
+test('rubric P3 cannot defer an existing predecessor onto or past its dependent', () => {
+  setup();
+  addItem('0.2.14', { ...cell('base') });
+  addItem('0.2.15', { ...cell('dependent'), owner: 'MK', predecessors: ['base'] });
+  expect(placeCell({ ...cell('base'), grade: 'P3' }, { ...deps(), merged24h: 10 }).version).toBe('0.2.14');
+  expect(listChecklist('0.2.14').items.map((item) => item.id)).toEqual(['base']);
+  expect(checklistHistory('base').filter((row) => row.field === 'move')).toHaveLength(0);
+});
+
+test('rubric grade is not a ledger priority or a rebalance score', () => {
+  setup();
+  const decision = placeCell({ ...cell('deferred'), grade: 'P3' }, { ...deps(), merged24h: 10 });
+  expect(decision.version).toBe('0.2.17');
+  expect(listChecklist('0.2.17').items[0]).toMatchObject({ priority: 'P2' });
+  expect(listChecklist('0.2.17').items[0]).not.toHaveProperty('grade');
+  setSchedule('0.2.18', { cutAt: '2026-10-08T02:00:00Z', landBy: '2026-10-08T02:00:00Z' }, 'OP');
+  const near = new Date('2026-10-07T01:00:00Z');
+  expect(rebalance('0.2.17', { now: near, merged24h: 10, dryRun: true }).decisions.map((row) => row.id)).toEqual(['deferred']);
+  expect(listChecklist('0.2.17').items.map((item) => item.id)).toEqual(['deferred']);
+});
+
 test('P0 incident goes to next release even if its old P2 deadline has expired', () => {
   setup();
   addItem('0.2.14', { ...cell('incident'), deadlineVersion: '0.2.14' });

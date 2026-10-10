@@ -7,8 +7,9 @@ import { CliUserError } from '../cli/cli-user-error.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
 export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
-/** `screen` = a five-surface feature cell — its evidence carries a `짝:` line (MANUAL-five-surface-parity §A). */
-export type ChecklistKind = 'screen';
+/** `screen` = a five-surface feature cell — its evidence carries a `짝:` line (MANUAL-five-surface-parity §A). `postpub` = measured after publication, outside the pre-publication gate. */
+export type ChecklistKind = 'screen' | 'postpub';
+const CHECKLIST_KINDS: readonly ChecklistKind[] = ['screen', 'postpub'];
 export interface ChecklistItem {
   id: string;
   title: string;
@@ -227,7 +228,7 @@ export function validateCeoLoad(input: { ceoMinutes?: number; ceoDate?: string }
 export function addItem(v: string, input: { id: string; title: string; refs?: string[]; owner?: string; kind?: ChecklistKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }, options: { allowDuplicateId?: boolean } = {}): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
-  if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
+  if (input.kind !== undefined && !CHECKLIST_KINDS.includes(input.kind)) throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen|postpub');
   if (input.owner !== undefined) parseOwner(input.owner);
   if (input.priority !== undefined && !['P0', 'P1', 'P2'].includes(input.priority)) throw new CliUserError(`잘못된 우선순위: ${input.priority}`);
   if (input.predecessors !== undefined && (!Array.isArray(input.predecessors) || input.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === input.id))) throw new CliUserError('잘못된 선행 칸');
@@ -258,7 +259,7 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
-    if (patch.kind !== undefined && patch.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen');
+    if (patch.kind !== undefined && !CHECKLIST_KINDS.includes(patch.kind)) throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen|postpub');
     if (patch.priority !== undefined && !['P0', 'P1', 'P2'].includes(patch.priority)) throw new CliUserError(`잘못된 우선순위: ${patch.priority}`);
     if (patch.predecessors !== undefined && (!Array.isArray(patch.predecessors) || patch.predecessors.some((p) => typeof p !== 'string' || !p.trim() || p === id))) throw new CliUserError('잘못된 선행 칸');
     if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
@@ -357,6 +358,8 @@ export interface ChecklistGate {
   blocked: string[];
   moved: string[];
   knownIssues: Array<{ id: string; title: string; evidence: string }>;
+  /** Post-publication cells excluded from the pre-publication judgement. */
+  postpub?: string[];
   /** Screen cells whose `짝:` line is missing or has an untracked ⏳ — a warning; it never changes `ok`. */
   parity?: Array<{ id: string; why: string }>;
 }
@@ -374,8 +377,9 @@ export function parityGap(evidence: string | undefined): string | null {
 }
 
 export function checklistGate(v: string): ChecklistGate {
-  const result: ChecklistGate = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [], parity: [] };
+  const result: ChecklistGate = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [], postpub: [], parity: [] };
   for (const item of listChecklist(v).items) {
+    if (item.kind === 'postpub') { result.postpub!.push(item.id); continue; }
     if (item.kind === 'screen') {
       const why = parityGap(item.evidence);
       if (why) result.parity!.push({ id: item.id, why });
@@ -388,16 +392,27 @@ export function checklistGate(v: string): ChecklistGate {
     else result.undecided.push(item.id);
   }
   result.ok = result.red.length === 0 && result.undecided.length === 0 && result.blocked.length === 0;
+  if (result.postpub!.length) debug.log('release-loop.checklist', 'gate-postpub-excluded', { version: v, ids: result.postpub });
   return result;
 }
 
 /** GATE-ENTRY-ALIGN: the cut-time judgement shared by `release run`'s entry check and the checklist-gate node —
- *  past the landing deadline a non-P0 yellow without a disposition is carried (moved), and a P0 yellow always blocks. */
+ *  past the landing deadline a non-P0 yellow without a disposition is carried (moved); P0 yellow blocks unless OP recorded known-issue. */
 export function cutChecklistGate(v: string, landBy: string | null | undefined, now: Date = new Date()): ChecklistGate & { autoMoved: string[] } {
-  const items = listChecklist(v).items;
+  const { items, history } = listChecklist(v);
   const overdue = landBy !== null && landBy !== undefined && now.getTime() > Date.parse(landBy);
-  const autoMoved = overdue ? items.filter((item) => item.status === 'yellow' && item.priority !== 'P0' && item.disposition === undefined).map((item) => item.id) : [];
-  const p0 = items.filter((item) => item.status === 'yellow' && item.priority === 'P0').map((item) => item.id);
+  const autoMoved = overdue ? items.filter((item) => item.kind !== 'postpub' && item.status === 'yellow' && item.priority !== 'P0' && item.disposition === undefined).map((item) => item.id) : [];
+  const p0 = items.filter((item) => {
+    if (item.kind === 'postpub' || item.status !== 'yellow' || item.priority !== 'P0') return false;
+    if (item.disposition === 'known-issue') {
+      const decision = [...history].reverse().find((entry) => entry.id === item.id && entry.field === 'disposition' && entry.to === 'known-issue');
+      if (decision?.by === 'OP') {
+        debug.log('release-loop.checklist', 'p0-known-issue-allowed', { version: v, id: item.id, by: decision.by, at: decision.at });
+        return false;
+      }
+    }
+    return true;
+  }).map((item) => item.id);
   const gate = checklistGate(v);
   gate.undecided = gate.undecided.filter((id) => !autoMoved.includes(id) && !p0.includes(id));
   gate.moved = gate.moved.filter((id) => !p0.includes(id)).concat(autoMoved);

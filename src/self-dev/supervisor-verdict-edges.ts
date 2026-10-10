@@ -1,7 +1,5 @@
-import type { SelfDevJobResult } from './orchestrate.js';
-import type { SupervisorStopReason } from './run-supervisor.js';
-
-export type SupervisorNext = 'harvest' | 'scope-decompose' | 'self-review' | 'human-gate' | 'proposal';
+import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext } from './run-types.js';
+export type { SupervisorNext } from './run-types.js';
 export type SupervisorVerdictEdge = { readonly meaning: string; readonly next: SupervisorNext };
 
 // 목표 규칙: 사람 관문은 결제·공개·자격·비가역 결정에만. 지금 max-rounds·provider-exhausted·step-timeout 이 human-gate 인 것은

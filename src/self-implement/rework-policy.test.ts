@@ -769,9 +769,23 @@ describe('rework budget judgment rail', () => {
     expect(applyReworkBudgetDecision(7, { verdict: 'EXTEND', reason: '좁아짐' }, 5)).toEqual({ effectiveMax: 5, stop: false, exit: 'continue', applied: false });
   });
 
-  it('SUFFICIENT 종료는 레일에서 review만 PR 진행 disposition으로 결정한다', () => {
+  it('SUFFICIENT 종료는 레일에서 review를 PR 진행 disposition으로 결정하고 인자 없는 gate는 계속한다', () => {
     expect(applyReworkBudgetDecision(2, { verdict: 'SUFFICIENT', reason: '비블로커' }, 5, 'review')).toEqual({ effectiveMax: 2, stop: true, exit: 'proceed', applied: true });
     expect(applyReworkBudgetDecision(2, { verdict: 'SUFFICIENT', reason: '게이트 실패' }, 5, 'gate')).toEqual({ effectiveMax: 2, stop: false, exit: 'continue', applied: false });
+  });
+
+  it('gate SUFFICIENT는 기존 실패만 명시된 때에만 review처럼 proceed하며 그림자 종료도 같다', () => {
+    const verdict = { verdict: 'SUFFICIENT' as const, reason: '기존 실패만 남음' };
+    const proceed = { effectiveMax: 2, stop: true, exit: 'proceed', applied: true } as const;
+    const unchanged = { effectiveMax: 2, stop: false, exit: 'continue', applied: false } as const;
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'gate', 1, false, undefined, true)).toEqual(proceed);
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'gate', 1, false, undefined, false)).toEqual(unchanged);
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'gate', 1, false)).toEqual(unchanged);
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'supervisor', 1, false, undefined, true)).toEqual(unchanged);
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'review', 1, false, undefined, false)).toEqual(proceed);
+    expect(applyReworkBudgetDecision(2, verdict, 5, 'gate', 1, true, undefined, true)).toEqual({
+      ...unchanged, shadowed: true, wouldExit: 'proceed',
+    });
   });
 
   it('UNCONVERGEABLE 종료는 레일에서 차단 disposition으로 결정한다', () => {

@@ -30,6 +30,7 @@ export interface CooAdminDeps {
   project?: string;
   now?: Date;
   dateEvidence?: CooDateEvidence;
+  briefing?: boolean;
 }
 
 /** Reads the configured Linear project without changing any Linear issue. */
@@ -58,6 +59,32 @@ export async function dispatchCooAdmin(_args: Record<string, unknown>, deps: Coo
       : undefined;
     const deadlineFor = (item: LinearProjectIssue) => verifiedDate(evidenceFor(item)?.officialDeadline);
     const rank = (item: LinearProjectIssue) => item.priority === 0 ? 5 : item.priority;
+    if (deps.briefing) {
+      const todayKst = new Date(today.getTime() + 9 * 3_600_000).toISOString().slice(0, 10);
+      const day = (date: string) => Date.parse(`${date}T00:00:00Z`);
+      const todayDay = day(todayKst);
+      const byDeadline = (a: LinearProjectIssue, b: LinearProjectIssue) =>
+        day(deadlineFor(a)!) - day(deadlineFor(b)!) || rank(a) - rank(b) || a.identifier.localeCompare(b.identifier);
+      const dated = issues.filter(item => deadlineFor(item) !== null).sort(byDeadline);
+      const format = (item: LinearProjectIssue) => {
+        const due = deadlineFor(item);
+        const representative = verifiedDate(evidenceFor(item)?.representativeActionDate);
+        const priority = item.priority === 1 ? 'Urgent' : item.priority === 2 ? 'High' : `우선순위 ${item.priority || '미지정'}`;
+        const title = item.title.replace(/[\r\n\u2028\u2029]+/g, ' ').trim();
+        const url = item.url.replace(/[\r\n\u2028\u2029]+/g, '');
+        return `- ${due ? `확인된 마감일 ${due}` : '기한 미확인'} · ${priority} · ${title}${representative ? ` · 대표 손이 필요한 날 ${representative}` : ''}\n  ${url}`;
+      };
+      const overdueItems = dated.filter(item => day(deadlineFor(item)!) < todayDay);
+      const upcoming = dated.filter(item => day(deadlineFor(item)!) >= todayDay && day(deadlineFor(item)!) <= todayDay + 14 * 86_400_000);
+      const later = dated.filter(item => day(deadlineFor(item)!) > todayDay + 14 * 86_400_000);
+      const unknown = issues.filter(item => deadlineFor(item) === null).sort((a, b) => rank(a) - rank(b) || a.identifier.localeCompare(b.identifier));
+      debug.log('coo.admin', 'read', { count: issues.length, overdue: overdueItems.length, reason: 'ok' });
+      return [issues.truncated ? '조회 상한 250건 · 아래 목록은 일부이며 빠진 항목의 기한은 측정 불가' : '',
+        `지난 기한 ${overdueItems.length}건\n${overdueItems.map(format).join('\n') || '없음'}`,
+        `14일 안 기한 ${upcoming.length}건\n${upcoming.map(format).join('\n') || '없음'}`,
+        ...(later.length || unknown.length ? [`그 밖 · 14일 이후 ${later.length}건 · 기한 미확인 ${unknown.length}건\n${[...later, ...unknown].map(format).join('\n')}`] : []),
+      ].filter(Boolean).join('\n');
+    }
     issues.sort((a, b) => {
       const aDue = deadlineFor(a);
       const bDue = deadlineFor(b);

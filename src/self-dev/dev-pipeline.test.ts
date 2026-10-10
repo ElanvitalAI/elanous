@@ -2854,8 +2854,9 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         toolReviewerRate: 0,
         subscriptionReviewerDeps: { checkSubscription: () => subscribed, usedPercent: () => 12 },
         makeSubscriptionReviewLLM: (spawn) => async () => {
-          expect(spawn.command).toBe('claude');
-          expect(spawn.backendSpec.args).toEqual(['--dangerously-skip-permissions']);
+          // The ACP adapter, not the interactive `claude` CLI (which never answers the ACP handshake).
+          expect(spawn.command).toBe('claude-agent-acp');
+          expect(spawn.backendSpec.args).toEqual([]);
           expect(spawn.env.ANTHROPIC_API_KEY).toBeUndefined();
           calls.push('acp'); return 'VERDICT: PASS';
         },

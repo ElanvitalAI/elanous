@@ -4,6 +4,9 @@
 
 import { createHash } from 'node:crypto';
 import type { LLMUsage } from './prompt-cache/types.js';
+import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
+import { detectLocale, type Locale } from './expression/locale.js';
+import { format, getMessages } from './expression/i18n/index.js';
 import type { ModelRole } from './user-config.js';
 // ⭐ grok 자격 해석 — 구독(OAuth) 1순위 · API 키 2순위. ACP 경로와 «같은» 규칙.
 import { isGrokUnauthorized, refreshGrokSubscriptionToken, resolveFreshGrokCredential, resolveGrokCredential } from './grok/credential.js';
@@ -16,7 +19,7 @@ import {
   getGeminiApiKey, GEMINI_MODEL,
   DEFAULT_PROVIDER,
 } from './config.js';
-import { debug, redactSecrets } from './debug/log.js';
+import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
 import {
@@ -37,8 +40,9 @@ import {
   type ProviderFallbackTerminalVerdict,
 } from './session-runtime/retry-policy.js';
 import { fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
+import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
-import { reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
+import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
 import { closestMatches } from './tool-name-suggest.js';
 import { undoTurnRuntime } from './tool-runtime/undo-turn-runtime.js';
@@ -86,6 +90,8 @@ export type ToolResultContentItem =
  *  - `reasoningDetails`: OpenRouter `reasoning_details[]` — 2026-09-23 · Kimi K3·GLM 은 도구 루프에서 이전 추론을
  *    되돌려 받아야 한다(Kimi 공식 문서: 「K3 는 다중 턴·도구 호출 루프에서 필수」 · OpenRouter 가 이 배열로 통일). */
 export interface ProviderToolMeta { thoughtSignature?: string; reasoningDetails?: Array<Record<string, unknown>> }
+/** OR-TOOLARGS-REPAIR — 깨진 도구 인자의 요약(원문은 싣지 않는다 · 길이와 끝난 이유만). */
+export interface ToolArgsInvalid { chars: number; finishReason: string | null }
 
 export type ContentBlock =
   | { type: 'text';  text: string }
@@ -274,6 +280,10 @@ export type LLMStreamEvent =
        *  ("Function call is missing a thought_signature"). Other
        *  providers ignore this field. */
       providerMeta?: ProviderToolMeta;
+      /** OR-TOOLARGS-REPAIR (2026-10-10) — 인자 JSON 이 깨져(잘림·문법 오류) 파싱에 실패했다는 표지.
+       *  ⛔ OpenRouter 경로(`parseOpenAISSELines` 의 `flagInvalidToolArgs`)에서만 실린다 — 다른 공급자는 종전대로
+       *  `{}` 로 대체되고 이 칸이 없다. 실리면 `args` 는 `{}` 이고, 도구 루프는 실행하지 않고 오류 결과를 돌려준다. */
+      argsInvalid?: ToolArgsInvalid;
     }
   /** Reasoning-summary delta from Codex Responses API (gpt-5 family).
    *  `summary_part_added` is a separator marking the boundary between
@@ -322,6 +332,8 @@ export interface LLMOpts {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Override the text-stream idle watchdog per request (milliseconds). */
+  streamIdleTimeoutMs?: number;
   /** Optional per-request usage telemetry from the provider stream. */
   onUsage?(usage: LLMUsage): void;
   /** Optional model role attached to this request's usage observation. */
@@ -370,7 +382,9 @@ export interface LLMOpts {
   /** Prompt-caching toggle. Honored by Anthropic (attaches
    *  cache_control markers on system + tools + 2nd-to-last history
    *  message) and OpenAI (passes stream_options.include_usage so
-   *  the automatic cache telemetry reaches us). Default `true`.
+   *  the automatic cache telemetry reaches us). OpenRouter `anthropic/*` ·
+   *  `moonshotai/*` get part-level cache_control on system (first 2) + last 2
+   *  messages (`src/prompt-cache/openrouter.ts`). Default `true`.
    *  Pass `false` for tests that pin the legacy wire shape. */
   promptCache?: boolean;
   /** Cache TTL tier. `'5m'` (default) is the ephemeral tier; `'1h'`
@@ -1109,7 +1123,12 @@ function parseHarmonyHeader(header: string): { channel: HarmonyChannel; toolName
  *  unit tests — no fetch dependency. */
 export async function* parseOpenAISSELines(
   lines: AsyncIterable<string> | Iterable<string>,
+  /** OR-TOOLARGS-REPAIR (2026-10-10) — `flagInvalidToolArgs` 가 참이면(OpenRouter 경로) 인자 JSON 파싱 실패를
+   *  `{}` 로 «조용히» 바꾸지 않고 `argsInvalid` 표지를 단다(도구 루프가 실행을 막는다) ⊕ 관측을 남긴다.
+   *  ⛔ 생략·거짓이면 종전과 바이트 동일(다른 공급자 무변경). */
+  parseOpts: { flagInvalidToolArgs?: boolean } = {},
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
+  const flagInvalidToolArgs = parseOpts.flagInvalidToolArgs === true;
   const { parseOpenAIUsage } = await import('./prompt-cache/openai.js');
   // Indexed by `tc.index` (OpenAI standard) — partial-chunk streaming
   // assembles into a single accumulator per index. Gemini OpenAI-compat
@@ -1126,10 +1145,25 @@ export async function* parseOpenAISSELines(
     reasoningDetailsAttached = true;
     return [...reasoningDetailsAcc.values()];
   };
-  const yieldAccum = (acc: OpenAIToolCallAccum): LLMStreamEvent | null => {
+  const yieldAccum = (acc: OpenAIToolCallAccum, finishReason: string | null): LLMStreamEvent | null => {
     if (!acc.name) return null;
     let args: Record<string, unknown> = {};
-    try { args = acc.argsJson ? JSON.parse(acc.argsJson) : {}; } catch { /* empty */ }
+    let argsInvalid: ToolArgsInvalid | undefined;
+    try {
+      args = acc.argsJson ? JSON.parse(acc.argsJson) : {};
+    } catch {
+      // 종전: `{}` 로 대체해 도구가 엉뚱한 기본값으로 돌았다(조용한 실패). OpenRouter 경로만 표지를 단다.
+      if (flagInvalidToolArgs) {
+        argsInvalid = { chars: acc.argsJson.length, finishReason };
+        debug.log('llm.openrouter', 'tool-args-invalid', {
+          tool: acc.name,
+          chars: acc.argsJson.length,
+          finishReason,
+          // 원문은 앞 몇십 자만 · 비밀 가림.
+          head: redactSecretText(acc.argsJson.slice(0, 60)),
+        }, { level: 'warn' });
+      }
+    }
     const reasoningDetails = takeReasoningDetails();
     const meta: ProviderToolMeta = {
       ...(acc.thoughtSignature !== undefined ? { thoughtSignature: acc.thoughtSignature } : {}),
@@ -1141,6 +1175,7 @@ export async function* parseOpenAISSELines(
       name: acc.name,
       args,
       ...(Object.keys(meta).length > 0 ? { providerMeta: meta } : {}),
+      ...(argsInvalid !== undefined ? { argsInvalid } : {}),
     };
   };
   // Per-stream Harmony filter — routes `<|channel|>final` content to
@@ -1242,7 +1277,7 @@ export async function* parseOpenAISSELines(
         // (or omit id on continuation frags), so this only triggers on
         // the Gemini complete-frag pattern.
         if (accum && tc.id && accum.id && tc.id !== accum.id && accum.argsJson.length > 0) {
-          const ev = yieldAccum(accum);
+          const ev = yieldAccum(accum, null);
           if (ev) yield ev;
           accum = undefined;
           toolCalls.delete(idx);
@@ -1293,8 +1328,17 @@ export async function* parseOpenAISSELines(
       (choice.finish_reason === 'tool_calls'
         || (choice.finish_reason && toolCalls.size > 0))
     ) {
+      // OR-TOOLARGS-REPAIR — 출력 상한에서 잘린 턴(`length`)의 도구 호출은 인자가 온전해 보여도 «잘렸을 수 있다».
+      //   관측만 남긴다(파싱 실패면 yieldAccum 이 `argsInvalid` 로 막는다). 상한 조정은 범위 밖.
+      if (flagInvalidToolArgs && choice.finish_reason === 'length' && toolCalls.size > 0) {
+        debug.log('llm.openrouter', 'tool-args-maybe-truncated', {
+          finishReason: 'length',
+          tools: [...toolCalls.values()].map((tc) => tc.name),
+          chars: [...toolCalls.values()].map((tc) => tc.argsJson.length),
+        }, { level: 'warn' });
+      }
       for (const [, tc] of toolCalls) {
-        const ev = yieldAccum(tc);
+        const ev = yieldAccum(tc, typeof choice.finish_reason === 'string' ? choice.finish_reason : null);
         if (ev) yield ev;
       }
       toolCalls.clear();
@@ -1329,6 +1373,7 @@ function retryOptsFor(
 }
 
 function inferOpenAIProviderName(url: string): string {
+  if (/^https?:\/\/openrouter\.ai(?::\d+)?(?:\/|$)/i.test(url)) return 'openrouter';
   if (url.includes('x.ai')) return 'grok';
   if (url.includes('openai.com')) return 'openai';
   if (url.includes('localhost') || url.includes('127.0.0.1')) return 'local';
@@ -1383,7 +1428,9 @@ async function* streamOpenAIEvents(
   let textChars = 0;
   let toolCalls = 0;
   try {
-    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!))) {
+    // OR-TOOLARGS-REPAIR — 깨진 도구 인자 표지는 OpenRouter 엔드포인트에서만 켠다(다른 공급자 무변경).
+    const flagInvalidToolArgs = inferOpenAIProviderName(url) === 'openrouter';
+    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!), flagInvalidToolArgs ? { flagInvalidToolArgs } : {})) {
       if (ev.type === 'text') textChars += ev.delta.length;
       else if (ev.type === 'tool_call') toolCalls++;
       yield ev;
@@ -2420,12 +2467,29 @@ export function dedupeToolsByName(tools: LLMToolSpec[] | undefined): LLMToolSpec
   return out.length === tools.length ? tools : out;
 }
 
-export function toOpenAITools(tools: LLMToolSpec[] | undefined): any[] | undefined {
+/** OpenRouter's Moonshot/Kimi tool schema accepts a bare $ref and single-schema items. */
+export function sanitizeToolSchemaForKimi(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(sanitizeToolSchemaForKimi);
+  if (!schema || typeof schema !== 'object') return schema;
+  const record = schema as Record<string, unknown>;
+  if ('$ref' in record) return { $ref: record.$ref };
+  return Object.fromEntries(Object.entries(record).map(([key, value]) => [
+    key,
+    sanitizeToolSchemaForKimi(key === 'items' && Array.isArray(value) ? value[0] : value),
+  ]));
+}
+
+export function toOpenAITools(tools: LLMToolSpec[] | undefined, kimi = false): any[] | undefined {
   const unique = dedupeToolsByName(tools);
   if (!unique || unique.length === 0) return undefined;
   return unique.map(t => ({
     type: 'function',
-    function: { name: t.name, description: t.description, parameters: strictifyToolSchema(t.parameters) },
+    function: {
+      name: t.name, description: t.description,
+      parameters: kimi
+        ? sanitizeToolSchemaForKimi(strictifyToolSchema(t.parameters))
+        : strictifyToolSchema(t.parameters),
+    },
   }));
 }
 
@@ -3904,6 +3968,7 @@ export const PROVIDERS: Record<string, LLMProvider> = {
     streamChat: (messages, opts = {}) => makeOpenRouterProvider({ provider: 'openrouter' }).streamChat!(messages, opts),
     chat: (messages, opts = {}) => makeOpenRouterProvider({ provider: 'openrouter' }).chat!(messages, opts),
   },
+  bedrock: BedrockProvider, // 명시 선택 전용 — 자동 순서·폴백 체인에 «안» 넣는다(src/llm/bedrock-provider.ts)
 };
 
 const AUTOMATIC_PROVIDER_ORDER = ['grok', 'anthropic', 'gemini', 'local'] as const;
@@ -4085,12 +4150,13 @@ export function decideProviderForConfig(
       return { provider, model: selectedModel, auth: baseUrl || getLocalLLMUrl() ? 'local' : 'none' };
     case 'openrouter':
       return { provider, model: selectedModel, auth: apiKey || getOpenRouterApiKey() ? 'apikey' : 'none' };
+    case 'bedrock': return { provider, model: selectedModel, auth: authKindForProvider('bedrock', selectedModel) };
   }
   throw new Error(`unknown provider: ${provider as string}`);
 }
 
 function isKnownProviderName(provider: string): provider is ConcreteProviderName {
-  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter';
+  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'bedrock';
 }
 
 function authKindForProvider(provider: string, model: string, apiKey?: string): ProviderDecisionAuth {
@@ -4105,6 +4171,7 @@ function authKindForProvider(provider: string, model: string, apiKey?: string): 
   if (provider === 'anthropic') return getAnthropicApiKey() ? 'apikey' : 'none';
   if (provider === 'gemini') return getGeminiApiKey() ? 'apikey' : 'none';
   if (provider === 'openrouter') return getOpenRouterApiKey() ? 'apikey' : 'none';
+  if (provider === 'bedrock') return BedrockProvider.available() ? 'apikey' : 'none';
   if (provider === 'openai-codex') {
     try {
       return codexOAuthAvailable() ? 'oauth' : 'none';
@@ -4124,6 +4191,7 @@ function defaultModelForProvider(provider: ConcreteProviderName): string {
     case 'gemini': return GEMINI_MODEL;
     case 'local': return LOCAL_LLM_MODEL;
     case 'openrouter': return OPENROUTER_MODEL;
+    case 'bedrock': return BedrockProvider.defaultModel;
   }
   throw new Error(`unknown provider: ${provider as string}`);
 }
@@ -4247,7 +4315,7 @@ export function getProvider(model?: string): LLMProvider {
     if (adapted && PROVIDERS[adapted]) return PROVIDERS[adapted]!;
     // Unknown prefix — look up by exact name match on defaults
     for (const p of Object.values(PROVIDERS)) {
-      if (p.defaultModel === resolved) return p;
+      if (p.name !== 'bedrock' && p.defaultModel === resolved) return p; // bedrock 은 명시 선택 전용
     }
   }
 
@@ -4374,6 +4442,7 @@ export function buildMessagesWithContext(
 
 // Re-export converters so tests/adapters can assert wire-format correctness.
 export { toOpenAIMessage, toOpenAIMessages, toAnthropicMessage, systemToAnthropicString };
+export { usesAdaptiveThinking, mapReasoningLevelToAnthropicThinking, mapReasoningLevelToAnthropicEffort, sseLineStream, retryOptsFor }; // src/llm/bedrock-provider.ts
 
 /**
  * Best-effort classification of whether a model accepts image inputs.
@@ -4430,7 +4499,10 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
  * Convenience wrapper — stream chunks via a callback, returning the full text.
  * Mirrors the existing `streamGrok()` signature in chat.ts for drop-in use.
  */
-type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens'>;
+// ⭐ OPENROUTER-OPTIMIZE G9 — `reportedCostUsd`(OpenRouter `usage.cost`)도 싣는다. 빠지면 `stream-llm` 행이
+//   실청구액을 잃고 카탈로그 추정(대개 `cost.kind=unknown`)으로 떨어진다(리뷰·저작 행 실측).
+//   합산은 토큰 칸과 같은 규약이다 — OpenAI 호환 스트림은 `usage` 를 마지막 청크에 «한 번» 싣는다(누적 반복 보고 아님).
+type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd'>;
 
 type ProviderTextResult =
   | { ok: true; full: string; usage: ObservedUsage | 'unmeasured' }
@@ -4438,7 +4510,7 @@ type ProviderTextResult =
 
 function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): ObservedUsage {
   const total = { ...usage };
-  for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens'] as const) {
+  for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reportedCostUsd'] as const) {
     if (received[field] !== undefined) total[field] = (total[field] ?? 0) + received[field];
   }
   return total;
@@ -4468,17 +4540,40 @@ async function consumeProviderText(
       // Preserve the provider or callback error that caused this close.
     }
   };
+  const idleMs = opts.streamIdleTimeoutMs ?? (
+    usesLongReasoningIdle(getModelFamily(opts.model ?? provider.defaultModel), provider.name)
+      ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS
+  );
 
   while (true) {
-    let step: IteratorResult<string | LLMStreamEvent>;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let step: { idle: true } | { idle: false; result: IteratorResult<string | LLMStreamEvent> };
     try {
-      step = await iterator.next();
+      step = await Promise.race([
+        iterator.next().then((result) => ({ idle: false as const, result })),
+        new Promise<{ idle: true }>((resolve) => {
+          idleTimer = setTimeout(() => resolve({ idle: true }), idleMs);
+        }),
+      ]);
     } catch (error) {
       await closeIterator();
       return { ok: false, full, error };
+    } finally {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
     }
-    if (step.done) return { ok: true, full, usage: usage ?? 'unmeasured' };
-    const event = typeof step.value === 'string' ? { type: 'text' as const, delta: step.value } : step.value;
+    if (step.idle) {
+      debug.log('llm', 'stream-idle-timeout', {
+        provider: provider.name, model: opts.model ?? provider.defaultModel,
+        idleMs, receivedChars: full.length, site: 'stream-llm',
+      });
+      const error = new Error(`stream idle timeout after ${idleMs}ms`);
+      error.name = 'StreamIdleTimeoutError';
+      // An async generator can leave return() pending behind a stalled next().
+      void closeIterator();
+      return { ok: false, full, error };
+    }
+    if (step.result.done) return { ok: true, full, usage: usage ?? 'unmeasured' };
+    const event = typeof step.result.value === 'string' ? { type: 'text' as const, delta: step.result.value } : step.result.value;
     if (event.type === 'usage') {
       usage = accumulateUsage(usage, event.usage);
       try {
@@ -4504,11 +4599,11 @@ export async function streamLLM(
   onChunk: (delta: string, full: string) => void,
   opts: LLMOpts & { provider?: LLMProvider; initialProvider?: LLMProvider; onResolvedProvider?: (provider: string, model: string) => void } = {},
 ): Promise<string> {
+  const started = Date.now();
   let activeProvider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
   const attemptedProviders = new Set<string>([activeProvider.name]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
-  const started = Date.now();
 
   while (true) {
     const finalized = finalizeStreamingProviderModel(
@@ -4527,6 +4622,7 @@ export async function streamLLM(
       maxTokens: opts.maxTokens,
       temperature: opts.temperature,
     }, { level: 'info' });
+    // Keep text-only stream failures on streamLLM's existing provider fallback path.
     const consumed = await consumeProviderText(
       activeProvider,
       messages,
@@ -4544,6 +4640,7 @@ export async function streamLLM(
           logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: 'stream-llm', role: opts.usageRole });
         } catch { /* best-effort observation */ }
       }
+      debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', durationMs: Date.now() - started });
       debug.log('llm.router.done', 'streamLLM', {
         provider: activeProvider.name,
         model: activeModel,
@@ -4579,7 +4676,10 @@ export async function streamLLM(
       message: reason,
       ...(isAuthRejectionError(err) ? { authRejected: true } : {}),
     }, { level: 'error' });
-    if (opts.provider) throw err;
+    if (opts.provider) {
+      debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
+      throw err;
+    }
     const remaining = remainingFallbackProviderNames(attemptedProviders, opts);
     const verdict = decideProviderFallback({
       err,
@@ -4604,6 +4704,7 @@ export async function streamLLM(
       continue;
     }
     if (verdict.action === 'stop') {
+      debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
       debug.log('llm.router', 'provider-fallback-stop', {
         blockedProviders,
         category: verdict.category,
@@ -4622,6 +4723,7 @@ export async function streamLLM(
       ...(fallback ? { skippedFallbackProvider: fallback.name, emittedChars: full.length } : {}),
     }, { level: 'error' });
     onChunk(finalDelta, finalText);
+    debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'fallback-exhausted', kind: 'streamLLM', durationMs: Date.now() - started });
     return finalText;
   }
 }
@@ -5019,6 +5121,15 @@ const LOCAL_TOOL_DISCIPLINE = [
   '- 범위 읽기만으로 판단할 수 없을 때에만 전체 읽기를 선택하고, 읽은 뒤에는 다음 행동을 계속 결정하라.',
 ].join('\n');
 
+/** OpenRouter(`openrouter/…`) GLM·Kimi·Qwen 전용 도구 호출 규율 — 다른 군 상수와 합성하지 않는 독립 상수. */
+export const OPEN_WEIGHT_TOOL_DISCIPLINE = [
+  '[open-weight tool-use discipline]',
+  '- 도구로 할 수 있는 일은 이번 응답에서 바로 도구를 호출하라. "먼저 읽겠다" 또는 "확인하겠다" 같은 계획만 말하고 응답을 끝내지 마라.',
+  '- 작업을 시작하는 첫 응답에는 도구 호출이 하나 이상 있어야 한다.',
+  '- 도구 호출 인자는 해당 도구의 스키마에 맞는 JSON 으로 내라.',
+  '- 충분한 근거가 모이면 도구 호출 없이 최종 답을 평문으로 써서 끝내라.',
+].join('\n');
+
 /** 모델군 → 그 군에 주입할 툴 규율(없으면 `null`). **능력 술어 판** — 2026-08-14.
  *
  *  ⛔ **왜 `if` 세 개가 아니라 이 표인가**: codex·grok·local 이 각각 「같은 모양의 if」로 붙어 있었고,
@@ -5040,6 +5151,7 @@ const TOOL_DISCIPLINE_BY_FAMILY: Record<ModelFamily, string | null> = {
   codex: CODEX_TOOL_DISCIPLINE,
   grok: GROK_TOOL_DISCIPLINE,
   local: LOCAL_TOOL_DISCIPLINE,
+  'open-weight': OPEN_WEIGHT_TOOL_DISCIPLINE,
   // ⬇ 아래 넷은 「아직 안 쟀다」이지 「필요 없다」가 아니다.
   //   `other` 가 0인 것은 ***아무도 other 를 안 쟀기 때문***이고, 실제 자식 하나가 오늘 `other` 였다(`[S]` 실측).
   claude: null,
@@ -5215,6 +5327,19 @@ export const INSPECT_BUDGET_CODEX = Number.POSITIVE_INFINITY;
 
 function appendFinalSynthesisNotice(existingText: string, notice: string): string {
   return existingText.length > 0 ? `${existingText}\n\n${notice}` : notice;
+}
+
+export function buildNoFinalSynthesisLead(
+  reason: 'empty-turn' | 'budget-exhausted',
+  toolCallCount: number,
+  locale?: Locale,
+): string {
+  if (reason === 'empty-turn') {
+    return (locale ?? detectLocale()) === 'ko'
+      ? '답을 끝까지 쓰지 못했습니다 — 빈 응답이 이어졌습니다. 질문을 좁혀 다시 물어 주세요(예: 무엇 하나만).'
+      : 'I could not finish the answer — repeated empty responses stopped the reply. Please ask a narrower question (for example, just one thing).';
+  }
+  return format(getMessages(locale).chatNoSynthesisLead ?? getMessages('en').chatNoSynthesisLead!, { n: toolCallCount });
 }
 
 function buildNoFinalSynthesisNotice(reason: 'empty-turn' | 'budget-exhausted'): string {
@@ -7744,6 +7869,7 @@ export function selectIntentClassificationMessages(messages: readonly LLMMessage
       message.content === CODEX_TOOL_DISCIPLINE
       || message.content === GROK_TOOL_DISCIPLINE
       || message.content === LOCAL_TOOL_DISCIPLINE
+      || message.content === OPEN_WEIGHT_TOOL_DISCIPLINE
     )
   ));
 }
@@ -7956,12 +8082,13 @@ export async function streamLLMWithTools(
   // the caller — no per-turn duplication when the caller persists new messages.
   // Adapters fold multiple system messages, so this composes with (does not
   // mutate) the caller's persona/system prompt.
-  // ⭐ 세 갈래(codex · grok · local)가 «같은 모양의 if» 였다 — 해소 지점을 하나로 모은다.
+  // ⭐ 각 모델군의 규율은 같은 해소 지점에서 선택한다.
   //   대표 2026-08-14: *"claude 제외 다른 LLM 들이 공용화가 많아 보이고, 오히려 claude 일 때
   //   옵션화를 해야 하는 게 아닌지"* ⊕ `[S]` 와 합의한 축 분담(축② = 능력 술어는 `[T]` 소유).
-  //   ⛔ 동작은 «바이트 하나» 안 바뀐다 — 같은 조건에 같은 문면이다(테스트가 전송분으로 문다).
+  //   ⛔ 기존 군의 문면은 «바이트 하나» 안 바뀐다(테스트가 전송분으로 문다).
   const toolDiscipline = resolveToolDiscipline(modelFamily);
   if (toolDiscipline !== null) {
+    debug.log('llm.tool-discipline', 'injected', { modelFamily, model: effectiveModel, chars: toolDiscipline.length });
     // ⛔ **상수를 «그대로» 싣는다 — 합성하지 마라.**
     //    `selectIntentClassificationMessages` 가 «정확 일치»로 이 메시지를 걸러 내므로,
     //    여기서 한 글자라도 덧붙이면 ***분류기 셋이 다시 «오염»된다***(그 함수 주석에 실측이 있다).
@@ -8305,6 +8432,7 @@ export async function streamLLMWithTools(
       name: string;
       args: Record<string, unknown>;
       providerMeta?: ProviderToolMeta;
+      argsInvalid?: ToolArgsInvalid;
     }> = [];
     const turnStartedAt = Date.now();
     debug.log('llm.router', 'tool-loop.turn.start', {
@@ -8520,6 +8648,7 @@ export async function streamLLMWithTools(
           name: ev.name,
           args: ev.args,
           ...(ev.providerMeta !== undefined ? { providerMeta: ev.providerMeta } : {}),
+          ...(ev.argsInvalid !== undefined ? { argsInvalid: ev.argsInvalid } : {}),
         });
       } else if (ev.type === 'reasoning') {
         // Forward to the optional reasoning handler. Codex Responses
@@ -8660,11 +8789,12 @@ export async function streamLLMWithTools(
     if (pendingCalls.length === 0 && turnText.length === 0) {
       if (emptyRetries >= MAX_EMPTY_RETRIES) {
         const notice = buildNoFinalSynthesisNotice('empty-turn');
-        const finalText = finalizeVisibleAssistantText(
+        const visibleText = finalizeVisibleAssistantText(
           appendFinalSynthesisNotice(fullText, notice),
           notice,
           sawToolRound,
         );
+        const finalText = `${buildNoFinalSynthesisLead('empty-turn', toolCallHistory.length)}\n\n${visibleText}`;
         handlers.onText('', finalText);
         debug.log('llm.router', 'tool-loop.empty-turn.give-up', {
           turn, emptyRetries, finalTextInjected: true,
@@ -9557,6 +9687,22 @@ export async function streamLLMWithTools(
               `from the list, or write your final answer if no tool fits.`;
             return { result: stub, isError: true, phaseRejected: false };
           }
+        }
+        // OR-TOOLARGS-REPAIR (2026-10-10) — 인자 JSON 이 깨진 호출(OpenRouter 경로만 표지가 붙는다)은
+        //   ⛔ 실행하지 않는다. 종전엔 `{}` 로 실행돼 도구가 기본값으로 돌고 모델은 «성공»을 받았다.
+        //   기존 dispatch 오류 결과 모양(`{ error }` ⊕ isError)으로 돌려 모델이 다시 부르게 한다.
+        if (call.argsInvalid !== undefined) {
+          debug.log('llm.router', 'tool-loop.tool-args-invalid.blocked', {
+            turn,
+            tool: call.name,
+            chars: call.argsInvalid.chars,
+            finishReason: call.argsInvalid.finishReason,
+          }, { level: 'warn' });
+          return {
+            result: { error: buildInvalidToolArgsMessage(call.argsInvalid) },
+            isError: true,
+            phaseRejected: false,
+          };
         }
         // Codex-family same-args dedup guard (fix L-2). Scope is
         // EXPLORATORY_TOOLS only — repeating Bash/RunShell/Edit/Write
@@ -10639,11 +10785,14 @@ export async function streamLLMWithTools(
     });
   }
   const emittedText = synthesizedText ?? noticeWithFallback;
-  const finalText = finalizeVisibleAssistantText(
+  const visibleText = finalizeVisibleAssistantText(
     appendFinalSynthesisNotice(fullText, emittedText),
     emittedText,
     loopTermination === 'aborted' ? false : sawToolRound,
   );
+  const finalText = loopTermination === 'budget-exhausted' && synthesizedText === null
+    ? `${buildNoFinalSynthesisLead(loopTermination, toolCallHistory.length)}\n\n${visibleText}`
+    : visibleText;
   // Skip post-emit when synthesis was already streamed live AND
   // finalText matches synthesizedText. Emit when synthesis failed
   // (fallback notice) OR finalization enriched the text.
@@ -10788,13 +10937,21 @@ function makeOpenAICompatProvider(
       if (!apiKey && !grokSub) {
         throw new Error(`${name} unavailable: configure apiKey via \`elanous setup\``);
       }
-      const tools = toOpenAITools(opts.tools);
+      const activeModel = opts.model || model;
+      const tools = toOpenAITools(opts.tools, name === 'openrouter' && openRouterWireModel(activeModel).startsWith('moonshotai/'));
+      // OR-TOOLCHOICE-PASS (2026-10-10) — OpenRouter 경로만 호출자 toolChoice 를 싣는다.
+      //   ⛔ grok/openai 호환 경로는 손대지 않는다(무회귀). toolChoice 가 없거나 tools 가 없으면 키 자체를 안 싣는다.
+      const toolChoice = name === 'openrouter' && tools
+        ? openRouterToolChoice(openRouterWireModel(activeModel), opts.toolChoice)
+        : undefined;
+      if (toolChoice !== undefined) {
+        debug.log('llm.openrouter', 'tool-choice-sent', { model: openRouterWireModel(activeModel), requested: opts.toolChoice, toolChoice });
+      }
       // Image-pipeline P3.5 — gate the synthetic follow-up workaround
       // on the userMessage axis for the active model + brand. `name`
       // is 'grok' or 'openai' for makeOpenAICompatProvider callers.
       // P-3 §6.9 (2026-05-07) — same lookup also gates user-message
       // image blocks in the wire.
-      const activeModel = opts.model || model;
       const brand = name as Parameters<typeof isVisionCapableModel>[0];
       const followup = isVisionCapableModel(brand, activeModel, 'userMessage');
       // 구독이 있으면 «엔드포인트와 자격이 통째로» 바뀐다(cli-chat-proxy + Bearer).
@@ -10806,16 +10963,41 @@ function makeOpenAICompatProvider(
       if (useSub) {
         debug.log('llm.grok', 'credential', { kind: useSub.kind, source: useSub.source, baseUrl: useSub.baseUrl, via: 'compat-provider' });
       }
+      let wireMessages = messages.flatMap((m) => toOpenAIMessages(m, {
+        acceptToolImagesViaFollowup: followup,
+        acceptUserMessageImages: followup,
+        ...(name === 'openrouter' ? { echoReasoningDetails: true } : {}),
+      }));
+      // OR-ANTHROPIC-CACHE (2026-10-10) — OpenRouter 뒤 anthropic/* · moonshotai/* 만 cache_control 중단점을 싣는다.
+      //   ⛔ 다른 OpenRouter 모델과 grok/openai/local 호환 경로는 이 분기를 안 탄다 — 본문 바이트 동일(무회귀).
+      const cacheFamily = name === 'openrouter' ? openRouterPromptCacheFamily(openRouterWireModel(activeModel)) : null;
+      if (cacheFamily) {
+        if (opts.promptCache === false) {
+          debug.log('llm.openrouter', 'prompt-cache', { model: openRouterWireModel(activeModel), applied: false, reason: 'promptCache:false' });
+        } else {
+          const { getDefaultCacheTTL } = await import('./config.js');
+          const ttl = opts.promptCacheTTL ?? getDefaultCacheTTL();
+          const plan = applyOpenRouterCacheControl(wireMessages, { family: cacheFamily, ttl });
+          wireMessages = plan.messages;
+          debug.log('llm.openrouter', 'prompt-cache', {
+            model: openRouterWireModel(activeModel), applied: plan.breakpoints > 0, family: cacheFamily,
+            ttl: cacheFamily === 'anthropic' ? ttl : '5m',
+            breakpoints: plan.breakpoints, system: plan.systemBreakpoints, tail: plan.tailBreakpoints,
+          });
+        }
+      }
+      // OR-STICKY-ROUTING (2026-10-10) — 같은 세션/런의 요청을 같은 상류로 고정해 캐시 적중을 지킨다.
+      //   ⛔ openrouter 만, 그리고 키가 있을 때만 싣는다 — 키가 없거나 다른 provider 면 본문·헤더 바이트 동일(무회귀).
+      const sticky = name === 'openrouter' ? openRouterStickySessionKey(opts.sessionId, process.env.ELANOUS_RUN_ID) : null;
+      if (sticky) {
+        debug.log('llm.openrouter', 'sticky-routing', { model: openRouterWireModel(activeModel), source: sticky.source, hashed: sticky.hashed });
+      }
       yield* streamOpenAIEvents(
         useSub ? `${useSub.baseUrl}/chat/completions` : resolvedUrl,
         useSub ? useSub.token : apiKey,
         {
           model: wire.model ? wire.model(activeModel) : activeModel,
-          messages: messages.flatMap((m) => toOpenAIMessages(m, {
-            acceptToolImagesViaFollowup: followup,
-            acceptUserMessageImages: followup,
-            ...(name === 'openrouter' ? { echoReasoningDetails: true } : {}),
-          })),
+          messages: wireMessages,
           ...(() => {
             const fields = openAiCompatSamplingFields(brand, activeModel, opts.temperature ?? 0.3, opts.maxTokens ?? 2048);
             // ⛔ 2026-09-23 — OpenRouter 뒤의 추론 모델(kimi·glm·qwen …)은 기본 0.3 을 강제하면 안 된다:
@@ -10829,10 +11011,16 @@ function makeOpenAICompatProvider(
             return fields;
           })(),
           ...(tools ? { tools } : {}),
+          ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
           ...(wire.extraBody ?? {}),
+          // OpenRouter alone resolves per-call effort against the configured level and catalog default.
+          ...(name === 'openrouter'
+            ? openRouterReasoningField(activeModel, opts.reasoningEffort, cfg.reasoningLevel)
+            : {}),
+          ...(sticky ? { session_id: sticky.key } : {}),
         },
         opts.signal,
-        useSub ? useSub.headers : wire.headers,
+        useSub ? useSub.headers : (sticky ? { ...wire.headers, 'x-session-id': sticky.key } : wire.headers),
       );
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
@@ -10852,7 +11040,18 @@ function makeOpenRouterProvider(cfg: UCLLMConfig): LLMProvider {
     OPENROUTER_API_URL,
     { ...cfg, apiKey: cfg.apiKey || getOpenRouterApiKey() },
     // ⭐ BACKLOG C7 — `usage:{include:true}` 면 마지막 청크 `usage.cost` 에 «실제 청구액»이 온다(추정 아님).
-    { model: openRouterWireModel, headers: { 'X-Title': 'elanous' }, omitDefaultTemperature: true, omitMaxTokens: true, extraBody: { usage: { include: true } } },
+    {
+      model: openRouterWireModel, headers: { 'X-Title': 'elanous' }, omitDefaultTemperature: true, omitMaxTokens: true,
+      extraBody: {
+        usage: { include: true },
+        provider: {
+          require_parameters: true,
+          allow_fallbacks: true,
+          ...(cfg.openrouter?.providerPreferences && typeof cfg.openrouter.providerPreferences === 'object' && !Array.isArray(cfg.openrouter.providerPreferences)
+            ? cfg.openrouter.providerPreferences : {}),
+        },
+      },
+    },
   );
   // ⛔ 2026-09-23 — OpenRouter 의 `max_tokens` 는 «추론 토큰까지» 센다. 호환 경로 기본값 2048 이면 추론 모델이
   //   본문·도구 호출에 닿기 전에 잘렸다(실측 glm-5.3: 2048 → finish=length). 오전 판은 바닥 16384 를 뒀고,
@@ -10861,9 +11060,75 @@ function makeOpenRouterProvider(cfg: UCLLMConfig): LLMProvider {
   return inner;
 }
 
+/** OR-TOOLARGS-REPAIR — 깨진 도구 인자 호출에 돌려주는 오류 문면(도구는 실행되지 않았다). */
+export function buildInvalidToolArgsMessage(info: ToolArgsInvalid): string {
+  const truncated = info.finishReason === 'length';
+  return `tool arguments were not valid JSON (${info.chars} chars` +
+    (info.finishReason ? `, finish_reason=${info.finishReason}` : '') +
+    `${truncated ? ' — the output was cut off at the length limit' : ' — truncated or malformed?'}). ` +
+    'The tool was NOT executed. Re-issue the call with complete, valid JSON arguments' +
+    (truncated ? ' (keep the payload smaller, e.g. split a large write into several calls).' : '.');
+}
+
+/** OR-TOOLCHOICE-PASS — LLMOpts.toolChoice → OpenRouter `tool_choice` (`toChatToolChoice` 재사용).
+ *  ⚠️ Kimi(moonshotai/*)는 thinking 모드에서 강제 선택(required·특정 도구)을 400 으로 거부한다
+ *  (openclaw moonshot-thinking.ts:100-108 와 같은 처리) ⇒ 강제는 'auto' 로 내린다. */
+export function openRouterToolChoice(wireModel: string, tc: ToolChoice | undefined): unknown {
+  const chat = toChatToolChoice(tc);
+  if (chat === undefined) return undefined;
+  if (wireModel.startsWith('moonshotai/') && chat !== 'auto' && chat !== 'none') return 'auto';
+  return chat;
+}
+
+/** OR-STICKY-ROUTING — OpenRouter 고정 라우팅 키. 본문 최상위 `session_id` ⊕ 헤더 `x-session-id` 로 싣는다
+ *  (hermes plugins/model-providers/openrouter build_extra_body: 본문 session_id 를 «라우팅 키»로 직접 쓰고 첫 성공
+ *  요청부터 고정 · openclaw openai-completions-transport: openrouter 는 `x-session-id` 헤더 — `x-session-affinity` 는
+ *  openrouter 가 아닌 호환 게이트웨이용이라 여기선 안 쓴다).
+ *  키 우선순위: 호출자의 대화 `sessionId` → 하니스 런 `ELANOUS_RUN_ID`. 둘 다 없으면 null(아무것도 안 싣는다).
+ *  128자를 넘거나 허용 밖 문자가 있으면 sha256 앞 32자로 접는다(원문 id 를 상류에 안 흘린다는 부수 효과). */
+export function openRouterStickySessionKey(
+  sessionId: string | undefined,
+  runId: string | undefined,
+): { key: string; source: 'session' | 'run'; hashed: boolean } | null {
+  // 공백뿐이면 «없음». 검사·해시는 원문 그대로 — 다듬으면 ' sess ' 와 'sess' 가 같은 키가 된다.
+  const s = sessionId && sessionId.trim() ? sessionId : undefined;
+  const r = runId && runId.trim() ? runId : undefined;
+  const raw = s ?? r;
+  if (!raw) return null;
+  const source = s ? 'session' : 'run';
+  if (raw.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(raw)) return { key: raw, source, hashed: false };
+  return { key: `elanous-${createHash('sha256').update(raw).digest('hex').slice(0, 32)}`, source, hashed: true };
+}
+
 /** `openrouter/moonshotai/kimi-k3` → `moonshotai/kimi-k3`. 접두가 없으면 그대로. */
 export function openRouterWireModel(model: string): string {
   return model.startsWith('openrouter/') ? model.slice('openrouter/'.length) : model;
+}
+
+/** OpenRouter effort: call > resolved config (including escalation) > open-weight default.
+ *  Keep the existing effort mapping; Claude-family models use verbosity instead of reasoning. */
+const OPENROUTER_REASONING_EFFORT: Record<string, 'low' | 'medium' | 'high'> = {
+  minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high',
+};
+function openRouterReasoningField(
+  model: string, requested: string | undefined, configured: UCLLMConfig['reasoningLevel'],
+): { reasoning?: { effort: 'low' | 'medium' | 'high' }; verbosity?: 'low' | 'medium' | 'high' } {
+  const wireModel = openRouterWireModel(model);
+  // The catalog's model-specific open-weight verdict, not a vendor/slug prefix,
+  // gates the default: an unregistered release may be closed-weight.
+  const slug = wireModel.slice(wireModel.indexOf('/') + 1);
+  const openWeight = wireModel.includes('/') && BUILTIN_CATALOG.models.some(
+    (entry) => entry.id === slug && entry.openWeight === true,
+  );
+  const configEffort = configured === 'off' ? undefined : configured;
+  const source = requested !== undefined ? 'call' : configured !== undefined ? 'config' : openWeight ? 'default' : 'none';
+  const effort = requested ?? (configured !== undefined ? configEffort : openWeight ? 'medium' : undefined);
+  const sent = effort !== undefined && Object.hasOwn(OPENROUTER_REASONING_EFFORT, effort)
+    ? OPENROUTER_REASONING_EFFORT[effort] : undefined;
+  const field = sent ? (wireModel.startsWith('anthropic/') ? 'verbosity' : 'reasoning') : 'none';
+  debug.log('llm.openrouter', 'reasoning', { model, requested: requested ?? null, sent: sent ?? null, source, field });
+  return field === 'verbosity' ? { verbosity: sent }
+    : field === 'reasoning' ? { reasoning: { effort: sent! } } : {};
 }
 
 /** Codex-specific provider. Prefers OAuth tokens from ~/.config/elanous/auth.json
@@ -11210,6 +11475,7 @@ export function inferProviderFromModel(model: string | undefined): string | null
  *  its own configured default. */
 export function isModelCompatible(providerName: string, model: string | undefined): boolean {
   if (!model) return true;
+  if (providerName === 'bedrock') return isBedrockCompatibleModel(model, inferProviderFromModel);
   const implied = inferProviderFromModel(model);
   if (implied === null) return true;  // unknown prefix — let provider handle
   // openai-codex and openai accept each other's model families (gpt-*, codex-*).
@@ -11249,7 +11515,7 @@ export function anyProviderAvailable(userConfig?: UserConfig): boolean {
       } catch { return false; }
     }
   } catch { /* fall through to env check */ }
-  return Object.values(PROVIDERS).some(p => p.available());
+  return Object.values(PROVIDERS).some(p => p.name !== 'bedrock' && p.available()); // bedrock 은 auto 후보가 아니다
 }
 
 /** 직결 배선이 없는 계열 → OpenRouter 에서 그 벤더의 대표 모델(사다리 `openrouter` 에 선 것). */
@@ -11291,6 +11557,10 @@ export function getProviderForConfig(
     if (!isKnownProviderName(resolvedProviderName)) {
       throw new Error(`unknown provider: ${resolvedProviderName}`);
     }
+    if (resolvedProviderName === 'openrouter') {
+      // Preserve the requesting config for OpenRouter, not the config-free singleton.
+      return makeOpenRouterProvider({ provider: 'openrouter', model: decision.model, reasoningLevel: userConfig.llm.reasoningLevel });
+    }
     return PROVIDERS[resolvedProviderName]!;
   }
   if (!isKnownProviderName(resolvedProviderName)) {
@@ -11330,9 +11600,10 @@ export function getProviderForConfig(
     case 'openai-codex':
       return makeCodexProvider(llm);
     case 'openrouter':
-      return makeOpenRouterProvider(userConfig.llm.provider === 'openrouter' ? llm : { provider: 'openrouter', model: decision.model });
+      return makeOpenRouterProvider(userConfig.llm.provider === 'openrouter' ? llm : { provider: 'openrouter', model: decision.model, reasoningLevel: llm.reasoningLevel });
     case 'anthropic':
       return makeAnthropicProvider(llm);
+    case 'bedrock': return makeBedrockProvider(llm);
     case 'gemini':
       // Wave 1 (2026-05-04) — native @google/genai SDK. Previously
       // makeOpenAICompatProvider tunnel which couldn't carry

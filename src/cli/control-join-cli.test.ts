@@ -148,5 +148,6 @@ test('standalone join commands can be defined on a supplied group; real CLI regi
   const help = new TextDecoder().decode(child.stdout);
   expect(help).toContain('serve');
   expect(help).toMatch(/\bjoin\b/);
-  expect(help).not.toMatch(/\bleave\b|\bstatus\b/);
+  // #25203 CTRL-ONE — `control status`(읽기 전용 현황)는 관제부 자체 명령으로 따로 있다. join 쪽 leave 는 여전히 안 붙는다.
+  expect(help).not.toMatch(/\bleave\b/);
 });

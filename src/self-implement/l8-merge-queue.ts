@@ -30,9 +30,27 @@ export type L8MergeQueueDeps = {
 };
 
 export type L8ShadowVerdict = { number: number; head: string; base?: string; verdict: 'pass' | 'conflict' | 'fail'; detail?: string; tests: string[]; at: string };
-export type L8ShadowQueueState = { pending: { number: number; head: string }[]; verdicts: L8ShadowVerdict[] };
+export type L8ShadowQueueItem = {
+  number: number;
+  head: string;
+  files?: string[];
+  filesUnmeasured?: true;
+  overlapsWith?: number[];
+  overlapsUnknownWith?: number[];
+};
+export type L8ShadowQueueState = { pending: L8ShadowQueueItem[]; verdicts: L8ShadowVerdict[] };
+export type L8ShadowEnqueueObservation = {
+  number: number;
+  head: string;
+  fileCount: number | null;
+  filesUnmeasured: boolean;
+  overlapsWith: number[];
+  overlapsUnknownWith: number[];
+  pendingAfter: number;
+};
 export type L8ShadowQueueDeps = L8MergeQueueDeps & {
   observe?: (verdict: L8ShadowVerdict) => void | Promise<void>;
+  observeEnqueue?: (entry: L8ShadowEnqueueObservation) => void | Promise<void>;
   resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>;
 };
 
@@ -80,23 +98,67 @@ export function shadowPrNumber(raw: string): number {
   return number;
 }
 
+// Keep the CLI's existing pending return shape; metadata remains in the shared ledger and enqueue observation.
+function publicShadowQueueState(state: L8ShadowQueueState): L8ShadowQueueState {
+  return { ...state, pending: state.pending.map(({ number, head }) => ({ number, head })) };
+}
+
 export async function statusL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowQueueState> {
-  return withShadowQueue(cwd, deps, async (state) => state);
+  return withShadowQueue(cwd, deps, async (state) => publicShadowQueueState(state));
 }
 
 export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowQueueState> {
   if (!Number.isSafeInteger(number) || number <= 0) throw new Error('expected a positive PR number');
   return withShadowQueue(cwd, deps, async (state, path) => {
     const execute = deps.command ?? command;
-    const view = JSON.parse(shadowCommand(execute, 'gh', ['pr', 'view', String(number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'], cwd)) as {
+    const view = JSON.parse(shadowCommand(execute, 'gh', ['pr', 'view', String(number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository,files'], cwd)) as {
       headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+      files?: { path?: string }[];
     };
     if (!view.headRefOid || !/^[0-9a-f]{40}$/i.test(view.headRefOid) || view.baseRefName !== 'main'
       || view.state !== 'OPEN' || view.isDraft !== false || view.isCrossRepository !== false) throw new Error('PR is not an open, ready, same-repository main PR');
     if (state.pending.some((p) => p.number === number)) throw new Error(`PR #${number} already queued`);
-    state.pending.push({ number, head: view.headRefOid });
+    const files = Array.isArray(view.files) && view.files.length < 100
+      && view.files.every((file) => typeof file?.path === 'string')
+      ? [...new Set(view.files.map((file) => file.path!))].sort()
+      : undefined;
+    const filesUnmeasured = !files;
+    const overlapsWith: number[] = [];
+    const overlapsUnknownWith: number[] = [];
+    const paths = new Set(files);
+    for (const previous of state.pending) {
+      if (filesUnmeasured || !Array.isArray(previous.files) || previous.filesUnmeasured) {
+        overlapsUnknownWith.push(previous.number);
+      } else if (previous.files.some((file) => paths.has(file))) {
+        overlapsWith.push(previous.number);
+      }
+    }
+    const item: L8ShadowQueueItem = {
+      number, head: view.headRefOid, ...(files ? { files } : { filesUnmeasured: true as const }),
+      overlapsWith, overlapsUnknownWith,
+    };
+    const entry: L8ShadowEnqueueObservation = {
+      number, head: view.headRefOid, fileCount: files?.length ?? null, filesUnmeasured,
+      overlapsWith, overlapsUnknownWith, pendingAfter: state.pending.length + 1,
+    };
+    state.pending.push(item);
     writeShadowQueue(path, state);
-    return state;
+    try {
+      await (deps.observeEnqueue ?? ((data) => {
+        const store = getDefaultLogStore();
+        if (!store) {
+          if (process.env.NODE_ENV === 'test') return;
+          throw new Error('merge-queue observation store unavailable');
+        }
+        store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'merge-queue', event: 'enqueued', data }, surface: 'merge-queue' }]);
+      }))(entry);
+    } catch (error) {
+      // The shared queue is still locked: remove only this unobserved enqueue, leaving older items intact.
+      state.pending.pop();
+      writeShadowQueue(path, state);
+      throw error;
+    }
+    return publicShadowQueueState(state);
   });
 }
 

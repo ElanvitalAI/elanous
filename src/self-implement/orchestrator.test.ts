@@ -14620,7 +14620,8 @@ describe('evidenceCoverage 가 리뷰 컨텍스트까지 간다 (JDG-S4/S5)', ()
     let prompt = '';
     const seamsForReview = defaultSeams({
       reviewScopeDiff: async () => 'diff --git a/x.ts b/x.ts\n+const a = 1;\n',
-      llmReview: async (p: string) => { prompt = p; return JSON.stringify({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'r' }); },
+      // ⭐ REVIEW-NO-VERDICT-FAILCLOSED — 리뷰어 응답은 `VERDICT:` 줄이 있어야 «리뷰함»이다(종전 JSON 스텁은 판정 줄이 없어 기본 pass 에 기댔다).
+      llmReview: async (p: string) => { prompt = p; return 'VERDICT: PASS'; },
     });
     const review = await seamsForReview.reviewDiff!('/any/worktree', {
       goal: '골 본문',
@@ -14681,7 +14682,8 @@ describe('evidenceCoverage 가 리뷰 컨텍스트까지 간다 (JDG-S4/S5)', ()
     let prompt = '';
     const seamsForReview = defaultSeams({
       reviewScopeDiff: async () => 'diff --git a/x.ts b/x.ts\n+const a = 1;\n',
-      llmReview: async (p: string) => { prompt = p; return JSON.stringify({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'r' }); },
+      // ⭐ REVIEW-NO-VERDICT-FAILCLOSED — 리뷰어 응답은 `VERDICT:` 줄이 있어야 «리뷰함»이다(종전 JSON 스텁은 판정 줄이 없어 기본 pass 에 기댔다).
+      llmReview: async (p: string) => { prompt = p; return 'VERDICT: PASS'; },
     });
     const review = await seamsForReview.reviewDiff!('/any/worktree', {
       goal: '골 본문',
@@ -16617,5 +16619,67 @@ describe('runSelfImplement — harness fork seam wiring', () => {
       parentSessionId: 'parent-session',
       willFork: true,
     });
+  });
+});
+
+// AUTOMERGE-WARN-MUSTFIX(0.2.24): warn ⊕ must-fix≥1 은 루프를 그대로 빠져나와 종전엔 auto 였다.
+//   ⛔ 불변식: must-fix 0 인 warn/pass 는 결정·사유가 종전 그대로 · fail 은 종전 `review-must-fix` 그대로.
+describe('runSelfImplement — merge decision with a warn verdict that still carries must-fix', () => {
+  function captureMergeDecision(): { events: Array<Record<string, unknown>>; restore: () => void } {
+    const original = (debug as { log: typeof debug.log }).log;
+    const events: Array<Record<string, unknown>> = [];
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      if (event === 'merge-decision') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log;
+    return { events, restore: () => { (debug as { log: typeof debug.log }).log = original; } };
+  }
+
+  async function runWithReview(review: { verdict: 'pass' | 'warn' | 'fail'; mustFix: string[] }) {
+    const { events, restore } = captureMergeDecision();
+    let mergeCalls = 0;
+    try {
+      const result = await runSelfImplement({
+        feature: `merge decision ${review.verdict} ${review.mustFix.length}`,
+        autoMerge: true,
+        maxReworkRounds: 0,
+        seams: seams({
+          reviewDiff: async () => ({ ...review, shouldFix: [], summary: 'review', reviewed: true, diffTruncated: false }),
+          mergePr: async () => { mergeCalls++; return { merged: true }; },
+        }),
+      });
+      return { result, events, mergeCalls };
+    } finally {
+      restore();
+    }
+  }
+
+  test('warn with one must-fix goes to HITL with review-warn-with-must-fix and does not merge', async () => {
+    const { result, events, mergeCalls } = await runWithReview({ verdict: 'warn', mustFix: ['still broken'] });
+    expect(mergeCalls).toBe(0);
+    expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: 'review-warn-with-must-fix' });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ verdict: 'warn', decision: 'hitl', reason: 'review-warn-with-must-fix', mustFixCount: 1 });
+  });
+
+  test('warn with no must-fix keeps the previous auto decision', async () => {
+    const { result, events, mergeCalls } = await runWithReview({ verdict: 'warn', mustFix: [] });
+    expect(mergeCalls).toBe(1);
+    expect(result).toMatchObject({ stage: 'merged', merged: true });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ verdict: 'warn', decision: 'auto', reason: 'review-clean-armed', mustFixCount: 0 });
+  });
+
+  test('pass with no must-fix keeps the previous auto decision', async () => {
+    const { result, events, mergeCalls } = await runWithReview({ verdict: 'pass', mustFix: [] });
+    expect(mergeCalls).toBe(1);
+    expect(result).toMatchObject({ stage: 'merged', merged: true });
+    expect(events[0]).toMatchObject({ verdict: 'pass', decision: 'auto', reason: 'review-clean-armed', mustFixCount: 0 });
+  });
+
+  test('fail keeps the previous review-must-fix reason', async () => {
+    const { result, events, mergeCalls } = await runWithReview({ verdict: 'fail', mustFix: [] });
+    expect(mergeCalls).toBe(0);
+    expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: 'review-must-fix' });
+    expect(events[0]).toMatchObject({ verdict: 'fail', decision: 'hitl', reason: 'review-must-fix', mustFixCount: 0 });
   });
 });

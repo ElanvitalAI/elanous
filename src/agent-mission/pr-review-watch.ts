@@ -25,10 +25,14 @@ import { AUTO_REVIEW_LABEL } from '../self-implement/context-capsule.js';
 import { resolveReworkBackendChoice, runReviewLoop, type ReviewLoopOpts, type ReviewLoopResult, type ReviewVerdict } from './review-loop.js';
 import type { ReviewResult } from '../agent-substrate/pr-reviewer.js';
 
-/** 1차 리뷰 결과(ReviewResult) → review-loop injectedReview. fail→reinforce(mustFix)·pass/warn→ok(clean). 순수. */
+/** 1차 리뷰 결과(ReviewResult) → review-loop injectedReview. fail→reinforce(mustFix)·pass/warn→ok. 순수.
+ *  TA-LAND-MUSTFIX-ZERO — pass/warn 의 must-fix 를 «지우지 않고» asks 로 싣는다: 지우면 review-loop 의
+ *  자동 병합 관문이 «must-fix 0» 으로 읽는다. must-fix 0 이면 종전과 같은 `asks: []`. */
 export function mapReviewToInjected(r: ReviewResult): { verdict: ReviewVerdict; asks: string[] } {
   if (r.verdict === 'fail') return { verdict: 'reinforce', asks: r.mustFix };
-  return { verdict: 'ok', asks: [] };
+  // must-fix 목록을 못 읽으면 «0» 이 아니라 «모름» — ok 로 보내지 않는다(ambiguous = 명확화 요청 · 병합 없음).
+  if (!Array.isArray(r.mustFix)) return { verdict: 'ambiguous', asks: [] };
+  return { verdict: 'ok', asks: [...r.mustFix] };
 }
 
 /** [ISO] ELANOUS_STATE_DIR 존중(lazy) — 테스트격리 시 .elanous-test 로 스코프. */

@@ -252,7 +252,9 @@ export async function condenseContextWindowWithReport(
     if (!/^(?:https?:\/\/|elanous:\/\/)[^\s]+$/.test(link)) { skip('bad-link', source); continue; }
     const claim = summary.claim && { key: safeLine(summary.claim.key), value: safeLine(summary.claim.value) };
     if (claim && (!claim.key || !claim.value)) { skip('bad-claim', source); continue; }
-    if (source.kind === 'event' && !claim) { skip('no-claim', source); continue; }
+    // Sleep review can promote a sourced durable event without asserting a comparable fact.
+    // The ordinary condense command still requires a claim for event candidates.
+    if (source.kind === 'event' && !claim && policy.promotion !== 'sleep-review') { skip('no-claim', source); continue; }
     kept++;
     bump(funnel.summarized.accepted, source.seat);
     const key = keyFor({ project, seat, topic });

@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Database } from 'bun:sqlite';
 import { BriefItemsLedger, BRIEF_REACTIONS } from '../briefing/brief-items.js';
 import { registerBriefCommands } from './brief-cli.js';
 
@@ -169,7 +169,7 @@ test('brief send delivers one page, marks composed ids only after message id 77,
   const sent: string[] = [];
   const f = fixture({ now: sendNow, send: markdown => { sent.push(markdown); return 77; } });
   try {
-    expect(f.brief?.children.find(child => child.name === 'send')?.opts).toMatchObject({ slot: { required: true }, 'dry-run': { required: false } });
+    expect(f.brief?.children.find(child => child.name === 'send')?.opts).toMatchObject({ slot: { required: false }, realtime: { required: false }, 'dry-run': { required: false } });
     f.run('send', { slot: '08:30' });
     expect(f.output.at(-1)).toBe('(보낼 항목 없음)');
     expect(sent).toHaveLength(0);
@@ -254,6 +254,97 @@ test('brief send validates slot and marks only ids actually printed after dedupl
     expect(sent).toHaveLength(1);
     expect(f.output.at(-1)).toBe('(보낼 항목 없음)');
     expect(listedSentAt(f).map(at => at !== null)).toEqual([true, true, false, false]);
+  } finally { f.cleanup(); }
+});
+
+test('brief send --realtime sends only urgent unsent rows once; failed sender leaves P0 for the next slot', () => {
+  const sent: string[] = [];
+  let succeeds = true;
+  const f = fixture({ now: sendNow, send: markdown => { sent.push(markdown); return succeeds ? 77 : null; } });
+  try {
+    addTwo(f);
+    f.run('send', { realtime: true });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('결정 필요');
+    expect(sent[0]).not.toContain('동향 원문');
+    expect(listedSentAt(f).map(at => at !== null)).toEqual([true, false]);
+    const db = new Database(f.ledger.path);
+    try {
+      expect(db.query('SELECT item_id, slot FROM sends').all()).toEqual([{ item_id: 1, slot: 'realtime' }]);
+    } finally { db.close(); }
+    f.run('send', { realtime: true });
+    expect(f.output.at(-1)).toBe('(보낼 항목 없음)');
+    expect(sent).toHaveLength(1);
+    f.run('send', { slot: '08:30' });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain('동향 원문');
+    expect(sent[1]).not.toContain('결정 필요');
+
+    f.run('add', { text: '재시도 P0', domain: '판', priority: 'P0', source: '자리', createdAt: itemAt });
+    succeeds = false;
+    f.run('send', { realtime: true });
+    expect(f.errors.at(-1)).toContain('brief send: 발송 실패');
+    expect(listedSentAt(f).at(-1)).toBeNull();
+    const failedDb = new Database(f.ledger.path);
+    try {
+      expect(failedDb.query('SELECT COUNT(*) AS count FROM sends WHERE item_id = 3').get()).toEqual({ count: 0 });
+    } finally { failedDb.close(); }
+    succeeds = true;
+    f.run('send', { slot: '08:30' });
+    expect(sent.at(-1)).toContain('재시도 P0');
+    expect(listedSentAt(f).every(at => at !== null)).toBe(true);
+  } finally { f.cleanup(); }
+});
+
+test('brief add --priority P0 --send-now uses realtime delivery immediately and retains failed additions', () => {
+  const sent: string[] = [];
+  let succeeds = false;
+  const f = fixture({ now: sendNow, send: markdown => { sent.push(markdown); return succeeds ? 77 : null; } });
+  try {
+    f.run('add', { text: '일반', domain: '운영', priority: 'P1', source: '자리', createdAt: itemAt });
+    f.run('add', { text: '즉시 결정', domain: '판', priority: 'P0', source: '자리', sendNow: true });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('즉시 결정');
+    expect(sent[0]).not.toContain('일반');
+    expect(f.errors.at(-1)).toContain('brief add: 발송 실패');
+    expect(listedSentAt(f)).toEqual([null, null]);
+    succeeds = true;
+    f.run('send', { realtime: true });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain('즉시 결정');
+    expect(listedSentAt(f).map(at => at !== null)).toEqual([false, true]);
+    f.run('add', { text: '다음 즉시 결정', domain: '판', priority: 'P0', source: '자리', sendNow: true });
+    expect(sent).toHaveLength(3);
+    expect(sent[2]).toContain('- [P0] 다음 즉시 결정 (');
+    expect(sent[2]).not.toContain('- [P0] 즉시 결정 (');
+    expect(listedSentAt(f).map(at => at !== null)).toEqual([false, true, true]);
+    const count = f.ledger.list().length;
+    f.run('add', { text: '불가', domain: '판', priority: 'P1', source: '자리', sendNow: true });
+    expect(f.ledger.list()).toHaveLength(count);
+    expect(f.errors.at(-1)).toContain('--send-now requires --priority P0');
+  } finally { f.cleanup(); }
+});
+
+test('brief send --realtime includes due-today P1 but not tomorrow KST; dry-run does not mark', () => {
+  const sent: string[] = [];
+  const f = fixture({ now: sendNow, send: markdown => { sent.push(markdown); return 77; } });
+  try {
+    f.run('add', { text: '오늘 마감', domain: '판', priority: 'P1', source: '자리', deadline: '2026-10-05T15:30:00Z' });
+    f.run('add', { text: '내일 마감', domain: '판', priority: 'P1', source: '자리', deadline: '2026-10-06T15:00:00Z' });
+    f.run('send', { realtime: true, dryRun: true });
+    expect(f.output.at(-1)).toContain('오늘 마감');
+    expect(f.output.at(-1)).not.toContain('내일 마감');
+    expect(sent).toHaveLength(0);
+    expect(listedSentAt(f)).toEqual([null, null]);
+    f.run('send', { realtime: true });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('오늘 마감');
+    expect(sent[0]).not.toContain('내일 마감');
+    expect(listedSentAt(f).map(at => at !== null)).toEqual([true, false]);
+    f.run('send', {});
+    expect(f.errors.at(-1)).toContain('--slot is required unless --realtime');
+    f.run('send', { realtime: true, slot: '08:30' });
+    expect(f.errors.at(-1)).toContain('--realtime cannot be combined with --slot');
   } finally { f.cleanup(); }
 });
 

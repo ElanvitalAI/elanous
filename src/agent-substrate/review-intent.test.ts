@@ -263,6 +263,65 @@ describe('buildReviewIntent', () => {
     expect(out).toContain('quoted, not a lite declaration');
   });
 
+  test('three-sibling goal reaches the review input with scope, handoff and must-fix refutation rules', () => {
+    const identity = {
+      orchestrationId: 'three-siblings', shardId: 'task:handler', totalShards: 4, position: 1,
+      summary: 'Implement handler', siblings: [
+        { shardId: 'task:route', summary: 'Register the route' },
+        { shardId: 'task:screen', summary: 'Build the screen' },
+        { shardId: 'task:docs', summary: 'Write docs' },
+      ],
+    };
+    const goal = [
+      '대상 경로: src/handler.ts',
+      '보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다',
+      '## SCOPE BOUNDARY', '- 의도적 경계: 화면은 task:screen 담당 — 이 PR에서 변경하지 않는다',
+      '## Shard identity', JSON.stringify(identity),
+    ].join('\n');
+    const built = buildReviewIntent(toReviewIntentInput({ goal, changedFiles: ['src/handler.ts'] })!);
+    const reviewed = intentFromPr({ title: 'handler PR', body: `## 리뷰 intent\n${built}` });
+    for (const text of ['샤드 계약 — 리뷰 범위', '대상 경로: src/handler.ts',
+      '- task:route: Register the route', '- task:screen: Build the screen', '- task:docs: Write docs',
+      '보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다',
+      '의도적 경계: 화면은 task:screen 담당', 'out-of-scope → 담당 형제 조각 <id>',
+      'must-fix마다', '반증 확인 한 줄']) expect(reviewed).toContain(text);
+    expect(reviewed).not.toContain('"orchestrationId"');
+    const crowded = buildReviewIntent(toReviewIntentInput({
+      goal: `${'Long goal description.\n'.repeat(400)}\n${goal}`,
+      changedFiles: ['src/handler.ts'],
+    })!);
+    expect(crowded.length).toBeLessThanOrEqual(MAX_REVIEW_INTENT_CHARS);
+    for (const text of ['샤드 계약 — 리뷰 범위', '대상 경로: src/handler.ts',
+      '- task:docs: Write docs', '보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다',
+      'out-of-scope → 담당 형제 조각 <id>', '반증 확인 한 줄']) expect(crowded).toContain(text);
+  });
+
+  test('authored goal with three sibling shards reaches reviewDiff input and PR reviewer without editing the verbatim ask', () => {
+    const identity = { orchestrationId: 'three-siblings', shardId: 'task:handler', totalShards: 4, position: 1,
+      summary: 'Implement handler', siblings: [
+        { shardId: 'task:route', summary: 'Register route' },
+        { shardId: 'task:screen', summary: 'Build screen' },
+        { shardId: 'task:docs', summary: 'Write docs' },
+      ] };
+    const ask = ['대상 경로: src/handler.ts', '보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다',
+      '## Shard identity', JSON.stringify(identity)].join('\n');
+    const goal = ['## WHAT TO BUILD', 'Original ask (verbatim, unmodified):', '```', ask, '```',
+      '## ACCEPTANCE CRITERIA', '- handler must work', '## SCOPE BOUNDARY',
+      '- 의도적 경계: 화면은 task:screen 담당 — 이 PR에서 변경하지 않는다'].join('\n');
+    const forwarded = toReviewIntentInput({ goal, changedFiles: ['src/handler.ts'] });
+    expect(forwarded?.goal).toBe(goal);
+    const built = buildReviewIntent(forwarded!);
+    const reviewed = intentFromPr({ title: 'handler PR', body: `## 리뷰 intent\n${built}` });
+    for (const text of ['샤드 계약 — 리뷰 범위', '대상 경로: src/handler.ts',
+      '- task:route: Register route', '- task:screen: Build screen', '- task:docs: Write docs',
+      '보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다',
+      '의도적 경계: 화면은 task:screen 담당', 'out-of-scope → 담당 형제 조각 <id>',
+      'must-fix마다', '반증 확인 한 줄']) expect(reviewed).toContain(text);
+    expect(built.length).toBeLessThanOrEqual(MAX_REVIEW_INTENT_CHARS);
+    expect(reviewed).toContain('Original ask (verbatim, unmodified):');
+    expect(goal).toContain(ask);
+  });
+
   test('shard boundary gets budget before a long goal; JSON footer is absent from the goal block', () => {
     const identity = {
       orchestrationId: 'run-1', shardId: 'handler', totalShards: 3, position: 1,

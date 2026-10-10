@@ -1,5 +1,7 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 export interface SkillRun {
   skill: string;
@@ -23,6 +25,34 @@ export interface SkillFixProposal {
 /** Record one run at the caller-supplied ledger path; never touch a skill file. */
 export function appendSkillRun(ledgerPath: string, run: SkillRun): void {
   appendFileSync(ledgerPath, `${JSON.stringify(run)}\n`, 'utf8');
+}
+
+/**
+ * Ledger for skill runs: `<root>/skills/feedback.jsonl`, root defaulting to the
+ * effective instance (state) root — never a skill folder. Creates the directory.
+ */
+export function skillFeedbackLedgerPath(root: string = effectiveInstanceRoot()): string {
+  const dir = join(root, 'skills');
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'feedback.jsonl');
+}
+
+/**
+ * Fail-soft record of one skill run: resolving or writing the ledger never
+ * throws to the caller; a failure leaves a single `record-failed` observation.
+ */
+export function recordSkillRunSafe(run: SkillRun, ledgerPath?: string): void {
+  try {
+    appendSkillRun(ledgerPath ?? skillFeedbackLedgerPath(), run);
+  } catch (error) {
+    try {
+      debug.log('skill.feedback', 'record-failed', { skill: run.skill, error: String(error) }, { level: 'warn' });
+    } catch { /* observation must not break the skill result either */ }
+    return;
+  }
+  try {
+    debug.log('skill.feedback', 'recorded', { skill: run.skill, outcome: run.outcome, durationMs: run.durationMs });
+  } catch { /* fail-soft */ }
 }
 
 /** Read the JSONL ledger in append order; an absent ledger has no runs. */

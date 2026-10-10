@@ -17,6 +17,7 @@ import {
   toDiscordEvent,
 } from '../src/nexus/api/discord-trigger-bot';
 import type { DcTriggerEvent } from '../src/discord';
+import { receiveChannelEvent } from '../src/nexus/outbound/router';
 import type { DiscordEvent } from '../src/workflow-runtime/triggers/discord-source';
 
 // Minimal DiscordBot stub — implements just the surface the factory
@@ -98,6 +99,7 @@ describe('createNexusDiscordTriggerBot · factory + tap wiring', () => {
       messageId: 'msg-789',
       isDm: false,
     };
+    expect(receiveChannelEvent('discord', tap)).toEqual({ text: tap.body, kind: 'mention', channel: 'ch-123', senderId: 'user-456', messageId: 'msg-789' });
     const out = toDiscordEvent(tap);
     expect(out).toMatchObject({
       kind: 'mention',

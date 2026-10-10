@@ -37,7 +37,7 @@ function warnIfIgnoredEnv(resolved: string, source: 'flag' | 'state-dir' | 'defa
   if (env === undefined || normalizedDir(env) === normalizedDir(resolved)) return;
   console.error(`ELANOUS_CONFIG_DIR 는 읽지 않습니다 — 설정 폴더 = ${resolved} · 그 폴더를 쓰려면 --config-dir ${normalizedDir(env)}`);
   try {
-    const { debug } = require('./debug/log.js') as typeof import('./debug/log.js');
+    const { debug } = require('./debug/log.js') as { debug: { log: (category: string, event: string, data: Record<string, unknown>) => void } };
     debug.log('config.dir', 'env-ignored', { env, resolved, source });
   } catch { /* logging must not change config resolution */ }
 }
@@ -63,7 +63,7 @@ export function getElanousConfigDir(): string {
   //     두 축이 한 뿌리로 수렴한다. 로직을 여기 중복 구현하지 않는다.
   //     (`configDirFollowingStateDir` 은 §4d 계약을 문서화·테스트하는 순수 함수로 남는다 —
   //      실제 해석 경로는 이 리졸버 하나다.)
-  const { effectiveInstanceRoot } = require('./instance/resolve.js') as typeof import('./instance/resolve.js');
+  const { effectiveInstanceRoot } = require('./instance/resolve.js') as { effectiveInstanceRoot: () => string };
   const resolved = effectiveInstanceRoot();
   warnIfIgnoredEnv(resolved, process.env.ELANOUS_STATE_DIR?.trim() ? 'state-dir' : 'default');
   return resolved;

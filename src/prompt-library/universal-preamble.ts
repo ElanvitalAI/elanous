@@ -32,11 +32,11 @@ import { buildGrokFamilyAddendum } from './grok-family-addendum.js';
 import { buildSessionGuidanceAddendum } from './session-guidance.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 
-export const PROJECT_ANCHOR_MAX_CHARS = 32 * 1024;
+export const PROJECT_ANCHOR_MAX_CHARS = 36 * 1024; // 10-10 증액(32K→36K) — 줄이기는 AGENTS-CLAUDE-DIET(0.2.24)
 /** «lean» 예산(BACKLOG L2 · 2026-09-25) — 로컬 모델 구현 자식은 매 턴 이것을 prefill 한다.
  *  📏 09-25 node-b 기록 프록시: 시스템 50,068자 중 AGENTS.md 앵커 ~32K · 트리 ~8K 가 상위 둘이었다.
  *  ⭐ 켜는 법: env `ELANOUS_PROMPT_BUDGET=lean` — 하니스 구현 자식 spawn 이 child provider 가 local 일 때 준다.
- *  ⛔ API 모델 경로의 기본(32K·8K)은 그대로다 — 잘 도는 것을 바꾸지 않는다. */
+ *  ⛔ API 모델 경로의 기본(36K·8K)은 그대로다 — 잘 도는 것을 바꾸지 않는다. */
 export const PROJECT_ANCHOR_LEAN_MAX_CHARS = 8 * 1024;
 export const PROJECT_TREE_LEAN_MAX_CHARS = 2 * 1024;
 function promptBudgetLean(): boolean { return process.env.ELANOUS_PROMPT_BUDGET?.trim() === 'lean'; }

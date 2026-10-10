@@ -16,7 +16,7 @@
 
 import { existsSync } from 'node:fs';
 import type { UserConfig } from '../user-config.js';
-import { runTurn } from '../session/chat.js';
+import { runTurn, type RunTurnOpts } from '../session/chat.js';
 import type { SessionSource } from '../session/index.js';
 import { buildContinuationAgentTools } from '../dispatch/continuation-turn-runner.js';
 import { buildTerminalCapableTurn } from './terminal-surface.js';
@@ -54,6 +54,54 @@ function recentSentContext(): string {
     const db = openSurfaceEventsDb();
     try { return recentSentDigest(db); } finally { db.close(); }
   } catch { return ''; }
+}
+
+interface ToolRun { id: string; name: string; result?: unknown }
+
+const TOOL_RESULT_CLIP_CHARS = 1500;
+const TOOL_RESULT_MAX_RUNS = 12;
+
+function clipToolResult(result: unknown): string {
+  if (result === undefined) return '(결과 없음)';
+  let text: string;
+  try { text = typeof result === 'string' ? result : JSON.stringify(result) ?? String(result); } catch { text = String(result); }
+  return text.length > TOOL_RESULT_CLIP_CHARS ? `${text.slice(0, TOOL_RESULT_CLIP_CHARS)}…` : text;
+}
+
+/** 툴만 부르고 최종 텍스트가 빈 턴 — 관측을 남기고 툴 결과 요약 재턴을 한 번 돌린다. 재턴도 비면 바닥줄이 아니라
+ *  실패 문구를 돌려준다. 세션 재생은 role:'tool' 기록을 빼므로 재턴 프롬프트가 툴 결과를 직접 싣는다. */
+async function recoverEmptyAnswer(args: {
+  runTurnImpl: typeof runTurn;
+  opts: RunTurnOpts;
+  llmOpts: RunTurnOpts['llmOpts'];
+  systemPrompt: string;
+  toolRuns: ToolRun[];
+  surface: SessionSource;
+}): Promise<string> {
+  const { runTurnImpl, opts, llmOpts, systemPrompt, toolRuns, surface } = args;
+  let message = '';
+  let sawToolCall = false;
+  let retryText = '';
+  try {
+    const summary = toolRuns.slice(-TOOL_RESULT_MAX_RUNS)
+      .map((run) => `- ${run.name}: ${clipToolResult(run.result)}`).join('\n');
+    const retry = await runTurnImpl({
+      ...opts,
+      userText: `[툴 결과 요약 재턴] 아래 툴 실행 결과를 근거로 사용자 질문에 대한 최종 답을 텍스트로 작성하세요. 툴은 더 부르지 마세요.\n\n사용자 질문: ${opts.userText}\n\n툴 결과:\n${summary}`,
+      onDelta: (delta) => { message += delta; },
+      onToolCall: () => { message = ''; sawToolCall = true; },
+      onToolResult: () => {},
+      skipMemoryInjection: true,
+      llmOpts,
+      systemPrompt,
+      tools: [],
+    });
+    retryText = (sawToolCall ? message : retry.text)?.trim() ?? '';
+  } catch { /* 재턴 실패는 아래 실패 문구로 */ }
+  debug.log('agent.turn', 'empty-answer', {
+    surface, sessionId: opts.sessionId, toolCalls: toolRuns.length, recovered: retryText !== '',
+  });
+  return retryText || `⚠️ 답을 만들지 못했다 — 툴 ${toolRuns.length}개 실행`;
 }
 
 /** Build the tool-enabled elanous self runTurn for a messenger surface:
@@ -229,6 +277,8 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
     llmOpts = terminal.llmOpts;
     let currentMessage = '';
     let sawToolCall = false;
+    const toolRuns: ToolRun[] = [];
+    const systemPrompt = terminal.systemPromptParts.join('\n\n');
     return runTurnImpl({
       ...opts,
       onDelta: (delta) => {
@@ -238,21 +288,33 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
       onToolCall: (call) => {
         currentMessage = '';
         sawToolCall = true;
+        toolRuns.push({ id: call.id, name: call.name });
         opts.onToolCall?.(call);
       },
+      onToolResult: (call) => {
+        const run = toolRuns.find((candidate) => candidate.id === call.id);
+        if (run) run.result = call.result;
+        opts.onToolResult?.(call);
+      },
       llmOpts,
-      systemPrompt: terminal.systemPromptParts.join('\n\n'),
+      systemPrompt,
       tools: terminal.specs,
       dispatchTool: terminal.dispatch,
-    }).then((result) => {
+    }).then(async (result) => {
       // /cancel self-awareness — when the turn was aborted mid-run (user hit
       // `/cancel`), the tool loop returns with little/no final text. Substitute
       // a CLEAR cancellation marker so (a) the user gets an ack, and (b) it is
       // the text recorded to cross-surface memory (recordInboundTurn) — so the
       // NEXT turn's memory_recall knows the task was CANCELLED, not silently
       // dropped or still running. Only turnAbort (=/cancel) aborts this signal.
-      const wasAborted = opts.signal?.aborted === true;
-      const answer = sawToolCall ? currentMessage.trim() : result.text;
+      let wasAborted = opts.signal?.aborted === true;
+      let answer = sawToolCall ? currentMessage.trim() : result.text;
+      // Telegram only: other messenger surfaces (Discord …) keep their current final-answer behaviour.
+      if (!wasAborted && sawToolCall && !answer && surface === 'telegram') {
+        answer = await recoverEmptyAnswer({ runTurnImpl, opts, llmOpts, systemPrompt, toolRuns, surface });
+        // A /cancel that lands during the retry turn still wins over the retry answer or the failure sentence.
+        if (opts.signal?.aborted === true) { wasAborted = true; answer = ''; }
+      }
       const responseText = wasAborted
         ? (answer?.trim()
             ? `${answer}\n\n⏹️ 이 작업은 /cancel 로 취소되었습니다 (실행 중이던 Bash/PTY 종료됨).`

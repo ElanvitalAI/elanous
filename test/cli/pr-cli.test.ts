@@ -1142,6 +1142,163 @@ describe('elanous pr land', () => {
     return { run, commands };
   }
 
+  describe('TA-LAND-OVERLAP — pinned non-interactive overlap needs verified evidence', () => {
+    const HEAD = 'a'.repeat(40);
+    const TIP = 'b'.repeat(40);
+    const URL = 'https://github.com/example/repo/pull/51';
+    const LANDINGS = ['aaa111bbb222ccc333ddd444eee555fff666aaa', 'bbb222ccc333ddd444eee555fff666aaa111bbb'];
+    function pinnedRun(opts: { ancestor?: boolean; landingAncestors?: readonly string[] } = {}) {
+      const inner = landRun(overlapLog, 'src/land.ts\n', '');
+      const commands: Array<{ cmd: string; args: readonly string[] }> = [];
+      const run = (cmd: string, args: readonly string[]) => {
+        commands.push({ cmd, args });
+        const command = args.join(' ');
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,headRefName,state,isDraft,url')) {
+          return { ok: true, out: JSON.stringify({ headRefOid: HEAD, headRefName: 'feat/land', state: 'OPEN', isDraft: false, url: URL }) };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,state,isDraft')) {
+          return { ok: true, out: JSON.stringify({ headRefOid: HEAD, state: 'OPEN', isDraft: false }) };
+        }
+        if (cmd === 'git' && command === 'rev-parse HEAD') return { ok: true, out: `${HEAD}\n` };
+        if (cmd === 'git' && command === 'status --porcelain') return { ok: true, out: '' };
+        if (cmd === 'git' && command === 'ls-remote origin refs/heads/main') return { ok: true, out: `${TIP}\trefs/heads/main\n` };
+        if (cmd === 'git' && command === `merge-base --is-ancestor ${TIP} ${HEAD}`) return { ok: opts.ancestor ?? true, out: '' };
+        if (cmd === 'git' && args[0] === 'merge-base' && args[1] === '--is-ancestor' && args[3] === HEAD) return { ok: (opts.landingAncestors ?? []).includes(args[2]!), out: '' };
+        return inner.run(cmd, args);
+      };
+      return { run, commands };
+    }
+    function evidenceFiles(overrides: { gateBase?: string; review?: Record<string, unknown>; noGate?: boolean; reviewDir?: string; card?: string } = {}) {
+      const dir = mkdtempSync(join(tmpdir(), 'pr-land-overlap-evidence-'));
+      const reviewDir = overrides.reviewDir ?? 'review-results';
+      const reviewResult = join(dir, reviewDir, `${overrides.card ?? 'TA-1'}-51-${HEAD.slice(0, 12)}.json`);
+      mkdirSync(join(dir, reviewDir));
+      writeFileSync(reviewResult, `noise\n${JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: HEAD, ...overrides.review })}\n`);
+      const evidence = join(dir, 'evidence.json');
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: HEAD, ...(overrides.noGate ? {} : { gate: { head: HEAD, baseCommit: overrides.gateBase ?? TIP, passed: true } }), reviewResult }));
+      return { dir, evidence };
+    }
+    const pinnedManager = () => fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }) });
+
+    it('without --overlap-evidence the pinned refusal is unchanged', async () => {
+      const { run } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      expect(await runPrLand({ pr: '51', expectedHead: HEAD }, { ...baseDeps, run, manager, out: sink.out })).toBe(1);
+      expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+      expect(sink.errors.join('\n')).not.toContain('overlap-evidence');
+      expect(calls).not.toContain('merge');
+    });
+
+    it('verified evidence (rebased · gated on that base · review pass must-fix 0) lands the pinned head', async () => {
+      const { run, commands } = pinnedRun();
+      const { manager, calls } = fakeManager({ findPrForBranchOutcome: () => { calls.push('find'); return { status: 'ok OUTPUT', url: URL }; } });
+      const sink = output();
+      const { dir, evidence } = evidenceFiles();
+      const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+        expect(calls).toEqual(['find', 'merge']);
+        expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence:'))).toBe(true);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'ls-remote')).toBe(true);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'fetch')).toBe(false);
+        const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
+        expect(seen).toEqual([expect.objectContaining({ decision: 'accepted', pr: 51, head: HEAD, baseTip: TIP })]);
+      } finally {
+        logged.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ['not rebased onto the current base tip', { ancestor: false }, {}, 'not-rebased'],
+      ['gate ran on a stale base', {}, { gateBase: 'c'.repeat(40) }, 'gate-base-stale'],
+      ['review carries a must-fix', {}, { review: { mustFix: ['fix it'] } }, 'review-must-fix-1'],
+      ['review is for another head', {}, { review: { headCommit: 'd'.repeat(40) } }, 'review-head-mismatch'],
+      ['review verdict is warn', {}, { review: { verdict: 'warn' } }, 'review-verdict-warn'],
+      ['review file is outside a review-results directory', {}, { reviewDir: 'elsewhere' }, 'review-path-not-for-this-pr-head'],
+      ['review file name has no card part', {}, { card: '' }, 'review-path-not-for-this-pr-head'],
+    ] as const)('rejects when %s and keeps the old refusal', async (_label, runOpts, files, reason) => {
+      const { run } = pinnedRun(runOpts);
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles(files);
+      const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(1);
+        expect(sink.errors.some((line) => line.startsWith(`✗ overlap-evidence: ${reason}`))).toBe(true);
+        expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+        expect(calls).not.toContain('merge');
+        const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
+        expect(seen).toEqual([expect.objectContaining({ decision: 'rejected', reason: expect.stringContaining(reason) })]);
+      } finally {
+        logged.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('already-ancestor: every overlapping landing is inside the head → review pass alone lands (no rebase/gate check)', async () => {
+      const { run, commands } = pinnedRun({ landingAncestors: LANDINGS });
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles({ noGate: true });
+      const logged = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
+        expect(calls).toContain('merge');
+        expect(sink.logs.some((line) => line.startsWith('✓ overlap-evidence: already-ancestor'))).toBe(true);
+        expect(commands.filter(({ cmd, args }) => cmd === 'git' && args[0] === 'merge-base' && args[3] === HEAD).map(({ args }) => args[2])).toEqual(LANDINGS);
+        expect(commands.some(({ cmd, args }) => cmd === 'git' && args[0] === 'ls-remote')).toBe(false);
+        const seen = logged.mock.calls.filter((call) => call[0] === 'pr.land' && call[1] === 'overlap-evidence').map((call) => call[2]);
+        expect(seen).toEqual([expect.objectContaining({ decision: 'accepted', reason: 'already-ancestor', overlappingLandings: LANDINGS })]);
+      } finally {
+        logged.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ['one overlapping landing is not an ancestor and no gate record', { landingAncestors: [LANDINGS[0]!] }, { noGate: true }, 'gate-missing'],
+      ['all ancestors but the review carries a must-fix', { landingAncestors: LANDINGS }, { noGate: true, review: { mustFix: ['x'] } }, 'review-must-fix-1'],
+    ] as const)('already-ancestor rejects when %s', async (_label, runOpts, files, reason) => {
+      const { run } = pinnedRun(runOpts);
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles(files);
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, { ...baseDeps, run, manager, out: sink.out })).toBe(1);
+        expect(sink.errors.some((line) => line.startsWith(`✗ overlap-evidence: ${reason}`))).toBe(true);
+        expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+        expect(calls).not.toContain('merge');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not let evidence override a human hold', async () => {
+      const { run } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles();
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence }, {
+          ...baseDeps, run, manager, out: sink.out,
+          decideOverlapLanding: () => ({ outcome: 'user-hold', channel: 'terminal', interactive: true }),
+        })).toBe(1);
+        expect(sink.errors).toContain('✗ expected-head: overlap merge approval unavailable for the reviewed head');
+        expect(calls).not.toContain('merge');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects --overlap-evidence on an unpinned landing before any command', async () => {
+      const sink = output();
+      expect(await runPrLand({ overlapEvidence: 'evidence.json' }, { ...baseDeps, run: () => { throw new Error('no command'); }, out: sink.out })).toBe(1);
+      expect(sink.errors[0]).toContain('overlap-evidence');
+    });
+  });
+
   describe('changed-file base selection', () => {
     async function landWithBaseRefs(input: { remoteExists: boolean; localFiles: string; remoteFiles: string; behind?: number }) {
       const { manager } = fakeManager();

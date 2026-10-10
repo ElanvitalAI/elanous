@@ -23,11 +23,12 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { forkSessionById, HARNESS_SESSION_ORIGIN, isHarnessSessionOrigin } from '../session/index.js';
-import { configuredWorktreeRoot, getUserConfig, resolveRoleLlm } from '../user-config.js';
+import { configuredWorktreeRoot, getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addHarnessQueue } from '../harness/harness-queue.js';
 import { readFollowUpMode } from './follow-up-goals.js';
-import { getProviderForConfig } from '../llm.js';
+import { getProviderForConfig, NoLlmProviderAvailableError } from '../llm.js';
+import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { createWorktree, DEFAULT_BRANCH_WORKTREE_BASE, linkWorktreeDependencies, removeWorktree, resolveDefaultBranchBase, resolveMainRepoRoot } from '../git-fs/worktree.js';
 import { isWorktreeInUse, listActiveTerminalDirectories } from '../harness/harness-clean.js';
 import { readWorktreePorcelain } from './abandoned-classification.js';
@@ -198,7 +199,39 @@ export const SELF_IMPLEMENT_COMPLETION_REPORT_HINT = '자식이 최종 요약 �
 
 /** self-implement 실행 경계가 범용 brain에 전용 종료-보고 규칙을 주입한다. */
 export function createSelfImplementControlBrain(opts: Omit<LlmControlBrainOpts, 'systemHint'>) {
-  return createLlmControlBrain({ ...opts, systemHint: SELF_IMPLEMENT_COMPLETION_REPORT_HINT });
+  // ⭐ 이 부모에 쓸 provider 가 «하나도» 없으면(NoLlmProviderAvailableError) BRAIN-FAST 이전처럼 «지연 해석»
+  //   brain 을 돌려준다 — 생성 시점에 throw 하면 implement seam 전체가 자식을 띄우기도 전에 죽는다
+  //   (0.2.23 게이트 회귀 · 자식 LLM 은 따로 정해질 수 있다). provider 결정은 decide 시점 streamLLM 이 다시 한다.
+  //   ⛔ 다른 오류(예: provider 충돌)는 그대로 던진다.
+  const deferred = (error: unknown): ReturnType<typeof createLlmControlBrain> => {
+    if (!(error instanceof NoLlmProviderAvailableError)) throw error;
+    debug.log('self-implement', 'brain.model', { provider: null, model: opts.model ?? null, source: 'unresolved-deferred' }, { level: 'warn' });
+    return createLlmControlBrain({ ...opts, systemHint: SELF_IMPLEMENT_COMPLETION_REPORT_HINT });
+  };
+  let role: ReturnType<typeof resolveRoleLlm>;
+  try {
+    role = resolveRoleLlm('classify');
+  } catch (error) {
+    return deferred(error);
+  }
+  const explicit = role.source === 'flag' || role.source === 'config-role';
+  if (!opts.model && opts.provider && explicit && opts.provider !== role.provider) {
+    throw new Error(`brain provider conflict: caller=${opts.provider}, classify=${role.provider}`);
+  }
+  let provider: ReturnType<typeof resolveActiveProvider>;
+  try {
+    provider = opts.model ? (opts.provider ?? resolveActiveProvider(getUserConfig()))
+      : explicit ? role.provider : (opts.provider ?? resolveActiveProvider(getUserConfig()));
+  } catch (error) {
+    return deferred(error);
+  }
+  const budget = !opts.model && !explicit ? lookupLlmTierSpec(provider, 'budget') : undefined;
+  const model = opts.model ?? (explicit ? role.model : budget!.model);
+  const source = opts.model ? 'caller' : explicit ? role.source : 'tier-budget';
+  debug.log('self-implement', 'brain.model', { provider, model, source });
+  return createLlmControlBrain({ ...opts, model, provider,
+    ...(budget?.reasoningLevel ? { reasoningLevel: budget.reasoningLevel } : {}),
+    systemHint: SELF_IMPLEMENT_COMPLETION_REPORT_HINT });
 }
 
 function git(cwd: string, argv: string[]): { ok: boolean; out: string; stdout: string } {

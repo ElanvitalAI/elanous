@@ -16,6 +16,7 @@ import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { llmUsageCostFields } from '../budget/llm-cost.js';
+import { getUserConfig, resolveRoleLlm, type UserConfig } from '../user-config.js';
 
 function logLlmUsage(model: string, usage: LLMUsage): void {
   try {
@@ -97,6 +98,8 @@ export interface EnhanceOpts {
    */
   checklistUse?: ChecklistUse;
   reasoningEffort?: 'low' | 'medium' | 'high';
+  /** 호출자의 저작 시점 config. 생략 시 현재 사용자 설정을 읽는다. */
+  config?: UserConfig;
   /** 산출물 유형 힌트(선택) — 예: 'PPT 발표덱', 'PLAN 문서'. 제약 문구 조정. */
   deliverableHint?: string;
   /** Optional usage observer for the caller's authoring phase; missing usage stays unknown. */
@@ -115,6 +118,8 @@ export interface EnhanceOpts {
    * ⭐ 새 LLM 경로를 만들지 않는다 — 이 모듈이 이미 그 자리의 유일한 LLM 단계다.
    */
   groundedFacts?: readonly string[];
+  /** Clock seam for the first-token observation (ms epoch); defaults to `Date.now`. */
+  now?: () => number;
 }
 
 const FENCE = '```';
@@ -129,8 +134,29 @@ function askMarkerCount(ask: string): number {
   return (ask.match(/(?:^|\s)(?:불변식|경계|판정\s*신호|invariant|boundary|decision\s+signal)\s*:/gi) ?? []).length;
 }
 
-const defaultModel = (): string =>
-  process.env.ELANOUS_PROMPT_ENHANCE_MODEL || process.env.ELANOUS_PR_REVIEW_MODEL || tierModel('better');
+type EnhanceSelectionSource = 'opts' | 'env' | 'config-role' | 'default';
+
+/** Select the authoring knobs independently; a planning effort alone cannot change the model. */
+export function selectEnhanceLlm(
+  opts: Pick<EnhanceOpts, 'model' | 'reasoningEffort' | 'config'> = {},
+  env: NodeJS.ProcessEnv = process.env,
+): { model: string; effort: 'low' | 'medium' | 'high'; modelSource: EnhanceSelectionSource; effortSource: EnhanceSelectionSource } {
+  const config = opts.config ?? getUserConfig();
+  const planning = config.roleLlm?.planning;
+  const configuredModel = opts.model === undefined && !env.ELANOUS_PROMPT_ENHANCE_MODEL
+    && planning && (planning.model || planning.tier || planning.provider)
+    ? resolveRoleLlm('planning', { config, overrides: {} }).model : undefined;
+  const modelSource: EnhanceSelectionSource = opts.model !== undefined ? 'opts'
+    : env.ELANOUS_PROMPT_ENHANCE_MODEL ? 'env'
+    : configuredModel !== undefined ? 'config-role' : 'default';
+  const model = opts.model ?? (env.ELANOUS_PROMPT_ENHANCE_MODEL || configuredModel || env.ELANOUS_PR_REVIEW_MODEL || tierModel('better'));
+  const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+  const validEnvEffort = envEffort === 'low' || envEffort === 'medium' || envEffort === 'high' ? envEffort : undefined;
+  const effortSource: EnhanceSelectionSource = opts.reasoningEffort !== undefined ? 'opts'
+    : validEnvEffort !== undefined ? 'env'
+    : planning?.effort !== undefined ? 'config-role' : 'default';
+  return { model, effort: opts.reasoningEffort ?? validEnvEffort ?? planning?.effort ?? 'high', modelSource, effortSource };
+}
 
 /** 스캐폴드 생성 LLM 시스템 프롬프트 — 가산·원문불가침 규율. */
 const enhanceSystem = (deliverableHint?: string, wantsScqa = false, checklistUse: ChecklistUse = 'coverage-gate'): string =>
@@ -332,7 +358,10 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
     return { original, enhanced, checklist: [], verbatimPreserved: true, enhancedBy: 'fallback', model: null };
   }
 
-  const model = opts.model ?? defaultModel();
+  // Selected only when an LLM call will actually be attempted — the disabled path never records a selection.
+  const { model, effort, modelSource, effortSource } = selectEnhanceLlm(opts);
+  debug.log('prompt-enhance.model', 'selected', { model, effort, modelSource, effortSource });
+
   let goal = '';
   let constraints: string[] = [];
   let checklist: string[] = [];
@@ -367,9 +396,21 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
         ].join('\n'),
       },
     ];
-    const rawOut = await streamLLM(messages, () => {}, {
+    // ⭐ OPENROUTER-OPTIMIZE G13 — 첫 토큰까지 걸린 시간(TTFT)을 호출마다 «한 번» 남긴다.
+    //   총 소요만으로는 「대기(큐·라우팅)」와 「생성」을 못 가른다. 본문은 싣지 않는다(길이도 안 싣는다).
+    //   ⚠️ 첫 «텍스트» 델타까지다 — 추론(reasoning) 토큰을 먼저 내는 모델은 그 생성 시간도 여기 들어간다
+    //   (순수 대기·라우팅 시간으로 읽지 않는다).
+    const now = opts.now ?? Date.now;
+    const requestStartedAt = now();
+    let firstTokenLogged = false;
+    const onChunk = (delta: string): void => {
+      if (firstTokenLogged || delta.length === 0) return;
+      firstTokenLogged = true;
+      debug.log('prompt-enhance.stream', 'first-token', { model, ttftMs: Math.max(0, now() - requestStartedAt) });
+    };
+    const rawOut = await streamLLM(messages, onChunk, {
       model,
-      reasoningEffort: opts.reasoningEffort ?? 'high',
+      reasoningEffort: effort,
       onUsage: (usage) => {
         logLlmUsage(model, usage);
         try { opts.onUsage?.(usage); } catch { /* usage observation must not change enhancement */ }

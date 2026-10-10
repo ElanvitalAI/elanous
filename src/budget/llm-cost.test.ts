@@ -399,3 +399,55 @@ describe('geminiUsageFromMetadata — Gemini 사용량 규약 (C8)', () => {
     expect(geminiUsageFromMetadata({ promptTokens: 0, outputTokens: 0, cachedTokens: 0, thoughtTokens: 0 })).toBeUndefined();
   });
 });
+
+// OPENROUTER-OPTIMIZE G9 — the `stream-llm` usage site carries the provider-reported bill, not a catalog guess.
+describe('stream-llm site — reportedCostUsd (G9)', () => {
+  it('streamLLM keeps usage.cost through accumulation, so the llm-usage row is cost.kind=actual', async () => {
+    const { streamLLM } = await import('../llm.js');
+    const { debug } = await import('../debug/log.js');
+    const provider = {
+      name: 'g9-fake-router',
+      defaultModel: 'absent-model-for-test',
+      available: () => true,
+      async *chat() { yield 'ok'; },
+      async *streamChat() {
+        yield { type: 'text' as const, delta: 'ok' };
+        // OpenRouter shape: one final usage chunk with tokens and `usage.cost` together (parseOpenAIUsage output).
+        yield { type: 'usage' as const, usage: { provider: 'openai' as const, inputTokens: 10, outputTokens: 2, reportedCostUsd: 0.0042 } };
+      },
+    };
+    const spy = spyOn(debug, 'log');
+    try {
+      expect(await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider })).toBe('ok');
+      const row = spy.mock.calls.find((c) => c[0] === 'llm.usage' && c[1] === 'llm-usage' && (c[2] as { site?: string })?.site === 'stream-llm');
+      expect(row).toBeDefined();
+      expect((row![2] as { cost: unknown }).cost).toMatchObject({ kind: 'actual', usd: 0.0042, source: 'provider-reported' });
+      expect(row![2]).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('without a reported bill the same site stays on the estimate (negative control)', async () => {
+    const { streamLLM } = await import('../llm.js');
+    const { debug } = await import('../debug/log.js');
+    const provider = {
+      name: 'g9-fake-router',
+      defaultModel: 'absent-model-for-test',
+      available: () => true,
+      async *chat() { yield 'ok'; },
+      async *streamChat() {
+        yield { type: 'text' as const, delta: 'ok' };
+        yield { type: 'usage' as const, usage: { inputTokens: 10, outputTokens: 2 } };
+      },
+    };
+    const spy = spyOn(debug, 'log');
+    try {
+      await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider });
+      const row = spy.mock.calls.find((c) => c[0] === 'llm.usage' && (c[2] as { site?: string })?.site === 'stream-llm');
+      expect((row![2] as { cost: { kind: string } }).cost.kind).toBe('unknown');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

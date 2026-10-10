@@ -1,0 +1,31 @@
+{
+  "kind": "knowledge-pack",
+  "name": "b2b-sales-public",
+  "version": "0.1.0",
+  "description": "Original B2B sales playbook, discovery questions and proposal template with CARD1/CS1 integration points.",
+  "signature": { "algorithm": "ed25519", "keyId": "00000000" },
+  "dependencies": [],
+  "license": "CC-BY-4.0",
+  "visibility": "public",
+  "content": [
+    { "kind": "procedure", "path": "content/playbook.md" },
+    { "kind": "document", "path": "content/questions.md" },
+    { "kind": "document", "path": "content/proposal-template.md" },
+    { "kind": "qa", "path": "content/example-answer.md" }
+  ],
+  "distribution": {
+    "standalone": true,
+    "pluginCombination": true,
+    "internalMarketDownload": "requires enterprise-signed index, authorization and entitlement; not bundled with this sample",
+    "publicMarket": "candidate; publication requires signed index, content review and approval"
+  },
+  "sale": {
+    "targetDate": "2026-10-28",
+    "pricing": { "model": "free" },
+    "paid": "not-enabled-pending-merchant-payment-terms-approval",
+    "seller": "undecided",
+    "rightsHolder": "sample-authored-content",
+    "scope": "public and enterprise",
+    "revenueShare": "undecided"
+  }
+}

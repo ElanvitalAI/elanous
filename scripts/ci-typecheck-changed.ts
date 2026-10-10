@@ -24,6 +24,15 @@ function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * tsc 를 띄울 env — 호출자(runTsc)가 넘긴 env(= tscEnv · 20GB 힙)를 «바탕»으로 GIT_* 만 걷는다.
+ * 🩸 2026-10-09: 이 자리가 `env: gitEnv()`(process.env 바탕)로 덮어 tscEnv 의 힙이 사라졌다 → 호스트 재게이트 tsc 가
+ *   ≈4GB(V8 기본)에서 OOM · merge-ready 자식이 `host-regate-failed` 로 «실패» 기록(오늘 5건).
+ */
+export function tscExecEnv(callerEnv: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  return gitEnv(callerEnv ?? tscEnv());
+}
+
 /** git 조회용 — 명령 실패는 호출자가 빈 출력과 구분할 수 있게 전파한다. */
 function sh(cmd: string, cwd = process.cwd()): string {
   return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd, env: gitEnv() });
@@ -880,7 +889,7 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
 export function runGate(io: Partial<GateIo> = {}): void {
   const cwd = io.cwd ?? process.cwd();
   const defaultChanged = () => changedTsFiles((cmd) => sh(cmd, cwd), process.env, cwd, io.baseRef);
-  const { changedTsFiles: getChanged = defaultChanged, runTscCmd = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: gitEnv() })) as typeof execSync), log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
+  const { changedTsFiles: getChanged = defaultChanged, runTscCmd = (cmd: string) => runTsc(cmd, ((command, options) => execSync(command, { ...options, cwd, env: tscExecEnv(options?.env) })) as typeof execSync), log = (message: string) => console.log(message), warn = (message: string) => console.warn(message), error = (message: string) => console.error(message), exit = ((code: number) => process.exit(code)) as GateIo['exit'] } = io;
   const readBaselineDiagnostics = io.readBaselineDiagnostics ?? ((base: string, command: string) => readMergeBaseDiagnostics(base, command, cwd));
   // Set 주입은 기존 테스트 심이며 기준 revision이 없다. 실제 ChangedTsFiles 경로만 Git 관측을 요구한다.
   const requiredExportFields = io.requiredExportFields ?? ((changed: ReadonlySet<string>, base: string) => base === 'injected test seam'

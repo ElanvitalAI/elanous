@@ -289,14 +289,17 @@ export function cronEntryId(cron: string, effectiveCommand: string): string {
   return createHash('sha1').update(cron + '|' + effectiveCommand).digest('hex').slice(0, 12);
 }
 
-/** ★ 관측성 래퍼 unwrap (RFC-scheduler-execution-observability·2026-07-15) — crontab 라인이
- *  `bun scripts/cron-run.ts --schedule-id <id> scripts/X.ts --a` 로 래핑돼도 id/name 파생은 안쪽 실제 target 기준으로.
- *  래퍼와 그 id 인자만 제거 → 래핑 전 원본과 동일 문자열 → id(sha1) 불변·마이그레이션 0.
- *  순수·멱등(비래핑 라인은 그대로 반환). */
+/** ★ 관측성 래퍼 unwrap (RFC-scheduler-execution-observability·2026-07-15) — hq-fence 한 겹을
+ *  먼저 벗긴 뒤 cron-run.ts 래퍼와 id 인자를 제거한다. id/name 파생은 안쪽 target 기준.
+ *  감싸지 않은 명령은 그대로 반환하며, 결과는 다시 unwrap 해도 같다. */
 export function unwrapCronCommand(command: string): string {
-  const shell = command.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?--shell\s+/, '');
-  if (shell !== command) return shell;
-  return command.replace(/(?:[^\s]*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?/, '');
+  // 작은따옴표 인코딩('"'"' · '\'')만 복원한다. 닫힌 인용 뒤의 바깥 로그 리다이렉트는 버리고,
+  // 줄 끝 `# 주석` 은 감싸기 전 줄과 같은 꼴이 되도록 안쪽 명령 뒤에 그대로 붙인다.
+  const fence = /^(?:\S*\/)?hq-fence\s+(?:--role\s+[^\s'"]+(?:\s+--)?|[^\s'"]+)\s+'((?:[^']|'"'"'|'\\'')*)'(?:\s+(?:\d*>>?\s*\S+|\d+>&\d+))*(\s+#.*)?$/.exec(command);
+  const inner = fence ? fence[1]!.replaceAll(`'"'"'`, "'").replaceAll(`'\\''`, "'") + (fence[2] ?? '') : command;
+  const shell = inner.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?--shell\s+/, '');
+  if (shell !== inner) return shell;
+  return inner.replace(/(?:[^\s]*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?/, '');
 }
 
 /** crontab 라인을 관측성 래퍼로 감싼다(P3) — `bun scripts/X.ts` → `bun scripts/cron-run.ts --schedule-id <id> scripts/X.ts`.

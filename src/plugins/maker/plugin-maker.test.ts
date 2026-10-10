@@ -6,7 +6,8 @@ import { makePlugin, validatePluginDir } from './plugin-maker.js';
 import { runGraph } from '../../graph-runner/runner.js';
 import { debug } from '../../debug/log.js';
 import { fromWizardLogFrame } from '../../../apps/pwa/src/lib/inside-events.js';
-import { listInstalledPlugins } from '../install/plugin-install.js';
+import { installPlugin, listInstalledPlugins } from '../install/plugin-install.js';
+import { inspectPluginSecurity } from '../core/capability-policy.js';
 import { parse as parseYaml } from 'yaml';
 
 const dirs: string[] = [];
@@ -38,6 +39,45 @@ function twoNodesFor(dir: string, name: string): void {
 }
 
 function twoNodes(dir: string): void { twoNodesFor(dir, 'sample'); }
+
+test('imported plugin is classified from its bytes, hooks stay off and secrets never enter events', async () => {
+  const root = temp();
+  const source = join(root, 'imported-plugin');
+  mkdirSync(source);
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ name: 'imported-plugin', version: '1.0.0', license: 'MIT',
+    contributes: { hooks: [{ id: 'turn', event: 'Turn', command: 'echo private' }] } }));
+  writeFileSync(join(source, 'plugin.ts'), 'export default { name: "imported-plugin" };\n');
+  const secret = 'SECRET=superlongprivatevalue123456';
+  const events: unknown[] = [];
+  const installed = await installPlugin(source, { root, onEvent: event => events.push(event) });
+  expect(installed.name).toBe('imported-plugin');
+  expect(events.find(event => (event as { event: string }).event === 'verify')).toEqual({ event: 'verify', signature: 'missing', scan: 'caution' });
+  expect(inspectPluginSecurity(installed.path).findings.map(finding => finding.code)).toContain('hooks-disabled');
+  expect(JSON.stringify(events)).not.toContain('echo private');
+  const unsafe = join(root, 'unsafe-import');
+  mkdirSync(unsafe);
+  writeFileSync(join(unsafe, 'plugin.json'), JSON.stringify({ name: 'unsafe-import', version: '1.0.0' }));
+  writeFileSync(join(unsafe, 'plugin.ts'), `// ${secret}\nexport default {};\n`);
+  const rejected: unknown[] = [];
+  await expect(installPlugin(unsafe, { root, onEvent: event => rejected.push(event) })).rejects.toMatchObject({ reason: 'scan' });
+  expect(rejected.find(event => (event as { event: string }).event === 'verify')).toEqual({ event: 'verify', signature: 'missing', scan: 'dangerous' });
+  expect(JSON.stringify(rejected)).not.toContain(secret);
+  expect(listInstalledPlugins(root).map(item => item.name)).toEqual(['imported-plugin']);
+});
+
+test('validation reports codes without disclosing a secret embedded in an imported filename', async () => {
+  const root = temp();
+  const source = join(root, 'imported-plugin');
+  mkdirSync(source);
+  const secret = 'superlongprivatevalue123456';
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ name: 'imported-plugin', version: '1.0.0', license: 'MIT' }));
+  writeFileSync(join(source, `SECRET=${secret}.ts`), `const secret = 'SECRET=${secret}';`);
+  const errors = await validatePluginDir(source);
+  expect(errors).toContain('보안 검사 차단: credential-filename');
+  expect(errors).toContain('보안 검사 차단: embedded-secret');
+  expect(JSON.stringify(errors)).not.toContain(secret);
+  expect(JSON.stringify(inspectPluginSecurity(source))).not.toContain(secret);
+});
 
 test('fake codex writes two nodes; installed graph runs real runner with example input and six timings', async () => {
   const root = temp();

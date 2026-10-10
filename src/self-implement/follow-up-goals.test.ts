@@ -10,6 +10,7 @@ import {
   followUpDraftHash,
   followUpDraftText,
   followUpDraftsPath,
+  recordFollowUpOnBlocked,
   recordFollowUpOnMerge,
   remainingPiecesFromPrBody,
   seatForCellOwner,
@@ -245,7 +246,7 @@ describe('FOLLOWUP-LOOP① — leftover findings become one follow-up draft', ()
     });
     expect(record).toMatchObject({ queued: true });
     expect(store.queued).toHaveLength(1);
-    expect(events).toEqual(['ledger-confirm-failed']);
+    expect(events).toEqual(['ledger-confirm-failed', 'drafted']);
   });
 
   test('only the leading seat header names the cell, and one PR is drafted once across cells on disk', async () => {
@@ -262,6 +263,69 @@ describe('FOLLOWUP-LOOP① — leftover findings become one follow-up draft', ()
   test('the seat header on the line after `대상 경로:` names the cell (authoring Pod order)', () => {
     expect(followUpCellId({ feature: '대상 경로: src/a.ts · src/b.ts\n[MK 자리 · 0.2.17 체크리스트 칸 GRID-API · 역할 docs/roles/MK.md] 본문' })).toBe('GRID-API');
     expect(followUpCellId({ feature: '대상 경로: src/a.ts\n본문 — 체크리스트 칸 OTHER 언급\n[MK 자리 · 0.2.17 체크리스트 칸 GRID-API ·]' })).toBeUndefined();
+  });
+
+  test('blocked live mode drafts once with trimmed findings but never enqueues', async () => {
+    const store = memoryStore();
+    const logs: Array<{ event: string; data: unknown }> = [];
+    const input = { runId: 'run-a', stage: 'review-blocked' as const, unresolvedMustFix: [' must A ', 'must A'], decompositionPieces: ['piece one', 'piece two', ' '], feature: 'FLEX-FU-ON-FAIL 실패 뒤 후속\n둘째 줄', cellId: 'FLEX-FU-ON-FAIL' };
+    const record = await recordFollowUpOnBlocked(input, { ...store.seams, mode: 'live', log: (_c, event, data) => logs.push({ event, data }) });
+    expect(store.drafts).toHaveLength(1);
+    expect(record).toMatchObject({ ending: 'blocked', runId: 'run-a', prNumber: 0, stage: 'review-blocked', kind: 'draft', depth: 1, queued: false, remainings: ['must A', 'piece one', 'piece two'] });
+    expect(record?.draft).toBe(followUpDraftText('FLEX-FU-ON-FAIL 실패 뒤 후속', ['must A', 'piece one', 'piece two']));
+    expect(store.queued).toHaveLength(0);
+    expect(logs).toEqual([{ event: 'drafted', data: expect.objectContaining({ ending: 'blocked', runId: 'run-a', stage: 'review-blocked', mode: 'live', queued: false, remainingCount: 3 }) }]);
+  });
+
+  test('distinct blocked runs do not collide with each other or a merged PR, and depth uses both keys', async () => {
+    const store = memoryStore();
+    const logs: Array<{ event: string; data: unknown }> = [];
+    const seams = { ...store.seams, log: (_c: string, event: string, data?: unknown) => logs.push({ event, data }) };
+    const blocked = { runId: 'run-a', stage: 'gate-failed' as const, decompositionPieces: ['piece'], feature: FEATURE, cellId: 'CELL' };
+    await recordFollowUpOnBlocked(blocked, seams);
+    expect(await recordFollowUpOnBlocked(blocked, seams)).toBeNull();
+    const other = await recordFollowUpOnBlocked({ ...blocked, runId: 'run-b' }, seams);
+    const merged = await recordFollowUpOnMerge({ prNumber: 9, followUpMustFix: [MUST_A], feature: FEATURE, cellId: 'CELL' }, seams);
+    expect(store.drafts).toHaveLength(3);
+    expect(other).toMatchObject({ prNumber: 0, depth: 2, runId: 'run-b' });
+    expect(merged).toMatchObject({ prNumber: 9, depth: 3 });
+    expect(logs.filter(({ event, data }) => event === 'drafted' && (data as { ending?: string }).ending === 'merged')).toHaveLength(1);
+    expect(followUpChainDepth(store.drafts)).toBe(3);
+  });
+
+  test('blocked default ledger deduplicates by run across cells while preserving PR key', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'follow-up-blocked-'));
+    const input = { runId: 'run-a', stage: 'gate-failed' as const, unresolvedMustFix: [MUST_A], feature: FEATURE, cellId: 'CELL-A' };
+    const seams = { stateRoot: root, mode: 'live' as const, log: () => {} };
+    await recordFollowUpOnBlocked(input, seams);
+    expect(await recordFollowUpOnBlocked({ ...input, cellId: 'CELL-B' }, seams)).toBeNull();
+    await recordFollowUpOnBlocked({ ...input, runId: 'run-b' }, seams);
+    await recordFollowUpOnMerge({ prNumber: 0, followUpMustFix: [MUST_A], feature: FEATURE, cellId: 'CELL-A' }, { ...seams, mode: 'shadow' });
+    const rows = readFileSync(followUpDraftsPath(root), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as FollowUpDraftRecord);
+    expect(rows.map((row) => row.ending === 'blocked' ? `run:${row.runId}` : `pr:${row.prNumber}`)).toEqual(['run:run-a', 'run:run-b', 'pr:0']);
+  });
+
+  test('empty blocked and merged findings log their skip; blocked writer failures do not throw', async () => {
+    const store = memoryStore();
+    const logs: Array<{ event: string; data: unknown }> = [];
+    const seams = { ...store.seams, log: (_c: string, event: string, data?: unknown) => logs.push({ event, data }) };
+    expect(await recordFollowUpOnBlocked({ runId: 'empty', stage: 'gate-failed', feature: FEATURE, cellId: 'CELL' }, seams)).toBeNull();
+    expect(await recordFollowUpOnMerge({ prNumber: 5, feature: FEATURE, cellId: 'CELL' }, seams)).toBeNull();
+    expect(logs).toEqual([
+      { event: 'draft-skipped-empty', data: { ending: 'blocked', prNumber: 0, runId: 'empty' } },
+      { event: 'draft-skipped-empty', data: { ending: 'merged', prNumber: 5 } },
+    ]);
+    expect(await recordFollowUpOnBlocked({ runId: 'bad', stage: 'gate-failed', feature: FEATURE, cellId: 'CELL', unresolvedMustFix: [MUST_A] }, { ...seams, appendDraft: () => { throw new Error('disk down'); } })).toBeNull();
+    expect(logs.at(-1)?.event).toBe('draft-failed');
+  });
+
+  test('blocked depth four records an OP card and never queues', async () => {
+    const store = memoryStore();
+    for (const runId of ['a', 'b', 'c', 'd']) {
+      await recordFollowUpOnBlocked({ runId, stage: 'review-blocked', unresolvedMustFix: [MUST_A], feature: FEATURE, cellId: 'CELL' }, { ...store.seams, mode: 'live' });
+    }
+    expect(store.drafts[3]).toMatchObject({ depth: 4, kind: 'op-card-required', note: FOLLOW_UP_OP_CARD_REQUIRED, queued: false });
+    expect(store.queued).toHaveLength(0);
   });
 });
 

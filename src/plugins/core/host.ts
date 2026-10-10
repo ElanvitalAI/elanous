@@ -38,7 +38,7 @@ import { debug } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { CommandRegistry, type CommandDisposable, type RegisteredCommand } from '../../command-registry.js';
 import { PluginCapabilityPolicy, assertCapability } from './capability-policy.js';
-import { PluginTrustStore } from './trust-store.js';
+import { PluginTrustStore, enabledPluginHooks } from './trust-store.js';
 import { PluginTaskService } from './task-service.js';
 import { readClipboardText, writeClipboard } from '../../clipboard/index.js';
 import {
@@ -54,6 +54,7 @@ import { getGlobalElementRegistry, publishElementEvent } from '../../element-reg
 import { mintPluginUri } from '../../mss/uri/builder.js';
 import type { PluginUri } from '../../mss/uri/brand.js';
 import { loadPluginNodes } from '../../graph-kinds/plugin-nodes.js';
+import { registerOutboundAdapter } from '../../nexus/outbound/router.js';
 import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind, type NodeKindEntry } from '../../graph-kinds/registry.js';
 
 /** Clamp a tool handler's return value to something short enough for
@@ -113,8 +114,10 @@ export interface ActivePlugin {
   ownedCommandDisposables: CommandDisposable[];
   /** Task registrations for this activation. */
   ownedTaskDisposables: Array<{ dispose(): void }>;
-  /** PX-3: hook registrations (from manifest.contributes.hooks[] +
-   *  ctx.hooks.register calls). Disposed on deactivate. */
+  /** Connector registrations are owner-scoped and removed on deactivate. */
+  ownedChannelDisposers: Array<() => void>;
+  /** Hook registrations from manifest.contributes.hooks[]; disposed on deactivate.
+   *  PluginContext does not expose a programmatic hooks registration API. */
   ownedHookDisposers: Array<() => void>;
   /** PX-4: mission registrations (one per contributes.missions[] entry).
    *  Disposers tear down globalMissionRegistry entries on deactivate. */
@@ -369,13 +372,12 @@ export class PluginHost {
     }
   }
 
-  /** PX-3 P4: register all manifest-declared shell hooks for the
-   *  plugin we're activating. Disposers are tracked on the active
-   *  entry so deactivate() unregisters them. In-process hooks go
-   *  through ctx.hooks.register inside onActivate (see buildContext). */
+  /** Register manifest-declared shell hooks for the plugin being activated.
+   *  Installed plugins' hooks stay off (no approval path); disposers unregister them on deactivate. */
   private registerManifestHooks(entry: PluginEntry): void {
     if (!this.activeEntry) return;
-    const specs = entry.manifest.contributes.hooks ?? [];
+    const declared = entry.manifest.contributes.hooks ?? [];
+    const specs = enabledPluginHooks(declared, entry.source);
     if (specs.length === 0) return;
     // Lazy imports so headless tests that don't exercise hooks never
     // pull in the dispatcher stack.
@@ -770,6 +772,7 @@ export class PluginHost {
       ownedDisplayDisposables: [],
       ownedCommandDisposables: [],
       ownedTaskDisposables: [],
+      ownedChannelDisposers: [],
       ownedHookDisposers: [],
       ownedMissionDisposers: [],
       ownedRouteDisposers: [],
@@ -822,6 +825,13 @@ export class PluginHost {
     const ctx = this.buildContext();
     try {
       await plugin.onActivate?.(ctx);
+      for (const adapter of plugin.channelAdapters ?? []) {
+        if (!entry.manifest.contributes.connectors?.some(connector => connector.id === adapter.type)) {
+          throw new Error(`channel connector ${adapter.type} must be declared in contributes.connectors`);
+        }
+        // The manifest declaration alone is not an active channel.
+        this.activeEntry.ownedChannelDisposers.push(registerOutboundAdapter(adapter));
+      }
       // Resolve layout after onActivate so the plugin can initialize
       // state first (e.g. fetch remote rows). buildLayout can spawn
       // widgets via the tracked helper — we record ids for dispose.
@@ -848,6 +858,7 @@ export class PluginHost {
         for (const d of this.activeEntry.ownedDisplayDisposables) d.dispose();
         for (const d of this.activeEntry.ownedCommandDisposables) d.dispose();
         for (const d of this.activeEntry.ownedTaskDisposables) d.dispose();
+        for (const d of this.activeEntry.ownedChannelDisposers) d();
         for (const d of this.activeEntry.ownedHookDisposers) d();
         for (const d of this.activeEntry.ownedMissionDisposers) d();
         for (const d of this.activeEntry.ownedRouteDisposers) d();
@@ -880,6 +891,7 @@ export class PluginHost {
     for (const d of this.activeEntry.ownedDisplayDisposables) d.dispose();
     for (const d of this.activeEntry.ownedCommandDisposables) d.dispose();
     for (const d of this.activeEntry.ownedTaskDisposables) d.dispose();
+    for (const d of this.activeEntry.ownedChannelDisposers) d();
     const promptStore = getPromptBankStore();
     for (const id of this.activeEntry.promptFragmentIds) promptStore.delete(id);
     // PX-3: dispose hook registrations for this plugin.
@@ -1746,6 +1758,7 @@ function normalizePluginExport(plugin: Partial<ElanousPlugin>, manifest: PluginM
     ...(plugin.slashCommands ? { slashCommands: plugin.slashCommands } : {}),
     ...(plugin.keybindings ? { keybindings: plugin.keybindings } : {}),
     ...(plugin.llmTools ? { llmTools: plugin.llmTools } : {}),
+    ...(plugin.channelAdapters ? { channelAdapters: plugin.channelAdapters } : {}),
     ...(plugin.onActivate ? { onActivate: plugin.onActivate } : {}),
     ...(plugin.onDeactivate ? { onDeactivate: plugin.onDeactivate } : {}),
     ...(plugin.isBusy ? { isBusy: plugin.isBusy } : {}),

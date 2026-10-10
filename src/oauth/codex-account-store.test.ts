@@ -10,14 +10,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import { debug } from '../debug/log.js';
+import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
 import { saveTokens } from './store.js';
 import {
   _resetCodexRotationPinForTesting,
   _setCodexAccountOutboundSenderForTesting,
   _setRotationConfigReaderForTesting,
+  autoConsumeCodexResetCredit,
   inspectCodexRotation,
   notifyCodexResetCreditConsumed,
   resolveCodexAccountForRun,
+  resolveRunFallback,
 } from './codex-account-store.js';
 
 const madeDirs: string[] = [];
@@ -308,5 +311,138 @@ describe('기본 계정은 정본에 홈을 안 적어도 회전 후보다 (🅢
     expect(byName.default?.usedPercent).toBe(1);
     expect(byName.team?.home).toBe(teamHome);
     expect(byName.ghost).toBeUndefined();
+  });
+});
+
+describe('CODEX-ORDER ② — 리셋권 자동 소비(주입 가짜만 · 실물 소비 0)', () => {
+  type Credit = { id: string; status: string; granted_at: string | null; expires_at: string | null; redeem_started_at: string | null; redeemed_at: string | null; title: string | null; description: string | null };
+  const credit = (id: string, expires: string): Credit => ({ id, status: 'available', granted_at: null, expires_at: expires, redeem_started_at: null, redeemed_at: null, title: null, description: null });
+
+  function setup() {
+    const root = isolatedRoot('codex-reset-auto-');
+    const homes = { default: join(root, 'default-home'), team: join(root, 'team-home') };
+    for (const h of Object.values(homes)) mkdirSync(h, { recursive: true });
+    process.env.CODEX_HOME = homes.default;
+    const store = join(root, 'auth.json');
+    saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: homes.default }, store);
+    saveTokens('openai-codex:team', tokens(), { mirrorCodex: false, codexHome: homes.team }, store);
+    // 구독 남은 계정 없음 ⊕ 리셋권 available.
+    writeQuotaSignal(undefined, 100, homes.default); writeAvailabilityState(1, homes.default);
+    writeQuotaSignal(undefined, 100, homes.team); writeAvailabilityState(1, homes.team);
+    _setRotationConfigReaderForTesting(() => ({ llm: {} }));
+    const consumed: Array<{ authFilePath?: string }> = [];
+    const consume = (async (opts: { authFilePath?: string } = {}) => {
+      consumed.push(opts);
+      return { ok: true, value: { code: 'reset', credit: { ...credit('x', '2026-10-10T00:00:00Z'), status: 'redeemed', redeemed_at: 'now' } }, redeemRequestId: 'r' };
+    }) as never;
+    const list = (async (opts: { authFilePath?: string } = {}) => {
+      const team = opts.authFilePath?.startsWith(homes.team);
+      return { ok: true, value: { credits: [credit(team ? 'team-1' : 'def-1', team ? '2026-10-12T00:00:00Z' : '2026-10-20T00:00:00Z')], availableCount: 1, totalEarnedCount: 1 } };
+    }) as never;
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    const restore = () => { (debug as { log: typeof debug.log }).log = originalLog; };
+    return { root, homes, store, consumed, consume, list, events, restore, counterPath: join(root, 'budget', 'codex-reset-auto-consume.json') };
+  }
+
+  test('판정이 reset-credit-available 이고 오늘 0회면 만료가 가장 이른 계정으로 정확히 한 번 소비하고 reset-consumed 를 남긴다', async () => {
+    const t = setup();
+    try {
+      expect(inspectCodexRotation(process.env, { storePath: t.store }).reason).toBe('reset-credit-available');
+      const out = await autoConsumeCodexResetCredit({ storePath: t.store, consume: t.consume, list: t.list, counterPath: t.counterPath });
+      expect(out).toMatchObject({ consumed: true, account: 'team', todayCount: 1 });
+      expect(t.consumed).toHaveLength(1);
+      expect(t.consumed[0]!.authFilePath).toBe(join(t.homes.team, 'auth.json'));
+      const ev = t.events.find((e) => e.category === 'codex.rotation' && e.event === 'reset-consumed');
+      expect(ev?.data).toMatchObject({ account: 'team', expiresAt: '2026-10-12T00:00:00Z', todayCount: 1 });
+    } finally { t.restore(); }
+  });
+
+  test('오늘 이미 상한(1)이면 소비하지 않고 reset-consume-skipped 에 상한 이유를 남긴다', async () => {
+    const t = setup();
+    try {
+      mkdirSync(join(t.root, 'budget'), { recursive: true });
+      writeFileSync(t.counterPath, JSON.stringify({ day: new Date().toISOString().slice(0, 10), count: 1 }));
+      const out = await autoConsumeCodexResetCredit({ storePath: t.store, consume: t.consume, list: t.list, counterPath: t.counterPath });
+      expect(out).toMatchObject({ consumed: false, reason: 'daily-cap-reached' });
+      expect(t.consumed).toHaveLength(0);
+      expect(t.events.find((e) => e.event === 'reset-consume-skipped')?.data).toMatchObject({ reason: 'daily-cap-reached' });
+      // 크레딧 단계로 내려간다 — 판정은 여전히 리셋권을 가리키지만 적용부는 머문다(소비 없음).
+      expect(inspectCodexRotation(process.env, { storePath: t.store }).reason).toBe('reset-credit-available');
+    } finally { t.restore(); }
+  });
+
+  test('llm.codexResetAutoConsumePerDay=0 이면 끔', async () => {
+    const t = setup();
+    try {
+      _setRotationConfigReaderForTesting(() => ({ llm: { codexResetAutoConsumePerDay: 0 } }));
+      const out = await autoConsumeCodexResetCredit({ storePath: t.store, consume: t.consume, list: t.list, counterPath: t.counterPath });
+      expect(out).toMatchObject({ consumed: false, reason: 'disabled' });
+      expect(t.consumed).toHaveLength(0);
+    } finally { t.restore(); }
+  });
+
+  test('⛔ 가짜를 안 주면 테스트 러너 안에서는 실물 소비에 닿지 않는다(resolve 경로 포함)', async () => {
+    const t = setup();
+    try {
+      const out = await autoConsumeCodexResetCredit({ storePath: t.store, counterPath: t.counterPath });
+      expect(out).toMatchObject({ consumed: false, reason: 'test-runtime-guard' });
+      resolveCodexAccountForRun(process.env, { storePath: t.store });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(t.events.some((e) => e.event === 'reset-consumed')).toBe(false);
+      expect(t.events.filter((e) => e.event === 'reset-consume-skipped').every((e) => e.data.reason === 'test-runtime-guard')).toBe(true);
+    } finally { t.restore(); }
+  });
+});
+
+describe('OR-FALLBACK-TIER-1 — resolveRunFallback 이 config 의 openrouter 모델·키 존재를 판정에 싣는다', () => {
+  const chainCfg = (fallbackModel?: string) => () => ({ llm: {
+    fallbackChain: ['codex-rotate', 'openrouter'],
+    ...(fallbackModel ? { openrouter: { fallbackModel } } : {}),
+  } });
+  const run = (openrouterAvailable: boolean) => {
+    const root = isolatedRoot('or-fallback-');
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    // 판단 스위치(MAX)를 이 격리 우주에서 켠다 — 그래야 ROUTE 결정(emitDecision)이 실제로 나간다.
+    resetLiveDetailCacheForTesting();
+    writeLiveDetail({ ttlMin: 5 }, { path: join(root, 'live', 'detail.json') });
+    const logs: Array<{ category: string; event: string; data: any }> = [];
+    const original = debug.log;
+    (debug as any).log = (category: string, event: string, data: any) => { logs.push({ category, event, data }); };
+    try {
+      const decision = resolveRunFallback(process.env, {
+        storePath: join(root, 'store.json'), grokAvailable: false, openrouterAvailable,
+        currentStep: 'codex-rotate', currentCredentialRateLimited: true,
+      });
+      return {
+        decision,
+        decide: logs.find((l) => l.category === 'oauth.fallback-chain' && l.event === 'decide')?.data,
+        route: logs.find((l) => l.category === 'harness.decision' && l.data?.kind === 'ROUTE')?.data,
+      };
+    } finally { (debug as any).log = original; resetLiveDetailCacheForTesting(); }
+  };
+
+  test('모델 ⊕ 키 → 그 모델로 전환하고 tier-map 칸(미측정)을 관측에 남긴다', () => {
+    _setRotationConfigReaderForTesting(chainCfg('openrouter/z-ai/glm-5.3-flash'));
+    const { decision, decide, route } = run(true);
+    expect(decision).toEqual({ action: 'switch-backend', backend: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
+    expect(decide).toMatchObject({ openrouterAvailable: true, openrouterModelConfigured: true, model: 'openrouter/z-ai/glm-5.3-flash' });
+    expect(decide.modelSpec).toContain('GLM 5.3 Flash');
+    expect(decide.modelSpec).toContain('미측정');
+    // ROUTE 결정의 reason 에 모델 id ⊕ tier-map 라벨 ⊕ 미측정 근거가 모두 실린다.
+    expect(route?.target).toBe('openrouter');
+    expect(route?.reason).toContain('openrouter/z-ai/glm-5.3-flash');
+    expect(route?.reason).toContain('GLM 5.3 Flash (OpenRouter)');
+    expect(route?.reason).toContain('미측정');
+  });
+
+  test('키 없음 / 모델 없음 → 머물고 openrouter-unavailable', () => {
+    _setRotationConfigReaderForTesting(chainCfg('openrouter/z-ai/glm-5.3-flash'));
+    expect(run(false).decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
+    _setRotationConfigReaderForTesting(chainCfg());
+    expect(run(true).decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
   });
 });

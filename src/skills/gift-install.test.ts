@@ -1,13 +1,20 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { packDirDeterministic } from '../market/tgz.js';
+import { generateIndexKeyPair, signIndex } from '../market/signed-index.js';
+import { KgsSqliteStore } from '../knowledge/kgs/sqlite-store.js';
+import { listInstalledPacks, queryInstalledPack } from '../knowledge/query.js';
+import { runWizardStep } from '../graph-wizard/steps.js';
+import { dispatchKnowledgeQuery } from '../knowledge/tools/knowledge-query.js';
+import { knowledgeQueryRuntime } from '../tool-runtime/knowledge-runtimes.js';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { registerSkillsCommands } from '../cli/skills-cli.js';
-import { installGiftPack } from './gift-install.js';
+import { installGiftPack, installMarketKnowledgePack } from './gift-install.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.js';
 
 const dirs: string[] = [];
@@ -246,6 +253,31 @@ test('CLI sends consent and email to an explicit endpoint and reports used-up wi
   }
 });
 
+test('CLI market install branch rejects an unlisted knowledge pack without redeeming a gift', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gift-market-cli-'));
+  dirs.push(root);
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ market: { markets: [{ name: 'sample', url: 'https://sample.example/market/' }] } }));
+  const lines: string[] = [];
+  const stdout = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+  const originalExit = process.exitCode;
+  const previousConfig = process.env.ELANOUS_CONFIG_DIR;
+  try {
+    process.env.ELANOUS_CONFIG_DIR = root;
+    const program = new Command();
+    registerSkillsCommands(program);
+    await program.parseAsync(['skills', 'install', 'not-in-market', '--market', 'sample', '--json'], { from: 'user' });
+    expect(process.exitCode).toBe(1);
+    expect(JSON.parse(lines.join(''))).toMatchObject({ ok: false });
+    expect(lines.join('')).not.toContain('email-required');
+  } finally {
+    process.exitCode = originalExit ?? 0;
+    if (previousConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR;
+    else process.env.ELANOUS_CONFIG_DIR = previousConfig;
+    stdout.mockRestore();
+  }
+});
+
 test('skills.giftEndpoint defaults and survives a config save/reload', () => {
   const root = mkdtempSync(join(tmpdir(), 'gift-config-'));
   dirs.push(root);
@@ -398,4 +430,176 @@ with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as a:
   // Within the caps the same zip installs.
   const ok = await installGiftPack({ ...base, fetch: fakeGiftFetch(z.bytes, z.sha256) });
   expect(ok.ok).toBe(true);
+});
+
+test('internal market sample download requires enterprise-bound signing key and tenant', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'knowledge-internal-'));
+  dirs.push(root);
+  const keys = generateIndexKeyPair();
+  const source = join(import.meta.dir, '../../packs/b2b-sales-public');
+  const stage = join(root, 'b2b-sales-public');
+  cpSync(source, stage, { recursive: true });
+  const manifestPath = join(stage, 'knowledge-pack.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { signature: { keyId: string }; visibility: string };
+  manifest.signature.keyId = keys.keyId;
+  manifest.visibility = 'internal';
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const archive = packDirDeterministic(stage);
+  const index = Buffer.from(JSON.stringify({ name: 'private', interface: { displayName: 'Private' }, sequence: 1, plugins: [],
+    knowledgePacks: [{ name: 'b2b-sales-public', version: '0.1.0', visibility: 'internal', enterpriseId: 'tenant-a',
+      artifact: { sha256: createHash('sha256').update(archive).digest('hex'), bytes: archive.length, key: 'sales.tgz' } }] }));
+  const signature = signIndex(index, keys.privateKeyPem, keys.keyId);
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ market: { internalMarkets: [{ name: 'private',
+    url: 'https://private.example/market/', enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] }] } }));
+  const fetcher = (async (url: string) => {
+    const path = new URL(url).pathname.split('/').at(-1);
+    if (path === 'marketplace.json') return new Response(index);
+    if (path === 'index.sig') return new Response(signature);
+    return path === 'sales.tgz' ? new Response(new Uint8Array(archive)) : new Response(null, { status: 404 });
+  }) as typeof fetch;
+  const store = new KgsSqliteStore(':memory:');
+  try {
+    const input = { pack: 'b2b-sales-public', market: 'private', marketOptions: { configPath, root, fetcher }, fetch: fetcher, store };
+    expect(await installMarketKnowledgePack({ ...input, enterpriseId: 'tenant-b' })).toMatchObject({ ok: false, reason: 'knowledge-pack-install-failed' });
+    expect(await installMarketKnowledgePack(input)).toMatchObject({ ok: false, reason: 'knowledge-pack-install-failed' });
+    expect(store.readPack('b2b-sales-public', '0.1.0')).toBeNull();
+    expect(await installMarketKnowledgePack({ ...input, enterpriseId: 'tenant-a' }))
+      .toMatchObject({ ok: true, packId: 'pack:b2b-sales-public@0.1.0' });
+    expect(queryInstalledPack('pack:b2b-sales-public@0.1.0', 'CARD1', store)[0]?.ref)
+      .toContain('pack:b2b-sales-public@0.1.0#');
+  } finally { store.close(); }
+});
+
+test('two signed market sample packs install into the knowledge store and chat/graph retrieval cite both', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'knowledge-market-'));
+  dirs.push(root);
+  const key = generateIndexKeyPair();
+  const packs = ['semiconductor-process-public', 'b2b-sales-public'] as const;
+  const artifacts = new Map<string, Uint8Array>();
+  const entries = packs.map(name => {
+    const source = join(import.meta.dir, '../../packs', name);
+    const stage = join(root, name);
+    cpSync(source, stage, { recursive: true });
+    const manifestPath = join(stage, 'knowledge-pack.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { signature: { keyId: string }; version: string; description: string; content: Array<{ path: string }> };
+    manifest.signature.keyId = key.keyId;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    for (const content of manifest.content) expect(existsSync(join(stage, content.path))).toBe(true);
+    const archive = packDirDeterministic(stage);
+    artifacts.set(`${name}.tgz`, archive);
+    return { name, version: manifest.version, description: manifest.description, visibility: 'public' as const,
+      artifact: { sha256: createHash('sha256').update(archive).digest('hex'), bytes: archive.length, key: `${name}.tgz` } };
+  });
+  const index = Buffer.from(JSON.stringify({ name: 'sample', interface: { displayName: 'Sample' }, sequence: 1, plugins: [], knowledgePacks: entries }));
+  const signature = signIndex(index, key.privateKeyPem, key.keyId);
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ market: { markets: [{ name: 'sample', url: 'https://sample.example/market/' }],
+    trustedKeys: [{ keyId: key.keyId, publicKey: key.publicKey }] } }));
+  const fetcher = (async (url: string) => {
+    const path = new URL(url).pathname.split('/').at(-1)!;
+    if (path === 'marketplace.json') return new Response(index);
+    if (path === 'index.sig') return new Response(signature);
+    const archive = artifacts.get(path);
+    return archive ? new Response(new Uint8Array(archive)) : new Response(null, { status: 404 });
+  }) as typeof fetch;
+  const graphDb = join(root, 'kgs.db');
+  const store = new KgsSqliteStore(graphDb);
+  try {
+    const options = { market: 'sample', marketOptions: { configPath, root, fetcher }, fetch: fetcher, store };
+    const rejected = await installMarketKnowledgePack({ ...options, pack: 'not-in-market' });
+    expect(rejected).toMatchObject({ ok: false, reason: 'pack-not-in-verified-market' });
+    expect(store.readPack(packs[0], '0.1.0')).toBeNull();
+    const original = artifacts.get(`${packs[0]}.tgz`)!;
+    artifacts.set(`${packs[0]}.tgz`, Buffer.from('tampered'));
+    expect(await installMarketKnowledgePack({ ...options, pack: packs[0] })).toMatchObject({ ok: false, reason: 'artifact-mismatch' });
+    expect(store.readPack(packs[0], '0.1.0')).toBeNull();
+    artifacts.set(`${packs[0]}.tgz`, original);
+    const mismatched = join(root, packs[0]);
+    const manifestPath = join(mismatched, 'knowledge-pack.json');
+    const correctManifest = readFileSync(manifestPath);
+    const forged = JSON.parse(correctManifest.toString()) as { signature: { keyId: string } };
+    forged.signature.keyId = 'deadbeef';
+    writeFileSync(manifestPath, JSON.stringify(forged));
+    const forgedArchive = packDirDeterministic(mismatched);
+    const firstEntry = entries[0]!;
+    const correctArtifact = { ...firstEntry.artifact };
+    firstEntry.artifact = { ...firstEntry.artifact, sha256: createHash('sha256').update(forgedArchive).digest('hex'), bytes: forgedArchive.length };
+    artifacts.set(`${packs[0]}.tgz`, forgedArchive);
+    const forgedIndex = Buffer.from(JSON.stringify({ name: 'sample', interface: { displayName: 'Sample' }, sequence: 2, plugins: [], knowledgePacks: entries }));
+    const forgedSignature = signIndex(forgedIndex, key.privateKeyPem, key.keyId);
+    // A signed artifact with the wrong manifest key must still be rejected.
+    const forgedFetch = (async (url: string) => {
+      const path = new URL(url).pathname.split('/').at(-1)!;
+      if (path === 'marketplace.json') return new Response(forgedIndex);
+      if (path === 'index.sig') return new Response(forgedSignature);
+      const archive = artifacts.get(path);
+      return archive ? new Response(new Uint8Array(archive)) : new Response(null, { status: 404 });
+    }) as typeof fetch;
+    expect(await installMarketKnowledgePack({ ...options, pack: packs[0], marketOptions: { ...options.marketOptions, fetcher: forgedFetch, refresh: true } }))
+      .toMatchObject({ ok: false, reason: 'invalid-manifest' });
+    expect(store.readPack(packs[0], '0.1.0')).toBeNull();
+    writeFileSync(manifestPath, correctManifest);
+    firstEntry.artifact = correctArtifact;
+    artifacts.set(`${packs[0]}.tgz`, original);
+    const restoredIndex = Buffer.from(JSON.stringify({ name: 'sample', interface: { displayName: 'Sample' }, sequence: 3, plugins: [], knowledgePacks: entries }));
+    const restoredSignature = signIndex(restoredIndex, key.privateKeyPem, key.keyId);
+    const restoredFetch = (async (url: string) => {
+      const path = new URL(url).pathname.split('/').at(-1)!;
+      if (path === 'marketplace.json') return new Response(restoredIndex);
+      if (path === 'index.sig') return new Response(restoredSignature);
+      const archive = artifacts.get(path);
+      return archive ? new Response(new Uint8Array(archive)) : new Response(null, { status: 404 });
+    }) as typeof fetch;
+    for (const name of packs) {
+      expect(() => queryInstalledPack(`pack:${name}@0.1.0`, '식각', store)).toThrow('pack not installed');
+      const result = await installMarketKnowledgePack({ ...options, marketOptions: { ...options.marketOptions, fetcher: restoredFetch, refresh: true }, pack: name });
+      expect(result).toMatchObject({ ok: true, packId: `pack:${name}@0.1.0` });
+      if (result.ok) expect(result.citations).toContain(`pack:${name}@0.1.0#${name === packs[0] ? 'content/questions.md' : 'content/playbook.md'}`);
+    }
+    expect(listInstalledPacks(store).map(item => item.id).sort()).toEqual(packs.map(name => `pack:${name}@0.1.0`).sort());
+    expect(store.readPack('not-in-market', '0.1.0')).toBeNull();
+    for (const name of packs) {
+      const manifest = JSON.parse(readFileSync(join(import.meta.dir, '../../packs', name, 'knowledge-pack.json'), 'utf8')) as {
+        distribution: { internalMarketDownload: string }; sale: { targetDate: string; pricing: { model: string } };
+      };
+      expect(manifest.distribution.internalMarketDownload).toContain('enterprise-signed index');
+      expect(manifest.sale).toMatchObject({ targetDate: '2026-10-28', pricing: { model: 'free' } });
+    }
+    expect(JSON.parse(readFileSync(join(import.meta.dir, '../../packs', packs[0], 'knowledge-pack.json'), 'utf8')).sale.paid)
+      .toBe('not-enabled-pending-merchant-payment-terms-approval');
+    expect(readFileSync(join(import.meta.dir, '../../packs', packs[0], 'content/process-overview.md'), 'utf8'))
+      .toContain('https://www.semi.org/en/products-services/standards');
+    expect(JSON.parse(readFileSync(join(import.meta.dir, '../../packs', packs[1], 'knowledge-pack.json'), 'utf8')).distribution)
+      .toMatchObject({ standalone: true, pluginCombination: true });
+    const semiconductor = queryInstalledPack(`pack:${packs[0]}@0.1.0`, '식각', store);
+    const sales = queryInstalledPack(`pack:${packs[1]}@0.1.0`, 'CARD1', store);
+    expect(semiconductor.some(hit => hit.ref.includes('#content/questions.md') && hit.body.includes('[S4]'))).toBe(true);
+    expect(sales.some(hit => hit.ref.includes('#content/playbook.md') && hit.body.includes('CS1'))).toBe(true);
+    const chat = (id: string, question: string) => dispatchKnowledgeQuery({ pack_id: id, question },
+      { searchPack: (packId, query) => queryInstalledPack(packId, query, store) });
+    for (const [id, question] of [[packs[0], '식각'], [packs[1], 'CARD1']] as const) {
+      const answer = await chat(`pack:${id}@0.1.0`, question);
+      expect(answer.output).toContain(`[pack:${id}@0.1.0#content/`);
+      expect(answer.pack_hits?.some(hit => hit.body.includes(question))).toBe(true);
+    }
+    expect((await chat('pack:missing-sample@0.1.0', '식각')).pack_hits).toEqual([]);
+    const vaultResult = await dispatchKnowledgeQuery({ fulltext: 'no-such-sample-word' }, {
+      vault: { root, label: 'sample-test', isSimulated: false } });
+    expect(vaultResult.pack_hits).toBeUndefined();
+    expect(vaultResult.output).toContain('vault=sample-test');
+    // Chat's registered runtime and the graph step both read the installed-store path.
+    const { setKgsDbPathOverride, _resetKgsStoreSingleton } = await import('../knowledge/kgs/sqlite-store.js');
+    try {
+      _resetKgsStoreSingleton();
+      setKgsDbPathOverride(graphDb);
+      for (const [id, query] of [[packs[0], '식각'], [packs[1], 'CARD1']] as const) {
+        const runtime = await knowledgeQueryRuntime.run({ pack_id: `pack:${id}@0.1.0`, question: query }, { surface: 'dashboard' });
+        expect(runtime.output).toContain(`[pack:${id}@0.1.0#content/`);
+        const graph = runWizardStep('knowledge-rag', `pack:${id}@0.1.0`, { input: { query } });
+        expect(graph.outcome).toBe('ok');
+        expect(graph.text).toContain(`[pack:${id}@0.1.0#content/`);
+      }
+    } finally { _resetKgsStoreSingleton(); setKgsDbPathOverride(null); }
+  } finally { store.close(); }
 });

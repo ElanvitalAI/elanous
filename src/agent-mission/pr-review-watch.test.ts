@@ -343,6 +343,17 @@ describe('mapReviewToInjected — 1차 리뷰 → injectedReview', () => {
     expect(mapReviewToInjected({ verdict: 'warn', mustFix: [], shouldFix: ['개선 권고'], reviewed: true }))
       .toEqual({ verdict: 'ok', asks: [] });
   });
+  // TA-LAND-MUSTFIX-ZERO — pass/warn 의 must-fix 를 지우지 않는다(지우면 review-loop 자동 병합 관문이 «0» 으로 읽는다).
+  test('pass/warn ⊕ must-fix → ok 이되 must-fix 가 asks 로 남는다', () => {
+    expect(mapReviewToInjected({ verdict: 'warn', mustFix: ['고쳐라'], shouldFix: [], reviewed: true }))
+      .toEqual({ verdict: 'ok', asks: ['고쳐라'] });
+    expect(mapReviewToInjected({ verdict: 'pass', mustFix: ['고쳐라'], shouldFix: [], reviewed: true }))
+      .toEqual({ verdict: 'ok', asks: ['고쳐라'] });
+  });
+  test('must-fix 목록을 못 읽으면 ok 로 보내지 않는다(ambiguous)', () => {
+    expect(mapReviewToInjected({ verdict: 'pass', shouldFix: [], reviewed: true } as unknown as Parameters<typeof mapReviewToInjected>[0]))
+      .toEqual({ verdict: 'ambiguous', asks: [] });
+  });
 });
 
 describe('자동 초기리뷰어 — 리뷰 없는 라벨 PR', () => {

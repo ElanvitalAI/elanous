@@ -1,14 +1,15 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { debug } from '../debug/log.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { addItem, checklistHistory, listChecklist, setItem } from './checklist.js';
 import { exportJson } from './feature-store.js';
 import { placeCell, seatMove } from './placement.js';
-import { setSchedule } from './release-schedule.js';
+import { getSchedule, setSchedule } from './release-schedule.js';
 
 let dir = '';
 const now = new Date('2026-10-04T00:00:00Z');
@@ -51,6 +52,107 @@ test('different day, configured cap, and another release sharing an explicit dat
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { placement: { ceoDailyCap: 15 } } }));
   expect(() => placeCell(input('new', 6), deps)).toThrow('36분 > 하루 상한 15분');
   expect(placeCell(input('small', 5, '2026-10-07'), deps).version).toBe(v);
+});
+
+test('term calendar tightens the day; an event exception overrides it and overloads log three proposals before writes', () => {
+  setup();
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { placement: { ceoCalendar: {
+    terms: [{ from: '2026-10-01', to: '2026-10-31', dailyCap: 15 }],
+    events: { '2026-10-05': 0, '2026-10-06': 40 },
+  } } } }));
+  addItem(v, { id: 'EMBA', title: 'EMBA', owner: 'OP', ceoMinutes: 10, ceoDate: '2026-10-05' });
+  const before = listChecklist(v);
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    expect(() => placeCell(input('SNS', 10), deps)).toThrow('20분 > 하루 상한 0분');
+    expect(listChecklist(v)).toEqual(before);
+    const entry = log.mock.calls.find(([category, event]) => category === 'release.placement' && event === 'ceo-overload');
+    expect(entry?.[2]).toMatchObject({ day: '2026-10-05', id: 'SNS', total: 20, cap: 0 });
+    for (const proposal of ['늦추기', '자리 대행', '묶기']) expect((entry?.[2] as { reason: string }).reason).toContain(proposal);
+    expect(placeCell(input('YouTube', 20, '2026-10-06'), deps).version).toBe(v);
+    expect(() => placeCell(input('review', 16, '2026-10-07'), deps)).toThrow('16분 > 하루 상한 15분');
+    expect(() => placeCell(input('calendar-invalid', 1, '2026-10-06'), { ...deps, ceoCalendar: { events: { '2026-02-30': 20 } } })).toThrow('잘못된 대표 행사 달력 날짜');
+  } finally { log.mockRestore(); }
+});
+
+test('approval, filming, review and attendance minutes across scheduled and unscheduled cells share the same KST budget', () => {
+  setup();
+  addItem(v, { id: 'approval', title: 'approval', ceoMinutes: 8 });
+  addItem(v, { id: 'filming', title: 'filming', ceoMinutes: 10 });
+  addItem('0.9.1', { id: 'attendance', title: 'attendance', ceoMinutes: 7, ceoDate: '2026-10-05' });
+  const before = listChecklist(v);
+  expect(() => placeCell(input('review', 6), deps)).toThrow('31분 > 하루 상한 30분');
+  expect(listChecklist(v)).toEqual(before);
+  expect(placeCell(input('review', 5), deps).version).toBe(v);
+});
+
+test('schedule landing changes reject a cross-release KST collision without ledger/history mutation; explicit work day remains fixed', () => {
+  setup();
+  addItem(v, { id: 'SNS', title: 'SNS', owner: 'MK', ceoMinutes: 20 });
+  addItem('0.2.16', { id: 'YouTube', title: 'YouTube', owner: 'MK', ceoMinutes: 20 });
+  const previous = getSchedule('0.2.16');
+  const before = listChecklist('0.2.16');
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    expect(() => setSchedule('0.2.16', { landBy: '2026-10-05T14:59:00Z' }, 'OP')).toThrow('40분 > 하루 상한 30분');
+    expect(getSchedule('0.2.16')).toEqual(previous);
+    expect(listChecklist('0.2.16')).toEqual(before);
+    expect(log.mock.calls.some(([category, event, data]) => category === 'release.placement' && event === 'ceo-overload'
+      && (data as { reason: string }).reason.includes('늦추기') && (data as { reason: string }).reason.includes('자리 대행') && (data as { reason: string }).reason.includes('묶기'))).toBe(true);
+  } finally { log.mockRestore(); }
+  setItem('0.2.16', 'YouTube', { ceoDate: '2026-10-06' }, 'OP');
+  expect(setSchedule('0.2.16', { landBy: '2026-10-05T14:59:00Z' }, 'OP').landBy).toBe('2026-10-05T14:59:00.000Z');
+  expect(() => placeCell(input('review', 11), deps)).toThrow('31분 > 하루 상한 30분');
+});
+
+test('explicit schedule root uses its own CEO cap and event calendar, not the active root', () => {
+  setup();
+  const active = dir;
+  const activeSchedule = getSchedule(v);
+  const other = mkdtempSync(join(tmpdir(), 'ceo-load-explicit-root-'));
+  try {
+    writeFileSync(join(active, 'config.json'), JSON.stringify({ release: { placement: {
+      ceoDailyCap: 60, ceoCalendar: { events: { '2026-10-05': 60, '2026-10-06': 0 } },
+    } } }));
+    setElanousConfigDir(other);
+    writeFileSync(join(other, 'config.json'), JSON.stringify({ release: { placement: {
+      ceoDailyCap: 30, ceoCalendar: { events: { '2026-10-05': 0, '2026-10-06': 40 } },
+    } } }));
+    setSchedule(v, { cutAt: '2026-10-06T02:00:00Z', landBy: '2026-10-06T02:00:00Z' }, 'OP');
+    addItem(v, { id: 'YouTube', title: 'YouTube', owner: 'MK', ceoMinutes: 20 });
+    addItem('0.2.16', { id: 'EMBA', title: 'EMBA', owner: 'OP', ceoMinutes: 10, ceoDate: '2026-10-05' });
+    setElanousConfigDir(active);
+    const before = getSchedule(v, other);
+    const beforeChecklist = listChecklist(v, other);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(() => setSchedule(v, { landBy: '2026-10-05T02:00:00Z' }, 'OP', other)).toThrow('30분 > 하루 상한 0분');
+      expect(getSchedule(v, other)).toEqual(before);
+      expect(listChecklist(v, other)).toEqual(beforeChecklist);
+      const entry = log.mock.calls.find(([category, event]) => category === 'release.placement' && event === 'ceo-overload');
+      expect(entry?.[2]).toMatchObject({ day: '2026-10-05', id: 'YouTube', total: 30, cap: 0 });
+      for (const alternative of ['늦추기', '자리 대행', '묶기']) expect((entry?.[2] as { reason: string }).reason).toContain(alternative);
+    } finally { log.mockRestore(); }
+    writeFileSync(join(other, 'config.json'), JSON.stringify({ release: { placement: { ceoDailyCap: 10 } } }));
+    expect(() => setSchedule(v, { landBy: '2026-10-07T02:00:00Z' }, 'OP', other)).toThrow('20분 > 하루 상한 10분');
+    expect(getSchedule(v, other)).toEqual(before);
+    writeFileSync(join(other, 'config.json'), JSON.stringify({ release: { placement: {
+      ceoDailyCap: 30, ceoCalendar: { events: { '2026-10-05': 0, '2026-10-06': 40 } },
+    } } }));
+    expect(setSchedule(v, { landBy: '2026-10-07T02:00:00Z' }, 'OP', other).landBy).toBe('2026-10-07T02:00:00.000Z');
+    expect(setSchedule(v, { landBy: '2026-10-06T02:00:00Z' }, 'OP', other).landBy).toBe('2026-10-06T02:00:00.000Z');
+    expect(getSchedule(v)).toEqual(activeSchedule);
+  } finally { setElanousConfigDir(active); rmSync(other, { recursive: true, force: true }); }
+});
+
+test('adding a landing schedule for a previously unscheduled CEO cell rejects a day collision before writing', () => {
+  setup();
+  addItem('0.2.17', { id: 'filming', title: 'filming', ceoMinutes: 20 });
+  addItem(v, { id: 'approval', title: 'approval', ceoMinutes: 20 });
+  const before = listChecklist('0.2.17');
+  expect(() => setSchedule('0.2.17', { cutAt: '2026-10-05T12:00Z', landBy: '2026-10-05T12:00Z' }, 'OP')).toThrow('40분 > 하루 상한 30분');
+  expect(getSchedule('0.2.17')).toBeNull();
+  expect(listChecklist('0.2.17')).toEqual(before);
 });
 
 test('legacy checklist JSON import and exported snapshots retain representative minutes and day', () => {

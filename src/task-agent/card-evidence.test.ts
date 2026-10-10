@@ -89,6 +89,7 @@ test('terminal Pod failure is recorded once; missing terminal evidence keeps lau
   const runId = readTaskCard(card.id, path)!.runId!;
   await refreshCardRunBinding(card.id, path, { ...ledgers({ [runId]: [entry(runId, 'start')] }), now: () => new Date('2026-10-07T01:00:01.000Z') });
   expect(readTaskCard(card.id, path)?.status).toBe('launched');
+  expect(readTaskCard(card.id, path)?.history.filter((item) => item.event === 'failed')).toHaveLength(0);
   const deps = ledgers({ [runId]: [entry(runId, 'pod-child-run', { childRunId: CHILD }), entry(runId, 'run-status', { runStatus: 'failed', failureKind: 'pod-failure' })] }, [{ childRunId: CHILD, prUrl: '', state: 'failed', childError: 'exit 1 unknown/pod-failure' }]);
   await refreshCardRunBinding(card.id, path, deps);
   expect((readTaskCard(card.id, path) as { status: string } | undefined)?.status).toBe('failed');

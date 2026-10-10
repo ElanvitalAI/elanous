@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import type { GraphRunState } from '../../src/graph-runner/runner.js';
 import { join } from 'node:path';
 import { emitNodeResult, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
 
@@ -64,6 +66,37 @@ function cleanBullet(text: string): string | null {
   return line;
 }
 
+/** A waiver is copied verbatim into public notes, so reject internal or resolved claims before resuming. */
+export function publicWaiverReason(text: string): string {
+  const bullet = cleanBullet(text);
+  if (!bullet || resolved.test(bullet) || !/[a-z]{3}/i.test(bullet)) throw new Error('unsafe public waiver reason');
+  return bullet;
+}
+
+function recordedWaivers(context: GraphContext, accepted: Issue[]): Issue[] {
+  const contextPath = process.env.ELANOUS_GRAPH_CONTEXT;
+  if (!contextPath || !/\.json\.contexts\/[1-9]\d*\.json$/.test(contextPath)) return [];
+  const raw = JSON.parse(readFileSync(contextPath, 'utf8')) as { graphId?: string; runId?: string; nodeId?: string };
+  if (raw.graphId !== 'release-loop' || raw.nodeId !== 'known-issues' || !raw.runId || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.runId)) return [];
+  const statePath = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop', `${raw.runId}.json`);
+  const visit = Number(contextPath.slice(contextPath.lastIndexOf('/') + 1, -'.json'.length));
+  if (contextPath !== join(`${statePath}.contexts`, `${visit}.json`)) return [];
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+  if (state.graphId !== 'release-loop' || state.runId !== raw.runId || state.path[visit - 1] !== 'known-issues' ||
+    JSON.stringify((state.input as { acceptedRegressions?: unknown })?.acceptedRegressions ?? []) !== JSON.stringify(context.input.acceptedRegressions ?? [])) return [];
+  return accepted.filter((issue) => {
+    if (!issue.id.startsWith('waive:')) return false;
+    const node = issue.id.slice('waive:'.length);
+    const index = state.path.indexOf(node);
+    const record = state.nodes[index];
+    const waiver = record?.waiver;
+    return index >= 0 && index < visit - 1 && record?.nodeId === node && waiver !== undefined && waiver.reason === issue.note &&
+      // The runner writes a waiver only over a failed executed node (releaseResumeWaiver); its exit may be 0 (outcome fail) or null (timeout).
+      record.ok === true && record.executed === false &&
+      context.outputs[node]?.verdict === 'waived' && context.outputs[node]?.reason === issue.note;
+  });
+}
+
 function command(run: CommandRunner, program: string, args: string[], cwd?: string): string {
   const result = run(program, args, cwd);
   if (result.status !== 0) throw new Error(`${program} ${args[0]} failed: ${result.stderr || result.stdout}`);
@@ -85,13 +118,18 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
   let bullets: string[];
   let fallbackUsed = false;
   const allIssues = [...checklist, ...accepted];
-  const sourceIds = allIssues.map((issue) => issue.id);
-  const prompt = `Write public English release-note bullets for these known issues. Describe only user-visible impact; include a one-line workaround when available. No internal names, test paths, track names, PR numbers, or people. Each bullet must have at most two sentences. Return ONLY a JSON array with exactly one object {"id":"input ID","bullet":"English public sentence"} for each input, using each input ID exactly once. Do not include IDs in bullet text. Input: ${JSON.stringify({ checklist, acceptedRegressions: accepted })}`;
-  let response: ReturnType<CommandRunner>;
-  try {
-    response = run('elanous', ['--test', 'ask', '--json', prompt]);
-  } catch {
-    response = { status: 1, stdout: '', stderr: '' };
+  // The persisted failed-node waiver, not a claimed output or an ID prefix, is the public-note provenance.
+  const waiverIssues = recordedWaivers(context, accepted);
+  const modelIssues = allIssues.filter((issue) => !waiverIssues.includes(issue));
+  const sourceIds = modelIssues.map((issue) => issue.id);
+  const prompt = `Write public English release-note bullets for these known issues. Describe only user-visible impact; include a one-line workaround when available. No internal names, test paths, track names, PR numbers, or people. Each bullet must have at most two sentences. Return ONLY a JSON array with exactly one object {"id":"input ID","bullet":"English public sentence"} for each input, using each input ID exactly once. Do not include IDs in bullet text. Input: ${JSON.stringify({ checklist, acceptedRegressions: accepted.filter((issue) => !waiverIssues.includes(issue)) })}`;
+  let response: ReturnType<CommandRunner> = { status: 0, stdout: JSON.stringify({ reply: '[]' }), stderr: '' };
+  if (modelIssues.length) {
+    try {
+      response = run('elanous', ['--test', 'ask', '--json', prompt]);
+    } catch {
+      response = { status: 1, stdout: '', stderr: '' };
+    }
   }
   if (response.status !== 0) {
     bullets = [FALLBACK];
@@ -105,7 +143,7 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
           return FALLBACK;
         }
         if (resolved.test(safe)) throw new Error(`bullet for ${sourceIds[index]} claims the issue is resolved`);
-        if (!coversIssue(safe, allIssues[index]!, allIssues.filter((_, otherIndex) => otherIndex !== index))) {
+        if (!coversIssue(safe, modelIssues[index]!, modelIssues.filter((_, otherIndex) => otherIndex !== index))) {
           throw new Error(`bullet does not identify input ${sourceIds[index]}`);
         }
         return safe;
@@ -117,6 +155,13 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
     } catch (error) {
       throw new Error(`known issues coverage not verified: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+  // A waiver's supplied public impact must survive even when the model omits it or is unavailable.
+  for (const issue of waiverIssues) {
+    const bullet = cleanBullet(issue.note ?? '');
+    if (!bullet || resolved.test(bullet)) throw new Error(`unsafe public waiver reason for ${issue.id}`);
+    const publicBullet = /[.!?]$/.test(bullet) ? bullet : `${bullet}.`;
+    if (!bullets.includes(publicBullet)) bullets.push(publicBullet);
   }
   const original = readFileSync(notes, 'utf8');
   const heading = /^## Known issues\s*$/m;

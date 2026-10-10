@@ -7,6 +7,7 @@ import { defaultLlmPolicy, validateLlmPolicy } from '../policy/llm-policy.js';
 import {
   classifyReviewProviderFailure, buildReviewProviderAttempts, runReviewWithFallback,
   type ReviewFallbackObservation, subscriptionReviewerSpawn, runSubscriptionReviewer,
+  subscriptionReviewerAvailability, parseTeamclaudeStatusJson, parseTeamclaudeBaseUrl,
 } from './review-provider-fallback.js';
 
 const A = { model: 'gpt-5.6-sol', provider: getProvider('gpt-5.6-sol')!, label: 'codex' };
@@ -35,15 +36,114 @@ describe('Claude ACP subscription review', () => {
     const runStatus = (command: string, args: string[], cleanEnv: Record<string, string>) => {
       calls.push(`${command} ${args.join(' ')}`);
       expect(cleanEnv.ANTHROPIC_API_KEY).toBeUndefined();
+      if (args[0] === 'env') return { status: 0, stdout: proxyEnv };
       return { status: 0, stdout: 'Claude subscription active; usage: 42%' };
     };
     const api = async () => 'VERDICT: PASS';
     const acp = async () => 'VERDICT: WARN';
     expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env, { runStatus })).toBe('VERDICT: WARN');
-    expect(calls).toEqual(['teamclaude status', 'teamclaude status']);
+    // Old teamclaude: `--json` is not JSON, so both questions fall back to the text probe.
+    expect(calls).toEqual(['teamclaude status --json', 'teamclaude status', 'teamclaude env --no-mitm']);
     expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env,
       { runStatus: () => ({ status: 0, stdout: 'Claude subscription active' }) })).toContain('usage unavailable');
   });
+
+  // Key structure of a real `teamclaude status --json` (mbp 10-10); names are fake, quota ratios are 0-1.
+  const proxyEnv = 'export ANTHROPIC_BASE_URL=http://localhost:3456\n# TeamClaude env: base-URL mode, localhost:3456\n';
+  const tcJson = (accounts: unknown[], currentAccount = 'acct-b') => JSON.stringify({
+    accounts, currentAccount, currentAccounts: { anthropic: currentAccount }, switchThreshold: 0.95,
+    server: {}, sessions: [], usageDimensions: {},
+  });
+  const acct = (name: string, quota: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    name, type: 'oauth', provider: 'anthropic', status: 'active', disabled: false, unavailable: null,
+    quota: { unified5h: null, unified7d: null, unifiedStatus: null, ...quota }, ...extra,
+  });
+  const realShape = tcJson([acct('acct-a', {}), acct('acct-b', { unified5h: 0.09, unified7d: 0.5, unifiedStatus: 'allowed' })]);
+
+  test('teamclaude status --json: an active oauth account is a subscription and its quota ratio is a percent', () => {
+    expect(parseTeamclaudeStatusJson(realShape)).toEqual({ subscribed: true, usedPercent: 50, reason: 'current-account' });
+    const calls: string[] = [];
+    const runStatus = (command: string, args: string[]) => {
+      calls.push(`${command} ${args.join(' ')}`);
+      if (args[0] === 'env') return { status: 0, stdout: proxyEnv };
+      return { status: 0, stdout: args.includes('--json') ? realShape : 'Accounts\n  acct-b  active  5h 9%  7d 50%' };
+    };
+    const ok = subscriptionReviewerAvailability(cct, 60, env, { runStatus }).spawn;
+    expect(ok?.command).toBe('claude-agent-acp');
+    expect(ok?.env.ANTHROPIC_BASE_URL).toBe('http://localhost:3456');
+    expect(calls).toEqual(['teamclaude status --json', 'teamclaude env --no-mitm']);
+    // A proxy without a base URL is not a route: fail closed to the default reviewer.
+    expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus: (_c: string, args: string[]) =>
+      ({ status: 0, stdout: args[0] === 'env' ? '' : realShape }) }).reason).toBe('cct proxy base URL unavailable');
+    expect(subscriptionReviewerAvailability(cct, 40, env, { runStatus }).reason).toContain('at harness cap (40%)');
+  });
+
+  test('teamclaude status --json: logged-out or api-key-only accounts are not a subscription; unmeasured quota fails closed', () => {
+    const apiKeyOnly = tcJson([{ name: 'k', type: 'api-key', status: 'active', disabled: false, quota: { unified5h: 0.1 } }], 'k');
+    const loggedOut = tcJson([acct('acct-b', { unified5h: 0.1 }, { status: 'error' }), acct('acct-c', { unified5h: 0.1 }, { disabled: true })]);
+    for (const stdout of [apiKeyOnly, loggedOut, tcJson([])]) {
+      expect(parseTeamclaudeStatusJson(stdout)?.subscribed).toBe(false);
+      expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus: () => ({ status: 0, stdout }) }).reason)
+        .toBe('cct subscription check failed');
+    }
+    const unmeasured = tcJson([acct('acct-b', {})]);
+    expect(parseTeamclaudeStatusJson(unmeasured)).toEqual({ subscribed: true, reason: 'quota-unmeasured' });
+    expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus: () => ({ status: 0, stdout: unmeasured }) }).reason)
+      .toContain('usage unavailable');
+    // The routed (current) account's quota gates: another account's low usage does not stand in for it.
+    expect(parseTeamclaudeStatusJson(tcJson([acct('acct-a', { unified5h: 0.2 }), acct('acct-b', {})])))
+      .toEqual({ subscribed: true, reason: 'quota-unmeasured' });
+    // No usable current account: every usable account must be measured, and the highest counts.
+    expect(parseTeamclaudeStatusJson(tcJson([acct('acct-a', { unified5h: 0.2 }), acct('acct-c', { unified7d: 0.7 })], 'gone')))
+      .toEqual({ subscribed: true, usedPercent: 70, reason: 'max-active-account' });
+    expect(parseTeamclaudeStatusJson(tcJson([acct('acct-a', { unified5h: 0.2 }), acct('acct-c', {})], 'gone')))
+      .toEqual({ subscribed: true, reason: 'quota-unmeasured' });
+    // A bucket nulled by its window reset leaves the other bucket gating; an invalid present value fails closed.
+    expect(parseTeamclaudeStatusJson(tcJson([acct('acct-b', { unified5h: null, unified7d: 0.4 })])))
+      .toEqual({ subscribed: true, usedPercent: 40, reason: 'current-account' });
+    for (const bad of [1.5, -0.1, '0.2', {}]) {
+      const stdout = tcJson([acct('acct-b', { unified5h: bad, unified7d: 0.1 })]);
+      expect(parseTeamclaudeStatusJson(stdout)).toEqual({ subscribed: true, reason: 'quota-unmeasured' });
+      expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus: (_c: string, args: string[]) =>
+        ({ status: 0, stdout: args[0] === 'env' ? proxyEnv : stdout }) }).reason).toContain('usage unavailable');
+    }
+    // A missing bucket key is not a reset: unmeasured, fail closed.
+    expect(parseTeamclaudeStatusJson(JSON.stringify({ currentAccount: 'acct-b', accounts: [
+      { name: 'acct-b', type: 'oauth', status: 'active', disabled: false, quota: { unified7d: 0.1 } }] })))
+      .toEqual({ subscribed: true, reason: 'quota-unmeasured' });
+    // A non-boolean `disabled` is another schema, not an enabled account.
+    for (const disabled of ['true', null, undefined])
+      expect(parseTeamclaudeStatusJson(tcJson([acct('acct-b', { unified5h: 0.1 }, { disabled })]))).toBeUndefined();
+  });
+
+  test('teamclaude without --json (non-zero exit or non-JSON) falls back to the text probe', () => {
+    const runStatus = (_command: string, args: string[]) => args[0] === 'env' ? { status: 0, stdout: proxyEnv }
+      : args.includes('--json') ? { status: 1, stdout: 'unknown option --json' }
+      : { status: 0, stdout: 'Claude subscription active; usage: 30%' };
+    expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus }).spawn?.command).toBe('claude-agent-acp');
+    expect(parseTeamclaudeStatusJson('Claude subscription active')).toBeUndefined();
+    expect(parseTeamclaudeStatusJson('{"server":{}}')).toBeUndefined();
+    // Another account schema is not this JSON: it must reach the text probe, not read as "no subscription".
+    const otherSchema = JSON.stringify({ accounts: [{ kind: 'oauth', state: 'active' }] });
+    expect(parseTeamclaudeStatusJson(otherSchema)).toBeUndefined();
+    expect(subscriptionReviewerAvailability(cct, 60, env, { runStatus: (_c: string, args: string[]) => args[0] === 'env'
+      ? { status: 0, stdout: proxyEnv } : args.includes('--json') ? { status: 0, stdout: otherSchema }
+      : { status: 0, stdout: 'Claude subscription active; usage: 30%' } }).spawn?.command).toBe('claude-agent-acp');
+  });
+
+  test('a child that never answers the ACP handshake falls back to the default reviewer in bounded time', async () => {
+    const { makeAcpReviewLLM } = await import('../agent-substrate/acp-reviewer.js');
+    const { getAcpBackend } = await import('../acp/backend-registry.js');
+    const t0 = Date.now();
+    const text = await runSubscriptionReviewer(cct, 60, 'review', async () => 'VERDICT: PASS',
+      (prompt, spawn) => makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude', env: spawn.env, handshakeTimeoutMs: 300,
+        // The pre-fix child: an interactive CLI that never speaks ACP.
+        backendSpec: { ...getAcpBackend('claude'), command: '/bin/sleep', args: ['30'] } })(prompt),
+      env, { checkSubscription: () => true, usedPercent: () => 10,
+        runStatus: () => ({ status: 0, stdout: proxyEnv }) });
+    expect(text).toBe('VERDICT: PASS\n[reviewer fallback: ACP review failed; default reviewer used]');
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  }, 20_000);
 
   test('fallback notice survives review parsing and appears in rendered review result', async () => {
     const raw = await runSubscriptionReviewer(cct, 60, 'review', async () => 'VERDICT: PASS\nMUST-FIX:\n',
@@ -54,12 +154,16 @@ describe('Claude ACP subscription review', () => {
     expect(renderReview(result)).toContain('[reviewer fallback: cct subscription check failed; default reviewer used]');
   });
 
-  test('the executor command is passed to the ACP child without billing credentials', () => {
-    expect(subscriptionReviewerSpawn(cct, env)).toMatchObject({ command: 'teamclaude',
-      args: ['run', '--auto-fallback', '--', '--dangerously-skip-permissions'],
-      backendSpec: { id: 'claude', command: 'teamclaude', args: ['run', '--auto-fallback', '--', '--dangerously-skip-permissions'] } });
-    expect(subscriptionReviewerSpawn(cc, env)).toMatchObject({ command: 'claude', args: ['--dangerously-skip-permissions'],
-      backendSpec: { command: 'claude', args: ['--dangerously-skip-permissions'] } });
+  test('both executors run the ACP adapter (not the interactive CLI) without billing credentials; cct routes via the proxy base URL', () => {
+    for (const spec of [cct, cc]) {
+      expect(subscriptionReviewerSpawn(spec, env)).toMatchObject({ command: 'claude-agent-acp', args: [],
+        backendSpec: { id: 'claude', command: 'claude-agent-acp', args: [] } });
+    }
+    expect(subscriptionReviewerSpawn(cct, env, 'http://localhost:3456').env.ANTHROPIC_BASE_URL).toBe('http://localhost:3456');
+    expect(subscriptionReviewerSpawn(cc, env, 'http://localhost:3456').env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(parseTeamclaudeBaseUrl(proxyEnv + '# remote clients must also present the proxy key: ANTHROPIC_API_KEY=x\n'))
+      .toBe('http://localhost:3456');
+    expect(parseTeamclaudeBaseUrl('export ANTHROPIC_API_KEY=x\n')).toBeUndefined();
     for (const spec of [cct, cc]) {
       const child = subscriptionReviewerSpawn(spec, env).env;
       expect(child.PATH).toBe('/bin');
@@ -82,8 +186,8 @@ describe('Claude ACP subscription review', () => {
       { checkSubscription: () => true, usedPercent: () => 60 })).toContain('at harness cap (60%)');
     expect(calls).toEqual(['api', 'api', 'api']);
     expect(await runSubscriptionReviewer(cct, 60, 'review', api, acp, env,
-      { checkSubscription: () => true, usedPercent: () => 59 })).toBe('ACP PASS');
-    expect(calls.at(-1)).toBe('teamclaude');
+      { checkSubscription: () => true, usedPercent: () => 59, runStatus: () => ({ status: 0, stdout: proxyEnv }) })).toBe('ACP PASS');
+    expect(calls.at(-1)).toBe('claude-agent-acp');
     expect(await runSubscriptionReviewer(cc, 60, 'review', api, async () => '', env,
       { checkSubscription: () => true, usedPercent: () => 10 })).toContain('ACP review failed; default reviewer used');
   });

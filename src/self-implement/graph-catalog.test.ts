@@ -23,7 +23,7 @@ edges: []
 
 describe('node catalog declaration inspection', () => {
   test('default catalog loads role details and all active kinds', () => {
-    expect(catalog.kinds).toEqual(['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph']);
+    expect(catalog.kinds).toEqual(['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'prompt', 'subgraph']); // #25170 prompt 종류
     expect(catalog.roles.get('observe-logs')).toEqual({
       kind: 'observe', outcomes: ['ok', 'empty'], spawn: 'runtime', grain: 'atom', effects: 'none',
     });

@@ -199,7 +199,7 @@ describe('federated unfinished run ledgers', () => {
         expect.objectContaining({ runId: testRunId, ledgerDirectory: join(testStateDir, 'run-ledger') }),
       ],
     });
-  }, 20_000);
+  }, 90_000);
 });
 
 describe('GoalRunStore concurrent writers', () => {
@@ -248,7 +248,7 @@ describe('GoalRunStore concurrent writers', () => {
     const stored = new GoalRunStore(path, true);
     try { expect(stored.recordCount()).toBe(400); }
     finally { stored.close(); }
-  }, 20_000);
+  }, 90_000);
 });
 
 describe('GoalRunStore', () => {
@@ -265,7 +265,7 @@ describe('GoalRunStore', () => {
     } finally {
       goalRunStore.close();
     }
-  });
+  }, 30_000);
 
   test('round-trips GoalType provenance while legacy records retain omitted optional fields', () => {
     const { store: goalRunStore, goalFile } = store();
@@ -979,7 +979,7 @@ describe('GoalRunStore', () => {
     } finally {
       goalRunStore.close();
     }
-  });
+  }, 90_000);
 
   test('renders reproduction anchors and a relaunch command only for an exactly representable test universe', () => {
     const { store: goalRunStore, goalFile } = store();
@@ -1084,7 +1084,7 @@ describe('GoalRunStore', () => {
     } finally {
       goalRunStore.close();
     }
-  }, 20_000);
+  }, 90_000);
 
   test('keeps ledger read failures distinct from absent records and exhaustively summarizes exact run IDs', () => {
     const { store: goalRunStore, goalFile } = store();

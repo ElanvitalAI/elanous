@@ -118,6 +118,9 @@ export interface SelfGateCliResult {
   /** New vs. already-present failures (unknown/preconditionUnmet = failures it could not classify). Absent = the test
    *  step did not produce a measurement (e.g. shards unmeasured). */
   baseline?: { introduced: number; preexisting: number; unknown: number; preconditionUnmet: number };
+  /** LIGHT-RC-MEASURE ③ — why the sharded test step produced no measurement (the same text as the
+   *  `shards: unmeasured (…)` line). Absent when it measured, or on the unsharded path. */
+  unmeasuredReason?: string;
 }
 
 /** 시험 단계와 독립인 정책 관문 넷. skipTestStep 이든 시험 통과든 같은 함수를 부른다. */
@@ -667,10 +670,16 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   if (options.shards !== undefined) {
     const sharded = (deps.runShards ?? runShardedGateTests)(cwd, testFiles, selection.baseRef, options.shards);
     lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}`);
-    for (const attempt of sharded.attempts) lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt}`);
+    // 조각이 «못 쟀다»일 때 이유가 줄에 없으면 자리·시간 초과·죽음을 가를 수 없다(OP 10-09 light RC) — 종료 코드·신호를 같이 싣는다.
+    const side = (code: number | null, signal: string | null | undefined, junit: string | undefined) => signal ? `signal ${signal}` : code === null ? 'exit ?' : `exit ${code}${junit === undefined ? ' · junit 없음' : ''}`;
+    for (const attempt of sharded.attempts) lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt} · 지금 ${side(attempt.currentExitCode, attempt.currentSignal, attempt.currentJUnit)} · 기준 ${side(attempt.baselineExitCode, attempt.baselineSignal, attempt.baselineJUnit)}`);
     const { aggregate } = sharded;
     let shardBaseline: SelfGateCliResult['baseline'];
-    if (aggregate.status === 'unmeasured') lines.push(`shards: unmeasured (${aggregate.retryShardIds.join(', ') || sharded.reason || 'no complete JUnit'})`);
+    let unmeasuredReason: string | undefined;
+    if (aggregate.status === 'unmeasured') {
+      unmeasuredReason = aggregate.retryShardIds.join(', ') || sharded.reason || 'no complete JUnit';
+      lines.push(`shards: unmeasured (${unmeasuredReason})`);
+    }
     else if (aggregate.report) {
       const report = aggregate.report;
       logGateCliBaseline(cwd, {
@@ -692,6 +701,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
       alwaysIncludeMissing, ...(shardBaseline ? { baseline: shardBaseline } : {}),
+      ...(unmeasuredReason !== undefined ? { unmeasuredReason } : {}),
     };
   }
 

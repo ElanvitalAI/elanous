@@ -4456,8 +4456,9 @@ describe('defaultSeams.createWorktree — self-implement ownership provenance', 
       log.mockRestore();
     }
 
+    // 재사용 경로는 `git worktree list` 가 준 실경로다(macOS `/var` ↔ `/private/var`) — 같은 디렉토리인지를 실경로로 본다.
     expect(second).toMatchObject({
-      path: first.path,
+      path: realpathSync(first.path),
       branch,
       resolvedBase: head,
       baseFreshness: 'reused',
@@ -4466,7 +4467,7 @@ describe('defaultSeams.createWorktree — self-implement ownership provenance', 
       command: 'elanous dev',
     });
     expect(events).toEqual([expect.objectContaining({
-      path: first.path,
+      path: realpathSync(first.path),
       baseFreshness: 'reused',
       reused: true,
       owner: `dev:${runId}`,
@@ -4515,8 +4516,9 @@ describe('defaultSeams.createWorktree — self-implement ownership provenance', 
     const dirtBefore = git(first.path, 'status', '--porcelain').stdout;
 
     const second = await defaultSeams({ repoRoot: repo }).createWorktree({ branch, runId });
+    // 재사용 경로는 실경로다(macOS `/var` ↔ `/private/var`) — 같은 디렉토리인지를 실경로로 본다.
     expect(second).toMatchObject({
-      path: first.path,
+      path: realpathSync(first.path),
       branch,
       baseFreshness: 'reused',
       reused: true,

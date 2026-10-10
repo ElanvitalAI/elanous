@@ -21,8 +21,7 @@ describe('CLI user errors', () => {
     expect(foreign instanceof CliUserError).toBe(false);
     expect(foreign.name).toBe('CliUserError');
     expect(isCliUserError(foreign)).toBe(true);
-    const harnessCopy = await import(`../harness/harness-cli-command.ts?copy=${Date.now()}`);
-    const foreignHarness = new harnessCopy.HarnessCliInputError('remote harness input');
+    const foreignHarness = new copy.HarnessCliInputError('remote harness input');
     expect(foreignHarness instanceof HarnessCliInputError).toBe(false);
     expect(isCliUserError(foreignHarness)).toBe(true);
 

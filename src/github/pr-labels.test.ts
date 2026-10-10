@@ -9,7 +9,7 @@ describe('PR label registry', () => {
       'elanous:running', 'elanous:stalled', 'elanous:idea-approval', 'elanous:superseded',
     ]);
     expect(labelsForAxis('addon').map(({ name }) => name)).toEqual([
-      'elanous:keep', 'elanous:release-hold', 'elanous:idea-stale', 'elanous:needs-rebase',
+      'elanous:keep', 'elanous:release-hold', 'elanous:idea-stale', 'elanous:needs-rebase', 'elanous:harvestable',
     ]);
     expect(labelsForAxis('origin').map(({ name }) => name)).toEqual([
       'elanous:from-harness', 'elanous:from-intake', 'elanous:from-linear',
@@ -31,6 +31,7 @@ describe('PR label registry', () => {
     expect(STALLED_DRAFT_HOURS).toBe(24);
     expect(CLAIM_IDLE_HOURS).toBe(6);
     expect(PR_LABELS.find(({ name }) => name === 'elanous:stalled')?.sweep).toEqual({ action: 'close', afterHours: 24 });
+    expect(PR_LABELS.find(({ name }) => name === 'elanous:harvestable')).toMatchObject({ axis: 'addon', appliedBy: ['harness'], sweep: { action: 'close', afterHours: STALLED_DRAFT_HOURS } });
     expect(PR_LABELS.find(({ name }) => name === 'elanous:idea-stale')?.sweep).toEqual({ action: 'notify', afterDays: 7 });
     expect(PR_LABELS.find(({ name }) => name === 'elanous:idea-approval')?.sweep).toEqual({ action: 'none' });
     expect(PR_LABELS.find(({ name }) => name === 'elanous:keep')?.sweep).toEqual({ action: 'exclude' });

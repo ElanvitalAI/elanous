@@ -103,6 +103,13 @@ describe('parseJudge', () => {
     const raw = '{"verdict":"merge","asks":[],"reason":"keep {this}","evidence":{"file":"a.ts"}}';
     expect(parseJudge(raw)).toMatchObject({ verdict: 'merge', asks: [], reason: 'keep {this}' });
   });
+  // TA-LAND-MUSTFIX-ZERO — asks 가 없거나 못 읽으면 `[]` 를 «0» 으로 내지 않고 «모름» 표지를 단다.
+  test('asks 없음·배열 아님·문자열 아닌 원소는 asksUnreadable · 정상 배열은 표지 없음', () => {
+    expect(parseJudge('{"verdict":"merge","reason":"ok"}')).toMatchObject({ verdict: 'merge', asks: [], asksUnreadable: true });
+    expect(parseJudge('{"verdict":"merge","asks":"none","reason":"ok"}').asksUnreadable).toBe(true);
+    expect(parseJudge('{"verdict":"merge","asks":["keep",3],"reason":"ok"}')).toMatchObject({ asks: ['keep'], asksUnreadable: true });
+    expect(parseJudge('{"verdict":"merge","asks":[],"reason":"ok"}').asksUnreadable).toBeUndefined();
+  });
   test('JSON 없음은 기존 no-json 사유로 ambiguous다', () => {
     expect(parseJudge('그냥 텍스트')).toMatchObject({ verdict: 'ambiguous', asks: [], reason: 'no-json: 그냥 텍스트' });
   });

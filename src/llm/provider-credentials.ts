@@ -45,7 +45,9 @@ const ENV_KEY_OVERLAY: Readonly<Record<string, string>> = {
  *  인지 정해지지 않았다"** 이다. production 은 미지정 provider 를 `normalizeProvider()` 로 `auto` 로
  *  만들므로, `auto` 를 keyless 로 분류하면 `undefined` 만 고쳐도 **실제 경로에서는 누락 경고가 계속
  *  억제된다**(4R 수정이 절반만 된 지점). 로컬 실행은 `local`/`ollama` 로 명시된다. */
-const KEYLESS_PROVIDERS: ReadonlySet<string> = new Set(['local', 'ollama']);
+// ⭐ BEDROCK-PROVIDER — `bedrock` 은 «API 키»가 아니라 AWS 기본 자격 체인(env·~/.aws·SSO·IMDS)으로 선다.
+//   키 칸(rotation·env 키)이 비는 것이 정상이므로 누락 경고를 내지 않는다 — 실제 해석은 공급자가 호출 때 한다.
+const KEYLESS_PROVIDERS: ReadonlySet<string> = new Set(['local', 'ollama', 'bedrock']);
 
 /** catalog 에서 provider → envKey 를 접어 만든 파생 맵(모듈 1회). 카탈로그가 자라면 자동 반영된다.
  *  ⚠️ 캐시는 **불변** BUILTIN_CATALOG 기반이라 무효화 훅을 두지 않는다(리뷰 should-fix: 테스트 편의로

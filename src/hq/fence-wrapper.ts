@@ -69,6 +69,13 @@ if [ $# -lt 1 ] || [ -z "$1" ]; then
 fi
 ROLE=$1
 shift
+# FENCE-LIGHT: only when this host's heartbeat left a lease-cache file and the installed package ships the light fence.
+# No cache file = exactly the CLI path below. The sourced script always exits; returning is a fail-closed error.
+if [ -f "$CONFIG_DIR/hq/lease-cache" ] && [ -f scripts/hq/hq-fence-wrapper.sh ]; then
+  . scripts/hq/hq-fence-wrapper.sh
+  log_line "light fence returned without a decision (role=$ROLE)"
+  exit 1
+fi
 "$BUN" "$ENTRY" --config-dir "$CONFIG_DIR" hq fence --role "$ROLE" -- /bin/sh -c "$*"
 rc=$?
 if [ "$rc" -ne 0 ]; then alert "hq-fence: fence failed (rc=$rc, role=$ROLE)"; fi

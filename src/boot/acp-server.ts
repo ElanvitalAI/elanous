@@ -25,8 +25,8 @@
 // test.
 
 import { mkdirSync } from 'node:fs';
-import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { dirname, join as joinPath } from 'node:path';
+import { defaultUnixSocketPath } from './acp-socket-path.js';
+import { dirname } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 
 import {
@@ -37,6 +37,8 @@ import {
 import { runAcpServer, type AcpServerOptions } from '../acp/server.js';
 import type { LlmBrand } from '../llm-vision-capability.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
+
+export { defaultUnixSocketPath } from './acp-socket-path.js';
 
 export type AcpBootTransport = 'stdio' | 'unix-socket' | 'websocket';
 
@@ -54,11 +56,6 @@ export interface AcpBootOptions {
   noAuth?: boolean;
   /** Optional ACP tool cwd fallback; overrides ELANOUS_TOOL_CWD when set. */
   toolCwd?: string;
-}
-
-/** Default socket path — XDG-ish; `~/.elanous/elanous.sock`. */
-export function defaultUnixSocketPath(): string {
-  return joinPath(getElanousConfigDir(), 'elanous.sock');
 }
 
 /** Default websocket bind port. Mnemonic: π × 10⁴. */

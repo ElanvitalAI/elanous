@@ -11,7 +11,7 @@ import {
   type OrchestrateCliDeps,
 } from './orchestrate-cli.js';
 import type { DevPipelineSpec, OrchestrateRuntime } from './dev-pipeline.js';
-import { orchestrateSelfDev, type SelfDevJobResult } from './orchestrate.js';
+import { orchestrateSelfDev, type SelfDevJobResult, type SelfDevGoal } from './orchestrate.js';
 import { parseSelfImplementJson, type SelfImplementJobSpawn } from '../task-orchestrator/surfaces/self-implement.js';
 
 const jr = (over: Partial<SelfDevJobResult> = {}): SelfDevJobResult =>
@@ -508,6 +508,111 @@ describe('런 슈퍼바이저 — 중앙 심이 스위치를 «소유»한다', 
       'label#101:elanous:superseded', 'comment#101:102', 'close#101',
       'label#102:elanous:superseded', 'comment#102:103', 'close#102',
     ]);
+  });
+
+  it('records per-strategy launches from the actual supervised execution caller, not carried results', async () => {
+    const failed = (taskId: string, feature: string): SelfDevJobResult => jr({
+      taskId, feature, status: 'failed', stage: 'gate-failed', error: { code: 'GATE_FAILED', message: 'fix required' },
+    });
+    const first = [failed('old-a', 'a'), failed('old-b', 'b')];
+    const second = [jr({ taskId: 'new-a', feature: 'a', status: 'done', stage: 'merged', merged: true }), first[1]!];
+    const calls: SelfDevJobResult[][] = [];
+    const observations: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'self-dev.supervisor' && event === 'strategy.launch') observations.push(data as Record<string, unknown>);
+    });
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'a' }, { feature: 'b' }], runtime: {}, supervise: { rounds: 1, stallRounds: 99 } },
+        { executeReroute: (async (spec, runtime) => {
+          calls.push(runtime.resumeFrom ?? []);
+          if (calls.length === 2) runtime.onTaskLaunched?.(spec.parallel!.goals[0]!, 'new-a', 'old-a');
+          return { results: calls.length === 1 ? first : second, exitCode: 1 };
+        }) as OrchestrateCliDeps['executeReroute'],
+          readProposals: () => ({ proposals: new Map(), goalPlanRevisions: new Map(),
+            scannedFiles: 0, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/empty' }) },
+      );
+      expect(out.ok).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(calls[1]).toEqual(first);
+      expect(observations).toEqual([{ strategy: 'rework', round: 1, requested: 2, launched: 1, taskIds: ['new-a'] }]);
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps transient rerun launches separate from rework, including an unlaunched carry', async () => {
+    const transient = jr({ taskId: 'old-r', feature: 'retry', status: 'failed', stage: 'error',
+      error: { code: 'SELF_IMPL_FAILED', message: "cannot lock ref 'refs/remotes/origin/main'" } });
+    const rework = jr({ taskId: 'old-w', feature: 'fix', status: 'failed', stage: 'gate-failed',
+      error: { code: 'GATE_FAILED', message: 'fix required' } });
+    const initial = [transient, rework];
+    const next = [jr({ taskId: 'new-r', feature: 'retry', status: 'done', stage: 'merged', merged: true }), rework];
+    const observations: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'self-dev.supervisor' && event === 'strategy.launch') observations.push(data as Record<string, unknown>);
+    });
+    let calls = 0;
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'retry' }, { feature: 'fix' }], runtime: {}, supervise: { rounds: 1, stallRounds: 99 } },
+        { executeReroute: (async (spec, runtime) => {
+          if (calls++ === 0) return { results: initial, exitCode: 1 };
+          runtime.onTaskLaunched?.(spec.parallel!.goals[0]!, 'new-r', 'old-r');
+          return { results: next, exitCode: 1 };
+        }) as OrchestrateCliDeps['executeReroute'],
+          readProposals: () => ({ proposals: new Map(), goalPlanRevisions: new Map(),
+            scannedFiles: 0, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/empty' }) },
+      );
+      expect(out.ok).toBe(true);
+      expect(calls).toBe(2);
+      expect(observations).toEqual([
+        { strategy: 'rerun', round: 1, requested: 1, launched: 1, taskIds: ['new-r'] },
+        { strategy: 'rework', round: 1, requested: 1, launched: 0, taskIds: [] },
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  it('the real orchestrator reports the launched task and its selected resume predecessor', async () => {
+    const older = jr({ taskId: 'older-task', feature: 'shared', status: 'failed', stage: 'gate-failed' });
+    const predecessor = jr({ taskId: 'prior-task', feature: 'shared', status: 'failed', stage: 'gate-failed' });
+    const goal = { id: 'shared-goal', feature: 'shared' };
+    const links: Array<{ goal: SelfDevGoal; taskId: string; priorTaskId: string | undefined }> = [];
+    const result = await orchestrateSelfDev({
+      goals: [goal], resumeFrom: [older, predecessor],
+      spawn: (input) => ({ address: `self-impl:${input.spaceId}`, done: Promise.resolve({ exitCode: 0, output: '' }) }),
+      onTaskLaunched: (launchedGoal, taskId, priorTaskId) => links.push({ goal: launchedGoal, taskId, priorTaskId }),
+    });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toEqual({ goal, taskId: result[0]!.taskId, priorTaskId: predecessor.taskId });
+    expect(links[0]!.taskId).not.toBe(predecessor.taskId);
+  });
+
+  it('does not credit an older rework when a transient retry shares its feature', async () => {
+    const failed = (taskId: string, stage: string, message: string): SelfDevJobResult => jr({
+      taskId, feature: 'shared', status: 'failed', stage, error: { code: 'SELF_IMPL_FAILED', message },
+    });
+    const oldRetry = failed('old-retry', 'error', "cannot lock ref 'refs/remotes/origin/main'");
+    const oldRework = failed('old-rework', 'gate-failed', 'fix required');
+    const next = jr({ taskId: 'new-retry', feature: 'shared', status: 'done', stage: 'merged', merged: true });
+    const observed: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'self-dev.supervisor' && event === 'strategy.launch') observed.push(data as Record<string, unknown>);
+    });
+    let calls = 0;
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ id: 'a', feature: 'shared' }], runtime: {}, supervise: { rounds: 1 } },
+        { executeReroute: (async (spec, runtime) => {
+          if (calls++ === 0) return { results: [oldRework, oldRetry], exitCode: 1 };
+          runtime.onTaskLaunched?.(spec.parallel!.goals[0]!, next.taskId, oldRetry.taskId);
+          return { results: [next], exitCode: 0 };
+        }) as OrchestrateCliDeps['executeReroute'],
+          readProposals: () => ({ proposals: new Map(), goalPlanRevisions: new Map(),
+            scannedFiles: 0, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/empty' }) },
+      );
+      expect(out.ok).toBe(true);
+      expect(calls).toBe(2);
+      expect(observed).toEqual([{ strategy: 'rerun', round: 1, requested: 1, launched: 1, taskIds: ['new-retry'] }]);
+    } finally { log.mockRestore(); }
   });
 
   it('⛔ 전부 착지하면 «한 번»에 선다 — 다시 걸 것이 없다', async () => {

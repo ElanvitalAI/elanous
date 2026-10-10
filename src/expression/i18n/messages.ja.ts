@@ -39,6 +39,10 @@ export const messagesJa: Messages = {
   rangeError: '値は {min} から {max} の範囲で指定してください。',
   patternError: '"{value}" は想定された形式と一致しません。',
 
+  // Chat fallback
+  chatNoSynthesisLead: '回答を最後まで書けませんでした — ツールを {n} 回使ううちに、まとめる時間が尽きました。質問を絞ってもう一度聞いてください(例: ひとつだけ)。',
+  chatFoldedInternalTail: '● 内部記録を折りたたみ · {n} 行 · f で展開',
+
   // Async + status
   loading: '読み込み中…',
   saving: '保存中…',
@@ -76,6 +80,7 @@ export const messagesJa: Messages = {
   setupBanner: 'elanous — セットアップウィザード',
   setupWritingTo: '保存先: {path}',
   setupComplete: 'セットアップ完了',
+  setupErrorReportNotice: '問題が起きると、elanous はエラーを運営チームに自動で報告します(エラー内容・バージョン・ランダムなインストール ID — 名前やメールは送りません)。オフにするには: elanous config set errorReports.enabled false',
   setupRerunHint: '再実行: {cmd}',
 
   // Setup wizard — Step 1 (LLM provider)

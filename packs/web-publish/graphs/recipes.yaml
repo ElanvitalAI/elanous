@@ -1,0 +1,72 @@
+# web-publish recipes — 그래프는 새로 씀. 방법론 출처: passeth/business-motion-websites (MIT · © 2026 passeth · https://github.com/passeth/business-motion-websites) · 원작자 허락(2026-10-09)
+# 모든 cmd 는 run-step.ts 하나로 간다(생성·외부 호출 0). dry_run_command = 외부 호출 없는 드라이런.
+brief:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" brief'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" brief --dry'
+  timeout_ms: 20000
+absorb:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" absorb'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" absorb --dry'
+  timeout_ms: 20000
+strategy:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" strategy'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" strategy --dry'
+  timeout_ms: 20000
+hero-slice:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" hero-slice'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" hero-slice --dry'
+  timeout_ms: 20000
+media:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" media'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" media --dry'
+  timeout_ms: 20000
+audit-media:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" audit-media'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" audit-media --dry'
+  timeout_ms: 120000
+motion:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" motion'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" motion --dry'
+  timeout_ms: 20000
+qa:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" qa'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" qa --dry'
+  timeout_ms: 20000
+publish:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" publish'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" publish --dry'
+  timeout_ms: 60000
+verify-public:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" verify-public'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" verify-public --dry'
+  timeout_ms: 20000
+unobserved:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" unobserved'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" unobserved --dry'
+  timeout_ms: 20000
+done:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" done'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" done --dry'
+  timeout_ms: 20000
+failed:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" failed'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" failed --dry'
+  timeout_ms: 20000
+wait-absorb:
+  approval: '대기 — 참고 사이트에서 «값»만(색·활자·간격·배치·모션 수치) ref/seed.json 에 남겼나? 글·사진·로고·폰트 파일은 가져오지 않는다(자동 검사는 파일 참조·data: URI 만 거른다 — 옮겨 온 문구·인라인 자산은 사람이 본다). 승인하면 absorb_ref 재검사(반려 = 중단)'
+wait-strategy:
+  approval: '대기 — strategy/claims.json(주장 근거 등급) ⊕ strategy/page-map.json(페이지 지도: 질문→답→근거(evidence)→관련(related)→다음 행동) ⊕ DESIGN.md 를 썼나? 승인하면 strategy 재검사(반려 = 중단)'
+plan-approval:
+  approval: '기획 승인 — 브리프 ⊕ 주장 근거 표(미확인 주장은 공개 문구에 없다) ⊕ 페이지 지도 ⊕ DESIGN.md 를 확인했나? (반려 = strategy 로 되돌림)'
+wait-build:
+  approval: '대기 — site/index.html(대표 구간) ⊕ DESIGN.md 에서 만든 site/tokens.css 를 끝냈나? 승인하면 hero_slice 재검사(반려 = 중단)'
+wait-media:
+  approval: '대기 — media-manifest.json(자산마다 역할·권리 근거) ⊕ 생성 비용 장부(ledger/media_spend.jsonl)를 끝냈나? 미디어 검사 실패를 고쳤나? 승인하면 media 재검사(반려 = 중단)'
+wait-qa:
+  approval: '대기 — qa/qa-report.json(무엇으로 쟀나 ruler=webclone|manual ⊕ 폭 390·768·1280 판정 ⊕ 모션 감소 시 본문·CTA ⊕ 증거 등급: 에뮬/WebKit/실기기 — 안 잰 칸은 unverified)을 썼나? 승인하면 qa 재검사(반려 = 중단)'
+release-approval:
+  approval: '발행 승인 — QA 표 ⊕ 스크린숏 ⊕ 미디어 검사 결과를 확인했나? 승인하면 발행 어댑터가 돈다(반려 = hero_slice 로 되돌림)'
+wait-publish:
+  approval: '대기 — 발행 어댑터(pub | vercel)가 안내한 명령을 직접 실행하고 release/publish-record.json(target·url·at — 이번 승인 뒤 시각)을 썼나? 승인하면 publish 재검사(반려 = 중단)'
+wait-motion:
+  approval: '대기 — 스크롤·모션·모바일을 구현하고 motion/motion-plan.json(항목마다 element·kind(5종)·reduced_motion·mobile · 모션 없으면 [])을 썼나? 승인하면 motion 재검사(반려 = 중단)'

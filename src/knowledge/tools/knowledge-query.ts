@@ -2,10 +2,12 @@
 
 import type { LLMToolSpec } from '../../llm.js';
 import { discoverObsidianVault, type ObsidianVault } from '../../auto-research/obsidian-bridge.js';
-import { knowledgeQuery } from '../query.js';
+import { knowledgeQuery, queryInstalledPack } from '../query.js';
 import type { KnowledgeQueryInput, KnowledgeQueryResult } from '../types.js';
 
 export interface KnowledgeQueryToolInput {
+  pack_id?: string;
+  question?: string;
   tags?: string[];
   fulltext?: string;
   kind?: 'all' | 'rca' | 'a3' | 'incident' | 'wiki' | 'repomap' | 'note';
@@ -16,6 +18,8 @@ export interface KnowledgeQueryToolInput {
 
 export interface KnowledgeQueryToolResult {
   output: string;
+  /** Cited cards when pack_id is supplied; absent on the existing vault query path. */
+  pack_hits?: ReturnType<typeof queryInstalledPack>;
   results: KnowledgeQueryResult['results'];
   total: number;
   truncated: boolean;
@@ -24,12 +28,24 @@ export interface KnowledgeQueryToolResult {
 
 export interface KnowledgeQueryDispatchOpts {
   vault?: ObsidianVault;
+  searchPack?: typeof queryInstalledPack;
 }
 
 export async function dispatchKnowledgeQuery(
   input: KnowledgeQueryToolInput,
   opts: KnowledgeQueryDispatchOpts = {},
 ): Promise<KnowledgeQueryToolResult> {
+  if (input.pack_id !== undefined) {
+    try {
+      if (!input.question?.trim()) throw new Error('question required for pack search');
+      const hits = (opts.searchPack ?? queryInstalledPack)(input.pack_id, input.question);
+      return { output: hits.map(hit => `[${hit.ref}] ${hit.title}: ${hit.body}`).join('\n') || 'No matching installed pack cards.',
+        pack_hits: hits, results: [], total: hits.length, truncated: false };
+    } catch (error) {
+      return { output: `KnowledgeQuery failed: ${error instanceof Error ? error.message : String(error)}`,
+        pack_hits: [], results: [], total: 0, truncated: false };
+    }
+  }
   const vault = opts.vault ?? discoverObsidianVault();
   const notices: string[] = [];
   if (vault.isSimulated) {
@@ -75,13 +91,15 @@ export function buildKnowledgeQueryTool(): LLMToolSpec {
   return {
     name: 'KnowledgeQuery',
     description:
-      'Search the Obsidian knowledge vault (or simulated fallback) for notes matching tags, fulltext regex, '
+      'Search an explicitly installed knowledge pack by pack_id and question for cited cards, or search the Obsidian knowledge vault (or simulated fallback) for notes matching tags, fulltext regex, '
       + 'or kind. Returns paths + parsed frontmatter + excerpts (and optionally full body). Use this to look '
       + 'up prior incident analyses, tool docs, repo maps, or any markdown you or another agent wrote earlier. '
       + 'For writing, use KnowledgeWrite.',
     parameters: {
       type: 'object',
       properties: {
+        pack_id: { type: 'string', description: 'Installed pack id, e.g. pack:semiconductor-process-public@0.1.0. Requires question.' },
+        question: { type: 'string', description: 'Search words when pack_id is provided.' },
         tags: {
           type: 'array',
           items: { type: 'string' },

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { healthUrlFor, hqArbiterCheck, hqFenceDecision, hqHeartbeat, hqHostSet, hqLease, hqSeen, readLocal, readSeenGeneration } from './hq.js';
-import { decideArbiterCheck, decideFence, fileLeaseStore, parseLease, probeReachable, sha, type HostProbe, type LeaseStore, type SshRunner } from './lease.js';
+import { decideArbiterCheck, decideFence, fileLeaseStore, parseLease, probeReachable, serializeLease, serializeLocalLeaseCache, sha, type HostProbe, type LeaseStore, type SshRunner } from './lease.js';
 
 let dir = '';
 let clock = 1_000_000;
@@ -228,6 +228,74 @@ describe('HQ lease (HQ-HB)', () => {
     expect(parseLease(store.raw)).toMatchObject({ holder: 'node-b', generation: 2 });
   });
 
+  test('local cache serialization is separate from and cannot change the lease ledger format', () => {
+    const record = { holder: 'mbp', generation: 3, acquiredAt: clock, renewedAt: clock, ttlSeconds: 1500 };
+    expect(serializeLease(record)).toBe(`${JSON.stringify(record)}\n`);
+    expect(serializeLocalLeaseCache({ holder: 'mbp', generation: 3, confirmedAt: clock, expiresAt: clock + 660,
+      host: 'mbp', machine: 'mbp-machine' })).toBe(`mbp 3 ${clock + 660} mbp mbp-machine ${clock}\n`);
+    expect(() => serializeLocalLeaseCache({ holder: 'mbp injected', generation: 3, confirmedAt: clock,
+      expiresAt: clock + 660, host: 'mbp', machine: 'mbp-machine' })).toThrow('invalid local lease cache');
+    expect(() => serializeLocalLeaseCache({ holder: 'mbp', generation: 3, confirmedAt: clock,
+      expiresAt: clock + 661, host: 'mbp', machine: 'mbp-machine' })).toThrow('invalid local lease cache');
+  });
+
+  test('heartbeat refreshes short-lived host-local cache without altering the lease ledger or return contract', () => {
+    const machine = hostname().replace(/\.local$/, '');
+    const store = memStore();
+    const holder = deps('mbp', store, fakeSsh(new Set()));
+    hqLease('acquire', holder);
+    const first = hqHeartbeat(holder);
+    expect(first).toEqual({ outcome: 'renewed', generation: 1 });
+    const cache = join(dir, 'lease-cache');
+    expect(readFileSync(cache, 'utf8')).toBe(`mbp 1 ${clock + 660} mbp ${machine} ${clock}\n`);
+    expect(statSync(cache).mode & 0o777).toBe(0o600);
+    clock += 600;
+    expect(hqHeartbeat(holder)).toEqual(first);
+    expect(readFileSync(cache, 'utf8')).toBe(`mbp 1 ${clock + 660} mbp ${machine} ${clock}\n`);
+    expect(parseLease(store.raw)).toMatchObject({ holder: 'mbp', generation: 1, renewedAt: clock, ttlSeconds: 1500 });
+    store.down = true;
+    expect(hqHeartbeat(holder).outcome).toBe('arbiter-unreachable');
+    expect(() => readFileSync(cache)).toThrow();
+    store.down = false;
+    hqHeartbeat(holder);
+    expect(hqLease('release', holder, { expectedHolder: 'mbp', expectedGeneration: 1 }).ok).toBe(true);
+    expect(() => readFileSync(cache)).toThrow();
+    hqHeartbeat(holder);
+    expect(() => readFileSync(cache)).toThrow();
+  });
+
+  test('FENCE-LIGHT: a CLI fence «do not run» (promotion seen) retires the holder cache at once', () => {
+    const store = memStore();
+    const holder = deps('mbp', store, fakeSsh(new Set()));
+    hqLease('acquire', holder);
+    hqHeartbeat(holder);
+    const cache = join(dir, 'lease-cache');
+    expect(readFileSync(cache, 'utf8')).toContain('mbp 1 ');
+    store.raw = serializeLease({ ...parseLease(store.raw)!, holder: 'node-b', generation: 2, renewedAt: clock });
+    expect(hqFenceDecision('cron', holder)).toMatchObject({ run: false, reason: 'not-holder' });
+    expect(() => readFileSync(cache)).toThrow();
+  });
+
+  test('standby does not cache an earlier generation if its view CAS raced a promotion', () => {
+    const backing = memStore();
+    const holder = deps('mbp', backing, fakeSsh(new Set()));
+    hqLease('acquire', holder);
+    const racing: LeaseStore = {
+      read: () => backing.read(),
+      cas: (expected, next) => {
+        const proposed = parseLease(next);
+        if (proposed?.views?.node-b) {
+          const current = parseLease(backing.raw)!;
+          backing.raw = serializeLease({ ...current, holder: 'node-b', generation: 2, renewedAt: clock });
+          return false;
+        }
+        return backing.cas(expected, next);
+      },
+    };
+    expect(hqHeartbeat(deps('node-b', racing, fakeSsh(new Set()))).outcome).toBe('standby');
+    expect(() => readFileSync(join(dir, 'lease-cache'))).toThrow();
+  });
+
   test('heartbeat: holder renews, non-holder stays standby and reports its view of the holder', () => {
     const store = memStore();
     hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
@@ -235,6 +303,7 @@ describe('HQ lease (HQ-HB)', () => {
     expect(hqHeartbeat(deps('mbp', store, fakeSsh(new Set()))).outcome).toBe('renewed');
     const standby = hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
     expect(standby).toMatchObject({ outcome: 'standby', holder: 'mbp', holderReachable: false });
+    expect(() => readFileSync(join(dir, 'lease-cache'))).toThrow(); // FENCE-LIGHT: a standby never writes the fast-path hint
     expect(parseLease(store.raw)?.views?.node-b).toMatchObject({ target: 'mbp', reachable: false, at: clock });
     expect(logs.some(([c, e]) => c === 'hq.lease' && e === 'standby')).toBe(true);
   });

@@ -4,7 +4,7 @@ import { isScalar, parseDocument } from 'yaml';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { DEFAULT_FALLBACK_CHAIN, isFallbackStep, type FallbackStep } from '../oauth/fallback-chain.js';
 import { isCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
-import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig } from '../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig, type SubscriptionReviewerSpec } from '../user-config.js';
 
 export interface LlmPolicy {
   version: 1;
@@ -162,6 +162,19 @@ function removeExpired(input: Obj, now: Date, warnings: string[], prefix = ''): 
       warnings.push(`${path} expired on ${value.until}; ignored`);
     } else removeExpired(value, now, warnings, path);
   }
+}
+
+/**
+ * The reviewer ACP lane (`roleLlm.reviewer`) and its usage cap, resolved once for every caller.
+ * The harness (`dev-pipeline`) and `elanous self review` read the same policy row, so the two
+ * reviewers cannot drift apart on which config selects the subscription reviewer.
+ */
+export function resolveSubscriptionReviewer(
+  loaded: LoadedLlmPolicy,
+  userRoleLlm?: RoleLlmConfig,
+): { spec: SubscriptionReviewerSpec; cap: number } | undefined {
+  const spec = loaded.policy.roles.reviewer ?? userRoleLlm?.reviewer;
+  return spec ? { spec, cap: loaded.policy.caps.claude.harness } : undefined;
 }
 
 export function loadLlmPolicy(opts: LoadLlmPolicyOptions = {}): LoadedLlmPolicy {

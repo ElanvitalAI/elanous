@@ -3,6 +3,9 @@ import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-l
 import { DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, runDraftSweep, supersedeDraftsOnMerge, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
+import { activeClaimOwnerFromBodies, activeClaimRunIdFromBodies, lastClaimReleaseAtFromBodies } from '../harness/harness-cli-command.js';
+import type { TaskCard } from '../task-agent/task-hand.js';
+import type { PrTerminalRecord } from './draft-residue.js';
 
 const state = (name: string) => PR_LABELS.find((entry) => entry.axis === 'state' && entry.name.endsWith(name))!.name;
 const running = state('running');
@@ -231,7 +234,7 @@ describe('supersedeDraftsOnMerge', () => {
 
 describe('draft metrics', () => {
   it('counts open inventory, oldest age and missing claim owner; converts only merged PRs within 48h of creation', async () => {
-    const rows = [draft(1, { createdAt: '2026-09-29T00:00:00Z' }),
+    const rows = [draft(1, { createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T23:00:00Z' }),
       draft(2, { createdAt: '2026-09-26T00:00:00Z' }),
       draft(3, { branch: 'human/other', labels: [], createdAt: '2026-09-29T00:00:00Z' })];
     const fixture = make(rows);
@@ -241,7 +244,8 @@ describe('draft metrics', () => {
       { number: 11, title: 'late', branch: 'self-impl/late', draft: true, labels: [], createdAt: '2026-09-27T23:00:00Z', mergedAt: '2026-09-30T00:00:00Z' },
     ];
     expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
-      inventory: 2, oldestAgeHours: 96, needsOwner: 1, converted48h: 1, cohort48h: 3, conversion48h: 1 / 3,
+      inventory: 2, oldestAgeHours: 96, needsOwner: 1, claimUnobserved: 0,
+      converted48h: 1, cohort48h: 3, conversion48h: 1 / 3,
     });
     expect(draftSweepDaily(rows, [], now, new Map())).toEqual({ date: '2026-09-30', over24h: 2, closable: 0, harvestable: 0, blocked: 0 });
     fixture.adapters.listRecentClosed = async () => [{ number: 12, title: 'labelled', branch: 'topic/labelled', draft: true,
@@ -262,7 +266,8 @@ describe('draft metrics', () => {
     fixture.adapters.listRecentClosed = async () => [];
     fixture.adapters.getActiveClaimOwner = async () => undefined;
     expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toEqual({
-      inventory: 0, oldestAgeHours: null, needsOwner: 0, converted48h: 0, cohort48h: 0, conversion48h: null,
+      inventory: 0, oldestAgeHours: null, needsOwner: 0, claimUnobserved: 0,
+      converted48h: 0, cohort48h: 0, conversion48h: null,
     });
     fixture.adapters.listRecentClosed = undefined;
     expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('48h closed cohort unavailable');
@@ -274,6 +279,290 @@ describe('draft metrics', () => {
     fixture.adapters.listRecentClosed = async () => [{ number: 5, title: 'duplicate', branch: 'self-impl/duplicate', draft: true,
       labels: [], createdAt: '2026-09-28T00:00:00Z' }];
     expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Overlapping draft metric inventory');
+  });
+});
+
+describe('automatic draft claim lifecycle', () => {
+  const R = 'run-child-R';
+  const card = (id: string, pr: number): TaskCard => ({ id, text: 'draft', seat: 'UX', status: 'launched',
+    completion: 'code-pr', createdAt: now.toISOString(), history: [], runId: `run-parent-${id}`, runChildId: R, pr: { number: pr } });
+  const fixtureFor = (rows: SweepDraft[], cards: TaskCard[]) => {
+    const labels = new Map(rows.map((row) => [row.number, [...row.labels]]));
+    const comments = new Map(rows.map((row) => [row.number, [] as string[]]));
+    const fixture = make(rows);
+    let terminals: PrTerminalRecord[] = [];
+    fixture.adapters.listDrafts = async () => rows.map((row) => ({ ...row, labels: labels.get(row.number)!,
+      updatedAt: comments.get(row.number)!.length ? now.toISOString() : row.updatedAt }));
+    fixture.adapters.listRecentClosed = async () => [];
+    fixture.adapters.listTaskCards = async () => cards;
+    fixture.adapters.listPrTerminals = async () => terminals;
+    fixture.adapters.getActiveClaimOwner = async (_repo, number) => activeClaimOwnerFromBodies(comments.get(number)!);
+    fixture.adapters.getActiveClaimRunId = async (_repo, number) => activeClaimRunIdFromBodies(comments.get(number)!);
+    fixture.adapters.getLastClaimReleaseAt = async (_repo, number) => lastClaimReleaseAtFromBodies(comments.get(number)!);
+    fixture.adapters.setLabels = async (_repo, number, change) => {
+      labels.set(number, [...labels.get(number)!.filter((name) => !change.remove.includes(name) && name !== change.add), change.add]);
+      fixture.calls.push(`label:${number}:${change.add}`);
+    };
+    fixture.adapters.removeLabel = async (_repo, number, name) => { labels.set(number, labels.get(number)!.filter((label) => label !== name)); };
+    fixture.adapters.commentDraft = async (_repo, number, body) => { comments.get(number)!.push(body); };
+    return { ...fixture, labels, comments, setTerminals: (next: PrTerminalRecord[]) => { terminals = next; } };
+  };
+
+  it('shares freshness/expiry/unobserved decisions between metrics and sweep', async () => {
+    const rows = [draft(1, { updatedAt: new Date(now.getTime() - 3_600_000).toISOString() }),
+      draft(2, { updatedAt: new Date(now.getTime() - 7 * 3_600_000).toISOString() }),
+      draft(3, { updatedAt: undefined })];
+    const fixture = make(rows);
+    fixture.adapters.listRecentClosed = async () => [];
+    fixture.adapters.getActiveClaimOwner = async () => 'TC';
+    expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toMatchObject({ inventory: 3, needsOwner: 1, claimUnobserved: 1 });
+    fixture.statuses.set(2, 'running');
+    expect(await sweep(fixture.adapters)).toMatchObject({ claimed: 1, claimExpired: 1 });
+  });
+
+  it('claims each uniquely owned draft once and releases only after the matching immutable terminal', async () => {
+    const rows = [draft(501, { labels: [], updatedAt: now.toISOString() }), draft(502, { labels: [], updatedAt: now.toISOString() })];
+    const cards = [card('one', 501), card('two', 502)];
+    const fixture = fixtureFor(rows, cards);
+    const record: PrTerminalRecord = { childRunId: R, prNumber: 501, prUrl: 'https://github.com/owner/repo/pull/501',
+      repository: 'owner/repo', headSha: null, terminalClass: 'merge-ready-not-merged', stage: null,
+      owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 1, alreadyClosed: 1 });
+      expect(fixture.labels.get(501)).toContain(running);
+      expect(fixture.comments.get(501)).toEqual([`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`]);
+      expect(fixture.comments.get(502)).toHaveLength(1);
+      expect((await collectDraftMetrics('owner/repo', fixture.adapters, now)).needsOwner).toBe(0);
+      await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 1, alreadyClosed: 1 });
+      expect(fixture.comments.get(501)).toHaveLength(1);
+      fixture.setTerminals([record]);
+      const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 1, alreadyClosed: 1 });
+      expect(fixture.comments.get(501)?.at(-1)).toBe(`🔧 처리 끝 — ${now.toISOString()} · run ${R} · merge-ready-not-merged`);
+      expect(fixture.labels.get(501)).not.toContain(running);
+      await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 1, alreadyClosed: 1 });
+      expect(fixture.comments.get(501)).toHaveLength(2);
+      expect(activeClaimOwnerFromBodies(fixture.comments.get(501)!)).toBeUndefined();
+      expect(record).toEqual({ childRunId: R, prNumber: 501, prUrl: 'https://github.com/owner/repo/pull/501',
+        repository: 'owner/repo', headSha: null, terminalClass: 'merge-ready-not-merged', stage: null,
+        owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() });
+      expect(result.closed).toBe(0);
+      expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(0);
+      expect(log).toHaveBeenCalledWith('draft.residue', 'claim-released', { prNumber: 501, owner: 'UX', runId: R, reason: 'merge-ready-not-merged' });
+    } finally { log.mockRestore(); }
+  });
+
+  it('skips a terminal from another run of the same PR, including a parent/child mismatch', async () => {
+    const row = draft(550, { labels: [running], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('same-pr', 550)]);
+    fixture.comments.get(550)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run run-unrelated`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 550, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(550)).toHaveLength(1);
+    expect(fixture.labels.get(550)).toContain(running);
+  });
+
+  it('refuses two owners and an unreadable card inventory', async () => {
+    const row = draft(601, { labels: [], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 601), card('two', 601)]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(601)).toEqual([]);
+    fixture.adapters.listTaskCards = async () => undefined;
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(601)).toEqual([]);
+    expect(fixture.labels.get(601)).not.toContain(running);
+  });
+
+  it('resolves an opening child run without a card PR and releases a parent-run claim on the child terminal', async () => {
+    const opener = { ...card('run-only', 900), pr: undefined };
+    const row = draft(901, { labels: [], updatedAt: now.toISOString(), runId: R });
+    const fixture = fixtureFor([row], [opener]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(901)).toEqual([`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`]);
+    fixture.comments.get(901)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${opener.runId}`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 901, repository: 'owner/repo', prUrl: null,
+      headSha: null, terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(901)?.at(-1)).toBe(`🔧 처리 끝 — ${now.toISOString()} · run ${opener.runId} · failed-with-pr`);
+    expect(fixture.labels.get(901)).not.toContain(running);
+  });
+
+  it('does not re-claim a released draft whose terminal is already recorded', async () => {
+    const row = draft(802, { labels: [], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 802)]);
+    fixture.comments.get(802)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`);
+    fixture.comments.get(802)!.push(`🔧 처리 끝 — ${now.toISOString()} · run ${R} · failed-with-pr`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 802, repository: 'owner/repo', prUrl: null, headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(802)).toHaveLength(2);
+    expect(fixture.labels.get(802)).not.toContain(running);
+  });
+
+  it('repairs the missing owner comment after a label-only partial claim without duplicating it', async () => {
+    const row = draft(801, { labels: [], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 801)]);
+    let failComment = true;
+    let labelWrites = 0;
+    fixture.adapters.setLabels = async (_repo, number, change) => {
+      labelWrites++;
+      fixture.labels.set(number, [change.add]);
+    };
+    fixture.adapters.commentDraft = async (_repo, number, body) => {
+      if (failComment) throw new Error('comment denied');
+      fixture.comments.get(number)!.push(body);
+    };
+    await sweep(fixture.adapters, true);
+    expect(fixture.labels.get(801)).toEqual([running]);
+    expect(fixture.comments.get(801)).toEqual([]);
+    failComment = false;
+    await sweep(fixture.adapters, true);
+    await sweep(fixture.adapters, true);
+    expect(fixture.labels.get(801)).toEqual([running]);
+    expect(labelWrites).toBe(1);
+    expect(fixture.comments.get(801)).toEqual([`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`]);
+    expect(activeClaimOwnerFromBodies(fixture.comments.get(801)!)).toBe('UX');
+    expect(activeClaimRunIdFromBodies(fixture.comments.get(801)!)).toBe(R);
+  });
+
+  it('reports a failed release comment after label removal and repairs it on the next sweep', async () => {
+    const row = draft(803, { labels: [running], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 803)]);
+    fixture.comments.get(803)!.push(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 803, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    const comment = fixture.adapters.commentDraft!;
+    let fail = true;
+    fixture.adapters.commentDraft = async (...args) => {
+      if (fail) throw new Error('release comment denied');
+      await comment(...args);
+    };
+    const first = await sweep(fixture.adapters, true);
+    expect(first.entries[0]).toMatchObject({ action: 'keep', applied: false, partialApplied: true,
+      error: 'Error: release comment denied' });
+    expect(first.entries[0]?.reason).not.toBe('claim-released');
+    expect(fixture.labels.get(803)).not.toContain(running);
+    expect(activeClaimOwnerFromBodies(fixture.comments.get(803)!)).toBe('UX');
+    fail = false;
+    const second = await sweep(fixture.adapters, true);
+    expect(second.entries[0]).toMatchObject({ action: 'keep', reason: 'claim-released', applied: true });
+    expect(fixture.comments.get(803)?.at(-1)).toBe(`🔧 처리 끝 — ${now.toISOString()} · run ${R} · failed-with-pr`);
+    expect(activeClaimOwnerFromBodies(fixture.comments.get(803)!)).toBeUndefined();
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(803)).toHaveLength(2);
+  });
+
+  it('repairs a label-only claim after six hours, or holds it when ownership is ambiguous', async () => {
+    const row = draft(804, { labels: [], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 804)]);
+    const comment = fixture.adapters.commentDraft!;
+    let fail = true;
+    fixture.adapters.commentDraft = async (...args) => {
+      if (fail) throw new Error('claim comment denied');
+      await comment(...args);
+    };
+    await sweep(fixture.adapters, true);
+    expect(fixture.labels.get(804)).toContain(running);
+    expect(fixture.comments.get(804)).toHaveLength(0);
+    fixture.adapters.listDrafts = async () => [{ ...row, labels: fixture.labels.get(804)!,
+      updatedAt: new Date(now.getTime() - 7 * 3_600_000).toISOString() }];
+    fail = false;
+    const recovered = await sweep(fixture.adapters, true);
+    expect(recovered.entries[0]?.action).toBe('keep');
+    expect(fixture.comments.get(804)).toEqual([`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`]);
+    expect(activeClaimOwnerFromBodies(fixture.comments.get(804)!)).toBe('UX');
+    expect(fixture.labels.get(804)).toContain(running);
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(0);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(804)).toHaveLength(1);
+
+    const unknown = fixtureFor([draft(805, { labels: [running], updatedAt: new Date(now.getTime() - 7 * 3_600_000).toISOString() })],
+      [card('a', 805), card('b', 805)]);
+    const held = await sweep(unknown.adapters, true);
+    expect(held.entries[0]).toMatchObject({ action: 'keep', applied: false });
+    expect(unknown.comments.get(805)).toHaveLength(0);
+    expect(unknown.calls.filter((call) => call.startsWith('close:'))).toHaveLength(0);
+  });
+
+  it('respects a manual release for the card that was running, but lets a later resume card claim again', async () => {
+    const row = draft(806, { labels: [state('stalled')], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 806)]);
+    fixture.comments.get(806)!.push(`🔧 처리 중 — owner UX · ${new Date(now.getTime() - 3_600_000).toISOString()}`);
+    fixture.comments.get(806)!.push(`🔧 처리 끝 — ${now.toISOString()}`);
+    expect(lastClaimReleaseAtFromBodies(fixture.comments.get(806)!)).toBe(now.toISOString());
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      await sweep(fixture.adapters, true);
+      await sweep(fixture.adapters, true);
+      expect(fixture.comments.get(806)).toHaveLength(2);
+      expect(fixture.labels.get(806)).not.toContain(running);
+      expect(log).toHaveBeenCalledWith('draft.residue', 'claim-skipped', { prNumber: 806, owner: 'UX', runId: R, reason: 'release-respected' });
+    } finally { log.mockRestore(); }
+
+    const resumed = fixtureFor([draft(807, { labels: [], updatedAt: now.toISOString() })],
+      [{ ...card('resume', 807), createdAt: new Date(now.getTime() + 1_000).toISOString() }]);
+    resumed.comments.get(807)!.push(`🔧 처리 끝 — ${now.toISOString()}`);
+    await sweep(resumed.adapters, true);
+    expect(resumed.comments.get(807)?.at(-1)).toBe(`🔧 처리 중 — owner UX · ${now.toISOString()} · run ${R}`);
+    expect(resumed.labels.get(807)).toContain(running);
+    expect(lastClaimReleaseAtFromBodies(resumed.comments.get(807)!)).toBeUndefined();
+  });
+
+  it('keeps another seat\'s claim that names the run when the seat-attributed terminal belongs to a different owner', async () => {
+    const row = draft(808, { labels: [running], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 808)]);
+    fixture.comments.get(808)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run ${R}`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 808, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(808)).toHaveLength(1);
+    expect(fixture.labels.get(808)).toContain(running);
+    expect(activeClaimOwnerFromBodies(fixture.comments.get(808)!)).toBe('TC');
+  });
+
+  it('keeps a label-only partial claim when the run terminal is attributed to another seat', async () => {
+    const fixture = fixtureFor([draft(810, { labels: [running], updatedAt: now.toISOString() })], [card('one', 810)]);
+    fixture.setTerminals([{ childRunId: R, prNumber: 810, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'TC', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.labels.get(810)).toContain(running);
+    expect(fixture.comments.get(810)).toHaveLength(0);
+  });
+
+  it('releases a label-only partial claim once its run terminal arrives', async () => {
+    const row = draft(809, { labels: [], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 809)]);
+    const comment = fixture.adapters.commentDraft!;
+    let fail = true;
+    fixture.adapters.commentDraft = async (...args) => {
+      if (fail) throw new Error('claim comment denied');
+      await comment(...args);
+    };
+    await sweep(fixture.adapters, true);
+    expect(fixture.labels.get(809)).toContain(running);
+    expect(fixture.comments.get(809)).toHaveLength(0);
+    fail = false;
+    fixture.setTerminals([{ childRunId: R, prNumber: 809, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    const released = await sweep(fixture.adapters, true);
+    expect(released.entries[0]).toMatchObject({ action: 'keep', reason: 'claim-released', applied: true });
+    expect(fixture.labels.get(809)).not.toContain(running);
+    expect(fixture.comments.get(809)).toEqual([`🔧 처리 끝 — ${now.toISOString()} · run ${R} · failed-with-pr`]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(809)).toHaveLength(1);
+    expect(fixture.labels.get(809)).not.toContain(running);
+  });
+
+  it('does not overwrite a different active claim or release on a foreign PR terminal', async () => {
+    const row = draft(701, { labels: [running], updatedAt: now.toISOString() });
+    const fixture = fixtureFor([row], [card('one', 701)]);
+    fixture.comments.get(701)!.push(`🔧 처리 중 — owner TC · ${now.toISOString()} · run other-run`);
+    fixture.setTerminals([{ childRunId: R, prNumber: 701, prUrl: null, repository: 'other/repo', headSha: null,
+      terminalClass: 'failed-with-pr', stage: null, owner: 'UX', ownerSource: 'seat', card: null, at: now.toISOString() }]);
+    await sweep(fixture.adapters, true);
+    expect(fixture.comments.get(701)).toHaveLength(1);
+    expect(fixture.labels.get(701)).toContain(running);
   });
 });
 
@@ -860,6 +1149,14 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
     expect(result.entries.filter((entry) => entry.reason === 'close-cap')).toHaveLength(2);
     expect(result.closed).toBe(DRAFT_SWEEP_CLOSE_CAP);
+  });
+  it('closes already made by the pod-terminal replay count against the same tick cap (review must-fix)', async () => {
+    const drafts = Array.from({ length: 5 }, (_, i) => draft(300 + i, { updatedAt: idle(72) }));
+    const fixture = make(drafts);
+    for (const pr of drafts) fixture.statuses.set(pr.number, undefined);
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, now, closeCap: 3, closeCapSource: 'flag', alreadyClosed: 2 });
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(1);
+    expect(result.closed).toBe(1);
   });
 
   it('close cap: default stays 10; config 30 lets 30 closes through in one tick; flag overrides config; invalid falls back to 10', async () => {

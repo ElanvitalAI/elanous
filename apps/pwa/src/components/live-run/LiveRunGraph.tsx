@@ -12,10 +12,11 @@ import { useQuery } from '@tanstack/react-query';
 import { BaseEdge, Background, Controls, EdgeLabelRenderer, Handle, Position, ReactFlow, type EdgeProps, type NodeProps, type ReactFlowInstance } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import '@/components/workflows/node-status.css';
+import '@/lib/graph-wiring.css';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 import type { HarnessRunTraversal, RunGraphDetail } from '@/nexus/client';
 import { RUN_NODE_WIDTH, runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
-import { EDGE_FAMILY_COLOR } from '@/lib/graph-edge-route';
+import { EDGE_FAMILY_COLOR, hoverFocus, WIRING_STYLE, wiringEdgeStyle } from '@/lib/graph-edge-route';
 import type { TidyEdgeData } from '@/components/workflows/TidyEdge';
 import { durationLabel, kstClock, replayDelayMs, sceneAt, type LiveNodeState, type SceneEdge, type TraversalStep } from '@/lib/live-run-scene';
 import { graphFromSteps, mergeWalked, runStatusLabel } from '@/lib/live-run-view';
@@ -75,7 +76,7 @@ interface LiveEdgeData extends TidyEdgeData {
 }
 
 /** Same pre-routed path as the editor's tidy edge; taken edges light up, untaken dim, the active one carries a token. */
-function LiveEdge({ id, data, markerEnd }: EdgeProps) {
+function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
   const edge = data as LiveEdgeData | undefined;
   if (!edge?.route) return null;
   const { route } = edge;
@@ -84,9 +85,9 @@ function LiveEdge({ id, data, markerEnd }: EdgeProps) {
   return (
     <>
       <BaseEdge id={id} path={route.path} markerEnd={markerEnd}
-        style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: '6 4' } : {}) }} />
+        style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: '6 4' } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
       {edge.active && (
-        <g key={edge.tokenKey} data-testid={`edge-token-${route.from}-${route.to}`}>
+        <g key={edge.tokenKey} data-testid={`edge-token-${route.from}-${route.to}`} opacity={style?.opacity}>
           <circle r={7} fill={color} opacity={0.25}>
             <animateMotion dur={`${edge.tokenMs}ms`} fill="freeze" path={route.path} />
           </circle>
@@ -102,6 +103,7 @@ function LiveEdge({ id, data, markerEnd }: EdgeProps) {
               transform: `translate(-50%, -50%) translate(${route.label.x}px, ${route.label.y}px)`, width: route.label.width, textAlign: 'center',
               borderColor: color, color, background: 'var(--background, #fff)', opacity: edge.active || edge.taken ? 1 : 0.35,
               fontWeight: edge.active ? 700 : 500,
+              ...(style?.opacity !== undefined ? { opacity: style.opacity } : {}),
             }}>
             {route.label.text}
           </div>
@@ -164,6 +166,7 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(4);
   const [focus, setFocus] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
   // 카메라 따라가기 — 그래프가 넓으면 전체 맞춤은 글자가 작아진다. 재생·라이브 중엔 지금 노드로 다가가 따라간다.
   const [follow, setFollow] = useState(true);
   const flowRef = useRef<ReactFlowInstance | null>(null);
@@ -208,10 +211,15 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
     return next;
   }), []);
   const tokenMs = effectiveMode === 'replay' ? Math.max(250, replayDelayMs(steps, Math.max(0, cursor - 1), speed) * 0.6) : 1200;
+  const hover = useMemo(() => hoverFocus(
+    flow?.nodes.some((node) => node.id === hovered) ? hovered : null,
+    flow?.edges.map((edge) => ({ id: edge.id, from: edge.source, to: edge.target })) ?? [],
+  ), [hovered, flow]);
   const nodes = useMemo(() => {
     if (!flow) return [];
     const cards = flow.nodes.map((node) => ({
       ...node, type: 'live', zIndex: 1,
+      ...(hover && !hover.nodes.has(node.id) ? { style: { ...node.style, opacity: WIRING_STYLE.dimNode } } : {}),
       data: {
         ...node.data, state: scene.nodeState[node.id] ?? 'pending', visits: scene.visits[node.id] ?? 0, focused: focus === node.id,
         unrecorded: !live && !visited.has(node.id),
@@ -227,11 +235,13 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
         } satisfies GroupBoxData,
       }));
     return [...boxes, ...cards];
-  }, [flow, scene, focus, live, visited, unitOf, toggleUnit]);
+  }, [flow, scene, focus, hover, live, visited, unitOf, toggleUnit]);
   const edges = useMemo(() => flow?.edges.map((edge) => ({
     ...edge, type: 'live',
+    ...wiringEdgeStyle(hover, edge.id),
+    className: hover?.edges.has(edge.id) ? 'wiring-edge-flow' : undefined,
     data: { ...(edge.data as unknown as TidyEdgeData), taken: scene.takenEdges.has(edge.id), active: scene.activeEdge === edge.id, tokenKey: `${edge.id}:${scene.cursor}`, tokenMs } satisfies LiveEdgeData,
-  })) ?? [], [flow, scene, tokenMs]);
+  })) ?? [], [flow, scene, tokenMs, hover]);
 
   const zoomTo = useCallback((nodeId: string | null) => {
     setFocus(nodeId);
@@ -324,6 +334,8 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
           {flow && (
             <ReactFlow key={`${graph?.id ?? 'graph'}:${[...collapsed].sort().join(',')}`} nodes={nodes} edges={edges} nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES}
               onInit={(instance) => { flowRef.current = instance as unknown as ReactFlowInstance; setFlowReady((value) => value + 1); }}
+              onNodeMouseEnter={(_event, node) => { if (node.type !== 'groupBox') setHovered(node.id); }}
+              onNodeMouseLeave={() => setHovered(null)}
               onNodeClick={(_event, node) => {
                 if (node.type === 'groupBox') return;
                 if (isGroupNodeId(node.id)) {
@@ -393,6 +405,7 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
           </ol>
         </aside>
       </div>
+      <p className="shrink-0 text-[11px] text-text-tertiary">배선도 디자인: <a href="https://malfoy-meme-making.vercel.app/wiring/index.html" target="_blank" rel="noopener noreferrer" className="underline">공냥이 AI 실험실</a></p>
     </div>
   );
 }

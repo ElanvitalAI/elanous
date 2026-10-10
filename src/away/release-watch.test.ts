@@ -222,7 +222,7 @@ describe('GATE-LIVE-OBS — 외출 알림의 조각 줄', () => {
     ];
     const counts = { pending: 2, running: 3, done: 0, retry: 0, timeout, failed: 0 };
     return { v: 1 as const, version: '0.2.19', updatedAt: new Date(T0).toISOString(), shards: list,
-      summary: { total: list.length, counts, waitReasons: [{ reason: 'CPU 부족', count: 2 }], etaMin: 27, staleMin: 0, overrunMin: 0, doneWithFailures: 0 } };
+      summary: { total: list.length, counts, waitReasons: [{ reason: 'CPU 부족', count: 2 }], etaMin: 27, staleMin: 0, overrunMin: 0, doneWithFailures: 0, verdict: null } };
   };
 
   test('잘림·실패 조각이 늘 때만 한 줄 · 같은 수면 조용하다', () => {

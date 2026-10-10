@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { publicExposureFiles, runExposeGate } from './expose-gate.js';
@@ -9,23 +9,32 @@ import { admitLandingMerge } from './frozen-merges.js';
 import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
 import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
+import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
 
-/**
- * The PWA's static build type-checks every `src/**` file it imports, under Next's stricter
- * `ProcessEnv` — a change that only touches `src/**` can break it while tsc and bun test stay
- * green (2026-09-27: two such changes kept main's PWA build red for two hours). Build whenever
- * app code or non-test source changed; test files are never imported by the PWA.
- */
-export function needsPwaBuild(files: readonly string[]): boolean {
-  return files.some((file) => file.startsWith('apps/pwa/') || (file.startsWith('src/') && !/\.test\.tsx?$/.test(file)));
+/** Use pr-land's PWA reachability (including its undecidable-graph build fallback), not a blanket src/** trigger. */
+export function needsPwaBuild(files: readonly string[], repoRoot: string, graph: (root: string) => ReturnType<typeof pwaGraph> = pwaGraph): boolean {
+  return pwaReach(files, () => graph(repoRoot)).reaches;
 }
 
-export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
+/**
+ * Give a temporary checkout the source checkout's dependencies: link `<dir>/node_modules` when it is really installed
+ * there (its `marker` package exists), otherwise install into the candidate. Shared by host regate and the task agent's
+ * land worktree (TA-LAND-WORKTREE).
+ */
+export function provideCheckoutDependencies(candidate: string, sourceRoot: string, dir: string, marker: string, install: (cwd: string) => void): void {
+  if (existsSync(join(candidate, dir, 'node_modules'))) return;
+  if (existsSync(join(sourceRoot, dir, 'node_modules', marker, 'package.json'))) {
+    symlinkSync(join(sourceRoot, dir, 'node_modules'), join(candidate, dir, 'node_modules'), 'dir');
+  } else install(join(candidate, dir));
+}
+
+export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** TA-LIVE-LAND-2: run the full landing gates (release-path hold · neighbours · PR re-read) but stop before the freeze admission and `gh pr merge` — the task agent lands it later via `pr land --expected-head`. */ noMerge?: true; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
 export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
 export type InterferenceVerdict = { passed: boolean; detail?: string; unmeasured?: boolean; /** neighbour tests left out so the selection fits the inspection cap */ neighborsTrimmed?: number };
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
   interference?: (files: readonly string[], cwd: string) => Promise<InterferenceVerdict>;
+  /** Legacy injection for callers that supply an ephemeral worktree instead of a locked slot. */
   makeTemp?: () => string;
   removeTemp?: (path: string) => void;
   acquire?: (repoRoot: string) => Promise<() => void>;
@@ -104,7 +113,7 @@ function slotOwnerAlive(slot: string): boolean {
   }
 }
 
-export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pollMs?: number; now?: () => number } = {}): Promise<() => void> {
+export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pollMs?: number; now?: () => number } = {}): Promise<(() => void) & { worktree: string }> {
   const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: repoRoot, encoding: 'utf8' });
   if (gitDir.status !== 0 || !gitDir.stdout.trim()) throw new Error('git common directory unavailable for host regate lock');
   const root = join(gitDir.stdout.trim(), 'elanous-host-regate');
@@ -117,7 +126,7 @@ export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pol
       try {
         mkdirSync(slot);
         writeFileSync(join(slot, 'pid'), String(process.pid));
-        return () => rmSync(slot, { recursive: true, force: true });
+        return Object.assign(() => rmSync(slot, { recursive: true, force: true }), { worktree: join(root, `worktree-${i}`) });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         // A slot left by a crashed host process would otherwise block every later run.
@@ -133,6 +142,24 @@ export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pol
   }
 }
 
+function removeBrokenSlotRegistration(repoRoot: string, worktree: string): void {
+  const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: repoRoot, encoding: 'utf8' });
+  if (gitDir.status !== 0 || !gitDir.stdout.trim()) throw new Error('git common directory unavailable for slot repair');
+  const registrations = join(gitDir.stdout.trim(), 'worktrees');
+  if (!existsSync(registrations)) return;
+  for (const name of readdirSync(registrations)) {
+    const registration = join(registrations, name);
+    if (!lstatSync(registration).isDirectory()) continue;
+    const pointer = join(registration, 'gitdir');
+    if (!existsSync(pointer) || lstatSync(pointer).isSymbolicLink()) continue;
+    if (resolve(readFileSync(pointer, 'utf8').trim()) !== resolve(worktree, '.git')) continue;
+    rmSync(registration, { recursive: true });
+  }
+}
+
+/** Callers: podSelfImplementSpawn in src/task-orchestrator/surfaces/self-implement-pod.ts calls
+ *  (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: hostRoot, ... });
+ *  sweepFrozenMerges in frozen-merges.ts also calls runHostRegate(entry); landing queue serialization stays there. */
 export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps = {}): Promise<HostRegateResult> {
   const command = deps.command ?? defaultCommand;
   const log = deps.log ?? ((event: 'passed' | 'failed' | 'unmeasured' | 'base-raced', data: Record<string, unknown>) => debug.log('harness.host-regate', event, data));
@@ -141,6 +168,19 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let base = '';
   let worktree: string | undefined;
   let attached = false;
+  let ephemeral = false;
+  let slotCommonDir: string | undefined;
+  const verifySlot = (): void => {
+    if (!worktree || !slotCommonDir || lstatSync(worktree).isSymbolicLink() || !lstatSync(worktree).isDirectory()) throw new Error('slot worktree mismatch');
+    const pointer = join(worktree, '.git');
+    if (!lstatSync(pointer).isFile() || lstatSync(pointer).isSymbolicLink()) throw new Error('slot worktree mismatch');
+    const common = realpathSync(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], worktree));
+    const registration = realpathSync(run('git', ['rev-parse', '--path-format=absolute', '--git-dir'], worktree));
+    if (common !== slotCommonDir || dirname(registration) !== join(slotCommonDir, 'worktrees')
+      || resolve(readFileSync(join(registration, 'gitdir'), 'utf8').trim()) !== resolve(pointer)
+      || resolve(readFileSync(pointer, 'utf8').trim().replace(/^gitdir: /, '')) !== registration
+      || run('git', ['rev-parse', '--show-toplevel'], worktree) !== worktree) throw new Error('slot worktree mismatch');
+  };
   let release: (() => void) | undefined;
   let endLanding: ((merged?: boolean) => void) | undefined;
   let landed = false;
@@ -168,16 +208,57 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     const baseRefName = view.baseRefName;
     // verifyOnly(승인 탭): PR 에 기록된 base(baseRefOid)는 main 의 «지금 끝»보다 늙을 수 있다 — 지금 끝에 얹어 잰다.
     let baseCommit = view.baseRefOid!;
+    // REGATE-STALE-BASE: GitHub's baseRefOid can stay at the PR-open tip after main moves. After the bounded re-reads the
+    // regate measures on the fetched base tip (what the squash merge lands on) and records the stale PR base instead of failing.
+    // The closing PR re-read must still show the last PR base seen here (a PR that changed again is not the PR we measured).
+    let stalePrBase: string | undefined;
+    const initialPrBase = baseCommit;
+    let buildPwa = false;
     try {
       run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
-      const fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
+      let fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
       if (input.verifyOnly) { baseCommit = fetchedBase; verifiedBase = fetchedBase; }
-      else if (fetchedBase !== baseCommit) throw new Error('fetched PR base differs from checked SHA');
+      else {
+        for (let attempt = 1; fetchedBase !== baseCommit; attempt++) {
+          debug.log('harness.host-regate', 'base-moved-retry', { pr: input.prNumber, attempt, checked: baseCommit, fetched: fetchedBase });
+          if (attempt === 3) {
+            stalePrBase = baseCommit;
+            debug.log('harness.host-regate', 'base-stale', { pr: input.prNumber, prBaseRefOidInitial: initialPrBase, prBaseRefOid: baseCommit, fetched: fetchedBase, candidateBase: fetchedBase });
+            baseCommit = fetchedBase;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+          view = readPr();
+          if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || view.baseRefName !== baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) {
+            return result('unmeasured', 'pr-head', 'PR head, base commit, ready state or open state unavailable or changed');
+          }
+          baseCommit = view.baseRefOid!;
+          run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
+          fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
+        }
+      }
       run('git', ['fetch', 'origin', `refs/pull/${input.prNumber}/head`], input.repoRoot);
       if (run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot) !== input.headCommit) throw new Error('fetched PR head differs from checked SHA');
-      worktree = (deps.makeTemp ?? (() => mkdtempSync(join(tmpdir(), 'elanous-host-regate-'))))();
-      run('git', ['worktree', 'add', '--detach', worktree, baseCommit], input.repoRoot);
-      attached = true;
+      const slotWorktree = (release as (() => void) & { worktree?: string }).worktree;
+      ephemeral = !!deps.makeTemp || !slotWorktree;
+      worktree = deps.makeTemp?.() ?? slotWorktree ?? mkdtempSync(join(tmpdir(), 'host-regate-'));
+      if (ephemeral && slotWorktree && resolve(worktree) === resolve(slotWorktree)) throw new Error('temporary worktree overlaps locked slot');
+      if (!ephemeral && !deps.acquire) {
+        slotCommonDir = realpathSync(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], input.repoRoot));
+      }
+      if (!ephemeral && existsSync(worktree)) {
+        if (slotCommonDir) verifySlot();
+        attached = true;
+        // A previous host may have died mid-merge; never carry its index or untracked files into this run.
+        run('git', ['reset', '--hard'], worktree);
+        run('git', ['clean', '-fdx', '-e', 'node_modules', '-e', '.next', '-e', '*.tsbuildinfo'], worktree);
+        run('git', ['checkout', '--detach', baseCommit], worktree);
+      }
+      if (!attached) {
+        if (!ephemeral && !deps.acquire) removeBrokenSlotRegistration(input.repoRoot, worktree);
+        run('git', ['worktree', 'add', '--detach', worktree, baseCommit], input.repoRoot);
+        attached = true;
+      }
       if (run('git', ['rev-parse', 'HEAD'], worktree) !== baseCommit) throw new Error('worktree base HEAD mismatch');
       base = run('git', ['merge-base', baseCommit, input.headCommit], worktree);
       files = run('git', ['diff', '--name-only', base, input.headCommit], worktree).split('\n').filter(Boolean);
@@ -213,14 +294,10 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       // a temporary checkout whose node_modules is empty or purged; linking it turned every gate into
       // «Cannot find package 'typescript'» (unmeasured · 2026-09-29 #21239). Install into the candidate instead.
       const candidate = worktree;
-      const provide = (dir: string, marker: string): void => {
-        if (existsSync(join(candidate, dir, 'node_modules'))) return;
-        if (existsSync(join(input.repoRoot, dir, 'node_modules', marker, 'package.json'))) {
-          symlinkSync(join(input.repoRoot, dir, 'node_modules'), join(candidate, dir, 'node_modules'), 'dir');
-        } else run('bun', ['install', '--frozen-lockfile'], join(candidate, dir));
-      };
+      const provide = (dir: string, marker: string): void => provideCheckoutDependencies(candidate, input.repoRoot, dir, marker, (cwd) => { run('bun', ['install', '--frozen-lockfile'], cwd); });
       provide('', 'typescript');
-      if (needsPwaBuild(files) && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
+      buildPwa = needsPwaBuild(files, worktree);
+      if (buildPwa && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
     try {
       const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, { neighbors: !input.verifyOnly })))(files, worktree);
@@ -244,19 +321,21 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       try { run('bun', ['scripts/ci-isolation-hardcode-gate.ts', '--changed-files', ...files], worktree); }
       catch (e) { return result(/\[isolation-gate\] FAIL/.test(String(e)) ? 'failed' : 'unmeasured', 'isolation-gate', String(e)); }
     }
-    if (needsPwaBuild(files)) {
+    if (buildPwa) {
       try { run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'build'], worktree); }
       catch (e) { return result(String(e).includes('command unavailable') ? 'unmeasured' : 'failed', 'nexus-build', String(e)); }
     }
     let current: PrView;
     try { current = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
-    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || (!input.verifyOnly && current.baseRefOid !== baseCommit) || current.state !== 'OPEN' || current.isDraft !== false) {
+    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || (!input.verifyOnly && current.baseRefOid !== (stalePrBase ?? baseCommit)) || current.state !== 'OPEN' || current.isDraft !== false) {
       return result('unmeasured', 'pr-base-changed', 'PR head or base changed during host regate; rerun against the new base');
     }
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just
     // above; the seconds between that read and the merge are checked after the fact below.
     if (input.verifyOnly) return result('passed');
+    // TA-REJUDGE-ON-HEAD — 병합 없는 재게이트는 «잰 base 끝»을 같이 낸다(겹침 증거의 gate.baseCommit).
+    if (input.noMerge) return { ...result('passed'), status: 'passed', baseCommit };
     const landing = admitLandingMerge({ prNumber: input.prNumber, headCommit: input.headCommit, repoRoot: input.repoRoot, ...(input.goalFile ? { goalFile: input.goalFile } : {}) }, deps.freezeRoot, {}, input.resumed ? undefined : { prNumber: input.prNumber, repoRoot: input.repoRoot, headCommit: input.headCommit }, { prodFreezeRoot: deps.prodFreezeRoot });
     if (landing.kind !== 'merge') {
       debug.log('harness.merge', 'frozen', { pr: input.prNumber, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
@@ -295,10 +374,22 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     return result('unmeasured', 'host-regate', String(e));
   } finally {
     try { endLanding?.(landed); } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'landing-release', detail: String(e) }); }
-    try { if (attached && worktree) run('git', ['worktree', 'remove', '--force', worktree], input.repoRoot); }
-    catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
-    try { if (worktree) (deps.removeTemp ?? ((path) => rmSync(path, { recursive: true, force: true })))(worktree); }
-    catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
+    try {
+      if (attached && worktree) {
+        if (slotCommonDir) verifySlot();
+        run('git', ['reset', '--hard'], worktree);
+        run('git', ['clean', '-fdx', '-e', 'node_modules', '-e', '.next', '-e', '*.tsbuildinfo'], worktree);
+      }
+    } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
+    if (ephemeral && worktree) {
+      try {
+        if (attached) run('git', ['worktree', 'remove', '--force', worktree], input.repoRoot);
+      } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
+      try {
+        if (deps.removeTemp) deps.removeTemp(worktree);
+        else rmSync(worktree, { recursive: true, force: true });
+      } catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
+    }
     try { release?.(); }
     catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'lock', detail: String(e) }); }
     if (failures.length && failures[0]?.step !== 'release-path-hold') {

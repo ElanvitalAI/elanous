@@ -29,6 +29,8 @@ function simulation(reasons: string[], tier?: 'high' | 'standard') {
     if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
     // POD8b DNS probe (pool lease): coredns Ready and the disposable lookup Pod resolves.
     if (command.includes('deployment coredns')) return { status: 0, stdout: JSON.stringify({ spec: { replicas: 1 }, status: { readyReplicas: 1 } }), stderr: '' };
+    // POD-TTL-CLEANUP(#25593): the probe first lists existing DNS probes — none are live here.
+    if (command.includes('-l elanous.probe=dns') && args.includes('-o')) return { status: 0, stdout: '{"items":[]}', stderr: '' };
     if (command.includes('pod/elanous-dns-') && args.includes('logs')) return { status: 0, stdout: 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1\n', stderr: '' };
     if (command.includes('pod/elanous-dns-') && args.includes('-o')) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Succeeded' } }), stderr: '' };
     if (command.includes('elanous-dns-') || (args.includes('create') && input?.includes('elanous-dns-'))) return { status: 0, stdout: '', stderr: '' };
@@ -94,8 +96,8 @@ describe('Pod OOM retry', () => {
       expect(s.jobs).toHaveLength(2);
       expect(s.jobs.map((job) => job.metadata.annotations['elanous.dev/attempt'])).toEqual(['1', '2']);
       expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources)).toEqual([
-        { requests: { cpu: '1', memory: '2Gi' }, limits: { memory: '2Gi', cpu: '4' } },
-        { requests: { cpu: '1', memory: '9Gi' }, limits: { memory: '16Gi', cpu: '4' } },
+        { requests: { cpu: '250m', memory: '2Gi' }, limits: { memory: '2Gi', cpu: '4' } },
+        { requests: { cpu: '250m', memory: '9Gi' }, limits: { memory: '16Gi', cpu: '4' } },
       ]);
     } finally { rmSync(s.root, { recursive: true, force: true }); }
   });

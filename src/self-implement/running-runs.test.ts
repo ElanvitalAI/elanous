@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
@@ -237,7 +237,13 @@ test('passes includeTest consistently to the injected ledger and PTY target read
   };
 
   const pty = { refs: [{ instance: 'prod', id: 'pty-live', kind: 'shell' as const, alive: true, runId: 'run-live' }], unreadable: [] };
-  const deps = { queryLedgers: federatedLedger, ptyTargets: targets, listPtyRefs: () => pty };
+  const deps = {
+    queryLedgers: federatedLedger,
+    ptyTargets: targets,
+    listPtyRefs: () => pty,
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    observeQuery: () => {},
+  };
   const withoutTest = queryRunningRuns({}, deps);
   const withTest = queryRunningRuns({ includeTest: true }, deps);
 
@@ -786,6 +792,82 @@ test('keeps query results and original query errors unchanged when observation w
   expect(observed).toEqual(expected);
   expect(received).toBe(queryError);
 });
+
+test('same-process second query within one second reuses mtime-checked ledger facts with full cache hit rate', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-file-mtime-'));
+  const directory = join(root, 'run-ledger');
+  mkdirSync(directory);
+  const count = 5_100;
+  for (let n = 0; n < count; n += 1) {
+    const runId = `run-00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
+    writeFileSync(join(directory, `${runId}.jsonl`), `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`);
+  }
+  const deps = {
+    ledgerDirectories: () => [directory],
+    ptyTargets: () => [],
+    listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    observeQuery: () => {},
+  };
+  try {
+    const cold = queryRunningRuns({ caller: 'cli' }, deps);
+    const start = performance.now();
+    const warm = queryRunningRuns({ caller: 'cli' }, deps);
+    const secondMs = performance.now() - start;
+    expect(secondMs).toBeLessThanOrEqual(1_000);
+    expect([cold.ledger.cacheHits, cold.ledger.cacheMisses]).toEqual([0, count]);
+    expect([warm.ledger.cacheHits, warm.ledger.cacheMisses]).toEqual([count, 0]);
+    expect((warm.ledger.cacheHits ?? 0) / ((warm.ledger.cacheHits ?? 0) + (warm.ledger.cacheMisses ?? 0))).toBe(1);
+    expect(warm.entries).toEqual(cold.entries);
+    expect(warm.count).toBe(cold.count);
+    const runId = 'run-00000000-0000-4000-8000-000000000000';
+    const file = join(directory, `${runId}.jsonl`);
+    writeFileSync(file, `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event: 'start', data: {} })}\n`);
+    utimesSync(file, new Date('2026-10-09T00:00:02.000Z'), new Date('2026-10-09T00:00:02.000Z'));
+    const changed = queryRunningRuns({ caller: 'cli' }, deps);
+    expect([changed.ledger.cacheHits, changed.ledger.cacheMisses]).toEqual([count - 1, 1]);
+    expect(changed.entries.map((entry) => entry.runId)).toEqual([runId]);
+    expect(changed.entries).toEqual([expect.objectContaining({ runId, lifecycle: expect.any(String) })]);
+    console.log(`RUNNING_RUNS_CACHE secondMs=${secondMs.toFixed(1)} hitRate=${warm.ledger.cacheHits}/${count} boundMs=1000`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('isolated running-runs CLI scans 8001 ledgers and exits within 15 seconds', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-cli-state-'));
+  // --all selects the prod log target at HOME/.elanous/logs/logs.db even under --test.
+  // Keep HOME private so the real CLI resolver scans only these fixture ledgers.
+  const directory = join(root, '.elanous', 'run-ledger');
+  const count = 8_001;
+  try {
+    mkdirSync(directory, { recursive: true });
+    for (let n = 0; n < count; n += 1) {
+      const runId = `run-00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
+      writeFileSync(join(directory, `${runId}.jsonl`), `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`);
+    }
+    const start = performance.now();
+    const child = Bun.spawnSync([process.execPath, 'bin/elanous.mjs', `--test=${join(root, 'test-state')}`, 'self', 'running-runs', '--json'], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: root, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '' },
+      stdout: 'pipe', stderr: 'pipe', timeout: 15_000,
+    });
+    const elapsedMs = performance.now() - start;
+    // A cold ledger scan was observed at 0.9–1.8 s; 15 s budgets CLI startup and 8,001 reads.
+    expect(child.exitCode).toBe(0);
+    expect(elapsedMs).toBeLessThanOrEqual(15_000);
+    const result = JSON.parse(child.stdout.toString()) as { entries: unknown[]; count: number; ledger: { ledgerDirectories: string[]; cacheHits: number; cacheMisses: number; unreadableLedgerCount: number } };
+    expect(result.ledger.ledgerDirectories).toContain(directory);
+    expect(result.ledger.cacheHits).toBe(0);
+    expect(result.ledger.cacheMisses).toBe(count);
+    expect(result.ledger.unreadableLedgerCount).toBe(0);
+    expect(result.entries).toEqual([]);
+    expect(result.count).toBe(0);
+    console.log(`RUNNING_RUNS_CLI exitMs=${elapsedMs.toFixed(1)} scanned=${result.ledger.cacheMisses}/${count} boundMs=15000`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 40_000);
 
 test('distinguishes unreadable phase observation from no observed phase without changing status assessment', () => {
   const queryLedgers = (): FederatedUnfinishedRunLedgerQuery => ({

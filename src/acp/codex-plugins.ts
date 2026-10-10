@@ -15,7 +15,7 @@
 // installations don't churn quickly and a BackendPickerChip re-render
 // should not trigger a fresh RPC roundtrip every time.
 
-import type { CodexAppServerClient } from './codex-app-server-client.js';
+import { spawnCodexAppServer, type CodexAppServerClient } from './codex-app-server-client.js';
 
 export interface CodexPlugin {
   /** Plugin slug as reported by codex (e.g. "gmail", "google-calendar"). */
@@ -43,13 +43,55 @@ export interface FetchCodexPluginsOpts {
   noCache?: boolean;
 }
 
+/** Uncached inventory probe: distinguish no session / RPC failure from an empty installed list. */
+export async function readCodexPluginsObservation(client: CodexAppServerClient | null | undefined): Promise<
+  { status: 'ok'; plugins: ReadonlyArray<CodexPlugin> } | { status: 'unknown'; plugins: readonly [] }
+> {
+  if (!client) return { status: 'unknown', plugins: [] };
+  try {
+    const response = await client.request<Record<string, never>, unknown>('plugin/list', {});
+    if (!isWellFormedPluginList(response)) return { status: 'unknown', plugins: [] };
+    return { status: 'ok', plugins: parseCodexPluginsResponse(response) };
+  } catch { return { status: 'unknown', plugins: [] }; }
+}
+
+/** Every marketplace and plugin row must have the shape the projector reads; a damaged or changed
+ *  RPC response is unknown, never a confirmed empty install list. */
+function isWellFormedPluginList(response: unknown): boolean {
+  if (!response || typeof response !== 'object') return false;
+  const marketplaces = (response as { marketplaces?: unknown }).marketplaces;
+  if (!Array.isArray(marketplaces)) return false;
+  return marketplaces.every(market => !!market && typeof market === 'object'
+    && typeof (market as { name?: unknown }).name === 'string' && (market as { name: string }).name.length > 0
+    && Array.isArray((market as { plugins?: unknown }).plugins)
+    && ((market as { plugins: unknown[] }).plugins).every(plugin => !!plugin && typeof plugin === 'object'
+      && typeof (plugin as { name?: unknown }).name === 'string' && (plugin as { name: string }).name.length > 0));
+}
+
+export type CodexPluginObservation = Awaited<ReturnType<typeof readCodexPluginsObservation>>;
+
+/** Isolated read-only RPC probe; always closes its own app-server process. */
+export async function readCodexPluginsFromAppServer(
+  spawn: typeof spawnCodexAppServer = spawnCodexAppServer,
+): Promise<CodexPluginObservation> {
+  let server: ReturnType<typeof spawnCodexAppServer>;
+  try { server = spawn({ requestTimeoutMs: 5000 }); }
+  catch { return { status: 'unknown', plugins: [] }; }
+  try {
+    await server.client.request('initialize', {
+      clientInfo: { name: 'elanous', version: '0.x' }, capabilities: { experimentalApi: true },
+    });
+    return await readCodexPluginsObservation(server.client);
+  } catch { return { status: 'unknown', plugins: [] }; }
+  finally {
+    try { await server.client.close(); }
+    finally { server.child.kill(); }
+  }
+}
+
 /** Query codex `plugin/list` and project the response into the
  *  BackendPickerChip-ready shape. Cached per client for 5 min.
- *
- *  Returns an empty array when:
- *    - `client` is null/undefined (no active codex session)
- *    - the RPC throws (timeout / closed / codex error) — soft-fail
- *      with stale cache if available, otherwise [] */
+ *  Returns [] for no client or RPC failure (stale cache when available). */
 export async function fetchCodexPlugins(
   client: CodexAppServerClient | null | undefined,
   opts: FetchCodexPluginsOpts = {},

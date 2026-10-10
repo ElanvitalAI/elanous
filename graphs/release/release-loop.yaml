@@ -14,13 +14,15 @@ nodes:
   - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
+  # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
+  - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: start }
   - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1 }
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
   - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: start }
   - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: start }
   - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
-  - { node_id: tui, kind: gate, recipe: 'cmd:tui', max_visits: 1 }
+  - { node_id: tui, kind: gate, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: docs, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: known-issues, kind: agent, recipe: 'cmd:known-issues', max_visits: 1 }
   - { node_id: notes-check, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
@@ -39,7 +41,9 @@ nodes:
 edges:
   - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }
   - { from: cutoff, on: outcome, map: { ok: checklist-gate, fail: failed, error: failed } }
-  - { from: checklist-gate, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: checklist-gate, on: outcome, map: { ok: prefetch, fail: failed, error: failed } }
+  # Prefetch never gates: even a crashed prefetch node is a cache miss — the late nodes take their original paths.
+  - { from: prefetch, on: outcome, map: { ok: gate, fail: gate, error: gate } }
   - { from: gate, on: outcome, map: { ok: mac-smoke, fail: failed, error: failed } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.
   - { from: mac-smoke, on: outcome, map: { ok: export-check, fail: export-check, error: export-check } }

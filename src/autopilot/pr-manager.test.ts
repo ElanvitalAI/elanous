@@ -46,10 +46,10 @@ describe('extractPrNumber', () => {
 });
 
 describe('resolveDeliverableBase — 비교 base 해석(2026-07-26)', () => {
-  it('명시 base 최우선(공백 트림) — git 조회 안 함', () => {
+  it('명시 base 최우선(공백 트림) — 로컬 ref 검증 성공 시 그대로 사용', () => {
     const { run, calls } = stubRunner();
     expect(resolveDeliverableBase(run, '/wt', '  release/x  ')).toBe('release/x');
-    expect(calls.length).toBe(0);
+    expect(calls).toEqual([['git', '-C', '/wt', 'rev-parse', '--verify', '--quiet', 'release/x']]);
   });
 
   it('미지정 → origin/HEAD 해석', () => {

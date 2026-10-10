@@ -1,14 +1,26 @@
 import { describe, expect, test } from 'bun:test';
 import { judgeNextMove } from './judge.js';
+import { STOP_CLASS_NO_LAUNCH, STOP_CLASS_POD_FAILURE } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 
 describe('TASK-AGENT 판단부 — 종료 어휘 → 다음 한 수 (RFC §A2)', () => {
   test('terminal Pod failure without PR/harvest needs owner; absent evidence waits', () => {
     expect(judgeNextMove({}).reason).toBe('종료 관측 대기');
-    expect(judgeNextMove({ terminalRun: { kind: 'pod-failure', reason: 'exit 1\nunknown', hasPr: false, hasHarvestBranch: false } }).reason).toBe('failed/needs-owner — exit 1 unknown');
-    expect(judgeNextMove({ terminalRun: { kind: 'no-launch', reason: 'exit 2', hasPr: false, hasHarvestBranch: false } }).reason).toBe('failed/needs-relaunch — exit 2');
+    expect(judgeNextMove({ terminalRun: { kind: STOP_CLASS_POD_FAILURE, reason: 'exit 1\nunknown', hasPr: false, hasHarvestBranch: false } }).reason).toBe('failed/needs-owner — exit 1 unknown');
+    expect(judgeNextMove({ terminalRun: { kind: STOP_CLASS_NO_LAUNCH, reason: 'exit 2', hasPr: false, hasHarvestBranch: false } }).reason).toBe('failed/needs-relaunch — exit 2');
     expect(judgeNextMove({ terminalRun: { kind: 'pod-failure', reason: '\n', hasPr: false, hasHarvestBranch: false } }).reason).toBe('failed/needs-owner — pod-failure');
     expect(judgeNextMove({ terminalRun: { kind: 'pod-failure', reason: 'exit 1', hasPr: true, hasHarvestBranch: false } }).reason).toBe('종료 관측 대기');
   });
+  test('terminal run with an existing PR or harvest branch remains protected', () => {
+    const terminalRun = { kind: STOP_CLASS_POD_FAILURE, reason: 'exit 1', hasPr: false, hasHarvestBranch: false };
+    expect(judgeNextMove({ terminalRun, pr: 77 }).reason).toBe('종료 관측 대기');
+    expect(judgeNextMove({ terminalRun: { ...terminalRun, hasHarvestBranch: true } }).reason).toBe('종료 관측 대기');
+  });
+
+  test('terminal run with an unknown stop_class is not mapped to a failed disposition', () => {
+    const terminalRun = { kind: 'unknown' as unknown as typeof STOP_CLASS_NO_LAUNCH, reason: 'exit 1', hasPr: false, hasHarvestBranch: false };
+    expect(judgeNextMove({ terminalRun }).reason.startsWith('failed/')).toBe(false);
+  });
+
   test('converged ⊕ 병합 → green 제안', () => {
     const j = judgeNextMove({ stopReason: 'converged', prState: 'MERGED', pr: 123 });
     expect(j.move).toBe('propose-green');

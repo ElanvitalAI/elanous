@@ -33,7 +33,7 @@ import {
   type LockMeta,
 } from './telegram-lock.js';
 
-import { defaultUnixSocketPath } from './boot/acp-server.js';
+import { defaultUnixSocketPath } from './boot/acp-socket-path.js';
 
 export type ElanousDaemonLockMeta = LockMeta;
 export class ElanousDaemonLockError extends TelegramLockError {}
@@ -56,8 +56,8 @@ export function elanousDaemonLogPath(): string {
   return joinPath(elanousDaemonDir(), 'elanous.log');
 }
 
-/** Default unix socket path the daemon binds. Re-exported from
- *  `boot/acp-server.ts` so callers don't have to chase the source. */
+/** Default unix socket path the daemon binds. Resolved from
+ *  `boot/acp-socket-path.ts` without loading the ACP server. */
 export function elanousDaemonSocketPath(): string {
   return defaultUnixSocketPath();
 }

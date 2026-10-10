@@ -343,7 +343,7 @@ import { terminalModalRouter } from '../input/terminal-modal-router.js';
 import { termSize, stripAnsi } from '../../tui.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
-import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, modelChangeLine, modelOverviewLines, resolveModelChoice } from './model-choices.js';
+import { HUMAN_MODEL_WORDS, MODEL_CODE_NAMES, humanWordForModel, modelChangeLine, modelOverviewLines, resolveModelChoice } from './model-choices.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveDashboardChatMainLogCommand } from '../input/chat-main-log-command.js';
 import {
@@ -6197,8 +6197,10 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     const curModel = curCfg.llm.model;
     const curReasoning = effectiveReasoningLevel(curCfg.llm, curProvider, curModel);
     if (!arg) {
-      const [now, codes] = modelOverviewLines(curProvider, curModel, curReasoning);
-      ctx.chatLines.push(now);
+      const [, codes] = modelOverviewLines(curProvider, curModel, curReasoning);
+      // A model outside the 빠름/보통/깊음 map (codename or custom) says so explicitly instead of dropping the tier slot.
+      const tierName = humanWordForModel(curProvider, curModel, curReasoning) ?? '단계 밖';
+      ctx.chatLines.push(`지금: ${curModel?.trim() || '기본 모델'} (${tierName} · 생각 ${curReasoning}) · 고르기: /model ${HUMAN_MODEL_WORDS.join(' | ')}`);
       ctx.chatLines.push(ctx.muted(codes));
       ctx.setChatScrollOffset(-1);
       return;

@@ -47,7 +47,7 @@ function isValidTimeZone(tz: string): boolean {
  *  뒤이어 도는 모든 테스트 파일이 오염된다(실제로 이 세션에서 catch-up 테스트 4건이
  *  그렇게 깨졌고, 파일 순서를 뒤집으면 통과했다). 그래서 env/OS 를 주입으로 뺀다. */
 export interface ResolveTimeZoneDeps {
-  /** config 의 timezone 값. 생략 시 user-config 에서 lazy 로드. */
+  /** config 의 timezone 값. 생략 시 등록된 config 소스에서 읽는다. */
   configTimeZone?: string | undefined;
   /** env 의 TZ 값. 생략 시 `process.env.TZ`. */
   envTimeZone?: string | undefined;
@@ -60,12 +60,21 @@ export interface ResolveTimeZoneDeps {
  *  `process.env.TZ` 를 단독으로 믿지 않는 이유: launchd 로 뜬 데몬은 TZ 를 물려받지
  *  못한다(실측 확인). 반면 `Intl` 은 OS 설정을 직접 읽어 그 경우에도 올바른 지역을
  *  돌려준다. 그래서 env 보다 OS 를 **뒤**에 두되 fallback 으로 반드시 둔다. */
+let configTimeZoneSource: (() => string | undefined) | undefined;
+
+/** Config 소유자가 로드될 때 등록한다. 이 바닥 모듈은 config 를 로드하지 않는다.
+ * 반환된 함수는 이전 소스를 복원한다(격리 테스트에서만 사용). */
+export function setConfigTimeZoneSource(fn: () => string | undefined): () => void {
+  const previous = configTimeZoneSource;
+  configTimeZoneSource = fn;
+  return () => { configTimeZoneSource = previous; };
+}
+
 export function resolveTimeZone(deps: ResolveTimeZoneDeps = {}): ResolvedTimeZone {
   let cfg = deps.configTimeZone;
-  if (cfg === undefined && !('configTimeZone' in deps)) {
+  if (!('configTimeZone' in deps)) {
     try {
-      const mod = require('../user-config.js') as typeof import('../user-config.js');
-      cfg = (mod.getUserConfig() as { timezone?: string }).timezone;
+      cfg = configTimeZoneSource?.();
     } catch { /* config 미가용(부팅 초기·격리 테스트) — 아래로 */ }
   }
   if (typeof cfg === 'string' && isValidTimeZone(cfg.trim())) {

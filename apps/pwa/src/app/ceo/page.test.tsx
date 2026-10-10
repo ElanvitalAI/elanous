@@ -122,6 +122,37 @@ test('failed and unanswered reads show 못 읽음 only after the request ends', 
   }
 });
 
+test('CEO loop card distinguishes a pending schedule, an empty schedule, and a failed read', async () => {
+  let respond!: (response: Response) => void;
+  const pendingSchedule = new Promise<Response>((resolve) => { respond = resolve; });
+  let scheduleResponse: () => Response | Promise<Response> = () => pendingSchedule;
+  globalThis.fetch = (async (url: string) => {
+    if (url.includes('/v1/schedules')) return scheduleResponse();
+    if (url.includes('/v1/ops/seats')) return json(seats);
+    if (url.includes('/v1/dashboard/loops')) return json({ loops: { loops: [] } });
+    if (url.includes('/v1/decisions')) return json({ decisions: [] });
+    if (url.includes('/v1/harness/runs')) return json({ completeness: 'complete', landed: [], finished: [], entries: [], finishedObservation: { skippedFiles: 0 } });
+    if (url.includes('/v1/grid')) return json(gridData);
+    throw Error(`Unexpected GET: ${url}`);
+  }) as typeof fetch;
+
+  let root = await mount();
+  expect(card(root, '루프 판정')).toContain('불러오는 중…');
+  expect(card(root, '루프 판정')).not.toContain('등록된 일정 0');
+  expect(card(root, '루프 판정')).not.toContain('못 읽음');
+  await act(async () => { respond(json({ schedules: [] })); });
+  expect(card(root, '루프 판정')).toBe('루프 판정등록된 일정 0루프 상호작용 보기 →');
+  expect(card(root, '루프 판정')).not.toContain('못 읽음');
+
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+  scheduleResponse = () => json({ error: 'offline' }, 503);
+  root = await mount();
+  expect(card(root, '루프 판정')).toBe('루프 판정못 읽음루프 상호작용 보기 →');
+  expect(card(root, '루프 판정')).not.toContain('등록된 일정 0');
+  expect(card(root, '루프 판정')).not.toContain('불러오는 중…');
+});
+
 test('completed cards resolve independently while another request remains unanswered', async () => {
   let releaseGrid!: (response: Response) => void;
   const pendingGrid = new Promise<Response>((resolve) => { releaseGrid = resolve; });
@@ -136,7 +167,7 @@ test('completed cards resolve independently while another request remains unansw
   }) as typeof fetch;
   const root = await mount();
   expect(card(root, '릴리스 판 진행')).toContain('green 2');
-  expect(card(root, '루프 판정')).toContain('등록 0');
+  expect(card(root, '루프 판정')).toContain('등록된 일정 0');
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
@@ -246,13 +277,13 @@ test('failed grid read is 못 읽음 while all five existing cards remain readab
   const root = await mount();
   expect(card(root, '그리드')).toBe('그리드못 읽음');
   expect(card(root, '릴리스 판 진행')).toContain('green 2');
-  expect(card(root, '루프 판정')).toContain('등록 0');
+  expect(card(root, '루프 판정')).toContain('등록된 일정 0');
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드0');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5해당 없음');
 });
 
-test('each unreadable source is 못 읽음 rather than zero; a successfully empty source is zero', async () => {
+test('an empty schedule says 등록된 일정 0 while unreadable sources say 못 읽음 rather than zero', async () => {
   Date.now = () => at;
   globalThis.fetch = (async (url: string) => {
     if (url.includes('/v1/ops/seats')) return json({ error: 'forbidden' }, 403);
@@ -266,7 +297,7 @@ test('each unreadable source is 못 읽음 rather than zero; a successfully empt
   expect(card(root, '릴리스 판 진행')).toBe('릴리스 판 진행못 읽음발행 현황 보기 →');
   expect(root.findByProps({ 'aria-label': '릴리스 판 진행' }).findByType('a').props.href).toBe('/ops/release');
   // LOOP-INTERACT D: 루프 판정 카드에서 루프 상호작용 지도로 한 탭.
-  expect(card(root, '루프 판정')).toBe('루프 판정등록 0루프 상호작용 보기 →');
+  expect(card(root, '루프 판정')).toBe('루프 판정등록된 일정 0루프 상호작용 보기 →');
   expect(root.findByProps({ 'aria-label': '루프 판정' }).findByType('a').props.href).toBe('/loops?view=interact');
   expect(card(root, '결정 대기 카드')).toBe('결정 대기 카드못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR못 읽음');
@@ -301,7 +332,7 @@ test('a failed loop registry never turns a readable schedule count into a false 
     throw Error(`Unexpected GET: ${url}`);
   }) as typeof fetch;
   const root = await mount();
-  expect(card(root, '루프 판정')).toBe('루프 판정등록 0루프 상호작용 보기 →');
+  expect(card(root, '루프 판정')).toBe('루프 판정등록된 일정 0루프 상호작용 보기 →');
   expect(card(root, '위험·막힘 톱 5')).toBe('위험·막힘 톱 5못 읽음');
   expect(card(root, '오늘 병합 PR')).toBe('오늘 병합 PR0');
 });

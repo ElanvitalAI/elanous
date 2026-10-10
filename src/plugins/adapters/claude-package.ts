@@ -72,25 +72,17 @@ export function readClaudePackageLedger(
     return { status: 'installed-plugins-unreadable', packages: [] };
   }
 
-  const marketplacesRaw = readJsonFile(marketplacesPath);
-  if (marketplacesRaw === undefined) {
-    return { status: 'known-marketplaces-unreadable', packages: [] };
-  }
-
   const plugins = asPluginMap(installedRaw);
   if (plugins === undefined) {
     return { status: 'installed-plugins-unreadable', packages: [] };
   }
 
-  const marketplaces = asMarketplaceMap(marketplacesRaw);
-  if (marketplaces === undefined) {
-    return { status: 'known-marketplaces-unreadable', packages: [] };
-  }
-
+  const marketplaces = asMarketplaceMap(readJsonFile(marketplacesPath));
+  const status: ClaudePackageLedgerStatus = marketplaces === undefined ? 'known-marketplaces-unreadable' : 'ok';
   const packages: ClaudeInstalledPackage[] = [];
   for (const [key, records] of Object.entries(plugins)) {
     const { plugin, marketplace } = splitClaudePluginKey(key);
-    const source = formatMarketplaceSource(marketplaces[marketplace]);
+    const source = formatMarketplaceSource(marketplaces?.[marketplace]);
     for (const record of records) {
       packages.push({
         name: key,
@@ -104,7 +96,7 @@ export function readClaudePackageLedger(
     }
   }
 
-  return { status: 'ok', packages };
+  return { status, packages };
 }
 
 function readJsonFile(path: string): unknown {

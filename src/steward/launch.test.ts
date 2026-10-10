@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { collectOutcomes, launch, planLaunches, raiseHitl, readLaunchLedger, type LaunchDeps } from './launch.js';
 import type { ScheduledDecision, TriageIssue } from './triage.js';
 import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const runId = 'run-12345678-1234-1234-1234-123456789abc';
 const issues: TriageIssue[] = Array.from({ length: 5 }, (_, n) => ({ identifier: `ELA-${n + 1}`, ref: `ref-${n + 1}`, title: `Build ${n + 1}`, body: `Body ${n + 1}\n출처: telegram` }));
@@ -22,6 +23,7 @@ test('shadow records the exact command once without calling budget, decisions or
     const entry = launch(planned.launches[0]!, deps);
     expect(entry.status).toBe('shadow');
     expect(entry.command).toContain('--substrate');
+    expect(entry.command).toContain('/bin/elanous.mjs');
     expect(entry.command).toContain('pool-node-b@node-b:8');
     expect(entry.command).toContain('"Build 1\\nBody 1');
     expect(readLaunchLedger(dir).launches['ELA-1']).toEqual(entry);
@@ -54,7 +56,7 @@ test('legacy launch live without mode still passes budget and duplicate gates be
     const item = planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!;
     let checked = 0;
     let spawned = 0;
-    const entry = launch(item, { root: dir, ledger, settings,
+    const entry = launch(item, { root: dir, ledger, settings, launchSeat: () => dir,
       command: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       gate: (goalId, budget) => { checked++; expect(goalId).toBe('linear:ELA-1'); expect(budget).toMatchObject({ action: 'proceed' });
         return { action: 'proceed', sameGoalActiveRuns: [], budget, reason: 'no confirmed duplicate' }; },
@@ -62,6 +64,77 @@ test('legacy launch live without mode still passes budget and duplicate gates be
     });
     expect([checked, spawned, entry.status]).toEqual([1, 1, 'launched']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('live launch sends the installed CLI argv through the registered OP seat boundary and keeps the ledger schema', () => {
+  const dir = root();
+  try {
+    const ledger = readLaunchLedger(dir);
+    const settings = { mode: 'live' as const };
+    const item = planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!;
+    const seat = join(dir, 'seats', 'OP');
+    const calls: Array<{ args: string[]; cwd?: string }> = [];
+    const entry = launch(item, { root: dir, settings, ledger, launchSeat: () => seat,
+      command: (args, cwd) => { calls.push({ args, cwd }); return { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }; },
+      gate: (_goalId, budget) => ({ action: 'proceed', sameGoalActiveRuns: [], budget, reason: 'clear' }),
+      spawn: (args, _log, cwd) => { calls.push({ args, cwd }); return { pid: 99999999 }; },
+    });
+    expect(calls).toHaveLength(2);
+    for (const { args, cwd } of calls) {
+      expect(cwd).toBe(seat);
+      expect(args[0]).toBe(process.execPath);
+      expect(args[1]).toEndWith('/bin/elanous.mjs');
+      expect(args[1]).not.toBe('bin/elanous.mjs');
+    }
+    expect(calls[0]!.args).toContain('budget');
+    expect(calls[1]!.args).toContain('say');
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, 'steward', 'launches.json'), 'utf8')))).toEqual(['launches', 'hitl']);
+    expect(readLaunchLedger(dir).launches['ELA-1']).toEqual(entry);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('missing OP seat blocks a live launch before budget or spawn', () => {
+  const dir = root();
+  try {
+    const ledger = readLaunchLedger(dir);
+    const settings = { mode: 'live' as const };
+    const item = planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!;
+    const entry = launch(item, { root: dir, settings, ledger, launchSeat: () => { throw new Error('house missing'); },
+      command: () => { throw new Error('budget invoked'); }, spawn: () => { throw new Error('spawn invoked'); } });
+    expect(entry.status).toBe('blocked-location');
+    expect(entry.reason).toContain('house missing');
+    expect(readLaunchLedger(dir).launches['ELA-1']).toEqual(entry);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('missing registered OP seat blocks live launch with both process callbacks injected before budget', () => {
+  const dir = root();
+  const priorHome = process.env.HOME;
+  const priorConfigDir = getElanousConfigDirOverride();
+  try {
+    process.env.HOME = dir;
+    setElanousConfigDir(dir);
+    const ledger = readLaunchLedger(dir);
+    const settings = { mode: 'live' as const };
+    const item = planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!;
+    let commands = 0;
+    let spawns = 0;
+    const entry = launch(item, { root: dir, settings, ledger,
+      command: () => { commands++; return { exitCode: 0, stdout: '{"outcome":"proceed"}' }; },
+      spawn: () => { spawns++; return { pid: 99999999 }; },
+    });
+    expect(entry.status).toBe('blocked-location');
+    expect(entry.reason).toContain('steward OP seat unavailable');
+    expect([commands, spawns]).toEqual([0, 0]);
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, 'steward', 'launches.json'), 'utf8')))).toEqual(['launches', 'hitl']);
+    expect(readLaunchLedger(dir).launches['ELA-1']).toEqual(entry);
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(priorConfigDir);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('mode takes precedence over legacy launch setting for direct callers', () => {
@@ -95,7 +168,7 @@ test('shadow simulation can become one live launch after switching mode, but not
     const live = { mode: 'live' as const, launch: 'live' as const };
     expect(planLaunches(rows.slice(0, 1), issues, readLaunchLedger(dir), live).launches).toHaveLength(1);
     let spawned = 0;
-    launch(planLaunches(rows.slice(0, 1), issues, ledger, live).launches[0]!, { root: dir, ledger, settings: live,
+    launch(planLaunches(rows.slice(0, 1), issues, ledger, live).launches[0]!, { root: dir, ledger, settings: live, launchSeat: () => dir,
       command: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       gate: () => ({ action: 'proceed', sameGoalActiveRuns: [], budget: { action: 'proceed', reasons: [] }, reason: 'no confirmed duplicate' }),
       spawn: (_args, log) => { spawned++; writeFileSync(log, `starting ${runId}`); return { pid: 99999999 }; },
@@ -112,7 +185,7 @@ test('live launches only three of five; two completed slots release the remainin
     const ledger = readLaunchLedger(dir);
     const settings = { mode: 'live' as const, launch: 'live' as const, maxParallel: 3, podPool: 'test-pool' };
     let spawned = 0;
-    const deps: LaunchDeps = { root: dir, settings, ledger,
+    const deps: LaunchDeps = { root: dir, settings, ledger, launchSeat: () => dir,
       gate: () => ({ action: 'proceed', sameGoalActiveRuns: [], budget: { action: 'proceed', reasons: [] }, reason: 'no confirmed duplicate' }),
       command: args => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' } : { exitCode: 0, stdout: '{"event":"run-status","data":{"runStatus":"completed"}}\n' },
       spawn: (args, log) => { spawned++; expect(args).toContain('test-pool'); writeFileSync(log, `started ${runId.slice(0, -1)}${spawned}`); return { pid: 99999999 }; } };
@@ -163,6 +236,29 @@ test('shadow HITL records only a handoff; first live cycle raises once and later
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('missing OP seat does not block HITL decisions or outcome collection for existing runs', () => {
+  const dir = root();
+  try {
+    const ledger = readLaunchLedger(dir);
+    const settings = { mode: 'live' as const };
+    const hitl = { ...rows[0]!, rung: 'hitl' as const, hitlReason: 'money' as const, disposition: 'hitl' as const };
+    ledger.launches['ELA-2'] = { issue: 'ELA-2', title: 'Build 2', source: 'cli', command: 'say', status: 'running', runId };
+    const calls: string[][] = [];
+    const deps: LaunchDeps = { root: dir, ledger, settings,
+      launchSeat: () => { throw new Error('OP seat missing'); },
+      command: args => {
+        calls.push(args);
+        return args.includes('raise') ? { exitCode: 0, stdout: '{}' }
+          : { exitCode: 0, stdout: '{"event":"run-status","data":{"runStatus":"completed"}}' };
+      },
+    };
+    expect(raiseHitl(issues[0]!, hitl, deps)).toMatchObject({ raised: true, attempted: true });
+    expect(collectOutcomes(ledger, deps).map(entry => entry.status)).toEqual(['completed']);
+    expect(calls.map(args => args.includes('raise') ? 'raise' : 'run-ledger')).toEqual(['raise', 'run-ledger']);
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, 'steward', 'launches.json'), 'utf8')))).toEqual(['launches', 'hitl']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('HITL never launches; decisions raise is attempted exactly once, including when unavailable', () => {
   const dir = root();
   try {
@@ -202,7 +298,7 @@ test('live launch requires the shared gate, budget and a safe pod location befor
     const item = planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!;
     let spawned = 0;
     let checked = 0;
-    const deps: LaunchDeps = { root: dir, ledger, settings,
+    const deps: LaunchDeps = { root: dir, ledger, settings, launchSeat: () => dir,
       command: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
       gate: (goalId, budget) => { checked++; expect(goalId).toBe('linear:ELA-1'); expect(budget).toMatchObject({ action: 'proceed' });
         return { action: 'blocked-duplicate', sameGoalActiveRuns: [runId], budget, reason: 'same-goal active runs' }; },
@@ -231,7 +327,7 @@ test('blocked budget records reason and does not spawn; next cycle can retry', (
   try {
     const ledger = readLaunchLedger(dir);
     const settings = { mode: 'live' as const, launch: 'live' as const };
-    const deps: LaunchDeps = { root: dir, ledger, settings, command: () => ({ exitCode: 0, stdout: '{"outcome":"wait-reset","reasons":["quota"]}' }), spawn: () => { throw new Error('budget bypassed'); } };
+    const deps: LaunchDeps = { root: dir, ledger, settings, launchSeat: () => dir, command: () => ({ exitCode: 0, stdout: '{"outcome":"wait-reset","reasons":["quota"]}' }), spawn: () => { throw new Error('budget bypassed'); } };
     const result = launch(planLaunches(rows.slice(0, 1), issues, ledger, settings).launches[0]!, deps);
     expect(result.status).toBe('skipped-budget');
     expect(result.reason).toContain('quota');
@@ -380,7 +476,7 @@ test('the sentence goes after `--`, so a title starting with a dash is not read 
     const dashed: TriageIssue[] = [{ identifier: 'ELA-9', ref: 'ref-9', title: '--base evil', body: 'b' }];
     const settings = { mode: 'live' as const, launch: 'live' as const };
     let argv: string[] = [];
-    launch(planLaunches([{ ...rows[0]!, issue: 'ELA-9' }], dashed, ledger, settings).launches[0]!, { root: dir, ledger, settings,
+    launch(planLaunches([{ ...rows[0]!, issue: 'ELA-9' }], dashed, ledger, settings).launches[0]!, { root: dir, ledger, settings, launchSeat: () => dir,
       command: () => ({ exitCode: 0, stdout: '{"outcome":"next-provider","reasons":[]}' }),
       gate: () => ({ action: 'proceed', sameGoalActiveRuns: [], budget: { action: 'next-provider', reasons: [] }, reason: 'no confirmed duplicate' }),
       spawn: args => { argv = args; return { pid: 99999999 }; } });

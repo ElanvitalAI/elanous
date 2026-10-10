@@ -26,7 +26,7 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js'
 //   import 라 런타임 순환 없음(발송 로직은 이 파일에 self-contained). origin 없으면 report 폴백.
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
 import { conatusDataDir, conatusPath } from './conatus-data-dir.js';
-import { assertNoRealSendFromTest, assertNotTestWritingOps, isTestDouble } from '../instance/test-write-guard.js';
+import { assertNoRealSendFromTest, assertNotTestWritingOps, isTestDouble, TestOpsWriteRefusedError } from '../instance/test-write-guard.js';
 
 /** Explicit `ELANOUS_NEXUS_URL` wins. Otherwise ask the daemon endpoint resolver.
  *  A missing daemon is not a guessed port — the caller falls through to direct send. */
@@ -627,6 +627,7 @@ export function deliver(text: string, kind = 'alert', onBot?: (bot: string) => v
   }
   // 2) fallback: 텔레그램 sendMessage 직접(3900자 분할) — 데몬 미경유라 클라가 원장 기록.
   //    The same config judges the route and explains a failure (review r1).
+  //    deliver → sendTelegramDirect: the refusal propagates to the caller instead of becoming «undeliverable».
   let cfg: UserConfig | undefined;
   try { cfg = getUserConfig(); } catch { /* sendTelegramDirect fails closed without config */ }
   if (sendTelegramDirect(text, kind, cfg ? { config: cfg } : {}, onBot)) return 'direct';
@@ -704,16 +705,26 @@ export function sendTelegramDirect(
   deps: { config?: UserConfig; sendRaw?: typeof sendTelegramRaw; legacyEnv?: typeof conatusEnv } = {},
   onBot?: (bot: string) => void,
 ): boolean {
-  const sendRaw = deps.sendRaw ?? sendTelegramRaw;
-  // An injected sender still may not run in a test that resolved the ops universe.
-  if (deps.sendRaw) assertTestSendFaked('send a Telegram message from the ops universe', false);
+  const sendRaw = (token: string, chatId: string | number, body: string): boolean => {
+    // The transport is checked only after a route is eligible; a test double cannot target the ops universe.
+    assertTestSendFaked('send a real Telegram message', !deps.sendRaw);
+    return (deps.sendRaw ?? sendTelegramRaw)(token, chatId, body);
+  };
   let cfg: UserConfig | undefined;
   try { cfg = deps.config ?? getUserConfig(); } catch { /* unavailable config: operational delivery still fails closed */ }
   if (cfg) {
     try {
       const target = kindRouteTarget(cfg, kind);
-      if (target) { onBot?.(botLabel(target.botToken)); return sendRaw(target.botToken, String(target.chatId), text); }
-    } catch { /* unavailable channel routing: fall through */ }
+      if (target) {
+        // Refusal must escape the routing fallback; other routing/callback/transport failures retain that fallback.
+        assertTestSendFaked('send a real Telegram message', !deps.sendRaw);
+        onBot?.(botLabel(target.botToken));
+        return (deps.sendRaw ?? sendTelegramRaw)(target.botToken, String(target.chatId), text);
+      }
+    } catch (error) {
+      if (error instanceof TestOpsWriteRefusedError) throw error;
+      /* unavailable channel routing: fall through */
+    }
     // A declared table is authoritative: missing roles cannot escape to an env bot.
     if (cfg.telegram.channels?.length) {
       logKindRouteFallback(kind, 'none', false);

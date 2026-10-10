@@ -10,6 +10,7 @@ import { lastJsonObject, runGraph, type GraphRunState } from '../../src/graph-ru
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
+import { releaseResumeAcceptedRegressions, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -55,7 +56,7 @@ function safeRunId(runId: string): string {
 }
 
 /** Point the saved version-release output at the current release/<v> tip (fast-forward of the recorded commit only). */
-export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps = {}, from?: string): TipRefresh {
+export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps = {}, from?: string, waiverCommit?: string): TipRefresh {
   const root = deps.root ?? effectiveInstanceRoot();
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(runId)}.json`);
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
@@ -81,6 +82,9 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} is not on origin — this run was not cut as a release branch`);
   git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   const to = git(['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+  if (waiverCommit && (recorded.toLowerCase() !== waiverCommit.toLowerCase() || to.toLowerCase() !== waiverCommit.toLowerCase() || advertised.toLowerCase() !== waiverCommit.toLowerCase())) {
+    throw new Error('release branch moved — re-gate the new tip before waiving a node');
+  }
   if (to !== advertised) throw new Error(`${branch} moved while it was read (${advertised} → ${to})`);
   if (to === recorded) {
     debug.log('release-loop.resume', 'tip-unchanged', { runId, version, commit: to });
@@ -164,14 +168,40 @@ function savedGraphPath(statePath: string): string | undefined {
 }
 
 /** Refresh the branch tip, then restart the failed run at `from` with the saved graph snapshot. */
-export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
+export async function resumeReleaseRun(opts: { runId: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[] }, deps: ResumeReleaseDeps = {}): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
   // RELEASE-LEDGER-UNIVERSE: decide the universe once; the run lookup and every resumed node use it.
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
-  const tip = refreshReleaseBranchTip(opts.runId, deps, opts.from);
+  const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
+  let waiverCommit: string | undefined;
+  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined
+    ? JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState : undefined;
+  const waiver = original && (opts.waive !== undefined || opts.reason !== undefined)
+    ? releaseResumeWaiver(original, opts) : undefined;
+  const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
+    ? releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from) : undefined;
+  // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
+  if (waiver) {
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+    const versionRecord = saved.nodes.find((node) => node.nodeId === 'version-release');
+    const output = lastJsonObject(versionRecord?.output);
+    const version = output?.version;
+    const recorded = output?.commit;
+    if (typeof version !== 'string' || typeof recorded !== 'string' || !isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error('release waiver requires a recorded release commit');
+    const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
+    const branch = `release/${version}`;
+    const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0];
+    if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
+    waiverCommit = recorded;
+  }
+  // Check the refreshed tip before refresh writes a new version-release record or backup.
+  const tip = refreshReleaseBranchTip(opts.runId, deps, opts.from, waiverCommit);
   const partial = preparePartial(tip, opts, deps);
   // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
-  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true, deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
+  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true,
+    ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
+    ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
+    deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };
 }

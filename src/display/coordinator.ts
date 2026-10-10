@@ -252,6 +252,15 @@ export class DisplayCoordinator {
   private readonly regionMap: RegionMap;
   private readonly termSize: () => TermSize;
   private readonly invalidateRow: (row0: number) => void;
+  /** TUI-SLASH-FLICKER — true when the host wired a real row
+   *  invalidator, so a region move can be repaired by a plain diff
+   *  frame instead of a forced full-screen repaint. */
+  private readonly hasRowInvalidator: boolean;
+  /** TUI-SLASH-FLICKER — the previous flush invalidated overlay rows
+   *  (region moved / vanished); the next flush must re-emit the overlay
+   *  even when its bytes are unchanged, because the base rows under it
+   *  were just repainted. Replaces the old forceNext follow-up. */
+  private overlayRowsInvalidated = false;
 
   private surfaces = new Map<SurfaceId, DisplaySurface>();
   private focusNodes = new Map<SurfaceId, FocusNode>();
@@ -536,6 +545,7 @@ export class DisplayCoordinator {
     this.regionMap = opts.regionMap ?? new DefaultRegionMap();
     this.termSize = opts.termSize ?? (() => ({ rows: 24, cols: 80 }));
     this.invalidateRow = opts.invalidateRow ?? (() => { /* no-op default */ });
+    this.hasRowInvalidator = typeof opts.invalidateRow === 'function';
 
     // H1.6 · W1 → W2 bridge. Whenever LayerTree announces a layer
     // state change (bounds / opacity / parent / zIndex), inform the
@@ -2848,8 +2858,10 @@ export class DisplayCoordinator {
     // region invalidation (V4 cascade above) handles the actual
     // erase by marking rows dirty in the main frame buffer.
     let overlaySkippedThisFlush = false;
+    const overlayRowsInvalidated = this.overlayRowsInvalidated;
+    this.overlayRowsInvalidated = false;
     if (ansi.length > 0) {
-      if (request.force || ansi !== this.prevOverlayAnsi) {
+      if (request.force || overlayRowsInvalidated || ansi !== this.prevOverlayAnsi) {
         this.writeOverlay(ansi);
         this.prevOverlayAnsi = ansi;
         this.overlayWritesEmitted++;
@@ -2875,7 +2887,18 @@ export class DisplayCoordinator {
     }
     this.lastOverlayRegions = currentRegions;
     if (vanished && !request.force) {
-      this.forceNext = true;
+      // TUI-SLASH-FLICKER (2026-10-09) — the prior region rows were
+      // invalidated above, so the follow-up frame's row diff already
+      // repaints exactly those rows. Forcing it reached tui.ts::render
+      // as a full-screen erase (`\x1b[1;1H\x1b[J`) every time the slash
+      // picker's height changed while typing — whole-screen flicker.
+      // Keep the blanket force only when no row invalidator is wired.
+      if (this.hasRowInvalidator) {
+        this.markDirty('all');
+        this.overlayRowsInvalidated = true;
+      } else {
+        this.forceNext = true;
+      }
       this.requestFrame();
     }
   }

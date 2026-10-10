@@ -1,0 +1,25 @@
+graph_id: log-horizon-watch
+loop:
+  title: Log retention horizon watch
+  owner: TC
+  trigger:
+    cron: '23 * * * *'
+    events: [manual]
+version: 1
+entry_node: sample
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: sample
+    kind: agent
+    recipe: cmd:log-horizon-sample
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: sample
+    on: outcome
+    map: { ok: done, fail: failed, error: failed }

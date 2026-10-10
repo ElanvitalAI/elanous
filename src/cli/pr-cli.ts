@@ -57,6 +57,7 @@ import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import { admitLandingMerge } from '../self-implement/frozen-merges.js';
+import { verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -83,6 +84,8 @@ export interface PrLandOpts {
   forceFreeze?: string;
   /** Land even though changed files would leak into the public export (the reason goes in --land-reason). */
   allowPublicLeak?: boolean;
+  /** Pinned landing only: JSON evidence (rebased · re-gated · reviewed head) that replaces the unavailable non-interactive overlap approval. */
+  overlapEvidence?: string;
 }
 
 export interface PrGranularityOpts {
@@ -998,6 +1001,7 @@ function emitLandingOverlapAdvisory(
   base: string,
   currentFiles: readonly string[],
   out: { log: (message: string) => void },
+  overlappingLandings: string[] = [],
 ): boolean {
   if (currentFiles.length === 0) {
     record('overlap', true, { outcome: 'no-changed-files' });
@@ -1009,6 +1013,8 @@ function emitLandingOverlapAdvisory(
     return false;
   }
   const overlaps = overlapWithCurrentChanges(commits, currentFiles);
+  const current = new Set(currentFiles);
+  overlappingLandings.push(...commits.filter((commit) => commit.files.some((file) => current.has(file))).map((commit) => commit.hash));
   const line = formatOverlapAdvisory(overlaps);
   if (line) {
     record('overlap', true, {
@@ -1184,6 +1190,10 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const cwd = opts.cwd ?? process.cwd();
   const run = deps.run ?? defaultCmdRunner;
   const pinned = opts.pr !== undefined || opts.expectedHead !== undefined;
+  if (opts.overlapEvidence !== undefined && (!pinned || !opts.overlapEvidence.trim())) {
+    out.error('✗ overlap-evidence: --overlap-evidence <file> 는 --pr ⊕ --expected-head 머리 고정 착지에서만 쓴다.');
+    return 1;
+  }
   let pinnedBranch: string | undefined;
   let pinnedUrl: string | undefined;
   if (pinned) {
@@ -1562,7 +1572,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 1;
   }
 
-  const overlapFound = emitLandingOverlapAdvisory(run, cwd, base, changedPaths, out);
+  const overlappingLandings: string[] = [];
+  const overlapFound = emitLandingOverlapAdvisory(run, cwd, base, changedPaths, out, overlappingLandings);
   const siblingFound = emitSiblingPrAdvisory(
     branch,
     deps.listOpenPrs ?? (() => lookupOpenPrs(run, cwd)),
@@ -1593,7 +1604,23 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     });
   }
   const hold = !!opts.hold || overlapDecision?.outcome === 'user-hold';
-  if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge') {
+  // TA-LAND-OVERLAP — 비대화형 «승인 불가»만 증거로 대신한다(사람의 hold 는 증거로 뒤집지 않는다) · 증거가 없거나 어긋나면 종전 거부 그대로.
+  let overlapEvidenceAccepted = false;
+  if (pinned && overlapDecision?.outcome === 'unavailable' && opts.overlapEvidence !== undefined) {
+    const ref = resolveRemoteBranchRef(run, cwd, base);
+    const verdict = verifyOverlapEvidence({
+      evidencePath: opts.overlapEvidence, pr: Number(opts.pr), expectedHead: opts.expectedHead!,
+      remote: ref.remote, branch: ref.branch, cwd, run, readFile, overlappingLandings,
+    });
+    overlapEvidenceAccepted = verdict.ok;
+    if (verdict.ok) {
+      out.log(verdict.mode === 'already-ancestor'
+        ? `✓ overlap-evidence: already-ancestor — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass must-fix 0 (${verdict.reviewResult})`
+        : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
+    }
+    else out.error(`✗ overlap-evidence: ${verdict.reason}`);
+  }
+  if (pinned && overlapDecision && overlapDecision.outcome !== 'user-merge' && !overlapEvidenceAccepted) {
     out.error('✗ expected-head: overlap merge approval unavailable for the reviewed head');
     return 1;
   }
@@ -1852,6 +1879,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
     .option('--land-reason <text>', '권고를 보고도 지금 내는 이유(예: 남이 기다리는 차단 해제)')
     .option('--force-freeze <reason>', '동결을 넘겨 병합할 명시적 이유(필수)')
     .option('--allow-public-leak', '바뀐 파일이 공개본에 사적 흔적을 실어도 착지(이유는 --land-reason)')
+    .option('--overlap-evidence <file>', '머리 고정 착지 전용: 비대화형 겹침 승인을 대신할 증거 JSON {pr, head, gate:{head,baseCommit,passed}, reviewResult} — 재기반·재게이트·리뷰를 CLI 가 다시 잰다(겹친 착지가 전부 머리의 조상이면 리뷰만 · gate 생략 가능)')
     .action(async (opts: PrLandOpts) => {
       // ⛔⭐⭐⭐ **관측 sink 를 먼저 건다** — 라이브 도그푸드가 잡은 결함(2026-08-03).
       //   단위 테스트는 `debug.log` 가 **불렸다**를 단언하지만, standalone CLI 는 sink 를 등록하지

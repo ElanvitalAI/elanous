@@ -2,17 +2,10 @@ import { createRequire } from 'node:module';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
 import { debug } from '../debug/log.js';
 import type { LLMToolSpec } from '../llm.js';
-import type { NativeToolCatalogEntry } from '../native-tool-catalog.js';
 import type { ToolRunResult, ToolRuntime, ToolRuntimeContext } from './types.js';
+import { SELF_COGNITION_TOOL_NAMES } from './self-cognition-catalog.js';
 
-/** Canonical names for the read-only self-cognition surface. */
-export const SELF_COGNITION_TOOL_NAMES = [
-  'self_recall',
-  'logs_query',
-  'ops_status',
-  'memory_recall',
-  'context_now',
-] as const;
+export { SELF_COGNITION_TOOL_NAMES, SELF_COGNITION_MCP_CATALOG_ENTRIES } from './self-cognition-catalog.js';
 
 type SelfCognitionToolName = (typeof SELF_COGNITION_TOOL_NAMES)[number];
 type RecallToolName = 'memory_recall' | 'self_recall';
@@ -206,19 +199,4 @@ export const SELF_COGNITION_RUNTIMES: readonly ToolRuntime[] = SELF_COGNITION_TO
     : name === 'memory_recall' || name === 'self_recall'
       ? runRecall(name, args, ctx)
       : toToolRunResult(await coreTools().buildCoreTools().dispatch(name, args)),
-}));
-
-/** MCP catalog metadata derived from the same name ledger as the runtimes. */
-export const SELF_COGNITION_MCP_CATALOG_ENTRIES: readonly NativeToolCatalogEntry[] = SELF_COGNITION_TOOL_NAMES.map(name => ({
-  id: name,
-  kind: 'other',
-  aliases: [name],
-  displayName: name,
-  description: 'Read-only self-cognition query over elanous history, memory, operations, or logs.',
-  promptSummary: `\`${name}\` (read-only self-cognition query)`,
-  host: ['mcp'],
-  safety: ['read-only'],
-  supportsParallel: true,
-  defaultEnabled: true,
-  intentScope: 'ops-ui',
 }));

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as yaml } from 'yaml';
 import { runAutoApprove, WARNING_ONLY } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 import { runPublish, waitForAssets } from './publish-node.js';
@@ -125,6 +126,62 @@ test('publish rechecks freeze immediately before irreversible publication; only 
     if (previous.graph === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous.graph;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('publish-at waits after measured auto-approval and prerequisites; omission and past deadlines publish immediately', () => {
+  const root = mkdtempSync(join(tmpdir(), 'publish-deadline-'));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const version = '0.2.4';
+  const commit = 'a'.repeat(40);
+  const outputs: GraphContext['outputs'] = {
+    'auto-approve': { outcome: 'ok', decidedBy: 'release-loop metrics', metrics: Array.from({ length: 8 }, (_, i) => ({ name: `metric-${i}`, verdict: 'pass' })) },
+    'version-release': { commit }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' },
+    prepare: { outcome: 'ok', commit, out: root }, docs: { outcome: 'ok', branch: `release-docs/${version}` },
+  };
+  let now = Date.parse('2099-10-09T10:59:00Z');
+  const sleeps: number[] = [];
+  const calls: string[] = [];
+  const publishTimeouts: Array<number | undefined> = [];
+  const run = (command: string, args: string[], _cwd?: string, timeoutMs?: number) => {
+    calls.push(`${command} @ ${now}`);
+    if (command === 'bun') publishTimeouts.push(timeoutMs);
+    return { status: 0, stderr: '', stdout: command === 'git'
+      ? args[1]?.endsWith('pages.json') ? '{"pages":[]}' : `# ${version}\n\nBody\n`
+      : JSON.stringify({ ok: true, published: true, tag: `v${version}` }) };
+  };
+  const clock = { now: () => now, sleep: (ms: number) => { sleeps.push(ms); now += ms; } };
+  const publish = (publishAt?: string, authorized = true) => {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version, previousVersion: '0.2.3', ...(publishAt ? { publishAt } : {}) },
+      outputs: authorized ? outputs : { ...outputs, 'auto-approve': { outcome: 'fail' } } });
+    calls.length = 0;
+    sleeps.length = 0;
+    return runPublish(run, root, clock);
+  };
+  try {
+    expect(publish('2099-10-09T20:00+09:00')).toMatchObject({ outcome: 'ok', tag: `v${version}` });
+    expect(sleeps).toEqual([60_000]);
+    expect(publishTimeouts).toEqual([1_800_000]);
+    expect(calls).toEqual([`git @ ${Date.parse('2099-10-09T10:59:00Z')}`, `git @ ${Date.parse('2099-10-09T10:59:00Z')}`, `bun @ ${Date.parse('2099-10-09T11:00:00Z')}`]);
+    const unchanged = publish();
+    expect(unchanged).toEqual({ outcome: 'ok', verdict: 'pass', summary: `published v${version} · 0 assets downloadable`, tag: `v${version}` });
+    expect(sleeps).toEqual([]);
+    expect(publishTimeouts).toEqual([1_800_000, 1_800_000]);
+    expect(calls.at(-1)).toBe(`bun @ ${now}`);
+    expect(publish('2099-10-09T10:58:00Z').outcome).toBe('ok');
+    expect(sleeps).toEqual([]);
+    expect(publish('2099-10-09T11:01:00Z', false).outcome).toBe('fail');
+    expect(calls).toEqual([]);
+    expect(sleeps).toEqual([]);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the release graph publish command can outlive the scheduled wait; the inner publish remains bounded', () => {
+  const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
+  expect(recipes['publish-command']?.command).toBe('bun scripts/release-loop/publish-node.ts');
+  expect(recipes['publish-command']?.timeout_ms).toBeUndefined();
 });
 
 test('REL3: waits while an asset is not served yet, then reports none pending', () => {

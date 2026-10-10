@@ -5,9 +5,10 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--dry-run] [--json] [--if-ready]
-//   elanous release resume  --run <runId> --from <node> [--json]   (release/<v> 수리 뒤 새 끝으로 이어 달리기)
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--dry-run] [--json] [--if-ready]
+//   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
+//   elanous release rehearsal tick [--apply] [--checkout <dir>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 30분 전 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
 //
@@ -39,14 +40,17 @@ import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
 import { fileLeaseStore } from '../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
+import { publishAtError } from '../../scripts/release-loop/publish-at.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
 import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
+import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
 import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
+import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 
@@ -596,7 +600,7 @@ function compareReleaseVersions(a: string, b: string): number {
   return 0;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
@@ -811,7 +815,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         process.exitCode = 1;
       }
     });
-  withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
+  withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄 · postpub = 발행 뒤 실측 칸 — 판 관문이 발행 전 판정에서 빼고 따로 센다')
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD (없으면 판 착지일 KST)')
     .option('--accelerator', '가속 등급 — 다른 칸의 처리량을 올리는 칸(자율성·효율성·동시성). 생략하면 등급 없음')
@@ -825,7 +829,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
-    .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄')
+    .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸 · 근거에 짝: PWA … · 데스크톱 … · 폴드 … · 아이폰 … · 아이패드 … 한 줄 · postpub = 발행 뒤 실측 칸 — 판 관문이 발행 전 판정에서 빼고 따로 센다')
     .option('--priority <priority>', 'P0|P1|P2').option('--deadline-version <v>', '마감 판').option('--predecessor <id...>', '선행 칸 id').option('--no-predecessor', '선행 칸 비우기(진짜 의존이 아니면 · CHECKLIST-PRED-CLEAR)')
     .option('--ceo-minutes <minutes>', '대표 손 분량(분)').option('--ceo-date <date>', '대표 손 날짜 YYYY-MM-DD')
     .option('--accelerator', '가속 등급 부여').option('--no-accelerator', '가속 등급 해제(기본은 없음)')
@@ -985,12 +989,20 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
       // Only the rc rehearsal channel is operated for now (alpha/beta stay valid version shapes, not run options).
       if (o.prerelease !== undefined && o.prerelease !== 'rc') {
         const message = `--prerelease supports rc only: ${o.prerelease}`;
         if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: message })}\n`);
         else console.error(`⛔ ${message}`);
+        process.exitCode = 1;
+        return false;
+      }
+      // A malformed --publish-at is refused before readiness, so --if-ready cannot defer it as a success.
+      const publishAtInvalid = o.publishAt === undefined ? null : publishAtError(o.publishAt);
+      if (publishAtInvalid) {
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: publishAtInvalid })}\n`);
+        else console.error(`⛔ ${publishAtInvalid}`);
         process.exitCode = 1;
         return false;
       }
@@ -1026,7 +1038,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           const outcome = await runReleaseIfReady(o.version, {
             ledgerRoot: releaseRunDeps.ledgerRoot,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (o.json) await writeStdoutJson(`${JSON.stringify(outcome)}\n`);
@@ -1054,7 +1066,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze }, releaseRunDeps);
+        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, publishAt: o.publishAt }, releaseRunDeps);
         log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
         return result;
       }, (r) => r.dryRun || r.state?.status === 'done' || r.state?.status === 'awaiting-approval');
@@ -1067,9 +1079,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--prerelease <kind>', '미리보기 판(rc) — <v>-rc.<다음 빈 번호> · npm next · GitHub pre-release · docs-land/ops-upgrade/dev-bump 건너뜀')
     .option('--dry-run', '체크리스트·그래프 실행 없이 전체 입력 보기')
     .option('--if-ready', '준비되지 않았으면 사유를 출력하고 성공으로 건너뛴다')
+    .option('--publish-at <iso>', '승인·선행 노드 통과 뒤 지정 시각까지 발행 대기(오프셋 포함 ISO 시각)')
     .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; forceFreeze?: boolean; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
     .description('컷 30분 전 사전 점검(읽기 전용) — 체크리스트 게이트 모의 · 발행 뒤 칸 · run --dry-run 입력 · 동결 · 일정/게이트 실측. ⛔ 있으면 exit 1')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')
@@ -1112,16 +1125,45 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
     .requiredOption('--from <node>', '다시 시작할 노드(예: gate)')
     .option('--partial', 'GATE-PARTIAL — --from gate 에서 앞 게이트 뒤 바뀐 시험 파일 ⊕ 앞 실패 파일만 다시 돈다(시험·문서만 바뀐 경우 · 아니면 전체 게이트로)')
+    .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
+    .option('--reason <text>', '면제 사유 — 공개 알려진 문제에 들어갈 사용자 영향 설명')
+    .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; partial?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
-        const result = await resumeReleaseRun({ runId: o.run, from: o.from, partial: o.partial });
+        let acceptedRegressions: AcceptedRegression[] | undefined;
+        if (o.acceptedRegressions !== undefined) {
+          try { acceptedRegressions = JSON.parse(o.acceptedRegressions) as AcceptedRegression[]; }
+          catch { throw new Error('--accepted-regressions must be a JSON array of {id, note}'); }
+          if (!Array.isArray(acceptedRegressions) || acceptedRegressions.some((issue) => !issue ||
+            typeof issue.id !== 'string' || !issue.id.trim() || typeof issue.note !== 'string' || !issue.note.trim())) {
+            throw new Error('acceptedRegressions must be an array of {id, note}');
+          }
+        }
+        const result = await resumeReleaseRun({ runId: o.run, from: o.from, partial: o.partial,
+          ...(o.waive === undefined ? {} : { waive: o.waive }),
+          ...(o.reason === undefined ? {} : { reason: o.reason }),
+          ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }) });
         if (result.partial.requested) log(result.partial.applied
           ? `◐ 부분 재검: ${result.partial.files}파일 · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId };
       }, (r) => r.status === 'done' || r.status === 'awaiting-approval');
+    });
+  release.command('rehearsal').description('판 일정에서 컷 전 가벼운 RC 두 단계').command('tick')
+    .description('15분 틱: 다음 판 컷 −7h · −150m RC 계획(기본 보기만)')
+    .option('--apply', '도장 선점 후 해당 단계 실행')
+    .option('--checkout <dir>', '깨끗한 git 체크아웃(기본 ELANOUS_REHEARSAL_GIT_CWD)')
+    .option('--json', '결과 한 줄 JSON(stdout)')
+    .action(async (o: { apply?: boolean; checkout?: string; json?: boolean }) => {
+      await jsonAction(o.json, async (log) => {
+        const ledgerRoot = scheduleLedgerRoot();
+        if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
+        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, ledgerRoot }, rehearsalDeps);
+        log(`· 리허설 ${result.status}${'version' in result ? ` ${result.version}` : ''}${result.status === 'due' ? ` · 실행 ${result.run ?? '-'} · 건너뜀 ${result.supersede.join(', ') || '-'}` : ''}`);
+        return result;
+      }, (result) => !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome)));
     });
   release.command('auto-start')
     .description('판 일정의 컷 창에서 릴리스 시작을 미리 본다 · --apply 로 release run --if-ready 실행')

@@ -23,7 +23,7 @@ import { debug } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
 import { HostPoolLease, hostLeaseBaseDir, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
-import { acquireLockSync } from '../../storage/file-lock.js';
+import { acquireLockAsync, acquireLockSync } from '../../storage/file-lock.js';
 import { harnessCpuSlotsBesideGate, measurePoolLease, recommendConcurrency, type PodLeaseMember, type PoolDnsProbe, type PoolLeaseRecommendation } from './pod-lease.js';
 
 export interface PodPoolMember {
@@ -97,6 +97,12 @@ export function registryImageRef(member: PodPoolMember, commit: string | null, r
     const tags = (JSON.parse(r.stdout) as { tags?: string[] }).tags ?? [];
     return tags.includes(tag) ? `${registry}/${imageName}:${tag}` : null;
   } catch { return null; }
+}
+
+/** IMAGE-ONE-SOURCE: 이 멤버의 노드에 레지스트리 컨테이너가 있나(syncPoolImages 의 판정과 같은 명령). 로컬 멤버는 false. */
+export function memberHasRegistry(member: PodPoolMember, run: RemoteRun = defaultRemoteRun): boolean {
+  if (!member.sshHost) return false;
+  return run(member.sshHost, `docker inspect ${memberRegistry(member).split(':')[0]} >/dev/null 2>&1`).status === 0;
 }
 
 /** 노드 이미지의 스킬 해시 라벨(`elanous.pod-skills`). */
@@ -276,7 +282,14 @@ export class PodPoolScheduler {
       const decision = measured.recommended === null ? measured : { ...measured, recommended: Math.max(0, measured.recommended - others + (transferIsOther ? 1 : 0)) };
       // An unknown reading cannot erase permits already granted: on recovery,
       // the first healthy recommendation must still account for their slots.
-      if (decision.recommended === null) return decision;
+      // GATE-ADMIT-UNMEASURED(10-09 대표 «판 발행 문제없게»): 측정이 «?»(예: 부하 노드의 DNS 탐침)여도 게이트 조각은 하나씩 들어간다 —
+      //   게이트가 측정 복구를 기다리며 조각마다 승인 시간 초과를 물지 않게. 실제로 자리가 없으면 스케줄러가 Pending 으로 둔다(잃는 것 없음).
+      if (decision.recommended === null) {
+        if (!gate) return decision;
+        const active = this.gateAdmission.snapshot().active;
+        debug.log('pod.pool', 'gate-admit-unmeasured', { active, reason: decision.reason ?? null });
+        return { ...decision, recommended: active + 1 };
+      }
       // A new launch consumes a measured additional slot. Compare consecutive
       // measurements so repeated stale readings cannot grant that slot again.
       this.budget = Math.max(0, this.budget + decision.recommended - (this.initialized ? this.lastFree : 0));
@@ -324,7 +337,7 @@ export class PodPoolScheduler {
         const pendingJobs = this.lastRaw?.pendingJobs ?? [];
         const lease = transferred ?? (free !== null && free > 0 ? this.hostLease.tryReserve((others) =>
           others - this.hostLease.live().filter((r) => leaseHasPendingPod(r, pendingJobs) &&
-            (r.pid !== process.pid || r.startedAt !== this.hostLease.selfStart())).length < free) : null);
+            (r.pid !== process.pid || r.startedAt !== this.hostLease.selfStart())).length < free) : (gate && free === null ? this.hostLease.tryReserve(() => true) : null));
         if (lease) {
           let hostReleased = false;
           const releaseHost = () => { if (!hostReleased) { hostReleased = true; lease(); } };
@@ -719,7 +732,7 @@ function defaultRemoteBuild(script: string, image: string): RemoteBuild {
  *           📏 커밋이 바뀐 뒤 두 노드를 올리는 데 벽시계 55초(종전: 다시 굽기 1분 40초 ⊕ 4GB 차례 전송 5분 48초).
  *   실패하면 = 종전의 통째 전송(syncPoolImage)으로 떨어진다.
  */
-export async function syncPoolImages(members: readonly PodPoolMember[], image: string, localCommit: string | null, deps: { run?: RemoteRun; remoteBuild?: RemoteBuild; buildScript?: string | null; ship?: typeof syncPoolImage; localSkillsDigest?: string | null; waitIntervalMs?: number; waitMaxMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; inspect?: LocalImageInspect; transfer?: ImageShip; pack?: PoolPack | null } = {}): Promise<Map<string, PoolImageSync>> {
+export async function syncPoolImages(members: readonly PodPoolMember[], image: string, localCommit: string | null, deps: { run?: RemoteRun; remoteBuild?: RemoteBuild; buildScript?: string | null; ship?: typeof syncPoolImage; localSkillsDigest?: string | null; waitIntervalMs?: number; waitMaxMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; inspect?: LocalImageInspect; transfer?: ImageShip; pack?: PoolPack | null; lock?: ImageShipLockOptions } = {}): Promise<Map<string, PoolImageSync>> {
   const run = deps.run ?? defaultRemoteRun;
   const script = deps.buildScript === undefined ? podImageBuildScript() : deps.buildScript;
   const remoteBuild = deps.remoteBuild ?? (script ? defaultRemoteBuild(script, image) : null);
@@ -734,22 +747,61 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
     const t0 = Date.now();
     if (!m.sshHost) { results.set(m.context, { ok: true, action: 'local', detail: 'this machine', ms: 0 }); return; }
     const before = remoteImageCommit(m, image, run);
-    // ⭐ «같은 판» = 커밋 ⊕ 스킬 해시 ⊕ (레지스트리 노드면) 레지스트리에 그 커밋 태그가 있다 — 스킬만 바뀌어도 다시 굽는다(대표 2026-09-26 «스킬 셋트 싱크»).
     const skillsNow = deps.localSkillsDigest;
-    const skillsSame = skillsNow == null || remoteImageSkillsDigest(m, image, run) === skillsNow;
     const refBefore = registryImageRef(m, localCommit, run, image);
     const hasRegistry = run(m.sshHost, `docker inspect ${memberRegistry(m).split(':')[0]} >/dev/null 2>&1`).status === 0;
-    if (localCommit && before === localCommit && skillsSame && (!hasRegistry || refBefore)) {
-      results.set(m.context, { ok: true, action: 'fresh', detail: before.slice(0, 12), ms: Date.now() - t0, ...(refBefore ? { imageRef: refBefore } : {}) });
+    const registrySkillsSame = (ref: string) => skillsNow == null || remoteImageSkillsDigest(m, `localhost:${memberRegistry(m).split(':')[1]}/${ref.slice(ref.indexOf('/') + 1)}`, run) === skillsNow;
+    const skillsSame = hasRegistry && refBefore ? registrySkillsSame(refBefore) : skillsNow == null || remoteImageSkillsDigest(m, image, run) === skillsNow;
+    if (hasRegistry && refBefore && skillsSame) {
+      debug.log('pod.pool', 'image-fresh-registry-tag', { context: m.context, host: m.sshHost, commit: localCommit, localLabel: before, imageRef: refBefore, waitedMs: 0 });
+      results.set(m.context, { ok: true, action: 'fresh', detail: localCommit!.slice(0, 12), ms: Date.now() - t0, imageRef: refBefore });
+      return;
+    }
+    if (!hasRegistry && localCommit && before === localCommit && skillsSame) {
+      results.set(m.context, { ok: true, action: 'fresh', detail: before.slice(0, 12), ms: Date.now() - t0 });
       return;
     }
     if (remoteBuild) {
-      // 같은 판이 아닌 멤버가 처음 여기 닿을 때 pack 한다(전부 fresh 면 pack 도 없다).
-      const shared = sharePack ? await (packed ??= sharePack()) : null;
-      if (shared && !shared.ok) debug.log('self-implement.pod', 'pool-image-pack-failed', { context: m.context, detail: shared.detail });
-      const b = shared && !shared.ok
-        ? { ok: false, detail: shared.detail }
-        : await remoteBuild(m.sshHost, m.k3dCluster, m.registry, shared?.tgz);
+      // Build and publish under a separate per-host lock: a failed build can then enter ship's synchronous lock.
+      const lockOpts = deps.lock ?? {};
+      const lockDir = lockOpts.dir ?? join(hostLeaseBaseDir(), 'image-ship');
+      const lockPath = `${imageShipLockPath(m.sshHost, lockDir)}.build`;
+      const retryMs = lockOpts.retryMs ?? 2_000;
+      const staleMs = lockOpts.staleMs ?? IMAGE_SHIP_TIMEOUT_MS + REMOTE_RUN_TIMEOUT_MS + 120_000;
+      const lockStarted = Date.now();
+      let b: { ok: boolean; detail: string };
+      try {
+        mkdirSync(lockDir, { recursive: true });
+        // Probe atomically rather than testing path existence: another process can acquire between that test and us.
+        let lock;
+        let waited = false;
+        try { lock = await acquireLockAsync(lockPath, { staleMs, retryBusyMs: 1, maxTries: 1 }); }
+        catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith('acquireLockAsync: timed out')) throw error;
+          waited = true;
+          debug.log('pod.pool', 'image-build-lock-wait', { context: m.context, host: m.sshHost, commit: localCommit, localLabel: before, imageRef: refBefore, waitedMs: Date.now() - lockStarted });
+          lock = await acquireLockAsync(lockPath, { staleMs, retryBusyMs: retryMs, maxTries: lockOpts.maxTries ?? Math.ceil(staleMs / retryMs) + 10 });
+        }
+        try {
+          if (waited && hasRegistry) {
+            const refNow = registryImageRef(m, localCommit, run, image);
+            if (refNow && registrySkillsSame(refNow)) {
+              debug.log('pod.pool', 'image-build-skipped-after-wait', { context: m.context, host: m.sshHost, commit: localCommit, localLabel: before, imageRef: refNow, waitedMs: Date.now() - lockStarted });
+              results.set(m.context, { ok: true, action: 'fresh', imageRef: refNow, detail: `${localCommit?.slice(0, 12)} (built by another process while waiting)`, ms: Date.now() - t0 });
+              return;
+            }
+          }
+          // 같은 판이 아닌 멤버가 처음 여기 닿을 때 pack 한다(전부 fresh 면 pack 도 없다).
+          const shared = sharePack ? await (packed ??= sharePack()) : null;
+          if (shared && !shared.ok) debug.log('self-implement.pod', 'pool-image-pack-failed', { context: m.context, detail: shared.detail });
+          b = shared && !shared.ok
+            ? { ok: false, detail: shared.detail }
+            : lock.stillHeld() ? await remoteBuild(m.sshHost, m.k3dCluster, m.registry, shared?.tgz) : { ok: false, detail: 'image build lock lost' };
+          if (!lock.stillHeld()) b = { ok: false, detail: 'image build lock lost' };
+        } finally { lock.release(); }
+      } catch (error) {
+        b = { ok: false, detail: `image build lock: ${error instanceof Error ? error.message : String(error)}` };
+      }
       const after = remoteImageCommit(m, image, run);
       const refAfter = registryImageRef(m, localCommit ?? after, run, image);
       // ⭐ 레지스트리 노드면 «이 판 커밋 태그가 레지스트리에 있나»로 판정한다 — Pod 는 그 커밋 태그를 pull 한다.

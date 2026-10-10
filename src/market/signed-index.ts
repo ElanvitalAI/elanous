@@ -1,10 +1,31 @@
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 
+export interface MarketplaceArtifact {
+  sha256: string;
+  bytes: number;
+  key: string;
+}
+
+export interface MarketplaceScopedPack {
+  name: string;
+  version: string;
+  description?: string;
+  artifact: MarketplaceArtifact;
+  visibility: 'public' | 'internal';
+  enterpriseId?: string;
+}
+
+export interface MarketplaceLoopBundle extends MarketplaceScopedPack {
+  graphs?: string[];
+}
+
 export interface MarketplaceIndex {
   name: string;
   interface: { displayName: string };
   sequence: number;
   generatedAt?: string;
+  knowledgePacks?: MarketplaceScopedPack[];
+  loopBundles?: MarketplaceLoopBundle[];
   plugins: Array<{
     name: string;
     source: { source: string; [key: string]: unknown };
@@ -56,6 +77,27 @@ function invalidIndex(value: unknown): string | null {
   if (!Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0) return 'sequence: expected non-negative integer';
   if (value.generatedAt !== undefined && !string(value.generatedAt)) return 'generatedAt: expected string';
   if (!Array.isArray(value.plugins)) return 'plugins: expected array';
+
+  for (const collection of ['knowledgePacks', 'loopBundles'] as const) {
+    const entries = value[collection];
+    if (entries === undefined) continue;
+    if (!Array.isArray(entries)) return `${collection}: expected array`;
+    for (const [i, entry] of entries.entries()) {
+      const field = (name: string) => `${collection}[${i}] (${record(entry) && string(entry.name) ? entry.name : 'unnamed'}).${name}`;
+      if (!record(entry)) return field('expected object');
+      if (!string(entry.name) || !entry.name.trim()) return field('name: expected non-empty string');
+      if (!string(entry.version) || !entry.version.trim()) return field('version: expected non-empty string');
+      if (entry.description !== undefined && !string(entry.description)) return field('description: expected string');
+      if (entry.visibility !== 'public' && entry.visibility !== 'internal') return field('visibility: expected public or internal');
+      if (entry.visibility === 'internal' && (!string(entry.enterpriseId) || !entry.enterpriseId.trim())) return field('enterpriseId: required for internal entry');
+      if (entry.visibility === 'public' && entry.enterpriseId !== undefined) return field('enterpriseId: not allowed for public entry');
+      if (!record(entry.artifact)) return field('artifact: expected object');
+      if (!string(entry.artifact.sha256) || !/^[a-fA-F0-9]{64}$/.test(entry.artifact.sha256)) return field('artifact.sha256: expected 64 hex characters');
+      if (!Number.isSafeInteger(entry.artifact.bytes) || (entry.artifact.bytes as number) < 0) return field('artifact.bytes: expected non-negative integer');
+      if (!string(entry.artifact.key) || !entry.artifact.key.trim()) return field('artifact.key: expected non-empty string');
+      if (collection === 'loopBundles' && entry.graphs !== undefined && !stringArray(entry.graphs)) return field('graphs: expected string array');
+    }
+  }
 
   for (const [i, plugin] of value.plugins.entries()) {
     const field = (name: string) => `plugins[${i}] (${record(plugin) && string(plugin.name) ? plugin.name : 'unnamed'}).${name}`;

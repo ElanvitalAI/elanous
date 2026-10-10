@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { appendSkillRun, proposeSkillFixes, readSkillRuns, type SkillRun } from './skill-feedback.js';
+import {
+  appendSkillRun, proposeSkillFixes, readSkillRuns, recordSkillRunSafe, skillFeedbackLedgerPath, type SkillRun,
+} from './skill-feedback.js';
 
 function run(runId: string, skill = 'omni-crawl', failureKind = 'timeout'): SkillRun {
   return {
@@ -91,5 +93,55 @@ describe('skill feedback (shadow only)', () => {
     dirs.push(dir);
     expect(readSkillRuns(join(dir, 'missing.jsonl'))).toEqual([]);
     expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
+describe('skill feedback ledger (SK1 · state-root ledger, fail-soft)', () => {
+  const feedbackEvents = (skill: string, event: string) =>
+    debug.events(5000).filter((e) => e.category === 'skill.feedback' && e.event === event
+      && (e.data as { skill?: string } | undefined)?.skill === skill);
+
+  test('ledger path lives under <root>/skills/feedback.jsonl and the directory is created', () => {
+    const root = mkdtempSync(join(tmpdir(), 'skill-feedback-root-'));
+    dirs.push(root);
+    const ledger = skillFeedbackLedgerPath(root);
+    expect(ledger).toBe(join(root, 'skills', 'feedback.jsonl'));
+    expect(existsSync(join(root, 'skills'))).toBe(true);
+  });
+
+  test('success line then failure line read back in order, failureKind kept, nothing else written', () => {
+    const root = mkdtempSync(join(tmpdir(), 'skill-feedback-root-'));
+    dirs.push(root);
+    const skill = `sk1-order-${Date.now()}`;
+    const ledger = skillFeedbackLedgerPath(root);
+    const success: SkillRun = {
+      skill, runId: 'ok-1', outcome: 'success', userCorrected: false, retries: 0, durationMs: 5,
+      at: '2026-10-09T00:00:01Z',
+    };
+    const failure: SkillRun = { ...success, runId: 'fail-1', outcome: 'failure', failureKind: 'TypeError' };
+    recordSkillRunSafe(success, ledger);
+    recordSkillRunSafe(failure, ledger);
+    const runs = readSkillRuns(ledger);
+    expect(runs).toEqual([success, failure]);
+    expect(runs[1]!.failureKind).toBe('TypeError');
+    expect(readdirSync(root)).toEqual(['skills']);
+    expect(readdirSync(join(root, 'skills'))).toEqual(['feedback.jsonl']);
+    expect(feedbackEvents(skill, 'recorded')).toHaveLength(2);
+  });
+
+  test('unwritable ledger path returns normally with exactly one record-failed observation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'skill-feedback-root-'));
+    dirs.push(root);
+    const blocker = join(root, 'a-file');
+    writeFileSync(blocker, 'not a directory');
+    const skill = `sk1-unwritable-${Date.now()}`;
+    const failing: SkillRun = {
+      skill, runId: 'r-x', outcome: 'success', userCorrected: false, retries: 0, durationMs: 1,
+      at: '2026-10-09T00:00:00Z',
+    };
+    expect(() => recordSkillRunSafe(failing, join(blocker, 'skills', 'feedback.jsonl'))).not.toThrow();
+    expect(feedbackEvents(skill, 'record-failed')).toHaveLength(1);
+    expect(feedbackEvents(skill, 'recorded')).toHaveLength(0);
+    expect(readFileSync(blocker, 'utf8')).toBe('not a directory');
   });
 });

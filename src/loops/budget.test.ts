@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
+import { calculateSeatBaseShares, budgetTrafficTick, decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
 
 test('configured seat caps and default four-per-seat gate both constrain spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 3, caps: { TC: 8 } })).toEqual({ allow: true, reason: 'within-cap', cap: 4 });
@@ -61,6 +61,26 @@ test('injected cap is an independent candidate that cannot raise the configured 
 test('invalid cap inputs cannot permit a spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 0, caps: { TC: NaN } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
   expect(decideSpawn({ seat: 'TC', running: 0, gate: { TC: -1 } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
+});
+
+test('shared resource loop assigns weighted shares and retains physical caps above the spawn default gate', () => {
+  const caps = { OP: 2, TC: 4, MK: 6, UX: 2 };
+  const yellow = (owner: string) => ({ id: owner, title: owner, owner, status: 'yellow' as const });
+  expect(calculateSeatBaseShares({ totalSlots: 8, currentRound: [yellow('MK'), yellow('TC')],
+    nextRound: [yellow('OP')], seatCaps: caps })).toEqual({ OP: 2, TC: 3, MK: 3, UX: 0 });
+  const result = budgetTrafficTick({ processes: [{ seat: 'MK', command: 'bun bin/elanous.mjs harness ask goal', elapsedSeconds: 2400 }],
+    now: new Date('2026-10-05T00:00:00Z'), caps, openCells: [yellow('MK')], nextRound: [], totalSlots: 12 });
+  expect(result.seats[2]).toMatchObject({ seat: 'MK', cap: 6, baseShare: 6, running: 1, launchCap: 6, idle: true });
+});
+
+test('observation retains a pending MK cell with zero running even when launch approval is false', () => {
+  const input = { now: new Date('2026-10-05T00:00:00Z'), caps: { OP: 2, TC: 4, MK: 6, UX: 2 },
+    processes: [], openCells: [{ id: 'MK-WAIT', title: 'waiting', owner: 'MK', status: 'yellow' as const }],
+    nextRound: [], totalSlots: 0 };
+  const scheduled = budgetTrafficTick(input).seats[2];
+  expect(scheduled).toMatchObject({ running: 0, idle: false, nextCell: null });
+  const observed = budgetTrafficTick({ ...input, retainQueuedCells: true }).seats[2];
+  expect(observed).toMatchObject({ running: 0, idle: false, nextCell: input.openCells[0] });
 });
 
 describe('seatCapExclusion (SEAT-CAP-STALE)', () => {

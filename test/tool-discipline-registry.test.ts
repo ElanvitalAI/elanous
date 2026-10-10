@@ -9,7 +9,7 @@
 //    이 파일은 축② 다.
 
 import { describe, test, expect } from 'bun:test';
-import { resolveToolDiscipline, CODEX_TOOL_DISCIPLINE, GROK_TOOL_DISCIPLINE } from '../src/llm';
+import { resolveToolDiscipline, CODEX_TOOL_DISCIPLINE, GROK_TOOL_DISCIPLINE, OPEN_WEIGHT_TOOL_DISCIPLINE } from '../src/llm';
 import type { ModelFamily } from '../src/models/prompts';
 
 // ⛔⭐ 무인 리뷰 must-fix(#9079) — 초판은 `as const` 배열에 `satisfies readonly ModelFamily[]` 를
@@ -18,7 +18,7 @@ import type { ModelFamily } from '../src/models/prompts';
 //   ⇒ 키 완전성을 강제하는 형태로 바꾼다: `Record<ModelFamily, 1>` 은 빠진 키를 컴파일 에러로,
 //     `satisfies` 는 «없는 키»를 컴파일 에러로 만든다. 양쪽이 막힌다.
 const FAMILY_KEYS = {
-  claude: 1, gpt: 1, codex: 1, grok: 1, gemini: 1, local: 1, other: 1,
+  claude: 1, gpt: 1, codex: 1, grok: 1, gemini: 1, local: 1, 'open-weight': 1, other: 1,
 } satisfies Record<ModelFamily, 1>;
 const ALL_FAMILIES = Object.keys(FAMILY_KEYS) as readonly ModelFamily[];
 
@@ -27,6 +27,8 @@ describe('resolveToolDiscipline — 군마다 «칸»이 있다(분기가 아니
     expect(resolveToolDiscipline('codex')).toBe(CODEX_TOOL_DISCIPLINE);
     expect(resolveToolDiscipline('grok')).toBe(GROK_TOOL_DISCIPLINE);
     expect(resolveToolDiscipline('local')).toContain('[local tool-use discipline]');
+    expect(resolveToolDiscipline('open-weight')).toBe(OPEN_WEIGHT_TOOL_DISCIPLINE);
+    expect(OPEN_WEIGHT_TOOL_DISCIPLINE).toContain('[open-weight tool-use discipline]');
   });
 
   // ⛔ 「아직 안 쟀다」이지 「필요 없다」가 아니다. 이 단언은 «현재 상태»를 못 박을 뿐이고,

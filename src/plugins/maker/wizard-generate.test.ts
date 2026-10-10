@@ -37,6 +37,43 @@ test('research draft writes structurally valid files, declared secret names only
   expect(readdirSync(dir).sort()).toEqual(['README.md', 'examples', 'graphs', 'plugin.json', 'skills']);
 });
 
+test('declared knowledge packs go to plugin requires, while resource requires stay in skill metadata and survive inventory reload', async () => {
+  const parent = temp();
+  const withPacks: WizardResearchDraft = { ...draft, requires: { knowledgePacks: ['facts-pack', 'policy-pack', 'facts-pack'] } };
+  saveWizardDraft(parent, 'weather-research', withPacks);
+  const dir = join(parent, 'weather-research');
+  const manifest = JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8'));
+  expect(manifest.requires).toEqual({ knowledgePacks: ['facts-pack', 'policy-pack'] });
+  expect(manifest.extensions['ai.elanous'].requires).toBeUndefined();
+  expect(parseYaml(readFileSync(join(dir, 'skills/weather-research/SKILL.md'), 'utf8').split('---')[1]!)).toMatchObject({ requires: ['openai'] });
+  expect(listWizardDrafts(parent)[0]?.draft.requires).toEqual({ knowledgePacks: ['facts-pack', 'policy-pack'] });
+  expect(await validatePluginDir(dir)).toEqual([]);
+});
+
+test('scaffold and regeneration preserve unrelated plugin requirements and replace only explicitly declared knowledge packs', () => {
+  const dir = temp();
+  const path = join(dir, 'plugin.json');
+  writeFileSync(path, JSON.stringify({ name: 'weather-research', version: '0.1.0',
+    requires: { tools: ['ffmpeg'], knowledgePacks: ['old-pack'] },
+    extensions: { 'ai.elanous': { graphs: ['./graphs/weather-research.yaml'], capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'] } } }));
+  generateWizardFiles(dir, 'weather-research', { ...draft, requires: { knowledgePacks: ['new-pack'] } });
+  expect(JSON.parse(readFileSync(path, 'utf8')).requires).toEqual({ tools: ['ffmpeg'], knowledgePacks: ['new-pack'] });
+  generateWizardFiles(dir, 'weather-research', draft, { regenerate: true });
+  expect(JSON.parse(readFileSync(path, 'utf8')).requires).toEqual({ tools: ['ffmpeg'], knowledgePacks: ['new-pack'] });
+  generateWizardFiles(dir, 'weather-research', { ...draft, requires: { knowledgePacks: [] } }, { regenerate: true });
+  expect(JSON.parse(readFileSync(path, 'utf8')).requires).toEqual({ tools: ['ffmpeg'], knowledgePacks: [] });
+  expect(parseYaml(readFileSync(join(dir, 'skills/weather-research/SKILL.md'), 'utf8').split('---')[1]!)).toMatchObject({ requires: ['openai'] });
+});
+
+test('invalid declared knowledge packs are rejected before writing or changing wizard files', () => {
+  const dir = temp();
+  for (const requires of [{ knowledgePacks: 'facts-pack' }, { knowledgePacks: ['  '] }, { knowledgePacks: [42] }, { unexpected: ['facts-pack'] }]) {
+    expect(() => generateWizardFiles(dir, 'weather-research', { ...draft, requires } as unknown as WizardResearchDraft))
+      .toThrow('wizard knowledge packs');
+    expect(readdirSync(dir)).toEqual([]);
+  }
+});
+
 test('generated research graph steps fail explicitly until requested processing is implemented', () => {
   const dir = temp();
   generateWizardFiles(dir, 'weather-research', draft);

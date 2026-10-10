@@ -4,6 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { debug } from '../../debug/log.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
+import { readFailureInbox } from '../../self-implement/heal-intake.js';
 import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { collectPodLedgers, createPodLedgerFollower, parsePodLedgerChunks } from './pod-ledger-collect.js';
 
@@ -31,6 +34,88 @@ function fixture(): { source: string; destination: string; original: Buffer; lin
 }
 
 describe('pod run-ledger collection', () => {
+  test('failed final Pod ledger enters host heal inbox once and a second recovery folds', async () => {
+    const host = mkdtempSync(join(tmpdir(), 'pod-heal-host-'));
+    const otherHost = mkdtempSync(join(tmpdir(), 'pod-heal-other-'));
+    const dir = runLedgerDir(host);
+    const at = '2026-10-08T11:00:00.000Z';
+    const jsonl = [
+      { timestamp: at, runId, event: 'start', data: { origin } },
+      { timestamp: at, runId, event: 'run-status', data: { runStatus: 'failed' } },
+    ].map(entry => JSON.stringify(entry) + '\n').join('');
+    try {
+      setElanousConfigDir(otherHost);
+      const logs = transfer(runId, jsonl).join('\n');
+      const collect = () => collectPodLedgers(logs, { dir, log: () => {}, emit: () => {} });
+      collect();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(jsonl);
+      expect(readFailureInbox({}, host)).toEqual([{
+        source: 'harness-run', kind: 'pod-run', ref: runId, summary: `Pod run ${runId} failed`, at,
+      }]);
+      expect(readFailureInbox({}, otherHost)).toEqual([]);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const recorded = () => debug.events(200).filter(entry => entry.category === 'heal.intake' && entry.event === 'recorded'
+        && (entry.data as { ref?: string }).ref === runId);
+      expect(recorded().at(-1)).toMatchObject({ data: { folded: false } });
+      collect();
+      expect(readFailureInbox({}, host)).toHaveLength(1);
+      expect(recorded().slice(-2).map(entry => (entry.data as { folded: boolean }).folded)).toEqual([false, true]);
+      expect(readFailureInbox({}, otherHost)).toEqual([]);
+    } finally {
+      resetElanousConfigDir();
+      rmSync(host, { recursive: true, force: true });
+      rmSync(otherHost, { recursive: true, force: true });
+    }
+  });
+
+  test('final replacement of a follower-owned partial ledger reaches the host heal inbox', () => {
+    const host = mkdtempSync(join(tmpdir(), 'pod-heal-final-replace-'));
+    try {
+      const dir = runLedgerDir(host);
+      const at = '2026-10-08T11:00:00.000Z';
+      const first = `${JSON.stringify({ timestamp: at, runId, event: 'start', data: {} })}\n`;
+      const final = first + `${JSON.stringify({ timestamp: at, runId, event: 'run-status', data: { runStatus: 'failed' } })}\n`;
+      const follower = createPodLedgerFollower({ runId, dir, log: () => {}, emit: () => {},
+        exec: () => ({ status: 0, stdout: `${first}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
+      });
+      follower.poll();
+      expect(follower.owned).toBe(true);
+      expect(readFailureInbox({}, host)).toEqual([]);
+      collectPodLedgers(transfer(runId, final).join('\n'), { dir, replace: new Set([runId]), log: () => {}, emit: () => {} });
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(final);
+      expect(readFailureInbox({}, host)).toEqual([{
+        source: 'harness-run', kind: 'pod-run', ref: runId, summary: `Pod run ${runId} failed`, at,
+      }]);
+    } finally { rmSync(host, { recursive: true, force: true }); }
+  });
+
+  test('a later start supersedes a failed status until a final failure arrives', () => {
+    const host = mkdtempSync(join(tmpdir(), 'pod-heal-superseded-'));
+    try {
+      const dir = runLedgerDir(host);
+      const jsonl = [
+        { timestamp: '2026-10-08T11:00:00Z', runId, event: 'run-status', data: { runStatus: 'failed' } },
+        { timestamp: '2026-10-08T11:01:00Z', runId, event: 'start', data: {} },
+      ].map(entry => JSON.stringify(entry) + '\n').join('');
+      collectPodLedgers(transfer(runId, jsonl).join('\n'), { dir, log: () => {}, emit: () => {} });
+      expect(readFailureInbox({}, host)).toEqual([]);
+    } finally { rmSync(host, { recursive: true, force: true }); }
+  });
+
+  test('completed or conflicting Pod ledgers do not enter host heal intake', () => {
+    const host = mkdtempSync(join(tmpdir(), 'pod-heal-filter-'));
+    const dir = runLedgerDir(host);
+    try {
+      const completed = `${JSON.stringify({ timestamp: '2026-10-08T11:00:00Z', runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`;
+      collectPodLedgers(transfer(runId, completed).join('\n'), { dir, log: () => {}, emit: () => {} });
+      expect(readFailureInbox({}, host)).toEqual([]);
+      const failed = `${JSON.stringify({ timestamp: '2026-10-08T11:00:00Z', runId, event: 'run-status', data: { runStatus: 'failed' } })}\n`;
+      collectPodLedgers(transfer(runId, failed).join('\n'), { dir, log: () => {}, emit: () => {} });
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(completed);
+      expect(readFailureInbox({}, host)).toEqual([]);
+    } finally { rmSync(host, { recursive: true, force: true }); }
+  });
+
   test('restores a real writer ledger byte-for-byte with origin from interspersed, out-of-order chunks', () => {
     const f = fixture();
     try {

@@ -6,6 +6,8 @@ import { canonicalGraphJson, parseGraphTemplateYaml } from '../../../../../src/s
 import { CORE_GRAPH_KINDS } from '@/lib/run-graph-yaml-edit';
 import {
   addNode,
+  applyCanvasRunStep,
+  applyCanvasRunSteps,
   connect,
   defaultOutcome,
   emptyGraph,
@@ -25,6 +27,7 @@ import {
 } from './graph-canvas-model';
 import { saveCanvasGraph, type CanvasSaveClient } from './graph-canvas-save';
 import { NexusApiError } from '@/nexus/client';
+import type { RunStep } from '../../../../../src/self-implement/run-step-projection';
 
 function threeNodeLine(): CanvasGraph {
   let graph = emptyGraph('cge-demo');
@@ -139,6 +142,76 @@ describe('graph canvas model (CGE-EDIT)', () => {
     graph = setFailTarget(graph, 'B', null);
     expect(failTarget(graph, 'B')).toBeNull();
     expect(() => setFailTarget(graph, 'B', 'B')).toThrow();
+  });
+});
+
+describe('canvas run steps', () => {
+  const ts = '2026-10-09T00:00:00.000Z';
+
+  test('re-entry after exit clears the previous outcome and exitedAt until the new visit exits', () => {
+    const source = threeNodeLine();
+    const entered = applyCanvasRunSteps(source, [
+      { seq: 4, ts: '2026-10-09T00:04:00.000Z', type: 'node-enter', node: 'A', visit: 2 },
+      { seq: 2, ts: '2026-10-09T00:02:00.000Z', type: 'node-exit', node: 'A', outcome: 'rework' },
+      { seq: 1, ts: '2026-10-09T00:01:00.000Z', type: 'node-enter', node: 'A', visit: 1 },
+      { seq: 3, ts: '2026-10-09T00:03:00.000Z', type: 'node-skipped', node: 'A', reason: 'condition' },
+    ]);
+    expect(entered.nodes.A).toEqual({
+      visit: 2, enteredAt: '2026-10-09T00:04:00.000Z', outcome: undefined,
+      exitedAt: undefined, skipped: undefined,
+    });
+    expect(entered.lastSeq).toBe(4);
+    expect(entered.graph).toBe(source);
+    const exited = applyCanvasRunStep(entered, { seq: 5, ts, type: 'node-exit', node: 'A', outcome: 'ok' });
+    expect(exited.nodes.A).toMatchObject({ visit: 2, outcome: 'ok', exitedAt: ts });
+    expect(entered.nodes.A?.outcome).toBeUndefined();
+  });
+
+  test('replays the shared format by seq through the final step without mutating the YAML graph', () => {
+    const source = threeNodeLine();
+    const before = toYaml(source);
+    const steps: RunStep[] = [
+      { seq: 8, ts, type: 'node-exit', node: 'B', outcome: 'ok' },
+      { seq: 1, ts, type: 'node-enter', node: 'A', visit: 1 },
+      { seq: 4, ts, type: 'node-skipped', node: 'C', reason: 'condition', condition: 'skip' },
+      { seq: 3, ts, type: 'edge-taken', from: 'A', to: 'B', via: 'outcome' },
+      { seq: 2, ts, type: 'node-exit', node: 'A', outcome: 'ok' },
+    ];
+    const result = applyCanvasRunSteps(source, steps);
+    expect(result.lastSeq).toBe(8);
+    expect(result.nodes.A).toMatchObject({ visit: 1, outcome: 'ok', enteredAt: ts, exitedAt: ts });
+    expect(result.nodes.B?.outcome).toBe('ok');
+    expect(result.nodes.C?.skipped).toEqual({ reason: 'condition', condition: 'skip', at: ts });
+    expect(result.taken).toEqual([{ seq: 3, ts, type: 'edge-taken', from: 'A', to: 'B', via: 'outcome' }]);
+    expect(result.graph).toBe(source);
+    expect(toYaml(source)).toBe(before);
+    expect(applyCanvasRunStep(result, steps[0]!)).toBe(result);
+  });
+
+  test('structural changes and childRunId-linked units apply in order; static positions and loader fields survive', () => {
+    const source = threeNodeLine();
+    const original = { ...source, extra: { version: 3, loop: { max_visits: 2 } } };
+    const steps: RunStep[] = [
+      { seq: 6, ts, type: 'unit-collapsed', node: 'B', resolution: 0, decider: 'supervisor', reason: 'finished' },
+      { seq: 2, ts, type: 'edge-rerouted', from: 'A', outcome: '', was: 'B', to: 'D', decider: 'supervisor', reason: 'branch' },
+      { seq: 1, ts, type: 'node-added', node: 'D', kind: 'agent', decider: 'supervisor', reason: 'need work' },
+      { seq: 3, ts, type: 'unit-expanded', node: 'B', unit: 'unit@1', childRunId: 'child-run-1', resolution: 1, decider: 'supervisor', reason: 'zoom' },
+      { seq: 4, ts, type: 'unit-expanded', node: 'C', unit: 'unit@2', childRunId: 'child-run-2', resolution: 2, decider: 'supervisor', reason: 'zoom' },
+      { seq: 5, ts, type: 'unit-expanded', node: 'B', unit: 'unit@1', childRunId: 'child-run-3', resolution: 2, decider: 'supervisor', reason: 'retry' },
+    ];
+    const result = applyCanvasRunSteps(original, steps);
+    expect(result.graph.nodes.map(({ id }) => id)).toEqual(['A', 'B', 'C', 'D']);
+    expect(result.graph.nodes.slice(0, 3)).toEqual(original.nodes);
+    expect(result.graph.edges[0]).toEqual({ from: 'A', to: 'D', outcome: '' });
+    expect(result.graph.extra).toEqual(original.extra);
+    expect(result.units).toEqual([
+      { node: 'C', unit: 'unit@2', childRunId: 'child-run-2', resolution: 2, expanded: true },
+      { node: 'B', unit: 'unit@1', childRunId: 'child-run-3', resolution: 0, expanded: false },
+    ]);
+    expect(result.lastSeq).toBe(6);
+    expect(original.edges[0]?.to).toBe('B');
+    expect(parseYaml(toYaml(original)).version).toBe(3);
+    expect(fromYaml(toYaml(original)).nodes.map(({ id }) => id)).toEqual(['A', 'B', 'C']);
   });
 });
 

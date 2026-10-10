@@ -6,7 +6,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { fileURLToPath } from 'node:url';
-import { createStaleInstallCheck, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
+import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
 import { LOCAL_SKILLS_DIR, SERVICE_NAMES, DATA_DIR, OBSIDIAN_VAULT } from '../config.js';
@@ -896,7 +896,7 @@ import { inspectActiveProvider } from '../provider-summary.js';
 import { activeCodexAccountView } from '../oauth/codex-account-store.js';
 import { buildDashboardStatusLines } from './dashboard-status-lines.js';
 import { readSlashContextNow, seatsNowLine } from '../context-bus/context-now-surfaces.js';
-import { buildFirstScreenBand } from './first-screen-band.js';
+import { buildFirstScreenBand, resolveTuiDaemonLink, type TuiDaemonLink } from './first-screen-band.js';
 import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
   workingDirSegment, sessionCwdSegment, modelSegment, gitSegment,
@@ -2128,15 +2128,22 @@ export function renderDashboardFirstScreenBand(input: {
   readonly draw: () => void;
   readonly observe: (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }) => void;
   readonly show?: () => Promise<Pick<NexusShowResult, 'status' | 'urls'>>;
+  readonly daemonLink?: () => Promise<TuiDaemonLink>;
 }): Promise<void> {
   if (input.history.some((message) => message.role !== 'system')) return Promise.resolve();
-  const band = buildFirstScreenBand({ width: input.width, daemon: false });
+  const band = buildFirstScreenBand({ width: input.width, daemon: false, link: { status: 'checking' } });
   input.lines.unshift(...band);
+  const daemonLink = input.daemonLink ?? resolveTuiDaemonLink;
+  const linkPending = Promise.resolve().then(() => daemonLink()).catch((): TuiDaemonLink => ({ status: 'error', stage: 'health' })).then((link) => {
+    if (input.lines[0] !== band[0]) return;
+    input.lines[0] = buildFirstScreenBand({ width: input.width, daemon: false, link })[0]!;
+    try { input.draw(); } catch { /* screen may have closed */ }
+  });
   const show = input.show ?? (() => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }));
   const observe = (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }): void => {
     try { input.observe(data); } catch { /* observation cannot interrupt the transcript */ }
   };
-  return Promise.resolve().then(show).then((result) => {
+  const pwaPending = Promise.resolve().then(show).then((result) => {
     const daemon = result.status !== 'absent';
     const pwa = result.urls?.pwa;
     const hasPwa = !!pwa;
@@ -2148,6 +2155,7 @@ export function renderDashboardFirstScreenBand(input: {
   }).catch(() => {
     observe({ daemon: false, hasPwa: false, hasTailnet: false });
   });
+  return Promise.all([linkPending, pwaPending]).then(() => {});
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
@@ -4361,13 +4369,27 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     now: Date.now,
   });
   if (versionDir) {
+    let staleNoticeIndex = -1;
+    let staleNoticeLine: string | undefined;
+    let staleNoticeCount = 0;
     const checkInstall = (): void => {
       const result = staleInstallCheck.check();
       debug.log('dashboard.version', 'install-check', {
         state: result.state, bootCommit: result.bootCommit, installedCommit: result.installedCommit,
       });
       if (staleInstallCheck.shouldNotify(result)) {
-        chatLines.push(C.warning(`elanous 가 새 판으로 바뀌었다 (${result.bootCommit!.slice(0, 7)} → ${result.installedCommit!.slice(0, 7)}) · TUI 를 다시 띄워라`));
+        staleNoticeCount++;
+        const notice = C.warning(formatStaleInstallNotice(result, staleNoticeCount));
+        if (chatLines[staleNoticeIndex] !== staleNoticeLine || staleNoticeLine === undefined) {
+          staleNoticeIndex = staleNoticeLine === undefined ? -1 : chatLines.indexOf(staleNoticeLine);
+        }
+        if (staleNoticeIndex < 0) {
+          chatLines.push(notice);
+          staleNoticeIndex = chatLines.length - 1;
+        } else {
+          chatLines[staleNoticeIndex] = notice;
+        }
+        staleNoticeLine = notice;
         chatScrollOffset = -1;
         try { draw(); } catch { /* TUI torn down */ }
       }

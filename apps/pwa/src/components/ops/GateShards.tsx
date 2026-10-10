@@ -11,10 +11,25 @@ export const SHARD_LOOK: Record<GateShardState, { word: string; mark: string; ce
   running: { word: '돌기', mark: '●', cell: 'border-primary bg-primary/10 text-foreground' },
   done: { word: '끝', mark: '✓', cell: 'border-emerald-600/50 bg-emerald-600/10 text-emerald-800 dark:text-emerald-300' },
 };
-/** 끝났지만 rc≠0 — «통과»가 아니다(실패한 시험이 있다 · 기존/새로는 게이트 노드가 가른다). 0.2.20 컷 실측. */
-const DONE_REPORTED = { word: '끝 · 실패 보고', mark: '!', cell: 'border-amber-600/60 bg-amber-500/15 text-amber-800 dark:text-amber-300' };
+/**
+ * 끝났지만 rc≠0 — «통과»가 아니다(0.2.20 컷 실측). 그렇다고 «실패»도 아니다: 기존 실패가 있는 판에선 조각 전부가 rc 1 로 끝난다
+ * (0.2.21 컷 24/24). 기존/새로는 게이트 노드가 가르고, 판정 전엔 «판정 전», 새 실패 0 이면 «기존 실패»라고 말한다.
+ */
+type Verdict = GateShards['summary']['verdict'];
+const DONE_RC: Record<'pending' | 'preexisting' | 'introduced', { word: string; mark: string; cell: string }> = {
+  pending: { word: '끝 · rc≠0 · 판정 전', mark: '!', cell: 'border-amber-600/60 bg-amber-500/15 text-amber-800 dark:text-amber-300' },
+  preexisting: { word: '끝 · 기존 실패', mark: '✓', cell: 'border-emerald-600/50 bg-emerald-600/10 text-emerald-800 dark:text-emerald-300' },
+  introduced: { word: '끝 · rc≠0 · 새 실패 있음', mark: '!', cell: 'border-red-600/60 bg-red-600/15 text-red-800 dark:text-red-300' },
+};
 const reportedFailures = (shard: GateShard) => shard.state === 'done' && shard.rc !== undefined && shard.rc !== 0;
-const lookOf = (shard: GateShard) => reportedFailures(shard) ? DONE_REPORTED : SHARD_LOOK[shard.state];
+const doneRcLook = (verdict: Verdict) => !verdict ? DONE_RC.pending : verdict.introduced > 0 ? DONE_RC.introduced : DONE_RC.preexisting;
+const lookOf = (shard: GateShard, verdict: Verdict) => reportedFailures(shard) ? doneRcLook(verdict) : SHARD_LOOK[shard.state];
+
+/** `끝` 꼬리 — 서버 shardsLine(src/release-loop/gate-shards.ts)과 같은 문면. */
+function doneTail(reported: number, verdict: Verdict): string {
+  if (verdict) return verdict.introduced > 0 ? `(새 실패 ${verdict.introduced})` : '';
+  return reported ? `(rc≠0 ${reported} · 기존 실패 포함 · 판정 전)` : '';
+}
 const ORDER = Object.keys(SHARD_LOOK) as GateShardState[];
 
 export function etaText(etaMin: number | null, opts: { overrunMin?: number; open?: number } = {}): string {
@@ -25,16 +40,16 @@ export function etaText(etaMin: number | null, opts: { overrunMin?: number; open
   return etaMin >= 60 ? `남은 약 ${Math.floor(etaMin / 60)}시간 ${etaMin % 60}분` : `남은 약 ${etaMin}분`;
 }
 
-/** 노드 칩 안의 한 줄 — «조각 24 · 돌기 5 · 대기 8 · 잘림 2 · 통과 9». */
+/** 노드 칩 안의 한 줄 — «조각 24 · 돌기 5 · 대기 8 · 잘림 2 · 끝 9(rc≠0 3 · 기존 실패 포함 · 판정 전)». */
 export function shardTally(gate: GateShards): string {
   const counts = gate.summary.counts;
   const reported = gate.shards.filter(reportedFailures).length;
   return [`조각 ${gate.summary.total}`, ...ORDER.filter((s) => counts[s] > 0)
-    .map((s) => `${SHARD_LOOK[s].word} ${counts[s]}${s === 'done' && reported ? `(실패 보고 ${reported})` : ''}`)].join(' · ');
+    .map((s) => `${SHARD_LOOK[s].word} ${counts[s]}${s === 'done' ? doneTail(reported, gate.summary.verdict) : ''}`)].join(' · ');
 }
 
-function shardTitle(shard: GateShard): string {
-  const bits = [`${shard.id} · ${lookOf(shard).word}`];
+function shardTitle(shard: GateShard, verdict: Verdict): string {
+  const bits = [`${shard.id} · ${lookOf(shard, verdict).word}`];
   if (shard.waitReason) bits.push(`대기 이유: ${shard.waitReason}`);
   if (shard.rc !== undefined) bits.push(`rc ${shard.rc}`);
   if (shard.installSec !== undefined) bits.push(`설치 ${shard.installSec}초`);
@@ -60,8 +75,8 @@ export function GateShardsPanel({ gate }: { gate: GateShards }): React.ReactNode
     </ul>}
     <ol aria-label="조각 상태 표" className="grid grid-cols-4 gap-1 sm:grid-cols-6 lg:grid-cols-8">
       {shards.map((shard) => {
-        const look = lookOf(shard);
-        return <li key={shard.id} data-shard-state={shard.state} title={shardTitle(shard)} aria-label={shardTitle(shard)}
+        const look = lookOf(shard, summary.verdict);
+        return <li key={shard.id} data-shard-state={shard.state} title={shardTitle(shard, summary.verdict)} aria-label={shardTitle(shard, summary.verdict)}
           className={`min-w-0 rounded border px-1.5 py-1 text-[11px] leading-tight ${look.cell}`}>
           <span className="block truncate font-mono">{shard.id}</span>
           <span className="block font-semibold">{look.mark} {look.word}</span>

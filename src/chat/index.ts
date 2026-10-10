@@ -55,7 +55,8 @@ export interface CursorSink {
  *  tests can inject a fake. */
 export interface ModalSink {
   pushModal(surface: ModalSurface): { id: string; dispose: () => void };
-  /** F-E2 — force the coordinator to repaint the modal overlay. Chat
+  /** F-E2 — ask the coordinator to repaint the modal overlay (a plain
+   *  dirty frame — NOT force; see TUI-SLASH-FLICKER). Chat
    *  calls this after every keystroke so the picker's paint closure
    *  re-evaluates `getFiltered()` / `getItems()` — without it, the
    *  picker handle stays mounted but its filter output doesn't flow
@@ -345,11 +346,19 @@ export function createTextInputRenderActions(opts: {
     if (opts.shouldRequestModalRender?.() === false) return;
     if (debug.enabled) {
       debug.log('chat.modal.requestRender', 'user-mutation', {
-        force: true,
+        force: false,
         painted,
       });
     }
-    opts.modalSink?.requestRender?.({ force: true });
+    // TUI-SLASH-FLICKER (2026-10-09) — ⛔ NOT `force: true`. A forced
+    // frame reaches tui.ts::render as `\x1b[1;1H\x1b[J` + every row, so
+    // each keystroke / ↑↓ in the picker erased and repainted the WHOLE
+    // screen (visible flicker). The picker surfaces carry no paint-cache
+    // `generation`, so a plain dirty frame already re-runs their paint
+    // closure and the dashboard frame re-emits the overlay every flush;
+    // rows the picker vacates are invalidated by the coordinator's
+    // region tracking. Regression: src/ux-sim/slash-menu-frames.test.ts.
+    opts.modalSink?.requestRender?.();
   };
   return { repaintHost, repaintUserMutation };
 }

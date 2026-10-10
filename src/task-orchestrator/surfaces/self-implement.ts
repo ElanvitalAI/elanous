@@ -56,7 +56,8 @@ export interface SelfImplementDisposition {
   /** Head SHA checked by the Pod before host regate. */
   checkedHeadCommit?: string;
   /** Review verdict only when the child bound a real pass to a clean, unchanged worktree head. */
-  selfReview?: { verdict: 'pass'; head: string };
+  /** `mustFixCount` = the child's review must-fix list length; omitted when the child JSON carried no list (unknown). */
+  selfReview?: { verdict: 'pass'; head: string; mustFixCount?: number };
   hostRegate?: { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string };
   merged?: boolean;
   detail?: string;
@@ -475,7 +476,10 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
           && o.review && typeof o.review === 'object' && !Array.isArray(o.review)
           && (o.review as { reviewed?: unknown; verdict?: unknown }).reviewed === true
           && (o.review as { verdict?: unknown }).verdict === 'pass'
-          ? { selfReview: { verdict: 'pass' as const, head: o.reviewedHeadCommit } } : {}),
+          ? { selfReview: { verdict: 'pass' as const, head: o.reviewedHeadCommit,
+            // TA-LAND-MUSTFIX-ZERO — must-fix 수를 같이 나른다(목록이 없으면 «모름» = 안 싣는다 · land 관문이 막는다).
+            ...(Array.isArray((o.review as { mustFix?: unknown }).mustFix) && ((o.review as { mustFix: unknown[] }).mustFix).every((fix) => typeof fix === 'string')
+              ? { mustFixCount: ((o.review as { mustFix: unknown[] }).mustFix).length } : {}) } } : {}),
         ...(typeof o.hostRegate === 'object' && o.hostRegate !== null ? { hostRegate: o.hostRegate as SelfImplementDisposition['hostRegate'] } : {}),
         ...(typeof o.merged === 'boolean' ? { merged: o.merged } : {}),
         ...(typeof o.detail === 'string' ? { detail: o.detail } : {}),

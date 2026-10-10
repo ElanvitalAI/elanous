@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { debug } from '../debug/log.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
@@ -150,6 +152,79 @@ test('tasks cover --json takes a federated read and says how many stores it coul
   expect(body.storeWarning).toContain('2개를 못 읽었다');
 });
 
+test('task hand inlines a relative multiline goal file and logs the carried sentence exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-goal-'));
+  const path = join(dir, 'goal.MD');
+  const state = join(dir, 'cards.json');
+  const sentence = '대상 경로: src/a.ts\n현재 계약: preserve the text';
+  writeFileSync(path, `${sentence}\n`);
+  const events: Array<{ event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'goal-file-capture', emit: (rec) => { if (rec.category === 'task-agent.hand') events.push(rec); } });
+  try {
+    const result = await run(['task', 'hand', relative(process.cwd(), path), '--json'], { taskStatePath: state, registerSink: async () => true });
+    expect(result.code ?? 0).toBe(0);
+    const output = JSON.parse(result.lines[0]!);
+    const commandText = output.move.command.at(-1) as string;
+    expect(commandText).toBe(sentence);
+    expect(createHash('sha256').update(commandText).digest('hex')).toBe(createHash('sha256').update(sentence).digest('hex'));
+    expect(output.card.text).toBe(sentence);
+    expect(Object.values(JSON.parse(readFileSync(state, 'utf8')).tasks)).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ event: 'goal-file-inlined', data: { path, chars: sentence.length, sha256: createHash('sha256').update(sentence).digest('hex') } });
+  } finally { off(); }
+});
+
+test('task hand rejects missing, directory, unreadable and empty goal files without writing or launching', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-reject-'));
+  const paths = [join(dir, 'missing.md'), join(dir, 'folder'), join(dir, 'empty.txt')];
+  mkdirSync(paths[1]!);
+  writeFileSync(paths[2]!, ' \n ');
+  const reasons = ['없다', '디렉터리', '비었다'];
+  const events: Array<{ event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'goal-file-reject-capture', emit: (rec) => { if (rec.category === 'task-agent.hand') events.push(rec); } });
+  try {
+    for (const [index, path] of paths.entries()) {
+      const state = join(dir, `cards-${index}.json`);
+      let launches = 0;
+      const result = await run(['task', 'hand', path, '--live'], { taskStatePath: state, registerSink: async () => true, taskLauncher: () => { launches++; } });
+      expect(result.code).toBe(1);
+      expect(result.lines.join('\n')).toContain(path);
+      expect(result.lines.join('\n')).toContain(reasons[index]!);
+      expect(launches).toBe(0);
+      expect(existsSync(state) ? Object.keys(JSON.parse(readFileSync(state, 'utf8')).tasks ?? {}) : []).toHaveLength(0);
+    }
+    expect(events).toHaveLength(paths.length);
+    for (const [index, path] of paths.entries()) expect(events[index]).toMatchObject({ event: 'goal-file-rejected', data: { path, reason: reasons[index] } });
+  } finally { off(); }
+});
+
+test('task hand preserves ordinary text and --mission without attempting to inline', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-plain-'));
+  for (const text of ['fix-login', '보고서 정리해 줘']) {
+    const result = await run(['task', 'hand', text, '--json'], { taskStatePath: join(dir, `${text}.json`), registerSink: async () => true });
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!).move.command.at(-1)).toBe(text);
+  }
+  const mission = await run(['task', 'hand', '--mission', '- first.md\n- second.md', '--json'], { taskStatePath: join(dir, 'mission.json'), registerSink: async () => true });
+  expect(mission.code ?? 0).toBe(0);
+  expect(JSON.parse(mission.lines[0]!).mission.text).toBe('- first.md\n- second.md');
+});
+
+test('separate process task hand --json inlines goal file in an isolated shadow universe', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-process-'));
+  const path = join(dir, 'goal.md');
+  const sentence = '대상 경로: src/a.ts\n현재 계약: keep original behavior';
+  writeFileSync(path, `${sentence}\n`);
+  const child = Bun.spawn([process.execPath, 'bin/elanous.mjs', `--test=${dir}`, 'task', 'hand', path, '--json'], {
+    cwd: process.cwd(), env: { ...process.env, ELANOUS_STATE_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+  });
+  const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  expect(exit === 0 ? 'exit 0' : `exit ${exit}: ${stderr.slice(0, 1200)}; stdout: ${stdout.slice(0, 400)}`).toBe('exit 0');
+  const commandText = JSON.parse(stdout.trim()).move.command.at(-1) as string;
+  expect(commandText.length).toBe(sentence.length);
+  expect(createHash('sha256').update(commandText).digest('hex')).toBe(createHash('sha256').update(sentence).digest('hex'));
+}, 120_000);
+
 test('task hand requires project id and target together', async () => {
   const result = await run(['task', 'hand', '보고서', '--project', 'p1'], { registerSink: async () => true });
   expect(result.code).toBe(1);
@@ -268,7 +343,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'parents', 'board', 'advance', 'show', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['cover', 'list', 'hand', 'parents', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'approve']);
 });
 
 test('an isolated universe without an acp-token still lists — no Authorization header is sent', async () => {
@@ -394,4 +469,72 @@ test('STOP-RECORD launch-failed: through task hand --live the card is launch-fai
   expect(cards[0]!.history[0]!.detail).toContain('child rc=2: error: bad argv');
   expect(written).toHaveLength(1);
   expect(written[0]!.data).toMatchObject({ class: 'launch-failed' });
+});
+
+test('TA-LIVE-MOVE-CARD-HISTORY — tasks show <card> reads the card ledger and prints live-move lines (shadow ok = —)', async () => {
+  const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-live-move-')), 'task-agent-actions.json');
+  const head = 'c'.repeat(40);
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-show-lm': {
+    id: 'ta-show-lm', text: 'feature ask', createdAt: '2026-10-10T00:00:00.000Z', status: 'launched', history: [
+      { at: '2026-10-10T00:00:00.000Z', event: 'launch' },
+      { at: '2026-10-10T01:00:00.000Z', event: 'live-move', kind: 'review', executed: true, ok: true, executorResult: 'live', detail: 'review requested', pr: 9, head, effect: 'review requested · result not received' },
+      { at: '2026-10-10T02:00:00.000Z', event: 'live-move', kind: 'propose-land', executed: false, executorResult: 'shadow', detail: 'judged\nsecond line\rthird', pr: 9, effect: 'none — shadow (not executed)' },
+    ] } } }));
+  const result = await run(['tasks', 'show', 'ta-show-lm'], { taskStatePath, registerSink: async () => true });
+  const moves = result.lines.filter((line) => line.startsWith('수: '));
+  expect(moves).toEqual([
+    `수: 2026-10-10T01:00:00.000Z · review live · executed=true ok=true · PR #9 head ${head.slice(0, 12)} · 효과: review requested · result not received · review requested`,
+    '수: 2026-10-10T02:00:00.000Z · propose-land shadow · executed=false ok=— · PR #9 · 효과: none — shadow (not executed) · judged\\nsecond line\\rthird',
+  ]);
+  expect(result.lines.some((line) => line.startsWith('다음 수: '))).toBe(true);
+});
+
+test('TA-REVIEW-RESULT-CAPTURE — tasks show <card> captures a pending review result file into a live-move-result line and prints it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-review-result-'));
+  const taskStatePath = join(dir, 'task-agent-actions.json');
+  const head = 'd'.repeat(40);
+  const resultPath = join(dir, 'review-results', `ta-show-rr-9-${head.slice(0, 12)}.json`);
+  mkdirSync(join(dir, 'review-results'), { recursive: true });
+  writeFileSync(resultPath, `noise\n${JSON.stringify({ pr: '9', verdict: 'warn', mustFix: ['fix it'], reviewed: true, reviewRoute: 'acp', headCommit: head })}\n`);
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-show-rr': {
+    id: 'ta-show-rr', text: 'feature ask', createdAt: '2026-10-10T00:00:00.000Z', status: 'launched',
+    reviewRequests: [{ pr: 9, head, at: '2026-10-10T01:00:00.000Z', resultPath }],
+    history: [{ at: '2026-10-10T00:00:00.000Z', event: 'launch' }],
+  } } }));
+  const result = await run(['tasks', 'show', 'ta-show-rr'], { taskStatePath, registerSink: async () => true, reviewResultNow: () => new Date('2026-10-10T01:10:00.000Z') });
+  expect(result.lines.filter((line) => line.startsWith('결과: '))).toEqual([
+    `결과: 2026-10-10T01:10:00.000Z · review · PR #9 head ${head.slice(0, 12)} · verdict=warn reviewed=true must-fix=1 route=acp · 효과: review result captured · verdict warn · reviewed true · must-fix 1 · `,
+  ]);
+  const card = JSON.parse(readFileSync(taskStatePath, 'utf8')).tasks['ta-show-rr'];
+  expect(card.history.at(-1)).toMatchObject({ event: 'live-move-result', pr: 9, verdict: 'warn', mustFix: 1, resultPath });
+  // 다시 봐도 한 줄.
+  await run(['tasks', 'show', 'ta-show-rr'], { taskStatePath, registerSink: async () => true });
+  expect(JSON.parse(readFileSync(taskStatePath, 'utf8')).tasks['ta-show-rr'].history.filter((item: { event: string }) => item.event === 'live-move-result')).toHaveLength(1);
+});
+
+test('TA-REJUDGE-ON-HEAD — tasks regate-run runs the host regate without merge and writes head · baseCommit · passed to --out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-regate-run-'));
+  const outPath = join(dir, 'regate-results', 'ta-x-30-bbbbbbbbbbbb.json');
+  const seen: unknown[] = [];
+  const result = await run(['tasks', 'regate-run', '--card', 'ta-x', '--pr', '30', '--head', 'b'.repeat(40), '--repo', '/repo', '--out', outPath], {
+    registerSink: async () => true,
+    hostRegate: async (input) => { seen.push(input); return { passed: true, failures: [], os: 'darwin', status: 'passed', baseCommit: 'c'.repeat(40) }; },
+  });
+  expect(result.code ?? 0).toBe(0);
+  expect(seen).toEqual([{ prNumber: 30, headCommit: 'b'.repeat(40), repoRoot: '/repo', noMerge: true }]);
+  expect(JSON.parse(readFileSync(outPath, 'utf8'))).toMatchObject({ pr: 30, head: 'b'.repeat(40), passed: true, status: 'passed', baseCommit: 'c'.repeat(40), failures: [] });
+});
+
+test('TA-REJUDGE-ON-HEAD — tasks rejudge --all judges each candidate card and prints step · decision', async () => {
+  const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-rejudge-')), 'task-agent-actions.json');
+  const a = 'a'.repeat(40);
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-rj': {
+    id: 'ta-rj', text: 'x', createdAt: '2026-10-11T00:00:00.000Z', status: 'launched', pr: { number: 30, url: 'https://github.com/o/r/pull/30' },
+    reviewRequests: [{ pr: 30, head: a, at: '2026-10-11T00:10:00.000Z' }], history: [],
+  } } }));
+  const result = await run(['tasks', 'rejudge', '--all'], { taskStatePath, registerSink: async () => true, rejudge: {
+    liveMoves: new Set(),
+    live: { repoCandidates: () => [{ source: 'host', cwd: '/repo' }], prHead: async () => ({ head: a, state: 'OPEN', url: 'https://github.com/o/r/pull/30' }) },
+  } });
+  expect(result.lines).toEqual([`ta-rj\tPR #30\t${a.slice(0, 12)}→${a.slice(0, 12)}\ttarget\thead-unchanged\tPR #30 head is still the judged head`]);
 });

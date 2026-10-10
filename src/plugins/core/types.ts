@@ -26,6 +26,15 @@ import type {
 
 export type PaneSlot = 'skills' | 'files' | 'preview' | 'log' | 'hud';
 
+/** Requirements declared by a plugin.json `requires` block. This is metadata, not an install request. */
+export interface PluginDependency {
+  elanous?: string;
+  tools?: string[];
+  optionalTools?: string[];
+  optionalPython?: string[];
+  knowledgePacks?: string[];
+}
+
 export interface DashboardPaneSummary {
   pane: string;
   visible: boolean;
@@ -327,6 +336,9 @@ export interface ElanousPlugin<S = unknown> {
   slashCommands?: SlashCommand[];
   keybindings?: Keybinding[];
   llmTools?: LLMToolDef[];
+  /** Host registers only adapters also declared in contributes.connectors;
+   * registration is disposed with this plugin activation. */
+  channelAdapters?: import('../../nexus/outbound/router.js').ChannelAdapter[];
   onActivate?(ctx: PluginContext): void | Promise<void>;
   onDeactivate?(ctx: PluginContext): void | Promise<void>;
   /** Plugin is executing a long-running op — host blocks input while true.

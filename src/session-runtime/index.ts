@@ -366,6 +366,15 @@ const SESSION_TOOL_FAMILY_RULES: SessionToolFamilyRule[] = [
     ]),
   },
   {
+    id: 'release-read',
+    description: 'Read-only release status, features, cells, schedules, and current operations.',
+    names: ['release_status', 'context_now'],
+    match: (text) => hasAny(text, [
+      'release', 'version', 'checklist', '발행', '버전', '릴리스', '피처',
+      '체크리스트', '칸', '컷', '일정', '판올림', '다음 판', '이번 판', '운영 상태',
+    ]),
+  },
+  {
     id: 'runtime-debug',
     description: 'Runtime inspection, traces, and input/debug history.',
     names: [
@@ -1721,7 +1730,7 @@ const ESSENTIAL_NATIVE_RULE_IDS = [
   // Keep dev-harness in the assembly candidate set so the catalog policy below is the single model-exposure authority.
   'agent', 'agent-output', 'agent-reply', 'agent-stop', 'agent-list', 'self-implement', 'self-orchestrate', 'dev-harness',
 ] as const;
-const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops'] as const;
+const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',

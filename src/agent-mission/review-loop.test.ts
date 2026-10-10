@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import * as llm from '../llm.js';
 import { buildReworkMission, classifyReview, extractAppliedReviewItems, fetchAppliedReviewItemsForBranch, fetchLatestReview, judgeAndFinalize, prepareReviewLoopContext, runReviewLoop, runReworkMission, type LatestReviewSource } from './review-loop.js';
-import { buildJudgePrompt, type AcpJudgeResult } from './acp-judge.js';
+import { buildJudgePrompt, parseJudge, type AcpJudgeResult } from './acp-judge.js';
 import { format } from '../agent-substrate/pr-comment-meta.js';
 import type { AgentMissionResult, AgentMissionSpec } from './driver.js';
 
@@ -26,6 +26,7 @@ function captureFilterObservation(fn: () => unknown): Record<string, unknown> {
 const reinforcementHeadline = '✅ 리뷰 보강 자동 반영(codex-in-elanous·제1원칙 렌즈):';
 const identityHeader = '<!-- elanous-pr-comment v1 role=author -->';
 
+const reviewedSource = () => source({ reviews: [{ body: 'LGTM — please merge', state: 'APPROVED', author: { login: 'reviewer' }, submittedAt: '2026-10-10T00:00:00Z' }] });
 const reviewLoopFiles = JSON.stringify({ files: [{ path: 'src/example.ts', additions: 1, deletions: 0 }] });
 
 describe('review-loop 분류 실패와 심판 범위 관측', () => {
@@ -124,6 +125,179 @@ describe('review-loop 분류 실패와 심판 범위 관측', () => {
       expect(calls).toContain(`pr comment 5550 --body OP approval required: automatic merge held because this PR changes ${path}.`);
     },
   );
+
+  // TA-LAND-MUSTFIX-ZERO — 1차 «ok» 자동 병합 출구: 지적(must-fix)이 남거나 목록을 모르면 승인·병합 없이 parked + 관측.
+  //   «모름»은 합성 주입이 아니라 «실제 분류 파서»(classifyReview)에 asks 빠진/깨진 LLM 응답을 넣어 끝까지 돌린다.
+  test.each([
+    ['must-fix 1', '{"verdict":"ok","asks":["still broken"],"reason":"lgtm but"}', 'review-warn-with-must-fix'],
+    ['asks 필드 없음', '{"verdict":"ok","reason":"lgtm"}', 'review-must-fix-unknown'],
+    ['asks 가 배열 아님', '{"verdict":"ok","asks":"none","reason":"lgtm"}', 'review-must-fix-unknown'],
+    ['asks 에 문자열 아닌 원소', '{"verdict":"ok","asks":[3],"reason":"lgtm"}', 'review-must-fix-unknown'],
+  ] as const)('light ok ⊕ %s(실 분류 파서) 는 autoMergeOnOk 여도 승인·병합하지 않는다', async (_label, llmText, reason) => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue(llmText);
+    const calls: string[] = [];
+    try {
+      const result = await runReviewLoop('5550', {
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+          if (args[0] === 'label' && args[1] === 'list') return '[]';
+          if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(reviewedSource()) : reviewLoopFiles;
+          return '';
+        },
+        autoMergeOnOk: true,
+        approve: () => { throw new Error('approval forbidden'); },
+      });
+      expect(result.action).toBe('parked');
+      expect(result.detail).toContain(reason);
+      expect(calls.some((call) => call.startsWith('pr merge'))).toBe(false);
+      expect(calls.some((call) => call.startsWith('pr comment 5550') && call.includes(reason))).toBe(true);
+      const blocked = log.mock.calls.find(([component, event]) => component === 'review-loop' && event === 'auto-merge-blocked');
+      expect(blocked?.[2]).toMatchObject({ pr: '5550', stage: 'initial-ok', reason });
+    } finally { stream.mockRestore(); log.mockRestore(); }
+  });
+
+  test('light ok ⊕ asks:[] (실 분류 파서) 는 종전대로 승인·자동 병합한다', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"verdict":"ok","asks":[],"reason":"lgtm"}');
+    const calls: string[] = [];
+    try {
+      const result = await runReviewLoop('5550', {
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+          if (args[0] === 'label' && args[1] === 'list') return '[]';
+          if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(reviewedSource()) : reviewLoopFiles;
+          return '';
+        },
+        autoMergeOnOk: true,
+        approve: () => {},
+        recordReviewOutcome: () => {},
+      });
+      expect(result.action).toBe('merged');
+      expect(calls).toContain('pr merge 5550 --squash');
+    } finally { stream.mockRestore(); }
+  });
+
+  test('heavy(finalJudge) ok ⊕ must-fix 는 autoMerge 여도 심판으로 가지 않고 parked — 심판 merge 가 1차 must-fix 를 덮지 못한다', async () => {
+    const calls: string[] = [];
+    const result = await runReviewLoop('5550', {
+      runGh: (args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+        if (args[0] === 'label' && args[1] === 'list') return '[]';
+        if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(reviewedSource()) : reviewLoopFiles;
+        return '';
+      },
+      injectedReview: { verdict: 'ok', asks: ['still broken'] },
+      finalJudge: true,
+      autoMerge: true,
+      approve: () => { throw new Error('approval forbidden'); },
+      judge: async () => { throw new Error('judge must not run'); },
+    });
+    expect(result.action).toBe('parked');
+    expect(result.detail).toContain('review-warn-with-must-fix');
+    expect(calls.some((call) => call.startsWith('pr merge'))).toBe(false);
+  });
+
+  test('heavy: 실 분류(ok·asks []) → 실 심판 파서(merge·asks 없음) 를 runReviewLoop 끝까지 — 병합 0 · parked', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"verdict":"ok","asks":[],"reason":"lgtm"}');
+    const calls: string[] = [];
+    try {
+      const result = await runReviewLoop('5550', {
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+          if (args[0] === 'label' && args[1] === 'list') return '[]';
+          if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(reviewedSource()) : reviewLoopFiles;
+          if (args[1] === 'diff') return 'diff';
+          return '';
+        },
+        finalJudge: true,
+        autoMerge: true,
+        approve: () => { throw new Error('approval forbidden'); },
+        recordReviewOutcome: () => { throw new Error('merge outcome forbidden'); },
+        judge: async (): Promise<AcpJudgeResult> => parseJudge('{"verdict":"merge","reason":"looks fine"}'),
+      });
+      expect(result.action).toBe('parked');
+      expect(result.detail).toContain('review-must-fix-unknown');
+      expect(calls.some((call) => call.startsWith('pr merge'))).toBe(false);
+    } finally { stream.mockRestore(); }
+  });
+
+  test('heavy ok ⊕ must-fix 라도 autoMergeOnOk 만(autoMerge 아님)이면 관문이 막지 않고 종전대로 심판 → ready-to-merge', async () => {
+    let judged = 0;
+    const result = await runReviewLoop('5550', {
+      runGh: (args) => {
+        if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+        if (args[0] === 'label' && args[1] === 'list') return '[]';
+        if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(source()) : reviewLoopFiles;
+        if (args[1] === 'diff') return 'diff';
+        return '';
+      },
+      injectedReview: { verdict: 'ok', asks: ['still broken'] },
+      finalJudge: true,
+      autoMergeOnOk: true,
+      approve: () => { throw new Error('approval forbidden'); },
+      judge: async (): Promise<AcpJudgeResult> => { judged++; return parseJudge('{"verdict":"merge","asks":[],"reason":"fine"}'); },
+    });
+    expect(judged).toBe(1);
+    expect(result.action).toBe('ready-to-merge');
+  });
+
+  test('light ok ⊕ must-fix 0 은 종전대로 승인·자동 병합한다', async () => {
+    const calls: string[] = [];
+    const approved: string[] = [];
+    const result = await runReviewLoop('5550', {
+      runGh: (args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts' }]]);
+        if (args[0] === 'label' && args[1] === 'list') return '[]';
+        if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(source()) : reviewLoopFiles;
+        return '';
+      },
+      injectedReview: { verdict: 'ok', asks: [] },
+      autoMergeOnOk: true,
+      approve: (pr) => { approved.push(pr); },
+      recordReviewOutcome: () => {},
+      verifyMerge: false,
+    });
+    expect(approved).toEqual(['5550']);
+    expect(calls).toContain('pr merge 5550 --squash');
+    expect(result.action).not.toBe('parked');
+  });
+
+  // TA-LAND-MUSTFIX-ZERO — 2차 심판 «merge» 자동 병합 출구: 심판 asks(미해결 지적)가 남거나 목록을 모르면 HITL.
+  //   심판 응답은 «실제 심판 파서»(parseJudge — judgeWithAcp 가 쓰는 그것)로 읽는다.
+  test.each([
+    ['must-fix 1', '{"verdict":"merge","asks":["unresolved"],"reason":"mostly fine"}', 'review-warn-with-must-fix'],
+    ['asks 필드 없음', '{"verdict":"merge","reason":"mostly fine"}', 'review-must-fix-unknown'],
+    ['asks 에 문자열 아닌 원소', '{"verdict":"merge","asks":[{}],"reason":"mostly fine"}', 'review-must-fix-unknown'],
+  ] as const)('2차 심판 merge ⊕ %s(실 심판 파서) 는 autoMerge 여도 승인·병합하지 않는다', async (_label, judgeText, reason) => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const calls: string[] = [];
+    try {
+      const result = await judgeAndFinalize('100', 'branch', ['ask'], {
+        autoMerge: true,
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/example.ts' }]]);
+          if (args[1] === 'diff') return 'diff';
+          return '';
+        },
+        approve: () => { throw new Error('approval forbidden'); },
+        recordReviewOutcome: () => { throw new Error('merge outcome forbidden'); },
+        judge: async (): Promise<AcpJudgeResult> => parseJudge(judgeText),
+      }, '', '/tmp', 2, true, 'light', ['src/example.ts']);
+      if ('rework' in result) throw new Error('expected final result');
+      expect(result.action).toBe('parked');
+      expect(result.detail).toContain(reason);
+      expect(calls).not.toContain('pr merge 100 --squash');
+      expect(calls.some((call) => call.startsWith('pr comment 100') && call.includes(reason))).toBe(true);
+      const blocked = log.mock.calls.find(([component, event]) => component === 'review-loop' && event === 'auto-merge-blocked');
+      expect(blocked?.[2]).toMatchObject({ pr: '100', stage: 'final-judge', reason, round: 2 });
+    } finally { log.mockRestore(); }
+  });
 
   test('runReviewLoop의 classified 관측은 실패 사유와 failure source를 전달한다', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});

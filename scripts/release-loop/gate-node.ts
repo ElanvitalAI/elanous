@@ -21,7 +21,7 @@ import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from 
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
 import { gateDepsInstallScript, parseGateDeps } from '../../src/task-orchestrator/surfaces/pod-gate-deps.js';
-import { gateShardsPath, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
+import { gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
 interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean }
@@ -75,6 +75,7 @@ export interface GateResult {
   knownEnv: number;
   knownEnvCleared: string[];
   stalledEnv: Array<{ file: string; reason: 'no-output' | 'isolated-timeout'; local: 'passed' | 'failed' | 'timeout' }>;
+  rcNonzeroNoFailures: Array<{ file: string; rc: number; pass: number; baseline: 'same' | 'clean' | 'missing' }>;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
   /** GATE-BASELINE-CACHE — isolated baseline files answered from the ledger (hits) or run now (misses). */
   baselineCache?: { hits: number; misses: number };
@@ -458,6 +459,47 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
     throw incomplete(`failure attribution incomplete: summary=${count}, identified=${failures.length}`);
   }
   return { failures, errors: [...new Set(errors)].sort() };
+}
+
+/**
+ * «N pass · 0 fail · rc=1» from an isolated run is read as `rc-nonzero-no-failures` only when the summary is a complete,
+ * clean, single-file summary for the requested file (`Ran N≥1 tests across 1 file` · 0 fail · 0 error · no `(fail)` ·
+ * no unhandled error · pass = N · no other test-file header). Every other run is read exactly as before (`failuresOf`,
+ * which throws on the incomplete shapes, plus a failure-count/identified-name check).
+ */
+export function readIsolatedRun(run: CommandResult, label: string, file: string):
+  | { kind: 'read'; failures: string[]; errors: string[] }
+  | { kind: 'rc-nonzero-no-failures'; rc: number; pass: number } {
+  const output = stripPodRepoRoot(run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
+  const ran = lastMatch(output, /Ran (\d+) tests? across (\d+) files?/);
+  // rc 1 only: other non-zero exits with a clean summary keep the established leaked-exit reading (clean) in failuresOf.
+  const cleanNonzero = run.rc === 1 && !!ran && Number(ran[1]) >= 1 && Number(ran[2]) === 1
+    && summaryCount(output, 'fail') === 0
+    && (Number.isNaN(summaryCount(output, 'error')) || summaryCount(output, 'error') === 0)
+    && parseFailures(output).length === 0 && !/\(fail\)/.test(output)
+    && !/Unhandled error between tests/.test(output);
+  if (!cleanNonzero) {
+    const read = failuresOf(run, label);
+    // Two (fail) lines folding into one id would undercount the file's failures: unreadable, not fewer.
+    const failCount = summaryCount(output, 'fail');
+    if (Number.isFinite(failCount) && read.failures.length !== failCount)
+      throw new Error(`${label} incomplete (rc=${run.rc}; failure attribution summary=${failCount}, identified=${read.failures.length})`);
+    return { kind: 'read', ...read };
+  }
+  // Bun's file headers, when present, must identify the requested file before the result is recorded or cached.
+  // Any test-file path counts: root-level (`other.test.ts:`), nested, or absolute (outside the stripped Pod root).
+  for (const raw of output.split(/\r?\n/)) {
+    // Any characters but `:` (unicode, spaces, @, +, …) — a header is `<path ending in .test/.spec.ts>:`.
+    const header = /^(?:\.\/)?([^\s:][^:]*?\.(?:test|spec)\.[cm]?[jt]sx?):/.exec(raw.trim());
+    if (header && header[1] !== file)
+      throw new Error(`${label} incomplete (rc=${run.rc}; isolated run attributed to another file: ${header[1]})`);
+  }
+  const pass = summaryCount(output, 'pass');
+  if (pass !== Number(ran![1]))
+    throw new Error(`${label} incomplete (rc=${run.rc}; pass=${Number.isNaN(pass) ? 'missing' : pass}; Ran=${ran![1]})`);
+  // Validate the requested file as well as the summary; only this one file can own the synthetic id.
+  fileOf(`${file} > [rc-nonzero]`);
+  return { kind: 'rc-nonzero-no-failures', rc: run.rc, pass };
 }
 
 class StalledPodShards extends Error {
@@ -1149,7 +1191,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     return baselineCommit(root, version);
   };
   const repo = resolve(opts.repo ?? process.cwd());
-  const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], durationMs: 0 };
+  const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0 };
   let work: string | undefined;
   let baseSnapshot = false;
   let cutFailures: SweepFailures | undefined;
@@ -1345,12 +1387,15 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
         continue;
       }
-      const isolatedCut = cutCheck === undefined
+      const cutReading = cutCheck === undefined ? undefined : readIsolatedRun(cutCheck, `cut isolated ${file}`, file);
+      const rcOnly = cutReading?.kind === 'rc-nonzero-no-failures' ? cutReading : undefined;
+      const rcOnlyId = `${file} > [rc-nonzero]`;
+      const isolatedCut: SweepFailures = cutReading === undefined
         ? { failures: cut.failures.filter((id) => fileOf(id) === file), errors: cut.errors.filter((id) => fileOf(id) === file) }
-        : failuresOf(cutCheck, `cut isolated ${file}`);
+        : cutReading.kind === 'read' ? cutReading : { failures: [], errors: [rcOnlyId] };
       if (cutCheck !== undefined) remember({ commit: opts.commit, file, host: cacheHost, failures: isolatedCut.failures, errors: isolatedCut.errors, missing: false });
       const reproduced = new Set([...isolatedCut.failures, ...isolatedCut.errors]);
-      let candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
+      let candidates = rcOnly ? [rcOnlyId] : diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
       // GATE-INTRO-RECHECK — a new failure that is only bun's «timed out» shape gets one more isolated run with a generous
       // per-test limit, on the same runner (node-b when the gate is remote). Passing there = flaky under load (warning);
       // an assertion failure, a failure again, or a run that cannot be read stays introduced.
@@ -1382,7 +1427,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       }
       if (candidates.length === 0) continue;
       let oldFailures: Set<string>;
+      let baselineMissing = false;
       const hit = baseCache.get(`${file}\0${cacheHost}`);
+      if (hit?.missing) baselineMissing = true;
       if (hit) {
         cacheStats.hits++;
         oldFailures = new Set([...hit.failures, ...hit.errors]);
@@ -1399,12 +1446,21 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], opts.remote ? baselineTree : repo);
           if (lookup.rc !== 0 || lookup.output.trim()) throw new Error(`baseline isolated run incomplete: ${file}`);
           oldFailures = new Set();
+          baselineMissing = true;
           remember({ commit: baseSha, file, host: cacheHost, failures: [], errors: [], missing: true });
         } else {
-          const prior = failuresOf(previous, `baseline isolated ${file}`);
+          const reading = readIsolatedRun(previous, `baseline isolated ${file}`, file);
+          const prior: SweepFailures = reading.kind === 'read' ? reading : { failures: [], errors: [rcOnlyId] };
+          if (reading.kind === 'rc-nonzero-no-failures') debug.log('release-loop.gate', 'isolated-rc-nonzero-no-failures',
+            { file, label: 'baseline isolated', rc: reading.rc, pass: reading.pass, baseline: 'same' });
           oldFailures = new Set([...prior.failures, ...prior.errors]);
           remember({ commit: baseSha, file, host: cacheHost, failures: prior.failures, errors: prior.errors, missing: false });
         }
+      }
+      if (rcOnly) {
+        const baseline = oldFailures.has(rcOnlyId) ? 'same' : baselineMissing ? 'missing' : 'clean';
+        result.rcNonzeroNoFailures.push({ file, rc: rcOnly.rc, pass: rcOnly.pass, baseline });
+        debug.log('release-loop.gate', 'isolated-rc-nonzero-no-failures', { file, label: 'cut isolated', rc: rcOnly.rc, pass: rcOnly.pass, baseline });
       }
       for (const id of candidates) {
         if (oldFailures.has(id)) result.preexisting++;
@@ -1456,6 +1512,15 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     }
   }
   if (result.outcome !== 'error') debug.log('release-loop.gate', 'judged', { version: opts.version, commit: opts.commit, introduced: result.introduced.length, preexisting: result.preexisting });
+  // GATE-LIVE-OBS-RC-WORDING ⓒ — the shards board says «판정 전» until this lands; then «새 실패 N» only (UX · gate-shards.ts).
+  // Same ledger as the board's own writes (sweep's shardsFile). A write failure is logged and never changes the verdict.
+  if (result.outcome !== 'error' && opts.pod) {
+    const path = opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version);
+    try {
+      const written = recordGateShardsVerdict(path, { introduced: result.introduced.length, preexisting: result.preexisting });
+      debug.log('release-loop.gate', 'shards-verdict', { version: opts.version, path, written, introduced: result.introduced.length, preexisting: result.preexisting });
+    } catch (error) { debug.log('release-loop.gate', 'shards-verdict-write-failed', { path, error: String(error) }); }
+  }
   return result;
 }
 
@@ -1464,6 +1529,7 @@ export function graphGateResult(result: GateResult, graph: boolean) {
     verdict: result.outcome === 'ok' ? 'pass' as const : 'fail' as const,
     summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
       + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
+      + (result.rcNonzeroNoFailures.length ? ` · ⚠ 종료코드만 비영 ${result.rcNonzeroNoFailures.length}` : '')
       + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(시간 초과 꼴 · ${GATE_TIMEOUT_RECHECK_MS / 1000}s 재실행 통과 · 막지 않음)` : '')
       + (result.stalledEnv.length ? ` · 환경 멈춤 ${result.stalledEnv.length} (Pod 밖 통과 ${result.stalledEnv.filter((item) => item.local === 'passed').length})` : '') };
 }
@@ -1535,7 +1601,7 @@ if (import.meta.main) {
     version = opts.version;
     result = await judgeGate(opts);
   } catch (error) {
-    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], durationMs: Date.now() - start, error: String(error) };
+    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start, error: String(error) };
   }
   if (result.error) console.error(result.error);
   debug.log('release-loop.gate', 'result', { version, outcome: result.outcome });

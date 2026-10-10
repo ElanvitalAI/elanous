@@ -393,6 +393,31 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test('GATE-ADMIT-UNMEASURED: when the reading is unmeasured (DNS unknown), gate callers are admitted one at a time; harness callers keep waiting', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-unmeasured-'));
+    const kubectl = (args: readonly string[]) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'node' }, status: { allocatable: { cpu: '4', memory: '128Gi' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      if (args.includes('top')) return { status: 1, stdout: '', stderr: 'unavailable' };
+      return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+    };
+    const events: Array<Record<string, unknown>> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((cat: string, ev: string, data?: unknown) => { if (cat === 'pod.pool' && ev === 'gate-admit-unmeasured') events.push(data as Record<string, unknown>); }) as typeof debug.log;
+    const harnessPool = new PodPoolScheduler(parsePodPool('gate:4'), { kubectl, dns: () => 'unknown', hostLease: new HostPoolLease('gate-unmeasured-h', { dir }), pollMs: 2 });
+    const gatePool = new PodPoolScheduler(parsePodPool('gate:4'), { kubectl, dns: () => 'unknown', hostLease: new HostPoolLease('gate-unmeasured-g', { dir }), pollMs: 2 });
+    const controller = new AbortController();
+    try {
+      const harness = harnessPool.acquireAdmission(controller.signal).then((r) => { r(); return 'admitted'; }, () => 'waiting');
+      const take = () => Promise.race([gatePool.acquireAdmission(controller.signal, undefined, { gate: true }).then(() => 'admitted'), Bun.sleep(500).then(() => 'timeout')]);
+      expect(await take()).toBe('admitted');
+      expect(await take()).toBe('admitted');
+      await Bun.sleep(15);
+      controller.abort();
+      expect(await harness).toBe('waiting');
+      expect(events.length).toBeGreaterThan(0);
+    } finally { (debug as { log: typeof debug.log }).log = original; controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('GATE-ADMIT-EXEMPT: with an unscheduled gate shard Job active, a gate caller is admitted by memory while a harness caller is bounded to 0', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gate-exempt-'));
     const hostLease = new HostPoolLease('gate-exempt-test', { dir });
@@ -953,10 +978,73 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(r.get('pool-node-b')).toMatchObject({ ok: true, action: 'built', imageRef: 'k3d-elanous-registry:5050/elanous-harness:mine' });
     expect(shipped).toBe(0);
     // 대조군: 레지스트리에 내 태그가 없으면(빌드가 안 올렸다) 종전대로 통째 전송으로 떨어진다
+    state.tags = [];
     const state2Build = async () => { state.tags = ['other']; state.local = 'other'; return { ok: true, detail: 'built' }; };
     const r2 = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'img', 'mine', { run, remoteBuild: state2Build, ship, localSkillsDigest: 'sk' });
     expect(r2.get('pool-node-b')?.ok).toBe(false);
     expect(shipped).toBe(1);
+  });
+
+  test('registry commit tag is fresh despite another :local commit; absent tag builds once', async () => {
+    const member = parsePodPool('pool-node-b@node-b:2')[0]!;
+    let tags = ['gate'];
+    const inspected: string[] = [];
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes('docker inspect k3d-elanous-registry')) return { status: 0, stdout: '', stderr: '' };
+      if (cmd.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags }), stderr: '' };
+      if (cmd.includes('elanous.pod-skills')) { inspected.push(cmd); return { status: 0, stdout: cmd.includes('localhost:5050/elanous-harness:gate') ? 'sk' : 'wrong', stderr: '' }; }
+      return { status: 0, stdout: 'other', stderr: '' };
+    };
+    let builds = 0;
+    const remoteBuild = async () => { builds++; tags = ['gate']; return { ok: true, detail: 'built' }; };
+    const deps = { run, remoteBuild, localSkillsDigest: 'sk', lock: { dir: mkdtempSync(join(tmpdir(), 'pool-gate-lock-')), retryMs: 5 } };
+    try {
+      const fresh = await syncPoolImages([member], 'elanous-harness:local', 'gate', deps);
+      expect(fresh.get(member.context)).toMatchObject({ ok: true, action: 'fresh', imageRef: 'k3d-elanous-registry:5050/elanous-harness:gate' });
+      expect(builds).toBe(0);
+      expect(inspected).toEqual([expect.stringContaining('localhost:5050/elanous-harness:gate')]);
+      tags = [];
+      const missing = await syncPoolImages([member], 'elanous-harness:local', 'gate', deps);
+      expect(missing.get(member.context)).toMatchObject({ ok: true, action: 'built' });
+      expect(builds).toBe(1);
+    } finally { rmSync(deps.lock.dir, { recursive: true, force: true }); }
+  });
+
+  test('same-host build lock skips a duplicate commit, but serializes distinct commits', async () => {
+    const member = parsePodPool('pool-node-b@node-b:2')[0]!;
+    const dir = mkdtempSync(join(tmpdir(), 'pool-build-lock-'));
+    const tags: string[] = [];
+    const intervals: string[] = [];
+    let builds = 0, active = 0, maxActive = 0;
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes('docker inspect k3d-elanous-registry')) return { status: 0, stdout: '', stderr: '' };
+      if (cmd.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags }), stderr: '' };
+      if (cmd.includes('elanous.pod-skills')) return { status: 0, stdout: 'sk', stderr: '' };
+      return { status: 0, stdout: 'other', stderr: '' };
+    };
+    const remoteBuild = async (_host: string, _cluster: string, _registry?: string) => {
+      builds++; active++; maxActive = Math.max(maxActive, active);
+      intervals.push('start');
+      await Bun.sleep(50);
+      tags.push(builds === 1 ? 'gate' : 'other-gate');
+      intervals.push('end'); active--;
+      return { ok: true, detail: 'built' };
+    };
+    const deps = { run, remoteBuild, localSkillsDigest: 'sk', lock: { dir, retryMs: 5 } };
+    try {
+      const [a, b] = await Promise.all([syncPoolImages([member], 'img', 'gate', deps), syncPoolImages([member], 'img', 'gate', deps)]);
+      expect(builds).toBe(1);
+      expect([a.get(member.context)?.action, b.get(member.context)?.action].sort()).toEqual(['built', 'fresh']);
+      expect(a.get(member.context)?.ok && b.get(member.context)?.ok).toBe(true);
+      expect(a.get(member.context)?.imageRef).toBe(b.get(member.context)?.imageRef);
+      expect([a.get(member.context)?.detail, b.get(member.context)?.detail].some((detail) => detail?.includes('while waiting'))).toBe(true);
+      tags.length = 0; builds = 0; intervals.length = 0;
+      const [c, d] = await Promise.all([syncPoolImages([member], 'img', 'gate', deps), syncPoolImages([member], 'img', 'other-gate', deps)]);
+      expect(builds).toBe(2);
+      expect(maxActive).toBe(1);
+      expect(intervals).toEqual(['start', 'end', 'start', 'end']);
+      expect(c.get(member.context)?.ok && d.get(member.context)?.ok).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   // 동시 발사: 노드 쪽 빌드가 부딪혀 실패해도, 같은 판을 굽는 첫째가 레지스트리에 태그를 올리면 그 판을 쓴다.

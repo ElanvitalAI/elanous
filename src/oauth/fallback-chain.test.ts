@@ -33,6 +33,14 @@ describe('normalizeFallbackChain — 「설정이 있다」와 「유효하다�
     expect(r.dropped).toEqual(['gork', 'claude']);
   });
 
+  it('openrouter 는 명시된 체인에서만 보존하고 기본 체인에는 없다', () => {
+    expect(isFallbackStep('openrouter')).toBe(true);
+    expect(normalizeFallbackChain(['codex-rotate', 'openrouter']))
+      .toEqual({ chain: ['codex-rotate', 'openrouter'], dropped: [], usedDefault: false });
+    expect(normalizeFallbackChain(undefined).chain).toEqual(['codex-rotate', 'grok']);
+    expect(DEFAULT_FALLBACK_CHAIN).not.toContain('openrouter');
+  });
+
   it('중복은 접는다 (결정론)', () => {
     expect(normalizeFallbackChain(['grok', 'grok', 'codex-rotate']).chain).toEqual(['grok', 'codex-rotate']);
   });
@@ -240,6 +248,41 @@ describe('claude-pty 성숙 관문과 명시 체인', () => {
       .toEqual({ action: 'switch-backend', backend: 'claude' });
     expect(decideFallback({ ...input, currentStep: 'grok', currentCredentialRateLimited: true, claudePtyMaturity: maturity }))
       .toEqual({ action: 'switch-backend', backend: 'claude' });
+  });
+});
+
+describe('openrouter 명시 폴백 — 모델과 키가 모두 있어야 한다', () => {
+  const base = { rotation: { reason: 'no-candidate' } as const,
+    chain: ['codex-rotate', 'openrouter'] as const, grokAvailable: false };
+  const model = 'openrouter/z-ai/glm-5.3-flash';
+
+  it('두 조건이 있으면 지정 모델을 전달한다', () => {
+    const decision = decideFallback({ ...base, openrouterFallbackModel: model, openrouterAvailable: true });
+    expect(decision).toEqual({ action: 'switch-backend', backend: 'openrouter', model });
+    expect(describeFallback(decision)).toContain('API 과금');
+    expect(decideFallback({ ...base, currentStep: 'codex-rotate', currentCredentialRateLimited: true,
+      openrouterFallbackModel: model, openrouterAvailable: true })).toEqual(decision);
+  });
+
+  it('키·모델 둘 중 하나라도 없거나 모델 식별자가 부적격이면 머물고 이유를 남긴다', () => {
+    for (const input of [
+      { openrouterFallbackModel: model, openrouterAvailable: false },
+      { openrouterAvailable: true },
+      { openrouterFallbackModel: '  ', openrouterAvailable: true },
+      { openrouterFallbackModel: 'grok-4.7', openrouterAvailable: true },
+    ]) {
+      const decision = decideFallback({ ...base, ...input });
+      expect(decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
+      expect(describeFallback(decision)).toContain('openrouter-unavailable');
+    }
+  });
+
+  it('앞 칸이 불가하면 뒤 칸을 살피되 기본 체인·기존 결정은 무변경', () => {
+    expect(decideFallback({ ...base, chain: ['codex-rotate', 'openrouter', 'grok'], grokAvailable: true }))
+      .toEqual({ action: 'switch-backend', backend: 'grok' });
+    expect(decideFallback({ ...base, chain: DEFAULT_FALLBACK_CHAIN, grokAvailable: false,
+      openrouterFallbackModel: model, openrouterAvailable: true }))
+      .toEqual({ action: 'stay', why: 'grok-unavailable' });
   });
 });
 

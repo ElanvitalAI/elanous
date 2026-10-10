@@ -9,6 +9,7 @@
 
 import { normalizeChildLlmProvider } from '../self-dev/dev-cli.js';
 import { providerEnvKey } from '../llm/provider-credentials.js';
+import { bedrockChildRelayEnv } from '../llm/bedrock.js';
 
 export type RunContext = 'production' | 'benchmark' | 'simulator' | 'self-build';
 
@@ -78,6 +79,12 @@ function childLocalEndpointEnv(provider: string): Record<string, string> {
   return url ? { LOCAL_LLM_URL: url } : {};
 }
 
+/** BEDROCK-PROVIDER — Bedrock 자격은 «파일»(~/.aws · HOME 으로 자식이 그대로 읽는다)과 «env»(AWS_*) 둘 다에 산다.
+ *  env 쪽은 replace env 라 상속이 없으므로 이름 목록대로 릴레이한다(값은 싣기만 하고 어디에도 찍지 않는다). */
+function childBedrockEnv(provider: string): Record<string, string> {
+  return provider === 'bedrock' ? bedrockChildRelayEnv() : {};
+}
+
 /** The family classifier is model-id based, so preserve local-provider identity
  * across the replace-env child boundary without changing non-local model IDs. */
 function childRelayModel(provider: string, model: string): string {
@@ -102,6 +109,7 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
       ...(selection.effort ? { ELANOUS_ESCALATE_EFFORT: selection.effort } : {}),
       ...childProviderKeyEnv(provider),
       ...childLocalEndpointEnv(provider),
+      ...childBedrockEnv(provider),
     };
   }
   // ⛔⭐ 상속 갈래도 local 이면 «주소»를 같이 넘긴다(BACKLOG B12 · 2026-09-25).
@@ -112,5 +120,7 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
     ...(process.env.ELANOUS_LLM_PROVIDER !== undefined ? { ELANOUS_LLM_PROVIDER: process.env.ELANOUS_LLM_PROVIDER } : {}),
     ...(process.env.ELANOUS_LLM_MODEL !== undefined ? { ELANOUS_LLM_MODEL: process.env.ELANOUS_LLM_MODEL } : {}),
     ...(inheritedProvider ? childLocalEndpointEnv(inheritedProvider) : {}),
+    // 상속 갈래도 bedrock 이면 AWS_* 를 같이 넘긴다(명시 갈래와 같은 규칙 — replace env 라 자동 상속이 없다).
+    ...(inheritedProvider ? childBedrockEnv(inheritedProvider) : {}),
   };
 }

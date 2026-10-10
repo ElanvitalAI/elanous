@@ -400,19 +400,48 @@ const GROK: TierMap = {
 //   kimi·qwen·glm 의 «첫 실제 경로». 사다리는 이름 기억이 아니라 ***실물 `/api/v1/models` 사실***로 골랐다
 //   (2026-09-23 실측 · 전 칸 `tools`·`reasoning` 지원 · 가격 $/MTok 입력/출력):
 //     budget   qwen3.8-flash      0.15/0.47  1M
-//     balanced glm-5.3            0.84/2.64  1.31M   ← 기본(OPENROUTER_MODEL)
+//     balanced glm-5.3            0.039/4.8  1.05M   ← 기본(OPENROUTER_MODEL)
+//     별도 모델 glm-5.3-flash     가격·창 미측정 (0으로 기록하지 않는다)
+//   📏 OP 10-10 OpenRouter 실측: GLM-5.3 입력 $0.039/MTok · 출력 $4.8/MTok · 창 1.05M.
 //     better   qwen3.8-max-0902   2/6        1M
 //     best     kimi-k3            3/15       1.05M
-//   ⇒ 가격순이면서 세 벤더를 «다» 덮는다. ⛔ 가격·창은 늙는다 — 카탈로그(`openrouter/*` 폴드)가 canonical.
+//   ⚠️ GLM 가격 갱신·flash 단가 미측정으로 가격순 주장은 보류한다. 가격·창은 늙는다 — 카탈로그(`openrouter/*` 폴드)가 canonical.
 //   `shipping` = «생성된다»(배선 계약). 도구 호출·도구 루프·elanous 실제 프롬프트 3/3 실측(리서치 문서 §9).
 //   ⚠️ `loaded` 의 reasoningLevel 은 wire 로 «안» 간다 — 측정상 OpenRouter `reasoning.effort` 를 보내면
 //      kimi·glm 이 «덜» 생각한다(필드 없음이 최대). 그래서 옮기지 않았다 — 리서치 문서 §9.
 const OPENROUTER: TierMap = {
   budget:   { model: 'openrouter/qwen/qwen3.8-flash',     label: 'Qwen 3.8 Flash (OpenRouter)',   rationale: 'Fast · cheap · 1M ctx',            status: 'shipping' },
-  balanced: { model: 'openrouter/z-ai/glm-5.3',           label: 'GLM 5.3 (OpenRouter)',          rationale: 'Default · 1.31M ctx',              status: 'shipping' },
+  balanced: { model: 'openrouter/z-ai/glm-5.3',           label: 'GLM 5.3 (OpenRouter)',          rationale: 'Default · $0.039/$4.8 per MTok · 1.05M ctx', status: 'shipping' },
   better:   { model: 'openrouter/qwen/qwen3.8-max-0902',  label: 'Qwen 3.8 Max (OpenRouter)',     rationale: 'Higher quality',                   status: 'shipping' },
   best:     { model: 'openrouter/moonshotai/kimi-k3',     label: 'Kimi K3 (OpenRouter)',          rationale: 'Best · Kimi flagship',             status: 'shipping' },
   loaded:   { model: 'openrouter/moonshotai/kimi-k3', reasoningLevel: 'high', label: 'Kimi K3 · reasoning high (OpenRouter)', rationale: 'Loaded · deep multi-step', status: 'shipping' },
+};
+
+// ── AWS Bedrock (BEDROCK-PROVIDER · 2026-10-11) ───────────────────
+//   ⭐ 판단: ANTHROPIC 사다리의 «추론 수준·역할 배치»를 그대로 두고, 모델은 Bedrock 메시지 엔드포인트에서
+//   확인한 5.5 계열 id(`src/llm/bedrock.ts` BEDROCK_MODELS · 출처 platform.claude.com «Claude in Amazon Bedrock»
+//   Supported models)로만 채운다. 아래 칸(budget·balanced)은 ANTHROPIC 이 haiku-4-5·sonnet-5 를 쓰지만, 이 PR 이
+//   카탈로그에 올린 Bedrock id 는 5.5 셋뿐이라 같은 등급의 5.5(haiku-5-5·sonnet-5-5)로 올렸다.
+//   ⛔ bedrock 은 명시 선택 전용 — 이 표는 `--role-llm <role>=bedrock/<tier>` 같은 «명시» 해석에만 쓰인다.
+//   ⚠️ status = `wip`: 실 AWS 호출(계정별 5.5 접근 조건)을 아직 안 쟀고, 셋업 키 감지 표(PROVIDER_ENV_SPEC)에도
+//      없다(자격이 API 키가 아니라 AWS 체인이라). 첫 실호출 스모크 뒤 `shipping` 으로 올린다.
+const BEDROCK: TierMap = {
+  budget:   { model: 'anthropic.claude-haiku-5-5',  reasoningLevel: 'off',    label: 'Claude Haiku 5.5 (Bedrock)',  rationale: 'Fast · cheap · bulk/classification', status: 'wip' },
+  balanced: { model: 'anthropic.claude-sonnet-5-5', reasoningLevel: 'off',    label: 'Claude Sonnet 5.5 (Bedrock)', rationale: 'Default · everyday coding (BEDROCK_DEFAULT_MODEL)', status: 'wip' },
+  better:   { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'ANTHROPIC better 와 같은 배치(구현 = Opus 5.5)', status: 'wip' },
+  best:     { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'Best reasoning · architecture', status: 'wip' },
+  loaded:   { model: 'anthropic.claude-opus-5-5',   reasoningLevel: 'high',   label: 'Claude Opus 5.5 · extended thinking (Bedrock)', rationale: 'Loaded · deep multi-step', status: 'wip' },
+};
+
+/** 가격·창 미측정이라 기존 tier 배치를 바꾸지 않고 명시 모델로만 고르는 칸.
+ *  소비 경로 = `lookupOpenRouterModelSpec()` ← `resolveRunFallback()`(openrouter 폴백 판정의 관측·ROUTE 결정). */
+const OPENROUTER_EXPLICIT_MODELS: Readonly<Record<string, LlmTierSpec>> = {
+  'z-ai/glm-5.3-flash': {
+    model: 'openrouter/z-ai/glm-5.3-flash',
+    label: 'GLM 5.3 Flash (OpenRouter)',
+    rationale: 'Fast · 가격/창 미측정',
+    status: 'shipping',
+  },
 };
 
 // ── Combined lookup ─────────────────────────────────────────────────
@@ -433,6 +462,7 @@ export const LLM_TIER_MAP_BY_PROVIDER: Readonly<Record<LlmTierProvider, TierMap>
   glm: GLM,
   grok: GROK,
   openrouter: OPENROUTER,
+  bedrock: BEDROCK,
 } as const;
 
 /** 사람이 쓰는 tier 별칭 → canonical ModelTier. "grok low tier" 같은 자연어 헷갈림을 SSOT 로 흡수한다.
@@ -454,8 +484,22 @@ export function parseTierArg(raw: string): ModelTier | undefined {
  *  tsc 는 배열 누락을 못 잡는다(2026-09-23 `#19900` 이 `openrouter` 를 빠뜨려 배선 계약 자가 그것을
  *  한 번도 누르지 않았다). 자 = `provider-wiring-contract.test.ts`. */
 export const TIER_PROVIDERS: readonly LlmTierProvider[] = [
-  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter',
+  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'bedrock',
 ];
+
+/** OpenRouter 모델 id(`openrouter/<vendor>/<model>` 또는 `<vendor>/<model>`)의 tier-map 칸.
+ *  명시 칸(`glm-5.3-flash` 등) → 5-tier 사다리 순으로 찾는다. 모르면 undefined(«미등록»을 기본값으로 접지 않는다). */
+export function lookupOpenRouterModelSpec(model: string): LlmTierSpec | undefined {
+  const bare = model.trim().replace(/^openrouter\//, '');
+  if (!bare) return undefined;
+  const explicit = OPENROUTER_EXPLICIT_MODELS[bare];
+  if (explicit) return explicit;
+  const wanted = `openrouter/${bare}`;
+  for (const tier of ['budget', 'balanced', 'better', 'best'] as const) {
+    if (OPENROUTER[tier].model === wanted) return OPENROUTER[tier];
+  }
+  return undefined;
+}
 
 /** Resolve the spec for (provider, tier).
  *  `auto` and unknown providers have no concrete provider ladder, so both use

@@ -1,0 +1,157 @@
+# web-publish — 사업 근거에서 출발하는 비즈니스 웹사이트 기획·제작·검증·발행 그래프
+# 새로 씀. 방법론 출처: passeth/business-motion-websites (MIT · © 2026 passeth · https://github.com/passeth/business-motion-websites)
+#   · 원작자 허락(2026-10-09). 스킬 7단계(사업 이해 → 페이지 지도 → 시각 방향 → 대표 구간 → 미디어 → 모션·모바일 → 검증·배포)를
+#   elanous 그래프 문법으로 옮김(⑥ 모션·모바일 = motion 노드 ⊕ qa). 사례 사이트 자산은 없다.
+#
+# 실행:  elanous graph run graphs/web-publish.yaml --input "$(cat examples/input.json)" --json
+# 승인:  elanous graph approve web-publish <run_id> [--reject] --by <이름>  → 같은 run 을 --resume
+# 대기:  검사 노드가 «산출이 아직 없다»(outcome=pending)면 wait_<stage> 승인 노드에서 멈춘다.
+#        스킬대로 만든 뒤 `graph approve … <run_id>` → `graph run … --resume <run_id>` 하면 그 검사로 되돌아간다.
+#
+# 시작 범위: input.mode = plan-only 면 기획 승인 뒤 hero_slice 가 outcome=plan_only 를 내고 done 으로 간다
+#   (구현·유료 생성·발행으로 넘어가지 않는다 — 스킬의 «시작 범위» 규칙).
+# 생성 비용: 그래프 단계는 생성·외부 호출 0. 이미지·영상·음성 생성은 스킬을 따르는 에이전트가 하고,
+#   media 노드가 ledger/media_spend.jsonl 합계를 input.budget 에 대어 막는다.
+# 발행: input.publish_target = folder(기본 · 로컬 폴더로 복사) | pub | vercel.
+#   pub·vercel 은 이 판에서 «실행 경로만» 있다 — 명령을 안내하고(pending) 사람이 실행한 기록을 확인한다.
+#   vercel 은 release/vercel-approval.json(승인 기록)이 없으면 fail.
+# 공개 재검증: verify_public 이 공개 URL 재검증 기록을 찾지 못하면 unobserved(발행은 됐지만 재지 못함)로 끝난다.
+# 반려 되돌림: approve_plan→strategy · approve_release→hero_slice (max_visits 가 반려 횟수 상한).
+# 고침 되돌림: audit_media fix→wait_media · qa fix→wait_build.
+#   wait_* 반려 = 제작 중단(failed).
+graph_id: web-publish
+version: 1
+entry_node: brief
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: brief
+    kind: agent
+    recipe: cmd:brief
+    max_visits: 2
+    contract: { inputs: [input.business, input.goal, input.mode, input.workspace, input.publish_target, input.budget, input.reference_urls], tools: 'bun · 파일 쓰기(workspace)', outputs: [workspace, mode, publish_target, budget] }
+  - node_id: absorb_ref
+    kind: observe
+    recipe: cmd:absorb
+    max_visits: 6
+    contract: { inputs: [input.reference_urls, ref/seed.json], tools: 'bun · 값만 남았나 확인(글·사진·로고·폰트 파일 금지)', outputs: [skip|seed, ref/assets.sha256] }
+  - node_id: wait_absorb
+    kind: hitl
+    recipe: approval:wait-absorb
+    max_visits: 4
+    contract: { inputs: [ref/], tools: '사람/에이전트 — 참고 사이트 «값» 흡수 완료 신호', outputs: [approved|rejected] }
+  - node_id: strategy
+    kind: agent
+    recipe: cmd:strategy
+    max_visits: 8
+    contract: { inputs: [strategy/claims.json, strategy/page-map.json, DESIGN.md], tools: 'bun · 근거 등급·페이지 지도 계약 검사', outputs: [claims, pages, unverified_public] }
+  - node_id: wait_strategy
+    kind: hitl
+    recipe: approval:wait-strategy
+    max_visits: 6
+    contract: { inputs: [strategy/, DESIGN.md], tools: '사람/에이전트 — 기획 문서 작성 완료 신호', outputs: [approved|rejected] }
+  - node_id: approve_plan
+    kind: hitl
+    recipe: approval:plan-approval
+    max_visits: 4
+    contract: { inputs: [brief.json, strategy/, DESIGN.md], tools: '사람 승인', outputs: [approved|rejected] }
+  - node_id: hero_slice
+    kind: agent
+    recipe: cmd:hero-slice
+    max_visits: 8
+    contract: { inputs: [site/index.html, site/tokens.css, DESIGN.md], tools: 'bun · 대표 구간 존재 ⊕ 토큰이 DESIGN.md 에서 왔나', outputs: [plan_only|ok] }
+  - node_id: wait_build
+    kind: hitl
+    recipe: approval:wait-build
+    max_visits: 6
+    contract: { inputs: [site/], tools: '사람/에이전트 — 대표 구간 구현 완료 신호', outputs: [approved|rejected] }
+  - node_id: media
+    kind: agent
+    recipe: cmd:media
+    max_visits: 8
+    contract: { inputs: [media-manifest.json, ledger/media_spend.jsonl], tools: 'bun · 역할·권리 칸 ⊕ 예산 장부(생성은 에이전트가 스킬대로)', outputs: [assets, spend] }
+  - node_id: wait_media
+    kind: hitl
+    recipe: approval:wait-media
+    max_visits: 8
+    contract: { inputs: [media-manifest.json], tools: '사람/에이전트 — 미디어 제작·수정 완료 신호', outputs: [approved|rejected] }
+  - node_id: audit_media
+    kind: judge
+    recipe: cmd:audit-media
+    max_visits: 8
+    contract: { inputs: [media-manifest.json], tools: 'node skills/business-motion-websites/scripts/audit-media.mjs (workdir 안 경로만 · --ffprobe 안 씀)', outputs: [media-audit.json, ok|fix|skip] }
+  - node_id: motion
+    kind: agent
+    recipe: cmd:motion
+    max_visits: 8
+    contract: { inputs: [motion/motion-plan.json], tools: 'bun · 모션 5종 구분 ⊕ 모션 감소·휴대폰 동작 칸(원 스킬 §6)', outputs: [motions, kinds] }
+  - node_id: wait_motion
+    kind: hitl
+    recipe: approval:wait-motion
+    max_visits: 6
+    contract: { inputs: [motion/, site/], tools: '사람/에이전트 — 스크롤·모션·모바일 구현 완료 신호', outputs: [approved|rejected] }
+  - node_id: qa
+    kind: judge
+    recipe: cmd:qa
+    max_visits: 8
+    contract: { inputs: [qa/qa-report.json, input.webclone_root], tools: 'bun · QA 표 계약(폭 390·768·1280 · 모션 감소 · 증거 등급) — 자가 없으면 pending', outputs: [verdict, evidence_grades] }
+  - node_id: wait_qa
+    kind: hitl
+    recipe: approval:wait-qa
+    max_visits: 6
+    contract: { inputs: [qa/], tools: '사람/에이전트 — QA 표 작성 완료 신호', outputs: [approved|rejected] }
+  - node_id: approve_release
+    kind: hitl
+    recipe: approval:release-approval
+    max_visits: 4
+    contract: { inputs: [qa/qa-report.json, media-audit.json], tools: '사람 승인', outputs: [approved|rejected] }
+  - node_id: publish
+    kind: agent
+    recipe: cmd:publish
+    max_visits: 6
+    contract: { inputs: [site/, input.publish_target, ref/assets.sha256], tools: '어댑터 folder(기본 · 복사) | pub · vercel(명령 안내만 · 실행은 사람)', outputs: [target, location] }
+  - node_id: wait_publish
+    kind: hitl
+    recipe: approval:wait-publish
+    max_visits: 4
+    contract: { inputs: [release/], tools: '사람 — 안내된 발행 명령 실행 ⊕ 기록', outputs: [approved|rejected] }
+  - node_id: verify_public
+    kind: observe
+    recipe: cmd:verify-public
+    max_visits: 2
+    contract: { inputs: [release/publish-record.json, release/verify-public.json], tools: 'bun · 발행 위치 확인(폴더) · 공개 URL 재검증 기록 확인(네트워크 0)', outputs: [ok|unobserved] }
+  - node_id: unobserved
+    kind: gate
+    recipe: cmd:unobserved
+    max_visits: 1
+    contract: { inputs: [outputs], tools: bun, outputs: [published_but_not_reverified] }
+  - node_id: done
+    kind: gate
+    recipe: cmd:done
+    max_visits: 1
+    contract: { inputs: [outputs], tools: bun, outputs: [final] }
+  - node_id: failed
+    kind: gate
+    recipe: cmd:failed
+    max_visits: 1
+    contract: { inputs: [outputs], tools: bun, outputs: [error, next] }
+edges:
+  - { from: brief, on: outcome, map: { ok: absorb_ref, fail: failed } }
+  - { from: absorb_ref, on: outcome, map: { ok: strategy, skip: strategy, pending: wait_absorb, fail: failed } }
+  - { from: wait_absorb, on: outcome, map: { ok: absorb_ref, fail: failed } }
+  - { from: strategy, on: outcome, map: { ok: approve_plan, pending: wait_strategy, fail: failed } }
+  - { from: wait_strategy, on: outcome, map: { ok: strategy, fail: failed } }
+  - { from: approve_plan, on: outcome, map: { ok: hero_slice, fail: strategy } }
+  - { from: hero_slice, on: outcome, map: { ok: media, plan_only: done, pending: wait_build, fail: failed } }
+  - { from: wait_build, on: outcome, map: { ok: hero_slice, fail: failed } }
+  - { from: media, on: outcome, map: { ok: audit_media, pending: wait_media, fail: failed } }
+  - { from: wait_media, on: outcome, map: { ok: media, fail: failed } }
+  - { from: audit_media, on: outcome, map: { ok: motion, skip: motion, fix: wait_media, fail: failed } }
+  - { from: motion, on: outcome, map: { ok: qa, pending: wait_motion, fail: failed } }
+  - { from: wait_motion, on: outcome, map: { ok: motion, fail: failed } }
+  - { from: qa, on: outcome, map: { ok: approve_release, pending: wait_qa, fix: wait_build, fail: failed } }
+  - { from: wait_qa, on: outcome, map: { ok: qa, fail: failed } }
+  - { from: approve_release, on: outcome, map: { ok: publish, fail: hero_slice } }
+  - { from: publish, on: outcome, map: { ok: verify_public, pending: wait_publish, fail: failed } }
+  - { from: wait_publish, on: outcome, map: { ok: publish, fail: failed } }
+  - { from: verify_public, on: outcome, map: { ok: done, unobserved: unobserved, fail: failed } }
+  - { from: unobserved, on: outcome, map: { ok: done, fail: failed } }

@@ -48,6 +48,15 @@ test('falls back to junit durations when no usable pod-*.json record exists or t
   expect(readFileWallWeights(join(dir, 'missing'), new Map())).toBeUndefined();
 });
 
+test('wall scaling excludes nested suite durations even after CDATA contains a closing tag', () => {
+  const dir = cutDir();
+  writeFileSync(join(dir, 'pod-0.junit.xml'), '<testsuites><testsuite file="a" time="1"><system-out><![CDATA[</testsuite>]]></system-out><testsuite file="nested" time="100"/></testsuite><testsuite file="b" time="3"/></testsuites>');
+  record(dir, 'pod-0', 400_000, ['a', 'b']);
+  const { durations, wall } = planDurations(dir);
+  expect(wall).toEqual({ shards: 1, scaledFiles: 2 });
+  expect(durations).toEqual(new Map([['a', 100], ['b', 300]]));
+});
+
 test('pod-23-shaped fixture: wall weights spread the slow shard so the max planned shard drops', () => {
   const dir = cutDir();
   // Previous cut: one file with a large junit time ran alone (100 s wall); 20 files with tiny junit times (0.5 s each)

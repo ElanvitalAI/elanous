@@ -16,7 +16,12 @@ import { searchMemories } from '../memory.js';
 import { debug } from '../debug/log.js';
 import { localRefGroundingDigest } from '../agent/ref-grounding.js';
 import { listContextCapsules } from '../self-implement/context-capsule-store.js';
-import type { HarnessContextCapsule, HarnessGroundingProvenance } from '../self-implement/context-capsule.js';
+import type { HarnessContextCapsule } from '../self-implement/context-capsule.js';
+import { isRepositoryImplementationCandidate, type DocumentGroundingMatch } from './codebase-grounding.js';
+import { registerGoalAuthorGroundMission } from '../self-implement/goal-author.js';
+export { isRepositoryImplementationCandidate } from './codebase-grounding.js';
+export type CodebaseGrounding = import('./codebase-grounding.js').CodebaseGrounding;
+export type { DocumentGroundingMatch, PersistentGroundingEvidenceItem } from './codebase-grounding.js';
 import { groundPersistently, type PersistentGroundingDeps } from '../skills/tools/persistent-grounding.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { llmUsageCostFields } from '../budget/llm-cost.js';
@@ -36,75 +41,6 @@ function logLlmUsage(site: 'codebase-gate-injected' | 'codebase-gate-dynamic', m
       ...llmUsageCostFields(model, usage),
     });
   } catch { /* usage observation must not change grounding */ }
-}
-
-// ⚠️ `<name>` 은 **한 구간**이다(리뷰 should-fix) — `.+` 는 중첩 경로까지 삼켜 정책 설명과 어긋난다.
-// ⛔ **대소문자를 가리지 않는다**(2026-07-30 실측) — 실물로 `~/.claude/skills/project-onboarding/skill.md`
-//    (전부 소문자)가 존재하고, 종전 정규식은 그것을 **구현 후보로 실었다**. macOS 기본 FS 는
-//    case-insensitive 라 같은 스킬이 어느 표기로도 존재할 수 있다.
-//    ⊕ 같은 형태의 우회로를 `[S·round6]` 가 자기 가드(`.MD`)에서 먼저 찾았다 — 같은 관례가 둘을 속였다.
-// ⛔ `/i` 를 **전체에 걸지 않는다**(리뷰 must-fix) — 그러면 `.CLAUDE/SKILLS/...` 까지 제외해
-//    "정책 범위는 `.claude/skills/<name>/SKILL.md` 한 구간" 이라는 내 경계를 내가 넓힌다.
-//    **디렉터리는 정확히**, **파일명만** 대소문자를 무시한다.
-const CLAUDE_SKILL_DOCUMENT = /(?:^|\/)\.claude\/skills\/[^/]+\/[Ss][Kk][Ii][Ll][Ll]\.[Mm][Dd]$/;
-
-/** The sole path policy for repository implementation candidates. */
-export function isRepositoryImplementationCandidate(path: string): boolean {
-  return !CLAUDE_SKILL_DOCUMENT.test(path.replace(/\\/g, '/'));
-}
-
-export interface PersistentGroundingEvidenceItem {
-  text: string;
-  sourceKind?: HarnessGroundingProvenance;
-}
-
-export interface CodebaseGrounding {
-  grounded: boolean;
-  context: string;   // 분해 objective 에 fold 할 "기존 관련 코드/문서" 맵
-  /** ⚠️ 이 판별은 **`.claude/skills/<name>/SKILL.md` 만** 제외한다 — "저장소 소스만" 을
-   *  일반적으로 가려내지 않는다(리뷰 should-fix: 과장 금지). 실측으로 확인된 오분류가 그것뿐이라
-   *  안 잰 것을 규칙으로 만들지 않았다. */
-  files: string[];
-  /** Persistent loop completion-evidence lines, preserved verbatim after Read-path verification. */
-  persistentEvidence?: string[];
-  /**
-   * Per-item source associations for persistent evidence. Association is positional rather
-   * than text-keyed so duplicate evidence text can retain distinct provenance.
-   */
-  persistentEvidenceItems?: readonly PersistentGroundingEvidenceItem[];
-  /** Persistent grounding loop's observed stop reason, including no-candidate outcomes. */
-  persistentStopReason?: string;
-  /** 코드 접지 «채널»의 상태 — ⛔ `files: []` 의 세 뜻을 가른다(2026-08-11 72차 실측).
-   *  `ok` 채널이 돌았다(결과가 0이어도 «찾아본» 것이다) · `disabled` 호출자가 껐다 ·
-   *  `failed` 채널이 «실패»했다(제공자 오류 등 — 그 0 은 「없다」가 «아니다») ·
- *  `incomplete` 채널이 «돌긴 했는데 목표를 못 끝냈다»(`stopReason !== goal_complete`) —
- *    그때 후보는 «일부러» 비운다(검증 안 된 것을 파일로 주장하지 않는다). 📏 72차 전수 400건에서
- *    후보 0인 finished 5건이 «전부» `end_turn` 이었다 ⇒ 「성공인데 0」은 «없는 수수께끼»였다.
-   *  ⛔ 이 값이 없던 동안, 제공자 과부하로 난 `files: []` 가 「ask 에 앵커가 없다」로 사람에게 보고됐고
-   *  두 트랙이 그 문면을 믿고 ask 를 여러 번 다시 썼다(상관 17/17). */
-  codeChannel?: 'ok' | 'disabled' | 'failed' | 'incomplete';
-  /** ★ L3 — 탐색이 찾은 skill 계약 팩트(`[skill:name] <계약>`). 경로가 아니라 내용이라 build seed→PLAN.md
-   *  로 실려 구현 에이전트가 Read 없이도 계약 보유. 없으면 []. */
-  skillFacts: string[];
-  /** ★ L4 — grounded 코드 파일의 export 심볼 팩트(`[code:file] sym1, sym2`). decompose 가 코드 재사용을
-   *  추측/환각(예: 없는 "URL helper")하지 않게 **실제 export 심볼**을 실어 나른다. 없으면 []. */
-  codeFacts: string[];
-  /** ★ P2 — 검색공간 3박자 확장(기억·자기이력·문서벡터) 팩트(`[memory:type]`/`[self:kind]`/`[doc]`). ⚠️ 참조
-   *  컨텍스트(사실 배경)로만 쓰고 files/reusables(파일 실존 주장)에 넣지 않는다(mirage 가드). 없으면 []. */
-  memoryFacts: string[];
-  /** 저장소 `docs/` 검색 후보. 문서 근거를 보존하되 고칠 구현 파일 `files`에는 승격하지 않는다. */
-  documentFacts: string[];
-  /** 문서 검색의 실제 랭킹 근거. 저작기는 이 메타데이터로만 scope boundary를 선별한다. */
-  documentMatches?: DocumentGroundingMatch[];
-  /** 문서·코드 검색에 실제 사용한 확장 term. 저작기가 문서 후보의 관련도와 근거를 설명할 때만 쓴다. */
-  searchTerms?: string[];
-  /** ask에 저장소 고유명사/식별자가 없어 일반 검색어만 사용했음을 나타낸다. 빈 결과는 부재가 아니라 검색 범위의 미지다. */
-  genericSearchScope?: boolean;
-  /** 로컬 reference repository 팩트(`[ref:name] /absolute/path`). 참조 컨텍스트로만 쓰며 repo files 로 주장하지 않는다. */
-  refFacts: string[];
-  /** ★ F2(2026-07-25) — 상류 PTY 잡 capsule 팩트(`[pty:<id>] <objective> — 완료기준…`). 검색-코퍼스로 관련
-   *  상류 산출을 grounding 에 편입(dependsOn 없이·§11 컨텍스트 교환). 참조 컨텍스트로만(files 승격 아님). 없으면 []. */
-  ptyFacts: string[];
 }
 
 /** 구현·변경·분석형 골 판정 — 기존 자산을 다루는 미션(순수 단발 조회 제외). 순수함수(테스트). */
@@ -227,13 +163,6 @@ export function hasRepositorySpecificIdentifier(goal: string, identifiers: reado
     const candidate = identifier.trim().toLowerCase();
     return candidate.length >= 3 && (tokens.includes(candidate) || containsAsWholeWord(normalized, candidate));
   });
-}
-
-export interface DocumentGroundingMatch {
-  path: string;
-  score: number;
-  matchedTerms: string[];
-  excerpt: string;
 }
 
 /** git grep 으로 키워드 매칭 구현 파일(src·scripts) 상위 N. 랭킹은 **distinct term coverage**
@@ -769,3 +698,5 @@ export async function groundMissionInCodebase(
     observeTiming();
   }
 }
+
+registerGoalAuthorGroundMission(groundMissionInCodebase);

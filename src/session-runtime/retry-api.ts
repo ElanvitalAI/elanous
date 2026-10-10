@@ -80,6 +80,9 @@ export interface FetchApiWithRetryOpts {
   /** Fallbacks still unused. When > 0, k consecutive overload-class
    *  failures throw OverloadFailoverError before another retry sleep. */
   remainingFallbacks?: number;
+  /** BEDROCK-PROVIDER — 재시도 «직전»마다 요청을 다시 만든다(SigV4 서명은 `x-amz-date` 기준 수 분만 유효 —
+   *  `retry-after` 대기가 길면 옛 서명은 403). 없으면 종전처럼 같은 `init` 을 다시 쓴다(다른 provider 불변). */
+  refreshInit?: () => Promise<RequestInit>;
 }
 
 /** Raised when overload repeats k times and a fallback is still unused.
@@ -128,6 +131,8 @@ export async function fetchApiWithRetry(
   let lastErr: unknown;
   while (attempt < maxAttempts) {
     let response: Response | null = null;
+    // ⛔ try «밖» — 재서명 실패(자격 부재 등)는 재시도할 네트워크 오류가 아니다. 그대로 던진다.
+    if (attempt > 0 && opts.refreshInit) init = await opts.refreshInit();
     try {
       response = await fetch(url, init);
       if (response.ok) {
@@ -179,7 +184,12 @@ export async function fetchApiWithRetry(
       const fp = fingerprintError(err, `api:${opts.provider}`);
       const doomStatus = tracker.record(fp);
       const retryAfter = err instanceof ApiHttpError ? err.retryAfter : undefined;
-      const decision = decideRetry(err, {
+      // OpenRouter may report an upstream transient as a non-5xx HTTP status.
+      // Keep the original status/error for callers, but classify this specific body as retryable.
+      const policyError = opts.provider === 'openrouter' && err instanceof ApiHttpError
+        && /Provider returned error/i.test(err.bodyText)
+        ? Object.assign(new Error(err.message), { code: '503' }) : err;
+      const decision = decideRetry(policyError, {
         attempt,
         doomStatus,
         retryAfter,

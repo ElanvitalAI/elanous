@@ -1,5 +1,8 @@
 import { describe, it, expect, spyOn } from 'bun:test';
-import { enhancePrompt, parseEnhanceJson, extractChecklistFallback } from './enhance.js';
+import { enhancePrompt, parseEnhanceJson, extractChecklistFallback, selectEnhanceLlm } from './enhance.js';
+import { defaultGoalAuthorDeps } from '../self-implement/goal-author.js';
+import { getUserConfig } from '../user-config.js';
+import { tierModel } from '../llm/model-defaults.js';
 import * as llm from '../llm.js';
 import { debug } from '../debug/log.js';
 
@@ -16,6 +19,61 @@ const MISSION = `엘라누스는 무엇인가
   - 2장의 mermaid 차트 => 기본 구조와 자동 리뷰 시스템
   - PTY 가 무엇인지
   => 이미지로 PTY 잘 설명 필요함`;
+
+describe('enhance — authoring model and effort selection', () => {
+  const configFor = (planning: { model?: string; effort?: 'low' | 'medium' | 'high' }) => {
+    const config = getUserConfig();
+    return { ...config, roleLlm: { ...config.roleLlm, planning }, llm: { ...config.llm, provider: 'local' as const } };
+  };
+  const env = { ELANOUS_PR_REVIEW_MODEL: 'legacy-review' };
+
+  it('opts > env > planning config > legacy defaults independently, with exact sources', () => {
+    const config = configFor({ model: 'gpt-6-sol', effort: 'medium' });
+    expect(selectEnhanceLlm({ config }, env)).toEqual({ model: 'gpt-6-sol', effort: 'medium', modelSource: 'config-role', effortSource: 'config-role' });
+    expect(selectEnhanceLlm({ config }, { ...env, ELANOUS_PROMPT_ENHANCE_MODEL: 'from-env', ELANOUS_PROMPT_ENHANCE_EFFORT: 'high' })).toEqual({ model: 'from-env', effort: 'high', modelSource: 'env', effortSource: 'env' });
+    expect(selectEnhanceLlm({ config, model: 'from-opts', reasoningEffort: 'low' }, { ...env, ELANOUS_PROMPT_ENHANCE_MODEL: 'from-env', ELANOUS_PROMPT_ENHANCE_EFFORT: 'high' })).toEqual({ model: 'from-opts', effort: 'low', modelSource: 'opts', effortSource: 'opts' });
+    expect(selectEnhanceLlm({ config: configFor({}) }, env)).toEqual({ model: 'legacy-review', effort: 'high', modelSource: 'default', effortSource: 'default' });
+    expect(selectEnhanceLlm({ config: configFor({}) }, {})).toEqual({ model: tierModel('better'), effort: 'high', modelSource: 'default', effortSource: 'default' });
+    expect(selectEnhanceLlm({ config: configFor({ effort: 'low' }) }, env)).toEqual({ model: 'legacy-review', effort: 'low', modelSource: 'default', effortSource: 'config-role' });
+    expect(selectEnhanceLlm({ config: configFor({ model: 'gpt-6-sol', effort: 'medium' }), reasoningEffort: 'low' }, env)).toEqual({ model: 'gpt-6-sol', effort: 'low', modelSource: 'config-role', effortSource: 'opts' });
+    expect(selectEnhanceLlm({ config }, { ...env, ELANOUS_PROMPT_ENHANCE_EFFORT: 'invalid' })).toEqual({ model: 'gpt-6-sol', effort: 'medium', modelSource: 'config-role', effortSource: 'config-role' });
+  });
+
+  it('the disabled path calls no LLM and records no model selection', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      await enhancePrompt('author this', { disabled: true, config: configFor({ model: 'gpt-6-sol', effort: 'medium' }) });
+      expect(log.mock.calls.some((call) => call[0] === 'prompt-enhance.model')).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
+  it('defaultGoalAuthorDeps().enhance passes config model/effort to streamLLM and records selection', async () => {
+    const before = { model: process.env.ELANOUS_PROMPT_ENHANCE_MODEL, effort: process.env.ELANOUS_PROMPT_ENHANCE_EFFORT };
+    delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;
+    delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT;
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"goal":"g","constraints":[],"checklist":["item"]}');
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const config = configFor({ model: 'gpt-6-sol', effort: 'medium' });
+      await defaultGoalAuthorDeps(process.cwd()).enhance('author this', { config });
+      expect(stream.mock.calls[0]?.[2]).toMatchObject({ model: 'gpt-6-sol', reasoningEffort: 'medium' });
+      expect(log.mock.calls.filter((call) => call[0] === 'prompt-enhance.model' && call[1] === 'selected').map((call) => call[2])).toEqual([
+        { model: 'gpt-6-sol', effort: 'medium', modelSource: 'config-role', effortSource: 'config-role' },
+      ]);
+      await defaultGoalAuthorDeps(process.cwd()).enhance('author this', { config: configFor({ effort: 'low' }) });
+      expect(stream.mock.calls[1]?.[2]?.reasoningEffort).toBe('low');
+      expect(stream.mock.calls[1]?.[2]?.model).toBe(selectEnhanceLlm({ config: configFor({ effort: 'low' }) }).model);
+      process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = 'high';
+      await defaultGoalAuthorDeps(process.cwd()).enhance('author this', { config });
+      expect(stream.mock.calls[2]?.[2]?.reasoningEffort).toBe('high');
+      expect(log.mock.calls.filter((call) => call[0] === 'prompt-enhance.model' && call[1] === 'selected').at(-1)?.[2]).toMatchObject({ effortSource: 'env' });
+    } finally {
+      stream.mockRestore(); log.mockRestore();
+      if (before.model === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL; else process.env.ELANOUS_PROMPT_ENHANCE_MODEL = before.model;
+      if (before.effort === undefined) delete process.env.ELANOUS_PROMPT_ENHANCE_EFFORT; else process.env.ELANOUS_PROMPT_ENHANCE_EFFORT = before.effort;
+    }
+  });
+});
 
 describe('enhance — verbatim 보존 불변식', () => {
   it('disabled 모드는 원문을 fenced 로만 감싼다(순수 verbatim)', async () => {
@@ -494,5 +552,32 @@ describe('enhance — 체크리스트 «용도»가 프롬프트를 가른다', 
       // ask 에 불변식·경계·판정 신호가 각각 하나씩 = 셋. ⛔ 체크리스트 문면과 대조하지 «않는다».
       expect(shape?.askMarkers).toBe(3);
     } finally { log.mockRestore(); spy.mockRestore(); }
+  });
+});
+
+describe('enhance — first-token time observation (G13)', () => {
+  it('logs first-token once per call with ms since request start, ignoring empty deltas', async () => {
+    const clock = [1_000, 1_250, 9_999];
+    const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, onChunk) => {
+      onChunk('', '');
+      onChunk('{"goal"', '{"goal"');
+      onChunk(':"g"}', '{"goal":"g"}');
+      return '{"goal":"g","constraints":["c"],"checklist":["item"]}';
+    });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      await enhancePrompt('raw ask', { model: 'ttft-model', now: () => clock.shift() ?? 99_999 });
+      const ttft = log.mock.calls.filter((call) => call[0] === 'prompt-enhance.stream' && call[1] === 'first-token');
+      expect(ttft.map((call) => call[2])).toEqual([{ model: 'ttft-model', ttftMs: 250 }]);
+    } finally { log.mockRestore(); stream.mockRestore(); }
+  });
+
+  it('does not log first-token when the stream yields no text', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('');
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      await enhancePrompt('raw ask', { model: 'ttft-model' });
+      expect(log.mock.calls.some((call) => call[1] === 'first-token')).toBe(false);
+    } finally { log.mockRestore(); stream.mockRestore(); }
   });
 });

@@ -1083,6 +1083,8 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     const board = readGateShards(gateShardsPath('1.0.1', join(dirname(instanceRoot), 'machine-ledger')));
     expect(board?.shards.map((row) => [row.id, row.state])).toEqual([['pod-0', 'done'], ['pod-1', 'done'], ['pod-2', 'done']]);
     expect(board?.shards.every((row) => typeof row.endedAt === 'string')).toBe(true);
+    // GATE-LIVE-OBS-RC-WORDING ⓒ: after judging, the same board carries the verdict, so the line leaves «판정 전».
+    expect(board?.verdict).toEqual({ introduced: result.introduced.length, preexisting: result.preexisting });
   } finally { log.mockRestore(); }
 });
 

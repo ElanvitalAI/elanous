@@ -1173,6 +1173,72 @@ describe('harness ask production entry wiring', () => {
     }
   });
 
+  test('dev self --say --json emits the preflight-blocked terminal result before exit(1)', async () => {
+    const { program, setDevLaunchControlTestSeams } = await import('./index.js');
+    const blockers = [
+      { kind: 'open-pr', name: '#42', overlapPaths: [{ path: 'src/index.ts', role: 'target' }] },
+      { kind: 'live-run', name: 'run-7', detail: 'src/index.ts is in use' },
+    ];
+    const output: string[] = [];
+    const write = process.stdout.write;
+    const exit = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      expect(code).toBe(1);
+      expect(output).toEqual([JSON.stringify({ kind: 'self', ok: false, stage: 'preflight-blocked', blockers }) + '\n']);
+      throw new Error('PREFLIGHT_EXIT');
+    }) as never);
+    try {
+      process.stdout.write = ((chunk: unknown, callback?: (error?: Error | null) => void) => {
+        output.push(String(chunk));
+        callback?.(null);
+        return true;
+      }) as typeof process.stdout.write;
+      setDevLaunchControlTestSeams({
+        runAskLaunchFlow: (async () => ({ kind: 'stopped-by-preflight', goalFile: '/tmp/blocked.md', blockers })) as never,
+        runDevPipeline: (async () => { throw new Error('pipeline must not run'); }) as never,
+      });
+      await expect(program.parseAsync(['node', 'elanous', 'dev', '--say', 'blocked launch', '--json']))
+        .rejects.toThrow('PREFLIGHT_EXIT');
+      expect(exit).toHaveBeenCalledWith(1);
+      output.length = 0;
+      await expect(program.parseAsync(['node', 'elanous', 'dev', '--say', 'blocked launch', '--json', '--target', '/tmp/target']))
+        .rejects.toThrow('PREFLIGHT_EXIT');
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      setDevLaunchControlTestSeams(undefined);
+      process.stdout.write = write;
+      exit.mockRestore();
+    }
+  });
+
+  test('dev self --say without --json preserves the preflight-blocked exit without JSON stdout', async () => {
+    const { program, setDevLaunchControlTestSeams } = await import('./index.js');
+    const output: string[] = [];
+    const write = process.stdout.write;
+    const exit = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      expect(code).toBe(1);
+      expect(output).toEqual([]);
+      throw new Error('PREFLIGHT_EXIT');
+    }) as never);
+    try {
+      process.stdout.write = ((chunk: unknown, callback?: (error?: Error | null) => void) => {
+        output.push(String(chunk));
+        callback?.(null);
+        return true;
+      }) as typeof process.stdout.write;
+      setDevLaunchControlTestSeams({
+        runAskLaunchFlow: (async () => ({ kind: 'stopped-by-preflight', goalFile: '/tmp/blocked.md', blockers: [] })) as never,
+        runDevPipeline: (async () => { throw new Error('pipeline must not run'); }) as never,
+      });
+      await expect(program.parseAsync(['node', 'elanous', 'dev', '--say', 'blocked launch']))
+        .rejects.toThrow('PREFLIGHT_EXIT');
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      setDevLaunchControlTestSeams(undefined);
+      process.stdout.write = write;
+      exit.mockRestore();
+    }
+  });
+
   test('dev --ask rejects --branch on configured Pod before authoring or dispatch, while explicit local preserves the option', async () => {
     const { program, setDevLaunchControlTestSeams } = await import('./index.js');
     const dir = await mkdtemp(join(tmpdir(), 'dev-ask-branch-'));

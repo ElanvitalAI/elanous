@@ -16,6 +16,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 --------------------------------------------------------------------------------
+Design credits
+
+Wiring-diagram design: 공냥이 AI 실험실 (Gongnyang AI Lab)
+https://malfoy-meme-making.vercel.app/wiring/index.html
+Used with permission (2026-10-09). No character or story IP is included.
+
+--------------------------------------------------------------------------------
 Third-party components
 
 Runtime dependencies are declared in package.json and carry their own licenses.

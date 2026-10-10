@@ -192,7 +192,7 @@ describe('POD7 measured per-kind requests', () => {
       const spawn = podSelfImplementSpawn({ kubectl, memoryAdvice: () => { throw new Error('unavailable'); }, credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }) });
       expect((await spawn({ spaceId: 'request-no-advice', feature: '코드 구현' }).done).exitCode).toBe(0);
       expect(jobs[0].spec.template.spec.containers[0].resources).toEqual({
-        requests: { cpu: '1', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' },
+        requests: { cpu: '250m', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' },
       });
       expect(defaults).toEqual([{ kind: 'code', reason: 'no-advice' }]);
     } finally { off(); }
@@ -216,9 +216,9 @@ describe('POD7 measured per-kind requests', () => {
     expect((await spawn({ spaceId: 'auto-document-lite', feature: '# Guide\n- GoalType: document' }).done).exitCode).toBe(0);
     expect((await spawn({ spaceId: 'explicit-document-lite', feature: '# Guide\n- GoalType: document\nPod 메모리: lite' }).done).exitCode).toBe(0);
     expect(jobs.map((job) => job.spec.template.spec.containers[0].resources)).toEqual([
-      { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
-      { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
-      { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+      { requests: { cpu: '250m', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+      { requests: { cpu: '250m', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+      { requests: { cpu: '250m', memory: '1Gi' }, limits: { cpu: '4', memory: '2Gi' } },
     ]);
   });
 
@@ -244,12 +244,12 @@ describe('POD7 measured per-kind requests', () => {
       expect((await spawn({ spaceId: 'request-unknown', feature: '작업 진행' }).done).exitCode).toBe(0);
       expect((await spawn({ spaceId: 'request-lite', feature: '코드 구현\nPod 메모리: lite' }).done).exitCode).toBe(0);
       expect(jobs.map((job) => { const { requests, limits } = job.spec.template.spec.containers[0].resources; return { requests, limits }; })).toEqual([
-        { requests: { cpu: '1', memory: '9Gi' }, limits: { cpu: '4', memory: '16Gi' } },
-        { requests: { cpu: '1', memory: '9Gi' }, limits: { cpu: '4', memory: '32Gi' } },
-        { requests: { cpu: '1', memory: '15Gi' }, limits: { cpu: '4', memory: '32Gi' } },
-        { requests: { cpu: '1', memory: '5Gi' }, limits: { cpu: '4', memory: '16Gi' } },
-        { requests: { cpu: '1', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' } },
-        { requests: { cpu: '1', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
+        { requests: { cpu: '250m', memory: '9Gi' }, limits: { cpu: '4', memory: '16Gi' } },
+        { requests: { cpu: '250m', memory: '9Gi' }, limits: { cpu: '4', memory: '32Gi' } },
+        { requests: { cpu: '250m', memory: '15Gi' }, limits: { cpu: '4', memory: '32Gi' } },
+        { requests: { cpu: '250m', memory: '5Gi' }, limits: { cpu: '4', memory: '16Gi' } },
+        { requests: { cpu: '250m', memory: '6Gi' }, limits: { cpu: '4', memory: '16Gi' } },
+        { requests: { cpu: '250m', memory: '2Gi' }, limits: { cpu: '4', memory: '2Gi' } },
       ]);
       expect(kinds).toEqual(['code', 'code', 'pwa-build', 'test', null, 'code']);
     } finally { off(); }

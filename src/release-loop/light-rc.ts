@@ -42,6 +42,9 @@ export interface LightRcResult {
   remote: string | null;
   gateExitCode: number;
   ok: boolean;
+  /** LIGHT-RC-MEASURE ③ — why the gate produced no measurement (e.g. `shard-2`); null = it measured. Carried in the
+   *  JSON so the reason reaches the caller even when the remote child's human lines (stderr) do not. */
+  unmeasured: string | null;
 }
 
 export interface LightRcDeps {
@@ -57,6 +60,8 @@ export interface LightRcDeps {
 
 /** Shown when the gate ran remotely but the host name did not come back. */
 export const LIGHT_RC_UNKNOWN_HOST = '(remote · host unknown)';
+/** No measurement came back and the gate named no reason (an older gate, or a result without the field). */
+export const LIGHT_RC_REASON_NOT_REPORTED = 'reason not reported';
 
 const defaultGit = (args: string[], cwd: string) => {
   const run = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -142,6 +147,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       alwaysInclude: alwaysInclude.length,
       alwaysIncludeMissing: [...local.alwaysIncludeMissing],
       shards, remote: null, gateExitCode: local.exitCode, ok: false,
+      unmeasured: local.unmeasuredReason ?? (local.baseline ? null : LIGHT_RC_REASON_NOT_REPORTED),
     };
   } else {
     const remote = parseRemoteResult(Buffer.concat(captured).toString('utf8'));
@@ -156,12 +162,15 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       alwaysIncludeMissing: Array.isArray(remote.alwaysIncludeMissing) ? remote.alwaysIncludeMissing.map(String) : [],
       shards, remote: typeof host === 'string' && host ? host : opts.remote ?? LIGHT_RC_UNKNOWN_HOST,
       gateExitCode: typeof remote.gateExitCode === 'number' ? remote.gateExitCode : rc, ok: false,
+      unmeasured: typeof remote.unmeasured === 'string' && remote.unmeasured
+        ? remote.unmeasured
+        : typeof remote.introduced === 'number' ? null : LIGHT_RC_REASON_NOT_REPORTED,
     };
   }
   // Unmeasured (null) or unclassified failures are never green; policy-gate findings in the gate output are reported
   // (gate rc), not a regression.
   result.ok = result.introduced === 0 && result.unclassified === 0;
-  debug.log('release.light-rc', 'done', { version, base, introduced: result.introduced, preexisting: result.preexisting, unclassified: result.unclassified, shards, remote: result.remote });
+  debug.log('release.light-rc', 'done', { version, base, introduced: result.introduced, preexisting: result.preexisting, unclassified: result.unclassified, shards, remote: result.remote, unmeasured: result.unmeasured });
   return result;
 }
 
@@ -169,5 +178,6 @@ export function formatLightRc(result: LightRcResult): string[] {
   return [
     `${result.ok ? '✅' : '⛔'} light-rc ${result.version} · base ${result.base.slice(0, 12)} · ${result.remote ? `host ${result.remote}` : 'local'} · shards ${result.shards}`,
     `  introduced ${result.introduced ?? '못 쟀다'} · preexisting ${result.preexisting ?? '못 쟀다'} · unclassified ${result.unclassified ?? '못 쟀다'} · always-include ${result.alwaysInclude}${result.alwaysIncludeMissing.length ? ` (missing: ${result.alwaysIncludeMissing.join(', ')})` : ''} · gate rc ${result.gateExitCode}`,
+    ...(result.unmeasured !== null ? [`  shards: unmeasured (${result.unmeasured})`] : []),
   ];
 }

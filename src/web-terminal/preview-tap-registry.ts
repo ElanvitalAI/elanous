@@ -18,13 +18,16 @@
 // the same session replaces its tap; other sessions remain attached.
 
 import type { PreviewTerminal } from '../preview/terminal.js';
-import type { AcpServerHandle } from '../acp/server.js';
 import { debug } from '../debug/log.js';
 import { getDefaultPaneFactory } from '../panes/factory.js';
 import { webTerminalPaneRef } from '../panes/web-terminal-pane.js';
 import { listPty, registerPtyControlTarget, startPtyControlPoller, type PtyControlTarget } from '../pty-shell/registry.js';
 import { upsertPtyManifest, markPtyManifestClosed, touchLivePtyManifest } from '../pty-shell/pty-manifest.js';
 import { tapPtyOutput } from '../pty-shell/pty-recording.js';
+
+export interface PreviewTapServerHandle {
+  terminalOutput(sessionId: string, terminalId: string, data: string): Promise<boolean>;
+}
 
 interface SessionTap {
   unsubscribe: () => void;
@@ -106,7 +109,7 @@ export function registerPreviewTerminalForWebTap(
   pt: PreviewTerminal,
   sessionId: string,
   terminalId: string,
-  handle: AcpServerHandle,
+  handle: PreviewTapServerHandle,
 ): () => void {
   let entry = entries.get(pt);
   const firstRegisteredAt = entry?.firstRegisteredAt;

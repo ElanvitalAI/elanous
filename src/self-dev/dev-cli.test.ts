@@ -4150,11 +4150,13 @@ describe.concurrent('dev 은퇴 옵션 실물', () => {
     });
   });
 
-  it('--ask --json은 --hold 전용 계약으로 exit 2 거부된다', async () => {
+  // #25547 (10-09) — `--json` is now allowed with self `--ask/--say` (preflight-stop JSON). Outside the harness the closed
+  // `dev --ask` door answers first, so `--ask --json` ends with the closed-door notice as a single JSON document on stdout (exit 1).
+  it('--ask --json은 닫힌 문 안내를 stdout 의 JSON 문서 하나로 내고 exit 1 이다', async () => {
     const result = await spawnRealCli(['bun', cli, '--test', 'dev', '--ask', 'missing.json-goal.md', '--json'], { cwd: repo, timeoutMs: 60_000 });
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('--json은 --hold 전용입니다');
-    expect(result.stdout).toBe('');
+    expect(result.status).toBe(1);
+    expect(result.stderr).not.toContain('--json은 --hold 전용입니다');
+    expect(JSON.parse(result.stdout.trim())).toEqual(expect.objectContaining({ ok: false, error: expect.stringContaining('dev --ask 는 닫혔습니다') }));
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('B/C 옵션은 선언을 유지하고 골 입력이 없으면 은퇴 안내를 내지 않는다', async () => {
@@ -4352,7 +4354,8 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   it('JSON mode is rejected outside hold before attach validation', async () => {
     const r = await runCli(['dev', '--json', '--attach', 'pty-123', 'x']);
     expect(r.code).toBe(2);
-    expect(`${r.stdout}${r.stderr}`).toContain('--json은 --hold 전용입니다');
+    // #25547 widened the message (hold · self --target · self --ask/--say); --attach is still rejected before validation.
+    expect(r.stderr).toContain('--json은 --hold, self --target 또는 self --ask/--say 전제 검사 중단 전용입니다');
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('elanous hold remains advisory-free on its existing path', async () => {

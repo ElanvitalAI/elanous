@@ -378,3 +378,46 @@ describe('발송 팬아웃 구조 — 크로스채널 리드 동기화', () => {
     expect(recentlyDelivered(db, 'k', 120)).toBe(false); // 오래됨
   });
 });
+
+describe('away mode respects role routes', () => {
+  test('away route never widens the channels a role is allowed to reach', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'outbound-away-role-'));
+    const path = join(root, 'presence.json');
+    setElanousConfigDir(root);
+    const calls: string[] = [];
+    const cfg = cfgWith({
+      channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+      routes: { alert: ['telegram'] },
+      roleRoutes: { OP: ['telegram'] },
+      awayRoutes: { alert: ['telegram', 'discord'] },
+    });
+    const deps = {
+      telegramSend: async () => { calls.push('telegram'); return true; },
+      fetchImpl: (async () => { calls.push('discord'); return new Response('', { status: 200 }); }) as unknown as typeof fetch,
+      deliveryDb: openDeliveryDb(':memory:'), dedup: false,
+    };
+    try {
+      writePresence(true, 'cli', { path });
+      const op = await routeOutbound(cfg, { text: 'op away', markdown: false, kind: 'alert', role: 'OP' }, deps);
+      expect(calls).toEqual(['telegram']);
+      expect(op.channels).toEqual([{ type: 'telegram', ok: true }]);
+      calls.length = 0;
+      const silenced = await routeOutbound(cfgWith({
+        channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://discord.com/api/webhooks/1/t' }],
+        routes: { alert: ['telegram'] }, roleRoutes: { OP: [] }, awayRoutes: { alert: ['telegram', 'discord'] },
+        primary: { OP: 'telegram' }, fallback: { OP: 'discord' },
+      }), { text: 'silenced role away', markdown: false, kind: 'alert', role: 'OP' }, deps);
+      expect(silenced.channels).toEqual([]);
+      expect(silenced.delivered).toBe(false);
+      expect(calls).toEqual([]);
+      calls.length = 0;
+      const plain = await routeOutbound(cfg, { text: 'plain away', markdown: false, kind: 'alert' }, deps);
+      expect(calls.sort()).toEqual(['discord', 'telegram']);
+      expect(plain.channels).toHaveLength(2);
+    } finally {
+      resetElanousConfigDir();
+      deps.deliveryDb.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

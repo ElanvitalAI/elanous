@@ -74,6 +74,7 @@ export const EDGE_KINDS = ['request', 'decision', 'report', 'card', 'run', 'hand
 const KINDS = new Set<string>(EDGE_KINDS);
 const ID = /^[a-zA-Z0-9_-]{1,128}$/;
 export const ORCHESTRATOR_NODE = 'loop:orchestrator';
+export const RESOURCE_NODE = 'loop:resources';
 export const TASK_AGENT_NODE = 'agent:task-agent';
 export const RUNS_NODE = 'hub:runs';
 /** 고정 노드(자리 넷 밖) — 간선이 없어도 늘 같은 자리에 선다. 조율 → TASK-AGENT → 런 묶음 → 발행 순, 수호자는 옆. */
@@ -124,6 +125,7 @@ export function activityNodes(rows: readonly LoopRow[], edges: readonly Activity
   const nodes = new Map<string, ActivityNode>();
   for (const seat of seatIds) nodes.set(seat, { id: seat, type: 'seat', label: SEAT_NAMES[seat] ?? toPublicText(seat) });
   for (const fixed of FIXED_NODES) nodes.set(fixed.id, { id: fixed.id, type: 'hub', label: fixed.label });
+  nodes.set(RESOURCE_NODE, { id: RESOURCE_NODE, type: 'hub', label: '자원' });
   const owners = new Set(seatIds);
   const loopLabels = new Set<string>();
   for (const row of rows) {
@@ -159,6 +161,7 @@ export function activityNodes(rows: readonly LoopRow[], edges: readonly Activity
 }
 
 export function activityTraceTarget(id: string, edge?: ActivityEdge): string {
+  if (id === RESOURCE_NODE && !edge) return '/loops?view=resources';
   if (edge && (edge.kind === 'hand' || edge.kind === 'launch' || edge.kind === 'move') && ID.test(edge.ref)) return `/trace?q=${encodeURIComponent(edge.ref)}`;
   if (id.startsWith('pr:') && /^\d{1,9}$/.test(id.slice(3)) && !edge) return `/trace?q=${encodeURIComponent(id.slice(3))}`;
   const target = edge?.kind === 'run' ? edge.ref : id;

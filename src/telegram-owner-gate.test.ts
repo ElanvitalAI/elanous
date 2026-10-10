@@ -1,12 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { TelegramBot, type TgCallbackQuery, type TgMessageReaction } from './telegram.js';
 import type { ContextNowAnswer } from './context-bus/context-now.js';
-import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
+import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
 
 // The first ordinary turn sends a context-first summary. Pin its source so the gate
 // test never reads the host's real release/decision ledgers (slow and host-dependent).
-const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [], events: [], guide: [] };
-const CONTEXT_SUMMARY = renderTelegramNow(CONTEXT_NOW);
+const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [{ kind: 'run', goal: 'G', phase: 'implement', elapsed: '1분', source: 'run://g' }], events: [], guide: [] };
+// The context-first opening carries only operational rows, and is not sent at all when nothing is live.
+const CONTEXT_SUMMARY = renderContextFirstOpening(CONTEXT_NOW);
 
 type ApiCall = { method: string; body: Record<string, unknown> };
 

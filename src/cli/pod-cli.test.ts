@@ -1,10 +1,16 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { POD_COMMAND_DEADLINE_SECONDS, registerPodCommands } from './pod-cli.js';
+import {
+  POD_CLONE_WITHOUT_INSTALL_WARNING,
+  POD_COMMAND_DEADLINE_SECONDS,
+  podCloneWithoutInstallWarning,
+  registerPodCommands,
+} from './pod-cli.js';
+import { debug } from '../debug/log.js';
 import { POD_HOST_LEASE_ANNOTATION } from '../task-orchestrator/surfaces/pod-lease.js';
 import { podPoolHostLease, parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
@@ -506,5 +512,143 @@ exit 0
     expect(cap.lines).toEqual(['/artifacts/job']);
     expect(cap.errors).toContain('산출 회수 못 함: connection refused');
     expect(cap.code()).toBe(1);
+  });
+});
+
+describe('elanous pod run --clone 설치 없는 bun 시험 경고 (TA-LIVE-LAND-PROOF-1)', () => {
+  const launch = async (argv: string[]) => {
+    const cap = capture();
+    const seen: RunPodCommandOptions[] = [];
+    const observed: Array<{ category: string; event: string; data?: unknown }> = [];
+    // What was already emitted at the moment the job is launched — proves the warning comes «before» the launch.
+    const atLaunch: Array<{ errors: string[]; observations: number }> = [];
+    const program = new Command();
+    program.exitOverride();
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      observed.push({ category, event, data });
+    }) as typeof debug.log);
+    const prev = process.argv;
+    process.argv = ['bun', 'elanous', ...argv];
+    try {
+      registerPodCommands(program, {
+        io: cap.io,
+        run: async (options) => {
+          seen.push(options);
+          atLaunch.push({
+            errors: [...cap.errors],
+            observations: observed.filter((entry) => entry.category === 'pod.run' && entry.event === 'clone-without-install').length,
+          });
+          return { exitCode: 0, artifactsDir: '/artifacts/job', job: 'job' };
+        },
+      });
+      await program.parseAsync(argv, { from: 'user' });
+    } finally {
+      process.argv = prev;
+      spy.mockRestore();
+    }
+    return {
+      cap,
+      seen,
+      atLaunch,
+      warnings: () => cap.errors.filter((line) => line === POD_CLONE_WITHOUT_INSTALL_WARNING),
+      observations: () =>
+        observed.filter((entry) => entry.category === 'pod.run' && entry.event === 'clone-without-install'),
+    };
+  };
+
+  test('경고 문면은 골이 정한 고정 문자열 그대로다(구현 상수와 무관하게)', async () => {
+    const launched = await launch(['pod', 'run', '--clone', '--', 'bun', 'test', 'src/steward/launch.test.ts']);
+    expect(launched.cap.errors).toEqual([
+      '⚠ --clone 트리에는 node_modules 가 없다 — 시험이면 sh -c "bun install --frozen-lockfile && <명령>" 꼴로 감싸라',
+    ]);
+  });
+
+  test('--clone ⊕ 설치 없는 `bun test` → 발사 «전에» stderr 경고 한 줄 + 관측 1건, 발사는 막지 않는다', async () => {
+    const launched = await launch(['pod', 'run', '--clone', '--', 'bun', 'test', 'src/steward/launch.test.ts']);
+    expect(launched.warnings()).toEqual([POD_CLONE_WITHOUT_INSTALL_WARNING]);
+    expect(launched.cap.errors).toEqual([POD_CLONE_WITHOUT_INSTALL_WARNING]);
+    expect(launched.observations()).toEqual([
+      { category: 'pod.run', event: 'clone-without-install', data: { argv0: 'bun', argv1: 'test' } },
+    ]);
+    expect(launched.seen).toEqual([
+      { command: ['bun', 'test', 'src/steward/launch.test.ts'], returnLogs: true, clone: true },
+    ]);
+    expect(launched.cap.lines).toEqual(['/artifacts/job']);
+    expect(launched.cap.code()).toBe(0);
+    expect(launched.atLaunch).toEqual([{ errors: [POD_CLONE_WITHOUT_INSTALL_WARNING], observations: 1 }]);
+  });
+
+  test('`install` 은 argv 토큰 그대로만 센다 — 인자 하나 안의 «install helper» 는 설치가 아니다', async () => {
+    const launched = await launch(['pod', 'run', '--clone', '--', 'bun', 'test', 'install helper']);
+    expect(launched.warnings()).toEqual([POD_CLONE_WITHOUT_INSTALL_WARNING]);
+    expect(launched.atLaunch).toEqual([{ errors: [POD_CLONE_WITHOUT_INSTALL_WARNING], observations: 1 }]);
+  });
+
+  test('`install` 은 낱말로만 센다 — 파일 이름에 install 이 든 `bun test` 도 경고한다', async () => {
+    const launched = await launch(['pod', 'run', '--clone', '--', 'bun', 'test', 'src/installation.test.ts']);
+    expect(launched.warnings()).toEqual([POD_CLONE_WITHOUT_INSTALL_WARNING]);
+    expect(launched.atLaunch).toEqual([{ errors: [POD_CLONE_WITHOUT_INSTALL_WARNING], observations: 1 }]);
+  });
+
+  test('--clone ⊕ 설치 없는 `bun run <스크립트>` 도 같은 경고 한 줄과 관측 1건을 낸다', async () => {
+    const launched = await launch(['pod', 'run', '--clone', '--', 'bun', 'run', 'test']);
+    expect(launched.warnings()).toEqual([POD_CLONE_WITHOUT_INSTALL_WARNING]);
+    expect(launched.observations().map((entry) => entry.data)).toEqual([{ argv0: 'bun', argv1: 'run' }]);
+    expect(launched.cap.lines).toEqual(['/artifacts/job']);
+  });
+
+  test('--clone 이어도 `install` 을 감싼 명령은 경고 0건 · 관측 0건', async () => {
+    const wrapped = 'bun install --frozen-lockfile && bun test src/steward/launch.test.ts';
+    const launched = await launch(['pod', 'run', '--clone', '--', 'sh', '-c', wrapped]);
+    expect(launched.warnings()).toEqual([]);
+    expect(launched.cap.errors).toEqual([]);
+    expect(launched.observations()).toEqual([]);
+    expect(launched.seen).toEqual([{ command: ['sh', '-c', wrapped], returnLogs: true, clone: true }]);
+  });
+
+  test('`--clone` 없는 경로는 `bun test` 여도 경고 0건 · Job 사양 그대로', async () => {
+    const launched = await launch(['pod', 'run', '--', 'bun', 'test', 'src/steward/launch.test.ts']);
+    expect(launched.warnings()).toEqual([]);
+    expect(launched.cap.errors).toEqual([]);
+    expect(launched.observations()).toEqual([]);
+    expect(launched.seen).toEqual([{ command: ['bun', 'test', 'src/steward/launch.test.ts'], returnLogs: true }]);
+  });
+
+  test('경계 보존: --lite · bun 아닌 다른 명령 · `bun install` 은 경고 0건, 출력·Job 사양 동일', async () => {
+    const lite = await launch(['pod', 'run', '--lite', '--', 'bun', 'test', 'x.test.ts']);
+    expect(lite.warnings()).toEqual([]);
+    expect(lite.cap.errors).toEqual([]);
+    expect(lite.seen).toEqual([{ command: ['bun', 'test', 'x.test.ts'], returnLogs: true, lite: true }]);
+    const other = await launch(['pod', 'run', '--clone', '--', 'pnpm', 'test']);
+    expect(other.warnings()).toEqual([]);
+    expect(other.observations()).toEqual([]);
+    expect(other.seen).toEqual([{ command: ['pnpm', 'test'], returnLogs: true, clone: true }]);
+    const install = await launch(['pod', 'run', '--clone', '--', 'bun', 'install']);
+    expect(install.warnings()).toEqual([]);
+    expect(install.observations()).toEqual([]);
+    expect(install.seen).toEqual([{ command: ['bun', 'install'], returnLogs: true, clone: true }]);
+  });
+
+  test('경계 보존: `pod run` 도움말 문면은 그대로다 — 새 옵션 없음 · 경고 문면 미노출', () => {
+    const cap = capture();
+    const program = new Command();
+    program.exitOverride();
+    registerPodCommands(program, { io: cap.io });
+    const pod = program.commands.find((command) => command.name() === 'pod');
+    const podRun = pod?.commands.find((command) => command.name() === 'run');
+    expect(podRun).toBeDefined();
+    expect(podRun?.options.map((option) => option.flags)).toContain('--clone');
+    expect(podRun?.options.some((option) => option.flags.includes('install'))).toBe(false);
+    expect(podRun?.helpInformation()).not.toContain(POD_CLONE_WITHOUT_INSTALL_WARNING);
+  });
+
+  test('판정 함수 계약: `--clone` ⊕ argv0=bun ⊕ argv1=test|run ⊕ install 토큰 없음 일 때만 경고', () => {
+    expect(podCloneWithoutInstallWarning(['bun', 'test', 'x.test.ts'], true)).toBe(POD_CLONE_WITHOUT_INSTALL_WARNING);
+    expect(podCloneWithoutInstallWarning(['bun', 'run', 'build'], true)).toBe(POD_CLONE_WITHOUT_INSTALL_WARNING);
+    expect(podCloneWithoutInstallWarning(['sh', '-c', 'bun install --frozen-lockfile && bun test x.test.ts'], true)).toBeNull();
+    expect(podCloneWithoutInstallWarning(['bun', 'install'], true)).toBeNull();
+    expect(podCloneWithoutInstallWarning(['pnpm', 'test'], true)).toBeNull();
+    expect(podCloneWithoutInstallWarning(['bun', 'test', 'x.test.ts'], undefined)).toBeNull();
+    expect(podCloneWithoutInstallWarning([], true)).toBeNull();
   });
 });

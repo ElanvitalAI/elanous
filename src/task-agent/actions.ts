@@ -164,6 +164,10 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
       parsed = item as typeof parsed;
     } catch { return record('failed', 'invalid review JSON'); }
     if (parsed.reviewed !== true) return record('failed', 'review was not performed');
+    // TA-LAND-MUSTFIX-ZERO — «pass» 라도 must-fix 가 남았거나 수를 못 읽으면 land 로 가지 않는다(#25941 `canAuto` 와 같은 축).
+    //   `self review --json` 은 mustFix 배열을 «항상» 싣는다 — 배열이 아니면 «0» 이 아니라 «모름»으로 읽는다(fail-closed).
+    if (parsed.verdict === 'pass' && (!Array.isArray(parsed.mustFix) || !parsed.mustFix.every(fix => typeof fix === 'string'))) return card('review-must-fix-unknown: pass verdict without a readable must-fix list');
+    if (parsed.verdict === 'pass' && parsed.mustFix!.length > 0) return card(`review-warn-with-must-fix: pass verdict carries ${parsed.mustFix!.length} must-fix`);
     if (parsed.verdict === 'pass') { record('done', 'review pass'); return executeNextAction({ ...action, kind: 'land', history: [...(action.history ?? []), 'review pass'] }, deps); }
     if (parsed.verdict === 'fail' && Array.isArray(parsed.mustFix) && parsed.mustFix.length > 0 && parsed.mustFix.every(fix => typeof fix === 'string' && fix.trim())) { record('done', 'review fail'); return executeNextAction({ ...action, kind: 'retry', mustFix: parsed.mustFix, history: [...(action.history ?? []), 'review fail'] }, deps); }
     return card('review verdict or must-fix unavailable');

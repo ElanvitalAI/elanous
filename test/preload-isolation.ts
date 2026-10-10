@@ -57,6 +57,12 @@ delete process.env.ELANOUS_ESCALATE_MODEL;
 process.env.ELANOUS_SSH_HOSTS_PATH = join(tmpdir(), `elanous-test-ssh-hosts-${process.pid}`, 'absent.json');
 delete process.env.ELANOUS_MEDIA_HOST;
 
+// The OP traffic signal and handed ledger are host files (~/elanous-hq/seat-state/OP/…). A seat-loop test that
+// reaches them filters its fixture checklist by the operator's live versions/hold/handed (SEAT-LOOP-HONOR-SIGNAL).
+// Point both at nothing (= «no signal installation»); signal tests inject `deps.trafficSignal` or set the env.
+process.env.ELANOUS_TRAFFIC_SIGNAL = join(tmpdir(), `elanous-test-traffic-${process.pid}`, 'absent.json');
+process.env.ELANOUS_HANDED_CELLS = join(tmpdir(), `elanous-test-traffic-${process.pid}`, 'absent-handed.txt');
+
 // The GitHub App key is machine-level (~/.elanous/secrets/github-app). A test that reaches it mints a real
 // bot token on the network, and that token can end up in a real gh under a temp HOME (10-01 keychain dialogs).
 // Point the App config at nothing; App tests pass `configPath` explicitly.

@@ -43,11 +43,13 @@ test('rescue launches like live; shadow takes no action', () => {
       const settings = { mode: 'rescue' as const };
       const item = planLaunches(rows, issues, ledger, settings).launches[0]!;
       let spawned = 0;
-      const entry = launch(item, { root: liveDir, ledger, settings,
-        command: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      let budgetSeat: string | undefined;
+      let spawnSeat: string | undefined;
+      const entry = launch(item, { root: liveDir, ledger, settings, launchSeat: () => liveDir,
+        command: (_args, seat) => { budgetSeat = seat; return { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }; },
         gate: (_goal, budget) => ({ action: 'proceed', sameGoalActiveRuns: [], budget, reason: 'ok' }),
-        spawn: () => { spawned++; return { pid: 99999999 }; } });
-      expect([spawned, entry.status]).toEqual([1, 'launched']);
+        spawn: (_args, _log, seat) => { spawned++; spawnSeat = seat; return { pid: 99999999 }; } });
+      expect([spawned, entry.status, budgetSeat, spawnSeat]).toEqual([1, 'launched', liveDir, liveDir]);
     } finally { rmSync(liveDir, { recursive: true, force: true }); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

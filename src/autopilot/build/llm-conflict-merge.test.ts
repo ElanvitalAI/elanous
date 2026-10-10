@@ -455,7 +455,8 @@ describe('defaultLlmResolve intent modes', () => {
       const small = await defaultLlmResolve('src/a.ts', CONFLICTED, 'main', { stream });
       expect(small).toBe(RESOLVED);
       expect(calls).toBe(1);
-      const oversized = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { stream }), gitSeam({ fileContents: { '/wt/src/a.ts': CONFLICTED.repeat(1300) } }).git);
+      // MERGE-CONFLICT-AUTO: knob off pins the old whole-file cap outcome (knob on = hunk path · llm-conflict-merge-hunk.test.ts).
+      const oversized = await mergeMainWithLlmResolve('/wt', 'main', (file, content) => defaultLlmResolve(file, content, 'main', { stream, mergeConflictAuto: false }), gitSeam({ fileContents: { '/wt/src/a.ts': CONFLICTED.repeat(1300) } }).git);
       expect(oversized.reason).toBe('conflict-input-too-large');
       expect(oversized.inputChars).toBeGreaterThan(DEFAULT_MERGE_CONFLICT_INPUT_MAX_CHARS);
       expect(calls).toBe(1);

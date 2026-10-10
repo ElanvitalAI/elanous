@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../../debug/log.js';
 import { newReportId } from '../../hooks/error-report.js';
+import { startErrorReportPruneTick } from './error-reports.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { setTestStateRoot } from '../paths.js';
 import { createNexusState } from '../state/state.js';
@@ -47,12 +49,38 @@ describe('handleErrorReportIngest', () => {
 
   test('day folders older than 30 days are removed on the next receipt; newer ones stay', async () => {
     const root = mkdtempSync(join(tmpdir(), 'er2-prune-'));
+    const old = join(root, 'error-reports', '2026', '08', '20');
+    const fresh = join(root, 'error-reports', '2026', '09', '15');
+    const reportId = newReportId(NOW);
     try {
-      mkdirSync(join(root, 'error-reports', '2026', '08', '20'), { recursive: true });
-      mkdirSync(join(root, 'error-reports', '2026', '09', '15'), { recursive: true });
-      expect(pruneErrorReports(root, NOW)).toBe(1);
-      expect(existsSync(join(root, 'error-reports', '2026', '08', '20'))).toBe(false);
-      expect(existsSync(join(root, 'error-reports', '2026', '09', '15'))).toBe(true);
+      mkdirSync(old, { recursive: true });
+      mkdirSync(fresh, { recursive: true });
+      writeFileSync(join(old, `${reportId}.json`), JSON.stringify(item()));
+      writeFileSync(join(fresh, `${reportId}.json`), JSON.stringify(item()));
+      const seen: Array<{ category: string; data?: unknown }> = [];
+      const off = debug.registerSink({ name: 'er-prune-ingest-test', emit: (row) => seen.push(row as { category: string; data?: unknown }) });
+      try {
+        expect((await handleErrorReportIngest(req(item()), { root: () => root, now: () => NOW, alert: async () => true })).status).toBe(202);
+      } finally { off(); }
+      expect(existsSync(old)).toBe(false);
+      expect(existsSync(join(fresh, `${reportId}.json`))).toBe(true);
+      expect(seen.some((event) => event.category === 'error-report.prune' && (event.data as { pruned?: number }).pruned === 1)).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('31-day-old report is removable without a receipt (retention primitive only)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'er2-idle-prune-'));
+    const old = join(root, 'error-reports', '2026', '09', '01');
+    const fresh = join(root, 'error-reports', '2026', '09', '02');
+    const reportId = newReportId(NOW);
+    try {
+      mkdirSync(old, { recursive: true });
+      mkdirSync(fresh, { recursive: true });
+      writeFileSync(join(old, `${reportId}.json`), JSON.stringify(item()));
+      writeFileSync(join(fresh, `${reportId}.json`), JSON.stringify(item()));
+      expect(pruneErrorReports(root, NOW + 86_400_000)).toBe(1);
+      expect(existsSync(old)).toBe(false);
+      expect(existsSync(join(fresh, `${reportId}.json`))).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -80,5 +108,42 @@ describe('route on the real daemon server', () => {
     });
     expect((await send()).status).toBe(401);
     expect((await send(token)).status).toBe(202);
+  });
+});
+
+describe('startErrorReportPruneTick — retention without a receipt', () => {
+  test('prunes at boot and on each daily tick with no ingest, observing pruned counts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'er2-tick-'));
+    let clock = NOW;
+    let tick = () => {};
+    let interval = 0;
+    try {
+      const reportId = newReportId(NOW);
+      const day = (y: string, m: string, d: string) => {
+        const dir = join(root, 'error-reports', y, m, d);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${reportId}.json`), JSON.stringify(item()));
+        return dir;
+      };
+      const stale = day('2026', '08', '20');
+      const edge = day('2026', '09', '01');
+      const seen: Array<{ category: string; data?: unknown }> = [];
+      const off = debug.registerSink({ name: 'er-prune-tick-test', emit: (row) => seen.push(row as { category: string; data?: unknown }) });
+      const handle = startErrorReportPruneTick({ root: () => root, now: () => clock,
+        schedule: (fn, ms) => { tick = fn; interval = ms; return {}; } });
+      expect(interval).toBe(86_400_000);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(edge)).toBe(true);
+      // No receipt arrives; a day passes and the timer fires.
+      clock += 86_400_000;
+      tick();
+      expect(existsSync(edge)).toBe(false);
+      const pruned = () => seen.filter((e) => e.category === 'error-report.prune').map((e) => (e.data as { pruned: number }).pruned);
+      expect(pruned()).toEqual([1, 1]);
+      handle.stop();
+      tick();
+      expect(pruned()).toHaveLength(2);
+      off();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

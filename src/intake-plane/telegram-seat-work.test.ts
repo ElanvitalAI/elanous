@@ -6,15 +6,16 @@ import type { UserConfig } from '../user-config.js';
 import type { PersonaProfile } from '../persona/types.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
 import type { ContextNowAnswer } from '../context-bus/context-now.js';
-import { renderTelegramNow } from '../context-bus/context-now-surfaces.js';
+import { renderContextFirstOpening } from '../context-bus/context-now-surfaces.js';
 
 const MSG = { chatId: -123, messageId: 456 };
 const OWNER = { chatId: 111, userId: 111, messageId: 456 };
 const config = { raw: { decisions: { telegramOwnerId: 111 } }, telegram: { allowedUsers: [111] } } as unknown as UserConfig;
 // Ordinary chat turns are preceded by a context-first summary; pin its source so these
 // tests never read the host's real release/decision ledgers (slow and host-dependent).
-const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [], events: [], guide: [] };
-const CONTEXT_SUMMARY = renderTelegramNow(CONTEXT_NOW);
+const CONTEXT_NOW: ContextNowAnswer = { at: '2026-10-08T00:00:00.000Z', topic: null, facts: [{ kind: 'run', goal: 'G', phase: 'implement', elapsed: '1분', source: 'run://g' }], events: [], guide: [] };
+// The context-first opening carries only operational rows, and is not sent at all when nothing is live.
+const CONTEXT_SUMMARY = renderContextFirstOpening(CONTEXT_NOW);
 const sage: PersonaProfile = { personaId: 'sage', displayName: 'Sage', systemPrompt: '차분히 답하라.', mentionPatterns: ['@mentor'] };
 const personaProfiles: PersonaProfile[] = [sage, { personaId: 'cmo', displayName: 'CMO Persona' }, { personaId: 'mira', displayName: 'Mira' }];
 const personaSource: PersonaSource = { list: () => personaProfiles, get: (id) => personaProfiles.find((p) => p.personaId === id) };

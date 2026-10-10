@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defaultLlmPolicy, loadLlmPolicy, validateLlmPolicy } from './llm-policy.js';
+import { defaultLlmPolicy, loadLlmPolicy, resolveSubscriptionReviewer, validateLlmPolicy } from './llm-policy.js';
 
 const roots: string[] = [];
 function fixture(legacy: object = {}, yaml?: string): string {
@@ -221,5 +221,20 @@ test('an unreadable policy folder is an error with its path, not «no file · va
     expect(result.errors.join('\n')).toContain('EACCES');
   } finally {
     chmodSync(folder, 0o755);
+  }
+});
+
+test('resolveSubscriptionReviewer — one reviewer row for the harness and `self review` (REVIEW-ACP-CLI)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-policy-reviewer-'));
+  try {
+    const none = loadLlmPolicy({ configDir: root, legacyConfig: {} });
+    expect(resolveSubscriptionReviewer(none)).toBeUndefined();
+    expect(resolveSubscriptionReviewer(none, { reviewer: { provider: 'claude-acp', executor: 'cc' } }))
+      .toEqual({ spec: { provider: 'claude-acp', executor: 'cc' }, cap: none.policy.caps.claude.harness });
+    const legacy = loadLlmPolicy({ configDir: root, legacyConfig: { roleLlm: { reviewer: { provider: 'claude-acp' } } } });
+    expect(resolveSubscriptionReviewer(legacy, { reviewer: { provider: 'claude-acp', executor: 'cc' } }))
+      .toEqual({ spec: { provider: 'claude-acp' }, cap: legacy.policy.caps.claude.harness });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

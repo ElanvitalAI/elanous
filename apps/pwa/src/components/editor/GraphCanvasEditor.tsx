@@ -7,6 +7,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import '@/components/workflows/node-status.css';
+import '@/lib/graph-wiring.css';
 import type { GraphKindEntry, GraphWizardSteps, NexusClient } from '@/nexus/client';
 import type { NodeRunStatus } from '@/components/workflows/run-status-helpers';
 import { nodeStatusClass } from '@/components/workflows/node-status-class';
@@ -16,7 +17,7 @@ import {
   type CanvasFlow, type CanvasGraph, type CanvasIssue,
 } from './graph-canvas-model';
 import { saveCanvasGraph } from './graph-canvas-save';
-import { hoverFocus, mergeParallelEdges, routeEdges } from '@/lib/graph-edge-route';
+import { hoverFocus, mergeParallelEdges, routeEdges, WIRING_STYLE, wiringEdgeStyle } from '@/lib/graph-edge-route';
 import { TIDY_EDGE_TYPES, type TidyEdgeData } from '@/components/workflows/TidyEdge';
 
 /** What a toolbar extension (e.g. CGE-RUN's «실행») reads from the canvas. */
@@ -316,7 +317,7 @@ export function GraphCanvasEditor({
     position: { x: node.x, y: node.y },
     selected: selection?.type === 'node' && selection.id === node.id,
     className: [nodeStatus ? nodeStatusClass(nodeStatus[node.id]) : '', newNodes.has(node.id) ? 'graph-wizard-new' : ''].filter(Boolean).join(' ') || undefined,
-    ...(focus && !focus.nodes.has(node.id) ? { style: { opacity: 0.25 } } : {}),
+    ...(focus && !focus.nodes.has(node.id) ? { style: { opacity: WIRING_STYLE.dimNode } } : {}),
     data: { id: node.id, kind: node.kind, recipe: node.recipe, ...(nodeLabels?.[node.id] ? { label: nodeLabels[node.id] } : {}), entry: graph.entry === node.id, terminal: ends.has(node.id), issueCount: nodeIssueCount.get(node.id) ?? 0, flow,
       ...(nodeStatus?.[node.id] ? { runStatus: nodeStatus[node.id] } : {}) } satisfies CanvasNodeData,
   }));
@@ -326,6 +327,7 @@ export function GraphCanvasEditor({
       const edge = graph.edges[index];
       return edge !== undefined && newEdges.has(`${edge.from}->${edge.to}:${edge.outcome}`);
     });
+    const wiring = wiringEdgeStyle(focus, route.id);
     return {
     id: route.id,
     source: route.from,
@@ -335,10 +337,9 @@ export function GraphCanvasEditor({
     type: 'tidy',
     data: { route } satisfies TidyEdgeData,
     selected: selection?.type === 'edge' && route.indexes.includes(selection.index),
-    animated: (focus?.edges.has(route.id) ?? false) || fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
-    ...(focus ? { style: focus.edges.has(route.id)
-      ? { stroke: '#f59e0b', strokeWidth: 3, strokeDasharray: '6 4' }
-      : { opacity: 0.15 } } : fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
+    className: focus?.edges.has(route.id) ? 'wiring-edge-flow' : undefined,
+    animated: wiring.animated || fresh || (nodeStatus?.[route.from] === 'done' && nodeStatus?.[route.to] === 'running'),
+    ...(focus ? { style: wiring.style } : fresh ? { style: { stroke: '#a855f7', strokeWidth: 3 } } : {}),
     };
   });
 
@@ -560,6 +561,7 @@ export function GraphCanvasEditor({
         )}
         </div>
       </div>
+      <p className="shrink-0 px-3 py-1 text-[11px] text-muted-foreground">배선도 디자인: <a href="https://malfoy-meme-making.vercel.app/wiring/index.html" target="_blank" rel="noopener noreferrer" className="underline">공냥이 AI 실험실</a></p>
     </div>
   );
 }

@@ -14,6 +14,7 @@ import {
   AutopilotApi, EXECUTION_MODEL_META, missionSchedulesHref,
   type MissionSummary, type MissionTrace, type DerivedStatus, type DerivedJob, type TriageResult,
 } from '@/lib/autopilot-api';
+import { missionStaleness } from '@/lib/mission-staleness';
 
 const STATUS_META: Record<DerivedStatus, { icon: string; tone: string; label: string }> = {
   ok: { icon: '✅', tone: 'text-emerald-300', label: '정상' },
@@ -107,6 +108,7 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
   const [trace, setTrace] = useState<MissionTrace | null>(null);
   const [busy, setBusy] = useState(false);
   const meta = m.model ? EXECUTION_MODEL_META[m.model] : null;
+  const staleness = missionStaleness(m.updatedAt, Date.now(), { status: m.status });
 
   const loadTrace = useCallback(async () => {
     setBusy(true);
@@ -144,7 +146,8 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
 
   return (
     <div className="rounded-lg border border-border bg-card/50">
-      <button type="button" onClick={() => void toggle()} className="flex w-full items-start gap-3 p-3 text-left">
+      <div className="flex items-start">
+        <button type="button" onClick={() => void toggle()} className="flex min-w-0 flex-1 items-start gap-3 p-3 text-left">
         <span className="mt-0.5 text-muted-foreground">{open ? '▾' : '▸'}</span>
         <div className="min-w-0 flex-1 space-y-1.5">
           <div className="flex flex-wrap items-center gap-2">
@@ -156,14 +159,22 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
             <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.source}</span>
             {awaitingApproval
               ? <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/40">승인 대기</span>
-              : <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.status}</span>}
+              : !staleness?.stale && <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground ring-1 ring-border">{m.status}</span>}
             {m.reviewDue && <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] text-amber-300 ring-1 ring-amber-500/30">⚠ 30일+ 리뷰</span>}
             {isHuman ? <TaskProgressChips counts={m.taskCounts} total={m.taskCount} /> : <RollupChips r={m.derived} />}
+            {staleness?.stale && <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/30">{staleness.days}일 멈춤 · 마지막 갱신 {staleness.lastUpdated}</span>}
           </div>
           <p className="truncate text-sm text-foreground/90">{m.goal}</p>
           <p className="font-mono text-[10px] text-muted-foreground">{m.id}</p>
         </div>
-      </button>
+        </button>
+        {staleness?.stale && !isHuman && (
+          <Button size="sm" variant="outline" disabled={cancelling} onClick={() => void cancel()}
+            className="mr-3 mt-3 shrink-0 border-amber-500/40 text-amber-300 hover:text-amber-200">
+            {cancelling ? '종료 중…' : '닫기 제안'}
+          </Button>
+        )}
+      </div>
       {open && isHuman && (
         <div className="border-t border-border px-4 py-3 space-y-2">
           <p className="text-xs text-muted-foreground">
@@ -336,7 +347,7 @@ export function AutopilotMissions({ api }: { api: AutopilotApi }) {
       {err && <p className="text-xs text-rose-400">{err}</p>}
       {missions && missions.length === 0 && (
         <p className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          아직 미션이 없습니다. 아래 &ldquo;골 던지기&rdquo;로 자율 미션을 만들거나, Intake 에서 메모를 포착하세요.
+          아직 미션이 없습니다. 위 &ldquo;골 던지기&rdquo;로 자율 미션을 만들거나, Intake 에서 메모를 포착하세요.
         </p>
       )}
       {missions && missions.length > 0 && (

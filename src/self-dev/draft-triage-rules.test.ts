@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'bun:test';
-import { branchStem, decideDraft, isAutoTitle, sameGoalPr, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+import { branchStem, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+
+it('preserves manual claim bytes and distinguishes missing timestamps from expiry', () => {
+  const now = new Date('2026-09-30T00:00:00Z');
+  expect(draftClaimComment('TC', now)).toBe('🔧 처리 중 — owner TC · 2026-09-30T00:00:00.000Z');
+  expect(draftClaimComment('UX', now, ' run R ')).toBe('🔧 처리 중 — owner UX · 2026-09-30T00:00:00.000Z · run R');
+  expect(draftReleaseComment(now)).toBe('🔧 처리 끝 — 2026-09-30T00:00:00.000Z');
+  expect(draftReleaseComment(now, 'run R · failed-with-pr')).toBe('🔧 처리 끝 — 2026-09-30T00:00:00.000Z · run R · failed-with-pr');
+  expect(draftClaimState({ labels: ['elanous:running'], updatedAt: '2026-09-29T23:00:00Z' }, now)).toBe('claimed');
+  expect(draftClaimState({ labels: ['elanous:running'], updatedAt: '2026-09-29T18:00:00Z' }, now)).toBe('expired');
+  expect(draftClaimState({ labels: ['elanous:running'], updatedAt: '2026-09-29T17:00:00Z' }, now)).toBe('expired');
+  expect(draftClaimState({ labels: ['elanous:running'] }, now)).toBe('unobserved');
+  expect(draftClaimState({ labels: ['elanous:running', 'elanous:harvestable'] }, now)).toBe('unclaimed');
+});
 
 const base: DraftTriageInput = {
   draft: { number: 1, title: 'same goal', branch: 'self-impl/x-goalid-a1b2c3-run' },
@@ -169,6 +182,10 @@ describe('decideDraft', () => {
 
 describe('sameGoalPr (TC 10-05 · identifier first, title only with harness stem)', () => {
   it('compares goal identifiers when both carry one', () => {
+    // review r7: a branch goal id on one side only is unverifiable — matching body «골:» lines must not close it.
+    expect(sameVerifiedGoal({ number: 1, title: 'A', branch: 'self-impl/x-goalid-abc1-r1', body: '골: one' }, { number: 2, title: 'B', branch: 'tc/hand', body: '골: one' })).toBe(false);
+    expect(sameVerifiedGoal({ number: 1, title: 'A', branch: 'a', body: '골: one' }, { number: 2, title: 'B', branch: 'b', body: '골: one' })).toBe(true);
+    expect(sameVerifiedGoal({ number: 1, title: 'A', branch: 'self-impl/x-goalid-abc1-r1' }, { number: 2, title: 'B', branch: 'self-impl/y-goalid-abc1-r2' })).toBe(true);
     expect(sameGoalPr({ number: 1, title: 'A', branch: 'self-impl/x-goalid-abc1-r1' }, { number: 2, title: 'B', branch: 'self-impl/y-goalid-abc1-r2' })).toBe(true);
     expect(sameGoalPr({ number: 1, title: 'Same', branch: 'self-impl/x-goalid-abc1-r1' }, { number: 2, title: 'Same', branch: 'self-impl/x-goalid-def2-r2' })).toBe(false);
     expect(sameGoalPr({ number: 1, title: 'Same', branch: 'a', body: '골: one' }, { number: 2, title: 'Same', branch: 'b', body: '골: two' })).toBe(false);

@@ -2,7 +2,7 @@
 //
 // Codex children drop parent env under shell_environment_policy inherit=core, so a
 // depth marker that only lives in the environment never arrives. Depth is therefore
-// carried on the codex argv (`-c shell_environment_policy.set.ELANOUS_NESTED_DEPTH=<n>`).
+// carried on the codex argv (`-c shell_environment_policy.set.ELANOUS_NESTED_DEPTH="<n>"` — TOML 문자열).
 //
 // Unset ELANOUS_NESTED_DEPTH is depth 0 (the outer launcher). A missing marker is
 // not "depth unknown" and does not refuse an ordinary mission spawn.
@@ -50,7 +50,9 @@ export function backendCarriesNestedDepth(backendName: string): boolean {
 export function nestedDepthCodexArgs(backendName: string, childDepth: number): string[] {
   if (backendName !== 'codex') return [];
   if (!Number.isInteger(childDepth) || childDepth < 0) return [];
-  return ['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}=${childDepth}`];
+  // 🩸 CODEX-NESTED-DEPTH-QUOTE(2026-10-09): `-c` 값은 TOML 이고 shell_environment_policy.set 은 «문자열» 맵이다.
+  //   맨 정수(`=1`)는 codex 0.159.3 에서 «failed to load bootstrap configuration» 으로 자식을 바로 죽인다 → 따옴표로 문자열.
+  return ['-c', `${CODEX_NESTED_DEPTH_CONFIG_KEY}="${childDepth}"`];
 }
 
 /**

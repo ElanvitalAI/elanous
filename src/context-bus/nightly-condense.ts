@@ -151,7 +151,7 @@ export function summaryInstruction(recipe: 'standard' | 'sleep-review' = 'standa
   const system = 'Summarize this one-line context event as a compact project/seat memory item. Return ONLY JSON: {"project":"...","topic":"...","summary":"...","claim":{"key":"...","value":"..."}}. Omit claim when the event makes no comparable factual assertion. Never invent a project, topic or claim.';
   if (recipe === 'standard') return system;
   // SLEEP1 builds on this librarian recipe; the guardian owns storage hygiene, not promotion judgments.
-  return `${system.replace('"project":"..."', '"promote":false,"project":"..."')} You are the nightly task agent (librarian). Sleep review (librarian contract): apply the coordinator promotion policy. Return a boolean "promote" for every source. Set promote=true only for sourced, durable project/seat facts or decisions; set promote=false for chatter or speculative claims. A correction with a later timestamp wins; return a comparable claim only for an explicit factual assertion so opposing claims can become OP conflict candidates. Do not perform guardian hygiene (retention, compression, size, backup, integrity or rollback).`;
+  return `${system.replace('"project":"..."', '"promote":false,"project":"..."')} You are the nightly task agent (librarian). Sleep review (librarian contract): apply the coordinator promotion policy. Return a boolean "promote" for every source. Set promote=true only for sourced, durable project/seat facts or decisions, including durable updates without a comparable claim; set promote=false for chatter or speculative claims. A correction with a later timestamp wins; return a comparable claim only for an explicit factual assertion so opposing claims can become OP conflict candidates. Do not perform guardian hygiene (retention, compression, size, backup, integrity or rollback).`;
 }
 
 export async function summarize(source: MemorySource, injected?: Record<string, MemorySummary>, recipe: 'standard' | 'sleep-review' = 'standard'): Promise<MemorySummary> {
@@ -213,6 +213,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
   if (!collected?.day || !collected.events || !collected.decisions) throw new Error('collect output missing');
   if (stage === 'condense') {
     const assignments: Array<{ owner: 'coordinator'; assignee: 'nightly-task-agent'; contract: 'librarian'; recipe: 'sleep-review'; workerPid: number }> = [];
+    const policy = { promotion: 'sleep-review', retention: 'guardian' } as const;
     const items = await condenseContextDay(collected.day, dryRun ? [] : storedItems(root).filter(item => Date.parse(item.updatedAt) < Date.parse(`${collected.day}T00:00:00Z`)), {
       events: () => collected.events!, decisions: () => collected.decisions!,
       summarize: async source => {
@@ -223,7 +224,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
         assignments.push({ owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review', workerPid });
         return result;
       },
-    }, now, { promotion: 'sleep-review', retention: 'guardian' });
+    }, now, policy);
     return { outcome: 'ok', items, assignments };
   }
   const items = context.outputs.condense?.items;

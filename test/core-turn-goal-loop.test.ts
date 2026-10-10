@@ -313,7 +313,11 @@ describe('runGoalLoop — across-turn 목표 실행 (구조화 완료)', () => {
     const pending = runGoalLoop(ctx, {
       runTurn: async (turnCtx) => {
         observedSignal = turnCtx.signal;
-        await new Promise<void>((resolve) => turnCtx.signal.addEventListener('abort', () => resolve(), { once: true }));
+        // 루프 진입이 provider 를 await 로 정하므로(#25876) 호출자 abort 가 턴 시작 «전»에 닿을 수 있다 —
+        // 이미 abort 된 신호면 기다리지 않는다(실제 턴도 signal.aborted 를 먼저 본다).
+        if (!turnCtx.signal.aborted) {
+          await new Promise<void>((resolve) => turnCtx.signal.addEventListener('abort', () => resolve(), { once: true }));
+        }
         return { stopReason: 'aborted', finalText: 'cancelled' };
       },
     });

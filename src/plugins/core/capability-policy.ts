@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, resolve, sep } from 'node:path';
 import type { ExecutionSurfaceSpec } from '../../display/index.js';
 import type { PluginCapability, PluginSource } from './manifest.js';
 
@@ -81,6 +84,144 @@ export class PluginCapabilityPolicy {
     }
     return { ok: true };
   }
+}
+
+export type PluginScanLevel = 'safe' | 'caution' | 'dangerous';
+export interface PluginSecurityFinding { level: Exclude<PluginScanLevel, 'safe'>; code: string }
+export interface PluginSecurityDecision {
+  scan: PluginScanLevel;
+  findings: PluginSecurityFinding[];
+  integrity: string;
+  license: 'redistributable' | 'restricted' | 'unknown';
+}
+
+/** Scan bytes before consent or installation. Only non-identifying codes leave this boundary. */
+export function inspectPluginSecurity(dir: string): PluginSecurityDecision {
+  const findings: PluginSecurityFinding[] = [];
+  const hash = createHash('sha256');
+  let license: PluginSecurityDecision['license'] = 'unknown';
+  // Code files are collected first; import/exec checks run after we know which files are reachable at runtime.
+  const code = new Map<string, { text: string; test: boolean }>();
+  const entrypoints: string[] = [];
+  const visit = (folder: string): void => {
+    for (const entry of readdirSync(folder, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+      const file = join(folder, entry.name);
+      const rel = relative(dir, file).replaceAll('\\', '/');
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) {
+        findings.push({ level: 'dangerous', code: 'unsafe-entry' });
+        hash.update(rel).update('!\0');
+        continue;
+      }
+      if (entry.isDirectory()) { hash.update(rel).update('/\0'); visit(file); continue; }
+      hash.update(rel).update('\0');
+      // Size is checked before reading so an oversized import cannot exhaust memory in the scanner.
+      const size = statSync(file).size;
+      if (size > 2_000_000) {
+        hash.update(String(size)).update('\0').update('oversize');
+        findings.push({ level: 'dangerous', code: 'unscannable-file' });
+        continue;
+      }
+      const bytes = readFileSync(file);
+      hash.update(String(bytes.length)).update('\0').update(bytes);
+      if (/(?:^|\/)(?:\.env(?:\.|$)|id_rsa$|credentials?\.json$)/i.test(rel)) {
+        findings.push({ level: 'dangerous', code: 'credential-file' });
+      }
+      if (/(?:api[_-]?key|secret|token)\s*[:=]\s*[A-Za-z0-9_-]{16,}/i.test(rel)) {
+        findings.push({ level: 'dangerous', code: 'credential-filename' });
+      }
+      if (/^(?:LICENSE|LICENCE)(?:\.[^/]*)?$/i.test(rel)) {
+        if (/\b(?:MIT License|Apache License, Version 2\.0|BSD [23]-Clause|ISC License)\b/i.test(bytes.toString('utf8'))) license = 'redistributable';
+        else if (license !== 'redistributable') license = 'restricted';
+      }
+      if (bytes.includes(0)) {
+        findings.push({ level: 'dangerous', code: 'unscannable-file' });
+        continue;
+      }
+      const text = bytes.toString('utf8');
+      if (/^plugin\.json$/.test(rel)) {
+        try {
+          const manifest: unknown = JSON.parse(text);
+          if (manifest && typeof manifest === 'object' && !Array.isArray(manifest)) {
+            const raw = manifest as Record<string, unknown>;
+            const ext = raw.extensions && typeof raw.extensions === 'object' ? (raw.extensions as Record<string, unknown>)['ai.elanous'] : undefined;
+            for (const main of [raw.main, ext && typeof ext === 'object' ? (ext as Record<string, unknown>).main : undefined]) {
+              if (typeof main === 'string' && main.trim()) entrypoints.push(resolve(dir, main));
+            }
+            if (typeof raw.license === 'string' && raw.license.trim()) {
+              license = /^(?:MIT|Apache-2\.0|BSD-2-Clause|BSD-3-Clause|ISC|0BSD|CC0-1\.0)$/.test(raw.license.trim())
+                ? 'redistributable' : 'restricted';
+            }
+            const contributes = raw.contributes ?? (ext && typeof ext === 'object' ? (ext as Record<string, unknown>).contributes : undefined);
+            if (contributes && typeof contributes === 'object' && Array.isArray((contributes as Record<string, unknown>).hooks)
+              && ((contributes as Record<string, unknown>).hooks as unknown[]).length) {
+              findings.push({ level: 'caution', code: 'hooks-disabled' });
+            }
+          }
+        } catch { findings.push({ level: 'dangerous', code: 'invalid-manifest' }); }
+      }
+      // Quotes may be JSON-escaped (a value nested inside a JSON string field), so allow a backslash before them.
+      const sensitive = /(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:\\?["'])?(?:api[_-]?key|secret|token)(?:\\?["'])?\s*[:=]\s*(\\?["'])?([A-Za-z0-9_\-]{16,})(\(?))/gi;
+      // Two narrow non-secrets: a documented placeholder (`tvly-YOUR_API_KEY`, `xxxxxxxx…`, `REPLACE_ME`) and an
+      // unquoted call result (`apiKey = getUpstageApiKey()`). Anything else that matches — quoted or not — still counts.
+      // Both exemptions look at the WHOLE value: a placeholder shape (optional vendor prefix), or a digit-free
+      // camelCase function name immediately called. A key with `xxxxxxxx` or `YOUR_` inside it still counts.
+      const placeholder = /^(?:[A-Za-z0-9]+[_-])*(?:YOUR[_-][A-Za-z_-]+|PLACEHOLDER[A-Za-z_-]*|REPLACE[_-]?ME[A-Za-z_-]*|x{8,})$/i;
+      const callee = /^[a-z_$][A-Za-z_$]*[a-z][A-Z][A-Za-z_$]*$/;
+      const hasSecret = [...text.matchAll(sensitive)].some(([, quote, value, call]) => value === undefined
+        || !(placeholder.test(value) || (!quote && call === '(' && callee.test(value))));
+      if (/(?:^|\/)(?:knowledge|knowledge-packs?)(?:\/|$)/i.test(rel) && hasSecret) {
+        findings.push({ level: 'dangerous', code: 'knowledge-dlp' });
+      } else if (hasSecret && !/\.lock$/.test(rel)) {
+        findings.push({ level: 'dangerous', code: 'embedded-secret' });
+      }
+      if (/\.[cm]?[jt]sx?$/.test(rel)) code.set(resolve(file), { text, test: /(?:^|\/)[^/]+\.(?:test|spec)\.[cm]?[jt]sx?$/.test(rel) });
+      if (/(?:curl|wget)\b[^\n|]*\|\s*(?:sh|bash)\b|\b(?:rm\s+-rf|sudo)\b/i.test(text)) {
+        findings.push({ level: 'dangerous', code: 'unsafe-command' });
+      }
+    }
+  };
+  visit(dir);
+  if (!entrypoints.length) entrypoints.push(resolve(dir, 'plugin.ts'));
+  // Shipped test fixtures are skipped only while nothing executable reaches them: the manifest `main`
+  // and every non-test code file are roots, and any test file they import (transitively) is scanned too.
+  const importsOf = (text: string): string[] =>
+    [...text.matchAll(/\b(?:import|export)\s*(?:[\s\S]*?\s+from\s*)?["']([^"']+)["']|\b(?:import|require)\s*\(\s*["']([^"']+)["']/g)]
+      .map(match => match[1] ?? match[2] ?? '').filter(Boolean);
+  const resolveLocal = (from: string, target: string): string | undefined => {
+    if (!target.startsWith('.')) return undefined;
+    const base = resolve(from, '..', target);
+    const swapped = base.replace(/\.([cm]?)js(x?)$/, '.$1ts$2');
+    return [base, swapped, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.mjs`, join(base, 'index.ts'), join(base, 'index.js')]
+      .find(candidate => code.has(candidate));
+  };
+  const reachable = new Set<string>();
+  const queue = [...entrypoints.filter(path => code.has(path)), ...[...code].filter(([, info]) => !info.test).map(([path]) => path)];
+  while (queue.length) {
+    const file = queue.pop()!;
+    if (reachable.has(file)) continue;
+    reachable.add(file);
+    for (const target of importsOf(code.get(file)!.text)) {
+      const next = resolveLocal(file, target);
+      if (next && !reachable.has(next)) queue.push(next);
+    }
+  }
+  for (const file of reachable) {
+    const text = code.get(file)!.text;
+    if (/\b(?:eval\s*\(|new\s+Function\s*\(|child_process\b|Bun\.spawn\s*\()/i.test(text)) {
+      findings.push({ level: 'caution', code: 'executable-code' });
+    }
+    for (const target of importsOf(text)) {
+      // A relative or absolute import must stay inside the package; the package's own `./src/…` is fine,
+      // while `../…/src/`, `/abs/…/src/` or a `file:` URL that can leave the package root is unsafe.
+      if (/^file:/i.test(target)
+        || ((target.startsWith('.') || target.startsWith('/')) && !resolve(file, '..', target).startsWith(`${resolve(dir)}${sep}`))) {
+        findings.push({ level: 'dangerous', code: 'unsafe-import' });
+      }
+    }
+  }
+  if ((license as PluginSecurityDecision['license']) !== 'redistributable') findings.push({ level: 'caution', code: 'private-only-license' });
+  return { scan: findings.some(f => f.level === 'dangerous') ? 'dangerous' : findings.length ? 'caution' : 'safe',
+    findings, integrity: hash.digest('hex'), license };
 }
 
 export function assertCapability(decision: CapabilityDecision): void {

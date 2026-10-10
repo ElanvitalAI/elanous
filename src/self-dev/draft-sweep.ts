@@ -1,6 +1,8 @@
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
-import { decideDraft, laterMergedTwins, sameGoalPr, type DraftTriagePr } from './draft-triage-rules.js';
+import { decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, type DraftTriagePr } from './draft-triage-rules.js';
+import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
+import type { PrTerminalRecord } from './draft-residue.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
 
 export interface SweepDraft extends DraftTriagePr {
@@ -35,6 +37,16 @@ export interface DraftSweepAdapters {
   getClaimOwner?(repository: string, number: number): Promise<string | undefined>;
   /** Current owner, accounting for a later claim release; only draft metrics need this distinction. */
   getActiveClaimOwner?(repository: string, number: number): Promise<string | undefined>;
+  /** Last active claim's run id; undefined for manual claims or after a release. */
+  getActiveClaimRunId?(repository: string, number: number): Promise<string | undefined>;
+  /** When the latest claim marker is a release, its timestamp ('' if unreadable); undefined when no release is latest. */
+  getLastClaimReleaseAt?(repository: string, number: number): Promise<string | undefined>;
+  /** A complete card source; undefined means ownership is unobserved. */
+  listTaskCards?(): Promise<readonly TaskCard[] | undefined>;
+  /** Host ledger terminal records; undefined means the ledger could not be read. */
+  listPrTerminals?(): Promise<readonly PrTerminalRecord[] | undefined>;
+  commentDraft?(repository: string, number: number, body: string): Promise<void>;
+  removeLabel?(repository: string, number: number, label: string): Promise<void>;
   /** Whether the current owned run has a self-implement.result final observation, even if its worktree remains. */
   hasFinalRunResult?(draft: SweepDraft, repository: string): Promise<boolean | undefined>;
   /** Per-file last change on the draft branch; undefined means file coverage is unverified. */
@@ -65,6 +77,8 @@ export interface DraftSweepOptions {
   /** Per-tick close cap; resolve it with resolveDraftSweepCloseCap. Absent or invalid ⇒ DRAFT_SWEEP_CLOSE_CAP. */
   closeCap?: number;
   closeCapSource?: DraftSweepCloseCapSource;
+  /** Closes already made this tick by the pod-terminal replay — they count against the same cap. */
+  alreadyClosed?: number;
 }
 
 export interface DraftSweepEntry {
@@ -117,6 +131,8 @@ export interface DraftMetrics {
   readonly inventory: number;
   readonly oldestAgeHours: number | null;
   readonly needsOwner: number;
+  /** Open running claims whose last update cannot be read; neither owned nor needs-owner. */
+  readonly claimUnobserved?: number;
   readonly converted48h: number;
   readonly cohort48h: number;
   readonly conversion48h: number | null;
@@ -160,7 +176,11 @@ export async function collectDraftMetrics(repository: string, adapters: Pick<Dra
   return {
     inventory: open.length,
     oldestAgeHours: open.length ? Math.max(...open.map((pr) => Math.max(0, (clock - Date.parse(pr.createdAt)) / 3_600_000))) : null,
-    needsOwner: owners.filter((owner) => !owner?.trim()).length,
+    needsOwner: open.filter((draft, index) => {
+      const state = draftClaimState(draft, now);
+      return state !== 'unobserved' && (state !== 'claimed' || !owners[index]?.trim());
+    }).length,
+    claimUnobserved: open.filter((draft) => draftClaimState(draft, now) === 'unobserved').length,
     converted48h,
     cohort48h: cohort.length,
     conversion48h: cohort.length ? converted48h / cohort.length : null,
@@ -425,6 +445,7 @@ const supersededLabel = label('close', 'superseded');
 const approvalLabel = PR_LABELS.find((entry) => entry.axis === 'state' && entry.sweep.action === 'none')?.name;
 const keepLabel = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')?.name;
 const releaseHoldLabel = PR_LABELS.find((entry) => entry.axis === 'addon' && entry.sweep.action === 'none')?.name;
+const harvestableLabel = PR_LABELS.find((entry) => entry.name === 'elanous:harvestable')!.name;
 const PAGE_SIZE = 100;
 /** At most this many closes per tick, so a wrong rule cannot close everything at once. Default for `tools.selfImplement.draftSweepCloseCap`. */
 export const DRAFT_SWEEP_CLOSE_CAP = 10;
@@ -605,15 +626,20 @@ export function draftSweepDaily(
 }
 
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
-export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource }: DraftSweepOptions): Promise<DraftSweepResult> {
+export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource, alreadyClosed = 0 }: DraftSweepOptions): Promise<DraftSweepResult> {
   const validCap = validCloseCap(requestedCap);
   const closeCap = validCap ?? DRAFT_SWEEP_CLOSE_CAP;
   const closeCapSource: DraftSweepCloseCapSource = validCap === undefined ? 'default' : requestedSource ?? 'flag';
   const result: DraftSweepResult = { repository, apply, complete: false, entries: [], counts: {}, closeCap, closeCapSource };
+  // Built once after the inventory (review r4: no per-decision scan of the draft list).
+  const runIdByNumber = new Map<number, string>();
   const record = (entry: DraftSweepEntry): void => {
     result.entries.push(entry);
     result.counts[entry.reason] = (result.counts[entry.reason] ?? 0) + 1;
     debug.log('drafts.cleanup', 'decided', { number: entry.number, action: entry.action, reason: entry.reason });
+    debug.log('draft.residue', 'sweep-decided', { childRunId: runIdByNumber.get(entry.number) ?? null,
+      number: entry.number, prNumber: entry.number, terminalClass: null, owner: 'unknown', ownerSource: 'unknown',
+      action: entry.action, reason: entry.reason });
   };
   const finish = (): DraftSweepResult => {
     debug.log('drafts.cleanup', 'summary', result.counts);
@@ -651,6 +677,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     return finish();
   }
   timing('inventory', drafts.length + merged.length);
+  for (const pr of drafts) if (pr.runId) runIdByNumber.set(pr.number, pr.runId);
   const statuses = new Map<number, string | undefined>();
   const finality = new Map<number, boolean | undefined>();
   const latestFileChanges = new Map<number, Readonly<Record<string, string>> | undefined>();
@@ -690,23 +717,128 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     timing('review-gate', censused.length);
   }
   result.daily = draftSweepDaily(drafts, merged, now, reviewGate);
+  // Card and terminal inventories are observations, not closing authority. An unreadable source cannot mint a claim.
+  let cards: readonly TaskCard[] | undefined;
+  let terminals: readonly PrTerminalRecord[] | undefined;
+  if (apply) {
+    try { cards = await adapters.listTaskCards?.(); if (cards && !Array.isArray(cards)) cards = undefined; }
+    catch (error) { debug.log('draft.residue', 'claim-skipped', { prNumber: null, owner: null, runId: null, reason: `cards-unreadable: ${sweepFailureReason(error)}` }); }
+    try { terminals = await adapters.listPrTerminals?.(); if (terminals && !Array.isArray(terminals)) terminals = undefined; }
+    catch (error) { debug.log('draft.residue', 'claim-skipped', { prNumber: null, owner: null, runId: null, reason: `terminals-unreadable: ${sweepFailureReason(error)}` }); }
+  }
   result.complete = true;
-  let closes = 0;
+  let closes = Number.isSafeInteger(alreadyClosed) && alreadyClosed > 0 ? alreadyClosed : 0;
   let unobserved = 0;
   let claimed = 0;
   let claimExpired = 0;
   for (const listedDraft of drafts) {
-    const draft = { ...listedDraft, latestFileChanges: latestFileChanges.get(listedDraft.number) };
+    const draft = { ...listedDraft, labels: [...listedDraft.labels], latestFileChanges: latestFileChanges.get(listedDraft.number) };
+    let releasedThisTick = false;
+    let claimWriteFailed = false;
+    let claimWriteError: string | undefined;
+    let claimPartialApplied = false;
+    let partialClaimUnowned = false;
+    let releasePending = false;
+    if (apply && harnessDraft(draft) && !draft.labels.some((name) => name === approvalLabel || name === keepLabel || name === releaseHoldLabel)
+      && stateLabels.filter((state) => draft.labels.includes(state.name)).length <= 1
+      && !draft.labels.includes(supersededLabel)) {
+      const logClaim = (event: 'claim-marked' | 'claim-released' | 'claim-skipped', owner: string | null, runId: string | null, reason: string) =>
+        debug.log('draft.residue', event, { prNumber: draft.number, owner, runId, reason });
+      try {
+        const hasTerminal = terminals?.some((record) => record.prNumber === draft.number
+          && record.repository?.toLowerCase() === repository.toLowerCase());
+        const claimRunId = hasTerminal || cards?.length || draft.labels.includes(runningLabel)
+          ? await adapters.getActiveClaimRunId?.(repository, draft.number) : undefined;
+        // A label write can succeed before the claim comment fails. Read the comment too: the label alone
+        // cannot prove ownership, and a manual claim (without a run id) must not be overwritten.
+        const claimOwner = claimRunId || cards?.length || draft.labels.includes(runningLabel)
+          ? await adapters.getActiveClaimOwner?.(repository, draft.number) : undefined;
+        const runTerminal = claimRunId && terminals?.find((record) => record.prNumber === draft.number
+          && record.repository?.toLowerCase() === repository.toLowerCase()
+          && (record.childRunId === claimRunId || cards?.some((card) => card.runId === claimRunId
+            && card.runChildId === record.childRunId
+            && (cardPrNumber(card) === draft.number || (draft.runId && (draft.runId === card.runId || draft.runId === card.runChildId))))));
+        // A seat-attributed terminal releases only its own seat's claim; another owner's claim naming the run is kept.
+        const ownerMismatch = Boolean(runTerminal && runTerminal.ownerSource === 'seat' && claimOwner && runTerminal.owner !== claimOwner);
+        if (ownerMismatch) logClaim('claim-skipped', claimOwner ?? null, claimRunId ?? null, 'terminal-owner-mismatch');
+        const terminal = ownerMismatch ? undefined : runTerminal;
+        releasePending = Boolean(terminal);
+        if (terminal && adapters.commentDraft && (!draft.labels.includes(runningLabel) || adapters.removeLabel)) {
+          if (draft.labels.includes(runningLabel)) {
+            await adapters.removeLabel!(repository, draft.number, runningLabel);
+            draft.labels.splice(draft.labels.indexOf(runningLabel), 1);
+            claimPartialApplied = true;
+          }
+          await adapters.commentDraft(repository, draft.number, draftReleaseComment(now, `run ${claimRunId} · ${terminal.terminalClass}`));
+          releasedThisTick = true;
+          draft.updatedAt = now.toISOString();
+          logClaim('claim-released', terminal.owner, claimRunId ?? null, terminal.terminalClass);
+        } else if (!releasePending && !draft.labels.includes(harvestableLabel)
+          && (draftClaimState(draft, now) === 'unclaimed'
+            || (draft.labels.includes(runningLabel) && adapters.getActiveClaimOwner && adapters.getActiveClaimRunId
+              && !claimOwner && !claimRunId))) {
+          partialClaimUnowned = draft.labels.includes(runningLabel) && !claimOwner && !claimRunId;
+          const owner = cards && draftTaskOwner(cards, draft);
+          const runId = owner?.runChildId ?? owner?.runId;
+          const ownerTerminal = owner ? terminals?.find((record) => record.prNumber === draft.number
+            && record.repository?.toLowerCase() === repository.toLowerCase()
+            && (record.childRunId === runId || record.childRunId === owner.runId)) : undefined;
+          // An explicit release (manual `drafts claim --release` or an earlier automatic one) is respected unless the
+          // owning card was created after it — that card is a resume, not the run the release ended.
+          const releasedAt = owner?.seat && runId && !claimOwner && !claimRunId
+            ? await adapters.getLastClaimReleaseAt?.(repository, draft.number) : undefined;
+          const releaseRespected = releasedAt !== undefined
+            && !(Date.parse(owner!.createdAt) > Date.parse(releasedAt));
+          if (partialClaimUnowned && owner?.seat && runId && ownerTerminal && adapters.removeLabel && adapters.commentDraft
+            && !(ownerTerminal.ownerSource === 'seat' && ownerTerminal.owner !== owner.seat)) {
+            // Label-only partial claim (comment write failed) whose run has since ended: undo the label and say so.
+            await adapters.removeLabel(repository, draft.number, runningLabel);
+            draft.labels.splice(draft.labels.indexOf(runningLabel), 1);
+            claimPartialApplied = true;
+            await adapters.commentDraft(repository, draft.number, draftReleaseComment(now, `run ${runId} · ${ownerTerminal.terminalClass}`));
+            releasedThisTick = true;
+            draft.updatedAt = now.toISOString();
+            logClaim('claim-released', owner.seat, runId, `partial-claim:${ownerTerminal.terminalClass}`);
+          } else if (owner?.seat && runId && terminals && !claimOwner && !claimRunId
+            && !merged.some((pr) => pr.number !== draft.number && sameGoalPr(draft, pr))
+            && !ownerTerminal && !releaseRespected && adapters.commentDraft) {
+            if (!draft.labels.includes(runningLabel)) {
+              await adapters.setLabels(repository, draft.number, { add: runningLabel,
+                remove: stateLabels.filter((state) => draft.labels.includes(state.name)).map((state) => state.name) });
+              draft.labels.splice(0, draft.labels.length, ...draft.labels.filter((name) => !stateLabels.some((state) => state.name === name)), runningLabel);
+              claimPartialApplied = true;
+            }
+            await adapters.commentDraft(repository, draft.number, draftClaimComment(owner.seat, now, `run ${runId}`));
+            draft.updatedAt = now.toISOString();
+            logClaim('claim-marked', owner.seat, runId, 'unique-card');
+          } else logClaim('claim-skipped', owner?.seat ?? null, runId ?? null,
+            !cards ? 'cards-unobserved' : !owner ? 'owner-ambiguous-or-missing' : !terminals ? 'terminals-unobserved'
+              : claimRunId || claimOwner ? 'claim-already-owned' : ownerTerminal ? 'run-terminal'
+                : releaseRespected ? 'release-respected' : 'run-not-live-or-write-unavailable');
+        }
+      } catch (error) {
+        claimWriteFailed = true;
+        claimWriteError = String(error);
+        logClaim('claim-skipped', null, null, `claim-write-failed: ${sweepFailureReason(error)}`);
+      }
+    }
     const runStatus = statuses.get(draft.number);
     const finalRunResult = finality.get(draft.number);
     const states = stateLabels.filter((state) => draft.labels.includes(state.name));
     const contradiction = states.length > 1 || draft.labels.includes(approvalLabel ?? '');
+    if (releasedThisTick || claimWriteFailed || partialClaimUnowned || releasePending) {
+      record({ number: draft.number, action: 'keep', reason: releasedThisTick ? 'claim-released'
+        : claimWriteFailed ? 'claim-write-unobserved' : releasePending ? 'claim-release-unobserved' : 'claim-owner-unobserved', applied: releasedThisTick,
+      ...(claimWriteFailed ? { error: claimWriteError, ...(claimPartialApplied ? { partialApplied: true } : {}) } : {}) });
+      continue;
+    }
     if (draft.labels.includes(releaseHoldLabel ?? '') || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
       const held = draft.labels.includes(keepLabel ?? '') ? keepLabel : releaseHoldLabel;
       record({ number: draft.number, action: 'keep', reason: `label:${held}`, applied: false });
       continue;
     }
-    const isClaimed = !contradiction && draft.labels.includes(runningLabel);
+    const claimState = contradiction ? 'unclaimed' : draftClaimState(draft, now);
+    const isClaimed = claimState !== 'unclaimed';
     const ageHours = (now.getTime() - Date.parse(draft.createdAt)) / 3_600_000;
     const idleHours = typeof draft.updatedAt === 'string' && Number.isFinite(Date.parse(draft.updatedAt))
       ? (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000 : NaN;
@@ -722,16 +854,16 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     // Without an observed update time, neither expiration nor a fallback to creation time can authorize mutation —
     // but a merged twin does not need the update time, so superseded keeps its priority over the unobserved claim.
-    if (isClaimed && !supersededClaim && (typeof draft.updatedAt !== 'string' || !Number.isFinite(Date.parse(draft.updatedAt)))) {
+    if (claimState === 'unobserved' && !supersededClaim) {
       record({ number: draft.number, action: 'keep', reason: 'claim-update-unobserved', applied: false });
       continue;
     }
-    if (isClaimed && !supersededClaim && Number.isFinite(idleHours) && idleHours < CLAIM_IDLE_HOURS) {
+    if (claimState === 'claimed' && !supersededClaim) {
       claimed += 1;
       record({ number: draft.number, action: 'keep', reason: `label:running(<${CLAIM_IDLE_HOURS}h)`, applied: false });
       continue;
     }
-    if (isClaimed && !supersededClaim && Number.isFinite(idleHours) && idleHours >= CLAIM_IDLE_HOURS) {
+    if (claimState === 'expired' && !supersededClaim) {
       claimExpired += 1;
       if (liveBranches.has(draft.branch) && finalRunResult === undefined
         && runStatus !== 'running' && runStatus !== 'probable-running') {
@@ -772,6 +904,12 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
       finalRunResult, ageHours: runStatus ? ageHours : idleHours });
+    const fallback = decision.reason === 'unobserved' || decision.reason === 'stale-unobserved'
+      || decision.reason === 'recent' || decision.reason.startsWith('recent (') || decision.reason.startsWith('stale-ended-run');
+    if (!contradiction && draft.labels.includes(harvestableLabel) && fallback) {
+      decision = Number.isFinite(idleHours) && idleHours >= STALLED_DRAFT_HOURS
+        ? { action: 'close', reason: 'harvest-expired' } : { action: 'keep', reason: 'harvestable' };
+    }
     if (!runStatus && (decision.reason === 'unobserved' || decision.reason === 'stale-unobserved')) unobserved += 1;
     if (!contradiction && decision.action === 'close') {
       if (closes >= closeCap) decision = { action: 'keep', reason: 'close-cap' };
@@ -799,6 +937,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       if (action === 'close') {
         await adapters.closeDraft(repository, draft.number, decision.reason === 'stale-unobserved'
           ? `Draft sweep: run unobserved — no run record reachable here, no host worktree for this branch, idle ≥${STALLED_DRAFT_HOURS}h. Closed as stalled. Branch preserved; reopen to restore.`
+          : decision.reason === 'harvest-expired'
+          ? `Draft sweep: harvest-expired — 종단이 수확 대상으로 표시한 뒤 ${STALLED_DRAFT_HOURS}h 동안 수확 없음. Branch preserved; reopen to restore.`
           : `Draft sweep: ${decision.reason}${decision.reason.startsWith('superseded-by #')
             ? ` (https://github.com/${repository}/pull/${decision.reason.slice('superseded-by #'.length).match(/^\d+/)![0]})` : ''}. Branch preserved.`);
       }
@@ -811,7 +951,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   timing('decide', drafts.length);
   try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: Date.now() - started, count: drafts.length, closed: closes, closeCap, closeCapSource }); } catch { /* fail-soft */ }
   result.unobserved = unobserved;
-  result.closed = closes;
+  // `closed` stays «closed by this sweep»; replay closes only consume the shared cap (alreadyClosed).
+  result.closed = closes - (Number.isSafeInteger(alreadyClosed) && alreadyClosed > 0 ? alreadyClosed : 0);
   result.claimed = claimed;
   result.claimExpired = claimExpired;
   return finish();

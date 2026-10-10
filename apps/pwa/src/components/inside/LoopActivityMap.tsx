@@ -5,7 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import { Background, Controls, Handle, Position, ReactFlow, type Edge, type EdgeTypes, type Node, type NodeProps, type NodeTypes } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { LoopRow } from '@/components/loops/loop-status';
-import { activityEdgeKey, activityNodes, activityTraceTarget, cardPathEdges, EDGE_HIGHLIGHT_MS, FIXED_NODES, isGhostLaunch, isRoundTrip, journeyEdges, journeyParam, journeyStages, KIND_WORDS, nearDetail, PACKET_SHAPES, RUNS_NODE, SEAT_NAMES, zoomTier, type ActivityEdge, type ActivityNode, type NearDetail, type NodeDetailSource } from './loop-activity-map';
+import { activityEdgeKey, activityNodes, activityTraceTarget, cardPathEdges, EDGE_HIGHLIGHT_MS, FIXED_NODES, isGhostLaunch, isRoundTrip, journeyEdges, journeyParam, journeyStages, KIND_WORDS, nearDetail, PACKET_SHAPES, RESOURCE_NODE, RUNS_NODE, SEAT_NAMES, zoomTier, type ActivityEdge, type ActivityNode, type NearDetail, type NodeDetailSource } from './loop-activity-map';
 import { toPublicText } from './public-text';
 import { PacketEdge, PACKET_MS, type PacketData } from './PacketEdge';
 import { NODE_STATE } from '@/components/ops/ReleaseFlow';
@@ -138,6 +138,9 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
     if (node) flowNodes.push({ id: nodeKeys.get(node.id)!, type: 'activity', position: { x: index * 220, y: FIXED_ROW_Y },
       data: { label: node.label, type: node.type, verdict: node.verdict, detail: detailOf(node.id) } });
   });
+  const resource = nodes.find(node => node.id === RESOURCE_NODE);
+  if (resource) flowNodes.push({ id: nodeKeys.get(resource.id)!, type: 'activity', position: { x: 0, y: -310 },
+    data: { label: resource.label, type: resource.type, detail: detailOf(resource.id) } });
   const others = nodes.filter(node => node.type === 'other');
   others.forEach((node, index) => flowNodes.push({ id: nodeKeys.get(node.id)!, type: 'activity', position: { x: Math.floor(index / 8) * 180, y: Math.max(...groups.map(g => Math.min(g.nodes.length, 8)), 1) * 138 + 40 + (index % 8) * 138 }, data: { label: node.label, type: node.type, detail: detailOf(node.id) } }));
   const flowEdges: Edge<PacketData & { edge: ActivityEdge }>[] = edges.filter(edge => nodeKeys.has(edge.from) && nodeKeys.has(edge.to)).map((edge, index) => {
@@ -163,7 +166,7 @@ export function LoopActivityMap({ rows, edges, seenAt, now, state, seatIds, deta
     };
   });
   return <section aria-label="루프 활동 지도" className="min-w-0 space-y-3">
-    <p className="text-sm text-slate-300">자리(큰 원) · 루프(작은 원) · 최근 60분 실제 사건. 노드나 간선을 누르면 Trace로 이동합니다.</p>
+    <p className="text-sm text-slate-300">자리(큰 원) · 루프(작은 원) · 최근 60분 실제 사건. 노드나 간선을 누르면 Trace로 이동합니다. 자원 노드는 자원 화면을 엽니다.</p>
     <p className="text-xs text-slate-400">꾸러미 모양 · 요청 ● 결정 ◆ 보고 ■ 넘김 ▲ 발사 ★ 판단 ⬟ · 넘김 실선 = 실발사 · 점선 = 그림자 · ✕ = 끊김 · 유령 = 발사 뒤 10분간 같은 ref 런 간선 없음 · 확대하면 노드 안 지금 일이 보입니다.</p>
     {demo !== null && <section aria-label="데모 여정" className="rounded-xl border border-sky-500/50 bg-[#173556] p-3">
       <h3 className="font-semibold">여정 · {toPublicText(demo)}</h3>

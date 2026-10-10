@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { constants as osConstants, hostname } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
+import { HarnessCliInputError } from '../cli/cli-user-error.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
@@ -20,12 +21,15 @@ import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthor
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerMatch } from '../self-implement/run-ledger.js';
 import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
-import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
+import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
+import { replayPodTerminals, type DraftResidueReplayOptions, type PrTerminalRecord } from '../self-dev/draft-residue.js';
+import { draftClaimComment, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
+import { readTaskAgentState, taskAgentStatePath, type TaskCard } from '../task-agent/task-hand.js';
 import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
@@ -44,8 +48,10 @@ import { resolveRepositoryName } from './repository-name.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
 import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem, type QueueSeat } from './harness-queue.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
+import { decideBackpressure, readBackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
 import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
+import { podChildProviderRefusal } from '../task-orchestrator/surfaces/pod-child-providers.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
 import type { MissionSolveOutcome } from './mission-solve-loop.js';
@@ -97,16 +103,9 @@ export function setHarnessPlanRfcForTesting(fn: typeof runHarnessPlanRfc | undef
   harnessPlanRfcForTesting = fn;
 }
 
-export type HarnessSupervisorSource = 'flag' | 'default';
+export { HarnessCliInputError } from '../cli/cli-user-error.js';
 
-/** A command-line value was rejected before any harness work began. */
-export class HarnessCliInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'HarnessCliInputError';
-    Object.defineProperty(this, Symbol.for('elanous.cli.HarnessCliInputError'), { value: true });
-  }
-}
+export type HarnessSupervisorSource = 'flag' | 'default';
 
 export interface HarnessAskSayOptions {
   seat?: QueueSeat;
@@ -427,6 +426,7 @@ export function classifyHarnessPodExit(
 ): { lines: string[]; reason: PodExitReason | 'pod-failure' } {
   let podFailure: string | undefined;
   let podJobFailed = false;
+  let podChildFailed = false;
   for (const line of output.split('\n').reverse()) {
     if (!line.trimStart().startsWith('[{') || !line.includes('"error"')) continue;
     try {
@@ -438,6 +438,7 @@ export function classifyHarnessPodExit(
         if (typeof error?.code !== 'string' || typeof error.message !== 'string' || !error.code.startsWith('pod-')) continue;
         podFailure = error.message;
         podJobFailed = error.code === 'pod-job-failed';
+        podChildFailed = error.code === 'pod-child-failed';
         break;
       }
     } catch { /* Non-result stdout cannot establish that a Pod child ran. */ }
@@ -447,6 +448,8 @@ export function classifyHarnessPodExit(
     const summary = output.split('\n').find((line) => /\s❌\sfailed · .* — pod-[\w-]+: /.test(line));
     podFailure = summary?.split(/\s❌\sfailed · .* — pod-[\w-]+: /)[1];
     podJobFailed = summary?.includes(' — pod-job-failed: ') ?? false;
+    // src/self-dev/orchestrate-summary-line.ts prints the pod-child-failed message (the Pod reason) on this line.
+    podChildFailed = summary?.includes(' — pod-child-failed: ') ?? false;
   }
   // Only the run announced at launch — another run id quoted in the output is not this run (review round 3).
   const observedRunId = deps.runId ?? harnessPodRunId(output);
@@ -454,9 +457,11 @@ export function classifyHarnessPodExit(
   if (podFailure) {
     const childError = podJobFailed ? podFailure.split('childError=')[1]?.split('\\n', 1)[0]?.split('\n', 1)[0] : undefined;
     try { debug.log('harness.pod', 'exit-classified', { runId, reason: 'pod-failure', status: exit.status, signal: exit.signal ?? null }); } catch { /* observation is fail-soft */ }
-    return { reason: 'pod-failure', lines: [podJobFailed && childError && childError !== 'no-result-line'
-      ? `Pod 안 자식이 실패했다 — ${childError}`
-      : `Pod 실행이 실패했다 — ${podFailure.split('\\n', 1)[0]}`] };
+    return { reason: 'pod-failure', lines: [podChildFailed
+      ? `Pod 안 자식이 실패했다 — ${podFailure.split('\\n', 1)[0]}`
+      : podJobFailed && childError && childError !== 'no-result-line'
+        ? `Pod 안 자식이 실패했다 — ${childError}`
+        : `Pod 실행이 실패했다 — ${podFailure.split('\\n', 1)[0]}`] };
   }
   let ledger: ReturnType<typeof loadRunLedger> = null;
   let ledgerReadable = false;
@@ -677,6 +682,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
       output = (output + text).slice(-16_000);
     } });
   if (status !== 0) {
+    // onPod is the existing ask/say caller: classify the dispatchHarnessOnPod output for both entrances.
     const classified = classifyHarnessPodExit({ status }, output, { ...(runId ? { runId } : {}) });
     recordClassifiedHarnessPodExit(runId ?? harnessPodRunId(output), classified.reason, status,
       { entrance, seat: o.seat, output });
@@ -712,6 +718,25 @@ export function recordHarnessPodStop(
     });
     return true;
   } catch { return false; /* ledger observation cannot change Pod output or exit */ }
+}
+
+/**
+ * POD-ANTHROPIC-PROVIDER ⓓ — 발사 관문과 Pod 가 «한 목록»(`POD_CHILD_PROVIDERS`)을 본다.
+ * 🩸 10-10: 관문은 anthropic 을 «예산 판정 밖» 으로 통과시켰고 Pod 단계가 rc=2 로 죽었다(관문·Pod 목록 엇갈림).
+ * Pod 기질에서 목록 밖 provider 는 발사 «전»에 Pod 와 같은 문면으로 거부한다 — 로컬 기질은 판정하지 않는다.
+ */
+export function podChildProviderLaunchRefusal(substrate: ResolvedHarnessSubstrate['substrate'], childLlmProvider: string | undefined): string | undefined {
+  return substrate === 'pod' ? podChildProviderRefusal(childLlmProvider) : undefined;
+}
+
+function refusePodChildProviderBeforeLaunch(resolved: ResolvedHarnessSubstrate, opts: { readonly childLlmProvider?: string }): boolean {
+  const refusal = podChildProviderLaunchRefusal(resolved.substrate, opts.childLlmProvider);
+  if (!refusal) return false;
+  console.error(`❌ launch gate: ${refusal}`);
+  try { debug.log('execution-loop.launch-gate', 'pod-child-provider-refused', { provider: opts.childLlmProvider?.trim() ?? null, substrate: resolved.substrate }); }
+  catch { /* observation is fail-soft */ }
+  process.exitCode = 2;
+  return true;
 }
 
 const LAUNCH_BUDGET_PROVIDER: Readonly<Record<string, string>> = { 'codex-rotate': CODEX_PROVIDER, grok: GROK_PROVIDER };
@@ -785,6 +810,10 @@ async function dispatchHarnessAskSay(
   // HARNESS-FULL-GRAPH — 여정 조인 키는 이 발사 동안만 환경에 싣는다(자식은 그동안 물려받는다).
   const journeyPreset = Boolean(process.env[JOURNEY_KEY_ENV]?.trim());
   try { await runInjectedHarnessHandler(async () => {
+    // POD-ANTHROPIC-PROVIDER ⓓ — Pod 가 못 받는 provider 는 모델 검사·대기열·관문 «전»에(그리고 `--dry-run` 머리 줄보다 먼저) 거부한다 —
+    //   Pod 와 같은 목록·같은 문면. 기질 판정은 아래 resolveLaunchSubstrate 와 같은 리졸버(같은 입력)다.
+    if (refusePodChildProviderBeforeLaunch(resolveHarnessSubstrate({ flag: opts as HarnessSubstrateOpts, config: getUserConfig(), env: process.env }), opts)) return;
+    if (opts.childLlmModel !== undefined) await ensureOpenRouterChildModelLive(opts.childLlmProvider, opts.childLlmModel, { persist: !isHarnessDryRun(opts) });
     assertHarnessChildLlmModel(opts);
     if (isHarnessDryRun(opts)) {
       resolveLaunchSubstrate(opts);
@@ -2392,6 +2421,16 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       ...(gatePass && !gateFail ? { gate: 'pass' as const } : gateFail ? { gate: 'fail' as const } : {}),
     };
   };
+  const claimCommentsFor = async (repository: string, number: number): Promise<string[]> => {
+    const batched = (await detailFor(repository, number))?.comments;
+    if (batched) return batched;
+    const pages = ghJson<Array<Array<{ body: string; created_at: string }>>>(['api', '--paginate', '--slurp',
+      `repos/${repository}/issues/${number}/comments?per_page=100`], execute);
+    if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page)
+      || page.some((comment) => typeof comment.body !== 'string' || !Number.isFinite(Date.parse(comment.created_at)))))
+      throw new Error('Incomplete claim comments');
+    return pages.flat().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)).map((comment) => comment.body);
+  };
   const landingCommentsFor = async (repository: string, number: number): Promise<string[]> =>
     ((await detailFor(repository, number))?.comments ?? await issueCommentsFor(repository, number, 'landing'))
       .filter((body) => /\blanding-verified\b/i.test(body));
@@ -2520,18 +2559,14 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       execute(['pr', 'close', String(number), '--repo', repository, '--comment', comment]);
     },
     getClaimOwner: async (repository, number) => claimCommentOwner(repository, number, execute),
-    getActiveClaimOwner: async (repository, number) => {
-      // DRAFT-METRIC: the batched GraphQL comments (oldest first, proven complete) answer without a per-draft REST call.
-      const batched = (await detailFor(repository, number))?.comments;
-      if (batched) return activeClaimOwnerFromBodies(batched);
-      const pages = ghJson<Array<Array<{ body: string; created_at: string }>>>(['api', '--paginate', '--slurp',
-        `repos/${repository}/issues/${number}/comments?per_page=100`], execute);
-      if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page)
-        || page.some((comment) => typeof comment.body !== 'string' || !Number.isFinite(Date.parse(comment.created_at)))))
-        throw new Error('Incomplete claim comments');
-      return activeClaimOwnerFromBodies(pages.flat().sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
-        .map((comment) => comment.body));
-    },
+    getActiveClaimOwner: async (repository, number) => activeClaimOwnerFromBodies(await claimCommentsFor(repository, number)),
+    getActiveClaimRunId: async (repository, number) => activeClaimRunIdFromBodies(await claimCommentsFor(repository, number)),
+    getLastClaimReleaseAt: async (repository, number) => lastClaimReleaseAtFromBodies(await claimCommentsFor(repository, number)),
+    listTaskCards: async () => Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(taskAgentStatePath()).tasks ?? {}),
+    listPrTerminals: async () => listRunLedgers().matches.flatMap((match) => match.entries.filter((entry) => entry.event === 'pr-terminal')
+      .map((entry) => entry.data as unknown as PrTerminalRecord)),
+    commentDraft: async (repository, number, body) => { execute(['pr', 'comment', String(number), '--repo', repository, '--body', body]); },
+    removeLabel: async (repository, number, name) => { execute(['pr', 'edit', String(number), '--repo', repository, '--remove-label', name]); },
     getReviewGate: async (draft, repository) => reviewGateForDraft(draft, repository),
   };
 }
@@ -2548,6 +2583,8 @@ export interface HarnessDraftSweepDeps {
   readonly runTtl?: RunTtlAdapters;
   /** Test seam for `tools.selfImplement.draftSweepCloseCap`; omitted ⇒ the user config. */
   readonly closeCapConfig?: () => unknown;
+  /** Replay test seam; production reads this instance's host run-ledger directory. */
+  readonly residueReplay?: DraftResidueReplayOptions;
 }
 
 /** RUN-TTL step inside the draft sweep — fail-soft: its failure never changes the sweep verdict. */
@@ -2574,6 +2611,18 @@ async function draftSweepRunTtl(repository: string, deps: HarnessDraftSweepDeps,
 export function activeClaimOwnerFromBodies(bodies: readonly string[]): string | undefined {
   const last = [...bodies].reverse().find((body) => draftClaimOwner(body) !== undefined || body.startsWith('🔧 처리 끝 —'));
   return last ? draftClaimOwner(last) : undefined;
+}
+
+export function activeClaimRunIdFromBodies(bodies: readonly string[]): string | undefined {
+  const last = [...bodies].reverse().find((body) => draftClaimOwner(body) !== undefined || body.startsWith('🔧 처리 끝 —'));
+  return last && draftClaimOwner(last) ? / · run (\S+)/.exec(last)?.[1] : undefined;
+}
+
+/** Timestamp of the latest marker when it is a release ('' when its time is unreadable); undefined otherwise. */
+export function lastClaimReleaseAtFromBodies(bodies: readonly string[]): string | undefined {
+  const last = [...bodies].reverse().find((body) => draftClaimOwner(body) !== undefined || body.startsWith('🔧 처리 끝 —'));
+  if (!last || draftClaimOwner(last) !== undefined) return undefined;
+  return /^🔧 처리 끝 — (\S+)/.exec(last)?.[1] ?? '';
 }
 
 function draftClaimOwner(body: string): string | undefined {
@@ -2619,12 +2668,12 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
           }
           const stalled = PR_LABELS.find((label) => label.axis === 'state' && label.sweep.action === 'close' && label.name.endsWith(':stalled'))!.name;
           execute(['pr', 'edit', number, '--repo', repository, '--add-label', stalled, '--remove-label', running]);
-          execute(['pr', 'comment', number, '--repo', repository, '--body', `🔧 처리 끝 — ${(deps.now?.() ?? new Date()).toISOString()}`]);
+          execute(['pr', 'comment', number, '--repo', repository, '--body', draftReleaseComment(deps.now?.() ?? new Date())]);
         } else {
           execute(['pr', 'edit', number, '--repo', repository, '--add-label', running,
             ...otherStates.flatMap((item) => ['--remove-label', item.name])]);
           execute(['pr', 'comment', number, '--repo', repository, '--body',
-            `🔧 처리 중 — owner ${owner} · ${(deps.now?.() ?? new Date()).toISOString()}${opts.note?.trim() ? ` · ${opts.note.trim()}` : ''}`]);
+            draftClaimComment(owner!, deps.now?.() ?? new Date(), opts.note)]);
         }
         (deps.write ?? console.log)(`#${number} ${opts.release ? 'release' : 'claim'}: ${repository}`);
       } catch (error) {
@@ -2689,8 +2738,19 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
           console.error(`⚠ ${warning}`);
           try { debug.log('self-dev.draft-sweep', 'close-cap-rejected', { warning, closeCap: cap.closeCap, closeCapSource: cap.closeCapSource }); } catch { /* fail-soft */ }
         }
+        let replayClosed = 0;
+        if (opts.apply && (!deps.adapters || deps.residueReplay)) {
+          try {
+            replayClosed = (await replayPodTerminals({ ...deps.residueReplay, repository, closeCap: cap.closeCap })).closed;
+          } catch (error) {
+            // Review r5: a replay that throws may already have closed PRs — spend the whole cap so this tick cannot exceed it.
+            replayClosed = cap.closeCap;
+            debug.log('draft.residue', 'failed', { childRunId: null, prNumber: null, terminalClass: null,
+              owner: 'unknown', ownerSource: 'unknown', step: 'replay', reason: sweepFailureReason(error) });
+          }
+        }
         const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? github!,
-          closeCap: cap.closeCap, closeCapSource: cap.closeCapSource });
+          closeCap: cap.closeCap, closeCapSource: cap.closeCapSource, alreadyClosed: replayClosed });
         const reason = result.error ? sweepFailureReason(result.error) : undefined;
         const ttlStarted = Date.now();
         const runTtl = await draftSweepRunTtl(repository, deps, github);
@@ -2955,6 +3015,7 @@ export interface HarnessCliCommandDeps {
   processObservation?: HarnessProcessObservationDeps;
   draftSweep?: HarnessDraftSweepDeps;
   queue?: HarnessQueueDeps;
+  backpressure?: BackpressureReadDeps;
   goalLookup?: GoalLookupOptions;
   goalArchive?: GoalArchiveOptions;
   ask?: HarnessAskHandler;
@@ -3034,6 +3095,24 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installHarnessGoalCommand(harnessCmd, deps.goalLookup, deps.goalArchive);
   installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
   const queue = harnessCmd.command('queue').description('자리별 영속 발사 대기열');
+  queue.command('backpressure').description('읽기 전용 발사 역압 판정')
+    .option('--json', '판정 객체 JSON 한 줄').option('--max <n>', '주기당 발사 상한 (기본 6)')
+    .action((opts: { json?: boolean; max?: string }) => {
+      if (opts.max !== undefined && (!/^(0|[1-9][0-9]*)$/.test(opts.max) || !Number.isSafeInteger(Number(opts.max)))) {
+        console.error('❌ --max 는 0 이상의 정수여야 합니다');
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const signals = readBackpressureSignals(deps.backpressure);
+        const verdict = decideBackpressure(signals, { maxPerCycle: opts.max === undefined ? 6 : Number(opts.max) });
+        debug.log('traffic.backpressure', 'verdict', { launchBudget: verdict.launchBudget, reasons: verdict.reasons, signals: verdict.signals });
+        console.log(opts.json ? JSON.stringify(verdict) : `발사 예산 ${verdict.launchBudget} · 이유 ${verdict.reasons.join(', ') || '없음'}`);
+      } catch (error) {
+        console.error(`❌ backpressure: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   const queueDeps = deps.queue ?? {};
   let launchedExit: Promise<number> | undefined;
   const immediateLaunch: NonNullable<HarnessQueueDeps['launch']> = queueDeps.launch ?? (async (item: QueueItem, args: string[], root: string) => {

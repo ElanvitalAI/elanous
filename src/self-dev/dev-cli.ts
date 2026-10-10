@@ -30,7 +30,8 @@ import type { ReasoningEffortCeiling } from '../intelligence-map/model-catalog.j
 import { tierModel } from '../llm/model-defaults.js';
 import { LLM_TIER_MAP_BY_PROVIDER } from '../model-tier/llm-tier-map.js';
 import { MODEL_TIERS } from '../model-tier/types.js';
-import { getCatalog } from '../registry/loader.js';
+import { getCatalog, isolatedCatalogTestUniverse } from '../registry/loader.js';
+import { isLiveVerifiedOpenRouterModel, liveLookupOpenRouterModel, OPENROUTER_SNAPSHOT_STALE_DAYS, readFoldSnapshotAgeDays, upstreamOpenRouterId } from '../registry/discovery/openrouter-live-resolve.js';
 import { singleRunAsJobResult } from '../self-implement/self-implement-cli.js';
 import { superviseRun, type SupervisorDecision, type SupervisorStopReason } from './run-supervisor.js';
 import { readDecomposeProposals, orderPiecesTopologically } from './decompose-proposal.js';
@@ -63,6 +64,7 @@ import { findGeminiModel, GEMINI_MODELS } from '../gemini/models.js';
 import { findGrokModel, GROK_MODELS } from '../grok/models.js';
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
+import { BEDROCK_DEFAULT_MODEL, BEDROCK_MODELS, findBedrockModel, resolveBedrockModelId } from '../llm/bedrock.js';
 
 /** `dev --plan` 도움말이 가리키는 대응 문. ⛔ 도움말에 이 문자열을 리터럴로 다시 적지 마라. */
 export const DEV_PLAN_REPLACEMENT = 'elanous harness say';
@@ -1339,7 +1341,7 @@ export function normalizeChildLlmProvider(provider: string): string {
 }
 
 function isKnownChildLlmProvider(provider: string): boolean {
-  return ['grok', 'anthropic', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter'].includes(normalizeChildLlmProvider(provider));
+  return ['grok', 'anthropic', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter', 'bedrock'].includes(normalizeChildLlmProvider(provider));
 }
 
 function findPickerCatalogModel(provider: string, id: string): CatalogModelView | undefined {
@@ -1350,8 +1352,18 @@ function findPickerCatalogModel(provider: string, id: string): CatalogModelView 
     case 'openai':
     case 'openai-codex': return findCodexModel(id);
     case 'openrouter': return findOpenRouterChildModel(id);
+    case 'bedrock': return findBedrockChildModel(id);
     default: return undefined;
   }
+}
+
+/** BEDROCK-PROVIDER — `anthropic.claude-sonnet-5-5` · `bedrock/claude-sonnet-5-5` · (provider=bedrock 일 때) `claude-sonnet-5-5`
+ *  를 받아 와이어 id(`anthropic.` 접두)로 해석한다. 표 밖은 «모른다» → 거부(다른 provider 와 같은 규율). */
+function findBedrockChildModel(id: string): CatalogModelView | undefined {
+  const entry = findBedrockModel(id);
+  if (!entry) return undefined;
+  // 지역 접두(`us.anthropic.…`)를 줬으면 그 와이어 id 를 그대로 쓴다(데이터 거주 선택 보존).
+  return { id: resolveBedrockModelId(id), tier: entry.tier, supportsThinking: entry.supportsThinking, recommended: entry.id === BEDROCK_DEFAULT_MODEL };
 }
 
 /** 결정 2026-09-23 — openrouter 는 피커 목록이 없다(454개 게이트웨이). 받는 것 = ⑴ openrouter 사다리의 모델
@@ -1359,7 +1371,8 @@ function findPickerCatalogModel(provider: string, id: string): CatalogModelView 
 function findOpenRouterChildModel(id: string): CatalogModelView | undefined {
   const ladder = MODEL_TIERS.map((t) => LLM_TIER_MAP_BY_PROVIDER.openrouter[t].model);
   const folded = getCatalog().models.get(id);
-  if (!ladder.includes(id) && folded?.provider !== 'openrouter') return undefined;
+  if (!ladder.includes(id) && folded?.provider !== 'openrouter' && !isLiveVerifiedOpenRouterModel(id)
+    && !(isolatedCatalogTestUniverse() && !process.env.ELANOUS_CATALOG_DISCOVERY_SNAPSHOT?.trim() && /^openrouter\/[^/\s]+\/[^/\s]+$/.test(id))) return undefined;
   return {
     id,
     tier: id === LLM_TIER_MAP_BY_PROVIDER.openrouter.balanced.model ? 'balanced' : 'standard',
@@ -1404,6 +1417,7 @@ function listImplementationChildModelCandidates(provider: string): string[] {
       case 'openai':
       case 'openai-codex': return CODEX_MODELS.map((model) => model.id);
       case 'openrouter': return [...new Set(MODEL_TIERS.map((t) => LLM_TIER_MAP_BY_PROVIDER.openrouter[t].model))];
+      case 'bedrock': return BEDROCK_MODELS.map((model) => model.id);
       default: return [];
     }
   })();
@@ -1442,6 +1456,56 @@ export function resolveImplementationChildModel(provider: string, model: string)
     supportsThinking: catalogThinking(suppliedProvider, entry),
     recommended: entry.recommended === true,
   };
+}
+
+let staleOpenRouterSnapshotWarned = false;
+
+/** OR-MODEL-NAMESPACE — 발사 «전» 비동기 관문. 동기 해석(`resolveImplementationChildModel`)이 스냅숏 밖의
+ *  `openrouter/<vendor>/<model>` 을 거부할 때만 공개 `/models` 를 한 번 묻는다.
+ *  ⛔ openrouter 가 아닌 provider · 스냅숏에 이미 있는 id 는 네트워크 0 · 해석 결과 불변.
+ *  ⛔ 확인 못 함(네트워크·시간 초과·봉투 오류)은 거부(fail-closed) ⊕ 사유 «카탈로그 확인 못 함». */
+export async function ensureOpenRouterChildModelLive(
+  provider: string | undefined,
+  model: string | undefined,
+  deps: { fetchImpl?: typeof fetch; timeoutMs?: number; write?: (line: string) => void; now?: () => number; persist?: boolean } = {},
+): Promise<void> {
+  if (!provider?.trim() || !model?.trim()) return;
+  if (normalizeChildLlmProvider(provider) !== 'openrouter') return;
+  const write = deps.write ?? ((line: string) => process.stderr.write(line));
+  const ageDays = readFoldSnapshotAgeDays((deps.now ?? Date.now)());
+  if (ageDays !== undefined && ageDays > OPENROUTER_SNAPSHOT_STALE_DAYS && !staleOpenRouterSnapshotWarned) {
+    staleOpenRouterSnapshotWarned = true;
+    write(`[dev] ⚠️ OpenRouter 모델 스냅숏이 ${ageDays}일 묵었다(discovery-snapshot.json) — 없는 모델은 공개 카탈로그로 한 번 확인한다\n`);
+  }
+  try {
+    resolveImplementationChildModel(provider, model);
+    return;
+  } catch (err) {
+    const entered = model.trim();
+    const aliased = resolveModelAlias(entered) ?? entered;
+    if (!upstreamOpenRouterId(aliased)) throw err;
+    const lookup = await liveLookupOpenRouterModel(aliased, {
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      ...(deps.timeoutMs !== undefined ? { timeoutMs: deps.timeoutMs } : {}),
+      ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.persist !== undefined ? { persist: deps.persist } : {}),
+    });
+    if (lookup.found) {
+      if (!lookup.persisted && deps.persist !== false) {
+        write(`[dev] ⚠️ ${aliased} 은 OpenRouter 에서 확인했지만 스냅숏에 못 합쳤다 — 이 프로세스에서만 통과(자식·Pod 재해석은 거부될 수 있다)\n`);
+      }
+      resolveImplementationChildModel(provider, model);
+      return;
+    }
+    if (lookup.error) {
+      throw new DevPipelineError(`${err instanceof Error ? err.message : String(err)} · 카탈로그 확인 못 함(${lookup.error})`);
+    }
+    throw err;
+  }
+}
+
+export function __resetStaleOpenRouterSnapshotWarningForTests(): void {
+  staleOpenRouterSnapshotWarned = false;
 }
 
 export const CHILD_LLM_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;

@@ -50,6 +50,12 @@ export interface Messages {
   /** Template — supplies `{value}`. */
   patternError: string;
 
+  // ── Chat fallback ────────────────────────────────────────────────
+  /** Template — supplies `{n}`. Optional for older locale bundles. */
+  chatNoSynthesisLead?: string;
+  /** Template — supplies `{n}`. Optional for older locale bundles. */
+  chatFoldedInternalTail?: string;
+
   // ── Async + status ───────────────────────────────────────────────
   loading: string;
   saving: string;
@@ -100,6 +106,8 @@ export interface Messages {
   setupWritingTo: string;
   /** Banner shown after the wizard saves the config. */
   setupComplete: string;
+  /** First-run notice that error reports are on by default — what is sent and how to turn it off. Keep the command untranslated. Optional so older bundles fall back to English. */
+  setupErrorReportNotice?: string;
   /** Template — supplies `{cmd}` (typically `elanous setup`). */
   setupRerunHint: string;
 

@@ -16,6 +16,9 @@ export interface GateShardAttempt {
   baselineExitCode: number | null;
   currentSignal?: string | null;
   baselineSignal?: string | null;
+  /** LIGHT-RC-MEASURE — the shard files that exist in the baseline tree, i.e. what the baseline side actually ran.
+   *  Absent = every shard file (the old shape). Empty = the baseline side was not run and contributes zero cases. */
+  baselineFiles?: readonly string[];
 }
 
 export interface GateShardAggregate {
@@ -25,7 +28,7 @@ export interface GateShardAggregate {
   report?: GateBaselineReport;
 }
 
-interface JUnitCase { file: string; name: string; failure?: string }
+interface JUnitCase { file: string; name: string; failure?: string; skipped?: true }
 
 const decode = (text: string): string => text.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, key: string) => {
   if (key[0] === '#') {
@@ -128,6 +131,7 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
   const cases: JUnitCase[] = [];
   const counts = new Map<string, number>();
   const executed = new Set<string>();
+  const occurrences = new Map<string, number>();
   let failures = 0;
   let errors = 0;
   const matchesCount = (value: string | undefined, actual: number) => value === undefined
@@ -149,12 +153,20 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
         if (!caseFile || !expected.has(caseFile) || !leaf || (file && file !== caseFile)) return undefined;
         total.tests++;
         counts.set(caseFile, (counts.get(caseFile) ?? 0) + 1);
-        if (child.children.some((c) => c.name === 'skipped')) return undefined;
+        // A skipped case is neither a pass nor a failure; it no longer voids the shard (LIGHT-RC-MEASURE ②).
+        const skipped = child.children.some((c) => c.name === 'skipped');
         const classname = child.attrs.classname;
-        const name = classname && classname !== caseFile ? `${classname} > ${leaf}` : leaf;
+        const declaredName = classname && classname !== caseFile ? `${classname} > ${leaf}` : leaf;
+        // Bun emits one name for every `test.each` row and for same-named cases in one describe; such repeats are
+        // told apart by their order in the file (#2, #3 …) on both sides instead of voiding the shard (LIGHT-RC-MEASURE).
+        const declaredIdentity = `${caseFile}\u0000${declaredName}`;
+        const ordinal = (occurrences.get(declaredIdentity) ?? 0) + 1;
+        occurrences.set(declaredIdentity, ordinal);
+        const name = ordinal === 1 ? declaredName : `${declaredName} #${ordinal}`;
         const identity = `${caseFile}\u0000${name}`;
         if (executed.has(identity)) return undefined;
         executed.add(identity);
+        if (skipped) { cases.push({ file: caseFile, name, skipped: true }); continue; }
         const failure = child.children.find((c) => c.name === 'failure' || c.name === 'error');
         if (failure?.name === 'failure') { failures++; total.failures++; }
         else if (failure) { errors++; total.errors++; }
@@ -179,6 +191,30 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
   return cases;
 }
 
+const SKIPPED_PASSED_AT_BASE = 'skipped now · passed at base — a skip must not hide a regression (LIGHT-RC-MEASURE ②)';
+
+/** Cases that passed at the baseline but were skipped now are counted as `unknown` failures — never green. */
+function withSkippedRegressions(report: GateBaselineReport | undefined, skipped: readonly JUnitCase[], baselineStatus: GateBaselineReport['baselineStatus']): GateBaselineReport {
+  const base: GateBaselineReport = report ?? {
+    introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0, missingAtBase: 0, timedOut: 0, timeoutPassedAtBase: 0,
+    flakyRerun: 0, rerunNotRun: 0, mayVaryNonTimeout: 0, rerunAttempted: 0, rerunRecovered: 0,
+    timeoutVariabilityCounts: { mayVary: 0, same: 0, unknown: 0 }, worktreeFailuresParsed: true,
+    failures: [], files: [], baselineStatus, log: 'shard baseline JUnit complete',
+  };
+  // An unknown failure means the child is not exonerated: `childResponsibility: 'none'` only holds when every remaining
+  // failure is flaky/preexisting (decideGateChildResponsibility), which an added unknown breaks.
+  const { childResponsibility: _dropped, ...rest } = base;
+  const added = skipped.map(({ file, name }) => ({
+    name: `${file} > ${name}`, file, diagnostic: SKIPPED_PASSED_AT_BASE, attribution: 'unknown' as const, baselinePresence: 'present' as const,
+  }));
+  return {
+    ...rest,
+    unknown: base.unknown + added.length,
+    failures: [...base.failures, ...added],
+    files: [...new Set([...base.files, ...added.map((failure) => failure.file)])],
+  };
+}
+
 function asGateLog(cases: readonly JUnitCase[]): string {
   return cases.map(({ file, name, failure }) => `${file}:\n${failure === undefined ? `(pass) ${name}` : `${failure}\n(fail) ${name}`}`).join('\n');
 }
@@ -196,35 +232,47 @@ export function aggregateGateTestShards(shards: readonly GateTestShard[], attemp
   const retryShardIds: string[] = [];
   const current: JUnitCase[] = [];
   const baseline: JUnitCase[] = [];
+  const skippedRegressions: JUnitCase[] = [];
   for (const shard of shards) {
     const attempt = selected.get(shard.id);
     const head = attempt?.currentJUnit === undefined ? undefined : readJUnit(attempt.currentJUnit, shard.files);
-    const base = attempt?.baselineJUnit === undefined ? undefined : readJUnit(attempt.baselineJUnit, shard.files);
-    if (!attempt || attempt.currentExitCode === null || attempt.baselineExitCode === null
-      || attempt.currentSignal || attempt.baselineSignal
-      || ![0, 1].includes(attempt.currentExitCode) || ![0, 1].includes(attempt.baselineExitCode)
+    // LIGHT-RC-MEASURE ① — the baseline side reads only the files that exist in the baseline tree; none = not run.
+    const baselineFiles = attempt?.baselineFiles ?? shard.files;
+    const baselineSkipped = baselineFiles.length === 0;
+    const base = baselineSkipped ? [] : attempt?.baselineJUnit === undefined ? undefined : readJUnit(attempt.baselineJUnit, baselineFiles);
+    if (!attempt || attempt.currentExitCode === null || attempt.currentSignal
+      || ![0, 1].includes(attempt.currentExitCode)
+      || baselineFiles.some((file) => !shard.files.includes(file))
+      || (!baselineSkipped && (attempt.baselineExitCode === null || attempt.baselineSignal || ![0, 1].includes(attempt.baselineExitCode)))
       || !head || !base
       || (attempt.currentExitCode === 0 && head.some((test) => test.failure !== undefined))
-      || (attempt.baselineExitCode === 0 && base.some((test) => test.failure !== undefined))
+      || (!baselineSkipped && attempt.baselineExitCode === 0 && base.some((test) => test.failure !== undefined))
       || (attempt.currentExitCode !== 0 && head.every((test) => test.failure === undefined))
-      || (attempt.baselineExitCode !== 0 && base.every((test) => test.failure === undefined))) {
+      || (!baselineSkipped && attempt.baselineExitCode !== 0 && base.every((test) => test.failure === undefined))) {
       retryShardIds.push(shard.id);
       continue;
     }
-    current.push(...head);
-    baseline.push(...base);
+    current.push(...head.filter((test) => !test.skipped));
+    baseline.push(...base.filter((test) => !test.skipped));
+    const passedAtBase = new Set(base.filter((test) => !test.skipped && test.failure === undefined).map((test) => `${test.file}\u0000${test.name}`));
+    skippedRegressions.push(...head.filter((test) => test.skipped && passedAtBase.has(`${test.file}\u0000${test.name}`)));
   }
   if (retryShardIds.length > 0 || shards.length === 0) return { status: 'unmeasured', retryShardIds };
-  if (current.every((test) => test.failure === undefined)) return { status: 'passed', retryShardIds: [] };
+  const baselineStatus = baseline.some((test) => test.failure !== undefined) ? 'test-fail' as const : 'pass' as const;
+  if (current.every((test) => test.failure === undefined)) {
+    if (skippedRegressions.length === 0) return { status: 'passed', retryShardIds: [] };
+    return { status: 'failed', retryShardIds: [], report: withSkippedRegressions(undefined, skippedRegressions, baselineStatus) };
+  }
   const passedTestEvidence: GatePassedTestEvidence = {
     status: 'available',
     tests: baseline.filter((test) => test.failure === undefined).map(({ file, name }) => ({ file, name: `${file} > ${name}` })),
   };
   const report = buildGateBaselineReport(asGateLog(current), {
-    status: baseline.some((test) => test.failure !== undefined) ? 'test-fail' : 'pass',
+    status: baselineStatus,
     output: asGateLog(baseline),
     passedTestEvidence,
     log: 'shard baseline JUnit complete',
   });
+  if (skippedRegressions.length > 0) return { status: 'failed', retryShardIds: [], report: withSkippedRegressions(report, skippedRegressions, baselineStatus) };
   return { status: allowsBaselineOnlyFailure(report) ? 'passed' : 'failed', retryShardIds: [], report };
 }

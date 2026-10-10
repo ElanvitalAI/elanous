@@ -5,7 +5,7 @@ import { checkLoops } from './checker.js';
 import { debug } from '../debug/log.js';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cronEntryId, inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
+import { cronEntryId, inventoryCrontab, listSchedules, openSchedulesDb, unwrapCronCommand } from '../domains/schedule-registry.js';
 import { listAllLoops, listLoops, unregisteredCronLoops } from './registry.js';
 
 const roots: string[] = [];
@@ -446,10 +446,13 @@ test('HQ role wrappers and periodic elanous launches keep graph and shell keys w
       const row = rows.find(item => item.command?.includes(script))!;
       expect(all.find(entry => entry.command?.includes(script))).toMatchObject({ kind: 'cron-shell', id: row.id, fenceRole: role });
     }
+    // Same-name slots follow installed schedule order (category, name). Since #25637 the fenced */16 line is
+    // named from its inner command, so which heartbeat gets which suffix is order detail — pin the set.
+    expect(['*/8 * * * *', '*/9 * * * *', '*/16 * * * *'].map(cron => all.find(entry => entry.cron === cron)).map(entry => {
+      expect(entry).toMatchObject({ kind: 'cron-shell', registered: true });
+      return entry!.id;
+    }).sort()).toEqual(['elanous:hq-heartbeat', 'elanous:hq-heartbeat-2', 'elanous:hq-heartbeat-3']);
     for (const [cron, id] of [
-      ['*/8 * * * *', 'elanous:hq-heartbeat'],
-      ['*/9 * * * *', 'elanous:hq-heartbeat-2'],
-      ['*/16 * * * *', 'elanous:hq-heartbeat-3'],
       ['*/11 * * * *', 'elanous:harness-queue'],
       ['*/12 * * * *', 'elanous:hq-arbiter-check'],
       ['*/13 * * * *', 'elanous:card-intake-scan'],
@@ -500,7 +503,8 @@ test('operational bun and node elanous cron lines share named keys with CLI laun
     expect(all.filter(entry => entry.id.startsWith('elanous:harness-queue')).map(entry => entry.id).sort())
       .toEqual(['elanous:harness-queue', 'elanous:harness-queue-2', 'elanous:harness-queue-3']);
     for (const row of gitRows) {
-      expect(row.id).toBe(cronEntryId(row.cron!, row.command!));
+      // #25637: a fenced line keeps the hash key of its unfenced (inner) command.
+      expect(row.id).toBe(cronEntryId(row.cron!, unwrapCronCommand(row.command!)));
       expect(all.find(entry => entry.id === row.id)).toMatchObject({
         kind: 'cron-shell', title: 'git push (hq-fence git-push)', owner: 'UX', ownerSource: 'config', fenceRole: 'git-push',
       });

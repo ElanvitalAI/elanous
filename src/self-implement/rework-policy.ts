@@ -459,6 +459,7 @@ export function applyReworkBudgetDecision(
   priorRounds = Number.POSITIVE_INFINITY,
   shadowStop = false,
   previousVerdict?: ReworkBudgetVerdict,
+  gateBaselineOnly?: boolean,
 ): { effectiveMax: number; stop: boolean; exit: 'continue' | 'proceed' | 'blocked'; applied: boolean; shadowed?: boolean; wouldExit?: 'proceed' | 'blocked'; contractConflictDisposition?: ContractConflictDisposition } {
   const cap = Math.max(0, hardCap);
   const normalizedMax = Math.min(cap, Math.max(0, effectiveMax));
@@ -482,7 +483,7 @@ export function applyReworkBudgetDecision(
     return { effectiveMax: extendedMax, stop: false, exit: 'continue', applied: extendedMax > normalizedMax };
   }
   if (decision.verdict === 'SUFFICIENT') {
-    if (kind !== 'review') return { effectiveMax: normalizedMax, stop: false, exit: 'continue', applied: false };
+    if (kind !== 'review' && !(kind === 'gate' && gateBaselineOnly === true)) return { effectiveMax: normalizedMax, stop: false, exit: 'continue', applied: false };
     return shadowStop
       ? { effectiveMax: normalizedMax, stop: false, exit: 'continue', applied: false, shadowed: true, wouldExit: 'proceed' }
       : { effectiveMax: normalizedMax, stop: true, exit: 'proceed', applied: true };

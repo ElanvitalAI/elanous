@@ -25,6 +25,7 @@ import { ensureRunIdentity, getHarnessSpace, normalizeSpaceId } from './harness/
 //   그 import 자체가 첫 비동기 작업이 되어, 그것이 거부되면 가드 없이 끝난다(무인 리뷰 must-fix).
 //   ⇒ «정적» import 로 올린다. 이 모듈은 부작용이 없어 부팅 비용이 사실상 0 이다.
 import { installDevCompletionGuard } from './self-dev/dev-completion-guard.js';
+import { formatOrchestrateResultLine } from './self-dev/orchestrate-summary-line.js';
 import { buildOrchestrateDecomposePrepareArgs, normalizeOrchestrateRequest, splitOrchestrateGoalTexts } from './self-dev/self-orchestrate-runtime.js';
 import { CLI_ENTRANCE_BASELINE, evaluateCommandEntranceBaseline } from './self-dev/entrance-baseline.js';
 import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describeEntranceCommand, listEntrancesWithModelExposure, renderLaunchEntrances, summarizeEntrances, type EntranceId } from './self-dev/entrance-registry.js';
@@ -1073,6 +1074,17 @@ fenceWrapperCmd.command('alert <reason>').description('HQ 울타리 실패를 �
       hqFenceAlert(reason, { root, outcomeDir: fenceOutcomeDir(_joinPath(root, 'hq', 'local.json')) });
     } catch (error) { console.error(`hq fence-wrapper alert: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
+fenceWrapperCmd.command('record <role> <rc>').description('가벼운 울타리(FENCE-LIGHT)가 돌린 잡의 rc 를 역할별 연속 실패 기록에 남김')
+  .action(async (role: string, rc: string) => {
+    try {
+      const { FENCE_ROLES } = await import('./hq/hq.js');
+      if (!(FENCE_ROLES as readonly string[]).includes(role)) throw new Error(`unknown role: ${role}`);
+      if (!/^\d{1,3}$/.test(rc)) throw new Error(`rc must be 0-255: ${rc}`);
+      const { fenceOutcomeDir, recordFenceOutcome } = await import('./hq/fence-outcomes.js');
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      recordFenceOutcome(fenceOutcomeDir(_joinPath(getElanousConfigDir(), 'hq', 'local.json')), role, Number(rc));
+    } catch (error) { console.error(`hq fence-wrapper record: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 hqCmd.command('fence-audit').description('운영 crontab 의 HQ 울타리 밖 쓰기 잡 목록과 감싼 줄 제안(읽기 전용)')
   .option('--json', 'JSON 출력')
   .action(async (opts: { json?: boolean }) => {
@@ -1684,7 +1696,7 @@ telegramCmd
       const { spawnSync } = await import('node:child_process');
       const result = installTelegramService(file, getUserConfig().telegram.poller, process.getuid?.() ?? 0, {
         exists: fs.existsSync, readFile: (p) => fs.readFileSync(p, 'utf8'), writeFile: (p, t) => fs.writeFileSync(p, t),
-        mkdir: (p) => fs.mkdirSync(p, { recursive: true }), rename: fs.renameSync,
+        mkdir: (p) => fs.mkdirSync(p, { recursive: true }), rename: fs.renameSync, chmod: fs.chmodSync,
         run: (c, a) => { const r = spawnSync(c, a, { encoding: 'utf8' }); return { status: r.status, stderr: r.stderr ?? String(r.error ?? '') }; },
       });
       debug.log('telegram.service', 'install', { ok: result.ok, path: result.path, backup: result.backup, steps: result.steps, reason: result.reason });
@@ -4701,7 +4713,7 @@ const selfOrchestrateCmd = selfCmd
   .option('--no-pod-rebuild', 'pod: 이미지 판(elanous.commit)이 HEAD 와 달라도 다시 굽지 않는다 — 측정은 «이미지 판»을 잰다')
   .option('--pod-pass-env <keys>', 'pod: 호스트 env 에서 Pod 로 넘길 키(쉼표) — 예 OPENROUTER_API_KEY,ANTHROPIC_API_KEY(벤치마크 과금 경로)')
   .option('--bench-arms <spec>', 'pod 벤치마크: 골 1개를 팔마다 «라벨 한 줄만 다르게» 복제해 동시에 — "id=provider[:model][@KEY+KEY];…" (예 codex=openai-codex;or-kimi=openrouter:openrouter/moonshotai/kimi-k3@OPENROUTER_API_KEY) · --auto-merge 거부 · RFC fleet 슈퍼바이저 §A3')
-  .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
+  .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok|openrouter|anthropic) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
   .addOption(new Option('--child-llm-model <id>', 'pod: 구현 자식 LLM model(--child-llm-provider 와 함께)').hideHelp())
   .addOption(new Option('--child-llm-effort <level>', 'pod: 구현 자식 추론 노력(--child-llm-provider 와 함께)').hideHelp())
   .option('--help-all', '모든 orchestrate 옵션 표시')
@@ -4879,7 +4891,9 @@ const selfOrchestrateCmd = selfCmd
       if (substrate === 'pod') {
         const { podSelfImplementSpawn, podSubstrateReady, defaultKubectl } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
         const poolMod = await import('./task-orchestrator/surfaces/pod-pool.js');
-        const poolSpec = poolMod.resolvePodPoolSpec((opts as { podPool?: string }).podPool);
+        const { harnessLaunchPolicyConfig } = await import('./harness/harness-substrate-default.js');
+        const launchPolicy = harnessLaunchPolicyConfig();
+        const poolSpec = poolMod.resolvePodPoolSpec((opts as { podPool?: string }).podPool, process.env, () => launchPolicy.harness?.podPool ?? launchPolicy.pod?.pool);
         let pool: import('./task-orchestrator/surfaces/pod-pool.js').PodPoolScheduler | undefined;
         let poolMembers: import('./task-orchestrator/surfaces/pod-pool.js').PodPoolMember[] = [];
         let ready: { ok: boolean; reason: string };
@@ -4898,41 +4912,82 @@ const selfOrchestrateCmd = selfCmd
         }
         if (!ready.ok) { ui.error(`--substrate pod: ${ready.reason}`); process.exit(2); }
         // ⛔ Pod 의 elanous 는 이미지 판이다 — HEAD 와 다르면 다시 굽는다(BACKLOG E6 · 09-25 세 판이 옛 판을 쟀다).
-        const { podImageFreshness } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
-        // ☸️ 풀이 «원격 노드뿐»이면 이 기계의 이미지는 아무도 안 쓴다 — 로컬 판정·굽기를 건너뛰고 기준 판 = HEAD 로 노드 동기화만 한다.
-        //   🩸 2026-09-26 실측: 원격 전용 풀인데 로컬 이미지가 없다고 로컬에서 굽다가 로컬 클러스터(elanous-h1)가 없어 런이 시작도 전에 죽었다.
-        const remoteOnlyPool = poolMembers.length > 0 && poolMembers.every((m) => Boolean(m.sshHost));
-        const headCommit = remoteOnlyPool ? ((await import('./git-fs/runner.js')).runGitCommand(process.cwd(), ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim() || null) : null;
-        let image = remoteOnlyPool
-          ? { imageCommit: headCommit, headCommit, fresh: true, reason: 'remote-only pool — 노드 쪽에서 맞춘다' }
-          : podImageFreshness();
-        if (!image.fresh) {
-          if ((opts as { podRebuild?: boolean }).podRebuild === false) {
-            ui.warn(`--substrate pod: 이미지가 낡았다(${image.reason}) — --no-pod-rebuild 라 그대로 쓴다. 측정은 «이미지 판»을 잰다.`);
-          } else {
-            if (!opts.json) ui.info(`[pod] 이미지 다시 굽기 — ${image.reason} (~1분)`);
-            const { spawnSync } = await import('node:child_process');
-            const { runGitCommand } = await import('./git-fs/runner.js');
-            const top = runGitCommand(process.cwd(), ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim() || process.cwd();
-            // bun 1.4 applies the 1 MiB default maxBuffer: a docker build log past it kills the child (ENOBUFS · status null).
-            const b = spawnSync('bash', [`${top}/docker/harness/build.sh`], { encoding: 'utf8', timeout: 900_000, maxBuffer: 64 * 1024 * 1024 });
-            if (b.status !== 0) { ui.error(`--substrate pod: 이미지 굽기 실패 rc=${b.status}${b.error ? ` (${(b.error as NodeJS.ErrnoException).code ?? b.error.message})` : ''}: ${(b.stdout + b.stderr).slice(-400)}`); process.exit(2); }
-            image = podImageFreshness();
+        const { podImageFreshness, rebuildLocalPodImageOnce } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
+        type PodPoolMemberT = import('./task-orchestrator/surfaces/pod-pool.js').PodPoolMember;
+        let remoteOnlyPool = false;
+        // 종전 경로(HEAD 비교·굽기·노드 동기화). IMAGE-ONE-SOURCE: 기준값이 없으면 전 멤버로 «그대로» 부른다.
+        const podHeadImagePath = async (members: readonly PodPoolMemberT[]) => {
+          // ☸️ 풀이 «원격 노드뿐»이면 이 기계의 이미지는 아무도 안 쓴다 — 로컬 판정·굽기를 건너뛰고 기준 판 = HEAD 로 노드 동기화만 한다.
+          //   🩸 2026-09-26 실측: 원격 전용 풀인데 로컬 이미지가 없다고 로컬에서 굽다가 로컬 클러스터(elanous-h1)가 없어 런이 시작도 전에 죽었다.
+          remoteOnlyPool = members.length > 0 && members.every((m) => Boolean(m.sshHost));
+          const headCommit = remoteOnlyPool ? ((await import('./git-fs/runner.js')).runGitCommand(process.cwd(), ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim() || null) : null;
+          let image = remoteOnlyPool
+            ? { imageCommit: headCommit, headCommit, fresh: true, reason: 'remote-only pool — 노드 쪽에서 맞춘다' }
+            : podImageFreshness();
+          if (!image.fresh) {
+            if ((opts as { podRebuild?: boolean }).podRebuild === false) {
+              ui.warn(`--substrate pod: 이미지가 낡았다(${image.reason}) — --no-pod-rebuild 라 그대로 쓴다. 측정은 «이미지 판»을 잰다.`);
+            } else {
+              const rebuilt = await rebuildLocalPodImageOnce({ initialImage: image,
+                onBuild: (reason) => { if (!opts.json) ui.info(`[pod] 이미지 다시 굽기 — ${reason} (~1분)`); },
+                onWait: () => { if (!opts.json) ui.info('[pod] 이미지 굽기 대기 — 같은 호스트의 다른 부모가 굽는 중'); },
+              });
+              if (rebuilt.action === 'failed') { ui.error(rebuilt.error ?? '--substrate pod: 이미지 굽기 실패'); process.exit(2); }
+              image = rebuilt.image;
+            }
           }
+          debug.log('self-implement.pod', 'image-freshness', { ...image });
+          // ☸️ 원격 노드도 «같은 판»이어야 한다 — 다르면 보내서 넣는다. 못 맞춘 노드는 풀에서 뺀다.
+          const synced: PodPoolMemberT[] = [];
+          if (pool) {
+            // ⭐ 노드들을 «동시에» — 노드 쪽 빌드(바뀐 층만) 1순위 · 실패하면 통째 전송.
+            const { podSkillsDigest, resolvePodSkills } = await import('./task-orchestrator/surfaces/pod-skills.js');
+            const syncs = await poolMod.syncPoolImages(members, 'elanous-harness:local', image.imageCommit, { localSkillsDigest: podSkillsDigest(resolvePodSkills().skills).digest });
+            for (const m of members) {
+              const r = syncs.get(m.context)!;
+              debug.log('self-implement.pod', 'pool-image-sync', { context: m.context, ...r });
+              if (r.ok) synced.push(r.imageRef ? { ...m, imageRef: r.imageRef } : m); else ui.warn(`[pod-pool] ${m.context} 뺌 — 이미지 판을 못 맞췄다: ${r.detail}`);
+              if (!opts.json && (r.action === 'shipped' || r.action === 'built')) ui.info(`[pod-pool] ${m.context} 이미지 ${r.action === 'built' ? '노드 쪽 빌드' : '보냄'} ${r.detail} · ${Math.round(r.ms / 1000)}초`);
+            }
+          }
+          return { image, synced };
+        };
+        // 🧷 IMAGE-ONE-SOURCE: 운영 config `harness.imageCommit` 이 있으면 레지스트리를 가진 멤버는 굽지 않고 기준 이미지(커밋 태그)를 당긴다.
+        const imageSourceMod = await import('./task-orchestrator/surfaces/pod-image-source.js');
+        let podImageCfg: { harness?: { imageCommit?: unknown } } | undefined = undefined;
+        // ⛔ 설정을 못 읽으면 «기준값 없음»으로 읽지 않는다 — 기준값이 있었을 수 있으니 굽지 않고 멈춘다.
+        try { podImageCfg = (await import('./user-config.js')).getUserConfig(); } catch (e) {
+          ui.error(`--substrate pod: 운영 config 를 못 읽어 기준 이미지(harness.imageCommit) 여부를 모른다 — 굽지 않고 멈춘다: ${(e as Error).message}`);
+          debug.log('self-implement.pod', 'image-source', { kind: null, ref: null, headCommit: null, waitedMs: 0, outcome: 'config-unreadable', error: (e as Error).message });
+          process.exit(2);
         }
-        debug.log('self-implement.pod', 'image-freshness', { ...image });
-        // ☸️ 원격 노드도 «같은 판»이어야 한다 — 다르면 보내서 넣는다. 못 맞춘 노드는 풀에서 뺀다.
+        const pinWaitSec = process.env.ELANOUS_POD_IMAGE_PIN_WAIT_SEC?.trim() ? Number(process.env.ELANOUS_POD_IMAGE_PIN_WAIT_SEC) : Number.NaN;
+        const preparedImage = await imageSourceMod.preparePodImage({
+          cfg: podImageCfg,
+          members: poolMembers,
+          headPath: podHeadImagePath,
+          ...imageSourceMod.podPoolImageLookup(),
+          ...(Number.isFinite(pinWaitSec) && pinWaitSec >= 0 ? { maxWaitMs: pinWaitSec * 1000 } : {}),
+          onWait: (pending, waitedMs) => { if (!opts.json) ui.info(`[pod] 기준 이미지 대기 — ${pending.map((m) => m.context).join(',')} 레지스트리에 아직 없다 (${Math.round(waitedMs / 1000)}초)`); },
+        });
+        // ref = 멤버가 «실제로» 당기는(또는 찾던) 이미지 ref 집합 — 기준 이미지 · 못 찾은 기준 이미지 · 종전 경로 멤버의 imageRef 또는 elanous-harness:local.
+        const usedImageRefs = [...new Set([...preparedImage.pinned.map((m) => m.imageRef), ...preparedImage.missing.map((x) => x.ref), ...(preparedImage.head ? (pool ? preparedImage.head.synced.map((m) => m.imageRef ?? 'elanous-harness:local') : ['elanous-harness:local']) : [])])];
+        if (preparedImage.source.kind === 'pinned') {
+          const pinnedHead = (await import('./git-fs/runner.js')).runGitCommand(process.cwd(), ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim() || null;
+          imageSourceMod.logPinnedImageSource(preparedImage, { ref: usedImageRefs.join(', '), headCommit: pinnedHead });
+          if (preparedImage.outcome === 'pinned-missing') { ui.error(imageSourceMod.podImageMissingMessage([...new Set(preparedImage.missing.map((x) => x.ref))].join(', '))); process.exit(2); }
+          for (const x of preparedImage.missing) ui.warn(`[pod-pool] ${x.member.context} 뺌 — ${imageSourceMod.podImageMissingMessage(x.ref)}`);
+        } else {
+          debug.log('self-implement.pod', 'image-source', { kind: 'head', ref: usedImageRefs.join(', ') || null, headCommit: preparedImage.head?.image.headCommit ?? null, waitedMs: 0, outcome: 'head' });
+        }
+        const pinnedOnly = preparedImage.head === null && preparedImage.source.kind === 'pinned';
+        if (pinnedOnly) remoteOnlyPool = true;
+        const image = preparedImage.head?.image
+          ?? { imageCommit: preparedImage.source.kind === 'pinned' ? preparedImage.source.commit : null, headCommit: null, fresh: true, reason: 'pinned — 레지스트리 기준 이미지' };
         if (pool) {
-          const synced: typeof poolMembers = [];
-          // ⭐ 노드들을 «동시에» — 노드 쪽 빌드(바뀐 층만) 1순위 · 실패하면 통째 전송.
-          const { podSkillsDigest, resolvePodSkills } = await import('./task-orchestrator/surfaces/pod-skills.js');
-          const syncs = await poolMod.syncPoolImages(poolMembers, 'elanous-harness:local', image.imageCommit, { localSkillsDigest: podSkillsDigest(resolvePodSkills().skills).digest });
-          for (const m of poolMembers) {
-            const r = syncs.get(m.context)!;
-            debug.log('self-implement.pod', 'pool-image-sync', { context: m.context, ...r });
-            if (r.ok) synced.push(r.imageRef ? { ...m, imageRef: r.imageRef } : m); else ui.warn(`[pod-pool] ${m.context} 뺌 — 이미지 판을 못 맞췄다: ${r.detail}`);
-            if (!opts.json && (r.action === 'shipped' || r.action === 'built')) ui.info(`[pod-pool] ${m.context} 이미지 ${r.action === 'built' ? '노드 쪽 빌드' : '보냄'} ${r.detail} · ${Math.round(r.ms / 1000)}초`);
-          }
+          const ok = new Set([...preparedImage.pinned.map((m) => m.context), ...(preparedImage.head?.synced ?? []).map((m) => m.context)]);
+          const byContext = new Map<string, PodPoolMemberT>([...(preparedImage.head?.synced ?? []), ...preparedImage.pinned].map((m) => [m.context, m]));
+          const synced = poolMembers.filter((m) => ok.has(m.context)).map((m) => byContext.get(m.context)!);
           if (synced.length === 0) { ui.error('--substrate pod: 이미지를 맞춘 풀 노드가 없다'); process.exit(2); }
           pool = new poolMod.PodPoolScheduler(synced);
           poolMembers = synced;
@@ -4943,7 +4998,7 @@ const selfOrchestrateCmd = selfCmd
         const explicitPodAccount = (opts as { podAccount?: string }).podAccount;
         let accountBroker: (() => string) | undefined;
         let rotationAccounts: readonly string[] | undefined;
-        let podProvider: 'openai-codex' | 'grok' = 'openai-codex';
+        let podProvider: import('./task-orchestrator/surfaces/pod-child-providers.js').PodChildProvider = 'openai-codex';
         let grokApiKeyOptIn = false;
         {
           // 10-05 PODPROVIDER: refuse child choices this Pod launch cannot honour instead of dropping them.
@@ -4953,8 +5008,8 @@ const selfOrchestrateCmd = selfCmd
             ? 'pod: --child-llm-model/--child-llm-effort 는 --child-llm-provider 와 함께'
             : named && benchArms
               ? 'pod: --child-llm-provider 는 --bench-arms 와 함께 못 쓴다(팔마다 모델이 하나다)'
-              : named === 'grok' && explicitPodAccount
-                ? 'pod: --child-llm-provider grok 은 --pod-account 와 함께 못 쓴다(그것은 codex 계정을 고정한다)'
+              : (named === 'grok' || named === 'openrouter' || named === 'anthropic') && explicitPodAccount
+                ? `pod: --child-llm-provider ${named} 은 --pod-account 와 함께 못 쓴다(그것은 codex 계정을 고정한다)`
                 : undefined;
           if (refuse) { ui.error(refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: named ?? null, reason: refuse }); process.exit(2); }
         }
@@ -4962,13 +5017,15 @@ const selfOrchestrateCmd = selfCmd
           const { inspectCodexRotation } = await import('./oauth/codex-account-store.js');
           const { planPodProvider, makePodAccountBroker } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
           const { resolveGrokCredential } = await import('./grok/credential.js');
-          const { getUserConfig } = await import('./user-config.js');
           const { defaultGrokModel } = await import('./grok/models.js');
-          grokApiKeyOptIn = getUserConfig().harness?.pod?.grokApiKeyOptIn === true;
+          grokApiKeyOptIn = launchPolicy.harness?.pod?.grokApiKeyOptIn === true;
           const credential = resolveGrokCredential();
           const { resolveCodexQuotaPolicy, codexPolicyAllowsCredits, codexPolicyAllowsFallback } = await import('./oauth/codex-quota-policy.js');
-          const resolvedQuota = resolveCodexQuotaPolicy(getUserConfig().llm);
+          const resolvedQuota = resolveCodexQuotaPolicy(launchPolicy.llm);
           const quotaPolicy = resolvedQuota.policy;
+          const { normalizeFallbackChain } = await import('./oauth/fallback-chain.js');
+          const fallbackEnabled = codexPolicyAllowsFallback(quotaPolicy)
+            && normalizeFallbackChain(launchPolicy.llm?.fallbackChain).chain.includes('grok');
           // POL1 — say which policy this launch uses and where it came from; warn when a test universe disagrees with production.
           const { effectiveInstanceRoot, prodInstanceRoot } = await import('./instance/resolve.js');
           const root = effectiveInstanceRoot();
@@ -4988,7 +5045,7 @@ const selfOrchestrateCmd = selfCmd
           // GROK-OPTIONAL (10-05): an expiring grok subscription the host cannot refresh is dropped from the chain here,
           // so the launch goes on with codex instead of dying later in hostGrokCredentials.
           let grokSubscriptionUsable = credential?.kind === 'subscription';
-          if (grokSubscriptionUsable && codexPolicyAllowsFallback(quotaPolicy)) {
+          if (grokSubscriptionUsable && fallbackEnabled) {
             const { podGrokSubscriptionUsable, podGrokSkippedLine } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
             const grokCheck = podGrokSubscriptionUsable();
             if (!grokCheck.usable) {
@@ -4999,41 +5056,61 @@ const selfOrchestrateCmd = selfCmd
           // 10-05 PODPROVIDER: a launch that named the child provider gets it, or is refused — never a silent codex.
           const namedChild = (opts as { childLlmProvider?: string }).childLlmProvider?.trim();
           const { podNamedChildProvider, podFallbackCredentials, podGrokSubscriptionUsable: namedGrokUsable } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
+          const { readFileSync: readPodKeyFile } = await import('node:fs');
+          const { homedir: podHome } = await import('node:os');
+          const { join: podJoin } = await import('node:path');
+          let openrouterKeyPresent = Boolean(process.env.OPENROUTER_API_KEY?.trim());
+          if (namedChild === 'openrouter' && !openrouterKeyPresent) {
+            try { openrouterKeyPresent = Boolean(readPodKeyFile(podJoin(podHome(), '.cache', 'openrouter_api_key'), 'utf8').trim()); } catch { /* missing host cache */ }
+          }
+          // POD-ANTHROPIC-PROVIDER — 제품 자격 해석(`getAnthropicApiKey` · 키 캐시 → env)으로 «있나»만 본다(값은 안 싣는다).
+          const anthropicKeyPresent = namedChild === 'anthropic' && Boolean((await import('./config.js')).getAnthropicApiKey()?.trim());
           const namedChildDecision = podNamedChildProvider(namedChild, {
             grokSubscription: namedChild === 'grok' && credential?.kind === 'subscription' && (grokSubscriptionUsable || namedGrokUsable().usable),
             grokApiKey: credential?.kind === 'api_key' && grokApiKeyOptIn,
-          });
+            openrouterKey: openrouterKeyPresent,
+            anthropicKey: anthropicKeyPresent,
+          }, (opts as { childLlmModel?: string }).childLlmModel);
           if (namedChildDecision.refuse) { ui.error(namedChildDecision.refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: namedChild, reason: namedChildDecision.refuse }); process.exit(2); }
           // A named codex child must stay codex — the plan may not fall back to grok (post-review must-fix).
           const namedCodex = namedChildDecision.provider === 'openai-codex';
-          const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan = namedChildDecision.provider === 'grok'
+          const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan | null = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'anthropic' ? null : namedChildDecision.provider === 'grok'
             ? { provider: 'grok', excluded: [], grokSubscriptionEligible: credential?.kind === 'subscription' }
             : planPodProvider({
             codexCandidates: inspectCodexRotation().candidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
-            thresholdPercentByAccount: getUserConfig().llm?.codexAccountRotationThresholdPercentByAccount,
+            thresholdPercentByAccount: launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount,
             // 대표 한도 정책 한 값(`llm.codexQuotaPolicy`) — 크레딧·폴백을 같이 정한다.
             creditsAllowed: codexPolicyAllowsCredits(quotaPolicy),
             ...podFallbackCredentials(namedChildDecision.provider, {
-              grokSubscription: codexPolicyAllowsFallback(quotaPolicy) && grokSubscriptionUsable,
-              grokApiKey: codexPolicyAllowsFallback(quotaPolicy) && credential?.kind === 'api_key',
+              grokSubscription: fallbackEnabled && grokSubscriptionUsable,
+              grokApiKey: fallbackEnabled && credential?.kind === 'api_key',
             }),
             grokApiKeyOptIn,
           });
-          if (plan.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')}${namedCodex ? ' · child provider 를 openai-codex 로 지정해 grok 으로 넘기지 않는다' : ''} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
-          podProvider = plan.provider;
-          if (plan.provider === 'openai-codex') {
+          if (plan?.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')}${namedCodex ? ' · child provider 를 openai-codex 로 지정해 grok 으로 넘기지 않는다' : ''} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
+          podProvider = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'anthropic' ? namedChildDecision.provider : plan!.provider!;
+          if (plan?.provider === 'openai-codex') {
             accountBroker = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
             rotationAccounts = plan.accounts;
             debug.log('self-implement.pod', 'account-plan', { usable: plan.accounts, excluded: plan.excluded });
             { const { emitDecision } = await import('./live/detail-switch.js');
               emitDecision({ kind: 'ROUTE', what: `Pod 계정 배분 ${plan.accounts.join(' → ')}`, reason: plan.excluded.length ? `뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : '모든 계정 여유', purpose: plan.creditAccounts ? '구독 잔량 0 — 정책상 크레딧으로 병렬 조각을 돌린다' : '병렬 조각이 한 계정에 몰리지 않게 잔량 순으로 돌려 준다', phase: 'dispatch', target: `Pod ${plan.accounts.length}계정`, paths: plan.accounts.length + plan.excluded.length }); }
             if (!opts.json) ui.info(`[pod] 계정 배분(잔량 순 · 돌려 가며): ${plan.accounts.join(' → ')}${plan.creditAccounts ? ' · 💳 크레딧(구독 잔량 0 · 허가됨)' : ''}${plan.excluded.length ? ` · 뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : ''}`);
+          } else if (namedChildDecision.provider === 'openrouter') {
+            const model = (opts as { childLlmModel?: string }).childLlmModel!.trim();
+            debug.log('self-implement.pod', 'provider-named', { provider: 'openrouter', model, openrouterKeyPresent: true });
+            if (!opts.json) ui.info(`[pod] child provider = openrouter(모델 ${model}) — 발사 인자로 지정됨`);
+          } else if (namedChildDecision.provider === 'anthropic') {
+            const model = (opts as { childLlmModel?: string }).childLlmModel?.trim() || null;
+            // ⓔ 과금 관측 — anthropic 은 API 키 과금(구독 아님). 새 예산 체계는 없다 · 관측 한 줄만.
+            debug.log('self-implement.pod', 'provider-named', { provider: 'anthropic', model, anthropicKeyPresent: true, billing: 'api-key' });
+            if (!opts.json) ui.info(`[pod] child provider = anthropic(모델 ${model ?? '기본'}) — 발사 인자로 지정됨 · 💳 API 키 과금(구독 아님)`);
           } else if (namedChildDecision.provider === 'grok') {
             const model = (opts as { childLlmModel?: string }).childLlmModel?.trim() || defaultGrokModel().id;
             debug.log('self-implement.pod', 'provider-named', { provider: 'grok', model, credential: credential?.kind ?? null });
             if (!opts.json) ui.info(`[pod] child provider = grok(모델 ${model}) — 발사 인자로 지정됨`);
-          } else {
+          } else if (plan) {
             const model = defaultGrokModel().id;
             debug.log('self-implement.pod', 'provider-fallback', { from: 'openai-codex', to: 'grok', excluded: plan.excluded, model });
             { const { emitDecision } = await import('./live/detail-switch.js');
@@ -5041,7 +5118,7 @@ const selfOrchestrateCmd = selfCmd
             if (!opts.json) ui.info(`[pod] 쓸 codex 계정 없음(${plan.excluded.map((x) => `${x.name}: ${x.why}`).join(' · ')}) → grok 으로(모델 ${model})`);
           }
         }
-        const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : requestedPassEnv;
+        const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : podProvider === 'openrouter' ? [...new Set([...requestedPassEnv, 'OPENROUTER_API_KEY'])] : podProvider === 'anthropic' ? [...new Set([...requestedPassEnv, 'ANTHROPIC_API_KEY'])] : requestedPassEnv;
         const podSourceSpec = (opts as { podSource?: string }).podSource;
         let podSource: import('./task-orchestrator/surfaces/pod-source-receive.js').PodSource | undefined;
         if (podSourceSpec) {
@@ -5063,7 +5140,7 @@ const selfOrchestrateCmd = selfCmd
         const childFlags = opts as { childLlmProvider?: string; childLlmModel?: string; childLlmEffort?: string };
         const podChildLlm = childFlags.childLlmProvider?.trim() ? { childProviderExplicit: true, ...(childFlags.childLlmModel?.trim() ? { childModel: childFlags.childLlmModel.trim() } : {}), ...(childFlags.childLlmEffort?.trim() ? { childEffort: childFlags.childLlmEffort.trim() } : {}) } : {};
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker, rotationAccounts } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : podProvider === 'openrouter' ? 'openrouter' : podProvider === 'anthropic' ? 'anthropic' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker, rotationAccounts } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : podProvider === 'openrouter' ? { provider: 'openrouter' as const } : podProvider === 'anthropic' ? { provider: 'anthropic' as const } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -5074,7 +5151,7 @@ const selfOrchestrateCmd = selfCmd
           ? poolMembers.map(({ context }) => ({ context, namespace: 'elanous-test' }))
           : [{ context: defaultKubectl(['config', 'current-context']).stdout.trim(), namespace: 'elanous-test' }];
         // ⭐ 팔 선언은 «runId 가 붙는» 이 줄에 싣는다 — 위의 `bench-arms` 줄은 runId 해석 «전»이라 비어 있다(09-25 실측) · 보고서(scripts/bench-report.ts)가 이 줄로 잇는다.
-        debug.log('self-dev.orchestrate', 'substrate', { substrate, account: podProvider === 'grok' ? 'grok' : (opts as { podAccount?: string }).podAccount ?? 'team', passEnv, context: ready.reason, imageCommit: image.imageCommit, imageFresh: image.fresh, ...(benchArms ? { benchArms: benchArms.map((a) => ({ id: a.id, provider: a.provider, model: a.model ?? null, modelSource: a.modelSource ?? null, passEnv: a.passEnv })) } : {}) });
+        debug.log('self-dev.orchestrate', 'substrate', { substrate, account: podProvider === 'grok' ? 'grok' : podProvider === 'openrouter' ? 'openrouter' : (opts as { podAccount?: string }).podAccount ?? 'team', passEnv, context: ready.reason, imageCommit: image.imageCommit, imageFresh: image.fresh, ...(benchArms ? { benchArms: benchArms.map((a) => ({ id: a.id, provider: a.provider, model: a.model ?? null, modelSource: a.modelSource ?? null, passEnv: a.passEnv })) } : {}) });
       } else if (substrate !== 'local') {
         ui.error(`--substrate: local | pod (받은 값: ${substrate})`); process.exit(2);
       }
@@ -5146,11 +5223,7 @@ const selfOrchestrateCmd = selfCmd
       const incomplete = results.length - done;
       console.log([
         `[self-dev] 완료 — ${done}/${results.length} done${promoted ? ` · ${promoted} PR 승격` : ''}${incomplete ? ` · 이어서: elanous self orchestrate <goals> --resume ${runId}` : ''}`,
-        ...results.map((r) => {
-          const icon = r.status === 'done' ? '✅' : r.status === 'cancelled' ? '⛔' : '❌';
-          const disp = r.merged ? ` → merged ${r.prUrl}` : r.prUrl ? ` → PR ${r.prUrl}` : r.stage ? ` [${r.stage}]` : '';
-          return `  ${icon} ${r.status} · ${r.feature.slice(0, 56)}${disp}${r.error ? ` — ${r.error.code}${r.error.code === 'pod-job-failed' ? `: ${r.error.message}` : ''}` : ''}`;
-        }),
+        ...results.map(formatOrchestrateResultLine),
       ].join('\n'));
       await reportRun(results);
       if (outcome.exitCode !== 0) process.exit(outcome.exitCode); // seam 이 done<total→1 매핑(원 규약 보존)
@@ -5693,12 +5766,19 @@ selfCmd
     const { streamLLM } = await import('./llm.js');
     const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
     const { debug } = await import('./debug/log.js');
-    const { runSelfReviewCliCommand, reviewerContextArgs } = await import('./agent-substrate/self-review-cli.js');
+    const { runSelfReviewCliCommand, reviewerContextArgs, selfReviewJsonLine } = await import('./agent-substrate/self-review-cli.js');
+    const { subscriptionReviewerAvailability } = await import('./self-dev/review-provider-fallback.js');
+    const { makeLazyAcpReviewLLM: makeRoleAcpReviewLLM } = await import('./agent-substrate/acp-reviewer.js');
     const contextOrder = reviewerContextArgs(process.argv.slice(2));
     const configuredAcpBackend = getUserConfig().acp.reviewBackend;
+    // ⭐ Same reviewer row the harness reads (`dev-pipeline` → `resolveSubscriptionReviewer`).
+    //    The seam decides whether it applies (only without an explicit reviewer flag).
+    const { loadLlmPolicy, resolveSubscriptionReviewer } = await import('./policy/llm-policy.js');
+    const roleReviewerSelection = resolveSubscriptionReviewer(loadLlmPolicy(), getUserConfig().roleLlm);
     const { results } = await runSelfReviewCliCommand(prArgs, {
       ...opts,
       ...(configuredAcpBackend ? { configuredAcpBackend } : {}),
+      ...(roleReviewerSelection ? { roleReviewer: roleReviewerSelection.spec } : {}),
       ...(contextOrder.length > 0 ? { contextOrder } : {}),
     }, {
       gh: (args, timeoutMs) => {
@@ -5735,6 +5815,20 @@ selfCmd
           return made(prompt, images);
         };
       },
+      // ⭐ Role-config ACP lane: the harness's subscription guard (subscription ⊕ usage cap ⊕ proxy URL),
+      //    then the claude ACP adapter with that scrubbed env. Unavailable = a reason code, never a throw.
+      makeRoleReviewerLlm: (spec, o) => {
+        // Defensive: the seam is only called with a resolved `roleReviewer`, so this is unreachable today.
+        if (!roleReviewerSelection) return { reason: 'role-reviewer-unconfigured' };
+        const availability = subscriptionReviewerAvailability(spec, roleReviewerSelection.cap, process.env);
+        if (!availability.spawn) return { reason: availability.reason ?? 'subscription reviewer unavailable' };
+        const spawn = availability.spawn;
+        // handshakeTimeoutMs left to the adapter default (min(timeoutMs, 60s)) — the harness lane passes none either.
+        return {
+          backend: 'claude',
+          llm: makeRoleAcpReviewLLM({ cwd: process.cwd(), backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env, timeoutMs: o.timeoutMs }),
+        };
+      },
       registerSink: async (surface) => { await registerStandaloneLogSink(surface); },
       log: (event, data, o) => debug.log('self-review', event, data, o ?? {}),
       info: (t) => ui.info(t),
@@ -5743,7 +5837,7 @@ selfCmd
       now: () => Date.now(),
       envModel: () => process.env.ELANOUS_PR_REVIEW_MODEL,
     });
-    if (opts.json) await writeStdoutJson(JSON.stringify(results.length === 1 ? results[0] : results) + '\n');
+    if (opts.json) await writeStdoutJson(selfReviewJsonLine(results));
   });
 
 selfCmd
@@ -6996,7 +7090,7 @@ const selfDevCmd = program
   .option('--no-commit', 'external+pty: 완료 시 자동 commit 생략')
   .option('--deliverable <hint>', 'external+pty: 산출물 유형 힌트')
   .option('--screens <dir>', 'external+pty: 스크린 캡처 디렉토리')
-  .option('--json', 'hold 결과를 한 줄 JSON으로 · --hold 전용')
+  .option('--json', 'hold 결과 또는 self --ask/--say 전제 검사 중단을 한 줄 JSON으로 출력 (--target 경로도 유지)')
   // ⭐ 역할별 LLM — 「한 번 정하고 아래로는 인자로만」(RFC-role-scoped-llm-selection-2026-08-18 §4e).
   //   ⛔ 모르는 역할·provider·tier 는 «거부»한다 — 110차에 `--acp-backend` 가 조용히 무시돼
   //   API 로 새어 나간 것이 이 플래그가 fail-closed 인 이유다.
@@ -7049,8 +7143,8 @@ const selfDevCmd = program
 
     // ⭐ 여기부터가 「가드가 덮는 구간」이다 — 위로 올릴 것은 아무것도 없다.
     const invokedAsDrive = command.parent?.args[0] === 'drive';
-    if (opts.json === true && opts.hold !== true && (opts.target === undefined || opts.backend !== 'self' || opts.elanous === true || opts.implement === true || opts.goal !== undefined || opts.plan === true || opts.ask !== undefined || opts.say !== undefined || opts.attach !== undefined)) {
-      console.error('❌ --json은 --hold 전용입니다');
+    if (opts.json === true && opts.hold !== true && (opts.backend !== 'self' || opts.elanous === true || opts.implement === true || opts.goal !== undefined || opts.plan === true || opts.attach !== undefined || (opts.target === undefined && opts.ask === undefined && opts.say === undefined))) {
+      console.error('❌ --json은 --hold, self --target 또는 self --ask/--say 전제 검사 중단 전용입니다');
       completionGuard.conclude();
       process.exit(2);
     }
@@ -7232,6 +7326,10 @@ const selfDevCmd = program
         askAuthoredFile = flowResult.goalFile;
         if (flowResult.kind === 'stopped-by-preflight') {
           releaseAuthoringLease();
+          if (opts.json) {
+            const terminalResult = { kind: 'self', ok: false, stage: 'preflight-blocked', blockers: flowResult.blockers };
+            await writeStdoutJson(`${JSON.stringify(terminalResult)}\n`);
+          }
           completionGuard.conclude();
           process.exit(1);
         }
@@ -7325,6 +7423,7 @@ const selfDevCmd = program
       if (!opts.json && !invokedAsDrive && explicitOptions.includes('backend') && executor.kind === 'external') {
         console.error(`[dev] 외부 backend 미션의 자기 명령은 \`elanous agent-mission mission\` 입니다; 대응 명령: elanous agent-mission mission --backend ${executor.backend}`);
       }
+      await devCli.ensureOpenRouterChildModelLive(devOpts.childLlmProvider, devOpts.childLlmModel);
       let spec = invokedAsDrive
         ? devCli.buildDriveAliasDevSpec(hasText ? textParts.join(' ') : undefined, devOpts, devCli.explicitDevOptionNames(command), devRunId)
         : buildDevCliSpec(input, executor, devOpts, devCli.explicitDevOptionNames(command), 'cli-dev-ask', undefined, undefined, devRunId);

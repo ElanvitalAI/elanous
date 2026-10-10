@@ -10,6 +10,7 @@ export interface WizardResearchDraft {
     credentials?: Array<{ name: string }>;
   }>;
   skill?: { description: string; instructions: string; requires?: string[] };
+  requires?: { knowledgePacks?: string[] };
 }
 
 const SLUG = /^[a-z0-9][a-z0-9-]{1,31}$/;
@@ -46,9 +47,16 @@ export function generateWizardFiles(dir: string, slug: string, draft: WizardRese
   if (!Array.isArray(requires) || requires.some(resource => typeof resource !== 'string' || !knownResources.has(resource))) {
     throw new Error('wizard requires must reference existing resource ids');
   }
+  if (draft.requires !== undefined && (!draft.requires || typeof draft.requires !== 'object' || Array.isArray(draft.requires) ||
+    Object.keys(draft.requires).some(key => key !== 'knowledgePacks') ||
+    (draft.requires.knowledgePacks !== undefined && (!Array.isArray(draft.requires.knowledgePacks) ||
+      draft.requires.knowledgePacks.some(pack => typeof pack !== 'string' || !pack.trim()))))) {
+    throw new Error('wizard knowledge packs must be non-empty names');
+  }
   const manifestPath = join(dir, 'plugin.json');
   const existing = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-    name: string; description?: string; extensions: { 'ai.elanous': { connectors?: unknown[]; graphs?: string[]; researchDraft?: boolean } };
+    name: string; description?: string; requires?: { knowledgePacks?: string[]; [key: string]: unknown };
+    extensions: { 'ai.elanous': { connectors?: unknown[]; graphs?: string[]; researchDraft?: boolean } };
   } : undefined;
   if (existing && (existing.name !== slug || !existing.extensions?.['ai.elanous'])) {
     throw new Error('wizard scaffold name or extension mismatch');
@@ -69,9 +77,13 @@ export function generateWizardFiles(dir: string, slug: string, draft: WizardRese
     throw new Error('wizard cannot replace existing scaffold connectors');
   }
   const manifest = existing ?? { name: slug, version: '0.1.0', description: draft.description,
+    requires: undefined as { knowledgePacks?: string[]; [key: string]: unknown } | undefined,
     extensions: { 'ai.elanous': { graphs: [`./graphs/${slug}.yaml`],
       capabilities: ['fs:workdir', 'proc:bun', 'proc:elanous'], connectors: [] as unknown[], researchDraft: true } } };
   if (options.regenerate) manifest.description = draft.description;
+  if (draft.requires?.knowledgePacks !== undefined) {
+    manifest.requires = { ...manifest.requires, knowledgePacks: [...new Set(draft.requires.knowledgePacks)] };
+  }
   manifest.extensions['ai.elanous'].connectors = connectors;
   manifest.extensions['ai.elanous'].researchDraft = true;
 
@@ -125,7 +137,8 @@ export function listWizardDrafts(parent: string): Array<{ name: string; descript
       const skillPath = join(skillDir, 'SKILL.md');
       if (lstatSync(manifestPath).isSymbolicLink() || lstatSync(skillDir).isSymbolicLink() || lstatSync(skillPath).isSymbolicLink()) return [];
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-        name?: string; description?: string; extensions?: { 'ai.elanous'?: { researchDraft?: boolean; connectors?: Array<{ id: string; fields: Array<{ name: string }> }> } } };
+        name?: string; description?: string; requires?: { knowledgePacks?: string[] };
+        extensions?: { 'ai.elanous'?: { researchDraft?: boolean; connectors?: Array<{ id: string; fields: Array<{ name: string }> }> } } };
       if (manifest.name !== entry.name || manifest.extensions?.['ai.elanous']?.researchDraft !== true) return [];
       const skill = readFileSync(skillPath, 'utf8');
       const parts = /^---\n([\s\S]*?)---\n\n([\s\S]*)$/.exec(skill);
@@ -134,6 +147,7 @@ export function listWizardDrafts(parent: string): Array<{ name: string; descript
       return [{ name: entry.name, description: manifest.description, draft: {
         description: manifest.description,
         connectors: manifest.extensions['ai.elanous'].connectors?.map(connector => ({ id: connector.id, credentials: connector.fields.map(field => ({ name: field.name })) })) ?? [],
+        ...(manifest.requires?.knowledgePacks !== undefined ? { requires: { knowledgePacks: manifest.requires.knowledgePacks } } : {}),
         skill: { description: meta.description ?? manifest.description, instructions: parts[2]!.trimEnd(), requires: meta.requires ?? [] },
       } }];
     } catch { return []; }

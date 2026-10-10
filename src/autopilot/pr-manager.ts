@@ -209,8 +209,16 @@ export function resolveDeliverableBase(
   explicit?: string,
 ): string | undefined {
   const e = explicit?.trim();
-  if (e) return e;
   const opts = { cwd };
+  if (e) {
+    if (e.startsWith('origin/') || run('git', ['-C', cwd, 'rev-parse', '--verify', '--quiet', e], opts).ok) return e;
+    const resolved = `origin/${e}`;
+    if (run('git', ['-C', cwd, 'rev-parse', '--verify', '--quiet', resolved], opts).ok) {
+      debug.log('autopilot.pr-manager', 'base-resolved-remote', { explicit: e, resolved });
+      return resolved;
+    }
+    return e;
+  }
   const head = run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'origin/HEAD'], opts);
   const headRef = head.ok ? head.out.trim() : '';
   // `origin/HEAD` 미설정 리포는 "origin/HEAD" 를 그대로 되돌려주기도 한다 → 해소 실패로 취급.
@@ -359,8 +367,9 @@ export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
       //   (node_modules·apps/pwa/out 심링크)를 이미 자동 skip 하는데, `:(exclude)<ignored>` 로 명시 지목하면
       //   git 이 "paths ignored by .gitignore … use -f" 로 exit 1 을 뱉는다(staging 은 성공하지만 exit≠0).
       //   그간 이게 add 실패로 오판돼 makePr null→pr-failed→budget 오힐 교착. gitignore 안 된 것만 exclude.
-      // ★ 최초 base 해석을 일반 경로의 판정과 PR 생성에 그대로 공유한다. self-base 인수 발사만
-      //   `branch..HEAD`의 구조적 0을 피하려 upstream 비교 ref와 기본 PR base를 추가 해석한다.
+      // ★ 최초 base 해석을 일반 경로의 판정과 PR 생성에 그대로 공유한다. 명시 base가 원격 추적으로만
+      //   존재하면 여기서 해석한 ref로 rev-list·diff를 비교하고 PR 생성에는 브랜치명만 전달한다.
+      //   self-base 인수 발사만 `branch..HEAD`의 구조적 0을 피하려 upstream 비교 ref와 기본 PR base를 추가 해석한다.
       const resolvedBase = resolveDeliverableBase(run, cwd, input.base);
       const selfBase = Boolean(resolvedBase && isBranchSelfRef(resolvedBase, input.branch));
       let comparisonBase = resolvedBase;

@@ -3,7 +3,13 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { debug } from '../debug/log.js';
+import { ensureInternalMarketIndex, ensureMarketIndex, type MarketFetchOptions } from '../plugins/install/market-fetch.js';
+import { scanPackInternalRefs } from '../market/pack-internal-refs.js';
+import { createPack } from '../knowledge/kgs/pack.js';
+import { KgsSqliteStore } from '../knowledge/kgs/sqlite-store.js';
+import type { KnowledgeCard, KnowledgeKind } from '../knowledge/kgs/types.js';
 
 export interface GiftInstallOptions {
   pack: string;
@@ -22,6 +28,119 @@ export interface GiftInstallOptions {
 export type GiftInstallResult =
   | { ok: true; names: string[]; paths: string[]; collisions: string[]; needsKeys: boolean; message: string }
   | { ok: false; reason: string; message: string };
+
+export type KnowledgePackInstallResult =
+  | { ok: true; packId: string; citations: string[] }
+  | { ok: false; reason: string };
+
+/** Install a named knowledge pack from a configured, signed market; no gift code or skill target is involved. */
+export async function installMarketKnowledgePack(input: {
+  pack: string;
+  market: string;
+  enterpriseId?: string;
+  marketOptions?: MarketFetchOptions;
+  fetch?: typeof fetch;
+  store?: Pick<KgsSqliteStore, 'writePack'>;
+}): Promise<KnowledgePackInstallResult> {
+  try {
+    const verified = input.enterpriseId
+      ? await ensureInternalMarketIndex(input.market, input.enterpriseId, input.marketOptions)
+      : await ensureMarketIndex(input.market, input.marketOptions);
+    const entry = verified.index.knowledgePacks?.find(item => item.name === input.pack);
+    if (!entry || (input.enterpriseId ? entry.visibility !== 'internal' || entry.enterpriseId !== input.enterpriseId : entry.visibility !== 'public')) {
+      return { ok: false, reason: 'pack-not-in-verified-market' };
+    }
+    const key = entry.artifact.key;
+    if (!key || key.startsWith('/') || key.includes('\\') || key.split('/').some(part => !part || part === '.' || part === '..')) {
+      return { ok: false, reason: 'invalid-artifact-key' };
+    }
+    const base = new URL(verified.market.url);
+    const artifactUrl = new URL(key, base);
+    if (key.includes('%') || key.includes('?') || key.includes('#') || base.protocol !== 'https:') return { ok: false, reason: 'invalid-artifact-key' };
+    if (artifactUrl.origin !== base.origin || !artifactUrl.pathname.startsWith(base.pathname) || artifactUrl.search || artifactUrl.hash) {
+      return { ok: false, reason: 'invalid-artifact-key' };
+    }
+    if (entry.artifact.bytes > MAX_DOWNLOAD_BYTES) return { ok: false, reason: 'artifact-mismatch' };
+    const response = await (input.fetch ?? fetch)(artifactUrl.href, { redirect: 'error' });
+    if (!response.ok || response.redirected || (response.url && response.url !== artifactUrl.href)) return { ok: false, reason: 'artifact-download-failed' };
+    const reader = response.body?.getReader();
+    if (!reader) return { ok: false, reason: 'artifact-download-failed' };
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > MAX_DOWNLOAD_BYTES || length > entry.artifact.bytes) { await reader.cancel(); return { ok: false, reason: 'artifact-mismatch' }; }
+      chunks.push(value);
+    }
+    const bytes = Buffer.concat(chunks);
+    if (bytes.length !== entry.artifact.bytes ||
+      createHash('sha256').update(bytes).digest('hex').toLowerCase() !== entry.artifact.sha256.toLowerCase()) {
+      return { ok: false, reason: 'artifact-mismatch' };
+    }
+    const archive = gunzipSync(bytes, { maxOutputLength: MAX_UNPACKED_BYTES });
+    const files = new Map<string, string>();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let endOffset = 0;
+    for (let offset = 0; offset + 512 <= archive.length;) {
+      const header = archive.subarray(offset, offset + 512);
+      if (header.every(byte => byte === 0)) { endOffset = offset; break; }
+      const field = (start: number, end: number) => header.subarray(start, end).toString('utf8').replace(/\0.*$/, '');
+      const checksum = parseInt(field(148, 156).trim(), 8);
+      const actualChecksum = header.reduce((sum, byte, index) => sum + (index >= 148 && index < 156 ? 32 : byte), 0);
+      if (checksum !== actualChecksum) return { ok: false, reason: 'invalid-archive' };
+      const size = parseInt(field(124, 136).trim(), 8);
+      const name = field(0, 100);
+      const prefix = field(345, 500);
+      const path = prefix ? `${prefix}/${name}` : name;
+      if (!Number.isSafeInteger(size) || size < 0 || !path || path.includes('\\') ||
+        path.split('/').some(part => !part || part === '.' || part === '..') || header[156] !== 48 ||
+        offset + 512 + size > archive.length || files.has(path)) return { ok: false, reason: 'invalid-archive' };
+      files.set(path, decoder.decode(archive.subarray(offset + 512, offset + 512 + size)));
+      offset += 512 + Math.ceil(size / 512) * 512;
+      if (files.size > MAX_ENTRIES) return { ok: false, reason: 'invalid-archive' };
+    }
+    if (!endOffset || archive.length - endOffset < 1024 || !archive.subarray(endOffset).every(byte => byte === 0)) return { ok: false, reason: 'invalid-archive' };
+    const manifest = JSON.parse(files.get('knowledge-pack.json') ?? 'null') as Record<string, unknown> | null;
+    if (files.size !== (Array.isArray(manifest?.content) ? manifest.content.length + 1 : -1)) return { ok: false, reason: 'invalid-content' };
+    if (!manifest || manifest.kind !== 'knowledge-pack' || manifest.name !== entry.name || manifest.version !== entry.version ||
+      !/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/.test(entry.name) || !/^\d+\.\d+\.\d+$/.test(entry.version) ||
+      typeof manifest.description !== 'string' || !manifest.description || manifest.description.length > 200 ||
+      !Array.isArray(manifest.content) || !manifest.content.length ||
+      !Array.isArray(manifest.dependencies) || manifest.dependencies.length !== 0 ||
+      manifest.visibility !== entry.visibility || typeof manifest.license !== 'string' || !manifest.license ||
+      !manifest.signature || typeof manifest.signature !== 'object' ||
+      (manifest.signature as Record<string, unknown>).algorithm !== 'ed25519' ||
+      (manifest.signature as Record<string, unknown>).keyId !== verified.keyId) return { ok: false, reason: 'invalid-manifest' };
+    const now = new Date().toISOString();
+    const cards: KnowledgeCard[] = [];
+    for (const item of manifest.content) {
+      if (!item || typeof item !== 'object') return { ok: false, reason: 'invalid-content' };
+      const { path, kind } = item as Record<string, unknown>;
+      if (typeof path !== 'string' || !/^content\/[a-z0-9-]+(?:\/[a-z0-9-]+)*\.md$/.test(path) || typeof kind !== 'string' ||
+        !['document', 'glossary', 'procedure', 'rule', 'qa'].includes(kind) || !files.has(path)) return { ok: false, reason: 'invalid-content' };
+      const body = files.get(path)!;
+      cards.push({ schema_version: 2, id: path, createdAt: now, updatedAt: now, author: entry.name,
+        title: body.match(/^# (.+)$/m)?.[1] ?? path, body, nature: 'fact',
+        kind: ({ procedure: 'playbook', glossary: 'wiki', qa: 'card', rule: 'checklist', document: 'note' } as Record<string, KnowledgeKind>)[kind]!,
+        reliability: 'self-reported', source: { kind: 'external', url: artifactUrl.href }, tags: [entry.name] });
+    }
+    if (cards.length > 200 || new Set(cards.map(card => card.id)).size !== cards.length ||
+      scanPackInternalRefs([...files].map(([path, text]) => ({ path, text }))).length) return { ok: false, reason: 'invalid-content' };
+    const pack = createPack({ id: { slug: entry.name, version: entry.version }, title: manifest.description as string,
+      intent: manifest.description as string, audience: input.enterpriseId ? 'team' : 'public', kind: 'generic',
+      author: entry.name, cards });
+    if (input.store) input.store.writePack(pack);
+    else {
+      const store = new KgsSqliteStore();
+      try { store.writePack(pack); } finally { store.close(); }
+    }
+    return { ok: true, packId: `pack:${entry.name}@${entry.version}`, citations: cards.map(card => `pack:${entry.name}@${entry.version}#${card.id}`) };
+  } catch {
+    return { ok: false, reason: 'knowledge-pack-install-failed' };
+  }
+}
 
 // GK1 public bundle: packs/elanous-essentials/plugin.json extensions.ai.elanous.bundle.
 const ESSENTIAL_SKILLS = ['youtube-master', 'omni-crawl', 'omni-digest', 'diagram-master', 'lecture-note-digitizer'];

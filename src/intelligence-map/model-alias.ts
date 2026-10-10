@@ -35,6 +35,12 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = {
   'opus-5':          'claude-opus-5',
   'opus-4-8':        'claude-opus-4-8',
   'opus-4-7':        'claude-opus-4-7',    // 하위호환
+  // ⭐ 2026-10-10 (MK) — 5.5 세대는 판을 붙여서만 부른다(맨몸 `sonnet`·`haiku` 는 옮기지 않았다 — 별개 결정).
+  //   공식 API id 는 하이픈(`claude-sonnet-5-5`)인데 OpenRouter·사람은 점(`claude-sonnet-5.5`)으로 쓴다 — 둘 다 받는다.
+  'sonnet-5-5':        'claude-sonnet-5-5',
+  'haiku-5-5':         'claude-haiku-5-5',
+  'claude-sonnet-5.5': 'claude-sonnet-5-5',
+  'claude-haiku-5.5':  'claude-haiku-5-5',
   // Google Gemini family
   'flash':           'gemini-3.8-flash',   // ⭐ 2026-09-25 최신 flash(models.list 실측)
   'flash-3-7':       'gemini-3.7-flash',

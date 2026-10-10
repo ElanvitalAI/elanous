@@ -9,7 +9,7 @@ import { withFileLockSync } from '../../storage/file-lock.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
 import { finishAdvice, measureFinish, type FinishAdvice, type FinishMetrics, type MeasureFinishDeps } from './finish-rate.js';
 import { collectAuthorDepth, type AuthorDepthResult, type CollectAuthorDepthDeps } from './author-depth.js';
-import { calculateSeatBaseShares } from './seat-share.js';
+import { budgetTrafficTick } from '../budget.js';
 
 export const TRAFFIC_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TrafficCell = Pick<ChecklistItem, 'id' | 'title' | 'owner' | 'status'>;
@@ -49,88 +49,12 @@ function realOrResolved(path: string): string {
   try { return realpathSync(path); } catch { return resolve(path); }
 }
 
-const IS_LAUNCH = /(?:^|\s)(?:\S*\/)?elanous\.mjs\s+(?:(?:--test|--config-dir\s+\S+)\s+)?harness\s+(?:ask|say)(?=\s|$)/;
 /** A `harness ask|say` launch command line — the only processes `trafficTick` counts. */
-export const isTrafficLaunch = (command: string): boolean => IS_LAUNCH.test(command);
+export { isTrafficLaunch } from '../budget.js';
 
-/** Process-to-seat resolution occurs at the boundary; this decision does no IO. */
-export function trafficTick({ processes, now, caps, lastLaunchAt, idleSince, openCells, nextRound, totalSlots, idleMinutes = 30 }: {
-  processes: readonly TrafficProcess[];
-  now: Date;
-  caps: Readonly<Record<OrchestratorSeat, number>>;
-  lastLaunchAt?: Partial<Record<OrchestratorSeat, Date | null>>;
-  idleSince?: Partial<Record<OrchestratorSeat, Date | null>>;
-  openCells: readonly TrafficCell[];
-  nextRound?: readonly TrafficCell[];
-  totalSlots?: number;
-  idleMinutes?: number;
-}): TrafficResult {
-  const launches = processes.filter(process => IS_LAUNCH.test(process.command));
-  const slotBudget = totalSlots ?? TRAFFIC_SEATS.reduce((sum, seat) => sum + caps[seat], 0);
-  // A missing next round is unknown, not an empty round with zero remaining work.
-  const baseShares = nextRound === undefined ? null : calculateSeatBaseShares({
-    totalSlots: slotBudget, currentRound: openCells, nextRound, seatCaps: caps,
-  });
-  const seats = TRAFFIC_SEATS.map((seat): TrafficSeatRow => {
-    const owned = launches.filter(process => process.seat === seat);
-    const latest = owned.reduce<number | null>((current, process) => {
-      if (!Number.isFinite(process.elapsedSeconds) || process.elapsedSeconds < 0) return current;
-      const start = now.getTime() - process.elapsedSeconds * 1000;
-      return current === null ? start : Math.max(current, start);
-    }, null);
-    const fallback = owned.length ? lastLaunchAt?.[seat]?.getTime() : undefined;
-    const idleStart = idleSince?.[seat]?.getTime();
-    const last = idleStart !== undefined && Number.isFinite(idleStart) ? idleStart
-      : latest ?? (fallback !== undefined && Number.isFinite(fallback) ? fallback : null);
-    const idleFor = last === null ? null : Math.max(0, Math.floor((now.getTime() - last) / 60_000));
-    const nextCell = openCells.find(cell => cell.status !== 'done' && cell.owner?.split('/')[0] === seat) ?? null;
-    const baseShare = baseShares?.[seat] ?? null;
-    return { seat, running: owned.length, cap: caps[seat], baseShare, borrowed: 0, lent: 0,
-      launchCap: baseShare === null ? caps[seat] : Math.max(owned.length, baseShare), idleFor,
-      idle: owned.length < caps[seat] && last !== null && now.getTime() - last > idleMinutes * 60_000, nextCell };
-  });
-  if (baseShares !== null) {
-    // Account for outstanding loans before lending new capacity. A returning
-    // lender cannot launch into a slot still occupied by the borrower's run.
-    for (const borrower of seats) {
-      let excess = Math.max(0, borrower.running - borrower.baseShare!);
-      borrower.borrowed += excess;
-      for (const lender of seats) {
-        if (!excess) break;
-        if (lender === borrower) continue;
-        const amount = Math.min(excess, Math.max(0, lender.baseShare! - lender.running - lender.lent));
-        lender.lent += amount;
-        excess -= amount;
-      }
-    }
-    for (const lender of seats) {
-      if (lender.nextCell) continue;
-      let available = Math.max(0, lender.baseShare! - lender.running - lender.lent);
-      for (const borrower of seats) {
-        if (!available) break;
-        if (borrower === lender || !borrower.nextCell) continue;
-        const needed = Math.max(0, Math.min(borrower.cap, borrower.running + 1) - borrower.launchCap);
-        const amount = Math.min(available, needed);
-        lender.lent += amount;
-        borrower.borrowed += amount;
-        borrower.launchCap += amount;
-        available -= amount;
-      }
-    }
-    for (const lender of seats) lender.launchCap = Math.max(lender.running, lender.launchCap - lender.lent);
-  }
-  // Reserve one available global slot per possible request, including unknown-seat
-  // launches in the occupied count; returning a lent share does not end its old run.
-  let freeSlots = Math.max(0, slotBudget - launches.length);
-  for (const row of seats) {
-    if (row.nextCell && row.idle && row.running < row.launchCap) {
-      if (freeSlots > 0) freeSlots--;
-      else row.launchCap = row.running;
-    }
-    row.idle = row.idle && (row.nextCell === null || row.running < row.launchCap);
-    if (!row.idle) row.nextCell = null;
-  }
-  return { seats, unassigned: launches.filter(process => process.seat === null).length, now, idleMinutes };
+/** Process observation stays at the boundary; the shared resource loop owns the decision. */
+export function trafficTick(input: Parameters<typeof budgetTrafficTick>[0]): TrafficResult {
+  return budgetTrafficTick(input);
 }
 
 export function withFinishAdvice(result: TrafficResult, deps: MeasureFinishDeps = {}): TrafficResult {

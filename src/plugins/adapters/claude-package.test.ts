@@ -169,6 +169,20 @@ describe('readClaudePackageLedger', () => {
     });
   });
 
+  test('retains installed packages without marketplace metadata, without inventing a source', () => {
+    withTempRoot((root) => {
+      writeFileSync(join(root, INSTALLED_PLUGINS_FILENAME), JSON.stringify({ plugins: {
+        'existing@offline-market': [{ scope: 'user', installPath: '/local/existing' }],
+      } }));
+      const result = readClaudePackageLedger({ pluginsRoot: root });
+      expect(result.status).toBe('known-marketplaces-unreadable');
+      expect(result.packages).toMatchObject([{
+        name: 'existing@offline-market', plugin: 'existing', marketplace: 'offline-market',
+        installPath: '/local/existing', source: CLAUDE_PACKAGE_MISSING,
+      }]);
+    });
+  });
+
   test('returns a named status for invalid installed_plugins JSON', () => {
     withTempRoot((root) => {
       writeFileSync(join(root, INSTALLED_PLUGINS_FILENAME), '{not-json');

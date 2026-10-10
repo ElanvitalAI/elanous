@@ -12,6 +12,8 @@ export interface OutboundMsg {
   text: string;
   markdown: boolean;
   kind: string;
+  /** Optional routing role; absent preserves per-kind fan-out. */
+  role?: string;
 }
 
 export interface FormattedMessage {

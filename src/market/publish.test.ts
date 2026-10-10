@@ -30,6 +30,23 @@ function archiveNames(archive: Uint8Array): string[] {
   return names;
 }
 
+function archiveEntries(archive: Uint8Array): Map<string, Buffer> {
+  const tar = gunzipSync(archive);
+  const entries = new Map<string, Buffer>();
+  const field = (part: Buffer) => part.toString().replace(/\0.*$/, '');
+  for (let offset = 0; tar.subarray(offset, offset + 512).some(byte => byte !== 0);) {
+    const h = tar.subarray(offset, offset + 512);
+    const prefix = field(h.subarray(345, 500));
+    const name = field(h.subarray(0, 100));
+    const size = parseInt(field(h.subarray(124, 136)).trim(), 8);
+    const type = String.fromCharCode(h[156] ?? 48);
+    if (type === 'x' || type === 'g') throw new Error('archiveEntries: PAX headers are not parsed here — extend the parser before relying on byte checks');
+    entries.set(prefix ? `${prefix}/${name}` : name, Buffer.from(tar.subarray(offset + 512, offset + 512 + size)));
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
 function treeNames(dir: string, prefix = ''): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -497,7 +514,7 @@ describe('publishMarket', () => {
       market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
     const byName = new Map(result.published.map(item => [item.name, item]));
     expect(result.ok).toBe(false);
-    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-essentials', 'elanous-hwp', 'image-first-shorts', 'video-broll', 'video-explainer']);
+    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-essentials', 'elanous-hwp', 'image-first-shorts', 'video-broll', 'video-explainer', 'web-publish']);
     expect(byName.get('elanous-basics')?.bundled).toContain('google-workspace');
     expect(byName.get('elanous-hwp')?.bundled).toEqual([]);
     expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.2');
@@ -531,6 +548,29 @@ describe('publishMarket', () => {
     for (const name of ['LICENSE', 'SOURCE.md', 'graphs/image-first-shorts.yaml', 'graphs/recipes.yaml', 'graphs/run-step.ts', 'skills/image-first-shorts/SKILL.md']) {
       expect(shorts).toContain(name);
     }
+    expect(byName.get('web-publish')?.bundled).toEqual([]);
+    const web = archiveNames(readFileSync(join(root, 'out', entry('web-publish').artifact.key)));
+    for (const name of ['LICENSE', 'SOURCE.md', 'graphs/web-publish.yaml', 'graphs/recipes.yaml', 'graphs/run-step.ts', 'nodes/web-publish.yaml',
+      ...['SKILL.md', 'scripts/audit-media.mjs', 'agents/openai.yaml', 'assets/project-brief.md', 'examples/evas.md',
+        ...['business-content', 'art-direction', 'media-production', 'scroll-and-mobile', 'verification-and-release'].map(name => `references/${name}.md`)]
+        .map(name => `skills/business-motion-websites/${name}`)]) {
+      expect(web).toContain(name);
+    }
+    expect(treeNames(join(root, 'out', 'plugins', 'web-publish'))).toEqual(web);
+    const webEntries = archiveEntries(readFileSync(join(root, 'out', entry('web-publish').artifact.key)));
+    for (const name of web) {
+      expect(readFileSync(join(root, 'out', 'plugins', 'web-publish', name))).toEqual(readFileSync(join(repo, 'packs', 'web-publish', name)));
+      expect(webEntries.get(name)).toEqual(readFileSync(join(repo, 'packs', 'web-publish', name)));
+    }
+    const webLicense = readFileSync(join(root, 'out', 'plugins', 'web-publish', 'LICENSE'), 'utf8');
+    const [notice1, notice2, blank, ...mit] = webLicense.split('\n');
+    expect(notice1).toBe('Required Notice: Copyright 2026 ElanvitalAI (https://github.com/ElanvitalAI/elanous)');
+    expect(notice2?.startsWith('Required Notice: Includes business-motion-websites, Copyright (c) 2026 passeth (MIT)')).toBe(true);
+    expect(blank).toBe('');
+    // 원 MIT 전문(고정 커밋의 LICENSE blob 3a7bc745…)이 그대로 뒤따른다.
+    const mitText = mit.join('\n');
+    expect(createHash('sha1').update(`blob ${Buffer.byteLength(mitText)}\0`).update(mitText).digest('hex')).toBe('3a7bc74573fd7701443dd8459b9f90e5aee42229');
+    expect(readFileSync(join(root, 'out', 'plugins', 'web-publish', 'SOURCE.md'), 'utf8')).toContain('fe5e8b0ae3a208efba751d3dd13aa168afd4fa74');
     expect(existsSync(join(repo, 'packs', 'elanous-basics', 'skills'))).toBe(false);
     expect(existsSync(join(repo, 'packs', 'video-broll', 'graphs'))).toBe(false);
   }));

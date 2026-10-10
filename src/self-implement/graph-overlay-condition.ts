@@ -53,6 +53,10 @@ export function evaluateOverlayCondition(
   const { key, operator, literal } = parsed.condition;
   if (!(key in state)) return { kind: 'key-absent', key };
   const actual = state[key];
+  if (actual === undefined || actual === null) return { kind: 'key-absent', key };
+  // Measured boolean branch keys accept only a real boolean observation — any textual lookalike
+  // ('true', 'TRUE', 'yes', 1) is unknown, whatever the literal spelling in the condition.
+  if ((key === 'sibling_overlap' || key === 'main_sync_conflict') && typeof actual !== 'boolean') return { kind: 'key-absent', key };
 
   if (typeof literal === 'number') {
     // ⛔ 수 비교인데 값이 수가 아니면 「비교 불가」다 — 거짓으로 접지 않는다.

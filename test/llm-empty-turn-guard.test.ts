@@ -9,7 +9,7 @@
 // still be re-prompted.
 
 import { describe, test, expect } from 'bun:test';
-import { streamLLMWithTools } from '../src/llm';
+import { buildNoFinalSynthesisLead, streamLLMWithTools } from '../src/llm';
 import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 
 function scriptedProvider(turns: LLMStreamEvent[][]): { provider: LLMProvider; callsSeen: () => number } {
@@ -28,6 +28,112 @@ function scriptedProvider(turns: LLMStreamEvent[][]): { provider: LLMProvider; c
 }
 
 describe('streamLLMWithTools — empty-turn guard', () => {
+  test('budget-exhausted lead uses the requested locale and actual tool count', () => {
+    const ko = buildNoFinalSynthesisLead('budget-exhausted', 7, 'ko');
+    const en = buildNoFinalSynthesisLead('budget-exhausted', 7, 'en');
+    expect(ko).toContain('답을 끝까지 쓰지 못했습니다');
+    expect(ko).toContain('7번');
+    expect(ko).toContain('다시 물어 주세요');
+    expect(en).toContain('7');
+    expect(en).toContain('Please ask a narrower question');
+    expect(en).not.toMatch(/[가-힣]/);
+    const ja = buildNoFinalSynthesisLead('budget-exhausted', 7, 'ja');
+    expect(ja).toContain('7');
+    expect(ja).not.toMatch(/[가-힣]/);
+    expect(ja).not.toBe(en);
+  });
+
+  test('empty-turn lead describes repeated empty replies instead of tool use', () => {
+    expect(buildNoFinalSynthesisLead('empty-turn', 0, 'ko')).toContain('빈 응답이 이어졌습니다');
+    expect(buildNoFinalSynthesisLead('empty-turn', 0, 'en')).toContain('repeated empty responses');
+    expect(buildNoFinalSynthesisLead('empty-turn', 0, 'ko')).not.toContain('0번');
+  });
+
+  test('three empty turns put the human lead first and preserve the internal notice', async () => {
+    const { provider } = scriptedProvider([[], [], []]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'hi' }],
+      { onText: () => {}, dispatchTool: async () => ({}) },
+      { provider, tools: [{ name: 'X', description: 'd', parameters: { type: 'object' } }], maxTurns: 10 },
+    );
+    expect(result.split('\n')[0]).not.toStartWith('[NO FINAL SYNTHESIS]');
+    expect(result).toContain('\n\n[NO FINAL SYNTHESIS]');
+  });
+
+  test('tool exhaustion puts the count-aware lead before notice and summary', async () => {
+    const { provider } = scriptedProvider([
+      [{ type: 'tool_call', id: '1', name: 'X', args: {} }],
+      [{ type: 'tool_call', id: '2', name: 'X', args: {} }],
+      [{ type: 'tool_call', id: '3', name: 'X', args: {} }],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'hi' }],
+      { onText: () => {}, dispatchTool: async () => 'tool-out' },
+      { provider, tools: [{ name: 'X', description: 'd', parameters: { type: 'object' } }], maxTurns: 3 },
+    );
+    expect(result.split('\n')[0]).toBe(buildNoFinalSynthesisLead('budget-exhausted', 3));
+    expect(result).toContain('\n\n[NO FINAL SYNTHESIS]');
+  });
+
+  test('tool exhaustion uses the configured Korean locale at the start of the reply', async () => {
+    const previous = process.env.ELANOUS_LANG;
+    process.env.ELANOUS_LANG = 'ko';
+    try {
+      const { provider } = scriptedProvider([
+        [{ type: 'tool_call', id: '1', name: 'X', args: {} }],
+        [{ type: 'tool_call', id: '2', name: 'X', args: {} }],
+        [{ type: 'tool_call', id: '3', name: 'X', args: {} }],
+      ]);
+      const result = await streamLLMWithTools(
+        [{ role: 'user', content: 'hi' }],
+        { onText: () => {}, dispatchTool: async () => 'tool-out' },
+        { provider, tools: [{ name: 'X', description: 'd', parameters: { type: 'object' } }], maxTurns: 3 },
+      );
+      expect(result.split('\n')[0]).toContain('도구를 3번');
+      expect(result).toContain('\n\n[NO FINAL SYNTHESIS]');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_LANG;
+      else process.env.ELANOUS_LANG = previous;
+    }
+  });
+
+  test('empty-turn after earlier planning text still opens with the human lead', async () => {
+    const { provider } = scriptedProvider([
+      [
+        { type: 'text', delta: 'I will look this up.' },
+        { type: 'tool_call', id: '1', name: 'X', args: {} },
+      ],
+      [], [], [],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'hi' }],
+      { onText: () => {}, dispatchTool: async () => 'tool-out' },
+      { provider, tools: [{ name: 'X', description: 'd', parameters: { type: 'object' } }], maxTurns: 10 },
+    );
+    expect(result.split('\n')[0]).toBe(buildNoFinalSynthesisLead('empty-turn', 1));
+    expect(result).toContain('\n\n[NO FINAL SYNTHESIS]');
+    expect(result).not.toContain('I will look this up.');
+  });
+
+  test('budget exhaustion after earlier planning text still opens with the human lead', async () => {
+    const { provider } = scriptedProvider([
+      [
+        { type: 'text', delta: 'I will look this up.' },
+        { type: 'tool_call', id: '1', name: 'X', args: {} },
+      ],
+      [{ type: 'tool_call', id: '2', name: 'X', args: {} }],
+      [{ type: 'tool_call', id: '3', name: 'X', args: {} }],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'hi' }],
+      { onText: () => {}, dispatchTool: async () => 'tool-out' },
+      { provider, tools: [{ name: 'X', description: 'd', parameters: { type: 'object' } }], maxTurns: 3 },
+    );
+    expect(result.split('\n')[0]).toBe(buildNoFinalSynthesisLead('budget-exhausted', 3));
+    expect(result).toContain('\n\n[NO FINAL SYNTHESIS]');
+    expect(result).not.toContain('I will look this up.');
+  });
+
   test('empty turn triggers re-prompt instead of returning immediately', async () => {
     // Turn 0: empty (no text, no tool_call) — should trigger reminder + retry
     // Turn 1: text 'done' — normal completion

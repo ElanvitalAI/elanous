@@ -84,6 +84,24 @@ test('a verdict without reviewed true never lands', async () => {
   await executeNextAction(action, f.deps);
   expect(f.calls.map(c => c[0])).toEqual(['self']);
 });
+// TA-LAND-MUSTFIX-ZERO — «pass ⊕ must-fix» 와 «must-fix 모름» 은 land 로 가지 않고 카드로 간다(관측 사유 포함).
+test('pass with must-fix raises a card and never lands (review-warn-with-must-fix)', async () => {
+  const f = fake({ verdict: 'pass', mustFix: ['still broken'], reviewed: true });
+  expect(await executeNextAction(action, f.deps)).toBe('decision');
+  expect(f.calls.map(c => c.slice(0, 2))).toEqual([['self', 'review'], ['decisions', 'raise']]);
+  expect(f.calls.some(c => c[0] === 'pr')).toBe(false);
+  expect(f.events.at(-1)).toMatchObject({ kind: 'review', result: 'decision', reason: expect.stringContaining('review-warn-with-must-fix') });
+});
+test('pass without a must-fix list raises a card and never lands (review-must-fix-unknown)', async () => {
+  const f = fake();
+  f.deps.command = async args => { f.calls.push(args); return { status: 0, stdout: args[0] === 'self' ? JSON.stringify({ verdict: 'pass', reviewed: true }) : '' }; };
+  expect(await executeNextAction(action, f.deps)).toBe('decision');
+  expect(f.calls.map(c => c.slice(0, 2))).toEqual([['self', 'review'], ['decisions', 'raise']]);
+  expect(f.events.at(-1)).toMatchObject({ result: 'decision', reason: expect.stringContaining('review-must-fix-unknown') });
+  const garbled = fake({ verdict: 'pass', mustFix: [null] as unknown as string[], reviewed: true });
+  expect(await executeNextAction(action, garbled.deps)).toBe('decision');
+  expect(garbled.events.at(-1)).toMatchObject({ reason: expect.stringContaining('review-must-fix-unknown') });
+});
 test('fail retries without rewriting original and includes must-fix and prior run', async () => {
   const f = fake({ verdict: 'fail', mustFix: ['fix this'], reviewed: true });
   await executeNextAction(action, f.deps);

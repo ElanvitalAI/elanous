@@ -57,6 +57,18 @@ export function renderTelegramNow(input: ContextNowAnswer, audience: ContextNowA
  *  release run, late schedules) ahead of the same `/now` body. `/now` itself stays unchanged. */
 export function renderContextFirstNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
   const answer = forAudience(input, audience);
+  const { lines, total } = operationalLines(answer);
+  if (total > lines.length) lines.push(`… 운영 항목 ${total - lines.length}개 더 (/now)`);
+  return [...lines, renderTelegramNow(answer, 'operator')].join('\n');
+}
+
+/** Telegram opening: at most three operational rows and nothing else — no `/now` body, no «최근:» row.
+ *  Empty when nothing operational is running, so the caller sends no opening at all. */
+export function renderContextFirstOpening(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
+  return operationalLines(forAudience(input, audience)).lines.join('\n');
+}
+
+function operationalLines(answer: ContextNowAnswer): { lines: string[]; total: number } {
   const labels = { run: '도는 런', release: '발행 런', 'schedule-late': '지연 스케줄' } as const;
   const operational = answer.facts.filter(fact => fact.kind === 'run' ||
     (fact.kind === 'release' && (fact.unreadable || fact.status !== 'done')) ||
@@ -67,8 +79,7 @@ export function renderContextFirstNow(input: ContextNowAnswer, audience: Context
     const text = fact.kind === 'run' && !fact.unreadable ? `${short(fact.goal.replace(/\s+/g, ' ').trim())} · ${fact.phase} · ${fact.elapsed}` : factText(fact);
     return `${labels[fact.kind as keyof typeof labels]}: ${text} — ${fact.source}`.replace(/\s+/g, ' ').trim();
   });
-  if (operational.length > lines.length) lines.push(`… 운영 항목 ${operational.length - lines.length}개 더 (/now)`);
-  return [...lines, renderTelegramNow(answer, 'operator')].join('\n');
+  return { lines, total: operational.length };
 }
 
 export function renderTuiNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string[] {

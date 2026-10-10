@@ -34,7 +34,8 @@ import { getHarnessSpace, resolveRunIdentity } from './harness-space.js';
 import type { AutonomyRiskHit, HarnessGroundingRef } from '../self-implement/context-capsule.js';
 import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from '../self-implement/context-capsule.js';
 import { verbatimOriginalAsk } from '../self-implement/goal-author.js';
-import { isSupervisorDecisionSection, splitGoalSections, supervisorGoalDigest } from '../self-implement/goal-digest.js';
+import { extractHarnessReviewAcceptance } from '../self-implement/goal-digest.js';
+export { extractHarnessReviewAcceptance } from '../self-implement/goal-digest.js';
 
 const AUTOREVIEW_SENTENCE_LIMIT = 240;
 const SECURITY_RISK_REASON = '보안/인증 정보';
@@ -220,25 +221,6 @@ async function buildPrBody(
     if (!body || !/^\s*##\s*Summary/im.test(body)) return heuristic();
     return [body, ...shouldFixBlock, '', '---', footer].join('\n');
   } catch { return heuristic(); }
-}
-
-/** 골 문서에서 `판정 신호` 절만 뽑아 리뷰 acceptance 로 쓴다. 계보 = self-implement seams. */
-export function extractHarnessReviewAcceptance(goalDocument: string | undefined): { goal: string | undefined; acceptance: string | undefined } {
-  let goal: string | undefined;
-  try {
-    goal = goalDocument?.trim() || undefined;
-  } catch {
-    return { goal: undefined, acceptance: undefined };
-  }
-  if (!goal) return { goal: undefined, acceptance: undefined };
-  try {
-    const acceptance = splitGoalSections(supervisorGoalDigest(goal, 3000).text)
-      .find((section) => isSupervisorDecisionSection(section.title) && section.title.includes('판정 신호'))
-      ?.body.trim() || undefined;
-    return { goal, acceptance };
-  } catch {
-    return { goal, acceptance: undefined };
-  }
 }
 
 function reviewAcceptanceObservation(goal: string | undefined, acceptance: string | undefined): { goalLoaded: boolean; acceptanceChars: number } {

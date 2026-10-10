@@ -33,6 +33,9 @@ test('only opted-in runnable core graphs (including subdirectories) appear, whil
     expect(graphs.map(g => g.id)).not.toContain(id);
   const coreIds = graphs.filter(g => g.path.startsWith(defaultGraphsDir())).map(g => g.id);
   expect(coreIds.sort()).toEqual(['field-feed', 'lecture-note', 'youtube-summary']);
+  expect(graphs.find(g => g.id === 'youtube-summary')).toMatchObject({
+    path: join(defaultGraphsDir(), 'video', 'youtube-summary.yaml'), inputKeys: ['url', 'format'],
+  });
   const core = join(root, 'core');
   mkdirSync(core);
   writeFileSync(join(core, 'no.yaml'), 'graph_id: no\nloop:\n  exec_request: false\n');

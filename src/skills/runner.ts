@@ -3,6 +3,9 @@
 // substitute template variables, and run them through the selected LLM provider.
 
 import { debug } from '../debug/log.js';
+import type { SkillTier } from './skill-tier.js';
+import { randomUUID } from 'node:crypto';
+import { recordSkillRunSafe, type SkillRun } from './skill-feedback.js';
 import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { LOCAL_SKILLS_DIR } from '../config.js';
@@ -307,7 +310,7 @@ export interface SkillManifest {
 }
 
 /** Ordered weak→strong. Session 21. */
-export type SkillTier = 'T3' | 'T2' | 'T1';
+export type { SkillTier } from './skill-tier.js';
 const TIER_RANK: Record<SkillTier, number> = { T3: 1, T2: 2, T1: 3 };
 
 /** True when `active` is at least as strong as `min`. Missing `min`
@@ -690,6 +693,9 @@ export interface ExecuteSkillOpts {
    *  pure-builder input so tests and future callers can reason about
    *  the final message shape without opening the SQLite store. */
   promptBankContext?: string;
+  /** Use this provider instead of resolving one from config/model hint
+   *  (tests and hosts that already hold a provider). */
+  provider?: LLMProvider;
 }
 
 export interface ExecuteSkillResult {
@@ -969,6 +975,57 @@ export async function executeSkill(
   onChunk: (delta: string, full: string) => void,
   opts: ExecuteSkillOpts = {},
 ): Promise<ExecuteSkillResult> {
+  // SK1: one feedback ledger line per run. Recording is fail-soft — the
+  // result returned and the exception thrown are exactly the run's own.
+  let started: number | undefined;
+  try { started = Date.now(); } catch { /* clock trouble must not block the skill */ }
+  const feedback = (outcome: SkillRun['outcome'], failureKind?: string): SkillRun => ({
+    skill: manifest.name,
+    runId: randomUUID(),
+    outcome,
+    ...(failureKind ? { failureKind } : {}),
+    userCorrected: false,
+    retries: 0,
+    durationMs: started === undefined ? 0 : Math.max(0, Date.now() - started),
+    at: new Date().toISOString(),
+  });
+  const record = (outcome: SkillRun['outcome'], failureKind?: string): void => {
+    try {
+      recordSkillRunSafe(feedback(outcome, failureKind));
+    } catch (error) {
+      // Building the record itself failed — still fail-soft, still observed.
+      try {
+        debug.log('skill.feedback', 'record-failed', { skill: manifest.name, error: String(error) }, { level: 'warn' });
+      } catch { /* never let observation change the skill outcome */ }
+    }
+  };
+  let result: ExecuteSkillResult;
+  try {
+    result = await executeSkillUnrecorded(manifest, args, onChunk, opts);
+  } catch (error) {
+    record('failure', skillFailureKind(error));
+    throw error;
+  }
+  record('success');
+  return result;
+}
+
+/** Failure kind for the feedback ledger: the exception's name, else 'error'. */
+function skillFailureKind(error: unknown): string {
+  try {
+    const name = (error as { name?: unknown } | null)?.name;
+    return typeof name === 'string' && name !== '' ? name : 'error';
+  } catch {
+    return 'error';
+  }
+}
+
+async function executeSkillUnrecorded(
+  manifest: SkillManifest,
+  args: string,
+  onChunk: (delta: string, full: string) => void,
+  opts: ExecuteSkillOpts,
+): Promise<ExecuteSkillResult> {
   debug.log('skill.router', 'executeSkill', {
     skill: manifest.name,
     args: args.length > 120 ? args.slice(0, 120) + '…' : args,
@@ -982,7 +1039,7 @@ export async function executeSkill(
   // vars. Previously getProvider(modelHint) — env-only — meant a user
   // with config.provider=openai-codex but XAI_API_KEY still in env
   // would see every skill fall back to Grok.
-  const provider: LLMProvider = resolveDefaultProvider(rawModelHint);
+  const provider: LLMProvider = opts.provider ?? resolveDefaultProvider(rawModelHint);
   // If the skill's declared model belongs to a DIFFERENT provider
   // family than the one user-config resolved to, drop it. Example:
   // user has openai-codex configured but a skill's SKILL.md says

@@ -170,6 +170,7 @@ import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
 import { handleHarnessRunTraversalGet } from './harness-traversal.js';
 import { handleLoopEdgesGet } from './loop-edges.js';
+import { handleLoopResourcesGet } from './loop-resources.js';
 import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
 import { handleMe, operatorSignal } from './operator.js';
@@ -498,6 +499,8 @@ export interface NexusHttpServerOpts {
   outputs?: OutputsDeps;
   /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
   grid?: GridDeps;
+  /** Resource observation seam; production reads the same ORCH traffic decision. */
+  loopResources?: Parameters<typeof handleLoopResourcesGet>[0];
   /** DRAFT-METRIC cached source seam; omitted in production for the process-wide TTL cache. */
   draftMetrics?: DraftMetricsSource;
   decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
@@ -1396,6 +1399,11 @@ export async function routeRequest(
 
   // Same owner auth as the neighbouring GETs (short-lived owner tokens · same-origin PWA); #23932 compared the admin
   // bearer only, so a PWA on a short-lived token got 401 and the loop map stayed empty.
+  if (pathname === '/v1/loops/resources' && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleLoopResourcesGet(opts.loopResources);
+  }
   if (pathname === '/v1/loops/edges' && method === 'GET') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);

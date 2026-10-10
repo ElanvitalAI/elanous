@@ -23,7 +23,7 @@ test('그날 흡수·갈래가 끝난 것만 · 축별로 묶고 노트의 한 �
   const NOW = '2026-09-26T03:00:00.000Z';   // KST 12:00
   ingestIntakeItems(r, 'youtube', [{ url: 'https://youtu.be/aaaaaaaaaaa', judgement: { axis: 'agent_basics', axisConf: 0.9, promo: 0, learn: 2 } }], NOW, quiet);
   ingestIntakeItems(r, 'telegram-saved', [{ url: 'https://x.com/i/status/1' }], NOW, quiet);
-  ingestIntakeItems(r, 'github', [{ url: 'https://github.com/a/b' }], NOW, quiet);   // 흡수 안 됨 → 빠진다
+  ingestIntakeItems(r, 'github', [{ url: 'https://github.com/a/b' }], '2026-09-25T03:00:00.000Z', quiet);   // 전날의 미흡수 항목 → E1·당일 GitHub 모두 빠진다
   const [a, b] = listIntakeItems(r).filter((i) => i.sources[0] !== 'github').map((i) => i.id);
   markIntakeItem(r, a, { status: 'absorbed', output: { kind: 'note', ref: '/v/A.md' } }, NOW);
   markIntakeItem(r, b, { status: 'absorbed', output: { kind: 'note', ref: '/v/B.md' } }, NOW);
@@ -167,6 +167,77 @@ test('a lens «why» that only names paths, even behind a label, is not shown as
   expect(pathOnly('`src/feature.ts:12`, scripts/x.ts')).toBe(true);
   expect(pathOnly('file: src/a.ts')).toBe(true);
   expect(pathOnly('video-gen 의 유료 렌더링 의존을 줄일 가능성이 있다.')).toBe(false);
+});
+
+test('same-day X and GitHub ledger rows share the first valid lens decision with absorbed, including 참고 and pending', () => {
+  const r = root();
+  const day = '2026-10-05';
+  const at = '2026-10-05T03:00:00.000Z';
+  ingestIntakeItems(r, 'x', [
+    { url: 'https://x.com/i/status/100', title: 'X first' },
+    { url: 'https://x.com/i/status/101', title: 'X reference' },
+    { url: 'https://x.com/i/status/102', title: 'X pending' },
+    ...Array.from({ length: 4 }, (_, n) => ({ url: `https://x.com/i/status/${103 + n}`, title: `X overflow ${n}` })),
+  ], at, quiet);
+  ingestIntakeItems(r, 'github', [
+    { url: 'https://github.com/owner/first', title: 'GitHub first' },
+    { url: 'https://github.com/owner/reference', title: 'GitHub reference' },
+    { url: 'https://github.com/owner/pending', title: 'GitHub pending' },
+    ...Array.from({ length: 4 }, (_, n) => ({ url: `https://github.com/owner/overflow${n}`, title: `GitHub overflow ${n}` })),
+  ], at, quiet);
+  ingestIntakeItems(r, 'github', [{ url: 'https://github.com/owner/yesterday', title: 'Old repository' }], '2026-10-04T03:00:00.000Z', quiet);
+  const items = listIntakeItems(r);
+  const byTitle = (title: string) => items.find((i) => i.title === title)!.id;
+  for (const title of ['X first', 'X reference', 'GitHub first', 'GitHub reference']) {
+    markIntakeItem(r, byTitle(title), { status: 'absorbed', output: { kind: 'note', ref: `/v/${title}.md` } }, at);
+  }
+  const lens = join(r, 'intake', 'outbox', 'lens');
+  mkdirSync(lens, { recursive: true });
+  writeFileSync(join(lens, `${day}.jsonl`), [
+    { id: byTitle('X first'), lensVerdict: '보강', why: 'src/path.ts', target: 'X-invalid' },
+    { id: byTitle('X first'), lensVerdict: '보강', why: '첫 X 근거가 칸을 보강한다.', target: 'X-1' },
+    { id: byTitle('X first'), lensVerdict: '대체 후보', why: '나중 판정은 무시한다.', target: 'X-2' },
+    { id: byTitle('GitHub first'), lensVerdict: '경쟁 대조', why: '첫 저장소를 비교해야 한다.', target: 'GitHub-1' },
+    { id: byTitle('GitHub first'), lensVerdict: '참고', why: '나중 판정은 무시한다.', target: 'GitHub-2' },
+    { id: byTitle('X reference'), lensVerdict: '참고', why: '참고 자료다.', target: 'X-3' },
+    { id: byTitle('X reference'), lensVerdict: '보강', why: '나중 판정은 무시한다.', target: 'X-4' },
+    { id: byTitle('GitHub reference'), lensVerdict: '참고', why: '참고 자료다.', target: 'GitHub-3' },
+    { id: byTitle('GitHub reference'), lensVerdict: '보강', why: '나중 판정은 무시한다.', target: 'GitHub-4' },
+    { id: byTitle('X pending'), lensVerdict: '보강', why: 'src/path.ts', target: 'X-5' },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const d = buildIntakeDigest(r, day, () => '## 한줄 결론\n오늘의 요지.\n');
+  expect(d.absorbed.map((e) => [e.id, e.impact])).toEqual([
+    [byTitle('X first'), { verdict: '보강', why: '첫 X 근거가 칸을 보강한다.', target: 'X-1' }],
+    [byTitle('X reference'), undefined],
+    [byTitle('GitHub first'), { verdict: '경쟁 대조', why: '첫 저장소를 비교해야 한다.', target: 'GitHub-1' }],
+    [byTitle('GitHub reference'), undefined],
+  ]);
+  expect(d.xTrends?.map((e) => [e.title, e.verdict])).toEqual([
+    ['X first', '보강'], ['X reference', '참고'], ['X pending', '판정 대기'],
+    ...Array.from({ length: 4 }, (_, n) => [`X overflow ${n}`, '판정 대기']),
+  ]);
+  expect(d.githubNew?.map((e) => [e.title, e.verdict])).toEqual([
+    ['GitHub first', '경쟁 대조'], ['GitHub reference', '참고'], ['GitHub pending', '판정 대기'],
+    ...Array.from({ length: 4 }, (_, n) => [`GitHub overflow ${n}`, '판정 대기']),
+  ]);
+  const telegram = renderDigestTelegram(d);
+  expect(telegram).toContain('X 트렌드 (7)\n- [보강] X first — https://x.com/i/status/100');
+  expect(telegram).toContain('GitHub 신규 (7)\n- [경쟁 대조] GitHub first — https://github.com/owner/first');
+  expect(telegram).toContain('- [참고] X reference — https://x.com/i/status/101');
+  expect(telegram).toContain('- [참고] GitHub reference — https://github.com/owner/reference');
+  expect(telegram).not.toContain('X overflow 3');
+  expect(telegram).not.toContain('GitHub overflow 3');
+  expect(telegram.match(/외 2건 · 원장/g)).toHaveLength(2);
+  const md = renderDigestMarkdown(d);
+  expect(md).toContain('### X 트렌드 (7)');
+  expect(md).toContain('### GitHub 신규 (7)');
+  expect(md).toContain('- [X first](https://x.com/i/status/100) — 보강');
+  expect(md).toContain('- [GitHub first](https://github.com/owner/first) — 경쟁 대조');
+  expect(md).toContain('- [X reference](https://x.com/i/status/101) — 참고');
+  expect(md).toContain('- [GitHub pending](https://github.com/owner/pending) — 판정 대기');
+  expect(md).toContain('X overflow 3');
+  expect(md).toContain('GitHub overflow 3');
+  expect(md).not.toContain('Old repository');
 });
 
 test('NEWS-INTAKE: telegram carries at most three news items, each with S · A · link', () => {

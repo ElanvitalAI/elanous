@@ -13,6 +13,7 @@ import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
+import { formatOrchestrateResultLine } from '../self-dev/orchestrate-summary-line.js';
 import { RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
@@ -1818,7 +1819,7 @@ describe('harness CLI command', () => {
       process.exitCode = 0;
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md', podPool: 'pool-test:1' }, expect.objectContaining({ onOutput: expect.any(Function) }));
+      expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-ask', input: '/tmp/goal.md', podPool: 'pool-test:1' }), expect.objectContaining({ onOutput: expect.any(Function) }));
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
@@ -1896,7 +1897,7 @@ describe('harness CLI command', () => {
       expect(records).toHaveLength(2);
       expect(records[1]).toMatchObject({ goalId: expect.stringMatching(/^request-[0-9a-f]{32}$/), goalText: 'write goal', targetPaths: [], spec: { input: { text: 'write goal' } } });
       expect(calls.map((entry) => (entry as string[])[0])).toEqual(['host', 'pod', 'host', 'pod']);
-      expect(dispatch.mock.calls[1]?.[0]).toEqual({ entrance: 'cli-harness-say', input: 'write goal', podPool: 'pool-test:1' });
+      expect(dispatch.mock.calls[1]?.[0]).toMatchObject({ entrance: 'cli-harness-say', input: 'write goal', podPool: 'pool-test:1' });
       expect(dispatch.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ onOutput: expect.any(Function) }));
       expect(process.exitCode).toBe(0);
     } finally {
@@ -2020,7 +2021,7 @@ describe('harness CLI command', () => {
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', missing, '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(records).toEqual([]);
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch.mock.calls[0]?.[0]).toEqual({ entrance: 'cli-harness-ask', input: missing, podPool: 'pool-test:1' });
+      expect(dispatch.mock.calls[0]?.[0]).toMatchObject({ entrance: 'cli-harness-ask', input: missing, podPool: 'pool-test:1' });
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
@@ -2236,6 +2237,61 @@ describe('harness CLI command', () => {
       else process.env.ELANOUS_STATE_DIR = previousState;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('POD-EXIT-REASON-SHOWN: real Pod producer pod-child-failed output reaches ask/say CLI as the Pod reason, not unknown', async () => {
+    const previousExit = process.exitCode;
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod');
+    const { program } = install(async () => {}, async () => {}, undefined, undefined, undefined, undefined, undefined,
+      async () => ({ cardId: 'card', mode: 'observe', decisions: {} as never }));
+    // Injected readers: the «before» classification must not read this machine's ledgers or checkpoints.
+    const noLedger = { loadLedger: () => [], supervisorDecision: () => undefined, loadCheckpoint: () => null, hasJobApplied: () => true };
+    try {
+      for (const [entrance, stage, childResult] of [
+        ['ask', 'review-blocked', { stage: 'review-blocked', ok: false, prNumber: 8 }],
+        ['say', 'review-blocked', { stage: 'review-blocked', ok: false, prNumber: 9, prUrl: 'https://github.com/o/r/pull/9' }],
+        ['say', 'host-regate-failed', { stage: 'merge-ready', ok: true, prNumber: 8, checkedHeadCommit: 'b'.repeat(40) }],
+      ] as const) {
+        const logs = JSON.stringify(childResult);
+        const kubectl: Kubectl = (args) => {
+          if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+          if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+          if (args.some((arg) => arg.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: '', stderr: '' };
+          if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Complete', stderr: '' };
+          if (args.includes('logs')) return { status: 0, stdout: logs, stderr: '' };
+          return { status: 0, stdout: '', stderr: '' };
+        };
+        // Real producer: src/task-orchestrator/surfaces/self-implement-pod.ts emits pod-child-failed with the Pod reason.
+        const produced = await podSelfImplementSpawn({
+          kubectl, credentials: () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' }),
+          ...(stage === 'host-regate-failed' ? { hostRegate: async () => ({ passed: false, failures: [{ step: 'test-interference', detail: 'combined fail' }], os: process.platform }) } : {}),
+        })({ feature: 'x', spaceId: `cli-pod-${stage}-${entrance}`, autoMerge: true }).done;
+        expect(produced.exitCode).toBe(1);
+        expect(produced.disposition?.stage).toBe(stage);
+        expect(produced.error?.code).toBe('pod-child-failed');
+        const podReason = produced.error!.message;
+        expect(podReason.length).toBeGreaterThan(0);
+        // The failed-job mapping of src/self-dev/orchestrate.ts (error ⊕ disposition stage ⊕ prUrl), then the real summary line.
+        const job = { feature: 'x', status: 'failed' as const, error: produced.error!,
+          ...(produced.disposition?.stage ? { stage: produced.disposition.stage } : {}),
+          ...(produced.disposition?.prUrl ? { prUrl: produced.disposition.prUrl } : {}) };
+        const output = `[self-dev] 완료 — 0/1 done\n${formatOrchestrateResultLine(job)}\n`;
+        // Before: the summary printed only the code for pod-child-failed, so the classifier fell to unknown.
+        const before = output.replace(`pod-child-failed: ${podReason}`, 'pod-child-failed');
+        expect(before).not.toBe(output);
+        expect(classifyHarnessPodExit({ status: 1 }, before, noLedger).reason).toBe('unknown');
+        // After: the Pod reason survives.
+        expect(classifyHarnessPodExit({ status: 1 }, output, noLedger)).toEqual({ reason: 'pod-failure', lines: [`Pod 안 자식이 실패했다 — ${podReason.split('\\n', 1)[0]}`] });
+        dispatch.mockImplementation((_input, deps) => { deps?.onOutput?.(output); return 1; });
+        process.exitCode = 0;
+        const errors = await captureError(() => program.parseAsync([
+          'node', 'elanous', 'harness', entrance, entrance === 'ask' ? '/tmp/goal.md' : 'write goal',
+          '--substrate', 'pod', '--pod-pool', 'pool-test:1',
+        ]));
+        expect(errors).toEqual([`Pod 안 자식이 실패했다 — ${podReason.split('\\n', 1)[0]}`]);
+        expect(process.exitCode).toBe(1);
+      }
+    } finally { dispatch.mockRestore(); process.exitCode = previousExit ?? 0; }
   });
 
   test('pod ask distinguishes a failed child result from a launch failure', async () => {

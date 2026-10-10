@@ -61,7 +61,7 @@ describe('pod command job manifest', () => {
     const spec = (withMirror.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
     expect(spec.volumes).toContainEqual({ name: 'host-mirror', hostPath: { path: '/mirror-host/elanous-agent.git', type: 'Directory' } });
     expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('0a0e36783b232d16c698ebd00985b451d32f47346d9a945a1f84b8b7b8b478ed');
     expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
   });
 
@@ -81,7 +81,7 @@ describe('pod command job manifest', () => {
     ]);
     expect(spec.initContainers[0]!.volumeMounts).toBeUndefined();
     expect(podCommandScript(cached)).toContain('if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;');
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('0a0e36783b232d16c698ebd00985b451d32f47346d9a945a1f84b8b7b8b478ed');
     expect(JSON.stringify(manifest({ clone: true, bunCache: undefined }))).toBe(JSON.stringify(original));
     expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
   });
@@ -108,7 +108,7 @@ describe('pod command job manifest', () => {
     const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
     const original = manifest({ clone: true });
     expect(res(original)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('0a0e36783b232d16c698ebd00985b451d32f47346d9a945a1f84b8b7b8b478ed');
     expect(JSON.stringify(manifest({ clone: true, cpu: undefined }))).toBe(JSON.stringify(original));
     expect(JSON.stringify(manifest({ clone: true, cpu: {} }))).toBe(JSON.stringify(original));
     expect(res(manifest({ clone: true, cpu: { request: '1', limit: '1' } }))).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '1' } });
@@ -211,7 +211,7 @@ describe('pod command job manifest', () => {
   // SHA-256 of the default JSON manifest (base + clone: true) — re-pinned 10-06 for POD-DIET (request 6Gi); a change here means the default manifest moved.
   test('commit source checks out the requested SHA; omitted source retains the default manifest bytes', () => {
     const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };
-    const original = '05e44a726eb53c32273cd436662dc0fdf6dbf49f12441afafa7e49464c9b7a46';
+    const original = '0a0e36783b232d16c698ebd00985b451d32f47346d9a945a1f84b8b7b8b478ed';
     const script = podCommandScript(manifest({ clone: true, source }));
     expect(script).toContain(podSourceScript(source, base.repoUrl));
     expect(script).toContain(`git checkout --detach ${source.sha}`);

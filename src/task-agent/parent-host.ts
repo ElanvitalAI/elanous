@@ -12,6 +12,7 @@
  * 기본 OFF — `taskAgent.parentHost` 가 없고 `ELANOUS_TA_PARENT_HOST` 도 없으면 아무것도 바뀌지 않는다.
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -29,7 +30,12 @@ export interface ParentHostConfig {
   configDir?: string;
   /** 원격 부모에 줄 `--pod-pool`(원격 kube context 이름이 HQ 와 다를 때). */
   podPool?: string;
+  /** Maximum simultaneous parent approvals on this host; absent means one conservative slot. */
+  approvalCapacity?: number;
 }
+
+/** A list opts into multi-host selection; the legacy object retains its original launch behavior. */
+export type ParentHostSetting = Partial<ParentHostConfig> | readonly Partial<ParentHostConfig>[];
 
 export const PARENT_HOST_ENV = 'ELANOUS_TA_PARENT_HOST';
 const DEFAULT_REMOTE_ELANOUS = '$HOME/.local/share/elanous/bin/elanous';
@@ -40,14 +46,94 @@ const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
  * 켜졌나 — env 가 이긴다(`off`·`0`·빈 값이면 끔). env 가 호스트를 주면 나머지 칸(cwd 등)은 설정에서 받는다.
  * cwd 가 없으면 켜지지 않는다(어디서 띄울지 모르는 원격 발사는 하지 않는다).
  */
-export function resolveParentHost(config: Partial<ParentHostConfig> | undefined, env: NodeJS.ProcessEnv = process.env): ParentHostConfig | null {
+export function resolveParentHost(config: ParentHostSetting | undefined, env: NodeJS.ProcessEnv = process.env): ParentHostConfig | null {
+  return resolveParentHosts(config, env)[0] ?? null;
+}
+
+/** Each target is validated independently; an invalid entry cannot turn a valid list into a local-only launch. */
+export function resolveParentHosts(config: ParentHostSetting | undefined, env: NodeJS.ProcessEnv = process.env): ParentHostConfig[] {
   const fromEnv = env[PARENT_HOST_ENV];
-  if (fromEnv !== undefined && ['', '0', 'off', 'false', 'local'].includes(fromEnv.trim().toLowerCase())) return null;
-  const host = (fromEnv?.trim() || config?.host || '').trim();
-  if (!host || !HOST_RE.test(host)) return null;
-  const cwd = config?.cwd?.trim();
-  if (!cwd || !cwd.startsWith('/')) return null;
-  return { host, cwd, ...(config?.elanous ? { elanous: config.elanous } : {}), ...(config?.configDir ? { configDir: config.configDir } : {}), ...(config?.podPool ? { podPool: config.podPool } : {}) };
+  if (fromEnv !== undefined && ['', '0', 'off', 'false', 'local'].includes(fromEnv.trim().toLowerCase())) return [];
+  const configured = Array.isArray(config) ? config : [config];
+  const seen = new Set<string>();
+  const targets: ParentHostConfig[] = [];
+  if (fromEnv && Array.isArray(config) && !config.some((entry) => entry.host === fromEnv.trim())) return targets;
+  for (const entry of configured) {
+    if (fromEnv && Array.isArray(config) && entry?.host !== fromEnv.trim()) continue;
+    const host = (fromEnv?.trim() || entry?.host || '').trim();
+    const cwd = entry?.cwd?.trim();
+    if (!host || !HOST_RE.test(host) || !cwd || !cwd.startsWith('/') || seen.has(host)
+      || (Array.isArray(config) && entry?.approvalCapacity !== undefined
+        && (!Number.isSafeInteger(entry.approvalCapacity) || entry.approvalCapacity < 1))) continue;
+    seen.add(host);
+    targets.push({ host, cwd, ...(entry?.elanous ? { elanous: entry.elanous } : {}), ...(entry?.configDir ? { configDir: entry.configDir } : {}), ...(entry?.podPool ? { podPool: entry.podPool } : {}), ...(entry?.approvalCapacity !== undefined ? { approvalCapacity: entry.approvalCapacity } : {}) });
+    if (fromEnv) break; // Explicit host override selects one target only.
+  }
+  return targets;
+}
+
+/** Capacity sample is read on the host before launch. Unknown or saturated capacity is not a positive weight. */
+export interface ParentHostCapacity { approvalHeadroom: number; load: number }
+const CAPACITY_MARKER = '__ELANOUS_PARENT_CAPACITY__';
+const APPROVAL_MARKER = '__ELANOUS_PARENT_APPROVALS__';
+const LOAD_MARKER = '__ELANOUS_PARENT_LOAD__';
+/** Recent admission decisions are the host's measured approval backlog, not an inferred process count. */
+export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner = defaultSshRunner): ParentHostCapacity | null {
+  const executable = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
+  const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
+  const script = `parents=$(ps -Ao command) || exit 1; printf '%s\\n' "$parents" | awk '/[e]lanous.*harness (say|ask)/ { n++ } END { print "${CAPACITY_MARKER}" n+0 }'; `
+    + `${executable} --config-dir ${configDir} logs --event admit-by-usage --since 5m --json --limit 1000 || exit 1; `
+    + `printf '\\n${APPROVAL_MARKER}\\n'; `
+    + `cpu=$(ps -Ao %cpu=) || exit 1; printf '%s\\n' "$cpu" | awk '{ total += $1 } END { printf "${LOAD_MARKER}%.3f\\n", total+0 }'; `
+    + `cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || exit 1; printf '${LOAD_MARKER}cores=%s\\n' "$cores"`;
+  try {
+    const result = ssh(target.host, script, 15_000);
+    if (result.status !== 0) return null;
+    const activeMatch = new RegExp(`^${CAPACITY_MARKER}(\\d+)$`, 'm').exec(result.stdout);
+    const boundary = result.stdout.indexOf(`\n${APPROVAL_MARKER}\n`);
+    const logsStart = result.stdout.indexOf('\n');
+    const cpuMatch = new RegExp(`^${LOAD_MARKER}([0-9]+(?:\\.[0-9]+)?)$`, 'm').exec(result.stdout);
+    const coresMatch = new RegExp(`^${LOAD_MARKER}cores=(\\d+)$`, 'm').exec(result.stdout);
+    if (!activeMatch || activeMatch.index !== 0 || logsStart < 0 || boundary < logsStart || !cpuMatch || !coresMatch) return null;
+    const active = Number(activeMatch[1]);
+    const cores = Number(coresMatch[1]);
+    const cpu = Number(cpuMatch[1]);
+    const capacity = target.approvalCapacity ?? 1;
+    if (!Number.isSafeInteger(active) || !Number.isSafeInteger(cores) || cores <= 0 || !Number.isFinite(cpu) || cpu < 0
+      || !Number.isSafeInteger(capacity) || capacity <= 0) return null;
+    const decisions = new Map<string, number>();
+    const logs = result.stdout.slice(logsStart, boundary).trim();
+    const rows = logs ? logs.split('\n').filter(Boolean) : [];
+    if (rows.length >= 1000) return null;
+    // `logs` prints newest first; apply older decisions first so the last recommendation wins.
+    for (const line of rows.reverse()) {
+      const row = JSON.parse(line) as { _meta?: unknown; category?: unknown; event?: unknown; data?: unknown };
+      if (row._meta) {
+        if (typeof row._meta === 'object' && row._meta !== null && (row._meta as { limitReached?: boolean }).limitReached) return null;
+        continue;
+      }
+      if (row.category !== 'pod-lease' || row.event !== 'admit-by-usage') return null;
+      const data = typeof row.data === 'string' ? JSON.parse(row.data) as { runId?: unknown; recommended?: unknown }
+        : row.data as { runId?: unknown; recommended?: unknown } | null;
+      if (typeof data?.runId !== 'string' || data.recommended === null) continue;
+      if (!Number.isSafeInteger(data.recommended) || (data.recommended as number) < 0) return null;
+      decisions.set(data.runId, data.recommended as number);
+    }
+    const waiting = [...decisions.values()].filter((n) => n === 0).length;
+    return { approvalHeadroom: Math.max(0, capacity - active - waiting), load: Math.max(0, cpu / (cores * 100)) };
+  } catch { return null; }
+}
+
+/** Weighted rendezvous: stable per run, no shared counter or dependence on dispatch order. */
+export function orderParentHosts(targets: readonly ParentHostConfig[], runId: string, capacities: Readonly<Record<string, ParentHostCapacity | null>>): ParentHostConfig[] {
+  return targets.map((target, index) => {
+    const sample = capacities[target.host];
+    const weight = sample && Number.isSafeInteger(sample.approvalHeadroom) && sample.approvalHeadroom > 0 && Number.isFinite(sample.load) && sample.load >= 0
+      ? sample.approvalHeadroom / (1 + sample.load) : 0;
+    const hash = createHash('sha256').update(`${runId}\0${target.host}`).digest();
+    const fraction = (hash.readUIntBE(0, 6) + 1) / (2 ** 48 + 1);
+    return { target, index, score: weight > 0 ? -Math.log(fraction) / weight : Infinity };
+  }).sort((a, b) => a.score - b.score || a.index - b.index).map(({ target }) => target);
 }
 
 /** `$HOME/…` 은 원격 셸이 풀도록 따옴표 밖에 둔다 — 나머지는 shellQuote. */
@@ -91,6 +177,20 @@ export const defaultSshRunner: SshRunner = (host, script, timeoutMs) => {
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? (result.error ? String(result.error) : '') };
 };
 
+/** PID 재사용을 피하려면 살아 있는 프로세스의 command 가 이 카드의 런 id 도 실어야 한다. */
+export function remoteParentAlive(parentHost: { host: string; pid?: number; runId: string }, ssh: SshRunner = defaultSshRunner): 'alive' | 'dead' | 'unknown' {
+  if (!Number.isSafeInteger(parentHost.pid) || !parentHost.pid || parentHost.pid <= 0 || !/^run-[A-Za-z0-9_-]{4,64}$/.test(parentHost.runId)) return 'unknown';
+  try {
+    // `env ELANOUS_RUN_ID=… nohup` 은 exec 뒤 argv 에 남지 않는다. ps eww 가 부모의 환경을 command 와 함께 보여 준다.
+    // ⚠️ `eww` 는 «앞»에 둔다 — macOS(node-b) ps 는 `-o command= eww` 꼴을 `illegal argument: eww`(rc=1)로 거부해
+    // 늘 'unknown' 이 된다(10-10 node-b 실측). 없는 pid 는 rc=1 · 빈 출력 → 'dead'.
+    const result = ssh(parentHost.host, `ps eww -p ${parentHost.pid} -o command=`, 10_000);
+    if (result.status === 0) return result.stdout.trim() ? (result.stdout.split(/[^A-Za-z0-9_-]+/).includes(parentHost.runId) ? 'alive' : 'dead') : 'dead';
+    if (result.status === 1 && !result.stdout.trim() && !result.stderr.trim()) return 'dead';
+    return 'unknown';
+  } catch { return 'unknown'; }
+}
+
 /** 발사 전 점검 결과 — `gaps` 가 비어야 원격으로 띄운다. */
 export interface ParentHostPreflight { ok: boolean; gaps: string[]; facts: Record<string, string> }
 
@@ -117,13 +217,22 @@ export interface PreflightInput {
   ssh?: SshRunner;
 }
 
+/** 기준판 — `0.2.23-dev.0` → `0.2.23`(앞 x.y.z 만). 모양이 아니면 원문 그대로(= 정확히 같아야 통과). */
+export function releaseCore(version: string): string {
+  return /^(\d+\.\d+\.\d+)/.exec(version)?.[1] ?? version;
+}
+
 /** 순수 판정 — 원격 사실 → 막는 칸 목록. */
 export function judgeParentHostFacts(facts: Record<string, string>, input: Omit<PreflightInput, 'ssh' | 'target'> & { podPoolOverride?: boolean }): string[] {
   const gaps: string[] = [];
   if (facts.unreachable) gaps.push(`unreachable: ${facts.unreachable}`);
   else {
     if (!facts.version) gaps.push('remote-elanous-missing');
-    else if (facts.version !== input.localVersion) gaps.push(`version-mismatch: remote ${facts.version} ≠ HQ ${input.localVersion}`);
+    else if (facts.version !== input.localVersion) {
+      // 레일은 HQ 를 30분마다 올리고 원격은 한 주기 늦을 수 있다 — 기준판(x.y.z)이 같으면 막지 않고 경고만 남긴다(OP 10-09 13:17).
+      if (releaseCore(facts.version) !== releaseCore(input.localVersion)) gaps.push(`version-mismatch: remote ${facts.version} ≠ HQ ${input.localVersion}`);
+      else debug.log('task-agent.parent-host', 'version-drift', { remote: facts.version, hq: input.localVersion });
+    }
     if (facts.config !== '1') gaps.push('remote-config-missing');
     if (facts.podPool !== '1' && !input.podPoolOverride) gaps.push('remote-pod-pool-unset');
     if (facts.repo !== '1') gaps.push('remote-repo-missing');

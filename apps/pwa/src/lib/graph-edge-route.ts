@@ -63,6 +63,20 @@ export const EDGE_FAMILY_COLOR: Record<EdgeFamily, string> = {
   neutral: 'var(--muted-foreground, #64748b)',
 };
 
+export const WIRING_STYLE = { gold: '#D4AF37', flowDash: '3 14', dimNode: 0.22, dimEdge: 0.15, width: 3 };
+
+export function wiringEdgeStyle(
+  focus: { nodes: Set<string>; edges: Set<string> } | null,
+  edgeId: string,
+): { style?: Record<string, string | number>; animated?: boolean } {
+  if (focus === null) return {};
+  if (focus.edges.has(edgeId)) return {
+    style: { stroke: WIRING_STYLE.gold, strokeWidth: WIRING_STYLE.width, strokeDasharray: WIRING_STYLE.flowDash },
+    animated: true,
+  };
+  return { style: { opacity: WIRING_STYLE.dimEdge } };
+}
+
 export function hoverFocus(
   nodeId: string | null,
   edges: readonly { id: string; from: string; to: string }[],

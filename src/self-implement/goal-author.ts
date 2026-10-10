@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
-import { groundMissionInCodebase, isRepositoryImplementationCandidate, type CodebaseGrounding } from '../autopilot/mission-codebase-gate.js';
+import { isRepositoryImplementationCandidate, type CodebaseGrounding } from '../autopilot/codebase-grounding.js';
 import { extractSlugSource, generateMissionSlug, slugify } from '../autopilot/mission-registry.js';
 import { enhancePrompt, type EnhanceOpts, type EnhanceResult } from '../prompt-enhance/enhance.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
@@ -44,7 +44,7 @@ import { extractGoalDocSections, type GoalDocSourceLine } from './goal-doc/secti
 import { isGoalAuthorFileName } from './goal-document.js';
 import { resolveGoalDocumentsDir } from './goal-documents-dir.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR } from './off-diff-evidence.js';
-import { renderLaunchPreflight, siblingTestPath, type LaunchPreflightResult } from '../self-dev/launch-preflight.js';
+import { renderLaunchPreflight, siblingTestPath, type LaunchPreflightResult } from '../self-dev/launch-preflight-text.js';
 import { quoteShellArg } from '../cli/logs-cli.js';
 import type { HarnessGroundingProvenance } from './context-capsule.js';
 import { hasGoalStepCodeName } from './goal-step-code-name.js';
@@ -119,6 +119,21 @@ export interface GoalAuthorGroundingDeps {
 export interface GoalAuthorGroundingResult {
   path: GoalAuthorGroundingPath;
   facts: CodebaseGrounding;
+}
+
+// A function-local slot is initialized only on access, after cyclic ESM evaluation has finished.
+function goalAuthorGroundMissionSlot(): { fn?: NonNullable<GoalAuthorGroundingDeps['groundMission']> } {
+  const key = Symbol.for('elanous.goalAuthor.groundMission');
+  const registry = globalThis as typeof globalThis & { [key: symbol]: { fn?: NonNullable<GoalAuthorGroundingDeps['groundMission']> } };
+  return registry[key] ??= {};
+}
+
+export function registerGoalAuthorGroundMission(fn: NonNullable<GoalAuthorGroundingDeps['groundMission']> | undefined): void {
+  goalAuthorGroundMissionSlot().fn = fn;
+}
+
+export function hasGoalAuthorGroundMission(): boolean {
+  return goalAuthorGroundMissionSlot().fn !== undefined;
 }
 
 export interface GoalAuthorPersistentGroundingDecision {
@@ -5583,12 +5598,17 @@ export async function groundForGoalAuthor(
   cwd: string,
   deps: GoalAuthorGroundingDeps = {},
 ): Promise<GoalAuthorGroundingResult> {
+  const groundMission = deps.groundMission ?? goalAuthorGroundMissionSlot().fn;
+  if (!groundMission) {
+    debug.log('goal-author.grounding', 'route-unregistered', { cwd });
+    throw new Error('route-unregistered: mission-codebase-gate 를 로드하라');
+  }
   return {
     path: 'groundMissionInCodebase',
     // ⛔⭐ 사람이 ask 에 «이름을 댄» 경로를 접지에 «넘긴다» — 접지가 그것을 후보로 쓴다.
     //   ⛔ 추출기를 «새로 만들지 않는다» — 이 파일이 이미 갖고 있는 askPathTokens 하나를 쓴다
     //     (2026-08-11 72차: 같은 것에 두 이름을 준 병을 하루에 여섯 번 셌다).
-    facts: await (deps.groundMission ?? groundMissionInCodebase)(ask, {
+    facts: await groundMission(ask, {
       cwd,
       seedPaths: askPathTokens(ask),
       ...(deps.persistent !== undefined ? { persistent: deps.persistent } : {}),
@@ -5694,7 +5714,7 @@ export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
      *   이 칸을 «안 주므로» 기본값 `coverage-gate` 로 종전 문면을 그대로 받는다.
      */
     enhance(ask, opts) {
-      return enhancePrompt(ask, { ...opts, checklistUse: 'authoring' });
+      return enhancePrompt(ask, { ...opts, checklistUse: 'authoring', config: opts?.config ?? getUserConfig() });
     },
     readSourceFile: createRepositoryReferencedFileReader(cwd),
     runHelpProbe: (argv) => runDefaultHelpProbe(cwd, argv),

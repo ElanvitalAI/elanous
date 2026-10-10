@@ -10,6 +10,7 @@ import * as skillRunner from '../src/skills/runner.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
 import { CardStore } from '../src/task-cards/card-store.js';
 import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
 import { SLASH_COMMANDS } from '../src/chat/index.js';
@@ -132,6 +133,10 @@ describe('Telegram common slash catalog wiring', () => {
     const root = mkdtempSync(join(tmpdir(), 'telegram-commands-preservation-'));
     wishRoots.push(root);
     process.env.ELANOUS_STATE_DIR = root;
+    // /now reads the checklist ledger, which follows the config-dir override (not ELANOUS_STATE_DIR) — point it at the
+    // same isolated root, or the #25364 test-write guard (correctly) refuses the operational ~/.elanous ledger.
+    const prevConfigDir = getElanousConfigDirOverride();
+    setElanousConfigDir(root);
     const execute = spyOn(skillRunner, 'executeSkill').mockResolvedValue({ fullResponse: 'digest-probe' } as Awaited<ReturnType<typeof skillRunner.executeSkill>>);
     // The isolated test HOME has no installed skills; /digest must still dispatch to the (mocked) runner.
     const manifest = spyOn(skillRunner, 'parseSkillMd').mockImplementation((name: string) => ({ name, description: 'probe', body: '' }) as unknown as ReturnType<typeof skillRunner.parseSkillMd>);
@@ -155,6 +160,8 @@ describe('Telegram common slash catalog wiring', () => {
     } finally {
       execute.mockRestore();
       manifest.mockRestore();
+      if (prevConfigDir === undefined) resetElanousConfigDir();
+      else setElanousConfigDir(prevConfigDir);
     }
   }, 30_000);
 

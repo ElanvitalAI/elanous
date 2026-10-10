@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { handleOutboundReport, routeOutboundInProcess } from '../src/nexus/api/outbound-report.js';
 import { debug } from '../src/debug/log.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
+import { openDeliveryDb } from '../src/nexus/outbound/delivery-ledger.js';
 import { setTestStateRoot } from '../src/nexus/paths.js';
 import { tmpdir } from 'node:os';
 
@@ -27,6 +28,43 @@ describe('outbound-report handler', () => {
     expect([401, 400, 503, 502, 200]).toContain(res.status);
     expect(typeof (await res.json())).toBe('object');
   });
+});
+
+test('authenticated outbound role selects primary channel without changing response keys or delivery ledger rows', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'outbound-role-'));
+  const ledger = openDeliveryDb(':memory:');
+  setTestStateRoot(root);
+  setUserConfigOverlay(cfg => ({ ...cfg, raw: { ...cfg.raw, outbound: {
+    channels: [{ type: 'telegram' }, { type: 'discord', webhookUrl: 'https://example.test/webhook' }],
+    routes: { alert: ['telegram', 'discord'] }, roleRoutes: { OP: ['discord'] }, primary: { OP: 'discord' },
+  } } }));
+  const sent: string[] = [];
+  try {
+    const res = await handleOutboundReport(new Request('http://localhost/v1/outbound', {
+      method: 'POST', body: JSON.stringify({ text: 'role message', kind: 'alert', role: 'OP' }),
+    }), { noAuth: true }, { deliveryDb: ledger, dedup: false, spill: text => ({ text, spilled: false }),
+      telegramSend: async () => { sent.push('telegram'); return true; },
+      fetchImpl: (async () => { sent.push('discord'); return new Response(null, { status: 204 }); }) as unknown as typeof fetch });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(['channel', 'channels', 'delivered', 'kind']);
+    expect(body).toMatchObject({ delivered: true, channel: 'discord', channels: [{ type: 'discord', ok: true }], kind: 'alert' });
+    expect(sent).toEqual(['discord']);
+    const row = ledger.prepare('SELECT channels FROM deliveries').get() as { channels: string };
+    expect(JSON.parse(row.channels)).toEqual([{ type: 'discord', ok: true }]);
+  } finally { setUserConfigOverlay(null); setTestStateRoot(null); ledger.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a malformed role is refused before routing instead of silently using the kind route', async () => {
+  const sent: string[] = [];
+  const res = await handleOutboundReport(new Request('http://localhost/v1/outbound', {
+    method: 'POST', body: JSON.stringify({ text: 'role message', kind: 'alert', role: 'O P!' }),
+  }), { noAuth: true }, { dedup: false, spill: text => ({ text, spilled: false }),
+    telegramSend: async () => { sent.push('telegram'); return true; },
+    fetchImpl: (async () => { sent.push('discord'); return new Response(null, { status: 204 }); }) as unknown as typeof fetch });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({ error: 'invalid-role' });
+  expect(sent).toEqual([]);
 });
 
 test('daemon in-process send records bot, kind, source and outcome without body or credentials', async () => {

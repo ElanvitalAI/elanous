@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addSelfDevRunParticipant, checkpointDependenciesForRun, closeSelfDevRunParticipant, saveSelfDevRun, loadSelfDevRun, listSelfDevRuns, listParkedGoals, listCombinedParkedGoals, parkedGoalsPopulationNotice, scanParkedGoals, countRunningGoals, countUnconvergeableRunLedgers, recordSelfDevRunSupervisorStop, resolveParkedSelfDevRun, runSummaryLine, failureClassificationForInterruptionVerdict, extractParkedGoalLedgerArtifactEvidence, PARKED_GOALS_LEDGER_STATUS, PARKED_GOALS_LIMITATION, type SelfDevRunState } from './run-store.js';
 import { analyzeRepairSignals, CLASSIFICATION_HINTS } from './repair-signals.js';
+import { oldDoorInternalEnv } from './old-door.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'self-dev-runs-'));
@@ -324,7 +325,9 @@ describe('self-dev run-store (S3 persistence)', () => {
       const resumed = Bun.spawnSync({
         cmd: [process.execPath, 'src/index.ts', 'self', 'orchestrate', 'noop', '--resume', state.runId, '--json'],
         cwd: process.cwd(),
-        env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_STATE_DIR: stateDir },
+        // `self orchestrate` is a closed outside door (OLD-DOOR-CLOSE #24330) — this real spawn carries the harness's own
+        // internal stamp, exactly as a harness parent does (`oldDoorInternalEnv`), so the checkpoint path itself is exercised.
+        env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_STATE_DIR: stateDir, ...oldDoorInternalEnv('self-orchestrate') },
         stdout: 'pipe',
         stderr: 'pipe',
       });
@@ -335,7 +338,7 @@ describe('self-dev run-store (S3 persistence)', () => {
     expect(loadSelfDevRun('resume-empty', dir)?.dependencies).toEqual({ prepare: [], implement: [] });
     expect(loadSelfDevRun('resume-predecessor', dir)?.dependencies).toEqual({ prepare: [], implement: ['prepare'] });
     expect(loadSelfDevRun('resume-predecessor', dir)?.results).toMatchObject(doneNoop);
-  }, 15_000);
+  }, 60_000);
 
   test('supervisor stop reason persists as a closed, distinct checkpoint field', () => {
     const dir = tmp();

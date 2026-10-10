@@ -6,6 +6,7 @@ import { WARNING_ONLY } from './auto-approve-node.js';
 import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
 import { prereleaseKind } from './release-version.js';
+import { publishAtError } from './publish-at.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
 
 export function publicNotes(markdown: string, pages: { pages: Array<{ id: string; slug?: string; source?: string }> }): string {
@@ -43,7 +44,8 @@ export function waitForAssets(run: CommandRunner, repo: string, tag: string, nam
   }
 }
 
-export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string) {
+export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string,
+  clock: { now: () => number; sleep: (ms: number) => void } = { now: Date.now, sleep: Bun.sleepSync }) {
   const context = readGraphContext();
   const version = context.input.version;
   // A measured automatic decision or the existing human approval must authorize publication.
@@ -69,6 +71,17 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
   if (doc.status !== 0 || registry.status !== 0) throw new Error(`docs branch missing notes or pages: ${branch}`);
   if (!doc.stdout.startsWith(`# ${version}\n`)) throw new Error('release notes version mismatch');
   const body = labelPrerelease(version, publicNotes(doc.stdout, JSON.parse(registry.stdout)));
+  if (context.input.publishAt !== undefined) {
+    const at = context.input.publishAt;
+    if (typeof at !== 'string' || publishAtError(at) !== null) {
+      throw new Error('invalid publishAt in release run input');
+    }
+    const deadline = Date.parse(at);
+    while (clock.now() < deadline) {
+      const remaining = deadline - clock.now();
+      clock.sleep(Math.min(remaining, 60_000));
+    }
+  }
   const dir = mkdtempSync(join(tmpdir(), 'release-publish-notes-'));
   try {
     const file = join(dir, 'notes.md');
@@ -83,7 +96,9 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
       if (context.input.forceFreeze !== true) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${landingFreezeMessage(frozen)}` };
     }
     let published: ReturnType<typeof run>;
-    try { published = run('bun', ['bin/elanous.mjs', 'release', 'publish', '--dir', out, '--notes-file', file, '--yes', '--json']); }
+    // The graph recipe no longer bounds this node (it may wait for publishAt), so the irreversible publication itself
+    // keeps the former 30-minute bound on every run — with or without publishAt.
+    try { published = run('bun', ['bin/elanous.mjs', 'release', 'publish', '--dir', out, '--notes-file', file, '--yes', '--json'], undefined, 1_800_000); }
     finally { landing.end(); }
     if (published.stderr) process.stderr.write(published.stderr);
     const result = lastResult(published);

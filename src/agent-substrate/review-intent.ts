@@ -16,7 +16,7 @@ import { parseGoalType, type GoalType } from '../self-implement/goal-author.js';
 import type { DesignCheckOutcome } from '../design/design-check.js';
 import type { DesignGateResult } from '../design/design-gate.js';
 import type { PriorDraftFinding } from '../self-implement/prior-draft-findings.js';
-import { parseShardIdentity, shardBoundaryBlock, withoutShardIdentity } from './shard-boundary-intent.js';
+import { parseShardIdentity, shardReviewContractBlock, withoutShardIdentity } from './shard-boundary-intent.js';
 
 export interface ReviewIntentInput {
   /** 무엇을 왜 — 골 원문. */
@@ -603,7 +603,9 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   그 안의 수용기준을 다시 목록으로 붙이면 **같은 내용이 두 번** 들어가 4000자 예산을 먹고,
   //   후순위 블록(스코프 경계)이 불필요하게 잘린다.
   const identity = parseShardIdentity(i.goal);
-  const shardBoundary = identity ? { title: '조각 경계', text: `조각 경계\n${shardBoundaryBlock(identity)}` } : undefined;
+  // This is the phaseIntent consumed by defaultSeams.reviewDiff → reviewPullRequest;
+  // the same block is retained by the orchestrator's PR-body review-intent section.
+  const shardBoundary = identity ? { title: '샤드 계약 — 리뷰 범위', text: shardReviewContractBlock(i.goal, identity, boundaries, i.changedFiles) } : undefined;
   const authoredLiteGoal = isLightweightGoal(i.goal);
   const liteGoal = authoredLiteGoal && Boolean(i.goalFile?.trim());
   const goalBody = liteGoal ? '' : stripExtractedSections(identity ? withoutShardIdentity(i.goal) : i.goal).trim();
@@ -629,8 +631,8 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
     const context = lightweightGoalContext(i.goal, i.goalFile!.trim());
     const boundaryBlock = listBlock('의도적 스코프 경계', boundaries);
     const liteBlocks = [
-      acceptanceBlock, context, boundaryBlock, priorFindings, applied,
-      runFacts, goalType, shardBoundary, preexisting, importerTestsNotRun,
+      acceptanceBlock, context, boundaryBlock, shardBoundary, priorFindings, applied,
+      runFacts, goalType, preexisting, importerTestsNotRun,
       gateEvidence, designCheck, designGate, shardSiblings, coverage, claims,
       listBlock('검증 못 한 경계 후보 (결정 아님 — 이것만으로 must-fix 를 면제하지도, 만들지도 말 것)', unverifiedBoundaryCandidates),
     ].filter((block): block is Block => Boolean(block));

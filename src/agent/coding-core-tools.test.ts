@@ -240,6 +240,15 @@ describe('tool profile invariants on the real CLI tool list', () => {
     expect([...coding.tools!.map((t) => t.name), ...coding.removed].sort()).toEqual([...all].sort());
     expect(coding.removed.length).toBeGreaterThan(0);
   });
+
+  // CHILD-TOOL-PROFILE-TRIM — 10-10 실측 27개(스키마 26,742자) → 코딩 도구 9개만 남는다.
+  test('coding on the real CLI list (Plan on) leaves exactly the nine coding tools', async () => {
+    const { applyToolProfile, parseToolProfile } = await import('./tool-profile.js');
+    const all = buildCliAgentTools(undefined, { sessionId: 'trim-probe', emitFeedback: () => {} }, process.cwd()).specs;
+    const coding = applyToolProfile(all, parseToolProfile('coding'));
+    expect(coding.tools!.map((t) => t.name).sort()).toEqual(['Bash', 'Edit', 'Glob', 'Grep', 'ListDir', 'MarkStepDone', 'Plan', 'Read', 'Write']);
+    expect([...coding.tools!.map((t) => t.name), ...coding.removed].sort()).toEqual(all.map((s) => s.name).sort());
+  });
 });
 
 // 대표 09-25 — 기본 모드에서 뺀 금융 도구도 자식이 상황을 보고 ToolSearch 로 불러 쓸 수 있다(전체 목록에서 찾는다).
@@ -250,5 +259,13 @@ test('a finance tool omitted by the coding profile is still reachable through To
   const catalog = buildCliAgentTools(cfg, undefined, process.cwd());
   const r = JSON.stringify(await catalog.dispatch('ToolSearch', { query: 'select:finance_quote' }));
   expect(r).toContain('finance_quote');
+  expect(r).not.toContain('unavailable in CLI');
+});
+
+// CHILD-TOOL-PROFILE-TRIM — coding 에서 빠진 운영 도구도 ToolSearch 로 닿는다.
+test('coo_admin omitted by the coding profile is still reachable through ToolSearch', async () => {
+  const catalog = buildCliAgentTools(undefined, undefined, process.cwd());
+  const r = JSON.stringify(await catalog.dispatch('ToolSearch', { query: 'select:coo_admin' }));
+  expect(r).toContain('coo_admin');
   expect(r).not.toContain('unavailable in CLI');
 });

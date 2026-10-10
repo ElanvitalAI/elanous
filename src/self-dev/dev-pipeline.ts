@@ -44,7 +44,7 @@ import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
 import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
-import { loadLlmPolicy } from '../policy/llm-policy.js';
+import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
 import { provisionRepository, type RepoProvisionResult } from '../self-implement/repo-provision.js';
@@ -1148,11 +1148,9 @@ export async function buildDefaultSelfImplementSeams(
   }
   let subscriptionReviewLLM: ((prompt: string) => Promise<string>) | undefined;
   if (reviewerIsDefaultApiCall) {
-    const userConfig = getUserConfig();
-    const policy = loadLlmPolicy();
-    const spec = policy.policy.roles.reviewer ?? userConfig.roleLlm?.reviewer;
-    if (spec) {
-      const cap = policy.policy.caps.claude.harness;
+    const reviewer = resolveSubscriptionReviewer(loadLlmPolicy(), getUserConfig().roleLlm);
+    if (reviewer) {
+      const { spec, cap } = reviewer;
       subscriptionReviewLLM = (prompt) => runSubscriptionReviewer(spec, cap, prompt, defaultApiReview, async (text, spawn) => {
         if (deps.makeSubscriptionReviewLLM) return deps.makeSubscriptionReviewLLM(spawn)(text);
         const { makeAcpReviewLLM } = await import('../agent-substrate/acp-reviewer.js');

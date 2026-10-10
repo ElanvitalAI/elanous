@@ -410,6 +410,8 @@ export interface RunNexusOptions {
    *  detachForTesting; production runs always start the server. Tests
    *  that DO want the server can pass false explicitly. */
   skipHttpServer?: boolean;
+  /** Test seam: replaces the daily error-report prune timer (the boot prune still runs for real). */
+  errorReportPruneScheduleForTesting?: (tick: () => void, ms: number) => { unref?: () => void };
   /** Override starting port for the HTTP server. Defaults to 31415. */
   httpStartPort?: number;
   /** Control-plane port; passing 0 also enables an isolated listener in detached tests. */
@@ -1266,6 +1268,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // 60s 틱마다 grace 유예 초과 구독자를 left 로 이탈 확정(reconcileSessionPresence).
   // cleared in shutdown hook.
   let presenceSweepHandle: ReturnType<typeof setInterval> | undefined;
+  // ERROR-REPORT-PRUNE-TICK — 30-day error-report retention must not wait for the next receipt:
+  // prune once at boot and once a day (unconditional · fail-soft · unref). Cleared in shutdown hook.
+  let errorReportPrune: { stop(): void } | undefined;
+  try {
+    const { startErrorReportPruneTick } = await import('./api/error-reports.js');
+    errorReportPrune = startErrorReportPruneTick({ ...(opts.errorReportPruneScheduleForTesting ? { schedule: opts.errorReportPruneScheduleForTesting } : {}) });
+  } catch (err) { console.warn(`[nexus] error-report prune wiring failed: ${(err as Error).message}`); }
   // ★ UR4d — 조율자 저지연 push watcher(logs.db tail edge-trigger). opt-in·기본 OFF.
   // cleared in shutdown hook(내부 타이머는 unref 이나 명시 정지).
   let coordinatorPushWatcher: { stop(): void } | undefined;
@@ -3383,6 +3392,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if (replayArmerHandle) { clearInterval(replayArmerHandle); replayArmerHandle = undefined; }
     // §P2 — stop the session presence grace sweeper.
     if (presenceSweepHandle) { clearInterval(presenceSweepHandle); presenceSweepHandle = undefined; }
+    if (errorReportPrune) { errorReportPrune.stop(); errorReportPrune = undefined; }
     // ★ UR4d — stop the coordinator low-latency push watcher(logs.db tail + debounce).
     if (coordinatorPushWatcher) { try { coordinatorPushWatcher.stop(); } catch { /* ignore */ } coordinatorPushWatcher = undefined; }
     // Phase 2 (2026-05-13) — dispose the TOX boot handle. dispose()

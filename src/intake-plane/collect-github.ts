@@ -41,6 +41,7 @@ export interface GithubStarRepo {
 
 /** 질의 하나 → 저장소 목록. 실제 구현은 `gh api` · 시험은 가짜. */
 export type SearchGithubRepos = (query: string, perQuery: number) => Promise<GithubStarRepo[]>;
+export type FetchGithubReadme = (fullName: string) => Promise<string>;
 
 export interface StarSnapshot { day: string; repo: string; stars: number }
 
@@ -175,6 +176,8 @@ export interface CollectGithubOpts {
   now?: () => Date;
   /** 등록 원천이 질의 하나만 수집할 때; 생략 시 관심 질의 전부 (최대 10개). */
   queries?: readonly string[];
+  /** 상위 세 저장소의 README 텍스트를 가져온다. 생략 시 gh api 사용. */
+  fetchReadme?: FetchGithubReadme;
 }
 
 /**
@@ -218,11 +221,21 @@ export async function collectGithubStars(
       ...(surge.baselineDays !== undefined ? { baselineDays: surge.baselineDays } : {}),
     };
   }).sort((a, b) => (b.starsPerDay ?? -Infinity) - (a.starsPerDay ?? -Infinity) || b.stars - a.stars);
+  const readmes = new Map<string, string>();
+  if (!opts.dryRun) {
+    for (const row of repos.slice(0, 3)) {
+      try {
+        readmes.set(row.repo, `README:\n${(await (opts.fetchReadme ?? ghApiFetchReadme)(row.repo)).slice(0, 1_500)}`);
+      } catch {
+        readmes.set(row.repo, 'README 미상');
+      }
+    }
+  }
   const raws: RawIntakeItem[] = repos.map((row) => ({
     url: row.url,
     title: row.title,
     // 모든 행 첫 줄에 라이선스: SPDX · 확인된 부재는 «없음» · 응답이 알려 주지 않으면 «미상»(없음으로 읽지 않는다).
-    text: `라이선스: ${row.license ?? '미상'}\n${row.text}`,
+    text: `라이선스: ${row.license ?? '미상'}\n${readmes.has(row.repo) ? `${readmes.get(row.repo)}\n` : ''}${row.text}`,
     signals: {
       stars: row.stars,
       ...(row.starsDelta !== undefined ? { starsDelta: row.starsDelta } : {}),
@@ -273,6 +286,11 @@ export function reposFromGhSearchItems(items: GhSearchItem[], perQuery: number):
   }
   return repos.slice(0, perQuery);
 }
+
+/** GitHub README raw 응답 — API 실패는 호출자가 해당 저장소의 «미상»으로 격리한다. */
+export const ghApiFetchReadme: FetchGithubReadme = async (fullName) => execFileSync('gh', [
+  'api', `repos/${fullName}/readme`, '-H', 'Accept: application/vnd.github.raw+json',
+], { encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
 
 /** `gh api search/repositories` 를 `sort=stars` 로 한 번 부른다. */
 export const ghApiSearchRepos: SearchGithubRepos = async (query, perQuery) => {

@@ -74,6 +74,8 @@ export interface TelegramServiceInstallDeps {
   writeFile: (path: string, text: string) => void;
   mkdir: (path: string) => void;
   rename: (from: string, to: string) => void;
+  /** SEC2: a replaced plist may carry an emergency EnvironmentVariables token — its backup is kept owner-only. */
+  chmod: (path: string, mode: number) => void;
   run: (command: string, args: string[]) => { status: number | null; stderr: string };
 }
 
@@ -106,8 +108,10 @@ export function installTelegramService(
   if (deps.exists(file.path)) {
     if (deps.readFile(file.path) !== file.content) {
       backup = `${file.path}.bak-${Date.now()}`;
+      // Restrict before moving: if chmod fails nothing has moved and the live plist stays in place.
+      deps.chmod(file.path, 0o600);
       deps.rename(file.path, backup);
-      steps.push(`backup ${backup}`);
+      steps.push(`backup ${backup} (0600)`);
     } else {
       steps.push('service file unchanged');
     }

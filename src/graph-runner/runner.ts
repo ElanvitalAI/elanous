@@ -22,6 +22,7 @@ import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
+import { releaseResumeAcceptedRegressions, releaseResumeWaiver, type AcceptedRegression } from '../../scripts/release-loop/resume.js';
 
 type BashRun = WorkflowDeps['runBash'];
 
@@ -38,7 +39,8 @@ export interface GraphRunState {
   path: string[];
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string;
-    startedAt?: string; endedAt?: string; seconds?: number }>;
+    startedAt?: string; endedAt?: string; seconds?: number;
+    waiver?: { reason: string; at: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; startedAt: string };
   input?: unknown;
@@ -68,6 +70,10 @@ export interface GraphRunOptions {
   resumeRunId?: string;
   resumeGraphId?: string;
   fromNodeId?: string;
+  /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
+  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
+  /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
+  releaseAcceptedRegressions?: { requested: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
   useCurrentGraph?: boolean;
   /**
    * RELEASE-LEDGER-UNIVERSE — stamp every cmd: child with this run's ledger root (`ELANOUS_STATE_DIR`).
@@ -388,6 +394,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
   if (options.useCurrentGraph && !options.resumeRunId) throw new Error('--use-current-graph requires --resume');
   if (options.variant && options.resumeRunId) throw new Error('variant cannot be combined with --resume');
+  if (options.releaseWaiver && (!options.resumeRunId || options.fromNodeId !== options.releaseWaiver.nodeId)) throw new Error('release waiver requires --resume --from <waived node>');
+  if (options.releaseAcceptedRegressions && (!options.resumeRunId || !options.fromNodeId || options.releaseWaiver)) throw new Error('accepted regressions require a release resume boundary');
   const root = options.deps?.root ?? effectiveInstanceRoot();
   const matchingRuns = options.resumeRunId && !options.resumeGraphId
     ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
@@ -499,6 +507,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     throw new Error('graph or recipes changed since grown run');
   }
   if (state.growth?.length) graph = withGrowth(graph, state.growth);
+  let waivedRecord: GraphRunState['nodes'][number] | undefined;
   if (options.fromNodeId) {
     if (state.status !== 'failed' || state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
     if (graphMode === 'current' && (!state.sourceHash || state.sourceHash !== approvalSourceHash)) throw new Error('graph or recipes changed since failed run');
@@ -534,6 +543,39 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     if (resolveNodeRecipe(graph.nodes.find((node) => node.nodeId === options.fromNodeId)!, recipes, catalogRoles).approval) {
       throw new Error('--from cannot restart an approval node');
+    }
+    if (options.releaseWaiver) {
+      if (graphId !== 'release-loop') throw new Error('release waiver requires the release-loop graph');
+      const checked = releaseResumeWaiver(state, { from: options.fromNodeId, waive: options.releaseWaiver.nodeId, reason: options.releaseWaiver.reason, acceptedRegressions: options.releaseWaiver.requestedRegressions });
+      if (!checked || JSON.stringify(checked.acceptedRegressions) !== JSON.stringify(options.releaseWaiver.acceptedRegressions)) throw new Error('release waiver input changed before restart');
+      const route = new Set<string>();
+      let cursor: string | undefined = nextNode(graph.edges, options.fromNodeId, 'ok', 'ok');
+      while (cursor && !route.has(cursor) && cursor !== 'known-issues') {
+        route.add(cursor);
+        cursor = nextNode(graph.edges, cursor, 'ok', 'ok');
+      }
+      if (cursor !== 'known-issues' || route.has('publish') || route.has('approve-publish')) throw new Error('waived node must reach known-issues before publication');
+    }
+    if (options.releaseAcceptedRegressions) {
+      if (graphId !== 'release-loop') throw new Error('accepted regressions require the release-loop graph');
+      const route = new Set<string>();
+      let cursor: string | undefined = options.fromNodeId;
+      while (cursor && !route.has(cursor) && cursor !== 'known-issues') {
+        route.add(cursor);
+        cursor = nextNode(graph.edges, cursor, 'ok', 'ok');
+      }
+      if (cursor !== 'known-issues' || route.has('publish') || route.has('approve-publish')) throw new Error('accepted regressions must reach known-issues before publication');
+      const checked = releaseResumeAcceptedRegressions(state, options.releaseAcceptedRegressions.requested, options.fromNodeId);
+      if (JSON.stringify(checked) !== JSON.stringify(options.releaseAcceptedRegressions.acceptedRegressions)) throw new Error('accepted regressions changed before restart');
+      state.input = { ...(state.input as Record<string, unknown>), acceptedRegressions: checked };
+    }
+    if (options.releaseWaiver) {
+      waivedRecord = state.nodes[from];
+      state.input = { ...(state.input as Record<string, unknown>), acceptedRegressions: options.releaseWaiver.acceptedRegressions };
+    } else if (graphId === 'release-loop' && state.nodes.slice(from).some((record) => record.waiver)) {
+      // Restarting at or before a waived node drops its waiver record, so its accepted issue goes with it.
+      state.input = { ...(state.input as Record<string, unknown>),
+        acceptedRegressions: releaseResumeAcceptedRegressions(state, [], options.fromNodeId) };
     }
     state.path = state.path.slice(0, from);
     state.nodes = state.nodes.slice(0, from);
@@ -692,7 +734,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let exit: number | null = null;
     let error: string | undefined;
     let output: unknown;
-    if (command && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
+    const waiving = options.releaseWaiver?.nodeId === current && waivedRecord !== undefined;
+    if (command && !waiving && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
       const outputs: Record<string, unknown> = Object.create(null);
       // 구조 산출(마지막 JSON 줄)이 있으면 그것을, 없으면 원문을 준다 — 다음 노드가 판단을 «값»으로 받는다.
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
@@ -752,7 +795,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       error = result.error ? redactCredentials(result.error) : undefined;
       state.executed++;
     }
-    if (prompt && !state.dryRun && !resumingCompleted) {
+    if (prompt && !waiving && !state.dryRun && !resumingCompleted) {
       const outputs: Record<string, { ok: boolean; output: unknown; durationMs: number }> = Object.create(null);
       for (const previous of state.nodes) outputs[previous.nodeId] = { ok: previous.ok, output: lastJsonObject(previous.output) ?? previous.output ?? null, durationMs: 0 };
       try {
@@ -775,6 +818,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     // A wall clock stepped back mid-node must not record an end before the start.
     const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
     delete state.currentNode;
+    if (waiving) {
+      output = JSON.stringify({ outcome: 'ok', verdict: 'waived', summary: `waived ${current}`, reason: options.releaseWaiver!.reason });
+      ok = true;
+      exit = 0;
+    }
     if (resumingCompleted && completed) {
       ok = completed.ok;
       exit = completed.exit;
@@ -785,7 +833,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (approval && !state.dryRun && !command) {
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun), ...((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun)), ...((waiving || ((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+        ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }
@@ -793,7 +842,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported = (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reported = waiving || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });

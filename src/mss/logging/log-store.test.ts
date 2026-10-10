@@ -6,7 +6,7 @@
  */
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -100,7 +100,7 @@ describe('LogStore writer contention', () => {
       stderr.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 35_000);
+  }, 50_000); // Six 5s SQLite busy waits + 3.1s retry backoff, with room for loaded CI hosts.
 
   it('opens and persists a row while a second connection holds BEGIN IMMEDIATE for 1.5 seconds', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'elanous-log-busy-'));
@@ -342,6 +342,32 @@ describe('LogStore — 적재/조회/보존', () => {
     expect(deletedByAge).toBe(1);
     expect(store.count()).toBe(1);
     store.close();
+  });
+
+  it('보존정책 — 크기 상한은 빈 페이지(freelist)를 세지 않는다 · 지운 뒤 다시 지우는 래칫 없음(OBS-RET-RATCHET)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'log-store-ret-'));
+    const store = new LogStore(join(dir, 'logs.db'));
+    try {
+      const pad = 'x'.repeat(2000);
+      const old = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      store.insertBatch(Array.from({ length: 400 }, () => ({ rec: rec({ ts: old, data: { pad } }), surface: 'nexus' })));
+      store.insertBatch(Array.from({ length: 100 }, () => ({ rec: rec({ data: { pad } }), surface: 'nexus' })));
+      // 오래된 400 행을 나이로 지우면 파일은 그대로 · 빈 페이지만 늘어난다.
+      expect(store.enforceRetention({ maxAgeDays: 7, maxDbMb: 0 }).deletedByAge).toBe(400);
+      const db = (store as unknown as { db: { query: (q: string) => { get: () => Record<string, number> } } }).db;
+      const page = db.query('PRAGMA page_size').get().page_size;
+      const fileMb = (db.query('PRAGMA page_count').get().page_count * page) / (1024 * 1024);
+      const liveMb = fileMb - (db.query('PRAGMA freelist_count').get().freelist_count * page) / (1024 * 1024);
+      expect(liveMb).toBeLessThan(fileMb / 2);
+      // 상한이 «파일»보다 작고 «쓰는 양»보다 크면 아무것도 안 지운다(옛 코드는 매번 지웠다).
+      const cap = (liveMb + fileMb) / 2;
+      expect(store.enforceRetention({ maxAgeDays: 0, maxDbMb: cap }).deletedBySize).toBe(0);
+      expect(store.enforceRetention({ maxAgeDays: 0, maxDbMb: cap }).deletedBySize).toBe(0);
+      expect(store.count()).toBe(100);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('보존정책 0 = 정리 안 함', () => {
@@ -980,6 +1006,193 @@ describe('registerLogStoreSink — sink 이후 부팅 관측', () => {
     }
   });
 
+  it('nexus owns periodic retention; non-owner uses one locked stamped startup fallback', async () => withLogStoreEnvAsync(async () => {
+    const store = getDefaultLogStore()!;
+    const policy = { maxAgeDays: 7, maxDbMb: 0 };
+    const old = new Date(Date.now() - 10 * 86_400_000).toISOString();
+    const run = async (surface: string, opts?: { retentionOwner?: boolean }): Promise<() => void> => {
+      const off = registerLogStoreSink(() => () => {}, surface, policy, opts);
+      expect(off).toBeFunction();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return off!;
+    };
+    const retentionSpy = spyOn(store, 'enforceRetention');
+    const reclaimSpy = spyOn(store, 'reclaimFreePages');
+    const intervalSpy = spyOn(globalThis, 'setInterval');
+    const periodicCount = (): number => intervalSpy.mock.calls.filter(([, delay]) => delay === 6 * 3600_000).length;
+    const offs: Array<() => void> = [];
+    try {
+      store.insertBatch([{ rec: rec({ ts: old, event: 'stale' }), surface: 'cli' }]);
+      offs.push(await run('cli'));
+      expect(periodicCount()).toBe(0);
+      expect(store.count()).toBe(0);
+      expect(retentionSpy).toHaveBeenCalledTimes(1);
+      expect(reclaimSpy).toHaveBeenCalledTimes(1);
+      expect(existsSync(`${store.path}.retention.stamp`)).toBe(true);
+      expect(existsSync(`${store.path}.retention.lock`)).toBe(false);
+      store.insertBatch([{ rec: rec({ ts: old, event: 'other-stale' }), surface: 'cli' }]);
+      offs.push(await run('autopilot'));
+      expect(periodicCount()).toBe(0);
+      expect(store.count()).toBe(1); // fresh stamp prevents another startup deletion
+      expect(retentionSpy).toHaveBeenCalledTimes(1);
+      writeFileSync(`${store.path}.retention.stamp`, String(Date.now() - 7 * 3600_000));
+      const second = await run('cli');
+      offs.push(second);
+      expect(store.count()).toBe(0);
+      expect(retentionSpy).toHaveBeenCalledTimes(2);
+      expect(reclaimSpy).toHaveBeenCalledTimes(2);
+      // A contender cannot bypass the lock even when the stamp is old.
+      writeFileSync(`${store.path}.retention.stamp`, '0');
+      mkdirSync(`${store.path}.retention.lock`);
+      offs.push(await run('cli'));
+      expect(retentionSpy).toHaveBeenCalledTimes(2);
+      rmSync(`${store.path}.retention.lock`, { recursive: true });
+      offs.push(await run('nexus'));
+      expect(periodicCount()).toBe(1);
+      expect(retentionSpy).toHaveBeenCalledTimes(3);
+      offs.push(await run('cli', { retentionOwner: true }));
+      expect(periodicCount()).toBe(2);
+      expect(retentionSpy).toHaveBeenCalledTimes(4); // explicit owner runs even with a fresh stamp
+      offs.push(await run('nexus', { retentionOwner: false }));
+      expect(retentionSpy).toHaveBeenCalledTimes(4);
+      expect(periodicCount()).toBe(2);
+    } finally {
+      for (const off of offs) off();
+      intervalSpy.mockRestore();
+      retentionSpy.mockRestore();
+      reclaimSpy.mockRestore();
+    }
+  }));
+
+  it('a live retention lock survives contenders, but SIGKILL leaves a recoverable lock for both fallback and owner', async () => withLogStoreEnvAsync(async () => {
+    const store = getDefaultLogStore()!;
+    const stateDir = process.env.ELANOUS_STATE_DIR!;
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-retention-crash-'));
+    const ready = join(dir, 'ready');
+    const childFile = join(dir, 'hold.ts');
+    writeFileSync(childFile, [
+      `import { LogStore, registerLogStoreSink } from ${JSON.stringify(join(import.meta.dir, 'log-store.ts'))};`,
+      `import { writeFileSync } from 'node:fs';`,
+      `LogStore.prototype.enforceRetention = function () {`,
+      `  writeFileSync(${JSON.stringify(ready)}, 'ready');`,
+      `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);`,
+      `  return { deletedByAge: 0, deletedBySize: 0 };`,
+      `};`,
+      `registerLogStoreSink(() => () => {}, 'nexus');`,
+      `setTimeout(() => {}, 60_000);`,
+    ].join('\n'));
+    const proc = Bun.spawn([process.execPath, childFile], {
+      env: { ...process.env, NODE_ENV: 'production', ELANOUS_STATE_DIR: stateDir },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const policy = { maxAgeDays: 7, maxDbMb: 0 };
+    const stale = () => store.insertBatch([{ rec: rec({ ts: new Date(Date.now() - 10 * 86_400_000).toISOString() }), surface: 'cli' }]);
+    const run = async (surface: string): Promise<void> => {
+      const off = registerLogStoreSink(() => () => {}, surface, policy);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      off?.();
+    };
+    try {
+      const started = Date.now();
+      while (!existsSync(ready) && Date.now() - started < 10_000) await Bun.sleep(20);
+      expect(existsSync(ready)).toBe(true);
+      stale();
+      await run('cli');
+      expect(store.count()).toBe(1);
+      expect(existsSync(`${store.path}.retention.lock`)).toBe(true);
+      proc.kill('SIGKILL');
+      await proc.exited;
+      await run('cli');
+      expect(store.count()).toBe(0);
+      expect(existsSync(`${store.path}.retention.lock`)).toBe(false);
+      stale();
+      await run('nexus');
+      expect(store.count()).toBe(0);
+    } finally {
+      if (proc.exitCode === null) proc.kill('SIGKILL');
+      await proc.exited;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }));
+
+  it('recovers an empty directory left by a dead owner during acquisition', async () => withLogStoreEnvAsync(async () => {
+    const store = getDefaultLogStore()!;
+    const lockPath = `${store.path}.retention.lock`;
+    const guard = new Database(`${lockPath}.db`);
+    try {
+      guard.run('CREATE TABLE owner (slot INTEGER PRIMARY KEY CHECK(slot = 1), token TEXT NOT NULL, pid INTEGER NOT NULL, start TEXT)');
+      guard.run("INSERT INTO owner VALUES (1, 'interrupted', 99999999, NULL)");
+    } finally { guard.close(); }
+    mkdirSync(lockPath);
+    store.insertBatch([{ rec: rec({ ts: new Date(Date.now() - 10 * 86_400_000).toISOString() }), surface: 'cli' }]);
+    const off = registerLogStoreSink(() => () => {}, 'cli', { maxAgeDays: 7, maxDbMb: 0 });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(store.count()).toBe(0);
+      expect(existsSync(lockPath)).toBe(false);
+    } finally { off?.(); }
+  }));
+
+  it('recovers dead acquisitions interrupted during owner marker writing, without stealing a live initializer', async () => withLogStoreEnvAsync(async () => {
+    const store = getDefaultLogStore()!;
+    const lockPath = `${store.path}.retention.lock`;
+    const guard = new Database(`${lockPath}.db`);
+    const token = 'dead-owner-token';
+    guard.run('CREATE TABLE owner (slot INTEGER PRIMARY KEY CHECK(slot = 1), token TEXT NOT NULL, pid INTEGER NOT NULL, start TEXT)');
+    const stale = () => store.insertBatch([{ rec: rec({ ts: new Date(Date.now() - 10 * 86_400_000).toISOString() }), surface: 'cli' }]);
+    const run = async (): Promise<void> => {
+      const off = registerLogStoreSink(() => () => {}, 'cli', { maxAgeDays: 7, maxDbMb: 0 });
+      try { await new Promise<void>((resolve) => setImmediate(resolve)); }
+      finally { off?.(); }
+    };
+    try {
+      // The row precedes mkdir. An unfinished temp file is never published as owner.
+      guard.run('INSERT INTO owner VALUES (1, ?, ?, NULL)', [token, process.pid]);
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, `owner.${token}.tmp`), token.slice(0, 4));
+      stale();
+      await run();
+      expect(store.count()).toBe(1);
+      expect(existsSync(join(lockPath, `owner.${token}.tmp`))).toBe(true);
+      guard.run('UPDATE owner SET pid = 99999999 WHERE slot = 1');
+      await run();
+      expect(store.count()).toBe(0);
+      expect(existsSync(lockPath)).toBe(false);
+
+      // Legacy direct writes may stop before the first byte or partway through.
+      for (const partial of ['', token.slice(0, 4)]) {
+        rmSync(`${store.path}.retention.stamp`, { force: true });
+        guard.run('INSERT INTO owner VALUES (1, ?, 99999999, NULL)', [token]);
+        mkdirSync(lockPath);
+        writeFileSync(join(lockPath, 'owner'), partial);
+        stale();
+        await run();
+        expect(store.count()).toBe(0);
+        expect(existsSync(lockPath)).toBe(false);
+      }
+    } finally { guard.close(); }
+  }));
+
+  it('a dead owner row cannot remove a lock bearing a different owner token', async () => withLogStoreEnvAsync(async () => {
+    const store = getDefaultLogStore()!;
+    const guardPath = `${store.path}.retention.lock.db`;
+    const lockPath = `${store.path}.retention.lock`;
+    const guard = new Database(guardPath);
+    try {
+      guard.run('CREATE TABLE owner (slot INTEGER PRIMARY KEY CHECK(slot = 1), token TEXT NOT NULL, pid INTEGER NOT NULL, start TEXT)');
+      guard.run("INSERT INTO owner VALUES (1, 'old-token', 99999999, NULL)");
+    } finally { guard.close(); }
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, 'owner'), 'new-token');
+    store.insertBatch([{ rec: rec({ ts: new Date(Date.now() - 10 * 86_400_000).toISOString() }), surface: 'cli' }]);
+    const off = registerLogStoreSink(() => () => {}, 'nexus', { maxAgeDays: 7, maxDbMb: 0 });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(store.count()).toBe(1);
+      expect(readFileSync(join(lockPath, 'owner'), 'utf8')).toBe('new-token');
+    } finally { off?.(); }
+  }));
+
   it('관측이 던져도 반환과 retention 배선은 유지한다', async () => withLogStoreEnvAsync(async () => {
     const store = getDefaultLogStore();
     expect(store).not.toBeNull();
@@ -988,7 +1201,7 @@ describe('registerLogStoreSink — sink 이후 부팅 관측', () => {
     const observeSpy = spyOn(nestDepth, 'observeNestAtBoot').mockImplementation(() => { throw new Error('observation unavailable'); });
     let unregistered = false;
     try {
-      const off = registerLogStoreSink(() => () => { unregistered = true; }, 'test', retention);
+      const off = registerLogStoreSink(() => () => { unregistered = true; }, 'test', retention, { retentionOwner: true });
       expect(off).toBeFunction();
       expect(observeSpy).toHaveBeenCalledTimes(1);
       await new Promise<void>((resolve) => setImmediate(resolve));

@@ -1,0 +1,5 @@
+# Source: passeth/business-motion-websites @ fe5e8b0ae3a208efba751d3dd13aa168afd4fa74 (MIT, Copyright (c) 2026 passeth) — https://github.com/passeth/business-motion-websites — vendored unchanged below this line. See SOURCE.md.
+interface:
+  display_name: "비즈니스 웹사이트 스튜디오"
+  short_description: "사업의 전문성을 다중 페이지와 이미지·영상·스크롤 모션으로 구현하는 제작 방법론"
+  default_prompt: "$business-motion-websites를 사용해 우리 사업의 전문성을 설득력 있는 다중 페이지 웹사이트로 구현해줘. 새로운 시각 방향과 이미지·영상·모션을 설계하고 실제 모바일 작동까지 검증해줘."

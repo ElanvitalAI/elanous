@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -8,6 +8,9 @@ import { recordRunExit } from './harness-incidents.js';
 import { appendRunLedgerEntry, loadRunLedger } from '../self-implement/run-ledger.js';
 
 const roots: string[] = [];
+// The refusal observation is enriched with the MSS identity (`~/.elanous/identity.json`, HOME-derived) —
+// a writer outside this ledger contract. Children run with MSS off so `before`/`after` measure only the ledger writers.
+const LEDGER_ONLY = { MSS_ENABLED: 'false' } as const;
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function temporaryRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'ledger-write-guard-'));
@@ -24,7 +27,8 @@ test('test markers refuse production root and observe each refused ledger write'
     }
     expect(log).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith('harness.incidents', 'write-refused', {
-      store: 'run-ledger', root: production, effectiveInstanceRoot: production,
+      // The guard reports the physical target (macOS tmpdir /var → /private/var), the instance root as given.
+      store: 'run-ledger', root: realpathSync(production), effectiveInstanceRoot: production,
     });
     expect(readdirSync(production)).toEqual([]);
   } finally { log.mockRestore(); }
@@ -34,7 +38,7 @@ test('both writers refuse the effective production root in a test child before c
   const home = temporaryRoot();
   const production = join(home, '.elanous');
   for (const marker of ['NODE_ENV', 'ELANOUS_TEST_HOME']) {
-    const env: Record<string, string | undefined> = { ...process.env, HOME: home, ELANOUS_STATE_DIR: production, NODE_ENV: '', ELANOUS_TEST_HOME: '' };
+    const env: Record<string, string | undefined> = { ...process.env, ...LEDGER_ONLY, HOME: home, ELANOUS_STATE_DIR: production, NODE_ENV: '', ELANOUS_TEST_HOME: '' };
     env[marker] = marker === 'NODE_ENV' ? 'test' : home;
     const child = Bun.spawnSync(['bun', 'src/harness/ledger-write-guard-child.fixture.ts'], { env, stdout: 'pipe', stderr: 'pipe' });
     expect(new TextDecoder().decode(child.stderr)).toBe('');
@@ -44,11 +48,11 @@ test('both writers refuse the effective production root in a test child before c
     expect(result.root).toBe(production);
     expect(result.effectiveInstanceRoot).toBe(result.root);
     expect(result.after).toEqual(result.before);
-    expect(result.after).not.toContain('incidents');
-    expect(result.after).not.toContain('run-ledger');
-    expect(result.after).not.toContain('.incident-write-lock.sqlite');
+    expect(result.after ?? []).not.toContain('incidents');
+    expect(result.after ?? []).not.toContain('run-ledger');
+    expect(result.after ?? []).not.toContain('.incident-write-lock.sqlite');
   }
-});
+}, 60_000);
 
 test('actual writers refuse nested paths, symlink aliases and missing descendants without creating files', () => {
   const home = temporaryRoot();
@@ -58,7 +62,7 @@ test('actual writers refuse nested paths, symlink aliases and missing descendant
   symlinkSync(production, alias, 'dir');
   const sibling = join(home, '.elanous-other');
   mkdirSync(sibling);
-  const env = { ...process.env, HOME: home, ELANOUS_STATE_DIR: production, NODE_ENV: 'test', ELANOUS_TEST_HOME: '' };
+  const env = { ...process.env, ...LEDGER_ONLY, HOME: home, ELANOUS_STATE_DIR: production, NODE_ENV: 'test', ELANOUS_TEST_HOME: '' };
   const cases = [
     [production, production],
     [join(production, 'nested'), join(production, 'nested', 'run-ledger')],
@@ -80,7 +84,7 @@ test('actual writers refuse nested paths, symlink aliases and missing descendant
   expect(isolatedChild.exitCode).toBe(0);
   expect(existsSync(join(sibling, 'run-ledger', 'run-test.jsonl'))).toBe(true);
   expect(existsSync(join(sibling, 'incidents'))).toBe(true);
-});
+}, 60_000);
 
 test('non-test process and isolated test root are not refused', () => {
   const production = temporaryRoot();

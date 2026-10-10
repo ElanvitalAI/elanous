@@ -20,6 +20,7 @@ export interface BriefWeeklyActions extends BriefActionCount {
 export type BriefDomain = (typeof BRIEF_DOMAINS)[number];
 export type BriefPriority = (typeof BRIEF_PRIORITIES)[number];
 export type BriefSlot = (typeof BRIEF_SLOTS)[number];
+export type BriefSendSlot = BriefSlot | 'realtime';
 
 const KST = 'Asia/Seoul';
 
@@ -95,6 +96,12 @@ function needsDecision(item: BriefItem, today: string): boolean {
   return item.priority === 'P0' || (item.deadline !== null && deadlineDate(item.deadline) === today);
 }
 
+/** Unsent decisions needing immediate delivery, using the same KST deadline rule as slot pages. */
+export function pendingRealtime(items: readonly BriefItem[], now: Date): BriefItem[] {
+  const today = dateKey(now, { timeZone: KST });
+  return items.filter(item => item.sent_at === null && needsDecision(item, today));
+}
+
 /**
  * One briefing page. Item text is copied verbatim.
  * Order: decisions due (P0, then a deadline of today) → domain groups →
@@ -105,13 +112,13 @@ export function composeBriefMarkdown(items: readonly BriefItem[], slot: BriefSlo
 }
 
 /** The ids are exactly the rows represented by the composed page, after deduplication. */
-export function composeBriefPage(items: readonly BriefItem[], slot: BriefSlot, now: Date): { markdown: string; ids: number[] } {
+export function composeBriefPage(items: readonly BriefItem[], slot: BriefSendSlot, now: Date): { markdown: string; ids: number[] } {
   const today = dateKey(now, { timeZone: KST });
   // A duplicate left out of a delivered page stays unsent in the ledger, but must not reappear on a later page.
   // A new undeliverable observation after a sent page is a new occurrence, not an old duplicate.
   const deliveredClaims = new Set(items.filter(item => item.sent_at !== null).map(item => normalizeClaim(item.text)));
-  const eligible = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now)
-    && (item.source === 'outbound.undeliverable' || !deliveredClaims.has(normalizeClaim(item.text))));
+  const candidates = slot === 'realtime' ? pendingRealtime(items, now) : items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now));
+  const eligible = candidates.filter(item => item.source === 'outbound.undeliverable' || !deliveredClaims.has(normalizeClaim(item.text)));
   // Duplicate claims keep the copy that needs a decision today (P0 or due today), then the higher priority, then the earliest (ACP must-fix).
   const rank = (item: BriefItem) => [needsDecision(item, today) ? 0 : 1, BRIEF_PRIORITIES.indexOf(item.priority), item.id];
   const better = (a: BriefItem, b: BriefItem) => { const x = rank(a), y = rank(b); return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!; };
@@ -354,6 +361,7 @@ export class BriefItemsLedger {
    * requirement funnel contributes ephemeral lines without adding ledger rows.
    */
   compose(slot: string): string {
+    if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
     return this.composeWithIds(slot).markdown;
   }
 
@@ -361,7 +369,7 @@ export class BriefItemsLedger {
     return db.query('SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items ORDER BY id').all() as BriefItem[];
   }
 
-  private pageFromDb(db: Database, slot: BriefSlot): { markdown: string; ids: number[] } {
+  private pageFromDb(db: Database, slot: BriefSendSlot): { markdown: string; ids: number[] } {
     const items = this.itemsFromDb(db);
     const now = this.now();
     const morningCutoff = Date.parse(`${dateKey(now, { timeZone: KST })}T08:30:00+09:00`);
@@ -383,26 +391,26 @@ export class BriefItemsLedger {
     const composed = composeBriefPage([...items, ...funnelItems], slot, now);
     // Ephemeral funnel lines appear on the page but have no ledger row to mark sent.
     const page = { markdown: composed.markdown, ids: composed.ids.filter(id => id > 0) };
-    const candidates = items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now)).length;
+    const candidates = (slot === 'realtime' ? pendingRealtime(items, now) : items.filter(item => item.sent_at === null && beforeSlot(item.created_at, slot, now))).length;
     this.log('briefing.items', 'composed', { slot, candidates, bytes: Buffer.byteLength(page.markdown) });
     return page;
   }
 
   /** Read-only page and the exact ledger item ids printed on it (after deduplication). */
   composeWithIds(slot: string): { markdown: string; ids: number[] } {
-    if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
-    return this.using(db => this.pageFromDb(db, slot as BriefSlot));
+    if (slot !== 'realtime' && !(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
+    return this.using(db => this.pageFromDb(db, slot as BriefSendSlot));
   }
 
   /** Hold the ledger's SQLite writer lock from selecting unsent rows through delivery and marking.
    * A failed delivery rolls back and releases the lock; the next sender can retry.
    */
-  withSendLock<T>(slot: string, work: (page: { markdown: string; ids: number[] }, markSent: (ids: readonly number[], slot: BriefSlot) => number) => T): T {
-    if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
+  withSendLock<T>(slot: string, work: (page: { markdown: string; ids: number[] }, markSent: (ids: readonly number[], slot: BriefSendSlot) => number) => T): T {
+    if (slot !== 'realtime' && !(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
     return this.using(db => {
       db.exec('BEGIN IMMEDIATE');
       try {
-        const page = this.pageFromDb(db, slot as BriefSlot);
+        const page = this.pageFromDb(db, slot as BriefSendSlot);
         const result = work(page, (ids, sentSlot) => {
           if (sentSlot !== slot || ids.length !== page.ids.length || ids.some((id, index) => id !== page.ids[index])) {
             throw new BriefItemsInputError('marked ids must match composed page');
@@ -418,7 +426,7 @@ export class BriefItemsLedger {
     });
   }
 
-  private markSentInDb(db: Database, ids: readonly number[], slot: BriefSlot): number {
+  private markSentInDb(db: Database, ids: readonly number[], slot: BriefSendSlot): number {
     const at = this.now().toISOString();
     const insert = db.query('INSERT INTO sends (item_id, slot, sent_at) VALUES (?, ?, ?)');
     let count = 0;
@@ -431,8 +439,8 @@ export class BriefItemsLedger {
    * Records that these items went out in a slot (append-only); later composes leave them out (ACP must-fix).
    * Only an actual sender calls this — compose itself stays read-only (no flag marks items it did not send).
    */
-  markSent(ids: readonly number[], slot: BriefSlot): number {
-    if (!(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
+  markSent(ids: readonly number[], slot: BriefSendSlot): number {
+    if (slot !== 'realtime' && !(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
     return this.using(db => db.transaction(() => this.markSentInDb(db, ids, slot))());
   }
 }

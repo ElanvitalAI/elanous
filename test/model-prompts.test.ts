@@ -47,6 +47,27 @@ describe('getModelFamily', () => {
     expect(stripLocalLlmSpec(resolvedModel)).toBe(rawModel);
   });
 
+  test('OpenRouter GLM, Kimi, Qwen IDs → open-weight only', () => {
+    for (const id of [
+      'openrouter/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash',
+      'openrouter/moonshotai/kimi-k3', 'openrouter/qwen/qwen3.8-max-0902',
+      'OPENROUTER/QWEN/QWEN3.8-FLASH',
+    ]) {
+      expect(getModelFamily(id)).toBe('open-weight');
+      expect(getModelPromptAddon(id)).toBe('');
+      expect(usesLongReasoningIdle(getModelFamily(id))).toBe(false);
+    }
+    expect(getModelFamily('openrouter/anthropic/claude-opus-4-8')).toBe('claude');
+    for (const id of [
+      'qwen3.8-27b-mlx', 'qwen3.6-flash', 'kimi-k2.6', 'glm-4.5-air',
+      'lmstudio-community/gemma-4-26b-a4b-it', 'openrouter/acme/model',
+      'vendor/qwen3.8-flash',
+      // bare vendor ids — LM Studio native keys look like this; they must stay 'other'.
+      'moonshotai/kimi-k3', 'z-ai/glm-5.3', 'qwen/qwen3.8-flash', 'qwen/qwen3-coder-30b',
+    ]) expect(getModelFamily(id)).toBe('other');
+    expect(getModelFamily('local:qwen')).toBe('local');
+  });
+
   test('undefined / empty → "other"', () => {
     expect(getModelFamily(undefined)).toBe('other');
     expect(getModelFamily('')).toBe('other');

@@ -92,7 +92,7 @@ describe('ACP reviewer backend factory', () => {
   it('uses a review-owned ACP child with the configured executor and scrubbed environment', async () => {
     const spawn = subscriptionReviewerSpawn({ provider: 'claude-acp' }, {
       PATH: '/bin', ANTHROPIC_API_KEY: 'key', ANTHROPIC_AUTH_TOKEN: 'token', NODE_ENV: 'test',
-    });
+    }, 'http://localhost:3456');
     let child: { spec: { command: string; args: string[] }; env: NodeJS.ProcessEnv } | undefined;
     const start = spyOn(AcpAgent.prototype, 'start').mockImplementation(async function (this: AcpAgent) {
       child = this as unknown as typeof child;
@@ -107,12 +107,26 @@ describe('ACP reviewer backend factory', () => {
       expect(prompt).toHaveBeenCalledTimes(1);
       expect(stop).toHaveBeenCalledTimes(1);
       expect(manager).not.toHaveBeenCalled();
-      expect(child?.spec.command).toBe('teamclaude');
-      expect(child?.spec.args).toEqual(['run', '--auto-fallback', '--', '--dangerously-skip-permissions']);
+      // The ACP adapter, never the interactive `teamclaude run`/`claude` CLI (that never answers the handshake).
+      expect(child?.spec.command).toBe('claude-agent-acp');
+      expect(child?.spec.args).toEqual([]);
+      expect(child?.env.ANTHROPIC_BASE_URL).toBe('http://localhost:3456');
       expect(child?.env.ANTHROPIC_API_KEY).toBeUndefined();
       expect(child?.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
     } finally {
       start.mockRestore(); newSession.mockRestore(); prompt.mockRestore(); stop.mockRestore(); manager.mockRestore();
+    }
+  });
+  it('bounds the whole handshake (start → session → model select) with one deadline and stops the child', async () => {
+    for (const hang of ['start', 'newSession', 'selectSessionModel'] as const) {
+      const agent = reviewAgent({ backendId: 'review-backend' });
+      (agent as unknown as Record<string, unknown>)[hang] = () => new Promise(() => {});
+      const stop = spyOn(agent, 'stop');
+      const t0 = Date.now();
+      await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'review-backend', model: 'opus',
+        handshakeTimeoutMs: 100, createAgent: () => agent })('review')).rejects.toThrow('ACP handshake timeout');
+      expect(Date.now() - t0).toBeLessThan(5_000);
+      expect(stop).toHaveBeenCalledTimes(1);
     }
   });
   it('canonicalizes a friendly backend alias, records its transport, and uses a review-owned manager', async () => {

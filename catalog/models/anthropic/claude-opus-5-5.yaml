@@ -8,6 +8,11 @@ familyShortcut: opus
 #    ✅ 2026-09-25 (대표 「모델별 최신으로」): `/v1/models` 실호출 ⊕ 메시지 실호출 OK · 「opus」 별칭을 여기로 옮겼다.
 #    📏 공식(platform.claude.com opus-5-5) 캐시 읽기 $0.20 = 입력의 5%.
 contextSize: 1000000
+# 📏 2026-10-10 채움(MK · MODEL-ROUTING-MATRIX) — 출력 상한 128K:
+#   ⑴ Anthropic 공식 https://platform.claude.com/내부 문서 `overview` (2026-10-10T08:38Z 직접 확인)
+#      «Context window: 1M tokens · Max output: 128K tokens»
+#   ⑵ OpenRouter `GET /api/v1/models` 실측 2026-10-10T05:10Z — anthropic/claude-opus-5.5: 1,000,000 · 128,000
+outputMaxTokens: 128000
 vision: images
 audio: { input: false, output: false }
 reasoning: adaptive
