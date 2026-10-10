@@ -1,12 +1,12 @@
 # Elanous
 
-> Give it a goal — it plans, builds, verifies and merges on its own. It watches itself, understands what it sees, and heals itself. Install with one line, then `elanous doctor`.
+> Elanous is the conductor that coordinates many AI agents (it works with Codex and Claude) and brings back only finished results — loop agents for repeating work, graphs as editable work manuals, and a harness underneath that watches, understands and heals itself. Install with one line, then `elanous doctor`.
 
 Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 ## Overview
 
-- [What is Elanous](https://docs.elanous.ai/): Give it a goal — it plans, builds, verifies and merges on its own.
+- [What is Elanous](https://docs.elanous.ai/): The conductor that coordinates AI agents and brings back only finished results.
 
 ## Get started
 
@@ -48,6 +48,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Surfaces
 
 - [Telegram](https://docs.elanous.ai/surfaces/telegram/): Run elanous as a Telegram bot.
+- [Set up outbound channels](https://docs.elanous.ai/surfaces/channel-setup/): Create Telegram and Discord bots and webhooks, set permissions, route alerts, store secrets, and check delivery.
 - [Discord voice channel](https://docs.elanous.ai/surfaces/discord/): Voice-channel round trips and voice attachments on Discord.
 - [The web app (PWA)](https://docs.elanous.ai/surfaces/pwa/): Open the browser dashboard: Chat, Terminal, Vault, Settings and first-time setup.
 - [Vault (Obsidian notes)](https://docs.elanous.ai/surfaces/pwa-vault/): Browse, search, edit and create Obsidian notes in the web app, and handle edits made elsewhere.
@@ -76,6 +77,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.23](https://docs.elanous.ai/releases/0-2-23/): Changes in 0.2.23.
 - [0.2.22](https://docs.elanous.ai/releases/0-2-22/): Changes in 0.2.22.
 - [0.2.21](https://docs.elanous.ai/releases/0-2-21/): Changes in 0.2.21.
 - [0.2.20](https://docs.elanous.ai/releases/0-2-20/): Changes in 0.2.20.

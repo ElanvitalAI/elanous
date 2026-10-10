@@ -2,11 +2,14 @@
 
 Source: https://docs.elanous.ai/
 
-**Give it a goal — it plans, builds, verifies and merges on its own. It watches itself, understands what it sees, and heals itself.**
+**Elanous is the conductor that coordinates many AI agents and brings back only finished results.**
+It works with Codex and Claude — and gives them wings.
 
-- **Observe** — it sees its own actions through logs, screens and memory.
-- **Understand** — it judges context on top of what it sees.
-- **Heal** — it fixes itself, and asks a person when it cannot.
+- **A team of AI on duty** — [loop agents](/using-elanous/loop-agents) take the work that repeats (every morning, every new request) and keep at it until it is done.
+- **Work manuals it can follow and reshape** — every job runs as a [graph](/concepts/graph-engineering): steps you can see, edit and share.
+- **One sentence to start** — say what you want; elanous turns it into a plan, a graph or a [plugin](/using-elanous/build-a-plugin).
+
+Underneath, it watches itself, understands what it sees, and heals itself — and asks a person only when it cannot.
 
 In practice, `elanous` takes a change described in one sentence, writes a goal document, implements it in an isolated git worktree, gates it with tests, reviews it unattended and merges it. You are called only when the system cannot converge.
 
@@ -710,6 +713,14 @@ These apply to both `harness say` and `harness ask`:
 | `--child-llm-provider <id>` ⊕ `--child-llm-model <id>` | Choose the model that writes the code (set both) |
 | `--child-llm-effort <level>` | Reasoning effort for that model (`minimal` … `max`); refused if the model does not support it |
 | `--json` | Structured output |
+
+For scripts using the self-development CLI, `elanous dev --say "<sentence>" --json`
+writes one JSON line to stdout if the launch is stopped by the preflight check:
+`{"kind":"self","ok":false,"stage":"preflight-blocked","blockers":[...]}`.
+The CLI exits with code 1 in that case; `blockers` contains the preflight
+blockers. Without `--json`, that stop still exits with code 1 but does not
+print the JSON line. This describes the preflight-blocked result, not a
+promise of JSON output for other outcomes.
 
 `harness plan` also takes `--role-llm <role>=<provider>[/<tier>]` (repeatable) to choose a model per role — for example `implement=grok/best` or `review=anthropic`.
 
@@ -1954,6 +1965,14 @@ The commands you will use most. The TUI has more — open the help overlay with 
 
 `elanous keys` prints every keybinding and slash command.
 
+## Folded internal notes in chat
+
+When a final reply contains a `[NO FINAL SYNTHESIS]` tail, the TUI shows the
+preceding text and folds the tail into one `● Internal notes folded · N lines ·
+press f to expand` line. With the log pane focused, press `f` to expand the
+most recent fold; press it again to collapse it. The tail is still available
+when expanded. Replies without that marker keep their usual display.
+
 ## Argument autocomplete
 
 After typing a command name and a space, Tab / Up / Down navigate
@@ -2606,6 +2625,51 @@ Away mode adds no new token. It uses the bot already in `config.json` — keep t
 
 ---
 
+# Set up outbound channels
+
+Source: https://docs.elanous.ai/surfaces/channel-setup/
+
+**S:** Elanous sends `/v1/outbound` messages through Telegram by default. It also has a Discord webhook sender and a Pushcut sender. The existing `routes`/`awayRoutes` fan out to the listed channels.
+
+**C:** An internal connector comparison observes Hermes `plugins/platforms/*` and OpenClaw `extensions/<channel>/openclaw.plugin.json`, with auth-dependent chat connectors dormant until configured. Elanous likewise must not imply that declaring a channel activates an uninstalled connector. Outbound webhook delivery is not a full messaging bot: Discord webhook sends cannot read messages, handle slash commands, or acknowledge buttons. Telegram's inbound bot commands use a separate poller. The outbound router now dispatches built-in senders through a common adapter registry, but this does not migrate all inbound consumers.
+
+**Q:** How do I provision and check these senders without assuming an unsupported channel works?
+
+**A:** Set up the bot and webhook below, configure routing explicitly, and check the send results. The capability boundary and troubleshooting table state what remains unavailable.
+
+## Create and install
+
+1. **Telegram:** DM `@BotFather` `/newbot`; copy the token. Run `elanous nexus channel-bot setup telegram` to enter the token in the NEXUS key/secret framework. For an existing `telegram` configuration, confirm that the outbound target selected by `telegram.reportChannel` or the role table is also configured, because outbound `kind: alert` may not target the home chat. DM your bot `/start`; obtain your numeric ID (for example with `@userinfobot`) and configure `telegram.allowedUsers`, then set `telegram.homeChannel` to the destination chat ID. Invite the bot into a group and grant it permission to post there; use BotFather `/setprivacy` only if the bot must receive ordinary group messages. Start with `elanous nexus run` (or `elanous telegram run` if `telegram.poller=standalone`). Check the bot by sending a DM or `/start` to it, then send an authenticated `POST /v1/outbound` with `kind: alert` and inspect `channels`/`delivered`; these are separate inbound and outbound checks, not a live end-to-end suite.
+2. **Discord:** Create an app in the Discord Developer Portal. To run an independent inbound bot, add a bot, install it in the server with `bot` and `applications.commands` scopes as applicable, grant only the needed View Channel/Send Messages permissions, and store its bot token via `elanous nexus channel-bot setup discord`. For **outbound** delivery, create a webhook under the target channel's Integrations → Webhooks, copy its URL and put it in `outbound.channels` below. The outbound webhook needs no OAuth scope; a bot token alone is not a webhook URL. This connector does not receive messages or provision a server/channel.
+
+## Route and verify
+
+Add this one-line `outbound` entry in the main configuration JSON (replace the webhook URL; never commit the real URL):
+
+```json
+"outbound": {"channels":[{"type":"telegram"},{"type":"discord","webhookUrl":"https://discord.com/api/webhooks/…"}],"routes":{"alert":["telegram","discord"]},"primary":{"alert":"telegram"},"fallback":{"alert":"discord"}}
+```
+
+`routes.alert` lists eligible channels. Optionally set `roleRoutes.OP:["discord","telegram"]` and `primary.OP:"discord"`/`fallback.OP:"telegram"` for messages with an explicit `role:"OP"` in an authenticated `/v1/outbound` POST. Requests without `role` retain the existing kind-based routing and response shape. `primary.alert` sends only to Telegram first; `fallback.alert` sends to Discord only if the primary fails. Omit `primary`/`fallback` to retain the old fan-out behavior. `awayRoutes` may replace the eligible list while `presence.json` says away, but it can never widen a role's `roleRoutes` (the two are intersected, and a role's empty route stays silent while away); explicitly empty routes suppress sends. A `fallback` without a `primary` is not used. If the main channel is not in the current route, the reply lists it as `not-routed` and only the backup is tried. Without an `outbound` configuration the Telegram-only default is unchanged. The delivery ledger still stores the same message ID, kind, text and `[{type,ok}]` channel rows.
+
+To check routing logic without credentials, run `bun test src/nexus/outbound/router.test.ts` and `bun test test/outbound-router.test.ts`. With Nexus running, POST an authenticated `{"kind":"alert","text":"test"}` to `/v1/outbound` and inspect the `channels` and `delivered` fields of the response; never print tokens in diagnostics. A successful local unit test does not prove a live bot/webhook integration or the entire TG-E2E-SUITE.
+
+## Key framework and common failures
+
+`elanous nexus channel-bot setup telegram|discord` stores **bot tokens** in the NEXUS secret store via the channel-bot setup flow. The existing outbound Discord `webhookUrl` still resides in the protected user configuration: it is a credential-bearing URL, **not yet stored as a secret reference**. Restrict file permissions, rotate a leaked webhook, and never paste it in logs, reports or a public issue. Linear's `elanous connector linear set-key` provisions the separate Linear-to-task connector, not a chat channel.
+
+| Symptom | Check / action |
+|---|---|
+| Telegram returns `not-configured` | This is an outbound (sending) failure: check the stored bot token, the `kind`-selected report/role target (or `homeChannel` for the operational bot), the destination chat ID, and whether the bot was started or blocked there. `telegram.allowedUsers` only controls who may send commands to the bot (inbound) and does not fix this. |
+| Discord returns `http-401` or `http-404` | The webhook URL may be revoked or wrong; recreate it for the target channel. |
+| Discord returns `http-429` | The sender reports rate limiting but does not retry it automatically. Slow the producer; do not claim delivery. |
+| `channels` is empty | Inspect `suppressed`: dedup may have accepted the prior delivery; otherwise check explicitly empty `routes` / `awayRoutes`. |
+| Telegram poller gets a 409 | Another poller or webhook owns `getUpdates`; run only one receiver for that token. |
+
+**Unsupported by default:** Slack, Microsoft Teams, and WhatsApp have no built-in connector registered. An installed Elanous plugin can declare `contributes.connectors: [{"id":"my-channel"}]` in its `plugin.json` and export an `ElanousPlugin.channelAdapters` entry of the same type with `capabilities.send`, `parseConfig` and `send`. The plugin host registers this entry on activation and disposes it on deactivation; it then becomes eligible in `outbound.channels`/`routes`/`primary`/`fallback`. Activation in the plugin host is required: installing a plugin without activating it does not add a channel to a separately running Nexus process. This does not provide inbound or interactive behavior. Until a real connector is installed and verified, naming one of these as primary cannot make it work. The registry's Telegram and Discord adapters normalize inbound taps accepted by the existing bot poller/gateway into the shared receive envelope (without changing workflow dispatch/raw); Pushcut has no receive adapter. The Discord **webhook** still cannot receive messages. Interactive inbound, thread/topic, persona avatar, channel create/archive, permissions, slash commands, attachments, buttons/choices, remote confirmation, and rate-limit handling are not supplied by the outbound adapter. NOTIFY-MANAGER's bell-store inputs and REQ-FUNNEL's ledger inputs are separate today; their migration and a real TG-E2E-SUITE pass remain outstanding. The named `RESEARCH-chat-daemon-channels-personas` comparison (hermes-agent/openclaw) was not found in this checkout, so this chapter does not assert conclusions from it.
+
+---
+
 # Discord voice channel
 
 Source: https://docs.elanous.ai/surfaces/discord/
@@ -2716,7 +2780,7 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 | **Approvals** | Tool | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
 | **Live** | Stable | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](/surfaces/pwa-live). |
 | **Trace** | Experimental | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](/surfaces/pwa-trace). |
-| **Missions** | Experimental | Mission lineage and the task board in one menu; you can also hand a new goal from here. |
+| **Missions** | Experimental | Mission lineage and the task board in one menu; you can also hand a new goal from here. In the Missions list, a mission with no update for at least 14 days and a non-terminal status shows an amber “N일 멈춤 · 마지막 갱신 YYYY-MM-DD” label; an autonomous mission in that state also shows **닫기 제안**. Done, completed, failed, disarmed, rejected and cancelled missions do not get this inactivity label. |
 | **Design** | Tool | Pick a design system, see drafts, or derive one from a URL. See [Design systems](/using-elanous/design). |
 | **Vault** | Experimental | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](/surfaces/pwa-vault). |
 | **마켓** (Market) | Stable | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](/using-elanous/plugins). |
@@ -5008,6 +5072,40 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.23
+
+Source: https://docs.elanous.ai/releases/0-2-23/
+
+## Behavior changes
+
+- a web-publish plugin pack plans, builds and checks a business website from a brief, with approval steps before build and release and a local-folder default for publishing; adapted with permission from passeth/business-motion-websites (MIT).
+- the Korean docs site now marks pages that are not translated yet with a "translation pending" notice above the English text, and flags Korean pages older than their English source, instead of silently showing English.
+- the docs home, site tagline, llms.txt and README describe elanous with the current one-line definition, and the Releases menu opens the release list instead of the oldest release.
+- both graph canvases (editor and live run) highlight a hovered node's direct connections, dim the rest and draw connected edges as gold flowing lines; design credit to Gongnyang AI Lab in the canvas and NOTICE.
+- typing after "/" or pressing up/down in the TUI slash picker no longer clears and repaints the whole screen.
+- the first-run notice that error reports are on by default now follows the user's language (en, ja, zh) and keeps the off command verbatim.
+- the TUI keeps a single "new version installed" line and updates it in place instead of stacking a warning each time the installed version changes.
+- the CEO loop card says no schedules are registered instead of a bare 0 when the schedule list is empty.
+- the PWA treats /board like the other TUI-only slash commands.
+- when the model runs out of tool turns without an answer, the reply now opens with a plain sentence in your language saying what happened and what to ask next, instead of an internal English marker.
+- `elanous release run --publish-at <iso>` waits after approval and checks until the promised time before publishing; an invalid or non-existent time is refused before anything runs.
+- a release checklist cell can be marked `--kind postpub` (measured after publication); the release gate lists such cells separately and no longer blocks publication on them.
+- `elanous mcp login` signs in with an OAuth device code when no browser is available (or the server only offers device login), and on a desktop lets aside approve the browser step, falling back to the default browser.
+- two public sample knowledge packs (semiconductor process basics from public sources, and a B2B sales playbook) install from a signed market with skills install --market, and CLI chat can query installed packs and cite them.
+- when a remote harness run is stopped by its launch check, the failure reason now names the blocking check (for example no target paths) instead of an unreadable stage.
+- `elanous release resume --waive <node> --reason <text>` resumes a stopped release past a failed display check (mac smoke or TUI) without re-running it, records the original failure, and lists the reason under Known issues in the public notes.
+- the PWA Loops view gains one resource node that shows seats, jobs, leases and queued cells from the same traffic decision the scheduler uses, served read-only at GET /v1/loops/resources.
+- outbound messages can name a main and a backup channel per message kind or role (the backup is tried only if the main fails), plugins can add channel connectors, and a new public channel setup guide covers Telegram, Discord and Pushcut.
+- `elanous tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` launches the run with that implementation model, records it on the task card, and reuses it on relaunch; without the flag the command and card are unchanged.
+- draft harvest and resume runs now mark the draft they own with a «🔧 in progress — owner, run» label and comment, and clear it when that run ends; manually released claims and other seats' claims are left alone.
+- OpenRouter implementation children now receive the requested tool choice (forced choices become auto for Kimi in thinking mode); requests for other providers are byte-identical.
+- an OpenRouter implementation child that answers with text only and has not called any tool is asked up to twice to actually call a tool before the turn is accepted; other providers keep the current behaviour.
+- when a large pull request is reviewed in several chunks, each chunk now gets the reviewer context for its own files (still capped per chunk), so the reviewer sees all of it instead of the same first 12,000 characters; single-chunk reviews are unchanged.
+
+Plus 276 internal changes.
+
+---
+
 # 0.2.22
 
 Source: https://docs.elanous.ai/releases/0-2-22/
@@ -5041,7 +5139,7 @@ Source: https://docs.elanous.ai/releases/0-2-22/
 - the plugin validator accepts approval recipes that the graph runner already executes.
 - the loop map says the token lacks access on 401/403 instead of showing a loading or daemon message.
 - a graph's schedule trigger now starts the graph on time through the workflow scheduler.
-- graphs can use a prompt node that sends a prompt to the LLM with $ values filled in.
+- graphs gain a prompt node that fills $ values into a prompt template; connecting it to your model provider in everyday runs comes in a later release.
 - the official plugin market adds image-first-shorts, a free, non-commercial plugin that makes vertical character shorts image-first (first frames, image-to-video, matting, beat-timed sound, effects, final cut) with three human approval steps; adapted with permission from Gongnyang AI Lab (credit in the plugin's SOURCE.md).
 - Claude 5.x models are recognised as reasoning-capable, so reasoning and interleaved thinking are enabled for them on the Anthropic provider.
 
